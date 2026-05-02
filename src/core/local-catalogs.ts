@@ -101,14 +101,15 @@ export function parseAutoInstallCatalogs(value: string | undefined): string[] {
 }
 
 export function installLocalCatalogs(world: WooWorld, names: readonly string[] = DEFAULT_LOCAL_CATALOGS): void {
-  // Expand to: requested names + every catalog already installed + transitive
-  // deps of either. Otherwise installLocalCatalogs(world, []) on a world that
-  // long ago auto-installed pinboard would skip both install and reconcile —
-  // pinboard would stay on stale source, and the V02 repair migration would
-  // fail because $note (a dep of pinboard) was never installed.
-  const expanded = localMigrationCatalogNames(world, sortCatalogNames(names));
-  for (const name of expanded) installLocalCatalog(world, name);
-  runLocalCatalogMigrations(world, expanded);
+  const requested = sortCatalogNames(names);
+  for (const name of requested) installLocalCatalog(world, name);
+
+  // Existing worlds still need repair even when WOO_AUTO_INSTALL_CATALOGS is
+  // intentionally empty. Missing dependencies of already-installed local
+  // catalogs are compatibility repair, not fresh auto-install policy.
+  const repairNames = localMigrationCatalogNames(world, requested);
+  installMissingLocalCatalogDependencies(world, repairNames);
+  runLocalCatalogMigrations(world, repairNames);
 }
 
 export function installLocalCatalog(world: WooWorld, name: string): void {
@@ -146,6 +147,14 @@ export function localCatalogStatuses(world: WooWorld, names: readonly string[] =
       pending_migrations: migrations.filter((migration) => !migration.applied).map((migration) => migration.id)
     };
   });
+}
+
+export function runHostScopedLocalCatalogLifecycle(world: WooWorld): void {
+  const names = hostScopedLocalCatalogNames(world);
+  for (const name of names) {
+    repairHostScopedLocalCatalog(world, name);
+  }
+  runHostScopedDataMigrations(world);
 }
 
 function runLocalCatalogMigrations(world: WooWorld, names: readonly string[]): void {
@@ -193,6 +202,63 @@ function localMigrationCatalogNames(world: WooWorld, requested: readonly string[
   const selected = new Set(requested);
   for (const name of installedLocalCatalogNames(world)) selected.add(name);
   return sortCatalogNames(Array.from(selected));
+}
+
+function installMissingLocalCatalogDependencies(world: WooWorld, names: readonly string[]): void {
+  for (const name of names) {
+    if (!localCatalogInstalled(world, name)) installLocalCatalog(world, name);
+  }
+}
+
+function hostScopedLocalCatalogNames(world: WooWorld): string[] {
+  const selected = new Set<string>();
+  const hostedDataIds = new Set(
+    world.objectRoutes()
+      .filter((route) => route.host === route.id || (route.anchor !== null && route.host === route.anchor))
+      .map((route) => route.id)
+  );
+  for (const name of LOCAL_CATALOGS.keys()) {
+    if (localCatalogPresentInWorldSlice(world, name, hostedDataIds)) selected.add(name);
+  }
+  return sortCatalogNames(Array.from(selected));
+}
+
+function localCatalogPresentInWorldSlice(world: WooWorld, name: string, hostedDataIds: Set<ObjRef>): boolean {
+  if (localCatalogInstalled(world, name)) return true;
+  const manifest = LOCAL_CATALOGS.get(name);
+  if (!manifest) return false;
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind === "create_instance" && hostedDataIds.has(hook.as)) return true;
+  }
+  for (const id of hostedDataIds) {
+    if (!world.objects.has(id)) continue;
+    for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) {
+      try {
+        if (world.isDescendantOf(id, def.local_name)) return true;
+      } catch {
+        // Support ancestors can be temporarily absent in an old host slice.
+      }
+    }
+  }
+  return false;
+}
+
+function repairHostScopedLocalCatalog(world: WooWorld, name: string): void {
+  const manifest = LOCAL_CATALOGS.get(name);
+  if (!manifest) return;
+  try {
+    repairCatalogManifest(world, manifest, {
+      actor: "$wiz",
+      allowImplementationHints: true,
+      reconcileSeedHooks: true,
+      skipMissingSeedHooks: true
+    });
+  } catch (err) {
+    // Host-scoped slices may temporarily lack a support object until the
+    // gateway's fresh seed can be fetched and merged. Catalog repair is
+    // idempotent, so defer rather than bricking unrelated requests on this DO.
+    console.warn("woo.local_catalog_host_repair_deferred", { catalog: name, error: repairErrorSummary(err) });
+  }
 }
 
 function runLocalCatalogMigration(world: WooWorld, names: readonly string[], id: string, options: { allowImplementationHints?: boolean; reconcileSeedHooks?: boolean; rehomeNowhereSeedObjects?: boolean; reconcileClassVerbs?: boolean; only?: string } = {}): void {
@@ -366,11 +432,15 @@ function runPinboardNotesToPinsMigration(world: WooWorld, names: readonly string
 
 function migratePinboardNoteRecords(world: WooWorld): void {
   for (const board of pinboardInstances(world)) {
+    const boardObj = world.object(board);
+    const hadLegacyNotes = boardObj.properties.has("notes");
+    const hadLegacyNextId = boardObj.properties.has("next_note_id");
     const rawNotes = world.propOrNull(board, "notes");
     const staleRecords = Array.isArray(rawNotes) ? rawNotes : [];
     let layout = mapValue(world.propOrNull(board, "layout"));
     let nextZ = numberValue(world.propOrNull(board, "next_z"), 1);
     let index = 0;
+    let changed = false;
     for (const raw of staleRecords) {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
       const record = raw as Record<string, WooValue>;
@@ -398,11 +468,14 @@ function migratePinboardNoteRecords(world: WooWorld): void {
       };
       nextZ = Math.max(nextZ, z + 1);
       index += 1;
+      changed = true;
     }
-    world.setProp(board, "layout", layout);
-    world.deleteProp(board, "notes");
-    world.deleteProp(board, "next_note_id");
-    world.setProp(board, "next_z", nextZ);
+    if (changed) {
+      world.setProp(board, "layout", layout);
+      world.setProp(board, "next_z", nextZ);
+    }
+    if (hadLegacyNotes) world.deleteProp(board, "notes");
+    if (hadLegacyNextId) world.deleteProp(board, "next_note_id");
   }
 }
 
@@ -457,4 +530,15 @@ function mapValue(value: WooValue): Record<string, WooValue> {
 
 function numberValue(value: WooValue | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function repairErrorSummary(err: unknown): Record<string, WooValue> {
+  if (err && typeof err === "object") {
+    const record = err as Record<string, unknown>;
+    return {
+      code: typeof record.code === "string" ? record.code : "E_INTERNAL",
+      message: typeof record.message === "string" ? record.message : String(err)
+    };
+  }
+  return { code: "E_INTERNAL", message: String(err) };
 }

@@ -402,9 +402,17 @@ The seed graph from [bootstrap.md](../semantics/bootstrap.md) materializes the f
    - Acquires its own storage transaction.
    - Materializes universal classes by RPC-creating each — `$root`, `$actor`, `$player`, `$wiz`, `$guest`, `$sequenced_log`, `$space`, `$thing`. Each landed via `env.WOO.get(idFromName(corename)).create(...)`.
    - Installs configured local catalogs per `WOO_AUTO_INSTALL_CATALOGS`; first-light demo classes and instances come from those catalog manifests.
+   - Runs deployment-local catalog repair for already-installed local catalogs.
    - Registers corenames in the `Directory` DO.
    - Sets `bootstrapped = true`.
 4. Boot is idempotent; concurrent first-requests serialize on `$system`'s single-threaded execution.
+
+Each object-owning DO also runs a host-scoped local catalog lifecycle after it
+loads or refreshes its host slice. This repairs the catalog support objects and
+seed verbs present in that slice and runs data migrations against the state that
+the host actually owns. The gateway's `$system.applied_migrations` ledger may be
+copied into a host seed, but it does not prove the host's local instance data was
+converted.
 
 ### R9.2 Boot identity
 

@@ -157,6 +157,9 @@ export type RepairCatalogOptions = {
   actor?: ObjRef;
   allowImplementationHints?: boolean;
   reconcileSeedHooks?: boolean;
+  // Host-scoped repair uses this for partial world slices: repair classes and
+  // existing seeds, but do not create missing instances on the wrong host.
+  skipMissingSeedHooks?: boolean;
   rehomeNowhereSeedObjects?: boolean;
   reconcileClassVerbs?: boolean;
 };
@@ -436,6 +439,7 @@ export function repairCatalogManifest(world: WooWorld, manifest: CatalogManifest
   const actor = options.actor ?? "$wiz";
   const allowImplementationHints = options.allowImplementationHints ?? false;
   const reconcileSeedHooks = options.reconcileSeedHooks ?? false;
+  const skipMissingSeedHooks = options.skipMissingSeedHooks ?? false;
   const rehomeNowhereSeedObjects = options.rehomeNowhereSeedObjects ?? false;
   const reconcileClassVerbs = options.reconcileClassVerbs ?? false;
   const existing = installedCatalogs(world);
@@ -461,6 +465,7 @@ export function repairCatalogManifest(world: WooWorld, manifest: CatalogManifest
     if (hook.kind === "create_instance") {
       const id = hook.as;
       if (!world.objects.has(id)) {
+        if (skipMissingSeedHooks) continue;
         const parent = resolveObjectRef(world, hook.class, localObjects, localSeeds, existing);
         const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
         const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;

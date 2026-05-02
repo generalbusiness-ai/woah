@@ -247,10 +247,21 @@ recompiling bundled catalog verbs after a DSL/compiler capability lands.
 Boot migrations are idempotent and recorded in `$system.applied_migrations`.
 They run after the local catalog install pass, so a fresh world installs the
 current manifests first and then records the migration as applied; an existing
-world repairs only catalogs already present in `$catalog_registry`. A migration
-must not special-case a demo application's object names or semantics. It may
-operate over the discovered bundled catalog manifests as a set, because that set
-is defined by the deployment's catalog tap location.
+world repairs only catalogs already present in `$catalog_registry`. Missing
+dependencies of an already-installed bundled catalog may be installed as a
+compatibility repair; this is not an auto-install policy for clean worlds.
+
+In multi-host deployments, every host that owns catalog data must run its own
+host-scoped local lifecycle at cold init. Gateway repair cannot see or safely
+convert state stored in self-hosted object DOs, and a copied
+`$system.applied_migrations` ledger is not proof that the owning host's data was
+already repaired. Host-scoped repair is therefore based on the catalog objects
+and self-hosted instances present in that host slice, plus their local
+dependencies, and the repair must be idempotent.
+
+A migration must not special-case a demo application's object names or
+semantics. It may operate over the discovered bundled catalog manifests as a
+set, because that set is defined by the deployment's catalog tap location.
 
 The first boot migration is `2026-04-30-source-catalog-verbs`: it recompiles
 already-installed local catalog verbs from their manifest source and replaces

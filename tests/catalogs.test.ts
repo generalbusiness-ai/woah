@@ -1,10 +1,10 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../src/core/authoring";
-import { createWorld } from "../src/core/bootstrap";
+import { createWorld, createWorldFromSerialized, nonEmptyHostScopedWorld } from "../src/core/bootstrap";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
-import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations } from "../src/core/local-catalogs";
+import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations, runHostScopedLocalCatalogLifecycle } from "../src/core/local-catalogs";
 import type { VerbDef } from "../src/core/types";
 
 type CatalogManifest = {
@@ -37,6 +37,12 @@ function readFrontmatter(name: string): Record<string, string> {
       return [line.slice(0, index).trim(), line.slice(index + 1).trim()];
     });
   return Object.fromEntries(entries);
+}
+
+function worldVerb(world: ReturnType<typeof createWorld>, object: string, name: string) {
+  const verb = world.ownVerbExact(object, name);
+  expect(verb, `${object}:${name} should exist`).toBeDefined();
+  return verb!;
 }
 
 describe("local catalogs", () => {
@@ -669,6 +675,46 @@ describe("local catalogs", () => {
     expect(pins).toHaveLength(1);
     expect(world.getProp(pins[0], "text")).toEqual(["real legacy"]);
     expect(world.getProp(pins[0], "color")).toBe("blue");
+  });
+
+  it("runHostScopedLocalCatalogLifecycle no-ops on a core-only world slice", () => {
+    const world = createWorld({ catalogs: false });
+    const before = world.exportWorld();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      runHostScopedLocalCatalogLifecycle(world);
+      expect(world.exportWorld()).toEqual(before);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("runHostScopedLocalCatalogLifecycle repairs host-owned catalog source even when the gateway ledger is already applied", () => {
+    const gateway = createWorld();
+    const listNotes = worldVerb(gateway, "$pinboard", "list_notes");
+    const installed = installVerb(gateway, "$pinboard", "list_notes", `verb :list_notes() rxd {
+  return this.notes;
+}`, listNotes.version);
+    expect(installed.ok).toBe(true);
+    const migrations = gateway.getProp("$system", "applied_migrations") as string[];
+    for (const id of ["2026-05-02-pinboard-v02-repair", "2026-05-02-pinboard-v02-data-repair"]) {
+      if (!migrations.includes(id)) migrations.push(id);
+    }
+    gateway.setProp("$system", "applied_migrations", migrations);
+
+    const scoped = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_pinboard");
+    expect(scoped).not.toBeNull();
+    const host = createWorldFromSerialized(scoped!, { persist: false });
+    const hadChatroomSeed = host.objects.has("the_chatroom");
+    const hadVerbEditorSeed = host.objects.has("the_verb_editor");
+    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("return this.notes");
+
+    runHostScopedLocalCatalogLifecycle(host);
+
+    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("contents(this)");
+    expect(host.objects.has("the_chatroom")).toBe(hadChatroomSeed);
+    expect(host.objects.has("the_verb_editor")).toBe(hadVerbEditorSeed);
   });
 
   it("seeds the_cockatoo in the chatroom with random-pick squawk", async () => {

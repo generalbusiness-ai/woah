@@ -6,7 +6,8 @@
 // host-scoped world slice exported by the gateway: hosted objects, their
 // parent/feature/bytecode support objects, hosted logs, snapshots, and tasks.
 // They do not auto-install the bundled catalogs or claim independent bootstrap
-// authority.
+// authority, but they do run host-scoped local catalog repair and data
+// migrations for the objects they actually own.
 //
 // What's wired through fetch() / the WS handlers:
 // - REST routing ported from src/server/dev-server.ts: auth, describe (with
@@ -31,7 +32,7 @@
 //   private repos and content-hash caching are deferred.
 
 import { createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHostScopedWorld } from "../core/bootstrap";
-import { parseAutoInstallCatalogs, runHostScopedDataMigrations } from "../core/local-catalogs";
+import { parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
   handleWsProtocolFrame,
@@ -321,12 +322,9 @@ export class PersistentObjectDO {
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
     const world = createWorldFromSerialized(scoped, { repository: this.repo });
-    // Run data-only migrations on this host's actual instance data. The
-    // gateway's migration framework can't reach self-hosted seeds (their
-    // properties live here, not on the gateway), so each owning host has to
-    // do the conversion locally on cold init. Idempotent and cheap when
-    // there's nothing to do.
-    runHostScopedDataMigrations(world);
+    // Run local catalog repair and data migrations on this host's actual
+    // slice. The gateway cannot repair or convert state it does not own.
+    runHostScopedLocalCatalogLifecycle(world);
     this.scrubStaleSubscribersOnce(world);
     return world;
   }
