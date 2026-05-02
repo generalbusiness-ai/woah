@@ -25,6 +25,7 @@ The sections below distinguish three flavors of pending item:
 - MCP queue retention — observation queues are session-scoped and reaped at DELETE; we don't yet enforce the session-grace TTL or drop observations older than the spec's ~1 hour TTL (`spec/protocol/mcp.md §M4.1`). Currently the only ceiling is the hard cap (4096 entries). Add age-based eviction once it shows up in profiling.
 - internal-auth replay cache — HMAC-signed Worker/Directory/cluster requests currently have timestamp freshness only. A captured signed internal request can replay inside the 5-minute skew window if internal traffic or logs leak. v1's same-deployment trust assumes attackers cannot observe internal traffic; if that assumption weakens, reuse the host-RPC `correlation_id`/recent-replies cache pattern for nonce replay protection.
 - verb alias wildcard lint/deprecation — `literal*` is currently a broad wildcard while `literal@` is LambdaCore-style abbreviation. First-party catalogs now use `@`, but the engine still accepts trailing `*` for compatibility. Add catalog/install warnings for aliases with a single trailing `*` and no `@`; later decide whether to reserve `*` or keep it as explicit glob syntax.
+- host-scoped local catalog repair retry state — host repair currently logs and defers when a partial slice cannot resolve a manifest reference. That is correct for transient stale seeds, but a permanently broken manifest can warn on every cold init. Add per-host backoff or "skip until manifest version changes" state if this gets noisy.
 
 ## structure
 
