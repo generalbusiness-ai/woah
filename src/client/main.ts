@@ -98,6 +98,8 @@ const state: AppState = {
 
 let audio: DubAudio | undefined;
 const sessionKey = "woo.session";
+const chatHistoryKey = "woo.chat.history";
+const chatHistoryLimit = 80;
 const drumVoices = [
   { id: "kick", label: "Kick" },
   { id: "snare", label: "Snare" },
@@ -137,6 +139,9 @@ let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
 let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
 const pinNoteClientZ = new Map<string, number>();
+let chatHistory = loadChatHistory();
+let chatHistoryCursor = chatHistory.length;
+let chatHistoryDraft = "";
 
 connect();
 window.setInterval(pruneLiveControls, 700);
@@ -1570,6 +1575,56 @@ function pushChatLine(line: ChatLine, shouldRender = true) {
   if (shouldRender && state.tab === "chat") render();
 }
 
+function loadChatHistory(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(chatHistoryKey) ?? "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(-chatHistoryLimit)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveChatHistory() {
+  try {
+    localStorage.setItem(chatHistoryKey, JSON.stringify(chatHistory.slice(-chatHistoryLimit)));
+  } catch {
+    // Local history is a convenience only; private-mode storage failures should
+    // not affect chat input.
+  }
+}
+
+function rememberChatInput(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  if (chatHistory.at(-1) !== trimmed) chatHistory = [...chatHistory, trimmed].slice(-chatHistoryLimit);
+  chatHistoryCursor = chatHistory.length;
+  chatHistoryDraft = "";
+  saveChatHistory();
+}
+
+function setChatInputValue(input: HTMLInputElement, value: string) {
+  input.value = value;
+  state.chatDraft = value;
+  input.setSelectionRange(value.length, value.length);
+}
+
+function navigateChatHistory(event: KeyboardEvent, input: HTMLInputElement) {
+  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+  if (chatHistory.length === 0) return;
+  event.preventDefault();
+  if (event.key === "ArrowUp") {
+    if (chatHistoryCursor === chatHistory.length) chatHistoryDraft = input.value;
+    chatHistoryCursor = Math.max(0, chatHistoryCursor - 1);
+    setChatInputValue(input, chatHistory[chatHistoryCursor] ?? "");
+    return;
+  }
+  if (chatHistoryCursor >= chatHistory.length) return;
+  chatHistoryCursor += 1;
+  setChatInputValue(input, chatHistoryCursor >= chatHistory.length ? chatHistoryDraft : chatHistory[chatHistoryCursor] ?? "");
+}
+
 function setChatPresent(result: any) {
   if (Array.isArray(result)) state.chatPresent = result.map(String);
   if (Array.isArray(result?.present_actors)) state.chatPresent = result.present_actors.map(String);
@@ -1667,14 +1722,19 @@ function renderChatLine(line: ChatLine) {
 }
 
 function bindChat() {
-  document.querySelector<HTMLInputElement>("[data-chat-input]")?.addEventListener("input", (event) => {
+  const chatInput = document.querySelector<HTMLInputElement>("[data-chat-input]");
+  chatInput?.addEventListener("keydown", (event) => navigateChatHistory(event, chatInput));
+  chatInput?.addEventListener("input", (event) => {
     state.chatDraft = (event.currentTarget as HTMLInputElement).value;
+    chatHistoryCursor = chatHistory.length;
+    chatHistoryDraft = state.chatDraft;
   });
   document.querySelector<HTMLFormElement>("[data-chat-form]")?.addEventListener("submit", (event) => {
     event.preventDefault();
     const input = document.querySelector<HTMLInputElement>("[data-chat-input]");
     const text = input?.value.trim() ?? "";
     if (!text) return;
+    rememberChatInput(text);
     state.chatDraft = "";
     sendChatInput(text);
     if (input) {
