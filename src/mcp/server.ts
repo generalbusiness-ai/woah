@@ -48,7 +48,8 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     {
       capabilities: {
         tools: { listChanged: true }
-      }
+      },
+      instructions: buildServerInstructions(actor)
     }
   );
 
@@ -400,4 +401,13 @@ function wooValueSchema(): Record<string, unknown> {
       { type: "null" }
     ]
   };
+}
+
+// Sent in the MCP `initialize` response so a fresh client gets enough framing
+// to find its bearings before reading the tool list. Refers to the actor by id
+// so the agent knows which name to use for `me`/self-reference.
+export function buildServerInstructions(actor: ObjRef): string {
+  return `You are an actor (\`${actor}\`) in woo, an object-graph world. To act anywhere, you call a verb on an object via \`woo_call(object, verb, args)\`, or use a directly-named tool. Verbs you can call right now are listed by \`woo_list_reachable_tools\`.
+
+Reachable objects are: \`${actor}\`, the actor's location, anything in the actor's focus list, and selected ambient spaces. Use \`woo_focus(target)\` to add an object to the working set. Use \`enter\` on a space to participate. Most spaces have \`look\` for orientation. Use \`help\` for a contextual index of other topics.`;
 }

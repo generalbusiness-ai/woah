@@ -3,7 +3,7 @@ import { installVerb, installVerbAs } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
-import { createMcpServer } from "../src/mcp/server";
+import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
 import type { Observation, ObjRef, RemoteToolDescriptor, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, HostBridge, MoveObjectResult, WooWorld } from "../src/core/world";
 
@@ -96,6 +96,17 @@ class RemoteToolBridge implements HostBridge {
 }
 
 describe("McpHost", () => {
+  it("frames the initialize instructions with the session's actor id", () => {
+    const text = buildServerInstructions("guest_42");
+    expect(text).toContain("`guest_42`");
+    expect(text).toContain("woo_call(object, verb, args)");
+    expect(text).toContain("woo_list_reachable_tools");
+    expect(text).toContain("woo_focus(target)");
+    expect(text).toContain("`enter`");
+    expect(text).toContain("`look`");
+    expect(text).toContain("`help`");
+  });
+
   it("does not expose other actors through contents, inventory, or focus", async () => {
     const world = bootstrapWorld();
     const alice = world.auth("guest:mcp-privacy-alice");
