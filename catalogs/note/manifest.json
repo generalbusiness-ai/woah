@@ -39,7 +39,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let lines = length(this.text); let suffix = \" lines\"; if (lines == 1) { suffix = \" line\"; } let summary = this.name + \" — \" + to_string(lines) + suffix + \". Use 'read' to see the text.\"; observe({ type: \"looked\", actor: actor, to: actor, room: this.location, text: summary, look: { id: this, title: this.name, description: this.description, lines: lines, location: this.location }, ts: now() }); return { id: this, title: this.name, description: this.description, lines: lines, location: this.location }; }"
+          "source": "verb :look_self() rxd { let lines = length(this.text); return { id: this, title: this.name, description: this.description, lines: lines, location: this.location }; }"
         },
         {
           "name": "text",

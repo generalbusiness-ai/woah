@@ -807,7 +807,18 @@ describe("local catalogs", () => {
     const lookPlan = await world.directCall("plan-look-cockatoo", first.actor, "the_chatroom", "command_plan", ["l cock"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") {
-      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_cockatoo", verb: "look", args: [] });
+      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_cockatoo"] });
+      const looked = await world.directCall("look-cockatoo-command", first.actor, String((lookPlan.result as Record<string, any>).target), String((lookPlan.result as Record<string, any>).verb), (lookPlan.result as Record<string, any>).args);
+      expect(looked.op).toBe("result");
+      if (looked.op === "result") {
+        expect(looked.observations.find((obs) => obs.type === "looked")).toMatchObject({ room: "the_chatroom", target: "the_cockatoo" });
+      }
+    }
+
+    const lookMePlan = await world.directCall("plan-look-me", first.actor, "the_chatroom", "command_plan", ["look me"]);
+    expect(lookMePlan.op).toBe("result");
+    if (lookMePlan.op === "result") {
+      expect(lookMePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: [first.actor] });
     }
 
     const prepPlan = await world.directCall("plan-long-prep", first.actor, "the_chatroom", "command_plan", ["look cock in front of me"]);
@@ -1204,7 +1215,7 @@ describe("local catalogs", () => {
     expect(migratedEnter?.source).toContain("set_presence");
     const migratedLook = world.ownVerb("$conversational", "look");
     expect(migratedLook?.kind).toBe("bytecode");
-    expect(migratedLook?.source).toContain("look_self");
+    expect(migratedLook?.source).toContain("look_at");
     expect(world.ownVerb("$task", "add_subtask")?.kind).toBe("bytecode");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-source-catalog-verbs");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-catalog-placement-metadata");

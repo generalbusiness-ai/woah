@@ -4529,21 +4529,7 @@ export class WooWorld {
       return await this.movetoChecked(ctx, ctx.thisObj, target);
     });
     this.nativeHandlers.set("thing_look", async (ctx) => {
-      const result = await this.dispatch({ ...ctx, caller: ctx.thisObj }, ctx.thisObj, "look_self", []);
-      const text = result && typeof result === "object" && !Array.isArray(result)
-        ? String((result as Record<string, WooValue>).description ?? "")
-        : "";
-      ctx.observe({
-        type: "looked",
-        source: ctx.thisObj,
-        actor: ctx.actor,
-        to: ctx.actor,
-        room: ctx.thisObj,
-        text,
-        look: result,
-        ts: Date.now()
-      });
-      return result;
+      return await this.dispatch({ ...ctx, caller: ctx.thisObj }, ctx.thisObj, "look_self", []);
     });
     this.nativeHandlers.set("add_feature", (ctx, args) => this.addFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
     this.nativeHandlers.set("remove_feature", (ctx, args) => this.removeFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
@@ -4649,7 +4635,6 @@ export class WooWorld {
   private async spaceLookSelf(ctx: CallContext): Promise<WooValue> {
     const room = ctx.thisObj;
     const look = await this.composeRoomLook(ctx, room);
-    await this.observeRoomLook(ctx, room, look);
     return look as unknown as WooValue;
   }
 
@@ -4755,37 +4740,6 @@ export class WooWorld {
       if (summary) summaries.set(id, summary);
     }));
     return { summaries, remoteCount: remoteIds.length, batchCount: remoteIds.length };
-  }
-
-  private async observeRoomLook(ctx: CallContext, room: ObjRef, look: Record<string, WooValue>): Promise<void> {
-    ctx.observe({
-      type: "looked",
-      source: room,
-      actor: ctx.actor,
-      to: ctx.actor,
-      room,
-      text: await this.roomLookText(ctx, look),
-      look,
-      ts: Date.now()
-    });
-  }
-
-  private async roomLookText(ctx: CallContext, look: Record<string, WooValue>): Promise<string> {
-    const lines = [String(look.description ?? "")];
-    const present = Array.isArray(look.present_actors) ? look.present_actors.filter((item): item is ObjRef => typeof item === "string") : [];
-    const presentNames = await Promise.all(present.map((actor) => this.objectDisplayNameAsync(ctx.progr, actor, ctx.hostMemo)));
-    lines.push(`Present: ${presentNames.join(", ") || "nobody"}.`);
-    const contents = Array.isArray(look.contents) ? look.contents : [];
-    const things = contents
-      .map((item) => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return "";
-        const record = item as Record<string, WooValue>;
-        return String(record.title ?? record.name ?? record.id ?? "");
-      })
-      .filter(Boolean);
-    if (things.length > 0) lines.push(`You see ${things.join(", ")}.`);
-    if (typeof look.mood === "string") lines.push(`Mood: ${look.mood}.`);
-    return lines.filter(Boolean).join(" ");
   }
 
   private async roomWho(ctx: CallContext): Promise<WooValue> {

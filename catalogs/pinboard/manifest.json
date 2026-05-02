@@ -59,7 +59,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let pins = this:list_notes(); let count = length(pins); let suffix = \" notes\"; if (count == 1) { suffix = \" note\"; } let summary = this.name + \" — \" + to_string(count) + suffix + \". Enter the pinboard to open it.\"; observe({ type: \"looked\", actor: actor, to: actor, room: this, text: summary, look: { id: this, title: this.name, description: this.description, notes: pins, present_actors: this.subscribers, viewport: this.viewport }, ts: now() }); return { id: this, title: this.name, description: this.description, notes: pins, present_actors: this.subscribers, viewport: this.viewport }; }"
+          "source": "verb :look_self() rxd { let pins = this:list_notes(); return { id: this, title: this.name, description: this.description, notes: pins, present_actors: this.subscribers, viewport: this.viewport }; }"
         },
         {
           "name": "enter",

@@ -373,7 +373,8 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:say(text)` | str | Emits `said`. |
 | `:emote(text)` | str | Emits `emoted`. |
 | `:tell(recipient, text)` | obj, str | Emits `told` to `recipient`. |
-| `:look()` | — | Thin chat command wrapper over `this:look_self()`. Room composition lives on `$room:look_self`, not in the chat feature. |
+| `:look()` | — | Thin chat command wrapper over `this:look_at(this)`. |
+| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
 | `:who()` | — | Returns the present-actor list. |
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
@@ -388,7 +389,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:look_self()` | — | Compose room title, description, present actors, and visible contents. Emits private `looked` to the looker. |
+| `:look_self()` | — | Compose room title, description, present actors, and visible contents. Pure view producer; the chat dispatcher emits private `looked`. |
 | `:announce(text)` | str | Tell everyone in the room except `actor`. |
 | `:announce_all(text)` | str | Tell every subscribed actor in the room. |
 | `:announce_all_but(ignore, text)` | list, str | Tell every subscribed actor except those listed. |
@@ -421,7 +422,7 @@ declare_event $conversational "emoted"  { source: obj, actor: obj, text: str };
 declare_event $conversational "told"    { source: obj, from:  obj, to:   obj, text: str };
 declare_event $conversational "entered" { source: obj, actor: obj, room: obj, origin?: obj, exit?: str, text: str };
 declare_event $conversational "left"    { source: obj, actor: obj, room: obj, destination?: obj, exit?: str, text: str };
-declare_event $conversational "looked"  { source: obj, actor: obj, to: obj, room: obj, text: str, look: map };
+declare_event $conversational "looked"  { source: obj, actor: obj, to: obj, room: obj, target?: obj, text: str, look: map };
 declare_event $conversational "who"     { source: obj, actor: obj, to: obj, room: obj, present_actors: list<obj>, text: str };
 declare_event $conversational "huh"     { source: obj, actor: obj, text: str, suggestion?: str };
 ```

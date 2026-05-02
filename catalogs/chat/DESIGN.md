@@ -57,7 +57,8 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:emote(text)` | str | Third-person action. Emits `emoted {actor, text}`. |
 | `:pose(text)` / `:quote(text)` / `:self(text)` | str | Small LambdaCore-flavored speech forms for `]`, `|`, and `<`. |
 | `:tell(recipient, text)` | obj, str | Directed message; emits `told {from: actor, to: recipient, text}` to recipient only. |
-| `:look()` rxd | — | Thin wrapper over `this:look_self()`. In chat rooms, composition comes from `$room:look_self()`: it returns `{description, present_actors, contents}`, emits a private `looked` observation to the looker, and lists contained objects as `{id, title, description}` using each item's `:title()` and actor-readable description. |
+| `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
+| `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
 | `:who()` rxd | — | Returns the present-actor list and emits a private `who` observation to the caller. |
 | `:enter(actor?)` | obj? | Adds actor (defaults `actor`) to subscribers and to its `presence_in`; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
 | `:leave(actor?)` | obj? | Removes presence and emits room-originated `left`. |
@@ -65,7 +66,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, args, cmd}`. |
 | `:command(text)` | str | Compatibility wrapper for direct plans; richer clients should call `:command_plan` and then execute the plan. |
 
-Most `$conversational` verbs remain portable source. `$match` and the command planner use trusted local native implementation hints until the DSL grows enough string/pattern primitives to express the parser cleanly as catalog code. Public tap installs ignore those hints and still compile the source fallback.
+Most `$conversational` verbs are portable source, including the command planner. `$match` still uses trusted local native implementation hints for tokenizer/object-matcher primitives. Public tap installs ignore those hints and still compile the source fallback.
 
 Room entry/exit (`:enter`, `:leave`) is source woocode on `$conversational`.
 Geographic movement belongs to `$room` and `$exit` below. The core only
