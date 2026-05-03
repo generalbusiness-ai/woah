@@ -143,6 +143,12 @@ Tools and in-world interfaces for making Woo programmable by people and agents.
 - [minimal-ide.md](spec/authoring/minimal-ide.md) — first Web IDE and authoring primitives (A1–A11)
 - [editor-rooms.md](spec/authoring/editor-rooms.md) — LambdaCore-style editor rooms for collaborative in-world authoring (E1–E8)
 
+### Catalogs
+
+Normative class designs for bundled-catalog content that ships with this repo. These are class-level specs (verb shapes, perms, observation contracts) for individual catalog classes whose design is worth pinning across catalog versions; the catalog *install* contract lives in [discovery/catalogs.md](spec/discovery/catalogs.md).
+
+- [persistent-chat.md](spec/catalogs/persistent-chat.md) — `$persistent_chatroom < $chatroom`: sequenced public-utterance verbs, replay-derived `:history()`, public-only transcripts (PC1–PC14)
+
 ### Deferred
 
 Designs intentionally deferred from v1 that reserve compatibility for later operator capabilities.
