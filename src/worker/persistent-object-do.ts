@@ -85,6 +85,15 @@ export class PersistentObjectDO {
   // hit this; a cache hit returns instantly without re-walking the object
   // graph. Cleared implicitly on DO restart (cold init wipes the Map).
   private hostStateCache = new Map<ObjRef, { version: number; payload: Record<string, unknown> }>();
+  // Cross-host property cache for stable, hot-path property reads
+  // (actor.name in a verb that runs on a different host's DO is a common
+  // case). Keyed by `${host}|${objRef}|${name}`. Only entries for
+  // CROSS_HOST_STABLE_PROPS are populated; everything else still pays the
+  // RPC. TTL-based with a hard cap to bound memory.
+  private crossHostPropCache = new Map<string, { value: unknown; expiresAt: number }>();
+  private static readonly CROSS_HOST_STABLE_PROPS = new Set(["name", "description", "aliases"]);
+  private static readonly CROSS_HOST_PROP_TTL_MS = 30_000;
+  private static readonly CROSS_HOST_PROP_CACHE_MAX = 1024;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -422,7 +431,20 @@ export class PersistentObjectDO {
         const read = async (): Promise<WooValue> => {
           const host = await hostForObject(objRef, memo);
           if (!host || host === localHost) return await world.getPropChecked(progr, objRef, name, memo);
+          const cacheable = PersistentObjectDO.CROSS_HOST_STABLE_PROPS.has(name);
+          const cacheKey = cacheable ? `${host}|${objRef}|${name}` : null;
+          if (cacheKey !== null) {
+            const cached = this.crossHostPropCache.get(cacheKey);
+            if (cached && cached.expiresAt > Date.now()) return cached.value as WooValue;
+          }
           const response = await this.forwardInternalChecked<{ value: WooValue }>(host, "/__internal/remote-get-prop", { progr, obj: objRef, name });
+          if (cacheKey !== null) {
+            if (this.crossHostPropCache.size >= PersistentObjectDO.CROSS_HOST_PROP_CACHE_MAX) {
+              const firstKey = this.crossHostPropCache.keys().next().value;
+              if (firstKey !== undefined) this.crossHostPropCache.delete(firstKey);
+            }
+            this.crossHostPropCache.set(cacheKey, { value: response.value, expiresAt: Date.now() + PersistentObjectDO.CROSS_HOST_PROP_TTL_MS });
+          }
           return response.value;
         };
         if (memo) return await memoizeHostOperation(memo.reads, `prop:${progr}:${objRef}:${name}`, read);

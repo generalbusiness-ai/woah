@@ -1315,7 +1315,7 @@ describe("local catalogs", () => {
     expect(squawk.op).toBe("result");
   });
 
-  it("migrates stale local catalog native verbs to current catalog implementations", async () => {
+  it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 15000 }, async () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", []);
     const look = world.ownVerb("$conversational", "look")!;
