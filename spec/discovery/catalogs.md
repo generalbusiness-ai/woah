@@ -327,6 +327,7 @@ Repair/update remains an explicit sequenced operation through
     {"kind": "create_instance", "class": "$loop_slot", "as": "slot_1", "anchor": "the_dubspace"},
     {"kind": "attach_feature", "consumer": "the_chatroom", "feature": "$conversational"},
     {"kind": "change_parent", "object": "$wiz", "parent": "$programmer"},
+    {"kind": "set_property", "object": "$system", "property": "help_dbs", "value": ["$help"], "mode": "append_unique"},
     ...
   ]
 }
@@ -339,10 +340,21 @@ stored form after install.
 
 Seed hooks are intentionally small. `create_instance` creates a named instance
 from a catalog or dependency class, `attach_feature` appends a feature object to
-a consumer, and `change_parent` runs the normal authored `chparent` path for an
-existing object. Catalogs use `change_parent` only for explicit opt-in surface
-changes such as making `$wiz` inherit a newly installed programmer class; it is
-not a hidden privilege grant.
+a consumer, `set_property` writes a generic registry/configuration property, and
+`change_parent` runs the normal authored `chparent` path for an existing object.
+`set_property.mode` is one of `set`, `set_if_missing`, or `append_unique`;
+`append_unique` is for registry lists such as `$system.help_dbs`, where catalogs
+must add their object without knowing what other catalogs contributed. Catalogs
+use `change_parent` only for explicit opt-in surface changes such as making
+`$wiz` inherit a newly installed programmer class; it is not a hidden privilege
+grant.
+
+`set_property` hooks run with installer authority during install and repair.
+Reviewers must treat them as wizard-authored property writes, especially when
+`mode: "set"` targets an object that may already carry operator-customized
+state. Prefer `set_if_missing` or `append_unique` for registry and extension
+points; use `set` only when replacing the current value is the catalog's explicit
+contract.
 
 Seed/repair may also derive cache-shaped properties from the manifest's own
 object data when the derivation is generic and name-free. The v1 room/exit

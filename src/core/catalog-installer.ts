@@ -68,6 +68,13 @@ type CatalogSeedHook =
       feature: string;
     }
   | {
+      kind: "set_property";
+      object: string;
+      property: string;
+      value: WooValue;
+      mode?: "set" | "set_if_missing" | "append_unique";
+    }
+  | {
       kind: "change_parent";
       object: string;
       parent: string;
@@ -333,6 +340,25 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
       }
       continue;
     }
+    if (hook.kind === "set_property") {
+      const object = resolveMaybeObjectRef(world, hook.object, localObjects, localSeeds, records);
+      if (object) {
+        const actual = world.propOrNull(object, hook.property);
+        const expected = resolveCatalogValue(world, hook.value, localObjects, localSeeds, records);
+        if (!seedPropertySatisfied(actual, expected, hook.mode ?? "set")) {
+          issues.push({
+            severity: "warning",
+            kind: "seed_property_drift",
+            object,
+            property: hook.property,
+            message: `${object}.${hook.property} differs from seed hook`,
+            expected,
+            actual
+          });
+        }
+      }
+      continue;
+    }
     const object = resolveMaybeObjectRef(world, hook.object, localObjects, localSeeds, records);
     const parent = resolveMaybeObjectRef(world, hook.parent, localObjects, localSeeds, records);
     if (object && parent && world.object(object).parent !== parent) {
@@ -414,6 +440,10 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
       world.chparentAuthoredObject(actor, object, parent);
       continue;
     }
+    if (hook.kind === "set_property") {
+      applySeedProperty(world, hook, localObjects, localSeeds, existing);
+      continue;
+    }
     const consumer = resolveObjectRef(world, hook.consumer, localObjects, localSeeds, existing);
     const feature = resolveObjectRef(world, hook.feature, localObjects, localSeeds, existing);
     attachFeature(world, consumer, feature);
@@ -485,6 +515,10 @@ export function repairCatalogManifest(world: WooWorld, manifest: CatalogManifest
       if (world.objects.has(object) && world.objects.has(parent) && world.object(object).parent !== parent && !world.isDescendantOf(parent, object)) {
         world.chparentAuthoredObject(actor, object, parent);
       }
+      continue;
+    }
+    if (hook.kind === "set_property") {
+      applySeedProperty(world, hook, localObjects, localSeeds, existing);
       continue;
     }
     if (world.objects.has(hook.consumer) && world.objects.has(hook.feature)) attachFeature(world, hook.consumer, hook.feature);
@@ -1037,6 +1071,45 @@ function attachFeature(world: WooWorld, consumer: ObjRef, feature: ObjRef): void
   world.setProp(consumer, "features", [...features, feature]);
   const current = Number(world.getProp(consumer, "features_version") ?? 0);
   world.setProp(consumer, "features_version", Number.isFinite(current) ? current + 1 : 1);
+}
+
+function applySeedProperty(
+  world: WooWorld,
+  hook: Extract<CatalogSeedHook, { kind: "set_property" }>,
+  localObjects: Map<string, ObjRef>,
+  localSeeds: Map<string, ObjRef>,
+  installed: InstalledCatalogRecord[]
+): void {
+  const object = resolveObjectRef(world, hook.object, localObjects, localSeeds, installed);
+  const value = resolveCatalogValue(world, hook.value, localObjects, localSeeds, installed);
+  const mode = hook.mode ?? "set";
+  if (mode === "set_if_missing") {
+    if (world.object(object).properties.has(hook.property)) return;
+    world.setProp(object, hook.property, value);
+    return;
+  }
+  if (mode === "append_unique") {
+    const existing = world.propOrNull(object, hook.property);
+    const current = Array.isArray(existing) ? existing : [];
+    const values = Array.isArray(value) ? value : [value];
+    const next = [...current];
+    for (const item of values) {
+      if (!next.some((existingItem) => stableStringify(existingItem) === stableStringify(item))) next.push(item);
+    }
+    if (stableStringify(next) !== stableStringify(current)) world.setProp(object, hook.property, next);
+    return;
+  }
+  world.setProp(object, hook.property, value);
+}
+
+function seedPropertySatisfied(actual: WooValue, expected: WooValue, mode: "set" | "set_if_missing" | "append_unique"): boolean {
+  if (mode === "append_unique") {
+    if (!Array.isArray(actual)) return false;
+    const expectedItems = Array.isArray(expected) ? expected : [expected];
+    return expectedItems.every((item) => actual.some((actualItem) => stableStringify(actualItem) === stableStringify(item)));
+  }
+  if (mode === "set_if_missing" && actual !== null) return true;
+  return stableStringify(actual) === stableStringify(expected);
 }
 
 function setDescriptionIfEmpty(world: WooWorld, obj: ObjRef, description: string): void {

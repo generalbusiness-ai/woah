@@ -5,7 +5,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized, nonEmptyHostScopedWorld } from "../src/core/bootstrap";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
 import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations, runHostScopedLocalCatalogLifecycle } from "../src/core/local-catalogs";
-import type { VerbDef } from "../src/core/types";
+import type { VerbDef, WooValue } from "../src/core/types";
 
 type CatalogManifest = {
   name: string;
@@ -86,6 +86,54 @@ describe("local catalogs", () => {
     expect(world.ownVerb("$dubspace", "leave")?.kind).toBe("bytecode");
     expect(world.ownVerb("$pinboard", "enter")?.kind).toBe("bytecode");
     expect(world.ownVerb("$pinboard", "leave")?.kind).toBe("bytecode");
+  });
+
+  it("installs the help database and routes player help through it", async () => {
+    const world = createWorld();
+
+    expect(world.object("$generic_help_db").parent).toBe("$thing");
+    expect(world.object("$help").parent).toBe("$generic_help_db");
+    expect(world.getProp("$system", "help_dbs")).toContain("$help");
+
+    const help = await world.directCall("help-commands", "$wiz", "$wiz", "help", ["commands"]);
+    expect(help.op).toBe("result");
+    if (help.op === "result") {
+      expect(help.result).toMatchObject({ ok: true, topic: "commands", db: "$help" });
+      expect(help.observations).toContainEqual(expect.objectContaining({ type: "text", target: "$wiz", text: expect.stringContaining("Common commands") }));
+    }
+
+    const index = await world.directCall("help-index", "$wiz", "$wiz", "help", []);
+    expect(index.op).toBe("result");
+    if (index.op === "result") expect(index.result).toMatchObject({ ok: true, topic: "index", title: "Woo Help" });
+
+    const plan = await world.directCall("help-plan", "$wiz", "the_chatroom", "command_plan", ["help movement"], { forceDirect: true });
+    expect(plan.op).toBe("result");
+    if (plan.op === "result") {
+      expect(plan.result).toMatchObject({ route: "direct", target: "$wiz", verb: "help", args: ["movement"] });
+    }
+
+    const miss = await world.directCall("help-miss", "$wiz", "$wiz", "help", ["definitely-missing"]);
+    expect(miss.op).toBe("result");
+    expect(world.getProp("$help", "missed_topics")).toContainEqual(expect.objectContaining({ topic: "definitely-missing", actor: "$wiz" }));
+  });
+
+  it("does not leak unreadable verb source through verbdoc help topics", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:help-reader");
+    const actor = session.actor;
+    const secretSource = "verb :sealed() x {\n  return \"SECRET HELP SOURCE\";\n}";
+
+    world.createObject({ id: "secret_help_object", name: "Secret Help Object", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(world, "secret_help_object", "sealed", secretSource, null).ok).toBe(true);
+    const topics = world.getProp("$help", "topics") as Record<string, WooValue>;
+    world.setProp("$help", "topics", { ...topics, "sealed-topic": ["*verbdoc*", "secret_help_object", "sealed"] });
+
+    const guestHelp = await world.directCall("help-verbdoc-guest", actor, actor, "help", ["sealed-topic"]);
+    expect(JSON.stringify(guestHelp)).not.toContain("SECRET HELP SOURCE");
+    expect(JSON.stringify(guestHelp)).toContain("Verb source is not readable");
+
+    const wizardHelp = await world.directCall("help-verbdoc-wiz", "$wiz", "$wiz", "help", ["sealed-topic"]);
+    expect(JSON.stringify(wizardHelp)).toContain("SECRET HELP SOURCE");
   });
 
   it("rejects missing catalog dependencies with the installed set in the error", async () => {

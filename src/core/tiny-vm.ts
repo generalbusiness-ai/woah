@@ -114,7 +114,7 @@ const BUILTIN_NAMES = [
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
-  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch"
+  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "str_join", "collect_prop"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -801,6 +801,12 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (!Number.isInteger(code) || code < 0 || code > 0x10FFFF) throw wooError("E_RANGE", "invalid code point", code);
         return String.fromCodePoint(code);
       }
+      case "str_join": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "str_join expects list and separator");
+        const list = assertList(builtinArgs[0]);
+        const separator = assertString(builtinArgs[1] ?? "");
+        return list.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(separator);
+      }
       case "min":
         return Math.min(...builtinArgs.map((value) => numeric(value, "min argument")));
       case "max":
@@ -816,8 +822,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "now":
         return Date.now();
       case "create": {
-        frame.ticksRemaining -= 45;
-        if (frame.ticksRemaining < 0) throw wooError("E_TICKS", "task exceeded tick budget");
+        chargeTicks(frame, 45);
         const parent = assertObj(builtinArgs[0]);
         let owner = frame.ctx.actor;
         let options: {
@@ -928,6 +933,19 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           callArgs,
           startAt
         );
+      }
+      case "collect_prop": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "collect_prop expects list and property name");
+        const refs = assertList(builtinArgs[0]).map((item, index) => {
+          try {
+            return assertObj(item);
+          } catch {
+            throw wooError("E_TYPE", `collect_prop item ${index + 1} must be an object reference`, { index: index + 1, value: item });
+          }
+        });
+        chargeTicks(frame, refs.length);
+        const prop = assertString(builtinArgs[1]);
+        return await frame.ctx.world.collectPropChecked(frame.ctx.progr, refs, prop, frame.ctx.hostMemo, { parallel: frame.ctx.seq < 0 });
       }
       case "builder_create_object":
         if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_create_object expects parent and optional opts");
@@ -1111,6 +1129,11 @@ function tickWeight(op: string): number {
   if (op === "CALL_VERB" || op === "PASS" || op === "EMIT") return 10;
   if (op === "MAKE_LIST" || op === "MAKE_MAP" || op === "LIST_APPEND" || op === "MAP_SET" || op === "INDEX_SET" || op === "STR_CONCAT" || op === "STR_INTERP") return 5;
   return 1;
+}
+
+function chargeTicks(frame: VmFrame, ticks: number): void {
+  frame.ticksRemaining -= ticks;
+  if (frame.ticksRemaining < 0) throw wooError("E_TICKS", "task exceeded tick budget");
 }
 
 function literal(bytecode: TinyBytecode, operand: WooValue | undefined): WooValue {

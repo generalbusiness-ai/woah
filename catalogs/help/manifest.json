@@ -1,0 +1,98 @@
+{
+  "name": "help",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "LambdaMOO-shaped in-world help database classes and a seeded global help database.",
+  "license": "MIT",
+  "depends": [],
+  "classes": [
+    {
+      "local_name": "$generic_help_db",
+      "parent": "$thing",
+      "description": "Generic help database. It stores static topic values in a topics map, resolves exact and abbreviated topic names, renders compact topic output, and records missed lookups for later documentation work.",
+      "properties": [
+        { "name": "topics", "type": "map<str,any>", "default": {}, "perms": "r" },
+        { "name": "missed_topics", "type": "list<map>", "default": [], "perms": "r" }
+      ],
+      "verbs": [
+        {
+          "name": "find_topics",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": { "args": ["topic?"] },
+          "source": "verb :find_topics(topic) rxd { return null; /* native: see help_db_find_topics */ }",
+          "implementation": { "kind": "native", "handler": "help_db_find_topics" }
+        },
+        {
+          "name": "get_topic",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": { "args": ["topic?", "remaining_dbs?"] },
+          "source": "verb :get_topic(topic, remaining_dbs) rxd { return null; /* native: see help_db_get_topic */ }",
+          "implementation": { "kind": "native", "handler": "help_db_get_topic" }
+        },
+        {
+          "name": "dump_topic",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": { "args": ["topic"] },
+          "source": "verb :dump_topic(topic) rxd { return null; /* native: see help_db_dump_topic */ }",
+          "implementation": { "kind": "native", "handler": "help_db_dump_topic" }
+        },
+        {
+          "name": "record_miss",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": { "args": ["topic"] },
+          "source": "verb :record_miss(topic) rxd { return null; /* native: see help_db_record_miss */ }",
+          "implementation": { "kind": "native", "handler": "help_db_record_miss" }
+        },
+        {
+          "name": "look_self",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :look_self() rxd { return { title: this.name, description: this.description, topics: this:find_topics(\"\") }; }"
+        }
+      ]
+    }
+  ],
+  "schemas": [
+    { "on": "$generic_help_db", "type": "help", "shape": { "source": "obj", "actor": "obj", "topic": "str", "lines": "list<str>" } }
+  ],
+  "seed_hooks": [
+    {
+      "kind": "create_instance",
+      "class": "$generic_help_db",
+      "as": "$help",
+      "name": "Help",
+      "description": "Global help database for first-light worlds. Catalogs and classes can add their own help databases later; this one supplies the baseline commands and conventions.",
+      "properties": {
+        "topics": {
+          "index": ["*index*", "Woo Help"],
+          "help": [
+            "Type help <topic> for a topic, or help index for the topic list.",
+            "Topic names accept abbreviations when they are unambiguous. Leading @ is ignored, so help @help and help help resolve the same way."
+          ],
+          "commands": [
+            "Common commands include look, look <thing>, say <text>, emote <text>, tell <person> <text>, go <exit>, take <thing>, and drop <thing>.",
+            "The exact verbs available come from the object you are in, the objects near you, and your player class."
+          ],
+          "movement": [
+            "Rooms expose exits as verbs such as north, west, southeast, out, or go <exit>.",
+            "Moving through an exit calls the exit object, which moves you and announces the departure and arrival through the source and destination rooms."
+          ],
+          "chat": [
+            "Speech is live and direct. say sends text to the current room; emote, pose, quote, and tell are conversational variants.",
+            "look asks the target to describe itself with look_self; room output is composed by the room."
+          ],
+          "building": [
+            "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",
+            "Use the programmer MCP tools or enter the verb editor when you have the appropriate class and progbit."
+          ]
+        }
+      }
+    },
+    { "kind": "set_property", "object": "$system", "property": "help_dbs", "value": ["$help"], "mode": "append_unique" }
+  ]
+}

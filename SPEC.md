@@ -128,4 +128,4 @@ For what is *currently built* (as opposed to what the spec is building toward), 
 
 Loose docs alongside the spec layers and bundled catalogs:
 - [spec/vision.md](spec/vision.md), [spec/README.md](spec/README.md) — author's working docs.
-- [catalogs/chat/DESIGN.md](catalogs/chat/DESIGN.md), [catalogs/dubspace/DESIGN.md](catalogs/dubspace/DESIGN.md), [catalogs/pinboard/DESIGN.md](catalogs/pinboard/DESIGN.md), [catalogs/taskspace/DESIGN.md](catalogs/taskspace/DESIGN.md) — catalog-owned demo design docs (what each bundled app provides; first-light profile).
+- [catalogs/chat/DESIGN.md](catalogs/chat/DESIGN.md), [catalogs/dubspace/DESIGN.md](catalogs/dubspace/DESIGN.md), [catalogs/help/DESIGN.md](catalogs/help/DESIGN.md), [catalogs/pinboard/DESIGN.md](catalogs/pinboard/DESIGN.md), [catalogs/taskspace/DESIGN.md](catalogs/taskspace/DESIGN.md) — catalog-owned design docs (what each bundled catalog provides; first-light profile).

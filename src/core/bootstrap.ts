@@ -215,6 +215,8 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "wizard_actions", []);
   seedProp(world, "$system", "bootstrap_token_used", false);
   seedProp(world, "$system", "applied_migrations", []);
+  define(world, "$system", "help_dbs", [], "list<obj>", "r");
+  define(world, "$root", "help", null, "obj|list<obj>|null", "r");
   define(world, "$actor", "presence_in", [], "list<obj>", "r");
   define(world, "$actor", "features", [], "list<obj>", "r");
   define(world, "$actor", "features_version", 0, "int", "r");
@@ -251,6 +253,7 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });
   native(world, "$player", "tell", "player_tell", "verb :tell(text) rxd { ... }", { directCallable: true });
   native(world, "$player", "tell_lines", "player_tell_lines", "verb :tell_lines(lines) rxd { ... }", { directCallable: true });
+  native(world, "$player", "help", "player_help", "verb :help(topic?) rxd { return null; /* native: see player_help */ }", { directCallable: true, skipPresenceCheck: true, toolExposed: true, aliases: ["?", "info", "information", "@help"], argSpec: { args: ["topic?"] } });
   native(world, "$guest", "on_disfunc", "guest_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$system", "return_guest", "return_guest", "verb :return_guest(guest) r { ... }", { perms: "r" });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });

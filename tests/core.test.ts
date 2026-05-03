@@ -444,6 +444,48 @@ describe("woo core", () => {
     expect(bridge.getPropCalls.get(`prop:${actor}:remote_box:value`)).toBe(1);
   });
 
+  it("lets woocode collect readable properties across local and remote objects", async () => {
+    const { world: home, actor } = authedWorld();
+    const remote = createWorld({ catalogs: false });
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["remote", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      ["remote_guest", "remote"]
+    ]);
+    const bridge = new LocalHostBridge("home", worlds, routes);
+    home.setHostBridge(bridge);
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+
+    remote.createObject({ id: "remote_guest", name: "Remote Guest", parent: "$player", owner: "$wiz" });
+    remote.setProp("remote_guest", "name", "Remote Guest");
+    home.createObject({ id: "collector", name: "Collector", parent: "$thing", owner: "$wiz" });
+    installVerb(home, "collector", "names", "verb :names(actors) rxd {\n  return str_join(collect_prop(actors, \"name\"), \", \");\n}", null);
+
+    const result = await home.directCall(undefined, actor, "collector", "names", [[actor, "remote_guest"]]);
+    expect(result.op).toBe("result");
+    if (result.op === "result") expect(result.result).toBe(`${home.getProp(actor, "name")}, Remote Guest`);
+    expect(bridge.getPropCalls.get(`prop:$wiz:remote_guest:name`)).toBe(1);
+  });
+
+  it("charges collect_prop ticks per input object", async () => {
+    const { world, actor } = authedWorld();
+    for (const id of ["tick_actor_1", "tick_actor_2", "tick_actor_3"]) {
+      world.createObject({ id, name: id, parent: "$player", owner: "$wiz" });
+      world.setProp(id, "name", id);
+    }
+    world.createObject({ id: "tick_collector", name: "Tick Collector", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(world, "tick_collector", "names", "verb :names(actors) rxd {\n  return collect_prop(actors, \"name\");\n}", null).ok).toBe(true);
+    const verb = world.ownVerbExact("tick_collector", "names");
+    if (!verb || verb.kind !== "bytecode") throw new Error("expected bytecode verb");
+    verb.bytecode.max_ticks = 8;
+
+    const result = await world.directCall("collect-prop-ticks", actor, "tick_collector", "names", [["tick_actor_1", "tick_actor_2", "tick_actor_3"]]);
+    expect(result.op).toBe("error");
+    if (result.op === "error") expect(result.error.code).toBe("E_TICKS");
+  });
+
   it("batches remote look descriptions into one host read per host", async () => {
     const { world: home, actor } = authedWorld();
     const remote = createWorld({ catalogs: false });

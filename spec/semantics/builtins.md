@@ -20,8 +20,13 @@ Builtins are functions, not verbs. They are registered with stable indices for t
 ### 19.2 String
 
 `str_slice(s, from, to?)` / `strsub(s, from, to)`, `str_index(s, sub)` / `index(s, sub)`, `rindex`, `match(s, pattern)`, `pcre`,  
-`str_lower(s)` / `tolower`, `toupper`, `str_trim(s)` / `trim`, `str_starts(s, prefix)`, `str_char(codepoint)`, `split(s, sep)`, `join(list, sep)`,  
+`str_lower(s)` / `tolower`, `toupper`, `str_trim(s)` / `trim`, `str_starts(s, prefix)`, `str_char(codepoint)`, `split(s, sep)`, `str_join(list, sep)` / `join(list, sep)`,
 `encode_json(v)`, `decode_json(s)`.
+
+`str_join(list, sep)` joins the list with a string separator. String elements
+are used directly; non-string elements are converted with the runtime's ordinary
+JSON-style value rendering. Callers that need a particular presentation should
+convert values explicitly before joining.
 
 ### 19.3 List / map
 
@@ -39,6 +44,17 @@ Builtins are functions, not verbs. They are registered with stable indices for t
 `set_property_info(obj, name, expected_version, info)`,  
 `delete_property(obj, name, expected_version)`, `property_info`, `properties(obj)`, `verbs(obj)`,  
 `move(obj, new_location)`.
+
+`collect_prop(list<obj>, name)` performs an order-preserving batch of readable
+property lookups and returns the resulting list of property values in input
+order. It costs `5 + length(list)` ticks: the ordinary `BUILTIN` dispatch cost
+plus one additional tick per input object. It is the safe parallel-read primitive
+for common presentation code such as `str_join(collect_prop(players, "name"),
+", ")`: reads may run concurrently across hosts in direct calls, but the builtin
+cannot mutate state, dispatch arbitrary verbs, or emit observations. Inside a
+sequenced VM frame, implementations must avoid parallel cross-host fanout
+because the sequencer already holds a queue slot; the reference implementation
+falls back to serial reads. If any read fails, the builtin raises that error.
 
 The authoring-facing contract for compile/install, expected-version conflicts,
 and diagnostics is in [../authoring/minimal-ide.md](../authoring/minimal-ide.md).

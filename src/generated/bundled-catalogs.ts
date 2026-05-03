@@ -4,10 +4,11 @@
 import type { CatalogManifest } from "../core/catalog-installer";
 import manifest0 from "../../catalogs/chat/manifest.json";
 import manifest1 from "../../catalogs/dubspace/manifest.json";
-import manifest2 from "../../catalogs/note/manifest.json";
-import manifest3 from "../../catalogs/pinboard/manifest.json";
-import manifest4 from "../../catalogs/prog/manifest.json";
-import manifest5 from "../../catalogs/taskspace/manifest.json";
+import manifest2 from "../../catalogs/help/manifest.json";
+import manifest3 from "../../catalogs/note/manifest.json";
+import manifest4 from "../../catalogs/pinboard/manifest.json";
+import manifest5 from "../../catalogs/prog/manifest.json";
+import manifest6 from "../../catalogs/taskspace/manifest.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -17,8 +18,9 @@ export type BundledCatalogEntry = {
 export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
   { path: "catalogs/chat/manifest.json", manifest: manifest0 as unknown as CatalogManifest },
   { path: "catalogs/dubspace/manifest.json", manifest: manifest1 as unknown as CatalogManifest },
-  { path: "catalogs/note/manifest.json", manifest: manifest2 as unknown as CatalogManifest },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest3 as unknown as CatalogManifest },
-  { path: "catalogs/prog/manifest.json", manifest: manifest4 as unknown as CatalogManifest },
-  { path: "catalogs/taskspace/manifest.json", manifest: manifest5 as unknown as CatalogManifest }
+  { path: "catalogs/help/manifest.json", manifest: manifest2 as unknown as CatalogManifest },
+  { path: "catalogs/note/manifest.json", manifest: manifest3 as unknown as CatalogManifest },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest4 as unknown as CatalogManifest },
+  { path: "catalogs/prog/manifest.json", manifest: manifest5 as unknown as CatalogManifest },
+  { path: "catalogs/taskspace/manifest.json", manifest: manifest6 as unknown as CatalogManifest }
 ];

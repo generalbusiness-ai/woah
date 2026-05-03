@@ -598,6 +598,15 @@ export class WooWorld {
     return this.getProp(objRef, name);
   }
 
+  async collectPropChecked(progr: ObjRef, objRefs: ObjRef[], name: string, memo?: HostOperationMemo, options: { parallel?: boolean } = {}): Promise<WooValue[]> {
+    if (options.parallel === false) {
+      const values: WooValue[] = [];
+      for (const objRef of objRefs) values.push(await this.getPropChecked(progr, objRef, name, memo));
+      return values;
+    }
+    return await Promise.all(objRefs.map((objRef) => this.getPropChecked(progr, objRef, name, memo)));
+  }
+
   async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue): Promise<void> {
     if (await this.remoteHostForObject(objRef)) {
       throw wooError("E_CROSS_HOST_WRITE", `cross-host writes are not atomic: ${objRef}.${name}`, { progr, obj: objRef, property: name, value });
@@ -2565,6 +2574,177 @@ export class WooWorld {
     });
   }
 
+  private async playerHelp(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
+    const topic = helpTopic(args[0]) || "index";
+    const dbs = await this.helpSearchPath(ctx);
+    const result = await this.resolveHelpTopic(ctx, topic, dbs);
+    const lines = result && typeof result === "object" && !Array.isArray(result) && Array.isArray(result.lines)
+      ? result.lines.map((line) => valueToText(line))
+      : [valueToText(result)];
+    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
+    return result;
+  }
+
+  private async helpSearchPath(ctx: CallContext): Promise<ObjRef[]> {
+    const dbs: ObjRef[] = [];
+    const pushHelpValue = (value: WooValue): void => this.appendHelpDbs(dbs, value);
+
+    for (const id of this.localAncestry(ctx.actor)) pushHelpValue(this.propOrNullForActor(ctx.actor, id, "help"));
+
+    const location = await this.objectLocationChecked(ctx.actor, ctx.hostMemo).catch(() => null);
+    if (typeof location === "string") {
+      if (this.objects.has(location)) {
+        for (const id of this.localAncestry(location)) pushHelpValue(this.propOrNullForActor(ctx.actor, id, "help"));
+      } else {
+        pushHelpValue(await this.propOrNullForActorAsync(ctx.actor, location, "help", ctx.hostMemo).catch(() => null));
+      }
+    }
+
+    pushHelpValue(this.propOrNullForActor(ctx.actor, "$system", "help_dbs"));
+    return dbs;
+  }
+
+  private localAncestry(objRef: ObjRef): ObjRef[] {
+    const ids: ObjRef[] = [];
+    let current: ObjRef | null = objRef;
+    while (current && this.objects.has(current)) {
+      ids.push(current);
+      current = this.object(current).parent;
+    }
+    return ids;
+  }
+
+  private appendHelpDbs(dbs: ObjRef[], value: WooValue): void {
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (typeof item === "string" && item.length > 0 && !dbs.includes(item)) dbs.push(item);
+    }
+  }
+
+  private async resolveHelpTopic(ctx: CallContext, topic: string, dbs: ObjRef[]): Promise<WooValue> {
+    for (let i = 0; i < dbs.length; i += 1) {
+      const db = dbs[i];
+      try {
+        const result = await this.dispatch({ ...ctx, caller: ctx.thisObj }, db, "get_topic", [topic, dbs.slice(i + 1)]);
+        if (result && typeof result === "object" && !Array.isArray(result)) return result;
+      } catch (err) {
+        const error = normalizeError(err);
+        if (error.code !== "E_HELPNF") throw err;
+      }
+    }
+    if (dbs.length > 0) {
+      await this.dispatch({ ...ctx, caller: ctx.thisObj }, dbs[0], "record_miss", [topic]).catch(() => null);
+    }
+    return {
+      ok: false,
+      status: "not_found",
+      topic,
+      lines: [`No help available for "${topic || "index"}".`]
+    };
+  }
+
+  private helpDbTopics(ctx: CallContext): Record<string, WooValue> {
+    const topics = this.propOrNullForActor(ctx.actor, ctx.thisObj, "topics");
+    return topics && typeof topics === "object" && !Array.isArray(topics) ? topics as Record<string, WooValue> : {};
+  }
+
+  private helpDbFindTopics(ctx: CallContext, args: WooValue[]): WooValue[] {
+    const topics = this.helpDbTopics(ctx);
+    const names = Object.keys(topics);
+    const query = normalizeHelpTopic(helpTopic(args[0]));
+    if (!query) return names;
+    const exact = names.filter((name) => normalizeHelpTopic(name) === query);
+    if (exact.length > 0) return exact;
+    return names.filter((name) => normalizeHelpTopic(name).startsWith(query));
+  }
+
+  private helpDbDumpTopic(ctx: CallContext, args: WooValue[]): WooValue {
+    const topics = this.helpDbTopics(ctx);
+    const matches = this.helpDbFindTopics(ctx, args).filter((item): item is string => typeof item === "string");
+    if (matches.length === 0) throw wooError("E_HELPNF", `help topic not found: ${helpTopic(args[0])}`, helpTopic(args[0]));
+    if (matches.length > 1) throw wooError("E_AMBIGUOUS", `ambiguous help topic: ${helpTopic(args[0])}`, matches);
+    return cloneValue(topics[matches[0]]);
+  }
+
+  private async helpDbGetTopic(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
+    const topic = helpTopic(args[0]) || "index";
+    const remaining = Array.isArray(args[1]) ? args[1].filter((item): item is ObjRef => typeof item === "string") : [];
+    const topics = this.helpDbTopics(ctx);
+    const matches = this.helpDbFindTopics(ctx, [topic]).filter((item): item is string => typeof item === "string");
+    if (matches.length === 0) throw wooError("E_HELPNF", `help topic not found: ${topic}`, topic);
+    if (matches.length > 1) {
+      return {
+        ok: false,
+        status: "ambiguous",
+        topic,
+        db: ctx.thisObj,
+        matches,
+        lines: [`Ambiguous help topic "${topic}": ${matches.join(", ")}`]
+      };
+    }
+    const matched = matches[0];
+    return await this.renderHelpTopic(ctx, ctx.thisObj, matched, topics[matched], remaining);
+  }
+
+  private async renderHelpTopic(ctx: CallContext, db: ObjRef, topic: string, raw: WooValue, remaining: ObjRef[]): Promise<WooValue> {
+    if (Array.isArray(raw) && typeof raw[0] === "string" && raw[0].startsWith("*")) {
+      const directive = raw[0];
+      if (directive === "*index*") {
+        const title = typeof raw[1] === "string" && raw[1] ? raw[1] : "Help";
+        const topics = Object.keys(this.helpDbTopics({ ...ctx, thisObj: db }));
+        return { ok: true, status: "found", topic, db, title, lines: [title, "", `Topics: ${topics.join(", ")}`] };
+      }
+      if (directive === "*pass*") {
+        const nextTopic = typeof raw[1] === "string" && raw[1] ? raw[1] : topic;
+        return await this.resolveHelpTopic(ctx, nextTopic, remaining);
+      }
+      if (directive === "*forward*") {
+        const nextTopic = typeof raw[1] === "string" && raw[1] ? raw[1] : topic;
+        return await this.helpDbGetTopic({ ...ctx, thisObj: db }, [nextTopic, remaining]);
+      }
+      if (directive === "*objectdoc*") {
+        const obj = assertObj(raw[1]);
+        const view = await this.dispatch({ ...ctx, caller: db }, obj, "look_self", []);
+        const title = view && typeof view === "object" && !Array.isArray(view) && typeof view.title === "string" ? view.title : await this.objectDisplayNameAsync(ctx.progr, obj, ctx.hostMemo);
+        const description = view && typeof view === "object" && !Array.isArray(view) && typeof view.description === "string" ? view.description : "";
+        return { ok: true, status: "found", topic, db, title, lines: [title, description].filter((line) => line.length > 0), object: obj, look: view as WooValue };
+      }
+      if (directive === "*verbdoc*") {
+        const obj = assertObj(raw[1]);
+        const name = assertString(raw[2] ?? "");
+        const { definer, verb } = this.resolveVerb(obj, name);
+        const readable = this.canReadVerb(ctx.actor, verb);
+        const source = readable ? verb.source || "No source available." : "Verb source is not readable.";
+        const lines = [`${obj}:${verb.name} (${verb.perms})`, source];
+        return {
+          ok: true,
+          status: "found",
+          topic,
+          db,
+          title: `${obj}:${verb.name}`,
+          lines,
+          object: obj,
+          verb: verb.name,
+          definer,
+          version: verb.version,
+          readable
+        };
+      }
+    }
+    const lines = Array.isArray(raw) ? raw.map((line) => valueToText(line)) : [valueToText(raw)];
+    return { ok: true, status: "found", topic, db, title: topic, lines };
+  }
+
+  private helpDbRecordMiss(ctx: CallContext, args: WooValue[]): WooValue {
+    const topic = helpTopic(args[0]);
+    if (!topic) return false;
+    const existing = this.propOrNull(ctx.thisObj, "missed_topics");
+    const misses = Array.isArray(existing) ? existing : [];
+    const entry: WooValue = { topic, actor: ctx.actor, ts: Date.now() };
+    this.setProp(ctx.thisObj, "missed_topics", [...misses.slice(-99), entry]);
+    return true;
+  }
+
   chparentAuthoredObject(actor: ObjRef, objRef: ObjRef, parentRef: ObjRef): void {
     this.assertCanAuthorObject(actor, objRef);
     this.assertCanCreateObject(actor, parentRef, actor);
@@ -4501,6 +4681,7 @@ export class WooWorld {
       for (const line of lines) this.tellPlayer(ctx, ctx.thisObj, [line]);
       return true;
     });
+    this.nativeHandlers.set("player_help", (ctx, args) => this.playerHelp(ctx, args));
     this.nativeHandlers.set("guest_on_disfunc", async (ctx) => {
       const homeValue = this.propOrNull(ctx.thisObj, "home");
       const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
@@ -4612,6 +4793,10 @@ export class WooWorld {
     this.nativeHandlers.set("room_who", (ctx) => this.roomWho(ctx));
     this.nativeHandlers.set("room_take", (ctx, args) => this.roomTake(ctx, assertString(args[0] ?? "")));
     this.nativeHandlers.set("room_drop", (ctx, args) => this.roomDrop(ctx, assertString(args[0] ?? "")));
+    this.nativeHandlers.set("help_db_find_topics", (ctx, args) => this.helpDbFindTopics(ctx, args));
+    this.nativeHandlers.set("help_db_get_topic", (ctx, args) => this.helpDbGetTopic(ctx, args));
+    this.nativeHandlers.set("help_db_dump_topic", (ctx, args) => this.helpDbDumpTopic(ctx, args));
+    this.nativeHandlers.set("help_db_record_miss", (ctx, args) => this.helpDbRecordMiss(ctx, args));
   }
 
   private chatPresent(room: ObjRef): ObjRef[] {
@@ -4744,7 +4929,7 @@ export class WooWorld {
 
   private async roomWho(ctx: CallContext): Promise<WooValue> {
     const present = this.chatPresent(ctx.thisObj);
-    const presentNames = await Promise.all(present.map((actor) => this.objectDisplayNameAsync(ctx.progr, actor, ctx.hostMemo)));
+    const presentNames = (await this.collectPropChecked(ctx.progr, present, "name", ctx.hostMemo)).map((name) => valueToText(name));
     ctx.observe({
       type: "who",
       source: ctx.thisObj,
@@ -5313,6 +5498,16 @@ function valueToText(value: WooValue): string {
   if (value === null) return "";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
   return JSON.stringify(value);
+}
+
+function helpTopic(value: WooValue | undefined): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeHelpTopic(value: string): string {
+  let topic = value.trim().toLowerCase();
+  if (topic.startsWith("@")) topic = topic.slice(1);
+  return topic.replace(/[-_]+/g, "-");
 }
 
 function runtimeObjectScope(value: ObjRef): string {

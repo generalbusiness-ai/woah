@@ -11,7 +11,7 @@ The sections below distinguish three flavors of pending item:
 ## random stuff to do
 
 - subscriptions (to anything) (grouped??)
-- help, equivalent to the MOO help-system (lots of pages, and "editor"... how?)
+- help policy in DSL — first-light help is native-backed with explicit source stubs. Move `$player:help`, help search-path policy, directive rendering, and miss recording into woocode once the DSL has actor-ancestry and actor-aware verb-source primitives; then drop the native help handlers.
 - ~~multiple rooms, and furniture and exits~~ — first chat slice landed with Living Room, Deck, Hot Tub, exits, fixed furniture, and portables.
 - migrate `the_dubspace`, `the_taskspace`, and `the_chatroom` manifests to declare `instances_self_host: true` on `$dubspace` / `$taskspace` / `$chatroom` (or `$room`) at the class, instead of stamping `host_placement: "self"` on each instance. Wire `create()` to compute `host_placement` from the parent chain. Keep `host_placement` as the runtime projection. Manifest-migration story per `spec/semantics/objects.md §4.2`.
 - mid-RPC origin-host crash drops the awaiting task: the v1 `awaiting_call` removal trades a real durability story for simplicity (`spec/semantics/tasks.md §16.3`). If a verb does many cross-host RPCs and the origin host evicts mid-flight, the in-memory task is lost. Revisit if the workload makes this hurt.
@@ -26,6 +26,7 @@ The sections below distinguish three flavors of pending item:
 - internal-auth replay cache — HMAC-signed Worker/Directory/cluster requests currently have timestamp freshness only. A captured signed internal request can replay inside the 5-minute skew window if internal traffic or logs leak. v1's same-deployment trust assumes attackers cannot observe internal traffic; if that assumption weakens, reuse the host-RPC `correlation_id`/recent-replies cache pattern for nonce replay protection.
 - verb alias wildcard lint/deprecation — `literal*` is currently a broad wildcard while `literal@` is LambdaCore-style abbreviation. First-party catalogs now use `@`, but the engine still accepts trailing `*` for compatibility. Add catalog/install warnings for aliases with a single trailing `*` and no `@`; later decide whether to reserve `*` or keep it as explicit glob syntax.
 - host-scoped local catalog repair retry state — host repair currently logs and defers when a partial slice cannot resolve a manifest reference. That is correct for transient stale seeds, but a permanently broken manifest can warn on every cold init. Add per-host backoff or "skip until manifest version changes" state if this gets noisy.
+- `collect_prop` host-grouped batching — the builtin currently shares the frame memo and can run direct-call reads in parallel, but it still issues one RPC per remote object. Group by resolved host and add a bulk property-read host RPC if profiling shows large remote lists (task summaries, room rosters) getting hot.
 
 ## structure
 

@@ -37,9 +37,9 @@ the target for runtime-created objects, but it is not active in v1.
 | Corename | Kind | Parent | Owner | Flags | Own state / definitions | Own verbs | Purpose |
 |---|---|---|---|---|---|---|---|
 | `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]` | `:return_guest(guest)` | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
-| `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
+| `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement`, `help` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
 | `$actor` | class | `$root` | `$wiz` | — | Defines `presence_in`, `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
-| `$player` | class | `$actor` | `$wiz` | — | Defines `session_id`, `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
+| `$player` | class | `$actor` | `$wiz` | — | Defines `session_id`, `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
 | `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc()` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
 | `$sequenced_log` | class | `$root` | `$wiz` | — | Inherits descriptive slots | Host operations `append(message)`, `read(from,limit)` | Append-only sequenced log base class. `$space` and registry-like coordination objects inherit its sequence/replay shape. |
@@ -65,6 +65,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `description` | str | `""` | Long-form description. Surfaced by `:look`-like verbs. |
 | `aliases` | list<str> | `[]` | Alternate names for command/match. |
 | `host_placement` | str \| null | null | Defined on `$root`. Optional host-placement hint. `self` means this object owns its own host; anchored objects route to their anchor's host. Runtime semantics do not depend on this hint in single-host deployments. |
+| `help` | obj \| list<obj> \| null | null | Defined on `$root`. Optional contextual help database or databases. `$player:help` includes this value from the actor and current-space ancestry when building its search path. |
 
 ### B2.2 `$system` own properties
 
@@ -74,6 +75,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `wizard_actions` | list<map> | `[]` | Audit trail for privileged bootstrap and operational actions. |
 | `bootstrap_token_used` | bool | false | Records consumption of the initial wizard bootstrap token. |
 | `applied_migrations` | list<str> | `[]` | Idempotency ledger for deployment-local boot migrations, including local catalog repair migrations. See [catalogs.md §CT5.4.1](../discovery/catalogs.md#ct541-local-boot-migrations). |
+| `help_dbs` | list<obj> | `[]` | Global in-world help database list. The bundled help catalog appends `$help` here with a generic `set_property` catalog hook; future catalogs can append additional DBs without runtime object-name knowledge. |
 
 ### B2.3 `$root` verbs
 
@@ -123,6 +125,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `:moveto(target)` | obj | Move this player to `target.contents`. Used by disfunc bodies. |
 | `:tell(text...)` rxd | any... | Deliver text output directly to this player. This is the LambdaCore `notify`/`:tell` output path adapted to observations. |
 | `:tell_lines(lines)` rxd | list | Deliver a sequence of text lines to this player. |
+| `:help(topic?)` rxd | str? | Search contextual help DBs and global `$system.help_dbs`, then deliver rendered help lines to the player. Aliases: `?`, `info`, `information`, `@help`. |
 
 ### B2.8 `$guest` verbs
 
