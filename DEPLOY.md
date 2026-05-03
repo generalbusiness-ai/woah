@@ -236,6 +236,8 @@ There is no "forgot wizard" recovery path. Your options are: restore the world f
 
 The deployed Worker starts with the clean-core/catalog policy chosen by `WOO_AUTO_INSTALL_CATALOGS`. Public GitHub tap install/update is available through the Worker; private repositories and GitHub API tokens are deferred.
 
+**Update one catalog per maintenance window.** Each catalog's migration is scoped to its own classes — a failing `dubspace v1 → v2` does not affect `chat` or `taskspace`, and rollback is contained. Run install/update, verify with `GET /api/taps` and `migration_state`, smoke-test the affected verbs, *then* move on. Bundling multiple catalog updates into one window means one failure can compound and force a multi-catalog rollback. Spec rule: [catalogs.md §CT14.5](spec/discovery/catalogs.md#ct145-operator-practice-one-catalog-per-window). Catalog updates are independent of runtime/Worker deploys ([deployments.md §DP6](spec/operations/deployments.md#dp6-rolling-vs-bluegreen)).
+
 ```sh
 curl -X POST https://your-world.example.com/api/tap/install \
   -H 'content-type: application/json' \

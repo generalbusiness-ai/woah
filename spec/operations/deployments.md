@@ -101,6 +101,8 @@ Two deployment-replacement patterns:
 
 For spec v1, blue/green is the default for spec-version bumps; rolling is the default for code-only upgrades. The distinction is forced by the per-task bytecode-version invariant ([hosts.md §3.4 (4)](../protocol/hosts.md#34-host-rpc-invariants)) — old in-flight tasks finish on old code; new calls use new code; no one runs against ambiguous code.
 
+**Catalog-version updates are not runtime deploys.** Updating an installed catalog from `vN` to `v(N+1)` ([catalogs.md §CT14](../discovery/catalogs.md#ct14-migrations)) runs as a `$catalog_registry` call against the live world — no Worker redeploy, no DO class change, no traffic switch. The rolling/blue-green choice above applies to runtime upgrades only. Operators SHOULD apply catalog updates one at a time per [catalogs.md §CT14.5](../discovery/catalogs.md#ct145-operator-practice-one-catalog-per-window), independent of the runtime deploy schedule.
+
 ---
 
 ## DP7. Cross-deployment data sync

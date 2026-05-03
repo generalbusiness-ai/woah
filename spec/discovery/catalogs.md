@@ -590,7 +590,7 @@ v1 ships **the contract** plus a first runtime slice. The runtime can already re
 
 ### CT14.1 Migration manifests
 
-A catalog publishing a major-version bump (e.g., `dubspace-v1.x.x` → `dubspace-v2.0.0`) ships a sibling file `migration-v1-to-v2.json` in the same `catalogs/<catalog>/` directory. The Worker fetches this alongside `manifest.json` when an `update` resolves to a major bump.
+A catalog publishing a major-version bump (e.g., `dubspace-v1.x.x` → `dubspace-v2.0.0`) ships a sibling file `migration-v1-to-v2.json` in the same `catalogs/<catalog>/` directory. The Worker fetches this alongside `manifest.json` when an `update` resolves to a major bump. A worked example covering every implemented step kind is checked in at [`spec/discovery/migration-example.json`](migration-example.json) — copy it as a starting point.
 
 ```jsonc
 {
@@ -648,7 +648,19 @@ Recovery from a failed migration is operator work in v1. The registry exposes `:
 
 Migration steps must be **idempotent** — running them twice is safe. This is the recovery story: if step N fails, the operator fixes the underlying issue (data, code, environment) and reruns the migration; steps 1..N-1 no-op (rename to a target that already has the target name; transform a value already transformed; drop a property already dropped). The runtime does not enforce idempotency; catalog publishers attest to it.
 
-### CT14.5 What's deferred
+### CT14.5 Operator practice: one catalog per window
+
+Catalog migrations are scoped to the classes, properties, and verbs that catalog defines. They run inside `$catalog_registry`'s sequenced call and do not touch the runtime, the universal seed, or other catalogs' types. There is no technical reason to bundle multiple catalog updates into a single maintenance window, and several reasons not to:
+
+- A failing migration only affects its own catalog's instances; recovery (`migration_state`, manual repair, or rollback to backup) is contained.
+- Independent publishers ship at independent cadences; coupling them at the operator layer recreates the dependency the catalog model was designed to avoid.
+- The blast radius an operator must reason about during an incident is smaller.
+
+Operators **SHOULD** apply catalog updates one at a time: install/update, verify (`migration_state`, smoke-test the affected verbs), then move on. Multi-catalog windows are an exception that requires explicit justification — typically a coordinated breaking change across two catalogs that share types via `depends`. Cross-catalog migration coordination is otherwise deferred (§CT14.6) and is the operator's manual responsibility today.
+
+This practice composes with the deployment lifecycle: catalog updates are *not* runtime deploys ([deployments.md §DP6](../operations/deployments.md#dp6-rolling-vs-bluegreen)). They run as live-world calls against an unchanged runtime and do not require the rolling/blue-green dance.
+
+### CT14.6 What's deferred
 
 - **Rollback to prior version.** Major downgrades are not in v1. A failed migration can be repaired forward but cannot reliably undo earlier migration steps. Backups are the recovery path; backups, snapshots, and the export tooling are spec'd separately ([backups.md](../operations/backups.md)).
 - **Cross-catalog migrations.** A migration that requires another catalog to be at a specific version is hard to express in v1's `depends` model. Defer.

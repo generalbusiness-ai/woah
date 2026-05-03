@@ -1,0 +1,43 @@
+{
+  "from_version": "1.x.x",
+  "to_version": "2.0.0",
+  "spec_version": "v1",
+  "steps": [
+    {
+      "kind": "rename_property",
+      "class": "$widget",
+      "from": "color_name",
+      "to": "palette_color"
+    },
+    {
+      "kind": "add_property",
+      "class": "$widget",
+      "name": "created_at",
+      "type": "int",
+      "default": 0,
+      "perms": "r"
+    },
+    {
+      "kind": "drop_property",
+      "class": "$widget",
+      "name": "legacy_id"
+    },
+    {
+      "kind": "rename_verb",
+      "class": "$widget",
+      "from": "configure",
+      "to": "set_config"
+    },
+    {
+      "kind": "drop_verb",
+      "class": "$widget",
+      "verb": "deprecated_render"
+    },
+    {
+      "kind": "change_parent",
+      "class": "$widget",
+      "from": "$thing",
+      "to": "$portable"
+    }
+  ]
+}

@@ -108,7 +108,7 @@ Concrete Cloudflare mappings for a v1 deployment target: storage, routing, quota
 Operationally visible procedures for lifecycle management: deploys, migrations, backups, and governance.
 
 - [worktrees.md](spec/operations/worktrees.md) — staging changes, sandboxes, atomic promote (W1–W13)
-- [migrations.md](spec/operations/migrations.md) — bytecode upgrades, schema changes, data migrations (M1–M9)
+- [migrations.md](spec/operations/migrations.md) — bytecode upgrades, schema changes, data migrations (M1–M9). Covers two of five migration kinds; for the decision tree across all of them see [AGENTS.md §Migrations](AGENTS.md#migrations).
 - [backups.md](spec/operations/backups.md) — world export format, restore, disaster recovery (B1–B8)
 - [deployments.md](spec/operations/deployments.md) — dev / staging / prod, version coordination, cross-environment sync (DP1–DP9)
 - [observability.md](spec/operations/observability.md) — logs, metrics, traces, audit (O1–O9)
