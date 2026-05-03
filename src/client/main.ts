@@ -504,10 +504,11 @@ function normalizePinboardNotes(notes: any[], previousNotes: any[] = []) {
 }
 
 function buildChatMeta(world: any) {
-  const catalog = installedCatalog(world, "chat");
-  const rooms = objectsByParent(world, catalogClass(catalog, "$chatroom"));
+  const chat = installedCatalog(world, "chat");
+  const demo = installedCatalog(world, "demoworld");
+  const rooms = objectsByParent(world, catalogClass(chat, "$chatroom"));
   const occupied = rooms.find((id) => Array.isArray(world.objects?.[id]?.props?.subscribers) && world.objects[id].props.subscribers.includes(state.actor));
-  const seededEntry = Object.values(catalog?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
+  const seededEntry = Object.values(demo?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
   const current = occupied ?? seededEntry ?? rooms[0];
   return { room: current, rooms };
 }

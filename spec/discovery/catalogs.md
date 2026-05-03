@@ -679,13 +679,16 @@ The catalogs under `catalogs/` ship with this repository for two distinct purpos
 | Catalog | Role | Ship for general deployment? | Notes |
 |---|---|---|---|
 | `help` | **Foundational utility** | Yes | In-world help-database framework (`$help_db`). Other catalogs append entries; chat depends on it. |
-| `chat` | **Foundational utility** | Yes | Provides `$conversational` (feature object), `$match` (text-to-action scaffold), and `$room`/`$exit` (room geography), all reusable. Also ships `$chatroom` as a runnable demo room. |
+| `chat` | **Foundational utility** | Yes | Provides `$conversational` (feature object), `$match` (text-to-action scaffold), `$room`/`$exit` (room geography), `$chatroom` template, and `$portable`/`$furniture` base classes. **Seeds no instances** — install `demoworld` for the bundled Living Room demo. |
 | `note` | **Foundational utility** | Optional | Generic portable text-bearing thing. Subclassed by pinboard pins; useful as a standalone primitive. |
 | `prog` | **Foundational utility** | Optional | Builder/programmer authority tooling for in-world authoring. Required only for worlds that allow runtime programming. |
-| `dubspace` | **Demo application** | No | Shared dub-mix sound space. Illustrates `$space` composition with control surfaces; not a foundation for other catalogs. |
-| `taskspace` | **Demo application** | No | Hierarchical task coordination. Illustrates anchored object trees; not a foundation. |
-| `pinboard` | **Demo application** | No | Spatial bulletin board. Depends on `note`; illustrates movable objects in a `$space`. |
+| `demoworld` | **Demo seed** | No | The first-light demo's seed catalog: `$cockatoo` class plus the populated Living Room / Deck / Hot Tub set with exits, props, and the cockatoo. Owns the mount-point rooms that `dubspace` and `pinboard` reference. |
+| `dubspace` | **Demo application** | No | Shared dub-mix sound space. Seeds `the_dubspace` mounted in `demoworld:the_chatroom`; depends on `chat` + `demoworld`. |
+| `taskspace` | **Demo application** | No | Hierarchical task coordination. Seeds `the_taskspace` with `chat:$conversational` attached; depends on `chat` only (does not mount in any demoworld room). |
+| `pinboard` | **Demo application** | No | Spatial bulletin board. Seeds `the_pinboard` mounted in `demoworld:the_deck`; depends on `chat` + `note` + `demoworld`. |
 
-**Foundational utilities** are reusable building blocks: a typical operator-deployed world will install all four. **Demo applications** are illustrative and runnable but are not part of the core feature set — operators ship them only to host the demo.
+**Foundational utilities** are reusable building blocks: a typical operator-deployed world will install some or all four. **Demo applications** are illustrative and runnable but are not part of the core feature set. The **demo seed** catalog (`demoworld`) is a thin wiring layer: it picks the names, locations, exits, and props that make the bundled demo a coherent place. An operator who wants the foundational classes without the bundled demo installs the four foundational catalogs and stops.
 
 The list above is **not exhaustive** of catalogs woo can run. Any GitHub-tap catalog can be installed alongside or instead of the bundled set; the runtime treats them identically. Specs that mention `$dubspace`, `$taskspace`, `$chatroom`, or other bundled-catalog classes by name use them as concrete examples — the contracts they illustrate apply to any catalog of the same shape.
+
+**Class library vs seed catalog distinction.** The split exists for dependency management. A catalog that defines classes (a "class library") should not seed instances unless those instances are tied to the class's identity. A catalog that opinionates a populated world (a "seed catalog") should seed but not define new classes beyond what its seeds need. `chat` is a class library after this refactor; `demoworld` is a seed catalog. `dubspace`, `taskspace`, `pinboard` mix both today because they're small enough that the split would be more friction than value — but the same separation is available to publishers who want it.

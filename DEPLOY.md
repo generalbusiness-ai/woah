@@ -130,8 +130,10 @@ WOO_AUTO_INSTALL_CATALOGS = ""
 That empty value means a fresh Cloudflare world starts with only the universal core objects. To bootstrap with bundled local catalogs, edit the value before first deploy:
 
 ```toml
-WOO_AUTO_INSTALL_CATALOGS = "chat,dubspace,pinboard,taskspace"
+WOO_AUTO_INSTALL_CATALOGS = "help,chat,note,prog,demoworld,dubspace,pinboard,taskspace"
 ```
+
+(For a world that wants foundational classes only, with no demo content, use `"help,chat,note,prog"`.)
 
 This is just an operator filter over catalog directories bundled with the deployment. The runtime does not privilege those catalogs over public GitHub taps.
 

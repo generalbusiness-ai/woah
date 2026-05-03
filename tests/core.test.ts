@@ -750,7 +750,7 @@ describe("woo core", () => {
     const session = world.auth("guest:clean");
     expect(world.getProp(session.actor, "presence_in")).toEqual([]);
 
-    installLocalCatalogs(world, ["chat", "taskspace", "dubspace"]);
+    installLocalCatalogs(world, ["chat", "demoworld", "taskspace", "dubspace"]);
     expect(world.object("the_chatroom").parent).toBe("$chatroom");
     expect(world.object("the_taskspace").parent).toBe("$taskspace");
     expect(world.object("the_dubspace").parent).toBe("$dubspace");

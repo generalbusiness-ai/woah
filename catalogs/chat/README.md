@@ -3,7 +3,7 @@ name: chat
 version: 0.1.0
 spec_version: v1
 license: MIT
-description: Feature-object chat surface and standalone chatroom demo.
+description: Foundational chat primitives — $conversational feature, $match scaffolding, $room/$exit geography, $chatroom/portable/furniture base classes. No demo instances; install @local:demoworld for those.
 keywords:
   - chat
   - feature
@@ -17,8 +17,10 @@ depends:
 Source catalog for the first-light chat demo.
 
 Defines the `$conversational` feature, `$match` scaffolding, sentinel match
-objects, `$room` / `$exit` geography, `$chatroom`, and the seeded tiny
-Living Room -> Deck -> Hot Tub path. Chat verbs are direct live interactions;
-their observations are not replayed through a space log.
+objects, `$room` / `$exit` geography, the `$chatroom` template, and the
+`$portable` / `$furniture` base classes. **No instances are seeded** — the
+bundled Living Room → Deck → Hot Tub demo lives in the separate
+`@local:demoworld` catalog. Chat verbs are direct live interactions; their
+observations are not replayed through a space log.
 
 See [DESIGN.md](DESIGN.md) for the app design and behavior contract.

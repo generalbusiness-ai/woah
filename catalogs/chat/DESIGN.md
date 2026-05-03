@@ -14,7 +14,6 @@ A canonical MOO surface — rooms, presence, talk, emote, tell — built as a fe
 | `$chatroom` | `$room` | Standalone chat-room class. Conversational behavior comes from `$conversational`. |
 | `$portable` | `$thing` | Carryable room object. Moves between room contents and actor inventory without changing host placement. |
 | `$furniture` | `$thing` | Fixed room furnishing. Appears in look output but is not carryable. |
-| `$cockatoo` | `$thing` | Talkative bird. Squawks random phrases, can be taught new ones, gagged when too noisy. |
 
 ## Goal
 

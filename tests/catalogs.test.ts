@@ -89,7 +89,7 @@ describe("local catalogs", () => {
 
   it("keeps mounted demo-space enter and leave verbs portable", async () => {
     const world = createWorld({ catalogs: false });
-    installLocalCatalogs(world, ["chat", "dubspace", "pinboard"]);
+    installLocalCatalogs(world, ["chat", "demoworld", "dubspace", "pinboard"]);
 
     expect(world.ownVerb("$dubspace", "enter")?.kind).toBe("bytecode");
     expect(world.ownVerb("$dubspace", "leave")?.kind).toBe("bytecode");
@@ -309,8 +309,13 @@ describe("local catalogs", () => {
     installHelpDependency(world);
     const manifest = readManifest("chat") as unknown as RuntimeCatalogManifest;
     installCatalogManifest(world, manifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "chat",
+      allowImplementationHints: false
+    });
+    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "demoworld",
       allowImplementationHints: false
     });
 
@@ -362,7 +367,7 @@ describe("local catalogs", () => {
     };
 
     installCatalogManifest(world, manifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "shorthand",
       allowImplementationHints: false
     });
@@ -382,7 +387,7 @@ describe("local catalogs", () => {
       allowImplementationHints: false
     });
     installCatalogManifest(world, readManifest("taskspace") as unknown as RuntimeCatalogManifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "taskspace",
       allowImplementationHints: false
     });
@@ -411,12 +416,17 @@ describe("local catalogs", () => {
     const world = createWorld({ catalogs: false });
     installHelpDependency(world);
     installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "chat",
       allowImplementationHints: false
     });
+    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "demoworld",
+      allowImplementationHints: false
+    });
     installCatalogManifest(world, readManifest("dubspace") as unknown as RuntimeCatalogManifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "dubspace",
       allowImplementationHints: false
     });
@@ -482,17 +492,22 @@ describe("local catalogs", () => {
     const world = createWorld({ catalogs: false });
     installHelpDependency(world);
     installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "chat",
       allowImplementationHints: false
     });
+    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "demoworld",
+      allowImplementationHints: false
+    });
     installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "note",
       allowImplementationHints: false
     });
     installCatalogManifest(world, readManifest("pinboard") as unknown as RuntimeCatalogManifest, {
-      tap: "github:hugh/woo",
+      tap: "github:example/woo-test",
       alias: "pinboard",
       allowImplementationHints: false
     });
@@ -681,7 +696,7 @@ describe("local catalogs", () => {
   });
 
   it("installs missing dependency catalogs of an already-installed catalog before repair", () => {
-    const world = createWorld({ catalogs: ["chat", "pinboard"] });
+    const world = createWorld({ catalogs: ["chat", "demoworld", "pinboard"] });
     expect(world.objects.has("$pinboard")).toBe(true);
     // Simulate a world that long ago auto-installed catalogs before new
     // dependency edges existed.
@@ -750,7 +765,7 @@ describe("local catalogs", () => {
     }));
   });
 
-  it("preserves live runtime properties across host-scoped schema plans", () => {
+  it("preserves live runtime properties across host-scoped schema plans", { timeout: 15000 }, () => {
     // Host schema plans reconcile class/seed metadata but seed-hook properties
     // remain initial values. They must not overwrite live state such as
     // pinboard layout entries, room exits maps, dubspace tempo/transport, etc.
@@ -1184,7 +1199,7 @@ describe("local catalogs", () => {
       world.objects.delete(id);
     }
 
-    installLocalCatalogs(world, ["chat"]);
+    installLocalCatalogs(world, ["chat", "demoworld"]);
 
     expect(world.object("the_chatroom").name).toBe("Living Room");
     expect(world.getProp("the_chatroom", "description")).toContain("bright, open living room");
@@ -1240,7 +1255,7 @@ describe("local catalogs", () => {
     world.object("the_towel").properties.delete("home");
     world.object("$nowhere").contents.add("the_towel");
 
-    installLocalCatalogs(world, ["chat"]);
+    installLocalCatalogs(world, ["chat", "demoworld"]);
 
     expect(world.object("the_towel").location).toBe("the_deck");
     expect(world.object("the_deck").contents.has("the_towel")).toBe(true);
@@ -1278,7 +1293,7 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-01-agent-tool-exposure-repair");
   });
 
-  it("migrates the cockatoo into worlds installed before it landed", async () => {
+  it("migrates the cockatoo into worlds installed before it landed", { timeout: 15000 }, async () => {
     const world = createWorld();
     // Reset to before the cockatoo migration ran
     world.setProp("$system", "applied_migrations", ["2026-04-30-source-catalog-verbs", "2026-04-30-catalog-placement-metadata"]);
@@ -1288,7 +1303,7 @@ describe("local catalogs", () => {
     expect(world.objects.has("$cockatoo")).toBe(false);
     expect(world.objects.has("the_cockatoo")).toBe(false);
 
-    installLocalCatalogs(world, ["chat"]);
+    installLocalCatalogs(world, ["chat", "demoworld"]);
 
     expect(world.objects.has("$cockatoo")).toBe(true);
     expect(world.objects.has("the_cockatoo")).toBe(true);

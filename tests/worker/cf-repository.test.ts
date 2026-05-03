@@ -390,7 +390,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     env = {
       WOO_INITIAL_WIZARD_TOKEN: "cf-command-token",
       WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "chat,pinboard",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
       DIRECTORY: new FakeDurableObjectNamespace((name) => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;

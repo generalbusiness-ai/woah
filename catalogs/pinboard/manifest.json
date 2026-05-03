@@ -4,21 +4,34 @@
   "spec_version": "v1",
   "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
-  "depends": ["@local:chat", "@local:note"],
+  "depends": [
+    "@local:chat",
+    "@local:note",
+    "@local:demoworld"
+  ],
   "classes": [
     {
       "local_name": "$pin",
       "parent": "$note",
       "description": "Pinboard note. Adds an optional .color (default null, displayed white when null). Otherwise inherits all $note semantics: text, read/write/erase, is_readable_by, is_writable_by, look. Pins are first-class movable: take one off a board, drop it in a room, post it on a different board, recycle it. The pin remembers its color across moves.",
       "properties": [
-        { "name": "color", "type": "str|null", "default": null, "perms": "r" }
+        {
+          "name": "color",
+          "type": "str|null",
+          "default": null,
+          "perms": "r"
+        }
       ],
       "verbs": [
         {
           "name": "set_color",
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["color"] },
+          "arg_spec": {
+            "args": [
+              "color"
+            ]
+          },
           "source": "verb :set_color(color) rx { if (color == \"white\") { color = null; } if (color != null && typeof(color) != \"string\") { raise { code: \"E_INVARG\", message: \"color must be a string or null\", value: color }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot recolor pin\", value: this }; } this.color = color; observe({ type: \"pin_recolored\", actor: actor, pin: this, color: color, ts: now() }); return true; }"
         }
       ]
@@ -28,11 +41,45 @@
       "parent": "$space",
       "description": "Shared spatial bulletin board. Holds $note descendants in .contents; tracks per-pin layout in a parallel map keyed by pin object id. Posting moves a pin into the board; taking moves it back to the actor's inventory. Board owners can :eject any pin; pin owners can :take their own. Subscribe to the board with :enter to receive incremental observations.",
       "properties": [
-        { "name": "layout", "type": "map<str, map>", "default": {}, "perms": "r" },
-        { "name": "next_z", "type": "int", "default": 1, "perms": "r" },
-        { "name": "palette", "type": "list<str>", "default": ["yellow", "blue", "green", "pink", "white"], "perms": "r" },
-        { "name": "viewport", "type": "map", "default": { "w": 960, "h": 560 }, "perms": "r" },
-        { "name": "mount_room", "type": "obj|null", "default": null, "perms": "r" }
+        {
+          "name": "layout",
+          "type": "map<str, map>",
+          "default": {},
+          "perms": "r"
+        },
+        {
+          "name": "next_z",
+          "type": "int",
+          "default": 1,
+          "perms": "r"
+        },
+        {
+          "name": "palette",
+          "type": "list<str>",
+          "default": [
+            "yellow",
+            "blue",
+            "green",
+            "pink",
+            "white"
+          ],
+          "perms": "r"
+        },
+        {
+          "name": "viewport",
+          "type": "map",
+          "default": {
+            "w": 960,
+            "h": 560
+          },
+          "perms": "r"
+        },
+        {
+          "name": "mount_room",
+          "type": "obj|null",
+          "default": null,
+          "perms": "r"
+        }
       ],
       "verbs": [
         {
@@ -40,17 +87,24 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :title() rxd { return this.name + \" on the wall\"; }"
         },
         {
           "name": "look",
-          "aliases": ["l@ook", "ex@amine"],
+          "aliases": [
+            "l@ook",
+            "ex@amine"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look() rxd { return this:look_self(); }"
         },
         {
@@ -58,7 +112,9 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look_self() rxd { let pins = this:list_notes(); return { id: this, title: this.name, description: this.description, notes: pins, present_actors: this.subscribers, viewport: this.viewport }; }"
         },
         {
@@ -67,7 +123,9 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :enter() rxd { set_presence(this, true); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
         },
         {
@@ -75,14 +133,24 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :leave() rxd { set_presence(this, false); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
         },
         {
           "name": "viewport",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["x", "y", "w", "h", "scale"] },
+          "arg_spec": {
+            "args": [
+              "x",
+              "y",
+              "w",
+              "h",
+              "scale"
+            ]
+          },
           "source": "verb :viewport(x, y, w, h, scale) rxd { observe({ type: \"pinboard_viewport\", actor: actor, board: this, x: x, y: y, w: w, h: h, scale: scale, ts: now() }); return true; }"
         },
         {
@@ -90,69 +158,122 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :list_notes() rxd { let layout = this.layout; let pins = []; for pin in contents(this) { let key = to_string(pin); let layout_entry = { x: 48, y: 48, w: 180, h: 110, z: 1 }; if (has(layout, key)) { layout_entry = layout[key]; } let color = null; if (typeof(pin.color) == \"string\" && pin.color != \"white\") { color = pin.color; } let text = []; try { text = pin:text(); } except err { text = []; } pins = pins + [{ id: pin, name: pin.name, text: text, color: color, owner: pin.owner, writers: pin.writers, x: layout_entry[\"x\"], y: layout_entry[\"y\"], w: layout_entry[\"w\"], h: layout_entry[\"h\"], z: layout_entry[\"z\"] }]; } return pins; }"
         },
         {
           "name": "acceptable",
           "perms": "rxd",
-          "arg_spec": { "args": ["object"] },
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
           "source": "verb :acceptable(object) rxd { return isa(object, $note); }"
         },
         {
           "name": "enterfunc",
           "perms": "rx",
-          "arg_spec": { "args": ["object"] },
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
           "source": "verb :enterfunc(object) rx { let key = to_string(object); let layout = this.layout; if (!has(layout, key)) { let z = this.next_z; this.next_z = z + 1; let count = length(contents(this)); layout[key] = { x: 48 + ((count - 1) * 32), y: 48 + ((count - 1) * 26), w: 180, h: 110, z: z }; this.layout = layout; } observe({ type: \"pin_added\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" pinned a note to \" + this.name + \".\", ts: now() }); } return true; }"
         },
         {
           "name": "exitfunc",
           "perms": "rx",
-          "arg_spec": { "args": ["object"] },
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
           "source": "verb :exitfunc(object) rx { let key = to_string(object); let layout = this.layout; if (has(layout, key)) { let next = {}; for k in keys(layout) { if (k != key) { next[k] = layout[k]; } } this.layout = next; } observe({ type: \"pin_removed\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" took a note from \" + this.name + \".\", ts: now() }); } return true; }"
         },
         {
           "name": "post",
-          "aliases": ["p@ost", "stick"],
+          "aliases": [
+            "p@ost",
+            "stick"
+          ],
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["pin"] },
+          "arg_spec": {
+            "args": [
+              "pin"
+            ]
+          },
           "source": "verb :post(pin) rx { if (!isa(pin, $note)) { raise { code: \"E_INVARG\", message: \"only notes can be posted\", value: pin }; } moveto(pin, this); return pin; }"
         },
         {
           "name": "take",
-          "aliases": ["t@ake", "get"],
+          "aliases": [
+            "t@ake",
+            "get"
+          ],
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["pin"] },
+          "arg_spec": {
+            "args": [
+              "pin"
+            ]
+          },
           "source": "verb :take(pin) rx { if (location(pin) != this) { raise { code: \"E_INVARG\", message: \"that note is not on this board\", value: pin }; } if (pin.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the pin's author may take it; board owners use eject\", value: pin }; } moveto(pin, actor); return pin; }"
         },
         {
           "name": "eject",
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["pin"] },
+          "arg_spec": {
+            "args": [
+              "pin"
+            ]
+          },
           "source": "verb :eject(pin) rx { if (location(pin) != this) { raise { code: \"E_INVARG\", message: \"that note is not on this board\", value: pin }; } if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the board owner may eject pins\", value: pin }; } moveto(pin, actor); return pin; }"
         },
         {
           "name": "move_pin",
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["pin", "x", "y"] },
+          "arg_spec": {
+            "args": [
+              "pin",
+              "x",
+              "y"
+            ]
+          },
           "source": "verb :move_pin(pin, x, y) rx { if (location(pin) != this) { raise { code: \"E_INVARG\", message: \"that note is not on this board\", value: pin }; } let key = to_string(pin); let layout = this.layout; if (!has(layout, key)) { raise { code: \"E_INVARG\", message: \"layout entry missing\", value: pin }; } let entry = layout[key]; let z = this.next_z; this.next_z = z + 1; entry[\"x\"] = floor(x); entry[\"y\"] = floor(y); entry[\"z\"] = z; layout[key] = entry; this.layout = layout; observe({ type: \"pin_moved\", actor: actor, board: this, pin: pin, x: entry[\"x\"], y: entry[\"y\"], z: z, ts: now() }); return true; }"
         },
         {
           "name": "resize_pin",
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["pin", "w", "h"] },
+          "arg_spec": {
+            "args": [
+              "pin",
+              "w",
+              "h"
+            ]
+          },
           "source": "verb :resize_pin(pin, w, h) rx { if (location(pin) != this) { raise { code: \"E_INVARG\", message: \"that note is not on this board\", value: pin }; } let key = to_string(pin); let layout = this.layout; if (!has(layout, key)) { raise { code: \"E_INVARG\", message: \"layout entry missing\", value: pin }; } let entry = layout[key]; entry[\"w\"] = max(100, min(420, floor(w))); entry[\"h\"] = max(72, min(320, floor(h))); layout[key] = entry; this.layout = layout; observe({ type: \"pin_resized\", actor: actor, board: this, pin: pin, w: entry[\"w\"], h: entry[\"h\"], ts: now() }); return true; }"
         },
         {
           "name": "add_note",
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["text", "color?", "x?", "y?", "w?", "h?"] },
+          "arg_spec": {
+            "args": [
+              "text",
+              "color?",
+              "x?",
+              "y?",
+              "w?",
+              "h?"
+            ]
+          },
           "source": "verb :add_note(text, color, x, y, w, h) rx { if (typeof(text) != \"string\" || !text) { raise { code: \"E_INVARG\", message: \"add_note requires text\" }; } let pin = create($pin, { owner: actor, name: \"sticky note\", description: \"A sticky note pinned to \" + this.name + \".\" }); moveto(pin, this); pin:set_text([text]); if (typeof(color) == \"string\" && color != \"white\" && color in this.palette) { pin:set_color(color); } let key = to_string(pin); let layout = this.layout; let entry = layout[key]; if (typeof(x) == \"number\") { entry[\"x\"] = floor(x); } if (typeof(y) == \"number\") { entry[\"y\"] = floor(y); } if (typeof(w) == \"number\") { entry[\"w\"] = max(100, min(360, floor(w))); } if (typeof(h) == \"number\") { entry[\"h\"] = max(72, min(260, floor(h))); } layout[key] = entry; this.layout = layout; let note_record = { id: pin, name: pin.name, text: text, color: pin.color, owner: pin.owner, x: entry[\"x\"], y: entry[\"y\"], w: entry[\"w\"], h: entry[\"h\"], z: entry[\"z\"] }; observe({ type: \"note_added\", actor: actor, board: this, pin: pin, note: note_record, ts: now() }); return note_record; }"
         }
       ]
@@ -160,18 +281,143 @@
   ],
   "features": [],
   "schemas": [
-    { "on": "$pinboard", "type": "pinboard_entered", "shape": { "actor": "obj", "board": "obj", "text": "str" } },
-    { "on": "$pinboard", "type": "pinboard_left", "shape": { "actor": "obj", "board": "obj", "text": "str" } },
-    { "on": "$pinboard", "type": "pinboard_viewport", "shape": { "actor": "obj", "board": "obj", "x": "num", "y": "num", "w": "num", "h": "num", "scale": "num" } },
-    { "on": "$pinboard", "type": "pinboard_activity", "shape": { "source": "obj", "board": "obj", "actor": "obj", "pin": "obj?", "text": "str" } },
-    { "on": "$pinboard", "type": "pin_added", "shape": { "actor": "obj", "board": "obj", "pin": "obj" } },
-    { "on": "$pinboard", "type": "pin_removed", "shape": { "actor": "obj", "board": "obj", "pin": "obj" } },
-    { "on": "$pinboard", "type": "pin_moved", "shape": { "actor": "obj", "board": "obj", "pin": "obj", "x": "int", "y": "int", "z": "int" } },
-    { "on": "$pinboard", "type": "pin_resized", "shape": { "actor": "obj", "board": "obj", "pin": "obj", "w": "int", "h": "int" } },
-    { "on": "$pinboard", "type": "pin_recolored", "shape": { "actor": "obj", "pin": "obj", "color": "str|null" } },
-    { "on": "$pinboard", "type": "note_added", "shape": { "actor": "obj", "board": "obj", "pin": "obj", "note": "map" } }
+    {
+      "on": "$pinboard",
+      "type": "pinboard_entered",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pinboard_left",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pinboard_viewport",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "x": "num",
+        "y": "num",
+        "w": "num",
+        "h": "num",
+        "scale": "num"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pinboard_activity",
+      "shape": {
+        "source": "obj",
+        "board": "obj",
+        "actor": "obj",
+        "pin": "obj?",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pin_added",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "pin": "obj"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pin_removed",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "pin": "obj"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pin_moved",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "pin": "obj",
+        "x": "int",
+        "y": "int",
+        "z": "int"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pin_resized",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "pin": "obj",
+        "w": "int",
+        "h": "int"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "pin_recolored",
+      "shape": {
+        "actor": "obj",
+        "pin": "obj",
+        "color": "str|null"
+      }
+    },
+    {
+      "on": "$pinboard",
+      "type": "note_added",
+      "shape": {
+        "actor": "obj",
+        "board": "obj",
+        "pin": "obj",
+        "note": "map"
+      }
+    }
   ],
   "seed_hooks": [
-    { "kind": "create_instance", "class": "$pinboard", "as": "the_pinboard", "name": "Pinboard", "description": "A shared cork-backed pinboard mounted on the Deck wall. It is a visible object in the chat world and a separate coordination space where people and agents arrange durable text notes.", "location": "chat:the_deck", "properties": { "next_seq": 1, "subscribers": [], "last_snapshot_seq": 0, "host_placement": "self", "aliases": ["pinboard", "board", "note board", "corkboard"], "layout": {}, "next_z": 1, "palette": ["yellow", "blue", "green", "pink", "white"], "viewport": { "w": 960, "h": 560 }, "mount_room": "chat:the_deck" } }
+    {
+      "kind": "create_instance",
+      "class": "$pinboard",
+      "as": "the_pinboard",
+      "name": "Pinboard",
+      "description": "A shared cork-backed pinboard mounted on the Deck wall. It is a visible object in the chat world and a separate coordination space where people and agents arrange durable text notes.",
+      "location": "demoworld:the_deck",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": [
+          "pinboard",
+          "board",
+          "note board",
+          "corkboard"
+        ],
+        "layout": {},
+        "next_z": 1,
+        "palette": [
+          "yellow",
+          "blue",
+          "green",
+          "pink",
+          "white"
+        ],
+        "viewport": {
+          "w": 960,
+          "h": 560
+        },
+        "mount_room": "demoworld:the_deck"
+      }
+    }
   ]
 }

@@ -1,0 +1,506 @@
+{
+  "name": "demoworld",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "license": "MIT",
+  "description": "First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and provides the mount-point rooms that bundled demo apps (dubspace, pinboard) use.",
+  "depends": [
+    "@local:chat"
+  ],
+  "keywords": [
+    "demo",
+    "first-light",
+    "world"
+  ],
+  "classes": [
+    {
+      "local_name": "$cockatoo",
+      "parent": "$thing",
+      "description": "A talkative bird. Cheap imitation of the LambdaMOO cockatoo (#1479): squawks random phrases, can be taught new ones, gagged when too noisy. Self-driven timer chatter is deferred until DSL exposes fork; for now squawking is actor-driven.",
+      "properties": [
+        {
+          "name": "phrases",
+          "type": "list<str>",
+          "default": [
+            "Squawk!",
+            "Hello!",
+            "Pretty bird!",
+            "Want a cracker?",
+            "I'm a cockatoo!",
+            "Programmable, persistent, and loud.",
+            "World of objects!"
+          ],
+          "perms": "rw"
+        },
+        {
+          "name": "shake_reactions",
+          "type": "list<str>",
+          "default": [
+            "flaps wildly",
+            "glares balefully",
+            "squawks in protest",
+            "showers feathers",
+            "preens with offended dignity"
+          ],
+          "perms": "rw"
+        },
+        {
+          "name": "gagged",
+          "type": "bool",
+          "default": false,
+          "perms": "rw"
+        },
+        {
+          "name": "mood",
+          "type": "str",
+          "default": "alert",
+          "perms": "rw"
+        }
+      ],
+      "verbs": [
+        {
+          "name": "title",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :title() rxd { let suffix = \"perched on the mantelpiece\"; if (this.gagged) { suffix = \"perched on the mantelpiece, gagged\"; } return this.name + \", a sulphur-crested cockatoo \" + suffix; }"
+        },
+        {
+          "name": "look",
+          "aliases": [
+            "l@ook",
+            "ex@amine"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :look() rxd { let state = this.mood; if (this.gagged) { state = \"gagged\"; } observe({ type: \"cockatoo_seen\", source: this, actor: actor, mood: state, ts: now() }); return { description: this.description, mood: state, phrase_count: length(this.phrases) }; }"
+        },
+        {
+          "name": "squawk",
+          "aliases": [
+            "sq@uawk"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :squawk() rxd { if (this.gagged) { observe({ type: \"cockatoo_muffled\", source: this, actor: actor, ts: now() }); return \"*muffled noises*\"; } let phrases = this.phrases; if (length(phrases) == 0) { return \"\"; } let phrase = phrases[random(length(phrases)) + 1]; observe({ type: \"cockatoo_squawk\", source: this, actor: actor, text: phrase, ts: now() }); return phrase; }"
+        },
+        {
+          "name": "teach",
+          "perms": "rx",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "phrase"
+            ]
+          },
+          "source": "verb :teach(phrase) rx { if (typeof(phrase) != \"string\") { raise { code: \"E_TYPE\", message: \"teach requires a string phrase\", value: phrase }; } if (!phrase) { raise { code: \"E_INVARG\", message: \"teach requires a non-empty phrase\" }; } this.phrases = this.phrases + [phrase]; observe({ type: \"cockatoo_taught\", source: this, actor: actor, phrase: phrase, ts: now() }); return length(this.phrases); }"
+        },
+        {
+          "name": "pluck",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :pluck() rxd { observe({ type: \"cockatoo_pluck\", source: this, actor: actor, text: \"*EEEEEEK!*\", ts: now() }); return true; }"
+        },
+        {
+          "name": "shake",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :shake() rxd { let reactions = this.shake_reactions; if (length(reactions) == 0) { return \"\"; } let reaction = reactions[random(length(reactions)) + 1]; observe({ type: \"cockatoo_shake\", source: this, actor: actor, reaction: reaction, ts: now() }); return reaction; }"
+        },
+        {
+          "name": "feed",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "food?"
+            ]
+          },
+          "source": "verb :feed(food) rxd { let snack = food; if (!snack) { snack = \"birdseed\"; } observe({ type: \"cockatoo_fed\", source: this, actor: actor, food: snack, ts: now() }); return snack; }"
+        },
+        {
+          "name": "gag",
+          "perms": "rx",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :gag() rx { this.gagged = true; observe({ type: \"cockatoo_gagged\", source: this, actor: actor, ts: now() }); return true; }"
+        },
+        {
+          "name": "ungag",
+          "perms": "rx",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :ungag() rx { this.gagged = false; observe({ type: \"cockatoo_ungagged\", source: this, actor: actor, ts: now() }); return true; }"
+        }
+      ]
+    }
+  ],
+  "features": [],
+  "schemas": [
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_seen",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "mood": "str"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_squawk",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_muffled",
+      "shape": {
+        "source": "obj",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_taught",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "phrase": "str"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_pluck",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_shake",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "reaction": "str"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_fed",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "food": "str"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_gagged",
+      "shape": {
+        "source": "obj",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$cockatoo",
+      "type": "cockatoo_ungagged",
+      "shape": {
+        "source": "obj",
+        "actor": "obj"
+      }
+    }
+  ],
+  "seed_hooks": [
+    {
+      "kind": "create_instance",
+      "class": "$chatroom",
+      "as": "the_chatroom",
+      "name": "Living Room",
+      "description": "A bright, open living room with a rough fireplace, bookcases on two walls, and broad windows looking south. A sliding glass door leads southeast onto a wooden deck.",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": [
+          "living room",
+          "lr"
+        ],
+        "exits": {
+          "southeast": "exit_living_room_southeast",
+          "south": "exit_living_room_south"
+        }
+      }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_chatroom",
+      "feature": "$conversational"
+    },
+    {
+      "kind": "create_instance",
+      "class": "$chatroom",
+      "as": "the_deck",
+      "name": "Deck",
+      "description": "A wooden deck behind the house, facing south across the pool toward the gardens. The living room is west through the glass door, and a large hot tub waits at the east end.",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": [
+          "deck",
+          "wooden deck"
+        ],
+        "exits": {
+          "west": "exit_deck_west",
+          "east": "exit_deck_east"
+        }
+      }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_deck",
+      "feature": "$conversational"
+    },
+    {
+      "kind": "create_instance",
+      "class": "$chatroom",
+      "as": "the_hot_tub",
+      "name": "Hot Tub",
+      "description": "A molded hot tub with a bench around three sides and bubbling jets running.",
+      "location": "the_deck",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": [
+          "hot tub",
+          "tub"
+        ],
+        "exits": {
+          "west": "exit_hot_tub_west"
+        }
+      }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_hot_tub",
+      "feature": "$conversational"
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_living_room_southeast",
+      "name": "southeast",
+      "description": "Sliding glass door leading from the living room onto the deck.",
+      "anchor": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "southeast",
+          "se",
+          "sliding door",
+          "door",
+          "deck",
+          "outside",
+          "out"
+        ],
+        "source": "the_chatroom",
+        "dest": "the_deck",
+        "oleave_msg": "goes southeast.",
+        "oarrive_msg": "has arrived."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_living_room_south",
+      "name": "south",
+      "description": "Tempting plate-glass windows on the south wall. They are not a real way out.",
+      "anchor": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "south",
+          "s"
+        ],
+        "source": "the_chatroom",
+        "dest": "the_deck",
+        "nogo_msg": "Surely you don't really want to try walking through the plate-glass windows, especially with a sliding glass door nearby.",
+        "onogo_msg": "attempts to walk through the plate-glass windows. Fortunately, they're tougher than that."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_deck_west",
+      "name": "west",
+      "description": "The sliding glass door back into the living room.",
+      "anchor": "the_deck",
+      "properties": {
+        "aliases": [
+          "west",
+          "w",
+          "living room",
+          "lr",
+          "inside",
+          "in"
+        ],
+        "source": "the_deck",
+        "dest": "the_chatroom",
+        "oleave_msg": "goes west.",
+        "oarrive_msg": "has arrived."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_deck_east",
+      "name": "east",
+      "description": "The raised hot tub area at the east end of the deck.",
+      "anchor": "the_deck",
+      "properties": {
+        "aliases": [
+          "east",
+          "e",
+          "hot tub",
+          "tub"
+        ],
+        "source": "the_deck",
+        "dest": "the_hot_tub",
+        "leave_msg": "You enter the soothing waters of the hot tub.",
+        "oleave_msg": "heads toward the hot tub.",
+        "oarrive_msg": "has arrived."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_hot_tub_west",
+      "name": "west",
+      "description": "The way back out to the deck.",
+      "anchor": "the_hot_tub",
+      "properties": {
+        "aliases": [
+          "west",
+          "w",
+          "deck",
+          "out"
+        ],
+        "source": "the_hot_tub",
+        "dest": "the_deck",
+        "oleave_msg": "gets out of the hot tub.",
+        "oarrive_msg": "has arrived."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$furniture",
+      "as": "the_couch",
+      "name": "Couch",
+      "description": "A low couch with worn cushions facing the mantelpiece. It is comfortable enough to sit on, but too large to carry.",
+      "anchor": "the_chatroom",
+      "location": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "couch",
+          "sofa"
+        ]
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$portable",
+      "as": "the_lamp",
+      "name": "Brass Lamp",
+      "description": "A small brass lamp with a warm shade. It is light enough to carry from room to room.",
+      "location": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "lamp",
+          "brass lamp"
+        ],
+        "home": "the_chatroom"
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$portable",
+      "as": "the_towel",
+      "name": "Deck Towel",
+      "description": "A striped towel folded over the deck rail, dry for now and ready to be taken along.",
+      "location": "the_deck",
+      "properties": {
+        "aliases": [
+          "towel",
+          "deck towel"
+        ],
+        "home": "the_deck"
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$portable",
+      "as": "the_mug",
+      "name": "Mug",
+      "description": "A heavy ceramic mug with the last smell of coffee in it.",
+      "location": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "mug",
+          "coffee mug",
+          "cup"
+        ],
+        "home": "the_chatroom"
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$cockatoo",
+      "as": "the_cockatoo",
+      "name": "Cockatoo",
+      "description": "A sulphur-crested cockatoo sitting in a cage on top of the mantelpiece. Inside the cage are a few bird-toys, a mirror, and a tray for its food and water.",
+      "anchor": "the_chatroom",
+      "location": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "cockatoo",
+          "cock",
+          "raven",
+          "bird",
+          "cuckatoo",
+          "duck"
+        ]
+      }
+    }
+  ]
+}

@@ -2,9 +2,11 @@
   "name": "chat",
   "version": "0.1.0",
   "spec_version": "v1",
-  "description": "Feature-object chat surface and standalone chatroom demo.",
+  "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
-  "depends": ["@local:help"],
+  "depends": [
+    "@local:help"
+  ],
   "classes": [
     {
       "local_name": "$match",
@@ -12,42 +14,345 @@
       "description": "Chat-shaped text-to-action scaffold.",
       "properties": [],
       "verbs": [
-        { "name": "match_object", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["name", "location"] }, "source": "verb :match_object(name, location) rxd { return $failed_match; }", "implementation": { "kind": "native", "handler": "match_object" } },
-        { "name": "match_verb", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["name", "target"] }, "source": "verb :match_verb(name, target) rxd { return $failed_match; }", "implementation": { "kind": "native", "handler": "match_verb" } },
-        { "name": "parse_command", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text", "actor"] }, "source": "verb :parse_command(text, who) rxd { return { text: text, actor: who }; }", "implementation": { "kind": "native", "handler": "parse_command" } }
+        {
+          "name": "match_object",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "name",
+              "location"
+            ]
+          },
+          "source": "verb :match_object(name, location) rxd { return $failed_match; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "match_object"
+          }
+        },
+        {
+          "name": "match_verb",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "name",
+              "target"
+            ]
+          },
+          "source": "verb :match_verb(name, target) rxd { return $failed_match; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "match_verb"
+          }
+        },
+        {
+          "name": "parse_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text",
+              "actor"
+            ]
+          },
+          "source": "verb :parse_command(text, who) rxd { return { text: text, actor: who }; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "parse_command"
+          }
+        }
       ]
     },
-    { "local_name": "$failed_match", "parent": "$thing", "description": "Stable sentinel returned when no visible object matches.", "properties": [], "verbs": [] },
-    { "local_name": "$ambiguous_match", "parent": "$thing", "description": "Stable sentinel returned when multiple visible objects match.", "properties": [], "verbs": [] },
+    {
+      "local_name": "$failed_match",
+      "parent": "$thing",
+      "description": "Stable sentinel returned when no visible object matches.",
+      "properties": [],
+      "verbs": []
+    },
+    {
+      "local_name": "$ambiguous_match",
+      "parent": "$thing",
+      "description": "Stable sentinel returned when multiple visible objects match.",
+      "properties": [],
+      "verbs": []
+    },
     {
       "local_name": "$room",
       "parent": "$space",
       "description": "LambdaCore-shaped room base. Rooms are spaces with contents, present actors, exit-object lookup, room-authored look output, and announce/tell fanout helpers.",
       "properties": [
-        { "name": "exits", "type": "map<str,obj>", "default": {}, "perms": "rw" },
-        { "name": "ctype", "type": "int", "default": 3, "perms": "rw" }
+        {
+          "name": "exits",
+          "type": "map<str,obj>",
+          "default": {},
+          "perms": "rw"
+        },
+        {
+          "name": "ctype",
+          "type": "int",
+          "default": 3,
+          "perms": "rw"
+        }
       ],
       "verbs": [
-        { "name": "look_self", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": [] }, "source": "verb :look_self() rxd { return { id: this, title: this.name, description: this.description }; }", "implementation": { "kind": "native", "handler": "room_look_self" } },
-        { "name": "announce", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text"] }, "source": "verb :announce(text) rxd { return this:announce_all_but([actor], text); }" },
-        { "name": "announce_all", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text"] }, "source": "verb :announce_all(text) rxd { return this:announce_all_but([], text); }" },
-        { "name": "announce_all_but", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["ignore", "text"] }, "source": "verb :announce_all_but(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } return true; }" },
-        { "name": "match_exit", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["name"] }, "source": "verb :match_exit(name) rxd { let exits = this.exits; if (name in exits) { return exits[name]; } return $failed_match; }" },
-        { "name": "acceptable", "perms": "rxd", "arg_spec": { "args": ["object"] }, "source": "verb :acceptable(object) rxd { return true; }" },
-        { "name": "enterfunc", "perms": "rx", "arg_spec": { "args": ["object"] }, "source": "verb :enterfunc(object) rx { return true; }" },
-        { "name": "exitfunc", "perms": "rx", "arg_spec": { "args": ["object"] }, "source": "verb :exitfunc(object) rx { return true; }" },
-        { "name": "north", "aliases": ["n"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :north() rxd { set_task_perms(caller_perms()); return this:go(\"north\"); }" },
-        { "name": "northeast", "aliases": ["ne"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :northeast() rxd { set_task_perms(caller_perms()); return this:go(\"northeast\"); }" },
-        { "name": "east", "aliases": ["e"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :east() rxd { set_task_perms(caller_perms()); return this:go(\"east\"); }" },
-        { "name": "southeast", "aliases": ["se"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :southeast() rxd { set_task_perms(caller_perms()); return this:go(\"southeast\"); }" },
-        { "name": "south", "aliases": ["s"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :south() rxd { set_task_perms(caller_perms()); return this:go(\"south\"); }" },
-        { "name": "southwest", "aliases": ["sw"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :southwest() rxd { set_task_perms(caller_perms()); return this:go(\"southwest\"); }" },
-        { "name": "west", "aliases": ["w"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :west() rxd { set_task_perms(caller_perms()); return this:go(\"west\"); }" },
-        { "name": "northwest", "aliases": ["nw"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :northwest() rxd { set_task_perms(caller_perms()); return this:go(\"northwest\"); }" },
-        { "name": "out", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :out() rxd { set_task_perms(caller_perms()); return this:go(\"out\"); }" },
-        { "name": "go", "aliases": ["g@o"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["exit"] }, "source": "verb :go(exit) rxd { set_task_perms(caller_perms()); let exit_obj = this:match_exit(exit); if (exit_obj == $failed_match) { let msg = \"You can't go that way (\" + exit + \").\"; tell(actor, msg); return msg; } return exit_obj:invoke(); }" },
-        { "name": "take", "aliases": ["t@ake", "get"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["object"] }, "source": "verb :take(object) rxd { raise { code: \"E_UNSUPPORTED\", message: \"room take requires the trusted local room handler\" }; }", "implementation": { "kind": "native", "handler": "room_take" } },
-        { "name": "drop", "aliases": ["d@rop"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["object"] }, "source": "verb :drop(object) rxd { raise { code: \"E_UNSUPPORTED\", message: \"room drop requires the trusted local room handler\" }; }", "implementation": { "kind": "native", "handler": "room_drop" } }
+        {
+          "name": "look_self",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :look_self() rxd { return { id: this, title: this.name, description: this.description }; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "room_look_self"
+          }
+        },
+        {
+          "name": "announce",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :announce(text) rxd { return this:announce_all_but([actor], text); }"
+        },
+        {
+          "name": "announce_all",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :announce_all(text) rxd { return this:announce_all_but([], text); }"
+        },
+        {
+          "name": "announce_all_but",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "ignore",
+              "text"
+            ]
+          },
+          "source": "verb :announce_all_but(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } return true; }"
+        },
+        {
+          "name": "match_exit",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "name"
+            ]
+          },
+          "source": "verb :match_exit(name) rxd { let exits = this.exits; if (name in exits) { return exits[name]; } return $failed_match; }"
+        },
+        {
+          "name": "acceptable",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :acceptable(object) rxd { return true; }"
+        },
+        {
+          "name": "enterfunc",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :enterfunc(object) rx { return true; }"
+        },
+        {
+          "name": "exitfunc",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :exitfunc(object) rx { return true; }"
+        },
+        {
+          "name": "north",
+          "aliases": [
+            "n"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :north() rxd { set_task_perms(caller_perms()); return this:go(\"north\"); }"
+        },
+        {
+          "name": "northeast",
+          "aliases": [
+            "ne"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :northeast() rxd { set_task_perms(caller_perms()); return this:go(\"northeast\"); }"
+        },
+        {
+          "name": "east",
+          "aliases": [
+            "e"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :east() rxd { set_task_perms(caller_perms()); return this:go(\"east\"); }"
+        },
+        {
+          "name": "southeast",
+          "aliases": [
+            "se"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :southeast() rxd { set_task_perms(caller_perms()); return this:go(\"southeast\"); }"
+        },
+        {
+          "name": "south",
+          "aliases": [
+            "s"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :south() rxd { set_task_perms(caller_perms()); return this:go(\"south\"); }"
+        },
+        {
+          "name": "southwest",
+          "aliases": [
+            "sw"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :southwest() rxd { set_task_perms(caller_perms()); return this:go(\"southwest\"); }"
+        },
+        {
+          "name": "west",
+          "aliases": [
+            "w"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :west() rxd { set_task_perms(caller_perms()); return this:go(\"west\"); }"
+        },
+        {
+          "name": "northwest",
+          "aliases": [
+            "nw"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :northwest() rxd { set_task_perms(caller_perms()); return this:go(\"northwest\"); }"
+        },
+        {
+          "name": "out",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :out() rxd { set_task_perms(caller_perms()); return this:go(\"out\"); }"
+        },
+        {
+          "name": "go",
+          "aliases": [
+            "g@o"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "exit"
+            ]
+          },
+          "source": "verb :go(exit) rxd { set_task_perms(caller_perms()); let exit_obj = this:match_exit(exit); if (exit_obj == $failed_match) { let msg = \"You can't go that way (\" + exit + \").\"; tell(actor, msg); return msg; } return exit_obj:invoke(); }"
+        },
+        {
+          "name": "take",
+          "aliases": [
+            "t@ake",
+            "get"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :take(object) rxd { raise { code: \"E_UNSUPPORTED\", message: \"room take requires the trusted local room handler\" }; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "room_take"
+          }
+        },
+        {
+          "name": "drop",
+          "aliases": [
+            "d@rop"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :drop(object) rxd { raise { code: \"E_UNSUPPORTED\", message: \"room drop requires the trusted local room handler\" }; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "room_drop"
+          }
+        }
       ]
     },
     {
@@ -55,20 +360,94 @@
       "parent": "$thing",
       "description": "First-class room exit. Exits live in their source room's anchor cluster, carry aliases and movement messages, and invoke the LambdaCore-style moveto path.",
       "properties": [
-        { "name": "source", "type": "obj|null", "default": null, "perms": "r" },
-        { "name": "dest", "type": "obj|null", "default": null, "perms": "r" },
-        { "name": "obvious", "type": "bool", "default": true, "perms": "r" },
-        { "name": "nogo_msg", "type": "str", "default": "", "perms": "r" },
-        { "name": "onogo_msg", "type": "str", "default": "", "perms": "r" },
-        { "name": "leave_msg", "type": "str", "default": "", "perms": "r" },
-        { "name": "oleave_msg", "type": "str", "default": "has left.", "perms": "r" },
-        { "name": "arrive_msg", "type": "str", "default": "", "perms": "r" },
-        { "name": "oarrive_msg", "type": "str", "default": "has arrived.", "perms": "r" }
+        {
+          "name": "source",
+          "type": "obj|null",
+          "default": null,
+          "perms": "r"
+        },
+        {
+          "name": "dest",
+          "type": "obj|null",
+          "default": null,
+          "perms": "r"
+        },
+        {
+          "name": "obvious",
+          "type": "bool",
+          "default": true,
+          "perms": "r"
+        },
+        {
+          "name": "nogo_msg",
+          "type": "str",
+          "default": "",
+          "perms": "r"
+        },
+        {
+          "name": "onogo_msg",
+          "type": "str",
+          "default": "",
+          "perms": "r"
+        },
+        {
+          "name": "leave_msg",
+          "type": "str",
+          "default": "",
+          "perms": "r"
+        },
+        {
+          "name": "oleave_msg",
+          "type": "str",
+          "default": "has left.",
+          "perms": "r"
+        },
+        {
+          "name": "arrive_msg",
+          "type": "str",
+          "default": "",
+          "perms": "r"
+        },
+        {
+          "name": "oarrive_msg",
+          "type": "str",
+          "default": "has arrived.",
+          "perms": "r"
+        }
       ],
       "verbs": [
-        { "name": "invoke", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": [] }, "source": "verb :invoke() rxd { set_task_perms(caller_perms()); return this:move(actor); }" },
-        { "name": "move", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["who"] }, "source": "verb :move(who) rxd { if (who != actor) { raise { code: \"E_PERM\", message: \"exits only move the invoking actor\", value: who }; } let source = this.source; let dest = this.dest; if (this.nogo_msg) { tell(who, this.nogo_msg); if (this.onogo_msg) { source:announce_all_but([who], who.name + \" \" + this.onogo_msg); } return this.nogo_msg; } if (!dest) { let msg = \"You can't go that way.\"; tell(who, msg); return msg; } if (this.leave_msg) { tell(who, this.leave_msg); } moveto(who, dest); set_presence(source, false); set_presence(dest, true); let left_text = who.name + \" \" + this.oleave_msg; observe_to_space(source, { type: \"left\", actor: who, room: source, destination: dest, exit: this.name, text: left_text, ts: now() }); if (this.arrive_msg) { tell(who, this.arrive_msg); } let entered_text = who.name + \" \" + this.oarrive_msg; observe_to_space(dest, { type: \"entered\", actor: who, room: dest, origin: source, exit: this.name, text: entered_text, ts: now() }); return { room: dest, from: source, exit: this.name, look_deferred: true }; }" },
-        { "name": "announce_msg", "perms": "rxd", "arg_spec": { "args": ["place", "who", "text"] }, "source": "verb :announce_msg(place, who, text) rxd { return place:announce_all_but([who], who.name + \" \" + text); }" }
+        {
+          "name": "invoke",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :invoke() rxd { set_task_perms(caller_perms()); return this:move(actor); }"
+        },
+        {
+          "name": "move",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "who"
+            ]
+          },
+          "source": "verb :move(who) rxd { if (who != actor) { raise { code: \"E_PERM\", message: \"exits only move the invoking actor\", value: who }; } let source = this.source; let dest = this.dest; if (this.nogo_msg) { tell(who, this.nogo_msg); if (this.onogo_msg) { source:announce_all_but([who], who.name + \" \" + this.onogo_msg); } return this.nogo_msg; } if (!dest) { let msg = \"You can't go that way.\"; tell(who, msg); return msg; } if (this.leave_msg) { tell(who, this.leave_msg); } moveto(who, dest); set_presence(source, false); set_presence(dest, true); let left_text = who.name + \" \" + this.oleave_msg; observe_to_space(source, { type: \"left\", actor: who, room: source, destination: dest, exit: this.name, text: left_text, ts: now() }); if (this.arrive_msg) { tell(who, this.arrive_msg); } let entered_text = who.name + \" \" + this.oarrive_msg; observe_to_space(dest, { type: \"entered\", actor: who, room: dest, origin: source, exit: this.name, text: entered_text, ts: now() }); return { room: dest, from: source, exit: this.name, look_deferred: true }; }"
+        },
+        {
+          "name": "announce_msg",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "place",
+              "who",
+              "text"
+            ]
+          },
+          "source": "verb :announce_msg(place, who, text) rxd { return place:announce_all_but([who], who.name + \" \" + text); }"
+        }
       ]
     },
     {
@@ -83,7 +462,12 @@
       "parent": "$thing",
       "description": "Carryable room object. Instances can move between room contents and actor inventory without changing host placement.",
       "properties": [
-        { "name": "portable", "type": "bool", "default": true, "perms": "r" }
+        {
+          "name": "portable",
+          "type": "bool",
+          "default": true,
+          "perms": "r"
+        }
       ],
       "verbs": []
     },
@@ -92,45 +476,14 @@
       "parent": "$thing",
       "description": "Fixed room furnishing. It appears in room look output but is not carryable.",
       "properties": [
-        { "name": "portable", "type": "bool", "default": false, "perms": "r" }
+        {
+          "name": "portable",
+          "type": "bool",
+          "default": false,
+          "perms": "r"
+        }
       ],
       "verbs": []
-    },
-    {
-      "local_name": "$cockatoo",
-      "parent": "$thing",
-      "description": "A talkative bird. Cheap imitation of the LambdaMOO cockatoo (#1479): squawks random phrases, can be taught new ones, gagged when too noisy. Self-driven timer chatter is deferred until DSL exposes fork; for now squawking is actor-driven.",
-      "properties": [
-        { "name": "phrases", "type": "list<str>", "default": [
-          "Squawk!",
-          "Hello!",
-          "Pretty bird!",
-          "Want a cracker?",
-          "I'm a cockatoo!",
-          "Programmable, persistent, and loud.",
-          "World of objects!"
-        ], "perms": "rw" },
-        { "name": "shake_reactions", "type": "list<str>", "default": [
-          "flaps wildly",
-          "glares balefully",
-          "squawks in protest",
-          "showers feathers",
-          "preens with offended dignity"
-        ], "perms": "rw" },
-        { "name": "gagged", "type": "bool", "default": false, "perms": "rw" },
-        { "name": "mood", "type": "str", "default": "alert", "perms": "rw" }
-      ],
-      "verbs": [
-        { "name": "title", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": [] }, "source": "verb :title() rxd { let suffix = \"perched on the mantelpiece\"; if (this.gagged) { suffix = \"perched on the mantelpiece, gagged\"; } return this.name + \", a sulphur-crested cockatoo \" + suffix; }" },
-        { "name": "look", "aliases": ["l@ook", "ex@amine"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :look() rxd { let state = this.mood; if (this.gagged) { state = \"gagged\"; } observe({ type: \"cockatoo_seen\", source: this, actor: actor, mood: state, ts: now() }); return { description: this.description, mood: state, phrase_count: length(this.phrases) }; }" },
-        { "name": "squawk", "aliases": ["sq@uawk"], "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :squawk() rxd { if (this.gagged) { observe({ type: \"cockatoo_muffled\", source: this, actor: actor, ts: now() }); return \"*muffled noises*\"; } let phrases = this.phrases; if (length(phrases) == 0) { return \"\"; } let phrase = phrases[random(length(phrases)) + 1]; observe({ type: \"cockatoo_squawk\", source: this, actor: actor, text: phrase, ts: now() }); return phrase; }" },
-        { "name": "teach", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": ["phrase"] }, "source": "verb :teach(phrase) rx { if (typeof(phrase) != \"string\") { raise { code: \"E_TYPE\", message: \"teach requires a string phrase\", value: phrase }; } if (!phrase) { raise { code: \"E_INVARG\", message: \"teach requires a non-empty phrase\" }; } this.phrases = this.phrases + [phrase]; observe({ type: \"cockatoo_taught\", source: this, actor: actor, phrase: phrase, ts: now() }); return length(this.phrases); }" },
-        { "name": "pluck", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :pluck() rxd { observe({ type: \"cockatoo_pluck\", source: this, actor: actor, text: \"*EEEEEEK!*\", ts: now() }); return true; }" },
-        { "name": "shake", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :shake() rxd { let reactions = this.shake_reactions; if (length(reactions) == 0) { return \"\"; } let reaction = reactions[random(length(reactions)) + 1]; observe({ type: \"cockatoo_shake\", source: this, actor: actor, reaction: reaction, ts: now() }); return reaction; }" },
-        { "name": "feed", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["food?"] }, "source": "verb :feed(food) rxd { let snack = food; if (!snack) { snack = \"birdseed\"; } observe({ type: \"cockatoo_fed\", source: this, actor: actor, food: snack, ts: now() }); return snack; }" },
-        { "name": "gag", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :gag() rx { this.gagged = true; observe({ type: \"cockatoo_gagged\", source: this, actor: actor, ts: now() }); return true; }" },
-        { "name": "ungag", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :ungag() rx { this.gagged = false; observe({ type: \"cockatoo_ungagged\", source: this, actor: actor, ts: now() }); return true; }" }
-      ]
     }
   ],
   "features": [
@@ -140,73 +493,427 @@
       "description": "Feature object carrying live chat verbs for spaces.",
       "properties": [],
       "verbs": [
-        { "name": "can_be_attached_by", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["actor"] }, "source": "verb :can_be_attached_by(who) rxd { return true; }" },
-        { "name": "say", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["text"] }, "source": "verb :say(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say requires text\" }; } observe({ type: \"said\", actor: actor, text: text, ts: now() }); return true; }" },
-        { "name": "say_to", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["recipient", "text"] }, "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now() }); return true; }" },
-        { "name": "say_as", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["style", "text"] }, "source": "verb :say_as(style, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_as requires text\" }; } observe({ type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); return true; }" },
-        { "name": "emote", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["text"] }, "source": "verb :emote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"emote requires text\" }; } observe({ type: \"emoted\", actor: actor, text: text, ts: now() }); return true; }" },
-        { "name": "pose", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["text"] }, "source": "verb :pose(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"pose requires text\" }; } observe({ type: \"posed\", actor: actor, text: text, ts: now() }); return true; }" },
-        { "name": "quote", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["text"] }, "source": "verb :quote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"quote requires text\" }; } observe({ type: \"quoted\", actor: actor, text: text, ts: now() }); return true; }" },
-        { "name": "self", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["text"] }, "source": "verb :self(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"self requires text\" }; } observe({ type: \"self_pointed\", actor: actor, text: text, ts: now() }); return true; }" },
-        { "name": "tell", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["recipient", "text"] }, "source": "verb :tell(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"tell requires text\" }; } observe({ type: \"told\", from: actor, to: recipient, text: text, ts: now() }); return true; }" },
-        { "name": "look", "aliases": ["l@ook"], "perms": "rxd", "direct_callable": true, "skip_presence_check": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :look() rxd { return this:look_at(this); }" },
-        { "name": "look_at", "perms": "rxd", "direct_callable": true, "skip_presence_check": true, "arg_spec": { "args": ["target"] }, "source": "verb :look_at(target) rxd { set_task_perms(caller_perms()); let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } if (has(view, \"present_actors\")) { let names = \"\"; try { names = str_join(collect_prop(view[\"present_actors\"], \"name\"), \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }" },
-        { "name": "who", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :who() rxd { observe({ type: \"who\", actor: actor, to: actor, room: this, present_actors: this.subscribers, text: \"Present.\", ts: now() }); return this.subscribers; }", "implementation": { "kind": "native", "handler": "room_who" } },
-        { "name": "enter", "perms": "rxd", "direct_callable": true, "skip_presence_check": true, "tool_exposed": true, "arg_spec": { "args": ["actor?"] }, "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old in actor.presence_in) { set_presence(old, false); observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } moveto(actor, this); set_presence(this, true); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, present_actors: this.subscribers, look_deferred: true }; }" },
-        { "name": "leave", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": ["actor?"] }, "source": "verb :leave(who) rxd { set_presence(this, false); moveto(actor, actor.home); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); return this.subscribers; }" },
-        { "name": "huh", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text", "reason?"] }, "source": "verb :huh(text, reason) rxd { observe({ type: \"huh\", actor: actor, text: text, reason: reason, ts: now() }); return false; }" },
-        { "name": "huh_plan", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text", "reason"] }, "source": "verb :huh_plan(text, reason) rxd { this:huh(text, reason); return { ok: false, route: \"huh\", target: this, verb: \"huh\", args: [text, reason], error: reason, text: text }; }" },
-        { "name": "directed_plan", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["rest", "verb_name", "original"] }, "source": "verb :directed_plan(rest, verb_name, original) rxd { rest = str_trim(rest); let cmd = $match:parse_command(verb_name + \" \" + rest, actor, this); let target = cmd[\"dobj_prefix\"]; let directed_text = cmd[\"dobj_prefix_rest\"]; if (target == null || !directed_text) { return this:huh_plan(original, \"Directed speech needs a recipient and text.\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: verb_name, args: [target, directed_text], cmd: cmd }; }" },
-        { "name": "object_command_plan", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["cmd", "original"] }, "source": "verb :object_command_plan(cmd, original) rxd { let target = cmd[\"dobj_prefix\"]; if (target == null) { return null; } let matched = $match:match_verb(cmd[\"verb\"], target); if (typeof(matched) != \"map\") { return this:huh_plan(original, to_string(target) + \" does not understand \" + cmd[\"verb\"] + \".\"); } let route = \"direct\"; let plan_space = null; if (!matched[\"direct_callable\"]) { route = \"sequenced\"; plan_space = this; } let call_args = []; let rest = cmd[\"dobj_prefix_rest\"]; if (rest) { call_args = [rest]; } return { ok: true, route: route, space: plan_space, target: target, verb: matched[\"name\"], args: call_args, cmd: cmd }; }" },
-        { "name": "command_plan", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text"] }, "source": "verb :command_plan(input) rxd { let text = str_trim(input); if (!text) { return this:huh_plan(input, \"empty command\"); } if (str_starts(text, \"/me \")) { let emote_msg = str_trim(str_slice(text, 5)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [emote_msg], cmd: $match:parse_command(\"emote \" + emote_msg, actor, this) }; } if (str_starts(text, \":\") && length(text) > 1) { let colon_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [colon_msg], cmd: $match:parse_command(\"emote \" + colon_msg, actor, this) }; } if (str_starts(text, \"]\") && length(text) > 1) { let pose_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"pose\", args: [pose_msg], cmd: $match:parse_command(\"pose \" + pose_msg, actor, this) }; } if (str_starts(text, \"|\") && length(text) > 1) { let quote_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"quote\", args: [quote_msg], cmd: $match:parse_command(\"quote \" + quote_msg, actor, this) }; } if (str_starts(text, \"<\") && length(text) > 1) { let self_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"self\", args: [self_msg], cmd: $match:parse_command(\"self \" + self_msg, actor, this) }; } if (str_starts(text, str_char(34)) && length(text) > 1) { let say_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [say_msg], cmd: $match:parse_command(\"say \" + say_msg, actor, this) }; } if (str_starts(text, \"`\") && length(text) > 1) { return this:directed_plan(str_slice(text, 2), \"say_to\", text); } if (str_starts(text, \"[\")) { let close = str_index(text, \"]\"); if (close > 2) { let style = str_trim(str_slice(text, 2, close - 1)); let styled_text = str_trim(str_slice(text, close + 1)); if (str_starts(styled_text, \":\")) { styled_text = str_trim(str_slice(styled_text, 2)); } if (!style || !styled_text) { return this:huh_plan(text, \"Styled speech needs a style and text.\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: \"say_as\", args: [style, styled_text], cmd: $match:parse_command(\"say_as \" + styled_text, actor, this) }; } } if (str_starts(str_lower(text), \"/tell \")) { return this:directed_plan(str_slice(text, 7), \"tell\", text); } let cmd = $match:parse_command(text, actor, this); let verb_name = str_lower(cmd[\"verb\"]); let argstr = cmd[\"argstr\"]; if (verb_name == \"help\" || verb_name == \"?\" || verb_name == \"info\" || verb_name == \"information\" || verb_name == \"@help\") { return { ok: true, route: \"direct\", space: null, target: actor, verb: \"help\", args: [argstr], cmd: cmd }; } if (verb_name == \"say\") { if (!argstr) { return this:huh_plan(text, \"Say what?\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [argstr], cmd: cmd }; } if (verb_name == \"emote\" || verb_name == \"pose\") { if (!argstr) { return this:huh_plan(text, verb_name + \" needs text.\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: verb_name, args: [argstr], cmd: cmd }; } if (verb_name == \"tell\" || verb_name == \"whisper\" || verb_name == \"page\") { return this:directed_plan(argstr, \"tell\", text); } if ((verb_name == \"look\" || verb_name == \"l\" || verb_name == \"examine\" || verb_name == \"ex\") && argstr) { let look_target = cmd[\"dobj_prefix\"]; if (look_target == null && cmd[\"dobj\"] != null) { look_target = cmd[\"dobj\"]; } if (look_target == null && cmd[\"iobj\"] != null) { look_target = cmd[\"iobj\"]; } if (look_target == null) { return this:huh_plan(text, \"I don't see \" + argstr + \".\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: \"look_at\", args: [look_target], cmd: cmd }; } let room_verb = $match:match_verb(cmd[\"verb\"], this); if (typeof(room_verb) == \"map\" && room_verb[\"direct_callable\"] && !argstr) { return { ok: true, route: \"direct\", space: null, target: this, verb: room_verb[\"name\"], args: [], cmd: cmd }; } if (typeof(room_verb) == \"map\" && room_verb[\"direct_callable\"] && argstr && room_verb[\"definer\"] != null && isa(this, room_verb[\"definer\"])) { return { ok: true, route: \"direct\", space: null, target: this, verb: room_verb[\"name\"], args: [argstr], cmd: cmd }; } let object_plan = this:object_command_plan(cmd, text); if (object_plan != null) { return object_plan; } if (typeof(room_verb) == \"map\" && room_verb[\"direct_callable\"]) { let room_args = []; if (argstr) { room_args = [argstr]; } return { ok: true, route: \"direct\", space: null, target: this, verb: room_verb[\"name\"], args: room_args, cmd: cmd }; } if (!str_starts(text, \"/\")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [text], cmd: cmd }; } return this:huh_plan(text, \"I don't see \" + argstr + \".\"); }" },
-        { "name": "command", "perms": "rxd", "direct_callable": true, "arg_spec": { "args": ["text"] }, "source": "verb :command(text) rxd { let plan = this:command_plan(text); if (!plan[\"ok\"] || plan[\"route\"] != \"direct\") { return plan; } set_task_perms(caller_perms()); return dispatch(plan[\"target\"], plan[\"verb\"], plan[\"args\"]); }" }
+        {
+          "name": "can_be_attached_by",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "actor"
+            ]
+          },
+          "source": "verb :can_be_attached_by(who) rxd { return true; }"
+        },
+        {
+          "name": "say",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :say(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say requires text\" }; } observe({ type: \"said\", actor: actor, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "say_to",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "recipient",
+              "text"
+            ]
+          },
+          "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "say_as",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "style",
+              "text"
+            ]
+          },
+          "source": "verb :say_as(style, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_as requires text\" }; } observe({ type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "emote",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :emote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"emote requires text\" }; } observe({ type: \"emoted\", actor: actor, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "pose",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :pose(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"pose requires text\" }; } observe({ type: \"posed\", actor: actor, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "quote",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :quote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"quote requires text\" }; } observe({ type: \"quoted\", actor: actor, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "self",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :self(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"self requires text\" }; } observe({ type: \"self_pointed\", actor: actor, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "tell",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "recipient",
+              "text"
+            ]
+          },
+          "source": "verb :tell(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"tell requires text\" }; } observe({ type: \"told\", from: actor, to: recipient, text: text, ts: now() }); return true; }"
+        },
+        {
+          "name": "look",
+          "aliases": [
+            "l@ook"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :look() rxd { return this:look_at(this); }"
+        },
+        {
+          "name": "look_at",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "target"
+            ]
+          },
+          "source": "verb :look_at(target) rxd { set_task_perms(caller_perms()); let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } if (has(view, \"present_actors\")) { let names = \"\"; try { names = str_join(collect_prop(view[\"present_actors\"], \"name\"), \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }"
+        },
+        {
+          "name": "who",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :who() rxd { observe({ type: \"who\", actor: actor, to: actor, room: this, present_actors: this.subscribers, text: \"Present.\", ts: now() }); return this.subscribers; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "room_who"
+          }
+        },
+        {
+          "name": "enter",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "actor?"
+            ]
+          },
+          "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old in actor.presence_in) { set_presence(old, false); observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } moveto(actor, this); set_presence(this, true); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, present_actors: this.subscribers, look_deferred: true }; }"
+        },
+        {
+          "name": "leave",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "actor?"
+            ]
+          },
+          "source": "verb :leave(who) rxd { set_presence(this, false); moveto(actor, actor.home); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); return this.subscribers; }"
+        },
+        {
+          "name": "huh",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text",
+              "reason?"
+            ]
+          },
+          "source": "verb :huh(text, reason) rxd { observe({ type: \"huh\", actor: actor, text: text, reason: reason, ts: now() }); return false; }"
+        },
+        {
+          "name": "huh_plan",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text",
+              "reason"
+            ]
+          },
+          "source": "verb :huh_plan(text, reason) rxd { this:huh(text, reason); return { ok: false, route: \"huh\", target: this, verb: \"huh\", args: [text, reason], error: reason, text: text }; }"
+        },
+        {
+          "name": "directed_plan",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "rest",
+              "verb_name",
+              "original"
+            ]
+          },
+          "source": "verb :directed_plan(rest, verb_name, original) rxd { rest = str_trim(rest); let cmd = $match:parse_command(verb_name + \" \" + rest, actor, this); let target = cmd[\"dobj_prefix\"]; let directed_text = cmd[\"dobj_prefix_rest\"]; if (target == null || !directed_text) { return this:huh_plan(original, \"Directed speech needs a recipient and text.\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: verb_name, args: [target, directed_text], cmd: cmd }; }"
+        },
+        {
+          "name": "object_command_plan",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "cmd",
+              "original"
+            ]
+          },
+          "source": "verb :object_command_plan(cmd, original) rxd { let target = cmd[\"dobj_prefix\"]; if (target == null) { return null; } let matched = $match:match_verb(cmd[\"verb\"], target); if (typeof(matched) != \"map\") { return this:huh_plan(original, to_string(target) + \" does not understand \" + cmd[\"verb\"] + \".\"); } let route = \"direct\"; let plan_space = null; if (!matched[\"direct_callable\"]) { route = \"sequenced\"; plan_space = this; } let call_args = []; let rest = cmd[\"dobj_prefix_rest\"]; if (rest) { call_args = [rest]; } return { ok: true, route: route, space: plan_space, target: target, verb: matched[\"name\"], args: call_args, cmd: cmd }; }"
+        },
+        {
+          "name": "command_plan",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :command_plan(input) rxd { let text = str_trim(input); if (!text) { return this:huh_plan(input, \"empty command\"); } if (str_starts(text, \"/me \")) { let emote_msg = str_trim(str_slice(text, 5)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [emote_msg], cmd: $match:parse_command(\"emote \" + emote_msg, actor, this) }; } if (str_starts(text, \":\") && length(text) > 1) { let colon_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [colon_msg], cmd: $match:parse_command(\"emote \" + colon_msg, actor, this) }; } if (str_starts(text, \"]\") && length(text) > 1) { let pose_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"pose\", args: [pose_msg], cmd: $match:parse_command(\"pose \" + pose_msg, actor, this) }; } if (str_starts(text, \"|\") && length(text) > 1) { let quote_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"quote\", args: [quote_msg], cmd: $match:parse_command(\"quote \" + quote_msg, actor, this) }; } if (str_starts(text, \"<\") && length(text) > 1) { let self_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"self\", args: [self_msg], cmd: $match:parse_command(\"self \" + self_msg, actor, this) }; } if (str_starts(text, str_char(34)) && length(text) > 1) { let say_msg = str_trim(str_slice(text, 2)); return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [say_msg], cmd: $match:parse_command(\"say \" + say_msg, actor, this) }; } if (str_starts(text, \"`\") && length(text) > 1) { return this:directed_plan(str_slice(text, 2), \"say_to\", text); } if (str_starts(text, \"[\")) { let close = str_index(text, \"]\"); if (close > 2) { let style = str_trim(str_slice(text, 2, close - 1)); let styled_text = str_trim(str_slice(text, close + 1)); if (str_starts(styled_text, \":\")) { styled_text = str_trim(str_slice(styled_text, 2)); } if (!style || !styled_text) { return this:huh_plan(text, \"Styled speech needs a style and text.\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: \"say_as\", args: [style, styled_text], cmd: $match:parse_command(\"say_as \" + styled_text, actor, this) }; } } if (str_starts(str_lower(text), \"/tell \")) { return this:directed_plan(str_slice(text, 7), \"tell\", text); } let cmd = $match:parse_command(text, actor, this); let verb_name = str_lower(cmd[\"verb\"]); let argstr = cmd[\"argstr\"]; if (verb_name == \"help\" || verb_name == \"?\" || verb_name == \"info\" || verb_name == \"information\" || verb_name == \"@help\") { return { ok: true, route: \"direct\", space: null, target: actor, verb: \"help\", args: [argstr], cmd: cmd }; } if (verb_name == \"say\") { if (!argstr) { return this:huh_plan(text, \"Say what?\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [argstr], cmd: cmd }; } if (verb_name == \"emote\" || verb_name == \"pose\") { if (!argstr) { return this:huh_plan(text, verb_name + \" needs text.\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: verb_name, args: [argstr], cmd: cmd }; } if (verb_name == \"tell\" || verb_name == \"whisper\" || verb_name == \"page\") { return this:directed_plan(argstr, \"tell\", text); } if ((verb_name == \"look\" || verb_name == \"l\" || verb_name == \"examine\" || verb_name == \"ex\") && argstr) { let look_target = cmd[\"dobj_prefix\"]; if (look_target == null && cmd[\"dobj\"] != null) { look_target = cmd[\"dobj\"]; } if (look_target == null && cmd[\"iobj\"] != null) { look_target = cmd[\"iobj\"]; } if (look_target == null) { return this:huh_plan(text, \"I don't see \" + argstr + \".\"); } return { ok: true, route: \"direct\", space: null, target: this, verb: \"look_at\", args: [look_target], cmd: cmd }; } let room_verb = $match:match_verb(cmd[\"verb\"], this); if (typeof(room_verb) == \"map\" && room_verb[\"direct_callable\"] && !argstr) { return { ok: true, route: \"direct\", space: null, target: this, verb: room_verb[\"name\"], args: [], cmd: cmd }; } if (typeof(room_verb) == \"map\" && room_verb[\"direct_callable\"] && argstr && room_verb[\"definer\"] != null && isa(this, room_verb[\"definer\"])) { return { ok: true, route: \"direct\", space: null, target: this, verb: room_verb[\"name\"], args: [argstr], cmd: cmd }; } let object_plan = this:object_command_plan(cmd, text); if (object_plan != null) { return object_plan; } if (typeof(room_verb) == \"map\" && room_verb[\"direct_callable\"]) { let room_args = []; if (argstr) { room_args = [argstr]; } return { ok: true, route: \"direct\", space: null, target: this, verb: room_verb[\"name\"], args: room_args, cmd: cmd }; } if (!str_starts(text, \"/\")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [text], cmd: cmd }; } return this:huh_plan(text, \"I don't see \" + argstr + \".\"); }"
+        },
+        {
+          "name": "command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
+          "source": "verb :command(text) rxd { let plan = this:command_plan(text); if (!plan[\"ok\"] || plan[\"route\"] != \"direct\") { return plan; } set_task_perms(caller_perms()); return dispatch(plan[\"target\"], plan[\"verb\"], plan[\"args\"]); }"
+        }
       ]
     }
   ],
   "schemas": [
-    { "on": "$conversational", "type": "said", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "said_to", "shape": { "source": "obj", "actor": "obj", "to": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "said_as", "shape": { "source": "obj", "actor": "obj", "style": "str", "text": "str" } },
-    { "on": "$conversational", "type": "emoted", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "posed", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "quoted", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "self_pointed", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "told", "shape": { "source": "obj", "from": "obj", "to": "obj", "text": "str" } },
-    { "on": "$conversational", "type": "entered", "shape": { "source": "obj", "actor": "obj", "room": "obj", "origin": "obj?", "exit": "str?", "text": "str" } },
-    { "on": "$conversational", "type": "left", "shape": { "source": "obj", "actor": "obj", "room": "obj", "destination": "obj?", "exit": "str?", "text": "str" } },
-    { "on": "$conversational", "type": "looked", "shape": { "source": "obj", "actor": "obj", "to": "obj", "room": "obj", "target": "obj?", "text": "str", "look": "map" } },
-    { "on": "$conversational", "type": "who", "shape": { "source": "obj", "actor": "obj", "to": "obj", "room": "obj", "present_actors": "list<obj>", "text": "str" } },
-    { "on": "$conversational", "type": "huh", "shape": { "source": "obj", "actor": "obj", "text": "str", "suggestion": "str?" } },
-    { "on": "$chatroom", "type": "blocked_exit", "shape": { "source": "obj", "actor": "obj", "exit": "str", "text": "str" } },
-    { "on": "$chatroom", "type": "taken", "shape": { "source": "obj", "actor": "obj", "item": "obj", "text": "str" } },
-    { "on": "$chatroom", "type": "dropped", "shape": { "source": "obj", "actor": "obj", "item": "obj", "room": "obj", "text": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_seen", "shape": { "source": "obj", "actor": "obj", "mood": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_squawk", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_muffled", "shape": { "source": "obj", "actor": "obj" } },
-    { "on": "$cockatoo", "type": "cockatoo_taught", "shape": { "source": "obj", "actor": "obj", "phrase": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_pluck", "shape": { "source": "obj", "actor": "obj", "text": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_shake", "shape": { "source": "obj", "actor": "obj", "reaction": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_fed", "shape": { "source": "obj", "actor": "obj", "food": "str" } },
-    { "on": "$cockatoo", "type": "cockatoo_gagged", "shape": { "source": "obj", "actor": "obj" } },
-    { "on": "$cockatoo", "type": "cockatoo_ungagged", "shape": { "source": "obj", "actor": "obj" } }
+    {
+      "on": "$conversational",
+      "type": "said",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "said_to",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "to": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "said_as",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "style": "str",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "emoted",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "posed",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "quoted",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "self_pointed",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "told",
+      "shape": {
+        "source": "obj",
+        "from": "obj",
+        "to": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "entered",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "room": "obj",
+        "origin": "obj?",
+        "exit": "str?",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "left",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "room": "obj",
+        "destination": "obj?",
+        "exit": "str?",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "looked",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "to": "obj",
+        "room": "obj",
+        "target": "obj?",
+        "text": "str",
+        "look": "map"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "who",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "to": "obj",
+        "room": "obj",
+        "present_actors": "list<obj>",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$conversational",
+      "type": "huh",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "text": "str",
+        "suggestion": "str?"
+      }
+    },
+    {
+      "on": "$chatroom",
+      "type": "blocked_exit",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "exit": "str",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$chatroom",
+      "type": "taken",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "item": "obj",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$chatroom",
+      "type": "dropped",
+      "shape": {
+        "source": "obj",
+        "actor": "obj",
+        "item": "obj",
+        "room": "obj",
+        "text": "str"
+      }
+    }
   ],
   "seed_hooks": [
-    { "kind": "change_parent", "object": "$chatroom", "parent": "$room" },
-    { "kind": "create_instance", "class": "$chatroom", "as": "the_chatroom", "name": "Living Room", "description": "A bright, open living room with a rough fireplace, bookcases on two walls, and broad windows looking south. A sliding glass door leads southeast onto a wooden deck.", "properties": { "next_seq": 1, "subscribers": [], "last_snapshot_seq": 0, "host_placement": "self", "aliases": ["living room", "lr"], "exits": { "southeast": "exit_living_room_southeast", "south": "exit_living_room_south" } } },
-    { "kind": "attach_feature", "consumer": "the_chatroom", "feature": "$conversational" },
-    { "kind": "create_instance", "class": "$chatroom", "as": "the_deck", "name": "Deck", "description": "A wooden deck behind the house, facing south across the pool toward the gardens. The living room is west through the glass door, and a large hot tub waits at the east end.", "properties": { "next_seq": 1, "subscribers": [], "last_snapshot_seq": 0, "host_placement": "self", "aliases": ["deck", "wooden deck"], "exits": { "west": "exit_deck_west", "east": "exit_deck_east" } } },
-    { "kind": "attach_feature", "consumer": "the_deck", "feature": "$conversational" },
-    { "kind": "create_instance", "class": "$chatroom", "as": "the_hot_tub", "name": "Hot Tub", "description": "A molded hot tub with a bench around three sides and bubbling jets running.", "location": "the_deck", "properties": { "next_seq": 1, "subscribers": [], "last_snapshot_seq": 0, "host_placement": "self", "aliases": ["hot tub", "tub"], "exits": { "west": "exit_hot_tub_west" } } },
-    { "kind": "attach_feature", "consumer": "the_hot_tub", "feature": "$conversational" },
-    { "kind": "create_instance", "class": "$exit", "as": "exit_living_room_southeast", "name": "southeast", "description": "Sliding glass door leading from the living room onto the deck.", "anchor": "the_chatroom", "properties": { "aliases": ["southeast", "se", "sliding door", "door", "deck", "outside", "out"], "source": "the_chatroom", "dest": "the_deck", "oleave_msg": "goes southeast.", "oarrive_msg": "has arrived." } },
-    { "kind": "create_instance", "class": "$exit", "as": "exit_living_room_south", "name": "south", "description": "Tempting plate-glass windows on the south wall. They are not a real way out.", "anchor": "the_chatroom", "properties": { "aliases": ["south", "s"], "source": "the_chatroom", "dest": "the_deck", "nogo_msg": "Surely you don't really want to try walking through the plate-glass windows, especially with a sliding glass door nearby.", "onogo_msg": "attempts to walk through the plate-glass windows. Fortunately, they're tougher than that." } },
-    { "kind": "create_instance", "class": "$exit", "as": "exit_deck_west", "name": "west", "description": "The sliding glass door back into the living room.", "anchor": "the_deck", "properties": { "aliases": ["west", "w", "living room", "lr", "inside", "in"], "source": "the_deck", "dest": "the_chatroom", "oleave_msg": "goes west.", "oarrive_msg": "has arrived." } },
-    { "kind": "create_instance", "class": "$exit", "as": "exit_deck_east", "name": "east", "description": "The raised hot tub area at the east end of the deck.", "anchor": "the_deck", "properties": { "aliases": ["east", "e", "hot tub", "tub"], "source": "the_deck", "dest": "the_hot_tub", "leave_msg": "You enter the soothing waters of the hot tub.", "oleave_msg": "heads toward the hot tub.", "oarrive_msg": "has arrived." } },
-    { "kind": "create_instance", "class": "$exit", "as": "exit_hot_tub_west", "name": "west", "description": "The way back out to the deck.", "anchor": "the_hot_tub", "properties": { "aliases": ["west", "w", "deck", "out"], "source": "the_hot_tub", "dest": "the_deck", "oleave_msg": "gets out of the hot tub.", "oarrive_msg": "has arrived." } },
-    { "kind": "create_instance", "class": "$furniture", "as": "the_couch", "name": "Couch", "description": "A low couch with worn cushions facing the mantelpiece. It is comfortable enough to sit on, but too large to carry.", "anchor": "the_chatroom", "location": "the_chatroom", "properties": { "aliases": ["couch", "sofa"] } },
-    { "kind": "create_instance", "class": "$portable", "as": "the_lamp", "name": "Brass Lamp", "description": "A small brass lamp with a warm shade. It is light enough to carry from room to room.", "location": "the_chatroom", "properties": { "aliases": ["lamp", "brass lamp"], "home": "the_chatroom" } },
-    { "kind": "create_instance", "class": "$portable", "as": "the_towel", "name": "Deck Towel", "description": "A striped towel folded over the deck rail, dry for now and ready to be taken along.", "location": "the_deck", "properties": { "aliases": ["towel", "deck towel"], "home": "the_deck" } },
-    { "kind": "create_instance", "class": "$portable", "as": "the_mug", "name": "Mug", "description": "A heavy ceramic mug with the last smell of coffee in it.", "location": "the_chatroom", "properties": { "aliases": ["mug", "coffee mug", "cup"], "home": "the_chatroom" } },
-    { "kind": "create_instance", "class": "$cockatoo", "as": "the_cockatoo", "name": "Cockatoo", "description": "A sulphur-crested cockatoo sitting in a cage on top of the mantelpiece. Inside the cage are a few bird-toys, a mirror, and a tray for its food and water.", "anchor": "the_chatroom", "location": "the_chatroom", "properties": { "aliases": ["cockatoo", "cock", "raven", "bird", "cuckatoo", "duck"] } }
+    {
+      "kind": "change_parent",
+      "object": "$chatroom",
+      "parent": "$room"
+    }
   ]
 }

@@ -17,10 +17,19 @@ documented in [spec/discovery/catalogs.md §CT15](../spec/discovery/catalogs.md#
 
 Install order for the full demo world:
 
-1. `@local:chat`
-2. `@local:dubspace`
-3. `@local:pinboard`
-4. `@local:taskspace`
+1. `@local:help`
+2. `@local:chat`
+3. `@local:note`
+4. `@local:prog`
+5. `@local:demoworld`
+6. `@local:dubspace`
+7. `@local:pinboard`
+8. `@local:taskspace`
+
+Class libraries (`chat`, `note`, `prog`) install foundational primitives without
+seeding instances; `demoworld` seeds the bundled Living Room set; the demo apps
+(`dubspace`, `pinboard`, `taskspace`) bring their own seeds. A world that wants
+foundational classes without any demo content installs steps 1-4 only.
 
 ## Class diagram
 
@@ -43,6 +52,8 @@ classDiagram
         class `$chatroom`
         class `$portable`
         class `$furniture`
+    }
+    namespace demoworld {
         class `$cockatoo`
     }
     namespace note {
