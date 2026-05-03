@@ -8,6 +8,8 @@ keywords:
   - chat
   - feature
   - demo
+depends:
+  - @local:help
 ---
 
 # Chat

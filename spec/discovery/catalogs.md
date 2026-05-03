@@ -259,6 +259,12 @@ already repaired. Host-scoped repair is therefore based on the catalog objects
 and self-hosted instances present in that host slice, plus their local
 dependencies, and the repair must be idempotent.
 
+Dependency repair may encounter a partial earlier bootstrap where catalog
+objects already exist but `$catalog_registry` has no matching installed record.
+For bundled `@local` dependencies only, the boot lifecycle may adopt those
+objects, repair them from the manifest, run seed hooks, and write the missing
+registry record. Public runtime installs still reject object-name collisions.
+
 A migration must not special-case a demo application's object names or
 semantics. It may operate over the discovered bundled catalog manifests as a
 set, because that set is defined by the deployment's catalog tap location.
