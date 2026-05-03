@@ -65,6 +65,7 @@ Use Git worktrees for isolation.
 - Ensure that tests cover the functionality.  Update where there are gaps.
 - Ensure that dead code and obsolete descriptions are removed.
 - Are migrations needed?  Use the decision table below.
+- If migrations are used, they must be test-run on a local Sqlite woo.
 
 ## Migrations
 

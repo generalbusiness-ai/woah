@@ -144,8 +144,66 @@ export function installLocalCatalog(world: WooWorld, name: string, options: { ad
     ref_requested: "@local",
     ref_resolved_sha: "unversioned"
   };
-  installCatalogManifest(world, manifest, { tap: "@local", alias: name, actor: "$wiz", provenance, adoptExisting: options.adoptExisting === true });
-  return options.adoptExisting !== true;
+  // Auto-adopt: if any of this catalog's declared classes/features/seeds
+  // already exist in the world (typical when a previously-installed catalog
+  // has been split — e.g. chat → chat + demoworld — and the new catalog now
+  // claims objects that the old one originally seeded), install in adoption
+  // mode rather than failing E_NAME_COLLISION. Idempotent on fresh worlds
+  // because no targets exist yet. After a successful adoption, the adopted
+  // ids are pruned from other catalogs' registry records so each object has
+  // exactly one owner. (Migration-declarative drop_seed/drop_class step
+  // kinds are deferred — see LATER.md.)
+  const adoptExisting = options.adoptExisting === true || hasPreexistingManifestObjects(world, manifest);
+  installCatalogManifest(world, manifest, { tap: "@local", alias: name, actor: "$wiz", provenance, adoptExisting });
+  if (adoptExisting) pruneAdoptedIdsFromOtherRecords(world, name, manifest);
+  return !adoptExisting;
+}
+
+function hasPreexistingManifestObjects(world: WooWorld, manifest: CatalogManifest): boolean {
+  for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) {
+    if (world.objects.has(def.local_name)) return true;
+  }
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind === "create_instance" && world.objects.has(hook.as)) return true;
+  }
+  return false;
+}
+
+function pruneAdoptedIdsFromOtherRecords(world: WooWorld, currentName: string, manifest: CatalogManifest): void {
+  if (!world.objects.has("$catalog_registry")) return;
+  const raw = world.propOrNull("$catalog_registry", "installed_catalogs");
+  if (!Array.isArray(raw)) return;
+  const adoptedIds = new Set<string>();
+  for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) {
+    adoptedIds.add(def.local_name);
+  }
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind === "create_instance") adoptedIds.add(hook.as);
+  }
+  if (adoptedIds.size === 0) return;
+  let mutated = false;
+  const next = raw.map((record) => {
+    if (!record || typeof record !== "object" || Array.isArray(record)) return record;
+    const item = record as Record<string, WooValue>;
+    if (item.alias === currentName) return record;
+    const objects = mapValue(item.objects);
+    const seeds = mapValue(item.seeds);
+    let changed = false;
+    const nextObjects: Record<string, WooValue> = {};
+    for (const [name, id] of Object.entries(objects)) {
+      if (typeof id === "string" && adoptedIds.has(id)) { changed = true; continue; }
+      nextObjects[name] = id;
+    }
+    const nextSeeds: Record<string, WooValue> = {};
+    for (const [name, id] of Object.entries(seeds)) {
+      if (typeof id === "string" && adoptedIds.has(id)) { changed = true; continue; }
+      nextSeeds[name] = id;
+    }
+    if (!changed) return record;
+    mutated = true;
+    return { ...item, objects: nextObjects as WooValue, seeds: nextSeeds as WooValue } as WooValue;
+  });
+  if (mutated) world.setProp("$catalog_registry", "installed_catalogs", next as WooValue);
 }
 
 export function localCatalogStatuses(world: WooWorld, names: readonly string[] = DEFAULT_LOCAL_CATALOGS): LocalCatalogStatus[] {
