@@ -172,6 +172,67 @@ export type RepairCatalogOptions = {
   reconcileClassVerbs?: boolean;
 };
 
+export type CatalogSchemaPlanScope = "gateway" | "host";
+
+export type CatalogSchemaPlanOptions = RepairCatalogOptions & {
+  scope?: CatalogSchemaPlanScope;
+  host?: string;
+};
+
+export type CatalogSchemaPlanStep =
+  | { id: string; kind: "ensure_object"; object: ObjRef; def: CatalogObjectDef }
+  | { id: string; kind: "ensure_property_def"; object: ObjRef; property: CatalogPropertyDef }
+  | { id: string; kind: "ensure_verb"; object: ObjRef; verb: CatalogVerbDef }
+  | { id: string; kind: "drop_stale_verbs"; object: ObjRef; keep: string[] }
+  | { id: string; kind: "ensure_event_schema"; object: ObjRef; schema: CatalogSchemaDef }
+  | { id: string; kind: "ensure_seed_object"; object: ObjRef; hook: Extract<CatalogSeedHook, { kind: "create_instance" }> }
+  | { id: string; kind: "reconcile_seed_object"; object: ObjRef; hook: Extract<CatalogSeedHook, { kind: "create_instance" }> }
+  | { id: string; kind: "seed_property_defaults"; object: ObjRef; hook: Extract<CatalogSeedHook, { kind: "create_instance" }> }
+  | { id: string; kind: "change_parent"; object: ObjRef; hook: Extract<CatalogSeedHook, { kind: "change_parent" }> }
+  | { id: string; kind: "set_property"; object: ObjRef; hook: Extract<CatalogSeedHook, { kind: "set_property" }> }
+  | { id: string; kind: "attach_feature"; consumer: ObjRef; feature: ObjRef; hook: Extract<CatalogSeedHook, { kind: "attach_feature" }> }
+  | { id: string; kind: "sync_exit_aliases"; object: ObjRef };
+
+export type CatalogSchemaPlan = {
+  id: string;
+  catalog: string;
+  version: string;
+  manifest_hash: string;
+  scope: CatalogSchemaPlanScope;
+  host: string;
+  options: {
+    allow_implementation_hints: boolean;
+    reconcile_seed_hooks: boolean;
+    skip_missing_seed_hooks: boolean;
+    rehome_nowhere_seed_objects: boolean;
+    reconcile_class_verbs: boolean;
+  };
+  steps: CatalogSchemaPlanStep[];
+};
+
+export type CatalogSchemaPlanStepResult = {
+  id: string;
+  kind: CatalogSchemaPlanStep["kind"];
+  target: string;
+  status: "applied" | "skipped" | "failed";
+  error?: ErrorValue;
+};
+
+export type CatalogSchemaPlanApplyResult = {
+  status: "completed" | "failed";
+  plan_id: string;
+  catalog: string;
+  version: string;
+  manifest_hash: string;
+  scope: CatalogSchemaPlanScope;
+  host: string;
+  started_at: number;
+  completed_at: number;
+  steps: CatalogSchemaPlanStepResult[];
+  issues: CatalogStatusIssue[];
+  error?: ErrorValue;
+};
+
 export type UpdateCatalogOptions = InstallCatalogOptions & {
   acceptMajor?: boolean;
   migration?: CatalogMigrationManifest | null;
@@ -467,64 +528,217 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
 }
 
 export function repairCatalogManifest(world: WooWorld, manifest: CatalogManifest, options: RepairCatalogOptions = {}): void {
-  const actor = options.actor ?? "$wiz";
+  const plan = planCatalogSchemaMigration(world, manifest, { ...options, scope: "gateway", host: "world" });
+  const result = applyCatalogSchemaPlan(world, manifest, plan, options);
+  if (result.status === "failed") throw wooError(result.error?.code ?? "E_CATALOG", result.error?.message ?? `catalog schema plan failed: ${plan.id}`, result.error?.value);
+}
+
+export function planCatalogSchemaMigration(world: WooWorld, manifest: CatalogManifest, options: CatalogSchemaPlanOptions = {}): CatalogSchemaPlan {
+  const scope = options.scope ?? "gateway";
+  const host = options.host ?? (scope === "gateway" ? "world" : "host");
   const allowImplementationHints = options.allowImplementationHints ?? false;
   const reconcileSeedHooks = options.reconcileSeedHooks ?? false;
-  const skipMissingSeedHooks = options.skipMissingSeedHooks ?? false;
+  const skipMissingSeedHooks = options.skipMissingSeedHooks ?? scope === "host";
   const rehomeNowhereSeedObjects = options.rehomeNowhereSeedObjects ?? false;
   const reconcileClassVerbs = options.reconcileClassVerbs ?? false;
+  const manifestHash = catalogManifestHash(manifest);
   const existing = installedCatalogs(world);
   const localObjects = new Map<string, ObjRef>();
   const localSeeds = new Map<string, ObjRef>();
   const objectDefs = [...(manifest.classes ?? []), ...(manifest.features ?? [])];
   for (const def of objectDefs) localObjects.set(def.local_name, def.local_name);
+  const steps: CatalogSchemaPlanStep[] = [];
 
   for (const def of objectDefs) {
-    if (!world.objects.has(def.local_name)) {
-      const parent = resolveObjectRef(world, def.parent, localObjects, localSeeds, existing);
-      world.createObject({ id: def.local_name, name: def.local_name, parent, owner: actor });
+    if (scope === "host" && !world.objects.has(def.local_name)) continue;
+    steps.push({ id: `${steps.length + 1}:ensure_object:${def.local_name}`, kind: "ensure_object", object: def.local_name, def });
+    for (const property of def.properties ?? []) {
+      steps.push({ id: `${steps.length + 1}:ensure_property_def:${def.local_name}.${property.name}`, kind: "ensure_property_def", object: def.local_name, property });
     }
-    setDescriptionIfEmpty(world, def.local_name, catalogDescription(def.description, def.local_name, manifest.name));
-    for (const property of def.properties ?? []) installProperty(world, def.local_name, property, actor);
-    for (const verb of def.verbs ?? []) installVerbDef(world, def.local_name, verb, actor, allowImplementationHints, true);
-    if (reconcileClassVerbs) dropStaleOwnVerbs(world, def.local_name, new Set((def.verbs ?? []).map((verb) => verb.name)));
+    for (const verb of def.verbs ?? []) {
+      steps.push({ id: `${steps.length + 1}:ensure_verb:${def.local_name}:${verb.name}`, kind: "ensure_verb", object: def.local_name, verb });
+    }
+    if (reconcileClassVerbs) {
+      steps.push({ id: `${steps.length + 1}:drop_stale_verbs:${def.local_name}`, kind: "drop_stale_verbs", object: def.local_name, keep: (def.verbs ?? []).map((verb) => verb.name) });
+    }
   }
   for (const schema of manifest.schemas ?? []) {
-    if (world.objects.has(schema.on)) world.defineEventSchema(schema.on, schema.type, schema.shape);
+    const object = resolveMaybeObjectRef(world, schema.on, localObjects, localSeeds, existing);
+    if (object) steps.push({ id: `${steps.length + 1}:ensure_event_schema:${object}:${schema.type}`, kind: "ensure_event_schema", object, schema });
   }
   for (const hook of manifest.seed_hooks ?? []) {
     if (hook.kind === "create_instance") {
       const id = hook.as;
-      if (!world.objects.has(id)) {
-        if (skipMissingSeedHooks) continue;
-        const parent = resolveObjectRef(world, hook.class, localObjects, localSeeds, existing);
-        const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
-        const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;
-        world.createObject({ id, name: hook.name ?? id, parent, owner: actor, anchor, location });
-      } else if (reconcileSeedHooks) {
-        reconcileSeedObject(world, id, hook, manifest, actor, localObjects, localSeeds, existing, rehomeNowhereSeedObjects);
+      if (world.objects.has(id)) {
+        if (reconcileSeedHooks) steps.push({ id: `${steps.length + 1}:reconcile_seed_object:${id}`, kind: "reconcile_seed_object", object: id, hook });
+        steps.push({ id: `${steps.length + 1}:seed_property_defaults:${id}`, kind: "seed_property_defaults", object: id, hook });
+        steps.push({ id: `${steps.length + 1}:sync_exit_aliases:${id}`, kind: "sync_exit_aliases", object: id });
+      } else if (!skipMissingSeedHooks && scope === "gateway") {
+        steps.push({ id: `${steps.length + 1}:ensure_seed_object:${id}`, kind: "ensure_seed_object", object: id, hook });
+        steps.push({ id: `${steps.length + 1}:seed_property_defaults:${id}`, kind: "seed_property_defaults", object: id, hook });
+        steps.push({ id: `${steps.length + 1}:sync_exit_aliases:${id}`, kind: "sync_exit_aliases", object: id });
       }
       localSeeds.set(hook.as, id);
-      setDescriptionIfEmpty(world, id, catalogDescription(hook.description, hook.name ?? id, manifest.name));
-      setNameIfMissing(world, id, hook.name ?? id);
-      for (const [name, value] of Object.entries(hook.properties ?? {})) setPropIfMissing(world, id, name, resolveCatalogValue(world, value, localObjects, localSeeds, existing));
       continue;
     }
     if (hook.kind === "change_parent") {
-      const object = resolveObjectRef(world, hook.object, localObjects, localSeeds, existing);
-      const parent = resolveObjectRef(world, hook.parent, localObjects, localSeeds, existing);
-      if (world.objects.has(object) && world.objects.has(parent) && world.object(object).parent !== parent && !world.isDescendantOf(parent, object)) {
-        world.chparentAuthoredObject(actor, object, parent);
-      }
+      const object = resolveMaybeObjectRef(world, hook.object, localObjects, localSeeds, existing);
+      const parent = resolveMaybeObjectRef(world, hook.parent, localObjects, localSeeds, existing);
+      if (object && parent) steps.push({ id: `${steps.length + 1}:change_parent:${object}->${parent}`, kind: "change_parent", object, hook });
       continue;
     }
     if (hook.kind === "set_property") {
-      applySeedProperty(world, hook, localObjects, localSeeds, existing);
+      const object = resolveMaybeObjectRef(world, hook.object, localObjects, localSeeds, existing);
+      if (object) steps.push({ id: `${steps.length + 1}:set_property:${object}.${hook.property}`, kind: "set_property", object, hook });
       continue;
     }
-    if (world.objects.has(hook.consumer) && world.objects.has(hook.feature)) attachFeature(world, hook.consumer, hook.feature);
+    const consumer = resolveMaybeObjectRef(world, hook.consumer, localObjects, localSeeds, existing);
+    const feature = resolveMaybeObjectRef(world, hook.feature, localObjects, localSeeds, existing);
+    if (consumer && feature) steps.push({ id: `${steps.length + 1}:attach_feature:${consumer}+${feature}`, kind: "attach_feature", consumer, feature, hook });
   }
-  populateSeedExitAliasMaps(world, manifest, localSeeds);
+  return {
+    id: `local-catalog-schema:${manifest.name}:${manifestHash.slice(0, 16)}`,
+    catalog: manifest.name,
+    version: manifest.version,
+    manifest_hash: `sha256:${manifestHash}`,
+    scope,
+    host,
+    options: {
+      allow_implementation_hints: allowImplementationHints,
+      reconcile_seed_hooks: reconcileSeedHooks,
+      skip_missing_seed_hooks: skipMissingSeedHooks,
+      rehome_nowhere_seed_objects: rehomeNowhereSeedObjects,
+      reconcile_class_verbs: reconcileClassVerbs
+    },
+    steps
+  };
+}
+
+export function applyCatalogSchemaPlan(world: WooWorld, manifest: CatalogManifest, plan: CatalogSchemaPlan, options: CatalogSchemaPlanOptions = {}): CatalogSchemaPlanApplyResult {
+  const actor = options.actor ?? "$wiz";
+  const allowImplementationHints = options.allowImplementationHints ?? plan.options.allow_implementation_hints;
+  const rehomeNowhereSeedObjects = options.rehomeNowhereSeedObjects ?? plan.options.rehome_nowhere_seed_objects;
+  const existing = installedCatalogs(world);
+  const localObjects = new Map<string, ObjRef>();
+  const localSeeds = new Map<string, ObjRef>();
+  const objectDefs = [...(manifest.classes ?? []), ...(manifest.features ?? [])];
+  for (const def of objectDefs) localObjects.set(def.local_name, def.local_name);
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind === "create_instance") localSeeds.set(hook.as, hook.as);
+  }
+  const startedAt = Date.now();
+  const stepResults: CatalogSchemaPlanStepResult[] = [];
+  let failed: ErrorValue | undefined;
+
+  for (const step of plan.steps) {
+    try {
+      world.withMutationSavepoint(() => {
+        applyCatalogSchemaPlanStep(world, manifest, step, {
+          actor,
+          allowImplementationHints,
+          rehomeNowhereSeedObjects,
+          localObjects,
+          localSeeds,
+          existing
+        });
+      });
+      stepResults.push({ id: step.id, kind: step.kind, target: catalogSchemaStepTarget(step), status: "applied" });
+    } catch (err) {
+      failed = errorValue(err);
+      stepResults.push({ id: step.id, kind: step.kind, target: catalogSchemaStepTarget(step), status: "failed", error: failed });
+      break;
+    }
+  }
+
+  const issues = failed ? [] : verifyCatalogSchemaPlan(world, manifest, plan);
+  const completedAt = Date.now();
+  return {
+    status: failed || issues.length > 0 ? "failed" : "completed",
+    plan_id: plan.id,
+    catalog: plan.catalog,
+    version: plan.version,
+    manifest_hash: plan.manifest_hash,
+    scope: plan.scope,
+    host: plan.host,
+    started_at: startedAt,
+    completed_at: completedAt,
+    steps: stepResults,
+    issues,
+    error: failed ?? (issues.length > 0 ? { code: "E_CATALOG", message: `catalog schema plan postcondition failed: ${plan.id}`, value: issues as unknown as WooValue } : undefined)
+  };
+}
+
+export function verifyCatalogSchemaPlan(world: WooWorld, manifest: CatalogManifest, plan: CatalogSchemaPlan): CatalogStatusIssue[] {
+  const status = catalogManifestStatus(world, manifest, {
+    tap: "@local",
+    alias: manifest.name,
+    actor: "$wiz",
+    allowImplementationHints: plan.options.allow_implementation_hints
+  });
+  const plannedObjects = new Set<ObjRef>();
+  const plannedVerbs = new Set<string>();
+  const plannedProperties = new Set<string>();
+  const plannedSchemas = new Set<string>();
+  const planSpecificIssues: CatalogStatusIssue[] = [];
+  const existing = installedCatalogs(world);
+  const localObjects = new Map<string, ObjRef>();
+  const localSeeds = new Map<string, ObjRef>();
+  for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) localObjects.set(def.local_name, def.local_name);
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind === "create_instance") localSeeds.set(hook.as, hook.as);
+  }
+  for (const step of plan.steps) {
+    if ("object" in step) plannedObjects.add(step.object);
+    if (step.kind === "ensure_verb") plannedVerbs.add(`${step.object}:${step.verb.name}`);
+    if (step.kind === "ensure_property_def") plannedProperties.add(`${step.object}.${step.property.name}`);
+    if (step.kind === "ensure_event_schema") plannedSchemas.add(`${step.object}:${step.schema.type}`);
+    if (step.kind === "attach_feature") plannedObjects.add(step.consumer);
+    if (step.kind === "drop_stale_verbs" && world.objects.has(step.object)) {
+      const keep = new Set(step.keep);
+      for (const verb of world.object(step.object).verbs) {
+        if (!keep.has(verb.name)) {
+          planSpecificIssues.push({
+            severity: "warning",
+            kind: "stale_verb",
+            object: step.object,
+            verb: verb.name,
+            message: `${step.object}:${verb.name} is not declared by catalog ${manifest.name}`
+          });
+        }
+      }
+    }
+    if ((step.kind === "ensure_seed_object" || step.kind === "reconcile_seed_object") && plan.options.rehome_nowhere_seed_objects && world.objects.has(step.object) && step.hook.location) {
+      const expectedLocation = resolveMaybeObjectRef(world, step.hook.location, localObjects, localSeeds, existing);
+      const actualLocation = world.object(step.object).location;
+      if (expectedLocation && actualLocation === "$nowhere" && expectedLocation !== "$nowhere") {
+        planSpecificIssues.push({
+          severity: "warning",
+          kind: "seed_location_drift",
+          object: step.object,
+          message: `${step.object} is stranded in $nowhere instead of ${expectedLocation}`,
+          expected: expectedLocation,
+          actual: actualLocation
+        });
+      }
+    }
+  }
+  if (plan.scope === "gateway") {
+    return [
+      ...status.issues.filter((issue) => issue.kind !== "version_mismatch" && issue.kind !== "not_installed"),
+      ...planSpecificIssues
+    ];
+  }
+  const filtered = status.issues.filter((issue) => {
+    if (issue.kind === "version_mismatch" || issue.kind === "not_installed") return false;
+    if (issue.verb && issue.object) return plannedVerbs.has(`${issue.object}:${issue.verb}`);
+    if (issue.property && issue.object) return plannedProperties.has(`${issue.object}.${issue.property}`);
+    if (issue.kind === "missing_object" || issue.kind === "parent_drift") return issue.object ? plannedObjects.has(issue.object) : false;
+    if (issue.kind === "missing_seed" || issue.kind === "seed_parent_drift" || issue.kind === "seed_property_drift") return issue.object ? plannedObjects.has(issue.object) : false;
+    if (issue.kind === "feature_drift") return issue.object ? plannedObjects.has(issue.object) : false;
+    if (issue.kind === "missing_schema" && issue.object && typeof issue.expected === "string") return plannedSchemas.has(`${issue.object}:${issue.expected}`);
+    return issue.object ? plannedObjects.has(issue.object) : false;
+  });
+  return [...filtered, ...planSpecificIssues];
 }
 
 export function updateCatalogManifest(world: WooWorld, manifest: CatalogManifest, options: UpdateCatalogOptions = {}): InstalledCatalogRecord {
@@ -585,6 +799,132 @@ export function updateCatalogManifest(world: WooWorld, manifest: CatalogManifest
   };
   recordCatalogInstall(world, record);
   return record;
+}
+
+function catalogManifestHash(manifest: CatalogManifest): string {
+  return hashSource(stableStringify(manifest));
+}
+
+function applyCatalogSchemaPlanStep(
+  world: WooWorld,
+  manifest: CatalogManifest,
+  step: CatalogSchemaPlanStep,
+  context: {
+    actor: ObjRef;
+    allowImplementationHints: boolean;
+    rehomeNowhereSeedObjects: boolean;
+    localObjects: Map<string, ObjRef>;
+    localSeeds: Map<string, ObjRef>;
+    existing: InstalledCatalogRecord[];
+  }
+): void {
+  switch (step.kind) {
+    case "ensure_object": {
+      const parent = resolveObjectRef(world, step.def.parent, context.localObjects, context.localSeeds, context.existing);
+      if (!world.objects.has(step.object)) world.createObject({ id: step.object, name: step.object, parent, owner: context.actor });
+      else if (world.object(step.object).parent !== parent && !world.isDescendantOf(parent, step.object)) {
+        world.chparentAuthoredObject(context.actor, step.object, parent);
+      }
+      setDescriptionIfEmpty(world, step.object, catalogDescription(step.def.description, step.object, manifest.name));
+      return;
+    }
+    case "ensure_property_def":
+      upsertPropertyDef(world, step.object, step.property, context.actor);
+      return;
+    case "ensure_verb":
+      installVerbDef(world, step.object, step.verb, context.actor, context.allowImplementationHints, true);
+      return;
+    case "drop_stale_verbs":
+      dropStaleOwnVerbs(world, step.object, new Set(step.keep));
+      return;
+    case "ensure_event_schema": {
+      const on = resolveObjectRef(world, step.schema.on, context.localObjects, context.localSeeds, context.existing);
+      if (world.objects.has(on)) world.defineEventSchema(on, step.schema.type, step.schema.shape);
+      return;
+    }
+    case "ensure_seed_object": {
+      if (!world.objects.has(step.object)) {
+        const parent = resolveObjectRef(world, step.hook.class, context.localObjects, context.localSeeds, context.existing);
+        const anchor = step.hook.anchor ? resolveObjectRef(world, step.hook.anchor, context.localObjects, context.localSeeds, context.existing) : null;
+        const location = step.hook.location ? resolveObjectRef(world, step.hook.location, context.localObjects, context.localSeeds, context.existing) : null;
+        world.createObject({ id: step.object, name: step.hook.name ?? step.object, parent, owner: context.actor, anchor, location });
+      }
+      reconcileSeedObject(world, step.object, step.hook, manifest, context.actor, context.localObjects, context.localSeeds, context.existing, context.rehomeNowhereSeedObjects);
+      return;
+    }
+    case "reconcile_seed_object":
+      reconcileSeedObject(world, step.object, step.hook, manifest, context.actor, context.localObjects, context.localSeeds, context.existing, context.rehomeNowhereSeedObjects);
+      return;
+    case "seed_property_defaults":
+      setDescriptionIfEmpty(world, step.object, catalogDescription(step.hook.description, step.hook.name ?? step.object, manifest.name));
+      setNameIfMissing(world, step.object, step.hook.name ?? step.object);
+      for (const [name, value] of Object.entries(step.hook.properties ?? {})) {
+        setPropIfMissing(world, step.object, name, resolveCatalogValue(world, value, context.localObjects, context.localSeeds, context.existing));
+      }
+      return;
+    case "change_parent": {
+      const object = resolveObjectRef(world, step.hook.object, context.localObjects, context.localSeeds, context.existing);
+      const parent = resolveObjectRef(world, step.hook.parent, context.localObjects, context.localSeeds, context.existing);
+      if (world.objects.has(object) && world.objects.has(parent) && world.object(object).parent !== parent && !world.isDescendantOf(parent, object)) {
+        world.chparentAuthoredObject(context.actor, object, parent);
+      }
+      return;
+    }
+    case "set_property":
+      applySeedProperty(world, step.hook, context.localObjects, context.localSeeds, context.existing);
+      return;
+    case "attach_feature":
+      attachFeature(world, step.consumer, step.feature);
+      return;
+    case "sync_exit_aliases":
+      populateExitAliasMap(world, step.object);
+      return;
+  }
+}
+
+function upsertPropertyDef(world: WooWorld, obj: ObjRef, property: CatalogPropertyDef, owner: ObjRef): void {
+  const target = world.object(obj);
+  const expectedDefault = property.default ?? null;
+  const existing = target.propertyDefs.get(property.name);
+  if (
+    existing &&
+    existing.owner === owner &&
+    existing.perms === (property.perms ?? "rw") &&
+    (existing.typeHint ?? null) === (property.type ?? null) &&
+    stableStringify(existing.defaultValue) === stableStringify(expectedDefault)
+  ) return;
+  world.defineProperty(obj, {
+    name: property.name,
+    defaultValue: expectedDefault,
+    typeHint: property.type,
+    owner,
+    perms: property.perms ?? "rw",
+    version: existing ? existing.version + 1 : 1
+  });
+}
+
+function catalogSchemaStepTarget(step: CatalogSchemaPlanStep): string {
+  switch (step.kind) {
+    case "ensure_object":
+    case "drop_stale_verbs":
+    case "ensure_seed_object":
+    case "reconcile_seed_object":
+    case "seed_property_defaults":
+    case "sync_exit_aliases":
+      return step.object;
+    case "ensure_property_def":
+      return `${step.object}.${step.property.name}`;
+    case "ensure_verb":
+      return `${step.object}:${step.verb.name}`;
+    case "ensure_event_schema":
+      return `${step.object}:${step.schema.type}`;
+    case "change_parent":
+      return `${step.object}->${step.hook.parent}`;
+    case "set_property":
+      return `${step.object}.${step.hook.property}`;
+    case "attach_feature":
+      return `${step.consumer}+${step.feature}`;
+  }
 }
 
 function reconcileSeedObject(
@@ -741,7 +1081,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
       existing.direct_callable !== repaired.direct_callable ||
       existing.skip_presence_check !== repaired.skip_presence_check ||
       existing.tool_exposed !== repaired.tool_exposed ||
-      Object.keys(existing.line_map ?? {}).length === 0;
+      (repaired.kind !== "native" && Object.keys(existing.line_map ?? {}).length === 0);
     if (changed) world.addVerb(obj, repaired);
     return;
   }
@@ -1269,7 +1609,7 @@ function catalogVerbDrift(actual: VerbDef, expected: VerbDef): string[] {
   if (actual.direct_callable !== expected.direct_callable) drift.push("direct_callable");
   if (actual.skip_presence_check !== expected.skip_presence_check) drift.push("skip_presence_check");
   if (actual.tool_exposed !== expected.tool_exposed) drift.push("tool_exposed");
-  if (Object.keys(actual.line_map ?? {}).length === 0) drift.push("line_map");
+  if (expected.kind !== "native" && Object.keys(actual.line_map ?? {}).length === 0) drift.push("line_map");
   return drift;
 }
 

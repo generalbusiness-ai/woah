@@ -100,6 +100,7 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "bootstrap_token_used",
   "wizard_actions",
   "applied_migrations",
+  "catalog_migration_records",
   "installed_catalogs"
 ]);
 
@@ -215,6 +216,7 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "wizard_actions", []);
   seedProp(world, "$system", "bootstrap_token_used", false);
   seedProp(world, "$system", "applied_migrations", []);
+  seedProp(world, "$system", "catalog_migration_records", []);
   define(world, "$system", "help_dbs", [], "list<obj>", "r");
   define(world, "$root", "help", null, "obj|list<obj>|null", "r");
   define(world, "$actor", "presence_in", [], "list<obj>", "r");

@@ -2,7 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../src/core/authoring";
-import { createWorld, createWorldFromSerialized, nonEmptyHostScopedWorld } from "../src/core/bootstrap";
+import { createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHostScopedWorld } from "../src/core/bootstrap";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
 import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations, runHostScopedLocalCatalogLifecycle } from "../src/core/local-catalogs";
 import type { VerbDef, WooValue } from "../src/core/types";
@@ -732,22 +732,28 @@ describe("local catalogs", () => {
       { id: "n1", text: "real legacy", color: "blue", x: 10, y: 20, w: 180, h: 110, z: 4, author: "$wiz", updated_by: "$wiz" }
     ]);
 
-    runHostScopedDataMigrations(world);
+    runHostScopedDataMigrations(world, "the_pinboard");
 
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     const pins = Array.from(world.object("the_pinboard").contents).filter((id) => world.isDescendantOf(id, "$pin"));
     expect(pins).toHaveLength(1);
     expect(world.getProp(pins[0], "text")).toEqual(["real legacy"]);
     expect(world.getProp(pins[0], "color")).toBe("blue");
+    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(records).toContainEqual(expect.objectContaining({
+      plan_id: "local-catalog-data:pinboard:2026-05-02-pinboard-notes-to-pins",
+      scope: "host",
+      host: "the_pinboard",
+      status: "completed",
+      pre_legacy_records: 1,
+      post_legacy_records: 0
+    }));
   });
 
-  it("preserves live runtime properties on existing seeds across host-scoped repair", () => {
-    // Cold init keeps re-running runHostScopedLocalCatalogLifecycle, which calls
-    // repairCatalogManifest with reconcileSeedHooks: true. Earlier behavior
-    // unconditionally rewrote seed-hook properties to manifest defaults each
-    // run, silently wiping user data: the_pinboard.layout entries, room exits
-    // maps, dubspace tempo/transport/next_seq, etc. This pin asserts that
-    // repair leaves runtime state alone.
+  it("preserves live runtime properties across host-scoped schema plans", () => {
+    // Host schema plans reconcile class/seed metadata but seed-hook properties
+    // remain initial values. They must not overwrite live state such as
+    // pinboard layout entries, room exits maps, dubspace tempo/transport, etc.
     const world = createWorld();
     world.setProp("the_pinboard", "layout", { obj_pin_a: { x: 100, y: 200, w: 180, h: 110, z: 5 } });
     world.setProp("the_pinboard", "next_z", 42);
@@ -777,14 +783,7 @@ describe("local catalogs", () => {
     }
   });
 
-  it("runHostScopedLocalCatalogLifecycle leaves host-owned source untouched while still running data migrations", () => {
-    // Schema repair on host slices is currently disabled (see comment on
-    // runHostScopedLocalCatalogLifecycle): repairCatalogManifest's
-    // populateSeedExitAliasMaps post-pass conflicts with host-slice exits
-    // state, and reconcileSeedObject previously wiped runtime properties.
-    // For now, host slices keep whatever source the gateway shipped them and
-    // only the idempotent data migrations run. This test pins that behavior
-    // so re-enabling schema repair is a deliberate change with new coverage.
+  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", () => {
     const gateway = createWorld();
     const listNotes = worldVerb(gateway, "$pinboard", "list_notes");
     const installed = installVerb(gateway, "$pinboard", "list_notes", `verb :list_notes() rxd {
@@ -797,9 +796,69 @@ describe("local catalogs", () => {
     const host = createWorldFromSerialized(scoped!, { persist: false });
     expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("return this.notes");
 
-    runHostScopedLocalCatalogLifecycle(host);
+    runHostScopedLocalCatalogLifecycle(host, "the_pinboard");
 
-    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("return this.notes");
+    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("contents(this)");
+    const records = host.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(records).toContainEqual(expect.objectContaining({
+      plan_id: expect.stringMatching(/^local-catalog-schema:pinboard:/),
+      scope: "host",
+      host: "the_pinboard",
+      status: "completed"
+    }));
+  });
+
+  it("auto-syncs local catalog schema drift without a hand-authored boot migration", () => {
+    const world = createWorld();
+    const listNotes = worldVerb(world, "$pinboard", "list_notes");
+    const installed = installVerb(world, "$pinboard", "list_notes", `verb :list_notes() rxd {
+  return this.notes;
+}`, listNotes.version);
+    expect(installed.ok).toBe(true);
+    const layoutDef = world.object("$pinboard").propertyDefs.get("layout");
+    expect(layoutDef).toBeDefined();
+    world.object("$pinboard").propertyDefs.set("layout", { ...layoutDef!, perms: "rw" });
+    const before = world.getProp("$system", "applied_migrations") as string[];
+    expect(before.some((id) => id.startsWith("local-catalog-schema:pinboard:"))).toBe(true);
+
+    installLocalCatalogs(world, []);
+
+    expect(worldVerb(world, "$pinboard", "list_notes").source).toContain("contents(this)");
+    expect(world.object("$pinboard").propertyDefs.get("layout")?.perms).toBe("r");
+    const after = world.getProp("$system", "applied_migrations") as string[];
+    expect(after.filter((id) => id.startsWith("local-catalog-schema:pinboard:"))).toHaveLength(1);
+    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(records).toContainEqual(expect.objectContaining({
+      plan_id: expect.stringMatching(/^local-catalog-schema:pinboard:/),
+      scope: "gateway",
+      host: "world",
+      status: "completed",
+      steps: expect.arrayContaining([expect.objectContaining({ id: expect.stringContaining("ensure_property_def:$pinboard.layout") })])
+    }));
+    const registry = world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
+    const pinboard = registry.find((record) => record.alias === "pinboard");
+    expect(pinboard?.provenance).toMatchObject({
+      local_schema_sync: expect.stringMatching(/^local-catalog-schema:pinboard:/),
+      local_manifest_hash: expect.stringMatching(/^sha256:/)
+    });
+  });
+
+  it("propagates gateway auto-synced schema to an existing host slice through seed merge", () => {
+    const staleGateway = createWorld();
+    const listNotes = worldVerb(staleGateway, "$pinboard", "list_notes");
+    const installed = installVerb(staleGateway, "$pinboard", "list_notes", `verb :list_notes() rxd {
+  return this.notes;
+}`, listNotes.version);
+    expect(installed.ok).toBe(true);
+    const staleScoped = nonEmptyHostScopedWorld(staleGateway.exportWorld(), "the_pinboard");
+    expect(staleScoped).not.toBeNull();
+
+    installLocalCatalogs(staleGateway, []);
+    const repairedScoped = nonEmptyHostScopedWorld(staleGateway.exportWorld(), "the_pinboard");
+    expect(repairedScoped).not.toBeNull();
+
+    const host = createWorldFromSerialized(mergeHostScopedSeed(staleScoped!, repairedScoped!), { persist: false });
+    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("contents(this)");
   });
 
   it("seeds the_cockatoo in the chatroom with random-pick squawk", async () => {

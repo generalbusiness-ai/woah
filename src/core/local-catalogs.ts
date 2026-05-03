@@ -1,5 +1,15 @@
 import { BUNDLED_CATALOGS } from "../generated/bundled-catalogs";
-import { catalogManifestStatus, installCatalogManifest, repairCatalogManifest, type CatalogManifest, type CatalogManifestStatus } from "./catalog-installer";
+import {
+  applyCatalogSchemaPlan,
+  catalogManifestStatus,
+  installCatalogManifest,
+  planCatalogSchemaMigration,
+  verifyCatalogSchemaPlan,
+  type CatalogManifest,
+  type CatalogManifestStatus,
+  type CatalogSchemaPlanApplyResult,
+  type CatalogSchemaPlanScope
+} from "./catalog-installer";
 import type { ObjRef, WooValue } from "./types";
 import type { WooWorld } from "./world";
 
@@ -48,6 +58,7 @@ const LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION = "2026-05-03-chat-look-at-collec
 const LOCAL_CATALOG_TASKSPACE_LIST_TASKS_GUARD_MIGRATION = "2026-05-02-taskspace-list-tasks-guard";
 const LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION = "2026-05-02-prog-editor-room";
 const LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION = "2026-05-02-prog-editor-nowhere";
+const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
 
@@ -106,21 +117,25 @@ export function parseAutoInstallCatalogs(value: string | undefined): string[] {
 
 export function installLocalCatalogs(world: WooWorld, names: readonly string[] = DEFAULT_LOCAL_CATALOGS): void {
   const requested = sortCatalogNames(names);
-  for (const name of requested) installLocalCatalog(world, name);
+  const cleanInstalled = new Set<string>();
+  for (const name of requested) {
+    if (installLocalCatalog(world, name)) cleanInstalled.add(name);
+  }
 
   // Existing worlds still need repair even when WOO_AUTO_INSTALL_CATALOGS is
   // intentionally empty. Missing dependencies of already-installed local
   // catalogs are compatibility repair, not fresh auto-install policy.
   const repairNames = localMigrationCatalogNames(world, requested);
   installMissingLocalCatalogDependencies(world, repairNames);
-  runLocalCatalogMigrations(world, repairNames);
+  const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
+  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered, requested.length === 0);
 }
 
-export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): void {
+export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): boolean {
   if (!isLocalCatalogName(name)) throw new Error(`unknown local catalog: ${name}`);
   // Boot auto-install is part of deterministic world construction, not a user
   // catalog operation. Runtime installs still go through $catalog_registry.
-  if (localCatalogInstalled(world, name)) return;
+  if (localCatalogInstalled(world, name)) return false;
   const manifest = LOCAL_CATALOGS.get(name)!;
   const provenance: Record<string, WooValue> = {
     tap: "@local",
@@ -130,19 +145,32 @@ export function installLocalCatalog(world: WooWorld, name: string, options: { ad
     ref_resolved_sha: "unversioned"
   };
   installCatalogManifest(world, manifest, { tap: "@local", alias: name, actor: "$wiz", provenance, adoptExisting: options.adoptExisting === true });
+  return options.adoptExisting !== true;
 }
 
 export function localCatalogStatuses(world: WooWorld, names: readonly string[] = DEFAULT_LOCAL_CATALOGS): LocalCatalogStatus[] {
   return sortCatalogNames(names).map((name) => {
     if (!isLocalCatalogName(name)) throw new Error(`unknown local catalog: ${name}`);
-    const migrations = LOCAL_CATALOG_MIGRATION_INDEX
-      .filter((migration) => !migration.only || migration.only === name)
-      .map((migration) => ({ id: migration.id, applied: migrationApplied(world, migration.id) }));
-    const base = catalogManifestStatus(world, LOCAL_CATALOGS.get(name)!, {
+    const manifest = LOCAL_CATALOGS.get(name)!;
+    const base = catalogManifestStatus(world, manifest, {
       tap: "@local",
       alias: name,
       actor: "$wiz",
       allowImplementationHints: true
+    });
+    const migrations = LOCAL_CATALOG_MIGRATION_INDEX
+      .filter((migration) => !migration.only || migration.only === name)
+      .map((migration) => ({ id: migration.id, applied: migrationApplied(world, migration.id) }));
+    const plan = planCatalogSchemaMigration(world, manifest, {
+      actor: "$wiz",
+      allowImplementationHints: true,
+      reconcileSeedHooks: true,
+      scope: "gateway",
+      host: "world"
+    });
+    migrations.push({
+      id: plan.id,
+      applied: catalogMigrationRecordCompleted(world, plan.id, "gateway", "world") && !catalogSchemaStatusNeedsSync(base)
     });
     return {
       ...base,
@@ -153,54 +181,55 @@ export function localCatalogStatuses(world: WooWorld, names: readonly string[] =
   });
 }
 
-export function runHostScopedLocalCatalogLifecycle(world: WooWorld): void {
-  // Host-scoped schema repair (verb sources, property defs, seed-hook
-  // reconciliation) is currently disabled because repairCatalogManifest's
-  // post-pass populateSeedExitAliasMaps treats the exits map as authoritative
-  // and conflicts with whatever the host slice has — and reconcileSeedObject's
-  // property reset previously wiped runtime state. Schema repair lives on the
-  // gateway only; host-scoped DOs run only the idempotent data migrations.
-  runHostScopedDataMigrations(world);
+export function runHostScopedLocalCatalogLifecycle(world: WooWorld, host = "host", options: { freshSeed?: boolean } = {}): void {
+  runHostScopedSchemaPlans(world, host, options.freshSeed === true);
+  runHostScopedDataMigrations(world, host);
 }
 
-function runLocalCatalogMigrations(world: WooWorld, names: readonly string[]): void {
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_SOURCE_MIGRATION);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PLACEMENT_MIGRATION);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_COCKATOO_MIGRATION);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_LOOK_CONTENTS_MIGRATION);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_COMMAND_PARSER_MIGRATION, { allowImplementationHints: true });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_DUBSPACE_CONTROL_GUARDS_MIGRATION, { allowImplementationHints: true });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_DUBSPACE_MOUNTED_CONTROLS_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "dubspace" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_ROOM_LOOK_SELF_MIGRATION, { allowImplementationHints: true });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_THREE_ROOM_MIGRATION, { allowImplementationHints: true });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_OBSERVATION_OUTPUT_MIGRATION, { allowImplementationHints: true });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_ROOM_CONTENTS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_AGENT_TOOL_EXPOSURE_REPAIR_MIGRATION, { allowImplementationHints: true });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_NAVIGATION_TOOL_EXPOSURE_MIGRATION, { allowImplementationHints: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_COCKATOO_TOOL_EXPOSURE_MIGRATION, { allowImplementationHints: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_NOWHERE_PORTABLES_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, rehomeNowhereSeedObjects: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_TASKSPACE_VERBS_REPAIR_MIGRATION, { allowImplementationHints: true, only: "taskspace" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PINBOARD_LOOK_OBSERVATION_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PINBOARD_ACTIVITY_TEXT_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PINBOARD_VIEWPORT_PRESENCE_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PINBOARD_FREE_COORDS_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_DUBSPACE_SOURCE_PRESENCE_MIGRATION, { allowImplementationHints: true, only: "dubspace" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PINBOARD_SOURCE_PRESENCE_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PINBOARD_PINS_MODEL_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "pinboard" });
+function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cleanInstalled: ReadonlySet<string>): Set<string> {
+  const covered = new Set<string>();
+  const run = (id: string, options: { allowImplementationHints?: boolean; reconcileSeedHooks?: boolean; rehomeNowhereSeedObjects?: boolean; reconcileClassVerbs?: boolean; only?: string } = {}) => {
+    for (const name of runLocalCatalogMigration(world, names, cleanInstalled, id, options)) covered.add(name);
+  };
+
+  run(LOCAL_CATALOG_SOURCE_MIGRATION);
+  run(LOCAL_CATALOG_PLACEMENT_MIGRATION);
+  run(LOCAL_CATALOG_CHAT_COCKATOO_MIGRATION);
+  run(LOCAL_CATALOG_CHAT_LOOK_CONTENTS_MIGRATION);
+  run(LOCAL_CATALOG_CHAT_COMMAND_PARSER_MIGRATION, { allowImplementationHints: true });
+  run(LOCAL_CATALOG_DUBSPACE_CONTROL_GUARDS_MIGRATION, { allowImplementationHints: true });
+  run(LOCAL_CATALOG_DUBSPACE_MOUNTED_CONTROLS_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "dubspace" });
+  run(LOCAL_CATALOG_ROOM_LOOK_SELF_MIGRATION, { allowImplementationHints: true });
+  run(LOCAL_CATALOG_CHAT_THREE_ROOM_MIGRATION, { allowImplementationHints: true });
+  run(LOCAL_CATALOG_CHAT_OBSERVATION_OUTPUT_MIGRATION, { allowImplementationHints: true });
+  run(LOCAL_CATALOG_CHAT_ROOM_CONTENTS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "chat" });
+  run(LOCAL_CATALOG_AGENT_TOOL_EXPOSURE_REPAIR_MIGRATION, { allowImplementationHints: true });
+  run(LOCAL_CATALOG_CHAT_NAVIGATION_TOOL_EXPOSURE_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_COCKATOO_TOOL_EXPOSURE_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_NOWHERE_PORTABLES_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, rehomeNowhereSeedObjects: true, only: "chat" });
+  run(LOCAL_CATALOG_TASKSPACE_VERBS_REPAIR_MIGRATION, { allowImplementationHints: true, only: "taskspace" });
+  run(LOCAL_CATALOG_PINBOARD_LOOK_OBSERVATION_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
+  run(LOCAL_CATALOG_PINBOARD_ACTIVITY_TEXT_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
+  run(LOCAL_CATALOG_PINBOARD_VIEWPORT_PRESENCE_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
+  run(LOCAL_CATALOG_PINBOARD_FREE_COORDS_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
+  run(LOCAL_CATALOG_DUBSPACE_SOURCE_PRESENCE_MIGRATION, { allowImplementationHints: true, only: "dubspace" });
+  run(LOCAL_CATALOG_PINBOARD_SOURCE_PRESENCE_MIGRATION, { allowImplementationHints: true, only: "pinboard" });
+  run(LOCAL_CATALOG_PINBOARD_PINS_MODEL_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "pinboard" });
   runPinboardNotesToPinsMigration(world, names, LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION);
   runPinboardV02RepairMigration(world, names);
   runPinboardNotesToPinsMigration(world, names, LOCAL_CATALOG_PINBOARD_V02_DATA_REPAIR_MIGRATION);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_SOURCE_MOVEMENT_MIGRATION, { allowImplementationHints: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_ROOM_EXIT_MODEL_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_EXIT_PRIVILEGE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_EXIT_ALIAS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_STALE_CLASS_VERBS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_SOURCE_MOVEMENT_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_ROOM_EXIT_MODEL_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_EXIT_PRIVILEGE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_EXIT_ALIAS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileSeedHooks: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_STALE_CLASS_VERBS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   runChatLookSkipPresenceMigration(world, names);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION, { allowImplementationHints: true, only: "chat" });
   runTaskspaceListTasksGuardMigration(world, names);
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
-  runLocalCatalogMigration(world, names, LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
+  run(LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
+  run(LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
+  return covered;
 }
 
 function localMigrationCatalogNames(world: WooWorld, requested: readonly string[]): string[] {
@@ -235,7 +264,6 @@ function hostScopedLocalCatalogNames(world: WooWorld): string[] {
 }
 
 function localCatalogPresentInWorldSlice(world: WooWorld, name: string, hostedDataIds: Set<ObjRef>): boolean {
-  if (localCatalogInstalled(world, name)) return true;
   const manifest = LOCAL_CATALOGS.get(name);
   if (!manifest) return false;
   for (const hook of manifest.seed_hooks ?? []) {
@@ -254,49 +282,90 @@ function localCatalogPresentInWorldSlice(world: WooWorld, name: string, hostedDa
   return false;
 }
 
-function repairHostScopedLocalCatalog(world: WooWorld, name: string): void {
-  const manifest = LOCAL_CATALOGS.get(name);
-  if (!manifest) return;
-  try {
-    repairCatalogManifest(world, manifest, {
-      actor: "$wiz",
+function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: boolean): void {
+  for (const name of hostScopedLocalCatalogNames(world)) {
+    const manifest = LOCAL_CATALOGS.get(name);
+    if (!manifest) continue;
+    if (freshSeed) {
+      recordCoveredHostCatalogSchemaPlan(world, host, manifest);
+      continue;
+    }
+    const result = runLocalCatalogSchemaPlan(world, name, manifest, "host", host, {
       allowImplementationHints: true,
       reconcileSeedHooks: true,
       skipMissingSeedHooks: true
     });
-  } catch (err) {
-    // Host-scoped slices may temporarily lack a support object until the
-    // gateway's fresh seed can be fetched and merged. Catalog repair is
-    // idempotent, so defer rather than bricking unrelated requests on this DO.
-    console.warn("woo.local_catalog_host_repair_deferred", { catalog: name, error: repairErrorSummary(err) });
+    if (result.status === "failed") {
+      console.warn("woo.local_catalog_host_schema_plan_failed", { catalog: name, host, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
+    }
   }
 }
 
-function runLocalCatalogMigration(world: WooWorld, names: readonly string[], id: string, options: { allowImplementationHints?: boolean; reconcileSeedHooks?: boolean; rehomeNowhereSeedObjects?: boolean; reconcileClassVerbs?: boolean; only?: string } = {}): void {
-  if (migrationApplied(world, id)) return;
+function recordCoveredHostCatalogSchemaPlan(world: WooWorld, host: string, manifest: CatalogManifest): void {
+  const plan = planCatalogSchemaMigration(world, manifest, {
+    actor: "$wiz",
+    allowImplementationHints: true,
+    reconcileSeedHooks: true,
+    skipMissingSeedHooks: true,
+    scope: "host",
+    host
+  });
+  if (catalogMigrationRecordCompleted(world, plan.id, "host", host)) return;
+  const now = Date.now();
+  recordCatalogMigrationResult(world, {
+    status: "completed",
+    plan_id: plan.id,
+    catalog: plan.catalog,
+    version: plan.version,
+    manifest_hash: plan.manifest_hash,
+    scope: "host",
+    host,
+    started_at: now,
+    completed_at: now,
+    steps: plan.steps.map((step) => ({ id: step.id, kind: step.kind, target: stepTarget(step), status: "skipped" })),
+    issues: []
+  }, []);
+}
+
+function runLocalCatalogMigration(
+  world: WooWorld,
+  names: readonly string[],
+  cleanInstalled: ReadonlySet<string>,
+  id: string,
+  options: { allowImplementationHints?: boolean; reconcileSeedHooks?: boolean; rehomeNowhereSeedObjects?: boolean; reconcileClassVerbs?: boolean; only?: string } = {}
+): Set<string> {
+  const covered = new Set<string>();
+  if (migrationApplied(world, id)) return covered;
   let repaired = false;
   for (const name of names) {
     if (options.only && name !== options.only) continue;
     if (!localCatalogInstalled(world, name)) continue;
-    repairCatalogManifest(world, LOCAL_CATALOGS.get(name)!, {
-      actor: "$wiz",
+    if (cleanInstalled.has(name)) {
+      repaired = true;
+      covered.add(name);
+      continue;
+    }
+    const result = runLocalCatalogSchemaPlan(world, name, LOCAL_CATALOGS.get(name)!, "gateway", "world", {
       allowImplementationHints: options.allowImplementationHints,
       reconcileSeedHooks: options.reconcileSeedHooks,
       rehomeNowhereSeedObjects: options.rehomeNowhereSeedObjects,
       reconcileClassVerbs: options.reconcileClassVerbs
     });
+    if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
     repaired = true;
+    covered.add(name);
   }
   if (repaired || !options.only) markMigrationApplied(world, id);
+  return covered;
 }
 
 function runPinboardV02RepairMigration(world: WooWorld, names: readonly string[]): void {
   if (!names.includes("pinboard")) return;
   if (!localCatalogInstalled(world, "pinboard")) return;
   if (migrationApplied(world, LOCAL_CATALOG_PINBOARD_V02_REPAIR_MIGRATION)) return;
-  // The repair re-walks the manifest, which references $note as $pin's
-  // parent. Without that ancestor in place repairCatalogManifest throws
-  // E_UNRESOLVED_REFERENCE — defer until a later boot installs note.
+  // The plan references $note as $pin's parent. Without that ancestor in
+  // place, planning cannot prove the postcondition — defer until a later boot
+  // installs note.
   if (!world.objects.has("$note")) return;
   const listNotes = world.objects.has("$pinboard") ? world.ownVerbExact("$pinboard", "list_notes") : null;
   const needsRepair =
@@ -306,12 +375,12 @@ function runPinboardV02RepairMigration(world: WooWorld, names: readonly string[]
     !world.ownVerbExact("$pinboard", "add_note")?.source.includes("create($pin");
 
   if (needsRepair) {
-    repairCatalogManifest(world, LOCAL_CATALOGS.get("pinboard")!, {
-      actor: "$wiz",
+    const result = runLocalCatalogSchemaPlan(world, "pinboard", LOCAL_CATALOGS.get("pinboard")!, "gateway", "world", {
       allowImplementationHints: true,
       reconcileSeedHooks: true,
       reconcileClassVerbs: true
     });
+    if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
   markMigrationApplied(world, LOCAL_CATALOG_PINBOARD_V02_REPAIR_MIGRATION);
 }
@@ -333,12 +402,257 @@ function runTaskspaceListTasksGuardMigration(world: WooWorld, names: readonly st
   if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_LIST_TASKS_GUARD_MIGRATION)) return;
   const listTasks = world.objects.has("$taskspace") ? world.ownVerbExact("$taskspace", "list_tasks") : null;
   if (!listTasks || !listTasks.source.includes("isa(t, $task)")) {
-    repairCatalogManifest(world, LOCAL_CATALOGS.get("taskspace")!, {
-      actor: "$wiz",
+    const result = runLocalCatalogSchemaPlan(world, "taskspace", LOCAL_CATALOGS.get("taskspace")!, "gateway", "world", {
       allowImplementationHints: true
     });
+    if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_LIST_TASKS_GUARD_MIGRATION);
+}
+
+function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>, forceVerify: boolean): void {
+  for (const name of names) {
+    if (!localCatalogInstalled(world, name)) continue;
+    const manifest = LOCAL_CATALOGS.get(name)!;
+    if (covered.has(name)) {
+      recordCoveredLocalCatalogSchemaPlan(world, name, manifest);
+      continue;
+    }
+    const plan = planCatalogSchemaMigration(world, manifest, {
+      actor: "$wiz",
+      allowImplementationHints: true,
+      reconcileSeedHooks: true,
+      scope: "gateway",
+      host: "world"
+    });
+    if (
+      !forceVerify &&
+      catalogMigrationRecordCompleted(world, plan.id, "gateway", "world") &&
+      localCatalogInstalledManifestHash(world, name) === plan.manifest_hash
+    ) {
+      markMigrationApplied(world, plan.id);
+      continue;
+    }
+    const result = runLocalCatalogSchemaPlan(world, name, manifest, "gateway", "world", {
+      allowImplementationHints: true,
+      reconcileSeedHooks: true
+    });
+    if (result.status === "completed") markMigrationApplied(world, result.plan_id);
+    else console.warn("woo.local_catalog_schema_plan_failed", { catalog: name, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
+  }
+}
+
+function localCatalogInstalledManifestHash(world: WooWorld, name: string): string | null {
+  if (!world.objects.has("$catalog_registry")) return null;
+  const raw = world.propOrNull("$catalog_registry", "installed_catalogs");
+  if (!Array.isArray(raw)) return null;
+  for (const record of raw) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+    const item = record as Record<string, WooValue>;
+    if (item.tap !== "@local") continue;
+    if (item.alias !== name && item.catalog !== name) continue;
+    const provenance = item.provenance;
+    if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) return null;
+    const hash = (provenance as Record<string, WooValue>).local_manifest_hash;
+    return typeof hash === "string" ? hash : null;
+  }
+  return null;
+}
+
+function recordCoveredLocalCatalogSchemaPlan(world: WooWorld, name: string, manifest: CatalogManifest): void {
+  const plan = planCatalogSchemaMigration(world, manifest, {
+    actor: "$wiz",
+    allowImplementationHints: true,
+    reconcileSeedHooks: true,
+    scope: "gateway",
+    host: "world"
+  });
+  if (!catalogMigrationRecordCompleted(world, plan.id, "gateway", "world")) {
+    const now = Date.now();
+    recordCatalogMigrationResult(world, {
+      status: "completed",
+      plan_id: plan.id,
+      catalog: plan.catalog,
+      version: plan.version,
+      manifest_hash: plan.manifest_hash,
+      scope: "gateway",
+      host: "world",
+      started_at: now,
+      completed_at: now,
+      steps: plan.steps.map((step) => ({ id: step.id, kind: step.kind, target: stepTarget(step), status: "skipped" })),
+      issues: []
+    }, []);
+  }
+  markMigrationApplied(world, plan.id);
+  recordLocalCatalogSchemaSync(world, name, plan.id, plan.manifest_hash, manifest);
+}
+
+function catalogSchemaStatusNeedsSync(status: CatalogManifestStatus): boolean {
+  return status.issues.some((issue) => issue.kind !== "not_installed" && issue.kind !== "version_mismatch");
+}
+
+function runLocalCatalogSchemaPlan(
+  world: WooWorld,
+  name: string,
+  manifest: CatalogManifest,
+  scope: CatalogSchemaPlanScope,
+  host: string,
+  options: {
+    allowImplementationHints?: boolean;
+    reconcileSeedHooks?: boolean;
+    skipMissingSeedHooks?: boolean;
+    rehomeNowhereSeedObjects?: boolean;
+    reconcileClassVerbs?: boolean;
+  } = {}
+): CatalogSchemaPlanApplyResult {
+  const plan = planCatalogSchemaMigration(world, manifest, {
+    actor: "$wiz",
+    ...options,
+    scope,
+    host
+  });
+  const preIssues = verifyCatalogSchemaPlan(world, manifest, plan);
+  if (catalogMigrationRecordCompleted(world, plan.id, scope, host) && preIssues.length === 0) {
+    return {
+      status: "completed",
+      plan_id: plan.id,
+      catalog: plan.catalog,
+      version: plan.version,
+      manifest_hash: plan.manifest_hash,
+      scope,
+      host,
+      started_at: Date.now(),
+      completed_at: Date.now(),
+      steps: plan.steps.map((step) => ({ id: step.id, kind: step.kind, target: stepTarget(step), status: "skipped" })),
+      issues: []
+    };
+  }
+  const result = applyCatalogSchemaPlan(world, manifest, plan, {
+    actor: "$wiz",
+    ...options,
+    scope,
+    host
+  });
+  recordCatalogMigrationResult(world, result, preIssues);
+  if (result.status === "completed" && scope === "gateway") recordLocalCatalogSchemaSync(world, name, result.plan_id, result.manifest_hash, manifest);
+  return result;
+}
+
+function recordLocalCatalogSchemaSync(world: WooWorld, name: string, id: string, manifestHash: string, manifest: CatalogManifest): void {
+  if (!world.objects.has("$catalog_registry")) return;
+  const raw = world.propOrNull("$catalog_registry", "installed_catalogs");
+  if (!Array.isArray(raw)) return;
+  const next = raw.map((record) => {
+    if (!record || typeof record !== "object" || Array.isArray(record)) return record;
+    const item = record as Record<string, WooValue>;
+    if (item.tap !== "@local") return record;
+    if (item.alias !== name && item.catalog !== name) return record;
+    const provenance = item.provenance && typeof item.provenance === "object" && !Array.isArray(item.provenance)
+      ? { ...(item.provenance as Record<string, WooValue>) }
+      : {};
+    return {
+      ...item,
+      version: manifest.version,
+      updated_at: Date.now(),
+      objects: { ...mapValue(item.objects), ...manifestObjectRefs(manifest) },
+      seeds: { ...mapValue(item.seeds), ...manifestSeedRefs(manifest) },
+      provenance: {
+        ...provenance,
+        local_schema_sync: id,
+        local_manifest_hash: manifestHash
+      }
+    } as WooValue;
+  });
+  world.setProp("$catalog_registry", "installed_catalogs", next as WooValue);
+}
+
+function stepTarget(step: { kind: string } & Record<string, unknown>): string {
+  if (typeof step.object === "string") {
+    if (step.kind === "ensure_property_def" && step.property && typeof step.property === "object" && "name" in step.property) return `${step.object}.${String(step.property.name)}`;
+    if (step.kind === "ensure_verb" && step.verb && typeof step.verb === "object" && "name" in step.verb) return `${step.object}:${String(step.verb.name)}`;
+    return step.object;
+  }
+  if (typeof step.consumer === "string" && typeof step.feature === "string") return `${step.consumer}+${step.feature}`;
+  return step.kind;
+}
+
+function catalogMigrationRecordCompleted(world: WooWorld, planId: string, scope: CatalogSchemaPlanScope, host: string): boolean {
+  return catalogMigrationRecords(world).some((record) =>
+    record.plan_id === planId &&
+    record.scope === scope &&
+    record.host === host &&
+    record.status === "completed"
+  );
+}
+
+function localCatalogManifestHashForRecord(world: WooWorld, name: string, scope: CatalogSchemaPlanScope, host: string): string {
+  const manifest = LOCAL_CATALOGS.get(name);
+  if (!manifest) return "";
+  return planCatalogSchemaMigration(world, manifest, {
+    actor: "$wiz",
+    allowImplementationHints: true,
+    reconcileSeedHooks: true,
+    skipMissingSeedHooks: scope === "host",
+    scope,
+    host
+  }).manifest_hash;
+}
+
+function recordCatalogMigrationResult(world: WooWorld, result: CatalogSchemaPlanApplyResult, preIssues: CatalogSchemaPlanApplyResult["issues"]): void {
+  if (!world.objects.has("$system")) return;
+  const record: Record<string, WooValue> = {
+    plan_id: result.plan_id,
+    catalog: result.catalog,
+    version: result.version,
+    manifest_hash: result.manifest_hash,
+    scope: result.scope,
+    host: result.host,
+    status: result.status,
+    started_at: result.started_at,
+    completed_at: result.completed_at,
+    steps: result.steps as unknown as WooValue,
+    pre_issues: preIssues as unknown as WooValue,
+    post_issues: result.issues as unknown as WooValue
+  };
+  if (result.error) record.error = result.error as unknown as WooValue;
+  const records = catalogMigrationRecords(world);
+  const next = [
+    ...records.filter((item) => !(item.plan_id === result.plan_id && item.scope === result.scope && item.host === result.host && item.status === "completed")),
+    record
+  ].slice(-CATALOG_MIGRATION_RECORD_LIMIT);
+  world.setProp("$system", "catalog_migration_records", next as WooValue);
+}
+
+function recordCatalogDataMigrationResult(world: WooWorld, result: Record<string, WooValue>): void {
+  if (!world.objects.has("$system")) return;
+  const records = catalogMigrationRecords(world);
+  const next = [
+    ...records.filter((item) => !(item.plan_id === result.plan_id && item.scope === result.scope && item.host === result.host && item.status === "completed")),
+    result
+  ].slice(-CATALOG_MIGRATION_RECORD_LIMIT);
+  world.setProp("$system", "catalog_migration_records", next as WooValue);
+}
+
+function catalogMigrationRecords(world: WooWorld): Array<Record<string, WooValue>> {
+  if (!world.objects.has("$system")) return [];
+  const raw = world.propOrNull("$system", "catalog_migration_records");
+  return Array.isArray(raw)
+    ? raw.filter((item): item is Record<string, WooValue> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+function manifestObjectRefs(manifest: CatalogManifest): Record<string, WooValue> {
+  const refs: Record<string, WooValue> = {};
+  for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) refs[def.local_name] = def.local_name;
+  return refs;
+}
+
+function manifestSeedRefs(manifest: CatalogManifest): Record<string, WooValue> {
+  const refs: Record<string, WooValue> = {};
+  for (const hook of manifest.seed_hooks ?? []) {
+    if (hook.kind === "create_instance") refs[hook.as] = hook.as;
+  }
+  return refs;
 }
 
 function isLocalCatalogName(name: string): name is LocalCatalogName {
@@ -424,9 +738,9 @@ function markMigrationApplied(world: WooWorld, id: string): void {
  * hasEquivalentMigratedPin (or equivalent) to avoid duplicate work, so calling
  * on every cold init is safe and cheap when there's nothing to do.
  */
-export function runHostScopedDataMigrations(world: WooWorld): void {
+export function runHostScopedDataMigrations(world: WooWorld, host = "host"): void {
   if (world.objects.has("$pin") && world.objects.has("$pinboard")) {
-    world.withMutationSavepoint(() => migratePinboardNoteRecords(world));
+    runPinboardNotesToPinsDataPlan(world, LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION, "host", host);
   }
 }
 
@@ -435,10 +749,55 @@ function runPinboardNotesToPinsMigration(world: WooWorld, names: readonly string
   if (!localCatalogInstalled(world, "pinboard")) return;
   if (migrationApplied(world, id)) return;
   if (!world.objects.has("$pin") || !world.objects.has("$pinboard")) return;
-  world.withMutationSavepoint(() => {
-    migratePinboardNoteRecords(world);
+  const result = runPinboardNotesToPinsDataPlan(world, id, "gateway", "world");
+  if (result.status === "completed") {
     markMigrationApplied(world, id);
-  });
+  }
+}
+
+function runPinboardNotesToPinsDataPlan(world: WooWorld, id: string, scope: CatalogSchemaPlanScope, host: string): { status: "completed" | "failed" } {
+  const planId = `local-catalog-data:pinboard:${id}`;
+  const manifestHash = localCatalogManifestHashForRecord(world, "pinboard", scope, host);
+  const preLegacyRecords = countPinboardLegacyNoteRecords(world);
+  if (catalogMigrationRecordCompleted(world, planId, scope, host) && preLegacyRecords === 0) return { status: "completed" };
+  const startedAt = Date.now();
+  try {
+    world.withMutationSavepoint(() => migratePinboardNoteRecords(world));
+    const postLegacyRecords = countPinboardLegacyNoteRecords(world);
+    const status = postLegacyRecords === 0 ? "completed" : "failed";
+    recordCatalogDataMigrationResult(world, {
+      plan_id: planId,
+      catalog: "pinboard",
+      version: String(LOCAL_CATALOGS.get("pinboard")?.version ?? ""),
+      manifest_hash: manifestHash,
+      scope,
+      host,
+      status,
+      started_at: startedAt,
+      completed_at: Date.now(),
+      pre_legacy_records: preLegacyRecords,
+      post_legacy_records: postLegacyRecords,
+      steps: [{ id: "1:migrate_pinboard_note_records", kind: "data_migration", target: "pinboard.notes", status: status === "completed" ? "applied" : "failed" }]
+    });
+    return { status };
+  } catch (err) {
+    recordCatalogDataMigrationResult(world, {
+      plan_id: planId,
+      catalog: "pinboard",
+      version: String(LOCAL_CATALOGS.get("pinboard")?.version ?? ""),
+      manifest_hash: manifestHash,
+      scope,
+      host,
+      status: "failed",
+      started_at: startedAt,
+      completed_at: Date.now(),
+      pre_legacy_records: preLegacyRecords,
+      post_legacy_records: countPinboardLegacyNoteRecords(world),
+      steps: [{ id: "1:migrate_pinboard_note_records", kind: "data_migration", target: "pinboard.notes", status: "failed", error: repairErrorSummary(err) }],
+      error: repairErrorSummary(err)
+    });
+    return { status: "failed" };
+  }
 }
 
 function migratePinboardNoteRecords(world: WooWorld): void {
@@ -488,6 +847,16 @@ function migratePinboardNoteRecords(world: WooWorld): void {
     if (hadLegacyNotes) world.deleteProp(board, "notes");
     if (hadLegacyNextId) world.deleteProp(board, "next_note_id");
   }
+}
+
+function countPinboardLegacyNoteRecords(world: WooWorld): number {
+  if (!world.objects.has("$pinboard")) return 0;
+  let count = 0;
+  for (const board of pinboardInstances(world)) {
+    const raw = world.propOrNull(board, "notes");
+    if (Array.isArray(raw)) count += raw.filter((item) => item && typeof item === "object" && !Array.isArray(item)).length;
+  }
+  return count;
 }
 
 function hasEquivalentMigratedPin(world: WooWorld, board: ObjRef, record: Record<string, WooValue>): boolean {

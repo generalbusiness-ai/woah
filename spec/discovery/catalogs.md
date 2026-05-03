@@ -240,7 +240,7 @@ Implementation rule: source code must not contain catalog-specific install polic
 ### CT5.4.1 Local boot migrations
 
 Local catalog auto-install may also run **deployment-local boot migrations**.
-These are not public catalog update migrations (§CT14). They are one-off repair
+These are not public catalog update migrations (§CT14). They are repair/sync
 steps for worlds created by an earlier build of the same deployment, such as
 recompiling bundled catalog verbs after a DSL/compiler capability lands.
 
@@ -251,13 +251,26 @@ world repairs only catalogs already present in `$catalog_registry`. Missing
 dependencies of an already-installed bundled catalog may be installed as a
 compatibility repair; this is not an auto-install policy for clean worlds.
 
+For ordinary bundled manifest drift, the deployment computes a stable manifest
+fingerprint and compares the manifest against stored classes, verbs, property
+definitions, schemas, and seed hooks. If drift is detected, the gateway repairs
+from the manifest and records `local-catalog-schema:<catalog>:<hash>`. The id is
+derived from content, not hand-authored for each source edit; this keeps routine
+source/schema sync repeatable and declaration-free. Explicit one-shot boot
+migrations remain only for data conversions or compatibility repairs that cannot
+be inferred from a manifest diff.
+
 In multi-host deployments, every host that owns catalog data must run its own
 host-scoped local lifecycle at cold init. Gateway repair cannot see or safely
 convert state stored in self-hosted object DOs, and a copied
 `$system.applied_migrations` ledger is not proof that the owning host's data was
-already repaired. Host-scoped repair is therefore based on the catalog objects
-and self-hosted instances present in that host slice, plus their local
-dependencies, and the repair must be idempotent.
+already repaired. Object hosts receive repaired class/verb/schema rows by merging
+a fresh gateway host seed. A brand-new host DO records the host-scoped
+content-addressed schema plan as covered by that seed; a host with stored state
+executes scoped plan steps, verifies postconditions, and appends a host-specific
+record to `$system.catalog_migration_records`. They do not run opaque manifest
+repair over partial slices. Host-local data migrations use the same ledger and
+run against state the host actually owns.
 
 Dependency repair may encounter a partial earlier bootstrap where catalog
 objects already exist but `$catalog_registry` has no matching installed record.

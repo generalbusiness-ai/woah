@@ -204,13 +204,17 @@ Major-version updates require `"accept_major": true` and a matching `migration-v
 
 ## Upgrades (pulling upstream changes)
 
-When you pull updates from upstream and redeploy, the DO migration tags must remain consistent:
+When you pull updates from upstream and redeploy, the Durable Object class-history
+migrations in `wrangler.toml` must remain consistent. These tags are Cloudflare
+deployment bookkeeping, not catalog versions and not woo schema versions.
 
-- **Never edit existing `[[migrations]]` blocks** in `wrangler.toml`.
-- **Append new tags** for new generations (`v1` → `v2` → `v3`).
-- The runtime emits `event: "migration_applied"` log lines on each tag application; tail for them after `wrangler deploy` to confirm.
+- Run `npm run cf:migrations:check` before deploy, or let `npm run deploy` do it.
+- If a new Durable Object class binding was added, run `npm run cf:migrations` to append a deterministic `cf-do-NNNN` migration.
+- Do not hand-edit existing `[[migrations]]` blocks. Class deletes are destructive and require an explicit `--allow-delete` run of `scripts/sync-wrangler-do-migrations.mjs`.
 
-If your fork diverges from upstream's migration history, you cannot cleanly merge. Keep your migration tags identical to upstream until a generation lands; then append your own.
+If your fork diverges from upstream's migration history, you cannot cleanly
+merge. Keep upstream migration history intact and append your own generated CF
+DO tags after it.
 
 ---
 

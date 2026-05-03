@@ -105,6 +105,12 @@ for required in WOO_INITIAL_WIZARD_TOKEN WOO_INTERNAL_SECRET; do
   ok "secret: $required set"
 done
 
+# Durable Object class-history migrations are CF deployment bookkeeping. The
+# check keeps wrangler.toml's final migrated class set aligned with bindings.
+npm run cf:migrations:check >/dev/null 2>&1 \
+  || fail "CF DO migration history is out of sync — run: npm run cf:migrations"
+ok "cf do migrations aligned"
+
 # typecheck (cheap; runs prebuild catalog index regen)
 npm run typecheck >/dev/null 2>&1 || fail "typecheck failed — run: npm run typecheck"
 ok "typecheck clean"

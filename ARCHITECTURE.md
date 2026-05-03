@@ -147,21 +147,19 @@ notes, tasks, drum patterns, and presence lists must survive. Migrations
 are how a catalog evolves its classes/verbs/seeds against worlds that were
 installed against an earlier shape. The discipline:
 
-1. **Catalog-scoped, ID-pinned, write-once.** A migration is a stable id
-   (date + slug — `2026-05-01-pinboard-activity-text`) registered in
-   `src/core/local-catalogs.ts` with `only: "<catalog>"`. Once the id is
-   in `$system.applied_migrations`, it never re-runs on that world. Don't
-   rename, reorder, or recycle migration ids — past worlds remember them.
+1. **Manifest schema sync is autodetected.** Routine bundled-catalog source,
+   verb metadata, property-def, schema, and seed-hook drift is detected by
+   comparing the current manifest against stored state. The gateway repairs
+   from the manifest and records a content-derived
+   `local-catalog-schema:<catalog>:<hash>` marker. Do not add a hand-written
+   migration id just to reapply the current manifest.
 
-2. **Migrations re-install; they don't hand-edit data.** Almost every
-   migration is just `repairCatalogManifest` with the relevant flags
-   (`allowImplementationHints`, `reconcileSeedHooks`,
-   `rehomeNowhereSeedObjects`). The repair walks the manifest, updates
-   classes/verbs/properties/schemas/seed_hooks to match, and bumps
-   `propertyVersions` where the manifest's default has changed. Do not
-   reach into core to scrub catalog-specific data; if existing instances
-   need a value normalized, write a one-shot verb on the catalog class
-   and call it from a seed_hook or a wizard verb.
+2. **One-shot boot migrations are for non-inferable changes.** Data
+   conversions and compatibility repairs that cannot be derived from manifest
+   drift still use stable ids in `src/core/local-catalogs.ts` (date + slug,
+   usually with `only: "<catalog>"`). Once such an id is in
+   `$system.applied_migrations`, it never re-runs on that world. Don't rename,
+   reorder, or recycle those ids — past worlds remember them.
 
 3. **Stored runtime state survives reseeding.** `mergeSeedObject` keeps
    the stored property value when its `propertyVersions[name]` is `>=`
@@ -171,17 +169,19 @@ installed against an earlier shape. The discipline:
    manifest property's default-value version. State that is *always*
    stored-side-of-truth (`subscribers`, `operators`, `presence_in`,
    `next_seq`, `last_snapshot_seq`, `applied_migrations`,
-   `bootstrap_token_used`, `wizard_actions`, `installed_catalogs`) is on
+   `catalog_migration_records`, `bootstrap_token_used`, `wizard_actions`,
+   `installed_catalogs`) is on
    the `DYNAMIC_HOST_SEED_PROPERTIES` allowlist in `src/core/bootstrap.ts`
    and never takes a seed value.
 
-4. **Migrations run on the gateway, propagate to cluster DOs through
-   seeding.** `installLocalCatalogs` runs at `createWorld` time on the
-   gateway's `WORLD_HOST` only. Cluster DOs (`host_placement: self`)
-   pick up changed verbs/classes the next time they refresh their host
-   slice from the gateway, via `mergeHostScopedSeed`. Don't write
-   migrations that try to run cluster-side; they won't fire reliably,
-   and you'll be re-creating the gateway-only invariant.
+4. **Schema sync runs on the gateway; data conversions run where data lives.**
+   `installLocalCatalogs` runs at `createWorld` time on the gateway's
+   `WORLD_HOST`. Cluster DOs (`host_placement: self`) pick up repaired
+   verbs/classes from a fresh gateway host seed. A new host DO records the
+   host-scoped content-addressed schema plan as covered by that seed; a host
+   with stored state verifies/applies the scoped plan locally before recording
+   it. Host lifecycle is not allowed to run opaque repair over a partial slice.
+   Idempotent data plans run on the host that owns the data.
 
 5. **A migration belongs to exactly one catalog.** Cross-catalog
    migrations bind catalog vocabulary in core. If two catalogs both need

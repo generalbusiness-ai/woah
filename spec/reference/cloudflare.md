@@ -408,8 +408,13 @@ The seed graph from [bootstrap.md](../semantics/bootstrap.md) materializes the f
 4. Boot is idempotent; concurrent first-requests serialize on `$system`'s single-threaded execution.
 
 Each object-owning DO also runs a host-scoped local catalog lifecycle after it
-loads or refreshes its host slice. This repairs the catalog support objects and
-seed verbs present in that slice and runs data migrations against the state that
+loads or refreshes its host slice. Support objects and seed verbs arrive from
+the gateway's fresh host seed and merge through `mergeHostScopedSeed`. A
+brand-new host records the host-scoped content-addressed catalog schema plan as
+covered by that seed; a host with stored state applies the plan in host scope,
+verifies postconditions, and records the result in
+`$system.catalog_migration_records`.
+Host-local data migrations use the same record path and run against state that
 the host actually owns. The gateway's `$system.applied_migrations` ledger may be
 copied into a host seed, but it does not prove the host's local instance data was
 converted.
@@ -592,6 +597,12 @@ head_sampling_rate = 1.0
 
 `new_sqlite_classes` (vs `new_classes`) opts into the new SQLite-backed DO storage (per CF's 2026 default for new projects). All persistence schemas in [persistence.md](persistence.md) target this storage shape.
 
+The repository verifies this class-history ledger with
+`scripts/sync-wrangler-do-migrations.mjs`. The script compares current
+`durable_objects.bindings` against the final class set produced by the ordered
+`[[migrations]]` history, appending deterministic `cf-do-NNNN` create entries
+for new classes when run with `--write`.
+
 Logpush configuration is per-account, not in wrangler — `wrangler logpush create` or via dashboard, targeting an R2 bucket.
 
 ---
@@ -692,19 +703,21 @@ Seeded deterministic ULID allocation remains deferred. Until it lands, `WOO_SEED
 When operators pull updates from this repository and redeploy, the migration tags must be ordered consistently — never rewrite history. Specifically:
 
 - Each `[[migrations]]` block in `wrangler.toml` represents a deploy generation.
-- New tags append (`v1` → `v2` → `v3`); old tags persist in the operator's deployed history.
+- New tags append; old tags persist in the operator's deployed history.
 - DO class renames use `renamed_classes`; class deletions use `deleted_classes`. Both are append-only.
 - Operators who fork and diverge their migration history cannot cleanly merge upstream changes — document this clearly.
 
-**Upgrade rule for repo maintainers**: never edit existing `[[migrations]]` blocks. Adding `tag = "v2"` is fine; mutating `tag = "v1"` after release is a breaking change for every fork.
+**Upgrade rule for repo maintainers**: never edit existing `[[migrations]]`
+blocks. Use `scripts/sync-wrangler-do-migrations.mjs` to verify or append
+deterministic CF DO tags such as `cf-do-0006`. These identities are Cloudflare
+class-history bookkeeping; they are not catalog versions and not
+`$system.spec_version`.
 
-The runtime emits a structured log at every migration application:
-
-```json
-{ "event": "migration_applied", "tag": "v2", "class_changes": [...] }
-```
-
-Operators can verify upgrades landed by tailing for these events.
+Operators verify the source-controlled class-history ledger with
+`npm run cf:migrations:check` before deploy and confirm application from
+Wrangler/Cloudflare deploy output. Woo catalog installs and updates have their
+own runtime audit path through `$catalog_registry`; CF DO class migrations are a
+separate platform ledger.
 
 ### R14.7 Failure modes
 

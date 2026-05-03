@@ -6,7 +6,7 @@
 // host-scoped world slice exported by the gateway: hosted objects, their
 // parent/feature/bytecode support objects, hosted logs, snapshots, and tasks.
 // They do not auto-install the bundled catalogs or claim independent bootstrap
-// authority, but they do run host-scoped local catalog repair and data
+// authority, but they do apply host-scoped catalog migration plans and data
 // migrations for the objects they actually own.
 //
 // What's wired through fetch() / the WS handlers:
@@ -322,9 +322,9 @@ export class PersistentObjectDO {
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
     const world = createWorldFromSerialized(scoped, { repository: this.repo });
-    // Run local catalog repair and data migrations on this host's actual
-    // slice. The gateway cannot repair or convert state it does not own.
-    runHostScopedLocalCatalogLifecycle(world);
+    // Run local catalog schema/data migration plans on this host's actual
+    // slice. The gateway cannot convert state it does not own.
+    runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
     this.scrubStaleSubscribersOnce(world);
     return world;
   }

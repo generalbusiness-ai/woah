@@ -3172,7 +3172,10 @@ export class WooWorld {
   }
 
   private scanObjectRefs(obj: WooObject, add: (id: ObjRef | null | undefined, scanRefs?: boolean) => void): void {
-    for (const value of obj.properties.values()) this.scanValueRefs(value, add);
+    for (const [name, value] of obj.properties) {
+      if (obj.id === "$system" && name === "catalog_migration_records") continue;
+      this.scanValueRefs(value, add);
+    }
     for (const def of obj.propertyDefs.values()) this.scanValueRefs(def.defaultValue, add);
     for (const [, schema] of obj.eventSchemas) this.scanValueRefs(schema as WooValue, add);
     for (const verb of obj.verbs) {

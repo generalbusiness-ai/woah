@@ -75,6 +75,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `wizard_actions` | list<map> | `[]` | Audit trail for privileged bootstrap and operational actions. |
 | `bootstrap_token_used` | bool | false | Records consumption of the initial wizard bootstrap token. |
 | `applied_migrations` | list<str> | `[]` | Idempotency ledger for deployment-local boot migrations, including local catalog repair migrations. See [catalogs.md §CT5.4.1](../discovery/catalogs.md#ct541-local-boot-migrations). |
+| `catalog_migration_records` | list<map> | `[]` | Trace ledger for content-addressed catalog schema/data plans. Records plan id, catalog, manifest hash, scope, host, steps, status, and postcondition issues. |
 | `help_dbs` | list<obj> | `[]` | Global in-world help database list. The bundled help catalog appends `$help` here with a generic `set_property` catalog hook; future catalogs can append additional DBs without runtime object-name knowledge. |
 
 ### B2.3 `$root` verbs
