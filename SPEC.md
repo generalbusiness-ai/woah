@@ -83,6 +83,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 - [moveto.md](spec/semantics/moveto.md) — receiver-driven container moves with acceptable/enter/exit hooks (M1–M10)
 - [match.md](spec/semantics/match.md) — `$match` scaffolding for chat-shaped text → object/verb resolution (MA1–MA7)
 - [features.md](spec/semantics/features.md) — feature objects: composition without multiple inheritance (FT1–FT10)
+- [text-format.md](spec/semantics/text-format.md) — `.format` property convention for markdown / plain text content (TF1–TF10)
 - [failures.md](spec/semantics/failures.md) — consolidated failure model (F1–F11)
 
 ### Protocol
