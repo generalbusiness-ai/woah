@@ -666,12 +666,21 @@ function populateExitAliasMap(world: WooWorld, exitRef: ObjRef): void {
       next[key] = exitRef;
       changed = true;
     } else if (existing !== exitRef) {
-      throw wooError("E_CATALOG", `exit alias maps to multiple exits: ${key}`, {
+      // Stale or duplicate exits map can have an alias pointing at a
+      // different exit object than the manifest says. Throwing aborts the
+      // entire catalog repair and crashes cold init. The manifest is the
+      // authoritative source for catalog seeds, so overwrite the stale entry
+      // and warn — gives the world a path back to a consistent state without
+      // bricking healthz on every request.
+      console.warn("woo.exit_alias_overwrite", {
         source,
         alias: key,
         existing,
         exit: exitRef
       });
+      next[key] = exitRef;
+      changed = true;
+      continue;
     }
   }
   if (changed) world.setProp(source, "exits", next);
