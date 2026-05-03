@@ -11,10 +11,7 @@ The contract for staging changes to a live woo world without making them
 visible until the change is ready: developing a multi-verb refactor, testing
 against representative state, promoting atomically when it works.
 
-The profile intent is the Cloudflare production flow. In-memory and local SQLite
-runtimes may implement worktrees as local snapshots for local testing and still
-opt into the same patch/promote data model, but they usually omit multi-tenant
-promotion workflows.
+This is targeted at Cloudflare mode (see [SPEC.md §1.1](../../SPEC.md)); in-memory and local SQLite modes may implement worktrees as local snapshots using the same patch/promote data model.
 
 This is what makes woo serious for multi-developer teams. LambdaMOO let wizards edit live and discover breakage by trying; that worked when one wizard owned the world. With many programmers, schema changes, and multi-verb refactors, "edit live, hope nothing breaks" is no longer table-stakes.
 
@@ -82,7 +79,7 @@ A sandbox is an isolated runtime that:
 - Has its own actor connections; sessions established against the sandbox do not surface to live actors and vice versa.
 - Can be discarded freely without affecting live.
 
-For the Cloudflare profile, a sandbox is a separate Worker namespace (or a sub-namespace within the deployment). Connections are routed by URL or token: `wss://world.example/connect?worktree=<id>` reaches the sandbox; `wss://world.example/connect` reaches live. In-process profiles may implement a process-local sandbox clone with an equivalent isolate of the runtime.
+In Cloudflare mode, a sandbox is a separate Worker namespace (or a sub-namespace within the deployment). Connections are routed by URL or token: `wss://world.example/connect?worktree=<id>` reaches the sandbox; `wss://world.example/connect` reaches live. In-memory and local SQLite modes may implement a process-local sandbox clone with an equivalent isolate of the runtime.
 
 A sandbox costs real durable storage. The platform caps:
 
@@ -229,7 +226,7 @@ Worktrees expose four primitives the runtime must provide:
 3. **Atomic promote within an anchor cluster.** A cluster's patches apply to live in order with full `expected_version` checking, with clean rollback (via captured reverse-patches) on any partial failure. Cross-cluster promotes commit cluster-by-cluster with explicit per-cluster atomicity; partial cross-cluster failures are observable rather than hidden.
 4. **Snapshot fork.** Cluster (and world) snapshots can be cheaply duplicated for sandbox seeding.
 
-These are each non-trivial. In the Cloudflare profile, sandbox runtime requires Worker namespace support; in-memory/local SQLite profiles use process-local snapshots. Patch capture requires authoring-API instrumentation; atomic-per-cluster promote requires a transactional within-DO apply with `expected_version` semantics on every patch type.
+These are each non-trivial. In Cloudflare mode, sandbox runtime requires Worker namespace support; in-memory and local SQLite modes use process-local snapshots. Patch capture requires authoring-API instrumentation; atomic-per-cluster promote requires a transactional within-DO apply with `expected_version` semantics on every patch type.
 
 The minimal IDE ([authoring/minimal-ide.md](../authoring/minimal-ide.md)) is the consumer of these primitives. Worktrees are how the IDE becomes a tool that real developers can use without fear of breaking live.
 

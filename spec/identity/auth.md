@@ -1,6 +1,6 @@
 ---
 date: 2026-04-29
-status: partial
+status: draft
 ---
 
 # Auth
@@ -9,7 +9,7 @@ status: partial
 
 The contract for actor identity beyond guest tokens. Covers credentialed authentication, account-vs-actor separation, multi-character users, service/agent accounts, and recovery. Builds on [identity.md](../semantics/identity.md) — the actor and session model is unchanged; this document specifies how credentials bind to actors.
 
-This document is the full-identity profile. The in-memory and local SQLite runtimes may run a reduced auth surface when intentionally scoped for development or small private deployments.
+The full identity surface here targets Cloudflare mode (see [SPEC.md §1.1](../../SPEC.md)). In-memory and local SQLite modes may run a reduced auth surface when intentionally scoped for development or small private deployments.
 
 ---
 
@@ -73,7 +73,7 @@ The token format is server policy; clients receive their next-presentable token 
 
 **Bearer lifetime.** Default 1 hour. A separate **refresh token** (JWT with `purpose: refresh`, longer lifetime — default 30 days) can mint new bearers without re-credentialing via `op: "refresh", token: "refresh:<jwt>"`. This frame is part of the credentialed wire.
 
-**Per-claim scopes.** A bearer's `scope` claim lists what the actor may do. First-light scopes: `read`, `write`, `admin`. Worlds may add their own. Scope is **advisory in v1**; the runtime trusts the actor's `progr` discipline as the enforcement primitive. Future versions may pre-filter calls by scope.
+**Per-claim scopes.** A bearer's `scope` claim lists what the actor may do. v1 scopes: `read`, `write`, `admin`. Worlds may add their own. Scope is **advisory in v1**; the runtime trusts the actor's `progr` discipline as the enforcement primitive. Future versions may pre-filter calls by scope.
 
 ---
 
@@ -160,7 +160,44 @@ Bearer token issuance is internal to the auth service; user code does not mint b
 
 ---
 
-## A11. What's deferred
+## A11. Initial wizard bootstrap
+
+When a fresh world is first stood up, no account exists yet — there is no wizard to mint other wizards from. The bootstrap exchange establishes the operator as the seeded `$wiz` actor through a single deploy-time secret.
+
+**Token shape.** `wizard:<random-string>`. The secret value is provisioned to the runtime out-of-band by the operator; the runtime never issues it to a client. The provisioning mechanism is mode-specific (see [SPEC.md §1.1](../../SPEC.md)): Cloudflare mode reads it from the `WOO_INITIAL_WIZARD_TOKEN` secret binding ([cloudflare.md §R14.4](../reference/cloudflare.md#r144-operator-identity-bootstrap)); in-memory and local SQLite modes read the same name from `.dev.vars` or the environment.
+
+**Single-use.** `$system.bootstrap_token_used` ([bootstrap.md](../semantics/bootstrap.md)) starts `false`. The first successful presentation:
+
+1. Verifies the presented secret byte-equals the configured value.
+2. Binds the connecting session's actor to the seeded `$wiz`.
+3. Sets `$system.bootstrap_token_used = true` atomically with binding.
+
+Subsequent presentations of the same token return `E_TOKEN_CONSUMED`. The runtime's secret store still holds the value — a redeploy without changing it does not re-arm the exchange; the consumed flag is the gate.
+
+**Errors.**
+
+- Secret unset at runtime: `E_BOOTSTRAP_TOKEN_MISSING` on every request.
+- Secret mismatch: `E_NOSESSION`.
+- Already consumed: `E_TOKEN_CONSUMED`.
+
+**Rotation and recovery (v1).** Rotation is operator-driven and two steps:
+
+1. Provision a new secret out-of-band (Cloudflare mode: `wrangler secret put WOO_INITIAL_WIZARD_TOKEN` then redeploy; local modes: edit `.dev.vars` and restart).
+2. A wizard with another path to authority resets `$system.bootstrap_token_used = false` via the runtime authoring console. The next presentation of the new secret consumes it normally.
+
+If no other wizard path exists (operator has lost their session and never minted a second wizard), recovery is a fresh deploy of the same world archive into a new deployment. This is why minting at least one secondary wizard immediately after first claim is recommended.
+
+A single-call `$system:rotate_bootstrap_token(new_token)` verb that combines both steps atomically is **deferred** — see §A12.
+
+**Forbidden alternatives** (must not ship):
+
+- "First connection wins" — race-prone; an attacker connecting between deploy and the operator's first auth gets wizard.
+- "Always-open admin endpoint gated by IP" — fragile; client-IP visibility varies by transport.
+- "Hardcoded admin credentials" — defeats fork-and-deploy.
+
+---
+
+## A12. What's deferred
 
 - **WebAuthn / passkey** support.
 - **Hardware-key 2FA.**
@@ -168,3 +205,4 @@ Bearer token issuance is internal to the auth service; user code does not mint b
 - **Account-to-account trust delegation.**
 - **Fine-grained capability tokens** (currently scope is advisory).
 - **Account audit log** (separate from wizard-action audit).
+- **`$system:rotate_bootstrap_token(new_token)` verb** combining new-secret provisioning with the consumed-flag reset. Until it lands, rotation is the two-step operator flow in §A11.

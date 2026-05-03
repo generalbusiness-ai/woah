@@ -36,7 +36,7 @@ A **catalog** is a directory in a public GitHub repository (or in the deployment
 
 Spec ships **source**, not bytecode. The manifest carries DSL source for every verb; the importing world recompiles in its own spec version. This avoids cross-spec-version bytecode portability problems entirely.
 
-**First-light local implementation hints.** The manifest format still permits a
+**Local implementation hints.** The manifest format still permits a
 non-portable `implementation` field on a verb (`native` handler or named
 bytecode fixture) for trusted `@local` bootstrap experiments. First-party demo
 catalogs should not rely on it; chat, taskspace, and dubspace install from

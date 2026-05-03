@@ -23,6 +23,8 @@ Woo has three runtime modes:
 - **Local SQLite (testing and small self-contained deployments).** Durable process-local storage, simpler operations, and single-environment lifecycle.
 - **Cloudflare (production).** Distributed host-per-object deployment with full identity flows, and the only mode that requires a dev/staging/prod pipeline and inter-environment promotion.
 
+For concrete deployment procedures for operators (including Cloudflare account setup and upgrade checks), use [DEPLOY.md](DEPLOY.md). Deployment lifecycle and environment behavior are specified in [spec/operations/deployments.md](spec/operations/deployments.md) and [spec/reference/cloudflare.md §R14](spec/reference/cloudflare.md#r14-deploying-your-own-world).
+
 The system is **infrastructure, not UI**. The chat-text interface is one renderer. The wire protocol is structured events. Browser-hosted "transient" objects participate in the same execution model as server-hosted persistent ones.
 
 The specification should be clear enough that independent implementations can be tested against it. Early implementation sketches are evidence and reference material, not substitutes for the normative spec.
@@ -151,7 +153,7 @@ Designs intentionally deferred from v1 that reserve compatibility for later oper
 
 See [LATER.md](LATER.md) for the informal todo list — open items, sketches, gaps, decisions still pending. Not commitments.
 
-For what is *currently built* (as opposed to what the spec is building toward), see the implementation snapshots in [`notes/`](notes/). The current cut is documented in [notes/impl-v0.5-rich-vm-persistence-compiler.md](notes/impl-v0.5-rich-vm-persistence-compiler.md); older snapshots are historical.
+For what is *currently built* (as opposed to what the spec is building toward), see the implementation snapshots in [`notes/`](notes/). The current cut is documented in [notes/2026-04-29-impl-v0.5-rich-vm-persistence-compiler.md](notes/2026-04-29-impl-v0.5-rich-vm-persistence-compiler.md); older snapshots are historical.
 
 Loose docs alongside the spec layers and bundled catalogs:
 - [spec/README.md](spec/README.md) — author's working docs.

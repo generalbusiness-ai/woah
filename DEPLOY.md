@@ -1,12 +1,60 @@
 # Deploying your own woo world
 
-woo is built to be **fork-and-deploy**. This document walks through publishing your own world to your own Cloudflare account.
+woo is built to be **fork-and-deploy**. This document is the operator quick reference for:
 
-The full normative deployment contract is in [spec/reference/cloudflare.md §R14](spec/reference/cloudflare.md#r14-deploying-your-own-world). This file is the operator's quick reference.
+- local test/single-node deployment (`npm run dev`, local SQLite, and in-memory testing), and
+- production deployment on your own Cloudflare account.
+
+For the normative Cloudflare deployment contract, see [spec/reference/cloudflare.md §R14](spec/reference/cloudflare.md#r14-deploying-your-own-world).
 
 ---
 
-## Quick start
+## Local deployment (tests and single-node systems)
+
+For local dev, secrets live in `.dev.vars` (gitignored) instead of Cloudflare secret storage. Copy the example:
+
+```sh
+cp .dev.vars.example .dev.vars
+# edit .dev.vars to set values
+npm run dev
+```
+
+The local dev server reads `.dev.vars` automatically via `tsx`/`vite`. Defaults in the example are safe for local-only experimentation.
+
+By default, local development uses the persistent `.woo/dev.sqlite` file:
+
+```sh
+WOO_DB=.woo/dev.sqlite
+```
+
+For a short-lived in-memory local DB (helpful for CI and throwaway test systems), run:
+
+```sh
+WOO_DB=:memory: npm run dev
+```
+
+For other local DB locations:
+
+```sh
+WOO_DB=.woo/test.sqlite npm run dev
+```
+
+For true in-memory world systems (no SQLite at all), use `InMemoryObjectRepository` directly in test runners or scripts:
+
+```ts
+import { createWorld } from "./src/core/bootstrap";
+import { InMemoryObjectRepository } from "./src/core/repository";
+
+const world = createWorld({ repository: new InMemoryObjectRepository() });
+```
+
+That mode resets when the process exits.
+
+When you need production hosting, continue to the Cloudflare section below.
+
+---
+
+## Cloudflare deployment quick start
 
 ```sh
 # 1. Clone and install
@@ -26,10 +74,7 @@ npm run deploy
 #    or, low-level:  npx wrangler deploy
 #    Hotfix overrides: --dirty, --allow-branch=<x>, --skip-tests, --skip-postflight
 
-# 5. Claim wizard authority
-#    Connect to the deployed world's URL and present:
-#      auth { token: "wizard:<the-token-you-set-in-step-3>" }
-#    The token is single-use; store it somewhere safe in case you need to recover.
+# 5. Claim wizard authority (see "Managing the wizard secret" below)
 ```
 
 After step 5, you have a running core world with you bound to `$wiz`. The Cloudflare config starts clean by default; install catalogs explicitly or opt into bundled local catalogs before first deploy. Runtime authoring endpoints are still local-server-only on the Cloudflare target.
@@ -54,20 +99,7 @@ Two secrets are required via `wrangler secret put` (never the `[vars]` block in 
 
 ### `WOO_INITIAL_WIZARD_TOKEN`
 
-A random string the operator presents at first auth to claim the `$wiz` binding. Generate something with high entropy:
-
-```sh
-openssl rand -hex 32
-```
-
-Set it:
-
-```sh
-npx wrangler secret put WOO_INITIAL_WIZARD_TOKEN
-# paste the value when prompted
-```
-
-The token is **single-use**. Once consumed, subsequent presentations return `401 E_TOKEN_CONSUMED`. To rotate the bootstrap token after first use (e.g., for disaster recovery), call `wiz:rotate_bootstrap_token(new_token)` once you have wizard authority.
+A random string the operator presents at first auth to claim the `$wiz` binding. Single-use. See [Managing the wizard secret](#managing-the-wizard-secret) below for generation, claim, and rotation.
 
 ### `WOO_INTERNAL_SECRET`
 
@@ -102,20 +134,6 @@ WOO_AUTO_INSTALL_CATALOGS = "chat,dubspace,pinboard,taskspace"
 ```
 
 This is just an operator filter over catalog directories bundled with the deployment. The runtime does not privilege those catalogs over public GitHub taps.
-
----
-
-## Local development
-
-For local dev, secrets live in `.dev.vars` (gitignored) instead of CF secret storage. Copy the example:
-
-```sh
-cp .dev.vars.example .dev.vars
-# edit .dev.vars to set values
-npm run dev
-```
-
-The local dev server reads `.dev.vars` automatically via `tsx`/`vite`. Defaults in the example are safe for local-only experimentation.
 
 ---
 
@@ -160,9 +178,30 @@ Default deploy serves at `<worker-name>.<account-subdomain>.workers.dev`. To use
 
 ---
 
-## First auth (claiming `$wiz`)
+## Managing the wizard secret
 
-After deploy, connect to your world (e.g., `https://woo.<your-subdomain>.workers.dev/`) and authenticate as wizard:
+`WOO_INITIAL_WIZARD_TOKEN` is the deploy-time secret that lets you claim the seeded `$wiz` actor for the first time. It is single-use: the first successful presentation binds your session to `$wiz` and sets `$system.bootstrap_token_used = true`. Subsequent presentations return `401 E_TOKEN_CONSUMED`.
+
+Spec contract: [auth.md §A11](spec/identity/auth.md#a11-initial-wizard-bootstrap).
+
+### 1. Generate
+
+```sh
+openssl rand -hex 32
+```
+
+Save it in a password manager. The runtime never echoes it back.
+
+### 2. Provision
+
+| Mode | How |
+|---|---|
+| Cloudflare | `npx wrangler secret put WOO_INITIAL_WIZARD_TOKEN` (paste at prompt) |
+| Local SQLite / in-memory | Set `WOO_INITIAL_WIZARD_TOKEN=...` in `.dev.vars` (gitignored) |
+
+### 3. Claim `$wiz`
+
+After deploy (or `npm run dev`), connect to your world and authenticate:
 
 **Via REST**:
 
@@ -174,9 +213,26 @@ curl -X POST https://your-world.example.com/api/auth \
 
 Response: `{ "actor": "$wiz", "session": "<session-id>" }`. Use `Authorization: Session <session-id>` for subsequent requests.
 
-**Via WebSocket**: connect, then send `{ "op": "auth", "token": "wizard:YOUR_INITIAL_WIZARD_TOKEN" }`. Receive `{ "op": "session", "actor": "$wiz" }`.
+**Via WebSocket**: send `{ "op": "auth", "token": "wizard:YOUR_INITIAL_WIZARD_TOKEN" }`; receive `{ "op": "session", "actor": "$wiz" }`.
 
-Either path consumes the token. The world records `bootstrap_token_used = true` in `$system` metadata on the gateway host; presenting the token again fails.
+### 4. Mint a backup wizard immediately
+
+Before doing anything else, create a second wizard-authority actor (a personal `$player` with `flags.wizard = true`, or a service-account `$bot`). If you lose your `$wiz` session and have no other wizard, you have no in-world path to rotate the secret — recovery becomes a fresh deploy from a backup archive.
+
+### 5. Rotate (when needed)
+
+Rotation is two steps in v1; the single-call `$system:rotate_bootstrap_token` verb is deferred (see auth.md §A12).
+
+1. **Provision a new secret.** Cloudflare: `wrangler secret put WOO_INITIAL_WIZARD_TOKEN` then redeploy. Local: edit `.dev.vars` and restart.
+2. **Reset the consumed flag.** From a session bound to a wizard actor, set `$system.bootstrap_token_used = false` via the runtime authoring console. The next presentation of the new secret consumes it normally.
+
+### 6. If you lose all wizard access
+
+There is no "forgot wizard" recovery path. Your options are: restore the world from a backup archive ([spec/operations/backups.md](spec/operations/backups.md)) into a fresh deployment with a new `WOO_INITIAL_WIZARD_TOKEN`, then claim `$wiz` from scratch. This is why step 4 matters.
+
+---
+
+## Installing catalogs
 
 The deployed Worker starts with the clean-core/catalog policy chosen by `WOO_AUTO_INSTALL_CATALOGS`. Public GitHub tap install/update is available through the Worker; private repositories and GitHub API tokens are deferred.
 
@@ -224,7 +280,7 @@ DO tags after it.
 |---|---|---|
 | `503 E_BOOTSTRAP_TOKEN_MISSING` | `WOO_INITIAL_WIZARD_TOKEN` or `WOO_INTERNAL_SECRET` not set | `wrangler secret put WOO_INITIAL_WIZARD_TOKEN`; `wrangler secret put WOO_INTERNAL_SECRET` |
 | `503 E_DO_UNAVAILABLE` | Account on Workers Free | Upgrade to Workers Paid |
-| `401 E_TOKEN_CONSUMED` on first auth | The bootstrap token was already used | Use the `Authorization: Session <id>` from the original response, or call `wiz:rotate_bootstrap_token` if you have wizard via another path |
+| `401 E_TOKEN_CONSUMED` on first auth | The bootstrap token was already used | Reuse the `Authorization: Session <id>` from the original claim response. If lost, follow [Managing the wizard secret §5](#5-rotate-when-needed) (rotate) or §6 (no wizard left). |
 | Worker deploys but requests time out | DO migration mismatch with prior deploy | Check `wrangler tail` for migration errors; reconcile with the upstream migration history |
 
 ---
@@ -256,7 +312,7 @@ Concrete production cost numbers depend on your traffic; the CF dashboard is aut
 
 Once your world is running:
 
-- Read [spec/dubspace-demo.md](spec/dubspace-demo.md), [spec/taskspace-demo.md](spec/taskspace-demo.md), and [spec/chat-demo.md](spec/chat-demo.md) to understand the seeded demos.
+- Read [catalogs/dubspace/DESIGN.md](catalogs/dubspace/DESIGN.md), [catalogs/taskspace/DESIGN.md](catalogs/taskspace/DESIGN.md), and [catalogs/chat/DESIGN.md](catalogs/chat/DESIGN.md) to understand the seeded demos.
 - Use the IDE tab in the bundled client to author verbs.
 - See [spec/authoring/minimal-ide.md](spec/authoring/minimal-ide.md) for the authoring loop.
 - File issues against your fork or upstream as you find them.

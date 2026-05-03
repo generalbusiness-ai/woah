@@ -46,6 +46,14 @@ of travel is woocode-ward, not native-ward.
 
 ## Development Process
 
+Implementation notes are not formal specs or commitments, and do not
+reflect the current status; they are just descriptions of work while
+it is being done, and other reference material.
+
+Work descriptions in `notes/` must be named by their origin date,
+e.g. "2026-05-03-perf-hotspots.md".  Reference material in `notes/`
+has undated filenames.
+
 Use Git worktrees for isolation.
 
 **DO NOT commit or deploy** without explicit instruction.

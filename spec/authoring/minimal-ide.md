@@ -44,7 +44,7 @@ The IDE is allowed to be plain. It must be precise.
 
 ## A2. First Authoring Loop
 
-First-light authoring requires only one actor with programmer authority and one
+v1 authoring requires only one actor with programmer authority and one
 editable object.
 
 Minimal interaction:

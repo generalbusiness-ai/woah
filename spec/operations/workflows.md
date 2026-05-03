@@ -175,7 +175,7 @@ Same pattern, different domains:
 
 - **Verb-edit review pipelines** in worktrees: `draft → submitted → approved | rejected → merged`.
 - **Approval chains** for quota grants: `requested → reviewed → granted | denied`.
-- **Deployment gates**: `staging → canary → prod` (example pattern used by the Cloudflare production profile).
+- **Deployment gates**: `staging → canary → prod` (example pattern used in Cloudflare mode).
 - **Content moderation**: `posted → flagged → reviewed → published | hidden`.
 
 Each is a `$workflow_space` subclass with a domain-specific workflow value. The runtime stays uniform; per-domain logic is in the workflow value plus domain-specific verbs.

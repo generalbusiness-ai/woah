@@ -16,6 +16,8 @@ multi-environment choreography by default.
 
 This document covers the same cross-environment lifecycle used by the Cloudflare production profile. In in-memory and local SQLite modes, export/restore are still valid backup primitives, but there is typically one durable deployment target and no mandatory dev/staging/prod progression.
 
+For deployment/authoring setup around restores and environment moves, see [DEPLOY.md](../../DEPLOY.md).
+
 ---
 
 ## B1. The backup problem

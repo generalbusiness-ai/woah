@@ -9,7 +9,7 @@ status: partial
 
 How a woo world moves through dev / staging / prod environments and how spec, code, and schema versions propagate in the Cloudflare production profile. The contract for "we have multiple environments and changes flow between them."
 
-This section does **not** apply to in-memory or local SQLite modes. Those runtimes are single-target deployments that rely on local process or local database resets/reloads and do not require multi-environment promotion.
+For concrete operator commands, bootstrap exchange details, and local test-system setup, see [DEPLOY.md](../../DEPLOY.md).
 
 ---
 
@@ -23,9 +23,14 @@ Conventional environments:
 - **staging** — long-lived but disposable; mirrors prod's recent state.
 - **prod** — long-lived, live; loss-of-state is a disaster.
 
-In the other runtime modes, a "world" is usually a single process target or local database.
-
 A world *exists* in a deployment. Moving a world between deployments uses backups ([backups.md](backups.md)).
+
+This section does **not** apply to in-memory or local SQLite modes. Those runtimes are single-target deployments that rely on local process or local database resets/reloads and do not require multi-environment promotion.
+
+### DP1.1 Local test and single-target systems
+
+- **In-memory mode** (tests). Run with `InMemoryObjectRepository` from [`src/core/repository.ts`](../../src/core/repository.ts); no disk persistence and reset on process exit.
+- **Local SQLite mode** (single-node local system). Use `npm run dev` (default `WOO_DB=.woo/dev.sqlite`) or set `WOO_DB` for custom path/in-memory behavior.
 
 ---
 

@@ -628,6 +628,8 @@ Logpush configuration is per-account, not in wrangler — `wrangler logpush crea
 
 The reference deployment is intended to be **fork-and-deploy**. Anyone who picks up this repo can run their own world in their own Cloudflare account. The single biggest design constraint that follows: nothing in the runtime may assume a particular operator, account, or pre-existing identity. The seed graph is universal; everything operator-specific is configuration.
 
+For command-level rollout steps and local bootstrap, use [DEPLOY.md](../../DEPLOY.md).
+
 ### R14.1 Prerequisites
 
 An operator deploying their own world needs:
@@ -665,22 +667,15 @@ Operators may add bindings in `wrangler.toml` after deploy without redeploying t
 
 ### R14.4 Operator identity bootstrap
 
-The first auth into a freshly-deployed world establishes the operator as `$wiz`. The flow:
+The bootstrap-token contract — single-use semantics, error vocabulary, rotation, and forbidden alternatives — is mode-neutral and lives in [auth.md §A11](../identity/auth.md#a11-initial-wizard-bootstrap).
 
-1. Operator deploys with `WOO_INITIAL_WIZARD_TOKEN = <random-string>` set.
-2. Operator connects (websocket or REST) presenting `auth { token: "wizard:<random-string>" }`.
-3. Worker validates the token against the secret. If match: bind the connecting actor to the seeded `$wiz` objref, mint a session, mark the token consumed in `$system` metadata (`bootstrap_token_used = true`), and register the session route in Directory.
-4. Subsequent presentations of the same token return `401 E_TOKEN_CONSUMED`.
+In Cloudflare mode the secret is provisioned via:
 
-After this exchange, the operator has wizard authority and can mint additional players, install verbs, and configure the world. The wizard token is single-use; rotating it requires a wizard verb (`wiz:rotate_bootstrap_token(new_token)`) so the operator can recover from a token compromise without redeploying.
+```sh
+wrangler secret put WOO_INITIAL_WIZARD_TOKEN
+```
 
-**Forbidden alternatives** (don't ship these):
-
-- "First connection wins" — race-prone; an attacker connecting between deploy and operator's first auth gets wizard.
-- "Always-open admin endpoint gated by IP" — fragile; CF's IP visibility varies.
-- "Hardcoded admin credentials" — defeats fork-and-deploy.
-
-The token-secret model is the only acceptable v1 path.
+The Worker reads it at request time, compares byte-equal against the presented `wizard:<random-string>` token, binds the connecting actor to seeded `$wiz`, mints a session, sets `$system.bootstrap_token_used = true`, and registers the session route in Directory. Subsequent presentations of the same token return `401 E_TOKEN_CONSUMED`.
 
 ### R14.5 ID determinism status
 
