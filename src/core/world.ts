@@ -3890,6 +3890,40 @@ export class WooWorld {
     this.setProp("$system", "wizard_actions", [...actions, { ts: Date.now(), actor, action, ...details }]);
   }
 
+  /**
+   * Wizard-only flag mutation. Updates the target's authority/lifecycle bits
+   * in place and records a wizard_action audit entry per changed flag.
+   *
+   * Allowed flags: wizard, programmer, fertile, recyclable. Unknown keys are
+   * ignored. Boolean coerced; non-bool values raise E_TYPE. The target must
+   * exist; passing $system or $wiz revokes nothing the substrate would not
+   * already protect, but we still audit.
+   *
+   * Required for the auth.md §A11 "mint a backup wizard" flow — the only
+   * in-world surface that can grant wizard authority to a non-substrate
+   * object after boot.
+   */
+  setObjectFlags(actor: ObjRef, target: ObjRef, flags: Record<string, unknown>): WooObject["flags"] {
+    if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to set object flags", { actor, target });
+    if (!this.objects.has(target)) throw wooError("E_OBJNF", `target object not found: ${target}`, target);
+    const allowed = new Set(["wizard", "programmer", "fertile", "recyclable"]);
+    const obj = this.object(target);
+    const before: Record<string, boolean> = { ...obj.flags };
+    const changes: Record<string, { from: boolean; to: boolean }> = {};
+    for (const [key, raw] of Object.entries(flags)) {
+      if (!allowed.has(key)) continue;
+      if (typeof raw !== "boolean") throw wooError("E_TYPE", `flag ${key} must be boolean`, { key, value: raw as WooValue });
+      const prev = Boolean(before[key]);
+      if (prev === raw) continue;
+      (obj.flags as Record<string, boolean>)[key] = raw;
+      changes[key] = { from: prev, to: raw };
+    }
+    if (Object.keys(changes).length === 0) return { ...obj.flags };
+    this.recordWizardAction(actor, "set_object_flags", { target, changes: changes as unknown as WooValue });
+    this.markObjectDirty(target);
+    return { ...obj.flags };
+  }
+
   private bumpFeaturesVersion(objRef: ObjRef): void {
     const current = Number(this.getProp(objRef, "features_version") ?? 0);
     this.setProp(objRef, "features_version", Number.isFinite(current) ? current + 1 : 1);
@@ -4703,6 +4737,12 @@ export class WooWorld {
       if (!this.isWizard(ctx.actor)) throw wooError("E_PERM", "only wizards may return guests", ctx.actor);
       this.returnGuest(assertObj(args[0]));
       return true;
+    });
+    this.nativeHandlers.set("set_object_flags", (ctx, args) => {
+      const target = assertObj(args[0]);
+      const flags = args[1];
+      if (!flags || typeof flags !== "object" || Array.isArray(flags)) throw wooError("E_TYPE", "set_object_flags requires a flags map", { value: flags as WooValue });
+      return this.setObjectFlags(ctx.actor, target, flags as Record<string, unknown>) as unknown as WooValue;
     });
     this.nativeHandlers.set("feature_can_be_attached_by", (ctx, args) => {
       const actor = assertObj(args[0] ?? ctx.actor);
