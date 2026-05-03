@@ -9,7 +9,7 @@ requirements, statuses, messages, and references to artifacts.
 | Class | Parent | Description |
 |---|---|---|
 | `$taskspace` | `$space` | Coordination space for hierarchical work. Extends `$space` with root task ordering and task-creation behavior. |
-| `$task` | `$root` | Work item. Stores title, description, status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
+| `$task` | `$note` | Work item and note/card artifact. Inherits note text/writer semantics while storing task-specific title, description, status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
 
 ## Goal
 
@@ -415,9 +415,9 @@ Two actors with different roles hand off through reviewable states; the platform
 ## Tasks Are Objects (Not Records)
 
 Taskspace deliberately models tasks as full `$task` objects rather than as
-value records on `the_taskspace`. The contrast is the [pinboard](../pinboard/DESIGN.md):
-notes there are lightweight values inside the board's state. Taskspace makes
-the opposite call.
+value records on `the_taskspace`. `$task` is a `$note` descendant: it can be
+treated as a movable text/card artifact by note-aware surfaces, while still
+carrying task-specific lifecycle properties and verbs.
 
 The reason is identity and hierarchy. A task has its own lifecycle that other
 parts of the world refer to: subtasks point at parents, artifacts may pin to

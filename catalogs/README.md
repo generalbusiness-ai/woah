@@ -107,7 +107,7 @@ classDiagram
     `$root` <|-- `$scene`
     `$space` <|-- `$dubspace`
     `$space` <|-- `$taskspace`
-    `$root` <|-- `$task`
+    `$note` <|-- `$task`
     `$note` <|-- `$pin`
     `$space` <|-- `$pinboard`
 ```

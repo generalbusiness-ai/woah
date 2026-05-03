@@ -83,7 +83,7 @@ describe("local catalogs", () => {
     const chat = readManifest("chat");
     const taskspace = readManifest("taskspace");
     expect(chat.depends).toEqual(["@local:help"]);
-    expect(taskspace.depends).toEqual(["@local:chat"]);
+    expect(taskspace.depends).toEqual(["@local:chat", "@local:note"]);
     expect(taskspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskspace", feature: "chat:$conversational" });
   });
 
@@ -386,6 +386,11 @@ describe("local catalogs", () => {
       alias: "chat",
       allowImplementationHints: false
     });
+    installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
+      tap: "@local",
+      alias: "note",
+      allowImplementationHints: false
+    });
     installCatalogManifest(world, readManifest("taskspace") as unknown as RuntimeCatalogManifest, {
       tap: "github:example/woo-test",
       alias: "taskspace",
@@ -405,6 +410,7 @@ describe("local catalogs", () => {
     expect(created.op).toBe("applied");
     const task = created.op === "applied" ? String(created.observations[0].task) : "";
     expect(world.getProp(task, "title")).toBe("Source task");
+    expect(world.isDescendantOf(task, "$note")).toBe(true);
 
     await world.call("requirement", session.id, "the_taskspace", { actor: session.actor, target: task, verb: "add_requirement", args: ["has source verbs"] });
     const done = await world.call("done", session.id, "the_taskspace", { actor: session.actor, target: task, verb: "set_status", args: ["done"] });
@@ -614,6 +620,46 @@ describe("local catalogs", () => {
     expect(world.propOrNull("the_pinboard", "next_note_id")).toBeNull();
     expect(world.getProp("the_pinboard", "next_z")).toBeGreaterThanOrEqual(6);
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-notes-to-pins");
+  });
+
+  it("lets room commands distinguish and inspect duplicate sticky notes by preview title", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:sticky-room-notes");
+    await world.directCall("enter-hot-tub-sticky", session.actor, "the_hot_tub", "enter", []);
+
+    world.createObject({ id: "sticky_alpha", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
+    world.createObject({ id: "sticky_beta", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
+    world.setProp("sticky_alpha", "name", "sticky note");
+    world.setProp("sticky_beta", "name", "sticky note");
+    world.setProp("sticky_alpha", "text", ["another one"]);
+    world.setProp("sticky_beta", "text", ["this is it"]);
+
+    const look = await world.directCall("look-sticky-alpha", session.actor, "the_hot_tub", "command_plan", ["look sticky note: another one"]);
+    expect(look.op).toBe("result");
+    if (look.op === "result") {
+      expect(look.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "look_at", args: ["sticky_alpha"] });
+    }
+
+    const noteLook = await world.directCall("look-at-sticky-alpha", session.actor, "the_hot_tub", "look_at", ["sticky_alpha"]);
+    expect(noteLook.op).toBe("result");
+    if (noteLook.op === "result") {
+      expect(noteLook.result).toMatchObject({ id: "sticky_alpha", title: "sticky note: another one", location: "the_hot_tub" });
+    }
+
+    const ambiguous = await world.directCall("take-sticky-ambiguous", session.actor, "the_hot_tub", "take", ["note"]);
+    expect(ambiguous.op).toBe("error");
+    if (ambiguous.op === "error") expect(ambiguous.error.code).toBe("E_AMBIGUOUS");
+
+    const takeByContainedPreview = await world.directCall("take-sticky-alpha", session.actor, "the_hot_tub", "take", ["another"]);
+    expect(takeByContainedPreview.op).toBe("result");
+    expect(world.object("sticky_alpha").location).toBe(session.actor);
+    await world.directCall("drop-sticky-alpha", session.actor, "the_hot_tub", "drop", ["another"]);
+    expect(world.object("sticky_alpha").location).toBe("the_hot_tub");
+
+    const take = await world.directCall("take-sticky-beta", session.actor, "the_hot_tub", "take", ["sticky note: this is it"]);
+    expect(take.op).toBe("result");
+    expect(world.object("sticky_beta").location).toBe(session.actor);
+    expect(world.object("the_hot_tub").contents.has("sticky_beta")).toBe(false);
   });
 
   it("repairs stale pinboard v0.1 source and leftover note records", () => {
@@ -1376,9 +1422,11 @@ describe("local catalogs", () => {
     expect(migratedLook?.kind).toBe("bytecode");
     expect(migratedLook?.source).toContain("look_at");
     expect(world.ownVerb("$task", "add_subtask")?.kind).toBe("bytecode");
+    expect(world.object("$task").parent).toBe("$note");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-source-catalog-verbs");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-catalog-placement-metadata");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-04-30-room-look-self");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-03-taskspace-task-note-parent");
     expect(world.getProp("the_taskspace", "auto_presence")).toBe(true);
     expect(world.getProp("the_taskspace", "host_placement")).toBe("self");
 
@@ -1391,6 +1439,7 @@ describe("local catalogs", () => {
       args: ["Migrated task", ""]
     });
     const task = created.op === "applied" ? String(created.observations[0].task) : "";
+    expect(world.isDescendantOf(task, "$note")).toBe(true);
     const subtask = await world.call("add-subtask", session.id, "the_taskspace", {
       actor: session.actor,
       target: task,
@@ -1430,6 +1479,33 @@ describe("local catalogs", () => {
     expect(deckLook.op).toBe("result");
     const list = await world.directCall("taskspace-list-guarded", session.actor, "the_taskspace", "list_tasks", []);
     expect(list.op).toBe("result");
+  });
+
+  it("migrates installed taskspace tasks under the note class", async () => {
+    const world = createWorld();
+    const migrations = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-03-taskspace-task-note-parent");
+    world.setProp("$system", "applied_migrations", migrations);
+    world.chparentAuthoredObject("$wiz", "$task", "$root");
+    expect(world.object("$task").parent).toBe("$root");
+
+    installLocalCatalogs(world, ["taskspace"]);
+
+    expect(world.object("$task").parent).toBe("$note");
+    expect(world.isDescendantOf("$task", "$note")).toBe(true);
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-03-taskspace-task-note-parent");
+
+    const session = world.auth("guest:task-note-parent");
+    const created = await world.call("task-note-parent-create", session.id, "the_taskspace", {
+      actor: session.actor,
+      target: "the_taskspace",
+      verb: "create_task",
+      args: ["Note-shaped task", ""]
+    });
+    const task = created.op === "applied" ? String(created.observations[0].task) : "";
+    expect(task).toBeTruthy();
+    expect(world.isDescendantOf(task, "$note")).toBe(true);
+    expect(world.isDescendantOf(task, "$task")).toBe(true);
   });
 
   it("repairs stale native chat command planning on existing installs", async () => {

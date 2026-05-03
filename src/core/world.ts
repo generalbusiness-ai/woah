@@ -5128,6 +5128,7 @@ export class WooWorld {
     const name = rawName.trim();
     if (!name) throw wooError("E_INVARG", "take requires an object name");
     const match = await this.matchObjectInCandidatesAsync(ctx, name, await this.objectContents(room, ctx.hostMemo));
+    if (match.status === "ambiguous") throw wooError("E_AMBIGUOUS", `I don't know which "${name}" you mean.`, name);
     if (match.status !== "ok") throw wooError("E_INVARG", `I don't see "${name}" here.`, name);
     const item = match.value;
     if (item === ctx.actor || (this.objects.has(item) && this.inheritsFrom(item, "$actor"))) throw wooError("E_PERM", "actors are not carryable", item);
@@ -5278,6 +5279,7 @@ export class WooWorld {
     const exact: ObjRef[] = [];
     const alias: ObjRef[] = [];
     const prefix: ObjRef[] = [];
+    const contains: ObjRef[] = [];
     const remoteSummaries = await this.objectSummariesForLook(ctx, candidates);
     for (const id of candidates) {
       const names = [id];
@@ -5304,6 +5306,11 @@ export class WooWorld {
       } else if (this.objects.has(id)) {
         const obj = this.object(id);
         names.push(obj.name);
+        try {
+          names.push(await this.titleForLook(ctx, ctx.thisObj, id));
+        } catch {
+          // Matching remains available by object id/name if a custom title fails.
+        }
         const localAliases = this.propOrNull(id, "aliases");
         if (Array.isArray(localAliases)) aliases.push(...localAliases.map((item) => String(item)));
       }
@@ -5312,8 +5319,9 @@ export class WooWorld {
       if (nameValues.includes(lower)) exact.push(id);
       else if (aliasValues.includes(lower)) alias.push(id);
       else if (wanted.length >= 2 && [...nameValues, ...aliasValues].some((item) => item.startsWith(lower))) prefix.push(id);
+      else if (wanted.length >= 2 && [...nameValues, ...aliasValues].some((item) => item.includes(lower))) contains.push(id);
     }
-    return this.resolveObjectMatch(exact.length > 0 ? exact : alias.length > 0 ? alias : prefix);
+    return this.resolveObjectMatch(exact.length > 0 ? exact : alias.length > 0 ? alias : prefix.length > 0 ? prefix : contains);
   }
 
   private resolveObjectMatch(matches: ObjRef[]): ObjectMatch {

@@ -307,7 +307,7 @@ hints until the VM can express them directly.
 | Corename | Parent | Anchor | Description |
 |---|---|---|---|
 | `$taskspace` | `$space` | n/a (own host) | Base class for spaces that coordinate hierarchical work. It extends `$space` with root task ordering and task-creation behavior for asynchronous human and agent collaboration. |
-| `$task` | `$root` | n/a | Base class for taskspace work items. A task stores title, description, status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
+| `$task` | `$note` | n/a | Base class for taskspace work items. A task is also a note/card artifact, and stores title, description, status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
 
 ### B4.1 `$taskspace` additional properties
 

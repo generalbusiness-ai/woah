@@ -48,8 +48,8 @@ Properties inherited from `$portable`:
 | `delete(line)` / `del@ete` / `rem@ove` | Remove one 1-based line. Permission: `:is_writable_by(actor)`. |
 | `is_readable_by(actor)` | Default `true`. Override in subclasses to restrict. |
 | `is_writable_by(actor)` | Owner, members of `.writers`, or wizard. |
-| `look` / `look_self` | Standard space/thing look surface. Returns name + line count. |
-| `title` | Object name. |
+| `look` / `look_self` | Standard space/thing look surface. Returns preview title, line count, and current location. |
+| `title` | Object name plus the first readable text line when present, so multiple notes in one room can be distinguished and matched. |
 
 ## What is intentionally absent in v0.1
 

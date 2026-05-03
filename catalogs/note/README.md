@@ -38,8 +38,8 @@ writer objects beyond the owner).
 :erase                  clear the text (writers only)
 :is_readable_by(actor)  default true; override in subclasses to restrict
 :is_writable_by(actor)  owner, .writers entries, or wizard
-:look / :look_self      standard look surface (returns line count)
-:title                  the note's name
+:look / :look_self      standard look surface (preview title, line count, location)
+:title                  name plus first readable text line when present
 ```
 
 `.text` is private (`perms: ""`); always go through `:text()` from
