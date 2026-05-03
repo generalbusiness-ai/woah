@@ -11,7 +11,7 @@ head_sampling_rate = 1.0
 # Cloudflare deploys start as a clean core world by default. To auto-install
 # bundled local catalogs at bootstrap, set a comma-separated list here before
 # first deploy, for example: "chat,dubspace,pinboard,taskspace".
-WOO_AUTO_INSTALL_CATALOGS = ""
+WOO_AUTO_INSTALL_CATALOGS = "chat,dubspace,help,note,pinboard,prog,taskspace"
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object
@@ -36,3 +36,22 @@ new_sqlite_classes = ["PersistentObjectDO"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["DirectoryDO"]
+
+# v3-v5 are the wipe dance. v3 created fresh SQLite storage under temporary
+# V3 names, v4 dropped the original empty classes, v5 renames the V3 storage
+# back to the clean names. The class names in code are unchanged; the version
+# tags are CF-side bookkeeping only.
+[[migrations]]
+tag = "v3-create-2026-05-02"
+new_sqlite_classes = ["PersistentObjectV3DO", "DirectoryV3DO"]
+
+[[migrations]]
+tag = "v4-drop-old-2026-05-02"
+deleted_classes = ["PersistentObjectDO", "DirectoryDO"]
+
+[[migrations]]
+tag = "v5-rename-back-2026-05-02"
+renamed_classes = [
+  { from = "PersistentObjectV3DO", to = "PersistentObjectDO" },
+  { from = "DirectoryV3DO", to = "DirectoryDO" }
+]
