@@ -10,6 +10,7 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
+- guest "it is awake and looks alert"
 - kanban
 - subscriptions (to anything) (grouped??)
 - help policy in DSL — first-light help is native-backed with explicit source stubs. Move `$player:help`, help search-path policy, directive rendering, and miss recording into woocode once the DSL has actor-ancestry and actor-aware verb-source primitives; then drop the native help handlers.

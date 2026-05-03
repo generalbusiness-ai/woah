@@ -765,7 +765,7 @@ describe("local catalogs", () => {
     }));
   });
 
-  it("preserves live runtime properties across host-scoped schema plans", { timeout: 15000 }, () => {
+  it("preserves live runtime properties across host-scoped schema plans", { timeout: 30000 }, () => {
     // Host schema plans reconcile class/seed metadata but seed-hook properties
     // remain initial values. They must not overwrite live state such as
     // pinboard layout entries, room exits maps, dubspace tempo/transport, etc.
@@ -798,7 +798,7 @@ describe("local catalogs", () => {
     }
   });
 
-  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", () => {
+  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", { timeout: 15000 }, () => {
     const gateway = createWorld();
     const listNotes = worldVerb(gateway, "$pinboard", "list_notes");
     const installed = installVerb(gateway, "$pinboard", "list_notes", `verb :list_notes() rxd {

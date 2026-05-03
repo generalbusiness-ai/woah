@@ -856,6 +856,7 @@ export class WooWorld {
   createApiKey(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to create api keys", { actor });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
+    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
     const id = randomHex(16);
     const secret = randomHex(32);
     const salt = randomHex(16);
@@ -4814,6 +4815,7 @@ export class WooWorld {
       if (!this.isWizard(ctx.actor)) throw wooError("E_PERM", "wizard authority required to mint sessions", ctx.actor);
       const target = assertObj(args[0]);
       this.object(target);
+      if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
       const session = this.createSessionForActor(target, "bearer");
       this.recordWizardAction(ctx.actor, "mint_session_for", { actor: target, session: session.id });
       return { id: session.id, actor: session.actor, expires_at: session.expiresAt, token_class: session.tokenClass } as unknown as WooValue;
