@@ -45,6 +45,13 @@ function worldVerb(world: ReturnType<typeof createWorld>, object: string, name: 
   return verb!;
 }
 
+function installHelpDependency(world: ReturnType<typeof createWorld>) {
+  installCatalogManifest(world, readManifest("help") as unknown as RuntimeCatalogManifest, {
+    tap: "@local",
+    alias: "help"
+  });
+}
+
 describe("local catalogs", () => {
   it("discovers bundled catalogs from manifest locations", async () => {
     const catalogDirs = readdirSync(root).filter((name) => existsSync(join(root, name, "manifest.json"))).sort();
@@ -73,7 +80,9 @@ describe("local catalogs", () => {
   });
 
   it("uses explicit dependency order for embedded chat", async () => {
+    const chat = readManifest("chat");
     const taskspace = readManifest("taskspace");
+    expect(chat.depends).toEqual(["@local:help"]);
     expect(taskspace.depends).toEqual(["@local:chat"]);
     expect(taskspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskspace", feature: "chat:$conversational" });
   });
@@ -297,6 +306,7 @@ describe("local catalogs", () => {
 
   it("installs chat from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
+    installHelpDependency(world);
     const manifest = readManifest("chat") as unknown as RuntimeCatalogManifest;
     installCatalogManifest(world, manifest, {
       tap: "github:hugh/woo",
@@ -365,6 +375,7 @@ describe("local catalogs", () => {
 
   it("installs taskspace from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
+    installHelpDependency(world);
     installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
       tap: "@local",
       alias: "chat",
@@ -398,6 +409,7 @@ describe("local catalogs", () => {
 
   it("installs dubspace from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
+    installHelpDependency(world);
     installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
       tap: "github:hugh/woo",
       alias: "chat",
@@ -468,6 +480,7 @@ describe("local catalogs", () => {
 
   it("installs pinboard from source and keeps notes as board-contained pin objects", async () => {
     const world = createWorld({ catalogs: false });
+    installHelpDependency(world);
     installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
       tap: "github:hugh/woo",
       alias: "chat",
@@ -670,11 +683,12 @@ describe("local catalogs", () => {
   it("installs missing dependency catalogs of an already-installed catalog before repair", () => {
     const world = createWorld({ catalogs: ["chat", "pinboard"] });
     expect(world.objects.has("$pinboard")).toBe(true);
-    // Simulate a world that long ago auto-installed pinboard but never had the
-    // note dependency installed (the depends edge is new in this codebase).
+    // Simulate a world that long ago auto-installed catalogs before new
+    // dependency edges existed.
     const registry = world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>>;
-    const trimmed = registry.filter((record) => record.alias !== "note" && record.catalog !== "note");
+    const trimmed = registry.filter((record) => record.alias !== "note" && record.catalog !== "note" && record.alias !== "help" && record.catalog !== "help");
     world.setProp("$catalog_registry", "installed_catalogs", trimmed as unknown as Parameters<typeof world.setProp>[2]);
+    world.setProp("$system", "help_dbs", []);
     // Tear $note out of the world the way an old-deploy world that never had
     // it would look. We can't recycle: $pin descends from $note, so removing
     // by parent is unsafe. Instead, simulate the prior state by walking the
@@ -693,6 +707,8 @@ describe("local catalogs", () => {
 
     installLocalCatalogs(world, []);
 
+    expect(world.getProp("$system", "help_dbs")).toContain("$help");
+    expect(world.getProp("$help", "topics")).toHaveProperty("commands");
     expect(world.objects.has("$note")).toBe(true);
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-v02-repair");
   });
@@ -723,6 +739,29 @@ describe("local catalogs", () => {
     expect(pins).toHaveLength(1);
     expect(world.getProp(pins[0], "text")).toEqual(["real legacy"]);
     expect(world.getProp(pins[0], "color")).toBe("blue");
+  });
+
+  it("preserves live runtime properties on existing seeds across host-scoped repair", () => {
+    // Cold init keeps re-running runHostScopedLocalCatalogLifecycle, which calls
+    // repairCatalogManifest with reconcileSeedHooks: true. Earlier behavior
+    // unconditionally rewrote seed-hook properties to manifest defaults each
+    // run, silently wiping user data: the_pinboard.layout entries, room exits
+    // maps, dubspace tempo/transport/next_seq, etc. This pin asserts that
+    // repair leaves runtime state alone.
+    const world = createWorld();
+    world.setProp("the_pinboard", "layout", { obj_pin_a: { x: 100, y: 200, w: 180, h: 110, z: 5 } });
+    world.setProp("the_pinboard", "next_z", 42);
+    world.setProp("the_dubspace", "tempo", 105);
+    world.setProp("the_dubspace", "transport", "playing");
+    const beforeExits = world.getProp("the_chatroom", "exits");
+
+    runHostScopedLocalCatalogLifecycle(world);
+
+    expect(world.getProp("the_pinboard", "layout")).toEqual({ obj_pin_a: { x: 100, y: 200, w: 180, h: 110, z: 5 } });
+    expect(world.getProp("the_pinboard", "next_z")).toBe(42);
+    expect(world.getProp("the_dubspace", "tempo")).toBe(105);
+    expect(world.getProp("the_dubspace", "transport")).toBe("playing");
+    expect(world.getProp("the_chatroom", "exits")).toEqual(beforeExits);
   });
 
   it("runHostScopedLocalCatalogLifecycle no-ops on a core-only world slice", () => {
@@ -1319,6 +1358,43 @@ describe("local catalogs", () => {
     expect(deckLook.op).toBe("result");
     const list = await world.directCall("taskspace-list-guarded", session.actor, "the_taskspace", "list_tasks", []);
     expect(list.op).toBe("result");
+  });
+
+  it("repairs stale native chat command planning on existing installs", async () => {
+    const world = createWorld();
+    const migrations = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-03-chat-command-plan-source-repair");
+    world.setProp("$system", "applied_migrations", migrations);
+
+    const commandPlan = world.ownVerbExact("$conversational", "command_plan")!;
+    world.addVerb("$conversational", {
+      kind: "native",
+      name: commandPlan.name,
+      aliases: commandPlan.aliases,
+      owner: commandPlan.owner,
+      perms: commandPlan.perms,
+      arg_spec: commandPlan.arg_spec,
+      source: commandPlan.source,
+      source_hash: commandPlan.source_hash,
+      version: commandPlan.version + 1,
+      line_map: commandPlan.line_map,
+      native: "chat_command_plan",
+      direct_callable: commandPlan.direct_callable,
+      skip_presence_check: commandPlan.skip_presence_check
+    });
+
+    installLocalCatalogs(world, ["chat"]);
+
+    const repaired = world.ownVerbExact("$conversational", "command_plan");
+    expect(repaired?.kind).toBe("bytecode");
+    expect(repaired?.source).toContain("parse_command");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-03-chat-command-plan-source-repair");
+
+    const session = world.auth("guest:command-plan-repair");
+    await world.directCall("enter-command-plan-repair", session.actor, "the_chatroom", "enter", []);
+    const plan = await world.directCall("repaired-plan", session.actor, "the_chatroom", "command_plan", ["hello after repair"]);
+    expect(plan.op).toBe("result");
+    if (plan.op === "result") expect(plan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "say", args: ["hello after repair"] });
   });
 
   it("surfaces :title failures during room look composition", async () => {

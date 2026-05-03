@@ -158,6 +158,7 @@ export type InstallCatalogOptions = {
   alias?: string;
   provenance?: Record<string, WooValue>;
   allowImplementationHints?: boolean;
+  adoptExisting?: boolean;
 };
 
 export type RepairCatalogOptions = {
@@ -399,7 +400,7 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
     ref_resolved_sha: "unversioned"
   };
   const existing = installedCatalogs(world);
-  assertCatalogInstallNameAvailable(world, manifest, tap, alias, provenance, existing);
+  assertCatalogInstallNameAvailable(world, manifest, tap, alias, provenance, existing, options.adoptExisting === true);
   assertDependenciesInstalled(manifest, existing);
 
   const localObjects = new Map<string, ObjRef>();
@@ -613,8 +614,14 @@ function reconcileSeedObject(
     world.setProp(id, "name", hook.name);
   }
   if (hook.description) world.setProp(id, "description", catalogDescription(hook.description, hook.name ?? id, manifest.name));
+  // Seed-hook properties are *initial* values — they bootstrap a fresh seed.
+  // The unconditional set_if_missing path at the repair call site (line 510)
+  // already handles "manifest added a new property; existing seed lacks it".
+  // Anything beyond that, including the DYNAMIC_SEED_PROPERTIES list, would
+  // overwrite live runtime state (next_z, layout, tempo, transport, exits...)
+  // on every host's cold init, which silently wipes user data.
   for (const [name, value] of Object.entries(hook.properties ?? {})) {
-    if (DYNAMIC_SEED_PROPERTIES.has(name) && obj.properties.has(name)) continue;
+    if (obj.properties.has(name)) continue;
     world.setProp(id, name, resolveCatalogValue(world, value, localObjects, localSeeds, existing));
   }
   const strandedInNowhere = rehomeNowhereSeedObjects && obj.location === "$nowhere" && location !== null && location !== "$nowhere";
@@ -1151,7 +1158,15 @@ function assertDependenciesInstalled(manifest: CatalogManifest, installed: Insta
   }
 }
 
-function assertCatalogInstallNameAvailable(world: WooWorld, manifest: CatalogManifest, tap: string, alias: string, provenance: Record<string, WooValue>, installed: InstalledCatalogRecord[]): void {
+function assertCatalogInstallNameAvailable(
+  world: WooWorld,
+  manifest: CatalogManifest,
+  tap: string,
+  alias: string,
+  provenance: Record<string, WooValue>,
+  installed: InstalledCatalogRecord[],
+  adoptExisting: boolean
+): void {
   const aliasMatch = installed.find((record) => record.alias === alias);
   if (aliasMatch) {
     if (sameCatalogInstall(aliasMatch, manifest, tap, alias, provenance)) {
@@ -1185,22 +1200,24 @@ function assertCatalogInstallNameAvailable(world: WooWorld, manifest: CatalogMan
       catalog: manifest.name
     });
   }
-  for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) {
-    if (world.objects.has(def.local_name)) {
-      throw wooError("E_NAME_COLLISION", `catalog object already exists: ${def.local_name}`, {
-        catalog: manifest.name,
-        alias,
-        object: def.local_name
-      });
+  if (!adoptExisting) {
+    for (const def of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) {
+      if (world.objects.has(def.local_name)) {
+        throw wooError("E_NAME_COLLISION", `catalog object already exists: ${def.local_name}`, {
+          catalog: manifest.name,
+          alias,
+          object: def.local_name
+        });
+      }
     }
-  }
-  for (const hook of manifest.seed_hooks ?? []) {
-    if (hook.kind === "create_instance" && world.objects.has(hook.as)) {
-      throw wooError("E_NAME_COLLISION", `catalog seed object already exists: ${hook.as}`, {
-        catalog: manifest.name,
-        alias,
-        object: hook.as
-      });
+    for (const hook of manifest.seed_hooks ?? []) {
+      if (hook.kind === "create_instance" && world.objects.has(hook.as)) {
+        throw wooError("E_NAME_COLLISION", `catalog seed object already exists: ${hook.as}`, {
+          catalog: manifest.name,
+          alias,
+          object: hook.as
+        });
+      }
     }
   }
 }
