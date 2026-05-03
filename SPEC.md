@@ -149,6 +149,7 @@ Tools and in-world interfaces for making Woo programmable by people and agents.
 Normative class designs for bundled-catalog content that ships with this repo. These are class-level specs (verb shapes, perms, observation contracts) for individual catalog classes whose design is worth pinning across catalog versions; the catalog *install* contract lives in [discovery/catalogs.md](spec/discovery/catalogs.md).
 
 - [persistent-conversation.md](spec/catalogs/persistent-conversation.md) — `$conversational` and `$persistent_conversational` as composable current-space chat features; `$chatroom` / `$persistent_chatroom` convenience classes; replay-derived `:history()` and public-only persistent transcripts (PC1–PC15)
+- [channels.md](spec/catalogs/channels.md) — `$channel` hierarchy (`$dm_channel`, `$group_channel`, `$public_channel`); deterministic-corename DM uniqueness; per-member `joined_seq`; one-way promotion (dm → group → public) with sequenced log preserved (CH1–CH14, **draft**)
 
 ### Deferred
 
