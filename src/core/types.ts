@@ -42,15 +42,33 @@ export type RemoteToolDescriptor = {
   enclosingSpace: ObjRef | null;
 };
 
-// Per spec/semantics/events.md §12.7.1, directed observations route by their
-// `to`/`from` fields rather than by audience-space presence. The set is closed
-// in v1; additions here require a spec update so transports stay in sync.
-export const DIRECTED_OBSERVATION_TYPES: ReadonlySet<string> = new Set(["told"]);
+// Per spec/semantics/events.md §12.7.1, directed observations route by an
+// explicit recipient field rather than by audience-space presence. The set
+// is closed in v1; additions here require a spec update so transports stay
+// in sync. `told` carries `to`/`from`; `text` (the substrate `tell()`
+// primitive's emission) carries `target` — both are routed straight to the
+// recipient's sockets regardless of whether the calling verb has a space
+// audience. Without `text` here, a verb like `$portable:give` running off
+// any $space (the_mug isn't a space, neither is its carrier) emits tell()
+// observations that vanish into the audience-broadcast path because
+// directAudience(...) returns null.
+export const DIRECTED_OBSERVATION_TYPES: ReadonlySet<string> = new Set(["told", "text"]);
 
 export type DirectedRecipients = { to: ObjRef | null; from: ObjRef | null };
 
 export function directedRecipients(observation: Observation): DirectedRecipients {
   if (!DIRECTED_OBSERVATION_TYPES.has(observation.type)) return { to: null, from: null };
+  if (observation.type === "text") {
+    // `text` is the substrate `tell(actor, …)` primitive's emission. It
+    // routes ONLY to the explicit recipient — `actor` is the sender and
+    // does not get an echo. Verbs that want the sender to also see the
+    // line emit a separate tell(actor, …) themselves (the
+    // `:give` / `:take` / `:drop` etc. pattern).
+    return {
+      to: typeof observation.target === "string" ? observation.target : null,
+      from: null
+    };
+  }
   return {
     to: typeof observation.to === "string" ? observation.to : null,
     from: typeof observation.from === "string" ? observation.from : null

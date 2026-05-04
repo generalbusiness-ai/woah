@@ -110,11 +110,14 @@ Both are advisory hints to transports. If absent, a transport falls back to the 
 
 The set of types treated as direct messages is **closed and explicit** in v1 — adding to it is a spec change, not a per-catalog choice:
 
-| Type | Meaning |
-|---|---|
-| `told` | Whisper / private message from one actor to another (the LambdaCore `:tell` shape). |
+| Type | Routing fields | Meaning |
+|---|---|---|
+| `told` | `to`, `from` | Whisper / private message from one actor to another (the LambdaCore `:tell` shape). |
+| `text` | `target` (recipient only — no echo to `actor`) | The substrate `tell()` primitive's emission. Targeted text delivered straight to one player's connection — independent of whether the calling verb has a space audience. Required so verbs running off any `$space` (e.g. `$portable:give`, `$player:inventory` invoked on a player) still reach their recipient. The `actor` field carries the sender for display, not for routing; verbs that want the sender to also see the line emit their own `tell(actor, …)` (the `:give` / `:take` / `:drop` pattern). |
 
 Future additions (`whispered`, `paged`, `pm`) require a spec amendment so all transports update in lockstep. Catalogs that want directed semantics for a non-listed type today should set `to`/`from` and use the `told` type; otherwise the observation broadcasts to the audience space's full subscriber list.
+
+> **Sequenced-call caveat (v1).** Directed observations are routed to recipients only when they flow through a *direct* call's live-event broadcast path. Observations embedded in an `applied` frame from a sequenced call are broadcast to the space's audience as a unit, so a directed observation inside one would leak to all room subscribers. In practice no v1 catalog verb emits directed observations (`text`, `told`) inside a sequenced call — all `tell()`-style chat affordances (`:take`, `:drop`, `:give`, `:inventory`, `:home`, `:set_description`) are direct. New sequenced verbs that need directed text should `dispatch(target, "tell", [text])` rather than emit `text` observations themselves; if a future feature requires both sequencing *and* directed observations, the broadcast layer needs a separate filter to split directed observations out of the applied frame before fan-out.
 
 #### 12.7.2 Receiver behavior
 
