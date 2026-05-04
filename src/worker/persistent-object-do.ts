@@ -762,6 +762,18 @@ export class PersistentObjectDO {
   }
 
   private async aggregateState(world: WooWorld, actor: ObjRef): Promise<Record<string, unknown>> {
+    const startedAt = Date.now();
+    const result = await this.aggregateStateInner(world, actor);
+    world.recordMetric({
+      kind: "state_projection",
+      ms: Date.now() - startedAt,
+      objects: Object.keys((result.objects ?? {}) as Record<string, unknown>).length,
+      remote_hosts: Array.isArray(result.object_routes) ? new Set((result.object_routes as Array<{ host?: string }>).map((r) => r.host ?? "").filter(Boolean)).size : 0
+    });
+    return result;
+  }
+
+  private async aggregateStateInner(world: WooWorld, actor: ObjRef): Promise<Record<string, unknown>> {
     const state = this.cachedHostState(world, actor);
     const routes = Array.isArray(state.object_routes)
       ? state.object_routes.filter((route): route is { id: string; host: string; anchor: string | null } => (

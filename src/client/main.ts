@@ -200,7 +200,8 @@ function connect() {
       state.observations.unshift({ seq: frame.seq, space: frame.space, observations, message: frame.message });
       trimObservations();
       rememberSeq(frame.space, frame.seq);
-      await refresh();
+      scheduleRefresh();
+      render();
       if (needsPinboardNotesRefresh) refreshPinboardNotes();
       animatePinboardNotes(pinboardAnimations);
     }
@@ -218,7 +219,8 @@ function connect() {
     if (frame.op === "task") {
       state.observations.unshift({ task: frame.task, space: frame.space, observations: frame.observations });
       trimObservations();
-      await refresh();
+      scheduleRefresh();
+      render();
     }
     if (frame.op === "replay") {
       for (const entry of frame.entries ?? []) {
@@ -226,7 +228,8 @@ function connect() {
         rememberSeq(frame.space, entry.seq);
       }
       trimObservations();
-      await refresh();
+      scheduleRefresh();
+      render();
     }
     if (frame.op === "error") {
       const errorHandler = typeof frame.id === "string" ? pendingFrameErrors.get(frame.id) : undefined;
@@ -354,6 +357,8 @@ function writeStorage(key: string, value: string) {
 }
 
 async function refresh() {
+  refreshDebounceTimer = null;
+  refreshDebouncePending = false;
   const response = await fetch("/api/state", { headers: authHeaders() });
   if (!response.ok) return;
   state.world = adaptWorld(await response.json());
@@ -363,6 +368,24 @@ async function refresh() {
   syncTaskSelection();
   audio?.sync(effectiveDubspace(), state.clockOffset);
   render();
+}
+
+// Debounced refresh used by the live event paths. Each applied/task/replay
+// frame already carries observations the client applies locally; a full
+// `/api/state` projection is only needed to catch state the observations don't
+// surface (e.g. ambient property changes, non-observed routing). Coalescing
+// keeps the worker out of the per-keystroke critical path.
+const REFRESH_DEBOUNCE_MS = 750;
+let refreshDebounceTimer: number | null = null;
+let refreshDebouncePending = false;
+function scheduleRefresh() {
+  if (refreshDebounceTimer != null) return;
+  refreshDebouncePending = true;
+  refreshDebounceTimer = window.setTimeout(() => {
+    refreshDebounceTimer = null;
+    if (!refreshDebouncePending) return;
+    void refresh();
+  }, REFRESH_DEBOUNCE_MS);
 }
 
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -711,11 +734,9 @@ function receiveLiveEvent(observation: any) {
         render();
       }
     }
-    const refreshed = refresh();
-    void refreshed.then(() => {
-      if (needsNoteRefresh) refreshPinboardNotes();
-      animatePinboardNotes(pinboardAnimations);
-    });
+    scheduleRefresh();
+    if (needsNoteRefresh) refreshPinboardNotes();
+    animatePinboardNotes(pinboardAnimations);
   }
   if (isDubspaceObservation(observation)) {
     if (String(observation?.actor ?? "") === state.actor) {
@@ -733,7 +754,7 @@ function receiveLiveEvent(observation: any) {
         }
       }
     }
-    void refresh();
+    scheduleRefresh();
   }
   if (isChatObservation(observation)) {
     receiveChatEvent(observation);
@@ -1017,7 +1038,7 @@ function renderDubspace() {
       <button data-save-scene>Save Scene</button>
       <button data-recall-scene>Recall Scene</button>
     </section>
-    <section class="dubspace-layout has-space-chat" style="--space-chat-h:${Math.round(spaceChatHeight(spaceId))}px">
+    <section class="dubspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(spaceId)}" style="--space-chat-h:${Math.round(spaceChatHeight(spaceId))}px">
       <div class="dubspace-work">
         <div class="grid">
           <article class="panel loop-console-panel">
@@ -2009,7 +2030,7 @@ function renderPinboard() {
       <h1>${escapeHtml(board.name ?? "Pinboard")}</h1>
       ${inBoard ? `<button data-pinboard-leave>Leave</button>` : `<button data-pinboard-enter ${canSendDirect() ? "" : "disabled"}>Enter</button>`}
     </section>
-    <section class="pinboard-layout has-space-chat" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
+    <section class="pinboard-layout has-space-chat" data-space-chat-layout="${escapeHtml(board.id)}" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
       <div class="pinboard-work">
         ${inBoard ? renderPinboardCreate(pinboard.palette) : ""}
         <div class="panel pinboard-stage-panel">
@@ -2401,10 +2422,14 @@ function bindSpaceChatResize(panel: HTMLElement | null) {
 
 function applySpaceChatHeight(panel: HTMLElement, height: number) {
   const space = panel.dataset.spaceChatSpace ?? "";
-  if (space) state.spaceChatHeights = { ...state.spaceChatHeights, [space]: height };
-  const rounded = `${Math.round(height)}px`;
+  const normalizedHeight = normalizeSpaceChatHeight(height);
+  if (space) state.spaceChatHeights = { ...state.spaceChatHeights, [space]: normalizedHeight };
+  const rounded = `${Math.round(normalizedHeight)}px`;
   panel.style.height = rounded;
-  panel.parentElement instanceof HTMLElement && panel.parentElement.style.setProperty("--space-chat-h", rounded);
+  if (!(panel.parentElement instanceof HTMLElement)) return;
+  panel.parentElement.style.setProperty("--space-chat-h", rounded);
+  const layout = panel.parentElement.querySelector<HTMLElement>(`[data-space-chat-layout="${cssAttrValue(space)}"]`);
+  if (layout) layout.style.setProperty("--space-chat-h", rounded);
 }
 
 function bringPinNoteToTop(id: string) {
@@ -2901,7 +2926,7 @@ function renderTaskspace() {
         ${taskStatuses.map((status) => renderStatusFilter(status, statusCounts[status] ?? 0)).join("")}
       </div>
     </section>
-    <section class="taskspace-layout has-space-chat" style="--space-chat-h:${Math.round(spaceChatHeight(space))}px">
+    <section class="taskspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(space)}" style="--space-chat-h:${Math.round(spaceChatHeight(space))}px">
       <div class="panel tree">
         <div class="task-create">
           <input data-new-title placeholder="Root task title" />

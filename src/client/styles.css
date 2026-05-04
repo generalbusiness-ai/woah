@@ -882,7 +882,6 @@ input[type="range"] {
   height: var(--space-chat-h, 180px);
   min-height: 96px;
   max-height: 35vh;
-  resize: vertical;
   overflow: auto;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;

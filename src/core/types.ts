@@ -187,7 +187,8 @@ export type MetricEvent =
   | { kind: "applied"; space: ObjRef; seq: number; verb: string; ms: number }
   | { kind: "direct_call"; target: ObjRef; verb: string; audience: ObjRef | null; observations: number; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
-  | { kind: "init"; phase: "world" | "mcp_gateway"; ms: number };
+  | { kind: "init"; phase: "world" | "mcp_gateway"; ms: number }
+  | { kind: "state_projection"; ms: number; objects: number; remote_hosts: number };
 
 export type SequencedMessage = {
   space: ObjRef;
