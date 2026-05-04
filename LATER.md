@@ -10,9 +10,6 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
-- cold-start browser experience
-- @describe me as...
-- look at guest -> show their contents
 - dm (outside of a room), chats and channels
 - are lists-of-text ok? that's a mooism that we don't really need and might cause problems later
 - flesh out the help, make it the default platform-docs

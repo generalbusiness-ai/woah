@@ -70,6 +70,23 @@ const PLAYER_INVENTORY_SOURCE = `verb :inventory() rxd {
   return { items: items, text: text };
 }`;
 
+const ROOT_SET_DESCRIPTION_SOURCE = `verb :set_description(desc) rxd {
+  if (typeof(desc) != "string") {
+    raise { code: "E_TYPE", message: "set_description requires a string", value: desc };
+  }
+  let cp = caller_perms();
+  let allowed = false;
+  if (cp == this) { allowed = true; }
+  else if (cp == this.owner) { allowed = true; }
+  else if (has_flag(cp, "wizard")) { allowed = true; }
+  if (!allowed) {
+    raise { code: "E_PERM", message: "you can't describe that", value: this };
+  }
+  this.description = desc;
+  tell(actor, "Description set.");
+  return true;
+}`;
+
 const PLAYER_HOME_SOURCE = `verb :home() rxd {
   let dest = this.home;
   if (dest == null || dest == $nowhere) { tell(this, "You don't have a home set."); return null; }
@@ -344,6 +361,7 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$root", "describe", "describe", "verb :describe() rxd { ... }", { directCallable: true });
   native(world, "$root", "title", "default_title", "verb :title() rxd { return this.name; }", { directCallable: true });
   native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
+  sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, { directCallable: true, toolExposed: true });
   sourceVerb(world, "$actor", "look_self", ACTOR_LOOK_SELF_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, { directCallable: true, toolExposed: true, aliases: ["i@nventory", "inv"] });
   sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, { directCallable: true, toolExposed: true, aliases: ["@home"] });

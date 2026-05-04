@@ -90,6 +90,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `:describe()` rxd | map | Introspection (see [introspection.md](introspection.md)). |
 | `:title()` rxd | str | Short identifying phrase for `:look`-style composition; default returns `this.name`. Subclasses override to add flair (e.g. `$cockatoo:title()` decorates with *"a sulphur-crested cockatoo perched on the mantelpiece"*). MOO/LambdaCore convention. |
 | `:look_self()` rxd | map | Generic object view. Default returns the object's `:title()` and actor-readable `description`. MOO/LambdaCore convention adapted to structured return values. Actor and catalog classes may override for richer presentation. |
+| `:set_description(desc)` rxd | bool | LambdaCore-shaped self-describe. Returns `true` on success. Allowed when `actor == this` (self-describe), `actor` owns `this`, or `actor` is a wizard. The verb is owned by `$wiz` so its `this.description = desc` write naturally bypasses the property's `r` perms; the explicit perm gate in the body keeps non-wizard callers from describing arbitrary objects. Tells the actor "Description set." on success. |
 | `:set_value(value)` | any | T0 fixture-style helper for simple property update verbs. |
 | `:set_prop(name, value)` | str, any | T0 fixture-style helper for simple named property update verbs. |
 

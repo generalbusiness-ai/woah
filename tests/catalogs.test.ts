@@ -1556,6 +1556,66 @@ describe("local catalogs", () => {
     expect(world.hasPresence(giver.actor, "the_deck")).toBe(false);
   });
 
+  it("dispatches @describe through $root:set_description with self/owner/wizard perms", async () => {
+    const world = createWorld();
+    const guest = world.auth("guest:describe-self");
+    await world.directCall("describe-enter", guest.actor, "the_chatroom", "enter", []);
+
+    // Self-describe via the planner — non-wizard, non-owner of self's def, but
+    // the self-describe carve-out should let it through.
+    const plan = await world.directCall("plan-describe-me", guest.actor, "the_chatroom", "command_plan", ["@describe me as A poised observer."]);
+    expect(plan.op).toBe("result");
+    if (plan.op === "result") {
+      expect(plan.result).toMatchObject({ ok: true, route: "direct", target: guest.actor, verb: "set_description", args: ["A poised observer."] });
+    }
+    const desc = await world.directCall("set-self-desc", guest.actor, guest.actor, "set_description", ["A poised observer."]);
+    expect(desc.op).toBe("result");
+    if (desc.op === "result") {
+      expect(desc.result).toBe(true);
+      expect(desc.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "text", target: guest.actor, text: "Description set." })
+      ]));
+    }
+    expect(world.getProp(guest.actor, "description")).toBe("A poised observer.");
+
+    // Foreign describe: another guest can't describe me.
+    const stranger = world.auth("guest:describe-stranger");
+    const denied = await world.directCall("foreign-desc", stranger.actor, guest.actor, "set_description", ["mine now"]);
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(guest.actor, "description")).toBe("A poised observer.");
+
+    // Owner branch: an object owned by the guest is describable by the guest
+    // even though they neither are the object nor a wizard. LambdaCore's
+    // `controls(caller_perms(), this)` clause.
+    world.createObject({ id: "describe_owned_curio", name: "guest curio", parent: "$thing", owner: guest.actor, location: "the_chatroom" });
+    const ownerDesc = await world.directCall("owner-desc", guest.actor, "describe_owned_curio", "set_description", ["A sleek brass curio."]);
+    expect(ownerDesc.op).toBe("result");
+    if (ownerDesc.op === "result") expect(ownerDesc.result).toBe(true);
+    expect(world.getProp("describe_owned_curio", "description")).toBe("A sleek brass curio.");
+
+    // Owner can't describe an object they don't own (just to keep the
+    // controls clause honest — the curio is theirs but the stranger's
+    // description is not).
+    const ownerOverreach = await world.directCall("owner-overreach", guest.actor, stranger.actor, "set_description", ["meddling"]);
+    expect(ownerOverreach.op).toBe("error");
+    if (ownerOverreach.op === "error") expect(ownerOverreach.error.code).toBe("E_PERM");
+
+    // Wizard branch: $wiz can describe arbitrary objects regardless of
+    // ownership or self-equality.
+    const wizDesc = await world.directCall("wiz-desc", "$wiz", stranger.actor, "set_description", ["Touched by a wizard."]);
+    expect(wizDesc.op).toBe("result");
+    if (wizDesc.op === "result") expect(wizDesc.result).toBe(true);
+    expect(world.getProp(stranger.actor, "description")).toBe("Touched by a wizard.");
+
+    // Disconnect-reset: reaping the guest's session resets description to "".
+    world.attachSocket(guest.id, "ws-describe-test");
+    world.detachSocket(guest.id, "ws-describe-test");
+    const detachedAt = world.sessions.get(guest.id)?.lastDetachAt ?? Date.now();
+    expect(world.reapExpiredSessions(detachedAt + 60_001)).toEqual([guest.id]);
+    expect(world.getProp(guest.actor, "description")).toBe("");
+  });
+
   it("repairs stale chat room seed metadata and missing room contents", () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", [
