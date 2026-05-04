@@ -1348,6 +1348,9 @@ function renamePropertyLocal(world: WooWorld, objRef: ObjRef, from: string, to: 
     if (!obj.propertyVersions.has(to)) obj.propertyVersions.set(to, obj.propertyVersions.get(from)! + 1);
     obj.propertyVersions.delete(from);
   }
+  if (from === "subscribers" || from === "presence_in" || to === "subscribers" || to === "presence_in") {
+    world.invalidatePresenceIndex();
+  }
   touchObject(world, objRef);
 }
 
@@ -1356,6 +1359,9 @@ function dropPropertyLocal(world: WooWorld, objRef: ObjRef, name: string): void 
   obj.propertyDefs.delete(name);
   obj.properties.delete(name);
   obj.propertyVersions.delete(name);
+  if (name === "subscribers" || name === "presence_in") {
+    world.invalidatePresenceIndex();
+  }
   touchObject(world, objRef);
 }
 

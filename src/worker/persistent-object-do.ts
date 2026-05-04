@@ -94,6 +94,11 @@ export class PersistentObjectDO {
   private static readonly CROSS_HOST_STABLE_PROPS = new Set(["name", "description", "aliases"]);
   private static readonly CROSS_HOST_PROP_TTL_MS = 30_000;
   private static readonly CROSS_HOST_PROP_CACHE_MAX = 1024;
+  // Actor -> live WebSocket set on this DO. Avoids the per-broadcast
+  // state.getWebSockets() scan: broadcast iterates the audience's actors
+  // (from world.presenceActorsIn) and looks up sockets directly. Built
+  // on rehydrate and maintained on attach/detach.
+  private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -291,10 +296,12 @@ export class PersistentObjectDO {
       // (hydrateSession in world.ts:1256). Re-attach each surviving socket
       // so presence-filtered broadcasts reach those clients again and the
       // session reap path doesn't expire actively-connected sessions.
+      this.socketsByActor.clear();
       for (const ws of this.state.getWebSockets()) {
         const att = this.attachment(ws);
         if (att && world.sessions?.has(att.sessionId)) {
           world.attachSocket(att.sessionId, att.socketId);
+          this.indexAddSocket(att.actor, ws);
         }
       }
       this.world = world;
@@ -822,33 +829,6 @@ export class PersistentObjectDO {
     return state;
   }
 
-  // Send live observations to the gateway's broadcast route so attached
-  // WebSocket / SSE / MCP listeners see them. Best-effort: if the gateway
-  // is unreachable the cluster's authoritative call result is already back
-  // to the originator; broadcast loss only affects passive observers.
-  private async forwardLiveEventsToGateway(
-    audience: ObjRef,
-    observations: Observation[],
-    audiences: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][] }
-  ): Promise<void> {
-    try {
-      const id = this.env.WOO.idFromName(WORLD_HOST);
-      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/broadcast-live-events`, {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8", "x-woo-host-key": WORLD_HOST },
-        body: JSON.stringify({
-          audience,
-          audience_actors: audiences.audienceActors,
-          observation_audiences: audiences.observationAudiences,
-          observations
-        })
-      }));
-      await this.env.WOO.get(id).fetch(request);
-    } catch {
-      // best-effort
-    }
-  }
-
   private async fetchHostState(host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
     try {
       const id = this.env.WOO.idFromName(host);
@@ -1250,10 +1230,14 @@ export class PersistentObjectDO {
       },
       attach: (_connection, session) => {
         const previous = this.attachment(ws);
-        if (previous) world.detachSocket(previous.sessionId, previous.socketId);
+        if (previous) {
+          world.detachSocket(previous.sessionId, previous.socketId);
+          this.indexRemoveSocket(previous.actor, ws);
+        }
         const socketId = `ws-${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         world.attachSocket(session.id, socketId);
         ws.serializeAttachment({ sessionId: session.id, actor: session.actor, socketId });
+        this.indexAddSocket(session.actor, ws);
       },
       session: () => this.liveAttachment(world, ws),
       send: (_connection, frameValue) => ws.send(JSON.stringify(frameValue)),
@@ -1299,7 +1283,10 @@ export class PersistentObjectDO {
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
     const world = await this.getWorld();
     const att = this.attachment(ws);
-    if (att) world.detachSocket(att.sessionId, att.socketId);
+    if (att) {
+      world.detachSocket(att.sessionId, att.socketId);
+      this.indexRemoveSocket(att.actor, ws);
+    }
     try {
       ws.close();
     } catch {
@@ -1310,7 +1297,23 @@ export class PersistentObjectDO {
   async webSocketError(ws: WebSocket, _err: unknown): Promise<void> {
     const world = await this.getWorld();
     const att = this.attachment(ws);
-    if (att) world.detachSocket(att.sessionId, att.socketId);
+    if (att) {
+      world.detachSocket(att.sessionId, att.socketId);
+      this.indexRemoveSocket(att.actor, ws);
+    }
+  }
+
+  private indexAddSocket(actor: ObjRef, ws: WebSocket): void {
+    let set = this.socketsByActor.get(actor);
+    if (!set) { set = new Set(); this.socketsByActor.set(actor, set); }
+    set.add(ws);
+  }
+
+  private indexRemoveSocket(actor: ObjRef, ws: WebSocket): void {
+    const set = this.socketsByActor.get(actor);
+    if (!set) return;
+    set.delete(ws);
+    if (set.size === 0) this.socketsByActor.delete(actor);
   }
 
   // ---- WS helpers ----
@@ -1437,14 +1440,19 @@ export class PersistentObjectDO {
     const data = JSON.stringify(frame);
     const dataNoId = JSON.stringify({ ...frame, id: undefined });
     let audienceSize = 0;
-    for (const ws of this.state.getWebSockets()) {
-      const att = this.attachment(ws);
-      if (!att || !world.hasPresence(att.actor, frame.space)) continue;
-      audienceSize += 1;
-      try {
-        ws.send(ws === originator ? data : dataNoId);
-      } catch {
-        // socket gone; webSocketClose will clean up
+    const audience = world.presenceActorsIn(frame.space);
+    if (audience) {
+      for (const actor of audience) {
+        const sockets = this.socketsByActor.get(actor);
+        if (!sockets) continue;
+        for (const ws of sockets) {
+          audienceSize += 1;
+          try {
+            ws.send(ws === originator ? data : dataNoId);
+          } catch {
+            // socket gone; webSocketClose will clean up
+          }
+        }
       }
     }
     this.mcpGateway?.routeAppliedFrame(frame, originMcpSessionId ?? null);
@@ -1463,10 +1471,14 @@ export class PersistentObjectDO {
     }
     const space = taskResultSpace(result);
     const data = JSON.stringify({ op: "task", task: result.task.id, space, observations: result.observations });
-    for (const ws of this.state.getWebSockets()) {
-      const att = this.attachment(ws);
-      if (!att || !world.hasPresence(att.actor, space)) continue;
-      try { ws.send(data); } catch { /* gone */ }
+    const audience = world.presenceActorsIn(space);
+    if (!audience) return;
+    for (const actor of audience) {
+      const sockets = this.socketsByActor.get(actor);
+      if (!sockets) continue;
+      for (const ws of sockets) {
+        try { ws.send(data); } catch { /* gone */ }
+      }
     }
   }
 
@@ -1485,21 +1497,24 @@ export class PersistentObjectDO {
   private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[]): number {
     const data = JSON.stringify(frame);
     const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
-    const audienceSet = audienceActors ? new Set(audienceActors) : null;
     let delivered = 0;
-    for (const ws of this.state.getWebSockets()) {
-      const att = this.attachment(ws);
-      if (!att) continue;
-      if (directedTo || directedFrom) {
-        if (att.actor !== directedTo && att.actor !== directedFrom) continue;
-      } else if (audienceSet) {
-        if (!audienceSet.has(att.actor)) continue;
-      } else if (!world.hasPresence(att.actor, audience)) {
-        continue;
+    const sendAll = (sockets: Set<WebSocket> | undefined): void => {
+      if (!sockets) return;
+      for (const ws of sockets) {
+        delivered += 1;
+        try { ws.send(data); } catch { /* gone */ }
       }
-      delivered += 1;
-      try { ws.send(data); } catch { /* gone */ }
+    };
+    if (directedTo || directedFrom) {
+      if (directedTo) sendAll(this.socketsByActor.get(directedTo));
+      if (directedFrom && directedFrom !== directedTo) sendAll(this.socketsByActor.get(directedFrom));
+      return delivered;
     }
+    const actorsIter: Iterable<ObjRef> | null = audienceActors
+      ? audienceActors
+      : world.presenceActorsIn(audience);
+    if (!actorsIter) return delivered;
+    for (const actor of actorsIter) sendAll(this.socketsByActor.get(actor));
     return delivered;
   }
 

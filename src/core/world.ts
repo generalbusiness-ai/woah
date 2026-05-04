@@ -264,6 +264,13 @@ export class WooWorld {
   // second local behavior mutate the same in-memory state mid-savepoint.
   private hostQueue: Promise<unknown> = Promise.resolve();
   private metricsHook: ((event: MetricEvent) => void) | null = null;
+  // O(1) presence lookup. Mirrors the `subscribers` list-property on each
+  // $space and the `presence_in` list on each actor. Built lazily; kept in
+  // sync from setPropLocal so writes through the verb path stay coherent.
+  // importWorld resets `presenceIndexBuilt` to force a fresh scan.
+  private subscribersIndex = new Map<ObjRef, Set<ObjRef>>();
+  private actorPresenceIndex = new Map<ObjRef, Set<ObjRef>>();
+  private presenceIndexBuilt = false;
 
   constructor(private repository?: WooRepository, options: { hostBridge?: HostBridge | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
@@ -394,6 +401,13 @@ export class WooWorld {
     if (!target.properties.has(property.name)) {
       target.properties.set(property.name, cloneValue(property.defaultValue));
       target.propertyVersions.set(property.name, 1);
+      // Catalog migrations that add `subscribers`/`presence_in` with a
+      // non-empty default would otherwise bypass setPropLocal. Invalidate
+      // rather than incrementally updating: presence is the OR of two
+      // independent properties, so single-property provenance matters.
+      if (property.name === "subscribers" || property.name === "presence_in") {
+        this.invalidatePresenceIndex();
+      }
     }
     this.persistObject(obj);
     this.persist();
@@ -412,6 +426,56 @@ export class WooWorld {
     obj.properties.set(name, cloneValue(value));
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
     obj.modified = Date.now();
+    if (name === "subscribers" || name === "presence_in") {
+      this.invalidatePresenceIndex();
+    }
+  }
+
+  // Drop the in-memory presence index. The next read rebuilds it. Call
+  // sites that mutate presence-related properties use this to avoid drift.
+  // This intentionally invalidates instead of incrementally editing one
+  // relation: `hasPresence()` is true if either `actor.presence_in` or
+  // `space.subscribers` contains the relation, so an index entry has no
+  // single source of truth.
+  invalidatePresenceIndex(): void {
+    this.presenceIndexBuilt = false;
+    this.subscribersIndex.clear();
+    this.actorPresenceIndex.clear();
+  }
+
+  private ensurePresenceIndex(): void {
+    if (this.presenceIndexBuilt) return;
+    this.subscribersIndex.clear();
+    this.actorPresenceIndex.clear();
+    for (const obj of this.objects.values()) {
+      const subs = obj.properties.get("subscribers");
+      if (Array.isArray(subs)) {
+        const ids = subs.filter((item): item is ObjRef => typeof item === "string");
+        if (ids.length > 0) {
+          this.subscribersIndex.set(obj.id, new Set(ids));
+          for (const actor of ids) {
+            let spaces = this.actorPresenceIndex.get(actor);
+            if (!spaces) { spaces = new Set(); this.actorPresenceIndex.set(actor, spaces); }
+            spaces.add(obj.id);
+          }
+        }
+      }
+      const pres = obj.properties.get("presence_in");
+      if (Array.isArray(pres)) {
+        const ids = pres.filter((item): item is ObjRef => typeof item === "string");
+        if (ids.length > 0) {
+          let spaces = this.actorPresenceIndex.get(obj.id);
+          if (!spaces) { spaces = new Set(); this.actorPresenceIndex.set(obj.id, spaces); }
+          for (const space of ids) {
+            spaces.add(space);
+            let subs2 = this.subscribersIndex.get(space);
+            if (!subs2) { subs2 = new Set(); this.subscribersIndex.set(space, subs2); }
+            subs2.add(obj.id);
+          }
+        }
+      }
+    }
+    this.presenceIndexBuilt = true;
   }
 
   deleteProp(objRef: ObjRef, name: string): boolean {
@@ -424,6 +488,9 @@ export class WooWorld {
     if (!hadProperty) return false;
     obj.modified = Date.now();
     this.deletePersistedProperty(objRef, name);
+    if (name === "subscribers" || name === "presence_in") {
+      this.invalidatePresenceIndex();
+    }
     this.persist();
     return true;
   }
@@ -997,10 +1064,20 @@ export class WooWorld {
   }
 
   hasPresence(actor: ObjRef, space: ObjRef): boolean {
-    const presence = this.propOrNull(actor, "presence_in");
-    if (Array.isArray(presence) && presence.includes(space)) return true;
-    const subscribers = this.propOrNull(space, "subscribers");
-    return Array.isArray(subscribers) && subscribers.includes(actor);
+    this.ensurePresenceIndex();
+    const subs = this.subscribersIndex.get(space);
+    if (subs && subs.has(actor)) return true;
+    const spaces = this.actorPresenceIndex.get(actor);
+    return spaces ? spaces.has(space) : false;
+  }
+
+  // Read-only audience view for a $space. Returns the in-memory set the
+  // index already maintains, so callers iterating the audience get the
+  // same actor list `hasPresence` consults — without an O(N) array copy.
+  // Returns `null` when no actor is recorded as present.
+  presenceActorsIn(space: ObjRef): ReadonlySet<ObjRef> | null {
+    this.ensurePresenceIndex();
+    return this.subscribersIndex.get(space) ?? null;
   }
 
   async call(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
@@ -2883,6 +2960,7 @@ export class WooWorld {
     }
     this.objects.delete(objRef);
     this.deletePersistedObject(objRef);
+    if (this.presenceIndexBuilt) this.invalidatePresenceIndex();
     this.persist();
   }
 
@@ -3097,6 +3175,9 @@ export class WooWorld {
       this.logs.clear();
       this.snapshots = [];
       this.parkedTasks.clear();
+      this.presenceIndexBuilt = false;
+      this.subscribersIndex.clear();
+      this.actorPresenceIndex.clear();
       for (const item of serialized.objects) {
         this.objects.set(item.id, {
           id: item.id,
@@ -4070,9 +4151,14 @@ export class WooWorld {
   }
 
   private liveAudienceActors(space: ObjRef): ObjRef[] | undefined {
+    // Existence check is via the property: an absent `subscribers` list is
+    // not the same as an empty subscriber list (the former returns
+    // undefined; broadcast then falls back). The index can't distinguish.
     const raw = this.propOrNull(space, "subscribers");
     if (!Array.isArray(raw)) return undefined;
-    return raw.filter((item): item is ObjRef => typeof item === "string");
+    this.ensurePresenceIndex();
+    const subs = this.subscribersIndex.get(space);
+    return subs ? Array.from(subs) : [];
   }
 
   // Compute the per-observation audience for a direct call from this host's
@@ -4675,6 +4761,10 @@ export class WooWorld {
     this.sessionCounter = savepoint.sessionCounter;
     this.guestFreePool = new Set(savepoint.guestFreePool);
     this.restorePersistenceDirtyState(savepoint.persistence);
+    // The index mirrors `subscribers`/`presence_in` properties on objects we
+    // just rolled back. Drop it so the next read rebuilds from the restored
+    // property values.
+    this.invalidatePresenceIndex();
   }
 
   private cloneObject(obj: WooObject): WooObject {
