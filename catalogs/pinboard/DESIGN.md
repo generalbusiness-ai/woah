@@ -42,7 +42,7 @@ $thing
   │           └── $pin        (catalogs/pinboard, adds .color)
   └── $space                  (core)
         ├── $pinboard         (catalogs/pinboard)
-        │      .contents holds $note descendants
+        │      .contents holds $note descendants and actors currently inside
         │      .layout map keyed by pin obj id → {x,y,w,h,z}
         │      .next_z, .palette, .viewport, .mount_room
         │      presence semantics from $space
@@ -65,12 +65,13 @@ because it shares those verbs, not because of cross-tree inheritance.
 | `text` | `$note` (inherited) | The actual content. List of strings. |
 | `writers` | `$note` (inherited) | Who else can edit besides owner. |
 | `color` | `$pin` | `null` or a string. Frontend renders white when null. |
-| `contents` | `$pinboard` (built-in) | Pins currently on the board. |
+| `contents` | `$pinboard` (built-in) | Pins currently on the board, plus actors who have entered it. Note-listing and layout verbs filter to `$note` descendants. |
 | `layout` | `$pinboard` | Map keyed by pin obj id → `{x, y, w, h, z}`. |
 | `next_z` | `$pinboard` | Z-index counter for stacking. |
 | `palette` | `$pinboard` | Allowed colors when `add_note` accepts a color. `white` is accepted as UI shorthand for `null`, not stored. |
 | `viewport` | `$pinboard` | Default viewport dimensions for clients. |
 | `mount_room` | `$pinboard` | Optional room that hosts this pinboard for room-level activity events. |
+| chat feature | `the_pinboard` seed instance | The bundled demo board attaches ephemeral `chat:$conversational`. Utterances are live observations, not durable pinboard log entries. When `$persistent_conversational` lands, the seed hook can swap to that durable feature. |
 | `contents` | `$kanban_board` (built-in) | Pins currently on the kanban board. |
 | `columns` | `$kanban_board` | Ordered list of column records: `{id, title, cards}`. |
 | `next_column_id` | `$kanban_board` | Monotone counter for generated stable column ids. |
@@ -133,13 +134,14 @@ Inherits everything from `$note` (`read`, `write`, `set_text`, `erase`,
 | Verb | Purpose |
 | --- | --- |
 | `look` / `look_self` | Standard space look surface; returns the joined view (pins + layout + presence). |
-| `enter` / `leave` | Subscribe/unsubscribe from incremental observations. |
+| `enter` / `leave` / `out` | Move the actor into/out of the board and subscribe/unsubscribe from incremental observations. `leave` and `out` return to `mount_room` when set, otherwise actor home. Enter/leave physically move actors and can cross hosts because bundled `the_pinboard` has `host_placement: "self"`. |
 | `viewport(x, y, w, h, scale)` | Frontend telemetry for client-side panning/zoom. |
 | `list_notes` | Returns `[{ id, name, text, color, owner, writers, x, y, w, h, z }]` joining contents + layout. |
-| `acceptable(object)` | Returns `isa(object, $note)`. Gates `:moveto` into the board. |
-| `enterfunc(object)` | Called by core when a note arrives. Allocates default layout if missing; fires `pin_added`. |
-| `exitfunc(object)` | Called when a note leaves. Removes its layout entry; fires `pin_removed`. |
+| `acceptable(object)` | Returns `isa(object, $note) || isa(object, $actor)`. Notes and actors can enter; layout verbs ignore actors. |
+| `enterfunc(object)` | Called by core when an object arrives. For notes, allocates default layout if missing and fires `pin_added`; actors are accepted without layout. |
+| `exitfunc(object)` | Called when an object leaves. For notes, removes its layout entry and fires `pin_removed`; actors are ignored. |
 | `post(pin)` | Convenience: `moveto(pin, this)` after the type check. Same effect as `pin:moveto(this)`. |
+| `drop(object)` | Sequenced room-style convenience for a carried note. Resolves the carried object, requires `location(pin) == actor`, and calls `moveto(pin, this)`, so `enterfunc` owns placement. |
 | `take(pin)` | Move pin to the actor's inventory. **Note-controller-only**: pin author or wizard. Board owners use `:eject` for curation; this verb does not grant board-owner authority. |
 | `eject(pin)` | Move pin to the actor's inventory. **Curator path**: board owner or wizard only. Use this to remove someone else's pin from your board. |
 | `move_pin(pin, x, y)` | Update layout. Brings the pin to top z. |

@@ -803,8 +803,9 @@ input[type="range"] {
   grid-template-columns: minmax(0, 1fr) 230px;
   gap: 1rem;
   align-items: stretch;
-  height: calc(100dvh - 5.25rem);
+  height: calc(100dvh - 5.25rem - var(--pinboard-chat-h, 180px) - 0.8rem);
   min-height: 0;
+  margin-bottom: 0.8rem;
 }
 
 .pinboard-work {
@@ -843,6 +844,86 @@ input[type="range"] {
 
 .pinboard-presence h2 {
   margin: 0;
+}
+
+.pinboard-chat-panel {
+  position: relative;
+  height: var(--pinboard-chat-h, 180px);
+  min-height: 96px;
+  max-height: 35vh;
+  resize: vertical;
+  overflow: auto;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0.45rem;
+  padding: 0.85rem 0.65rem 0.65rem;
+}
+
+.pinboard-chat-resizer {
+  position: absolute;
+  top: 0;
+  left: 0.75rem;
+  right: 0.75rem;
+  height: 0.7rem;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.pinboard-chat-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0.28rem;
+  left: 50%;
+  width: 4.5rem;
+  height: 0.18rem;
+  border-radius: 999px;
+  background: #9aa397;
+  transform: translateX(-50%);
+}
+
+.pinboard-chat-resizer:hover::before,
+.pinboard-chat-panel.is-resizing .pinboard-chat-resizer::before {
+  background: #4c6f56;
+}
+
+.pinboard-chat-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.pinboard-chat-head h2 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.pinboard-chat-head span {
+  color: #687365;
+  font-size: 0.76rem;
+}
+
+.pinboard-chat-feed {
+  font-size: 0.86rem;
+}
+
+.pinboard-chat-feed .chat-line {
+  padding: 0.32rem 0.45rem;
+  grid-template-columns: 3.6rem minmax(5.5rem, auto) minmax(0, 1fr);
+}
+
+.pinboard-chat-feed .chat-line.emote,
+.pinboard-chat-feed .chat-line.system,
+.pinboard-chat-feed .chat-line.error {
+  grid-template-columns: 3.6rem minmax(0, 1fr);
+}
+
+.pinboard-chat-form {
+  gap: 0.45rem;
+}
+
+.pinboard-chat-form input {
+  min-width: 0;
 }
 
 .pinboard-stage-panel {

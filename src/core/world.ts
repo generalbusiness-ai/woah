@@ -5311,6 +5311,7 @@ export class WooWorld {
         } catch {
           // Matching remains available by object id/name if a custom title fails.
         }
+        this.addLocalNoteMatchNames(ctx, id, names);
         const localAliases = this.propOrNull(id, "aliases");
         if (Array.isArray(localAliases)) aliases.push(...localAliases.map((item) => String(item)));
       }
@@ -5322,6 +5323,20 @@ export class WooWorld {
       else if (wanted.length >= 2 && [...nameValues, ...aliasValues].some((item) => item.includes(lower))) contains.push(id);
     }
     return this.resolveObjectMatch(exact.length > 0 ? exact : alias.length > 0 ? alias : prefix.length > 0 ? prefix : contains);
+  }
+
+  private addLocalNoteMatchNames(ctx: CallContext, id: ObjRef, names: string[]): void {
+    if (!this.isDescendantOf(id, "$note")) return;
+    const color = this.propOrNull(id, "color");
+    if (typeof color === "string" && color && color !== "white") {
+      names.push(`${color} note`, `the ${color} note`, `${color} sticky note`, `the ${color} sticky note`);
+    }
+    const text = this.propOrNull(id, "text");
+    if (Array.isArray(text)) {
+      for (const line of text) {
+        if (typeof line === "string" && line.trim()) names.push(line.trim());
+      }
+    }
   }
 
   private resolveObjectMatch(matches: ObjRef[]): ObjectMatch {

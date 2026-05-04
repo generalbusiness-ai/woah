@@ -81,8 +81,11 @@ describe("local catalogs", () => {
 
   it("uses explicit dependency order for embedded chat", async () => {
     const chat = readManifest("chat");
+    const pinboard = readManifest("pinboard");
     const taskspace = readManifest("taskspace");
     expect(chat.depends).toEqual(["@local:help"]);
+    expect(pinboard.depends).toEqual(["@local:chat", "@local:note", "@local:demoworld"]);
+    expect(pinboard.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_pinboard", feature: "chat:$conversational" });
     expect(taskspace.depends).toEqual(["@local:chat", "@local:note"]);
     expect(taskspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskspace", feature: "chat:$conversational" });
   });
@@ -530,6 +533,7 @@ describe("local catalogs", () => {
     const other = world.auth("guest:catalog-pinboard-other");
     const entered = await world.directCall("pinboard-enter", session.actor, "the_pinboard", "enter", []);
     expect(entered.op).toBe("result");
+    expect(world.object(session.actor).location).toBe("the_pinboard");
     expect(world.hasPresence(session.actor, "the_pinboard")).toBe(true);
     await world.directCall("pinboard-enter-other", other.actor, "the_pinboard", "enter", []);
 
@@ -590,6 +594,78 @@ describe("local catalogs", () => {
     expect(world.getProp("the_pinboard", "layout")).toMatchObject({ [pin]: { x: 80, y: 96 } });
   });
 
+  it("plans pinboard chat commands against the current board space", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["pinboard"]);
+
+    const session = world.auth("guest:catalog-pinboard-chat");
+    const entered = await world.directCall("pinboard-chat-enter", session.actor, "the_pinboard", "enter", []);
+    expect(entered.op).toBe("result");
+    expect(world.object(session.actor).location).toBe("the_pinboard");
+
+    const added = await world.call("pinboard-chat-add", session.id, "the_pinboard", {
+      actor: session.actor,
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["Bring the towel to the hot tub", "gray", 12, 24, 160, 88]
+    });
+    expect(added.op).toBe("applied");
+    if (added.op !== "applied") return;
+    const note = added.observations.find((obs) => obs.type === "note_added")?.note as Record<string, unknown>;
+    const pin = String(note.id);
+
+    expect(world.verbInfo("the_pinboard", "say").definer).toBe("$conversational");
+    const sayPlan = await world.directCall("pinboard-say-plan", session.actor, "the_pinboard", "command_plan", ["hello board"]);
+    expect(sayPlan.op).toBe("result");
+    if (sayPlan.op === "result") {
+      expect(sayPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "say", args: ["hello board"] });
+    }
+
+    const lookPlan = await world.directCall("pinboard-look-plan", session.actor, "the_pinboard", "command_plan", ["look"]);
+    expect(lookPlan.op).toBe("result");
+    if (lookPlan.op === "result") {
+      expect(lookPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "look", args: [] });
+    }
+    const looked = await world.directCall("pinboard-look", session.actor, "the_pinboard", "look", []);
+    expect(looked.op).toBe("result");
+    if (looked.op === "result") {
+      expect(looked.result).toMatchObject({ note_count: 1, summary: "Pinboard has 1 note on it." });
+      expect(looked.observations).toContainEqual(expect.objectContaining({ type: "looked", room: "the_pinboard", text: "Pinboard has 1 note on it." }));
+    }
+
+    const outPlan = await world.directCall("pinboard-out-plan", session.actor, "the_pinboard", "command_plan", ["out"]);
+    expect(outPlan.op).toBe("result");
+    if (outPlan.op === "result") {
+      expect(outPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "out", args: [] });
+    }
+
+    const takePlan = await world.directCall("pinboard-take-plan", session.actor, "the_pinboard", "command_plan", ["take towel"]);
+    expect(takePlan.op).toBe("result");
+    if (takePlan.op === "result") {
+      expect(takePlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_pinboard", target: "the_pinboard", verb: "take", args: [pin] });
+    }
+    await world.call("pinboard-chat-take", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "take", args: [pin] });
+
+    const dropPlan = await world.directCall("pinboard-drop-plan", session.actor, "the_pinboard", "command_plan", ["drop towel"]);
+    expect(dropPlan.op).toBe("result");
+    if (dropPlan.op === "result") {
+      expect(dropPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_pinboard", target: "the_pinboard", verb: "drop", args: [pin] });
+      await world.call("pinboard-drop-command", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "drop", args: [pin] });
+    }
+    expect(world.object(pin).location).toBe("the_pinboard");
+    expect(world.getProp("the_pinboard", "layout")).toHaveProperty(pin);
+
+    const rejectedDrop = await world.call("pinboard-drop-not-carried", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "drop", args: [pin] });
+    expect(rejectedDrop.op).toBe("applied");
+    if (rejectedDrop.op === "applied") expect(rejectedDrop.observations.find((obs) => obs.type === "$error")?.code).toBe("E_INVARG");
+
+    const left = await world.directCall("pinboard-out", session.actor, "the_pinboard", "out", []);
+    expect(left.op).toBe("result");
+    expect(world.object(session.actor).location).toBe("the_deck");
+    expect(world.hasPresence(session.actor, "the_pinboard")).toBe(false);
+    expect(world.hasPresence(session.actor, "the_deck")).toBe(true);
+  });
+
   it("migrates v0.1 pinboard note records into pin objects", () => {
     const world = createWorld();
     const session = world.auth("guest:pinboard-migration");
@@ -629,10 +705,14 @@ describe("local catalogs", () => {
 
     world.createObject({ id: "sticky_alpha", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
     world.createObject({ id: "sticky_beta", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
+    world.createObject({ id: "sticky_blue", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
     world.setProp("sticky_alpha", "name", "sticky note");
     world.setProp("sticky_beta", "name", "sticky note");
+    world.setProp("sticky_blue", "name", "sticky note");
     world.setProp("sticky_alpha", "text", ["another one"]);
     world.setProp("sticky_beta", "text", ["this is it"]);
+    world.setProp("sticky_blue", "text", ["hello"]);
+    world.setProp("sticky_blue", "color", "blue");
 
     const look = await world.directCall("look-sticky-alpha", session.actor, "the_hot_tub", "command_plan", ["look sticky note: another one"]);
     expect(look.op).toBe("result");
@@ -655,6 +735,18 @@ describe("local catalogs", () => {
     expect(world.object("sticky_alpha").location).toBe(session.actor);
     await world.directCall("drop-sticky-alpha", session.actor, "the_hot_tub", "drop", ["another"]);
     expect(world.object("sticky_alpha").location).toBe("the_hot_tub");
+
+    const takeByText = await world.directCall("take-sticky-blue-text", session.actor, "the_hot_tub", "take", ["hello"]);
+    expect(takeByText.op).toBe("result");
+    expect(world.object("sticky_blue").location).toBe(session.actor);
+    await world.directCall("drop-sticky-blue", session.actor, "the_hot_tub", "drop", ["the blue note"]);
+    expect(world.object("sticky_blue").location).toBe("the_hot_tub");
+
+    const takeByColor = await world.directCall("take-sticky-blue-color", session.actor, "the_hot_tub", "take", ["the blue note"]);
+    expect(takeByColor.op).toBe("result");
+    expect(world.object("sticky_blue").location).toBe(session.actor);
+    await world.directCall("drop-sticky-blue-again", session.actor, "the_hot_tub", "drop", ["blue note"]);
+    expect(world.object("sticky_blue").location).toBe("the_hot_tub");
 
     const take = await world.directCall("take-sticky-beta", session.actor, "the_hot_tub", "take", ["sticky note: this is it"]);
     expect(take.op).toBe("result");
@@ -1147,6 +1239,13 @@ describe("local catalogs", () => {
     expect(takePlan.op).toBe("result");
     if (takePlan.op === "result") {
       expect(takePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["lamp"] });
+    }
+
+    const missingTakePlan = await world.directCall("plan-take-missing", session.actor, "the_chatroom", "command_plan", ["get whatever"]);
+    expect(missingTakePlan.op).toBe("result");
+    if (missingTakePlan.op === "result") {
+      expect(missingTakePlan.result).toMatchObject({ ok: false, route: "huh", target: "the_chatroom", verb: "huh", text: "get whatever" });
+      expect(missingTakePlan.observations).toContainEqual(expect.objectContaining({ type: "huh", source: "the_chatroom", actor: session.actor, text: "get whatever" }));
     }
 
     const takeLamp = await world.directCall("take-lamp", session.actor, "the_chatroom", "take", ["lamp"]);

@@ -15,6 +15,8 @@ type AppState = {
   chatFeed: ChatLine[];
   chatPresent: string[];
   chatDraft: string;
+  pinboardChatDraft: string;
+  pinboardChatHeight: number;
   observations: any[];
   observationsCollapsed: boolean;
   selectedObject: string;
@@ -34,6 +36,7 @@ type ChatLine = {
   to?: string;
   style?: string;
   reason?: string;
+  source?: string;
   text?: string;
   ts?: number;
 };
@@ -88,6 +91,8 @@ const state: AppState = {
   chatFeed: [],
   chatPresent: [],
   chatDraft: "",
+  pinboardChatDraft: "",
+  pinboardChatHeight: 180,
   observations: [],
   observationsCollapsed: true,
   selectedObject: "",
@@ -102,6 +107,7 @@ let audio: DubAudio | undefined;
 const sessionKey = "woo.session";
 const chatHistoryKey = "woo.chat.history";
 const pinboardNewColorKey = "woo.pinboard.newColor";
+const pinboardChatHeightKey = "woo.pinboard.chatHeight";
 const chatHistoryLimit = 80;
 const drumVoices = [
   { id: "kick", label: "Kick" },
@@ -133,6 +139,8 @@ const PINBOARD_GRID_SIZE = 24;
 const PINBOARD_VIEW_ANIMATION_MS = 480;
 const PINBOARD_VIEWPORT_MIN_MS = 110;
 const PINBOARD_MAP_DEFAULT_ASPECT = 0.42;
+const PINBOARD_CHAT_MIN_HEIGHT = 96;
+const PINBOARD_CHAT_MAX_VIEWPORT_RATIO = 0.35;
 let reconnectDelayMs = reconnectBaseDelayMs;
 let reconnectTimer: number | undefined;
 let heartbeatTimer: number | undefined;
@@ -145,10 +153,12 @@ const pinNoteClientZ = new Map<string, number>();
 let chatHistory = loadChatHistory();
 let chatHistoryCursor = chatHistory.length;
 let chatHistoryDraft = "";
+state.pinboardChatHeight = loadPinboardChatHeight();
 
 connect();
 window.setInterval(pruneLiveControls, 700);
 window.addEventListener("resize", () => {
+  state.pinboardChatHeight = normalizePinboardChatHeight(state.pinboardChatHeight);
   schedulePinboardViewportPublish();
   window.requestAnimationFrame(updatePinboardMapViewports);
 });
@@ -1532,6 +1542,7 @@ function receiveChatEvent(observation: any, shouldRender = true) {
     to: typeof observation.to === "string" ? observation.to : undefined,
     style: typeof observation.style === "string" ? observation.style : undefined,
     reason: typeof observation.reason === "string" ? observation.reason : undefined,
+    source: chatObservationSource(observation),
     text: typeof observation.text === "string" ? observation.text : chatSystemText(observation),
     ts: typeof observation.ts === "number" ? observation.ts : undefined
   }, shouldRender);
@@ -1576,9 +1587,21 @@ function chatSystemText(observation: any): string | undefined {
   return undefined;
 }
 
+function chatObservationSource(observation: any): string | undefined {
+  for (const key of ["source", "room", "board"]) {
+    const value = observation?.[key];
+    if (typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
+
 function pushChatLine(line: ChatLine, shouldRender = true) {
   state.chatFeed = [...state.chatFeed, line].slice(-160);
-  if (shouldRender && state.tab === "chat") render();
+  if (shouldRender && currentTabHasChatPanel()) render();
+}
+
+function currentTabHasChatPanel(): boolean {
+  return ["chat", "pinboard"].includes(state.tab);
 }
 
 function loadChatHistory(): string[] {
@@ -1601,6 +1624,21 @@ function saveChatHistory() {
   }
 }
 
+function loadPinboardChatHeight(): number {
+  return normalizePinboardChatHeight(Number(readStorage(pinboardChatHeightKey) ?? "180"));
+}
+
+function savePinboardChatHeight(value: number) {
+  const height = normalizePinboardChatHeight(value);
+  state.pinboardChatHeight = height;
+  writeStorage(pinboardChatHeightKey, String(Math.round(height)));
+}
+
+function normalizePinboardChatHeight(value: number): number {
+  const max = Math.max(PINBOARD_CHAT_MIN_HEIGHT, Math.round(window.innerHeight * PINBOARD_CHAT_MAX_VIEWPORT_RATIO));
+  return clamp(Number.isFinite(value) ? value : 180, PINBOARD_CHAT_MIN_HEIGHT, max);
+}
+
 function rememberChatInput(text: string) {
   const trimmed = text.trim();
   if (!trimmed) return;
@@ -1612,7 +1650,8 @@ function rememberChatInput(text: string) {
 
 function setChatInputValue(input: HTMLInputElement, value: string) {
   input.value = value;
-  state.chatDraft = value;
+  if (input.dataset.pinboardChatInput !== undefined) state.pinboardChatDraft = value;
+  else state.chatDraft = value;
   input.setSelectionRange(value.length, value.length);
 }
 
@@ -1648,6 +1687,7 @@ function renderChat() {
   const room = state.world?.chat?.room;
   const present = state.chatPresent;
   const inRoom = Boolean(state.actor && present.includes(state.actor));
+  const lines = chatLinesForSpace(chatRoom());
   if (!inRoom) {
     const canEnter = canSendDirect();
     return `
@@ -1671,7 +1711,7 @@ function renderChat() {
     <section class="chat-layout">
       <div class="panel chat-panel">
         <div class="chat-feed" aria-live="polite">
-          ${state.chatFeed.map(renderChatLine).join("") || `<div class="chat-empty">${escapeHtml(room?.description ?? "No chat events yet.")}</div>`}
+          ${lines.map(renderChatLine).join("") || `<div class="chat-empty">${escapeHtml(room?.description ?? "No chat events yet.")}</div>`}
         </div>
         <form class="chat-form" data-chat-form>
           <input data-chat-input autocomplete="off" placeholder="say something — or :waves, look cockatoo, tell guest_2 hi" value="${escapeHtml(state.chatDraft)}" />
@@ -1686,6 +1726,11 @@ function renderChat() {
       </aside>
     </section>
   `;
+}
+
+function chatLinesForSpace(space: string): ChatLine[] {
+  if (!space) return [];
+  return state.chatFeed.filter((line) => !line.source || line.source === space);
 }
 
 function renderChatLine(line: ChatLine) {
@@ -1742,7 +1787,7 @@ function bindChat() {
     if (!text) return;
     rememberChatInput(text);
     state.chatDraft = "";
-    sendChatInput(text);
+    sendChatInput(chatRoom(), text);
     if (input) {
       input.value = "";
       input.focus();
@@ -1770,8 +1815,8 @@ function bindChat() {
   scrollChatFeedToEnd();
 }
 
-function scrollChatFeedToEnd() {
-  const feed = document.querySelector<HTMLElement>(".chat-feed");
+function scrollChatFeedToEnd(selector = ".chat-feed") {
+  const feed = document.querySelector<HTMLElement>(selector);
   if (!feed) return;
   feed.scrollTop = feed.scrollHeight;
 }
@@ -1784,13 +1829,12 @@ function focusChatInput() {
   });
 }
 
-function sendChatInput(text: string) {
-  const room = chatRoom();
-  if (!room) return;
-  direct(room, "command_plan", [text], (plan) => executeChatPlan(plan, text), receiveChatError);
+function sendChatInput(space: string, text: string) {
+  if (!space) return;
+  direct(space, "command_plan", [text], (plan) => executeChatPlan(space, plan, text), receiveChatError);
 }
 
-function executeChatPlan(plan: any, originalText: string) {
+function executeChatPlan(currentSpace: string, plan: any, originalText: string) {
   if (!plan || plan.ok !== true) return;
   const route = String(plan.route ?? "");
   const target = String(plan.target ?? "");
@@ -1798,7 +1842,7 @@ function executeChatPlan(plan: any, originalText: string) {
   const args = Array.isArray(plan.args) ? plan.args : [];
   if (!target || !verb) return;
   if (route === "sequenced") {
-    const space = String(plan.space ?? chatRoom());
+    const space = String(plan.space ?? currentSpace);
     if (space) callWithError(space, target, verb, args, receiveChatError);
     return;
   }
@@ -1898,7 +1942,7 @@ function renderPinboard() {
       <h1>${escapeHtml(board.name ?? "Pinboard")}</h1>
       ${inBoard ? `<button data-pinboard-leave>Leave</button>` : `<button data-pinboard-enter ${canSendDirect() ? "" : "disabled"}>Enter</button>`}
     </section>
-    <section class="pinboard-layout">
+    <section class="pinboard-layout" style="--pinboard-chat-h:${Math.round(normalizePinboardChatHeight(state.pinboardChatHeight))}px">
       <div class="pinboard-work">
         ${inBoard ? renderPinboardCreate(pinboard.palette) : ""}
         <div class="panel pinboard-stage-panel">
@@ -1918,6 +1962,28 @@ function renderPinboard() {
         <h2>Presence</h2>
         <div data-pinboard-map-shell>${renderPinboardMap(notes, present, width, height)}</div>
       </aside>
+    </section>
+    ${inBoard ? renderPinboardChatPanel(board.id) : ""}
+  `;
+}
+
+function renderPinboardChatPanel(boardId: string) {
+  const lines = chatLinesForSpace(boardId);
+  const height = Math.round(normalizePinboardChatHeight(state.pinboardChatHeight));
+  return `
+    <section class="panel pinboard-chat-panel" data-pinboard-chat-panel style="height:${height}px">
+      <div class="pinboard-chat-resizer" data-pinboard-chat-resizer role="separator" aria-orientation="horizontal" aria-label="Resize pinboard chat"></div>
+      <div class="pinboard-chat-head">
+        <h2>Chat</h2>
+        <span>${escapeHtml(boardId)}</span>
+      </div>
+      <div class="chat-feed pinboard-chat-feed" aria-live="polite">
+        ${lines.map(renderChatLine).join("") || `<div class="chat-empty">No chat events yet.</div>`}
+      </div>
+      <form class="chat-form pinboard-chat-form" data-pinboard-chat-form>
+        <input data-pinboard-chat-input autocomplete="off" placeholder="say something, /me waves, look, drop note" value="${escapeHtml(state.pinboardChatDraft)}" />
+        <button>Send</button>
+      </form>
     </section>
   `;
 }
@@ -2133,7 +2199,7 @@ function pinNoteMeta(note: any): string {
   const created = pinNoteTimestamp(note?.created_at);
   const updatedBy = typeof note?.updated_by === "string" ? actorLabel(note.updated_by) : "";
   const updated = pinNoteTimestamp(note?.updated_at);
-  const lines = [`Added by ${author}${created ? ` at ${created}` : ""}`];
+  const lines = [`Created by ${author}${created ? ` at ${created}` : ""}`];
   if (updatedBy && (note?.updated_by !== note?.author || note?.updated_at !== note?.created_at)) {
     lines.push(`Last edited by ${updatedBy}${updated ? ` at ${updated}` : ""}`);
   }
@@ -2199,6 +2265,73 @@ function bindPinboard() {
   });
   bindPinboardMap();
   bindPinboardViewport();
+  bindPinboardChat();
+}
+
+function bindPinboardChat() {
+  const input = document.querySelector<HTMLInputElement>("[data-pinboard-chat-input]");
+  input?.addEventListener("keydown", (event) => navigateChatHistory(event, input));
+  input?.addEventListener("input", (event) => {
+    state.pinboardChatDraft = (event.currentTarget as HTMLInputElement).value;
+    chatHistoryCursor = chatHistory.length;
+    chatHistoryDraft = state.pinboardChatDraft;
+  });
+  document.querySelector<HTMLFormElement>("[data-pinboard-chat-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = input?.value.trim() ?? "";
+    if (!text) return;
+    rememberChatInput(text);
+    state.pinboardChatDraft = "";
+    sendChatInput(pinboardSpace(), text);
+    if (input) {
+      input.value = "";
+      input.focus();
+    }
+  });
+  const panel = document.querySelector<HTMLElement>("[data-pinboard-chat-panel]");
+  if (panel && "ResizeObserver" in window) {
+    const observer = new ResizeObserver((entries) => {
+      const height = entries[0]?.contentRect.height;
+      if (typeof height === "number" && Math.abs(height - state.pinboardChatHeight) > 1) savePinboardChatHeight(height);
+    });
+    observer.observe(panel);
+  }
+  bindPinboardChatResize(panel);
+  scrollChatFeedToEnd(".pinboard-chat-feed");
+}
+
+function bindPinboardChatResize(panel: HTMLElement | null) {
+  const handle = document.querySelector<HTMLElement>("[data-pinboard-chat-resizer]");
+  if (!panel || !handle) return;
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = panel.getBoundingClientRect().height;
+    handle.setPointerCapture(event.pointerId);
+    panel.classList.add("is-resizing");
+    const move = (moveEvent: PointerEvent) => {
+      const height = normalizePinboardChatHeight(startHeight - (moveEvent.clientY - startY));
+      applyPinboardChatHeight(panel, height);
+    };
+    const up = (upEvent: PointerEvent) => {
+      handle.releasePointerCapture(upEvent.pointerId);
+      panel.classList.remove("is-resizing");
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      savePinboardChatHeight(panel.getBoundingClientRect().height);
+      schedulePinboardViewportPublish();
+      window.requestAnimationFrame(updatePinboardMapViewports);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up, { once: true });
+  });
+}
+
+function applyPinboardChatHeight(panel: HTMLElement, height: number) {
+  state.pinboardChatHeight = height;
+  const rounded = `${Math.round(height)}px`;
+  panel.style.height = rounded;
+  document.querySelector<HTMLElement>(".pinboard-layout")?.style.setProperty("--pinboard-chat-h", rounded);
 }
 
 function bringPinNoteToTop(id: string) {

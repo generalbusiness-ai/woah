@@ -10,6 +10,10 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
+- dm (outside of a room), chats and channels
+- are lists-of-text ok? that's a mooism that we don't really need and might cause problems later
+- flesh out the help, make it the default platform-docs
+    - help is markdown notes
 - guest "it is awake and looks alert"
 - kanban
 - subscriptions (to anything) (grouped??)

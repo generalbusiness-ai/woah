@@ -105,7 +105,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd { return this:look_self(); }"
+          "source": "verb :look() rxd { let view = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: this, target: this, text: view[\"summary\"], look: view, ts: now() }); return view; }"
         },
         {
           "name": "look_self",
@@ -115,7 +115,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { let pins = this:list_notes(); return { id: this, title: this.name, description: this.description, notes: pins, present_actors: this.subscribers, viewport: this.viewport }; }"
+          "source": "verb :look_self() rxd { let pins = this:list_notes(); let note_count = length(pins); let other = []; for item in contents(this) { if (!isa(item, $note) && !isa(item, $actor)) { other = other + [{ id: item, title: item.name, description: item.description }]; } } let summary = this.name + \" has \" + to_string(note_count) + \" note\"; if (note_count != 1) { summary = summary + \"s\"; } summary = summary + \" on it\"; if (length(other) > 0) { summary = summary + \" and \" + to_string(length(other)) + \" other thing\"; if (length(other) != 1) { summary = summary + \"s\"; } summary = summary + \" here\"; } summary = summary + \".\"; return { id: this, title: this.name, description: this.description, summary: summary, note_count: note_count, notes: pins, contents: other, present_actors: this.subscribers, viewport: this.viewport }; }"
         },
         {
           "name": "enter",
@@ -126,7 +126,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :enter() rxd { set_presence(this, true); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
+          "source": "verb :enter() rxd { let old = location(actor); if (old != null && old != this && old in actor.presence_in) { set_presence(old, false); } move(actor, this); set_presence(this, true); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
         },
         {
           "name": "leave",
@@ -136,7 +136,20 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :leave() rxd { set_presence(this, false); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
+          "source": "verb :leave() rxd { set_presence(this, false); let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest != null) { move(actor, dest); set_presence(dest, true); } let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
+        },
+        {
+          "name": "out",
+          "aliases": [
+            "o@ut"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :out() rxd { return this:leave(); }"
         },
         {
           "name": "viewport",
@@ -161,7 +174,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :list_notes() rxd { let layout = this.layout; let pins = []; for pin in contents(this) { let key = to_string(pin); let layout_entry = { x: 48, y: 48, w: 180, h: 110, z: 1 }; if (has(layout, key)) { layout_entry = layout[key]; } let color = null; if (typeof(pin.color) == \"string\" && pin.color != \"white\") { color = pin.color; } let text = []; try { text = pin:text(); } except err { text = []; } pins = pins + [{ id: pin, name: pin.name, text: text, color: color, owner: pin.owner, writers: pin.writers, x: layout_entry[\"x\"], y: layout_entry[\"y\"], w: layout_entry[\"w\"], h: layout_entry[\"h\"], z: layout_entry[\"z\"] }]; } return pins; }"
+          "source": "verb :list_notes() rxd { let layout = this.layout; let pins = []; for pin in contents(this) { if (isa(pin, $note)) { let key = to_string(pin); let layout_entry = { x: 48, y: 48, w: 180, h: 110, z: 1 }; if (has(layout, key)) { layout_entry = layout[key]; } let color = null; if (typeof(pin.color) == \"string\" && pin.color != \"white\") { color = pin.color; } let text = []; try { text = pin:text(); } except err { text = []; } pins = pins + [{ id: pin, name: pin.name, text: text, color: color, owner: pin.owner, writers: pin.writers, x: layout_entry[\"x\"], y: layout_entry[\"y\"], w: layout_entry[\"w\"], h: layout_entry[\"h\"], z: layout_entry[\"z\"] }]; } } return pins; }"
         },
         {
           "name": "acceptable",
@@ -171,7 +184,7 @@
               "object"
             ]
           },
-          "source": "verb :acceptable(object) rxd { return isa(object, $note); }"
+          "source": "verb :acceptable(object) rxd { return isa(object, $note) || isa(object, $actor); }"
         },
         {
           "name": "enterfunc",
@@ -181,7 +194,7 @@
               "object"
             ]
           },
-          "source": "verb :enterfunc(object) rx { let key = to_string(object); let layout = this.layout; if (!has(layout, key)) { let z = this.next_z; this.next_z = z + 1; let count = length(contents(this)); layout[key] = { x: 48 + ((count - 1) * 32), y: 48 + ((count - 1) * 26), w: 180, h: 110, z: z }; this.layout = layout; } observe({ type: \"pin_added\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" pinned a note to \" + this.name + \".\", ts: now() }); } return true; }"
+          "source": "verb :enterfunc(object) rx { if (!isa(object, $note)) { return true; } let key = to_string(object); let layout = this.layout; if (!has(layout, key)) { let z = this.next_z; this.next_z = z + 1; let count = length(layout) + 1; layout[key] = { x: 48 + ((count - 1) * 32), y: 48 + ((count - 1) * 26), w: 180, h: 110, z: z }; this.layout = layout; } observe({ type: \"pin_added\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" pinned a note to \" + this.name + \".\", ts: now() }); } return true; }"
         },
         {
           "name": "exitfunc",
@@ -191,7 +204,7 @@
               "object"
             ]
           },
-          "source": "verb :exitfunc(object) rx { let key = to_string(object); let layout = this.layout; if (has(layout, key)) { let next = {}; for k in keys(layout) { if (k != key) { next[k] = layout[k]; } } this.layout = next; } observe({ type: \"pin_removed\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" took a note from \" + this.name + \".\", ts: now() }); } return true; }"
+          "source": "verb :exitfunc(object) rx { if (!isa(object, $note)) { return true; } let key = to_string(object); let layout = this.layout; if (has(layout, key)) { let next = {}; for k in keys(layout) { if (k != key) { next[k] = layout[k]; } } this.layout = next; } observe({ type: \"pin_removed\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" took a note from \" + this.name + \".\", ts: now() }); } return true; }"
         },
         {
           "name": "post",
@@ -207,6 +220,20 @@
             ]
           },
           "source": "verb :post(pin) rx { if (!isa(pin, $note)) { raise { code: \"E_INVARG\", message: \"only notes can be posted\", value: pin }; } moveto(pin, this); return pin; }"
+        },
+        {
+          "name": "drop",
+          "aliases": [
+            "d@rop"
+          ],
+          "perms": "rx",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :drop(object) rx { let pin = object; if (typeof(object) == \"string\") { pin = $match:match_object(object, actor); } if (pin == $failed_match) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + object + \".\", value: object }; } if (pin == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + object + \" you mean.\", value: object }; } if (!isa(pin, $note)) { raise { code: \"E_INVARG\", message: \"only notes can be dropped on the pinboard\", value: pin }; } if (location(pin) != actor) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + object + \".\", value: pin }; } moveto(pin, this); return pin; }"
         },
         {
           "name": "take",
@@ -418,6 +445,11 @@
         },
         "mount_room": "demoworld:the_deck"
       }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_pinboard",
+      "feature": "chat:$conversational"
     }
   ]
 }
