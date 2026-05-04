@@ -4761,6 +4761,18 @@ export class WooWorld {
   private async canSeeCommandObject(ctx: CallContext, target: ObjRef): Promise<boolean> {
     if (this.isWizard(ctx.actor)) return true;
     if (target === ctx.caller) return true;
+    // When the verb is running on a $space (the chat planner's command_plan
+    // runs `this:object_command_plan(cmd, text)` on the room), trust the room
+    // to introspect its own contents. publicCommandLocation reads
+    // actor.location via a cross-host RPC that can transiently fail or return
+    // null during cold-start, leaving commandVisibleCandidates empty even
+    // though the target is in the room. The room asking "does this thing in
+    // my contents have this verb" doesn't leak info beyond what the room
+    // already knows.
+    if (this.objects.has(ctx.thisObj) && this.inheritsFrom(ctx.thisObj, "$space")) {
+      const here = await this.objectContents(ctx.thisObj, ctx.hostMemo).catch(() => [] as ObjRef[]);
+      if (here.includes(target)) return true;
+    }
     const location = await this.publicCommandLocation(ctx, ctx.actor, undefined);
     return (await this.commandVisibleCandidates(ctx, ctx.actor, location)).includes(target);
   }
