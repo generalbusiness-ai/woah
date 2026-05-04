@@ -981,7 +981,10 @@ export class WooWorld {
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
       this.persistSession(session);
-      this.setProp(actor, "session_id", id);
+      // No reader (substrate or catalog) consults `actor.session_id` —
+      // `world.sessions` is the source of truth for session lifecycle. The
+      // formerly-written mirror property fired on every (actor × host)
+      // first-touch and was a top-3 ambient writer.
       this.ensureAutoPresence(actor);
     });
     return session;
@@ -1009,7 +1012,10 @@ export class WooWorld {
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
       this.persistSession(session);
-      this.setProp(actor, "session_id", id);
+      // No reader (substrate or catalog) consults `actor.session_id` —
+      // `world.sessions` is the source of truth for session lifecycle. The
+      // formerly-written mirror property fired on every (actor × host)
+      // first-touch and was a top-3 ambient writer.
       this.ensureAutoPresence(actor);
     });
     return session;
@@ -3876,7 +3882,9 @@ export class WooWorld {
     session.attachedSockets.clear();
     this.killReadTasksFor(session.actor);
     this.removeActorPresence(session.actor);
-    this.setProp(session.actor, "session_id", null);
+    // session_id mirror is no longer written (see createSessionForActor /
+    // ensureSessionForActor); the matching reset on reap would just rewrite
+    // the inherited default.
     this.sessions.delete(sessionId);
     this.deletePersistedSession(sessionId);
     if (isGuest) this.resetGuestOnDisconnect(session.actor);
@@ -4663,9 +4671,9 @@ export class WooWorld {
     this.createObject({ id, name: displayName, parent: this.objects.has("$guest") ? "$guest" : "$player", owner: "$wiz", location: this.objects.has("$nowhere") ? "$nowhere" : null });
     this.setProp(id, "name", displayName);
     this.setProp(id, "description", "Dynamically allocated guest player. It can be bound to a temporary session and gives a local user or agent a stable actor for first-light testing.");
-    this.setProp(id, "presence_in", []);
-    this.setProp(id, "session_id", null);
-    if (this.objects.has("$nowhere")) this.setProp(id, "home", "$nowhere");
+    // presence_in/session_id/home defaults already come from the parent
+    // chain ($actor.presence_in=[], $player.session_id=null, $player.home="$nowhere").
+    // Skipping the explicit writes saves three property rows per allocation.
     return id;
   }
 
