@@ -1367,6 +1367,18 @@ describe("local catalogs", () => {
       expect(takePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["lamp"] });
     }
 
+    // "get mug" — the dobj resolves to the_mug (visible in the room) but the
+    // mug doesn't define a `get` verb. The planner must NOT huh; instead it
+    // should fall through to the room's `take` verb (resolved via the alias
+    // "get" on the $conversational feature attached to the room). Regression
+    // test for the case where the room-verb branch's `isa(this, definer)`
+    // gate excluded feature-attached verbs.
+    const getMugPlan = await world.directCall("plan-get-mug", session.actor, "the_chatroom", "command_plan", ["get mug"]);
+    expect(getMugPlan.op).toBe("result");
+    if (getMugPlan.op === "result") {
+      expect(getMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["mug"] });
+    }
+
     // "get whatever" should route to the room's take verb so room_take owns
     // the missing-match error (it knows the room's contents better than the
     // chat planner's broader visibility set).
