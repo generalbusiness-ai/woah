@@ -209,7 +209,12 @@ function connect() {
       state.actor = frame.actor;
       state.session = frame.session;
       storeSession(frame.session);
-      await refresh();
+      render();
+      try {
+        await refresh();
+      } catch {
+        render();
+      }
       requestReplay(socket);
     }
     if (frame.op === "applied") {

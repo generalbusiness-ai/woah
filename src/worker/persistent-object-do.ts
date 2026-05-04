@@ -70,6 +70,7 @@ const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
 const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
 const HOST_STATE_CACHE_LIMIT = 32;
+const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
 
 export class PersistentObjectDO {
   private state: DurableObjectState;
@@ -794,10 +795,10 @@ export class PersistentObjectDO {
     const remoteHosts = Array.from(new Set(routes.map((route) => route.host).filter((host) => host && host !== WORLD_HOST)));
     // Fan out to every remote host in parallel; each /__internal/state takes
     // O(per-host-state-compose) so a serial loop turns into O(N × that). The
-    // merge below is purely local object-reshape, so awaiting all fetches up
-    // front collapses the wall time to roughly max-host-latency.
+    // per-host timeout keeps a cold or wedged remote host from blocking the
+    // gateway's first state projection indefinitely.
     const fetched = await Promise.all(
-      remoteHosts.map((host) => this.fetchHostState(host, actor).then((remote) => ({ host, remote })))
+      remoteHosts.map((host) => this.fetchHostState(world, host, actor).then((remote) => ({ host, remote })))
     );
     for (const { host, remote } of fetched) {
       if (!remote) continue;
@@ -829,19 +830,60 @@ export class PersistentObjectDO {
     return state;
   }
 
-  private async fetchHostState(host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
+  private async fetchHostState(world: WooWorld, host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const startedAt = Date.now();
     try {
-      const id = this.env.WOO.idFromName(host);
-      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/state`, {
-        headers: { "x-woo-host-key": host, "x-woo-internal-actor": actor }
-      }));
-      const response = await this.env.WOO.get(id).fetch(request);
-      if (!response.ok) return null;
-      const body = await response.json();
-      return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
+      const fetchState = this.fetchHostStateInner(host, actor)
+        .then((remote) => {
+          if (!settled) {
+            settled = true;
+            world.recordMetric({
+              kind: "cross_host_rpc",
+              route: "/__internal/state",
+              host,
+              ms: Date.now() - startedAt,
+              status: remote ? "ok" : "error",
+              ...(remote ? {} : { error: "E_BAD_RESPONSE" })
+            });
+          }
+          return remote;
+        })
+        .catch((err) => {
+          if (!settled) {
+            settled = true;
+            const error = normalizeError(err);
+            world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "error", error: error.code });
+          }
+          return null;
+        });
+      const timedOut = new Promise<null>((resolve) => {
+        timeout = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "timeout" });
+          }
+          resolve(null);
+        }, HOST_STATE_FETCH_TIMEOUT_MS);
+      });
+      return await Promise.race([fetchState, timedOut]);
     } catch {
       return null;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
+  }
+
+  private async fetchHostStateInner(host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
+    const id = this.env.WOO.idFromName(host);
+    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/state`, {
+      headers: { "x-woo-host-key": host, "x-woo-internal-actor": actor }
+    }));
+    const response = await this.env.WOO.get(id).fetch(request);
+    if (!response.ok) return null;
+    const body = await response.json();
+    return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
   }
 
   private async handleInternal(request: Request, world: WooWorld, pathname: string): Promise<Response> {
@@ -1407,7 +1449,7 @@ export class PersistentObjectDO {
     const startedAt = Date.now();
     const response = await this.env.WOO.get(id).fetch(request);
     const parsed = await response.json() as T;
-    this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt });
+    this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok" });
     return parsed;
   }
 

@@ -180,7 +180,7 @@ export type WooObject = {
 export type MetricEvent =
   | { kind: "broadcast"; audience_size: number; obs_count: number; ms: number; origin_session?: string }
   | { kind: "compose_look"; room: ObjRef; present_count: number; contents_count: number; remote_titles: number; remote_describe_batches: number; ms: number }
-  | { kind: "cross_host_rpc"; route: string; host: string; ms: number }
+  | { kind: "cross_host_rpc"; route: string; host: string; ms: number; status: "ok" | "error" | "timeout"; error?: string }
   | { kind: "storage_flush"; objects: number; properties: number; sessions: number; deleted_sessions: number; tasks: number; deleted_tasks: number; counters: boolean; ms: number; top_properties?: Array<[string, number]>; top_objects?: Array<[ObjRef, number]> }
   | { kind: "storage_direct_write"; what: "object" | "object_delete" | "property" | "property_delete" | "session" | "session_delete" | "task" | "task_delete" | "counters"; ms: number }
   | { kind: "subscribers_write"; space: ObjRef; size: number; delta: number }

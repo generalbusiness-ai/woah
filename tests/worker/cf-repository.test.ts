@@ -448,6 +448,169 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("smokes Worker-routed cross-host room, inventory, and pinboard calls", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const wooStates = new Map<string, FakeDurableObjectState>();
+    const wooObjects = new Map<string, PersistentObjectDO>();
+    let env: Env;
+    const wooNamespace = new FakeDurableObjectNamespace((name) => {
+      let object = wooObjects.get(name);
+      if (!object) {
+        const state = new FakeDurableObjectState(name);
+        wooStates.set(name, state);
+        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+        wooObjects.set(name, object);
+      }
+      return object;
+    });
+    env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-smoke-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: wooNamespace
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    }
+
+    try {
+      const auth = await post("/api/auth", { token: "guest:cf-cross-host-smoke" });
+      expect(auth.status).toBe(200);
+      const session = String(auth.body.session);
+
+      const enterChat = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
+      expect(enterChat.status).toBe(200);
+      expect(enterChat.body.observations).toContainEqual(expect.objectContaining({ type: "entered", room: "the_chatroom" }));
+
+      const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session);
+      expect(goDeck.status).toBe(200);
+      expect(goDeck.body.result).toMatchObject({ room: "the_deck", from: "the_chatroom", look_deferred: true });
+
+      const takeTowel = await post("/api/objects/the_deck/calls/take", { args: ["towel"] }, session);
+      expect(takeTowel.status).toBe(200);
+      expect(takeTowel.body.result).toMatchObject({ item: "the_towel" });
+      expect(takeTowel.body.observations).toContainEqual(expect.objectContaining({ type: "taken", item: "the_towel" }));
+
+      const enterTub = await post("/api/objects/the_hot_tub/calls/enter", { args: [] }, session);
+      expect(enterTub.status).toBe(200);
+      expect(enterTub.body.result).toMatchObject({ room: "the_hot_tub", look_deferred: true });
+
+      const dropTowel = await post("/api/objects/the_hot_tub/calls/drop", { args: ["towel"] }, session);
+      expect(dropTowel.status).toBe(200);
+      expect(dropTowel.body.result).toMatchObject({ item: "the_towel", room: "the_hot_tub" });
+      expect(dropTowel.body.observations).toContainEqual(expect.objectContaining({ type: "dropped", item: "the_towel", room: "the_hot_tub" }));
+
+      const enterPinboard = await post("/api/objects/the_pinboard/calls/enter", { args: [] }, session);
+      expect(enterPinboard.status).toBe(200);
+      expect(enterPinboard.body.observations).toContainEqual(expect.objectContaining({ type: "pinboard_entered", board: "the_pinboard" }));
+
+      const addNote = await post("/api/objects/the_pinboard/calls/add_note", {
+        id: "cf-pinboard-add-smoke",
+        space: "the_pinboard",
+        args: ["CF smoke note", "blue", 12, 24, 160, 90]
+      }, session);
+      expect(addNote.status).toBe(200);
+      expect(addNote.body).toMatchObject({ op: "applied", space: "the_pinboard" });
+      const added = (addNote.body.observations as any[]).find((obs) => obs?.type === "note_added");
+      expect(added).toMatchObject({ type: "note_added", board: "the_pinboard" });
+      const pin = String(added.note.id);
+      expect(added.note).toMatchObject({ id: pin, text: "CF smoke note", color: "blue", x: 12, y: 24, w: 160, h: 90 });
+
+      const moveNote = await post("/api/objects/the_pinboard/calls/move_pin", {
+        id: "cf-pinboard-move-smoke",
+        space: "the_pinboard",
+        args: [pin, 80, 96]
+      }, session);
+      expect(moveNote.status).toBe(200);
+      expect(moveNote.body.observations).toContainEqual(expect.objectContaining({ type: "pin_moved", pin, x: 80, y: 96 }));
+
+      const editNote = await post(`/api/objects/${encodeURIComponent(pin)}/calls/set_text`, {
+        id: "cf-pinboard-edit-smoke",
+        space: "the_pinboard",
+        args: [["CF smoke edited"]]
+      }, session);
+      expect(editNote.status).toBe(200);
+      expect(editNote.body.observations).toContainEqual(expect.objectContaining({ type: "note_edited", note: pin, text: ["CF smoke edited"] }));
+
+      const listed = await post("/api/objects/the_pinboard/calls/list_notes", { args: [] }, session);
+      expect(listed.status).toBe(200);
+      expect(listed.body.result).toContainEqual(expect.objectContaining({ id: pin, text: ["CF smoke edited"], color: "blue", x: 80, y: 96 }));
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+    }
+  });
+
+  it("serves gateway state when a cold remote host state request stalls", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    let gateway: PersistentObjectDO;
+    const stalledHost = {
+      fetch: async () => await new Promise<Response>(() => {})
+    };
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-cold-state-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        if (name === "world") return gateway;
+        return stalledHost;
+      })
+    } as unknown as Env;
+    gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {
+      logs.push(args.map(String).join(" "));
+    });
+
+    try {
+      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: "guest:cf-cold-state" })
+      }));
+      expect(auth.ok).toBe(true);
+      const { session } = await auth.json() as { session: string };
+
+      const state = await Promise.race([
+        gateway.fetch(new Request("https://woo.test/api/state", {
+          headers: { authorization: `Session ${session}` }
+        })),
+        new Promise<Response>((_, reject) => setTimeout(() => reject(new Error("gateway /api/state did not return")), 4_000))
+      ]);
+      expect(state.ok).toBe(true);
+      const body = await state.json() as Record<string, unknown>;
+      expect(body.objects).toBeTruthy();
+      expect(body.object_routes).toEqual(expect.arrayContaining([expect.objectContaining({ host: "the_chatroom" })]));
+      expect(logs.some((line) => line.includes("woo.metric") && line.includes("\"kind\":\"cross_host_rpc\"") && line.includes("\"route\":\"/__internal/state\"") && line.includes("\"status\":\"timeout\""))).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("keeps cached api state clock fresh", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
