@@ -2,6 +2,7 @@ import { BUNDLED_CATALOGS } from "../generated/bundled-catalogs";
 import {
   applyCatalogSchemaPlan,
   catalogManifestStatus,
+  catalogSchemaPlanIdentity,
   installCatalogManifest,
   planCatalogSchemaMigration,
   verifyCatalogSchemaPlan,
@@ -347,6 +348,9 @@ function localCatalogPresentInWorldSlice(world: WooWorld, name: string, hostedDa
 }
 
 function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: boolean): void {
+  const startedAt = Date.now();
+  let planned = 0;
+  let skipped = 0;
   for (const name of hostScopedLocalCatalogNames(world)) {
     const manifest = LOCAL_CATALOGS.get(name);
     if (!manifest) continue;
@@ -354,6 +358,18 @@ function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: bool
       recordCoveredHostCatalogSchemaPlan(world, host, manifest);
       continue;
     }
+    // Cold-host wake re-runs schema sync against every installed catalog. The
+    // plan id is a function of manifest content only, so when a previous host
+    // boot already recorded a completed plan for this exact manifest we can
+    // skip both planCatalogSchemaMigration (walks every class/verb/seed_hook)
+    // and verifyCatalogSchemaPlan (walks the world for status). Drift gets
+    // repaired by the gateway sync; the host trusts the previous record.
+    const planId = catalogSchemaPlanIdentity(manifest).id;
+    if (catalogMigrationRecordCompleted(world, planId, "host", host)) {
+      skipped += 1;
+      continue;
+    }
+    planned += 1;
     const result = runLocalCatalogSchemaPlan(world, name, manifest, "host", host, {
       allowImplementationHints: true,
       reconcileSeedHooks: true,
@@ -362,6 +378,9 @@ function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: bool
     if (result.status === "failed") {
       console.warn("woo.local_catalog_host_schema_plan_failed", { catalog: name, host, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
     }
+  }
+  if (planned > 0 || skipped > 0) {
+    world.recordMetric({ kind: "host_schema_sync", host, planned, skipped, ms: Date.now() - startedAt });
   }
 }
 
@@ -521,6 +540,21 @@ function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly 
     if (covered.has(name)) {
       recordCoveredLocalCatalogSchemaPlan(world, name, manifest);
       continue;
+    }
+    // Fast-path: when not forcing verify, derive the plan id directly from the
+    // manifest (cheap) and skip both planCatalogSchemaMigration and
+    // verifyCatalogSchemaPlan if the migration record already covers it. The
+    // recorded manifest_hash on $catalog_registry must match too — that is the
+    // signal the manifest is byte-identical to the one that ran last time.
+    if (!forceVerify) {
+      const identity = catalogSchemaPlanIdentity(manifest);
+      if (
+        catalogMigrationRecordCompleted(world, identity.id, "gateway", "world") &&
+        localCatalogInstalledManifestHash(world, name) === identity.manifest_hash
+      ) {
+        markMigrationApplied(world, identity.id);
+        continue;
+      }
     }
     const plan = planCatalogSchemaMigration(world, manifest, {
       actor: "$wiz",

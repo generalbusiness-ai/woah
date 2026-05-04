@@ -805,6 +805,17 @@ function catalogManifestHash(manifest: CatalogManifest): string {
   return hashSource(stableStringify(manifest));
 }
 
+// Plan id and manifest hash derivation are a function only of (manifest name,
+// manifest content) so callers can ask whether a plan id has already been
+// recorded without paying the cost of building the full plan.steps list.
+export function catalogSchemaPlanIdentity(manifest: CatalogManifest): { id: string; manifest_hash: string } {
+  const hash = catalogManifestHash(manifest);
+  return {
+    id: `local-catalog-schema:${manifest.name}:${hash.slice(0, 16)}`,
+    manifest_hash: `sha256:${hash}`
+  };
+}
+
 function applyCatalogSchemaPlanStep(
   world: WooWorld,
   manifest: CatalogManifest,
