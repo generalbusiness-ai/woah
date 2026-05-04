@@ -1141,7 +1141,6 @@ describe("woo core", () => {
     expect(world.hasPresence(actor, "the_taskspace")).toBe(false);
     expect(world.hasPresence(actor, "the_chatroom")).toBe(false);
     expect(world.getProp("the_dubspace", "operators")).toEqual([]);
-    expect(world.getProp(actor, "session_id")).toBeNull();
     expect(world.getProp(actor, "description")).toBe("");
     expect(world.getProp(actor, "aliases")).toEqual([]);
     expect(world.getProp(actor, "focus_list")).toEqual([]);

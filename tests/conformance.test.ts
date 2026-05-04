@@ -764,7 +764,6 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       expect(world.hasPresence(actor, "the_dubspace")).toBe(false);
       expect(world.hasPresence(actor, "the_taskspace")).toBe(false);
       expect(world.hasPresence(actor, "the_chatroom")).toBe(false);
-      expect(world.getProp(actor, "session_id")).toBeNull();
       expect(world.getProp(actor, "description")).toBe("");
       expect(world.getProp(actor, "aliases")).toEqual([]);
       expect(world.object(actor).location).toBe("$nowhere");

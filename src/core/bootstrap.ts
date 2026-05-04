@@ -127,7 +127,6 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "operators",
   "last_snapshot_seq",
   "presence_in",
-  "session_id",
   "focus_list",
   "bootstrap_token_used",
   "wizard_actions",
@@ -255,9 +254,13 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$actor", "features", [], "list<obj>", "r");
   define(world, "$actor", "features_version", 0, "int", "r");
   define(world, "$actor", "focus_list", [], "list<obj>", "r");
-  define(world, "$player", "session_id", null, "str|null", "r");
   define(world, "$player", "home", "$nowhere", "obj|null");
   removeSeedProperty(world, "$player", "attached_sockets");
+  // Legacy: $player.session_id was a write-only mirror of the session table
+  // that no reader ever consulted. Retired now that session lifecycle lives
+  // exclusively in `world.sessions`. The def is no longer (re)defined here;
+  // a one-shot migration drops any own def/values on $player and its
+  // descendants for upgraded worlds.
   define(world, "$space", "next_seq", 1, "int", "r");
   define(world, "$space", "subscribers", [], "list<obj>", "r");
   define(world, "$space", "last_snapshot_seq", 0, "int", "r");
@@ -340,7 +343,6 @@ function seedGuests(world: WooWorld): void {
     // setNameIfMissing; bootstrap had to do it explicitly.
     world.setProp(id, "name", displayName);
     seedProp(world, id, "presence_in", []);
-    seedProp(world, id, "session_id", null);
     seedProp(world, id, "home", "$nowhere");
     removeSeedProperty(world, id, "attached_sockets");
   }

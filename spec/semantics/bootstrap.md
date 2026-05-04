@@ -44,7 +44,7 @@ the target for runtime-created objects, but it is not active in v1.
 | `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]` | `:return_guest(guest)` | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
 | `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement`, `help` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
 | `$actor` | class | `$root` | `$wiz` | — | Defines `presence_in`, `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
-| `$player` | class | `$actor` | `$wiz` | — | Defines `session_id`, `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
+| `$player` | class | `$actor` | `$wiz` | — | Defines `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
 | `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc()` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
 | `$sequenced_log` | class | `$root` | `$wiz` | — | Inherits descriptive slots | Host operations `append(message)`, `read(from,limit)` | Append-only sequenced log base class. `$space` and registry-like coordination objects inherit its sequence/replay shape. |
@@ -119,10 +119,9 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 
 | Property | Type | Default | Notes |
 |---|---|---|---|
-| `session_id` | str \| null | null | Current session (see identity.md §I2). |
 | `home` | obj \| null | `$nowhere` | Where this player returns on `:on_disfunc`. Defaults to `$nowhere` for universal players and guests. |
 
-`attached_sockets` is **not** a persistent property. Connection state is in-memory on the player host (per [identity.md §I2](identity.md#i2-three-layers-actor-session-connection)); persisting socket ids causes orphaned attachments after restart.
+Session lifecycle is **not** carried on the player. Live session data lives only in `world.sessions` (see identity.md §I2); there is no `session_id` mirror property, and `attached_sockets` is similarly in-memory rather than persisted, so a host restart never resurrects stale attachments.
 
 ### B2.7 `$player` verbs
 
@@ -500,7 +499,7 @@ For the taskspace, no instances exist at boot — tasks are created at runtime b
 
 ## B7. Guest player pool
 
-A pre-seeded pool of `$guest` objects, e.g. `guest_1`..`guest_8`, exists at boot. Guest pool objects are operational seed instances, not universal classes. Each has `parent = $guest`, `owner = $wiz`, `location = $nowhere`, no special flags, a display `name` mirrored into the `name` property, a non-empty `description`, `presence_in = []`, `session_id = null`, and `home = $nowhere`. When a client presents `auth { token: "guest:<random>" }`, `allocateGuest` assigns one of the unbound guest objects to the new session. The pool refills as sessions are reaped: `$guest:on_disfunc` resets the guest's state and returns it to the free pool via `$system:return_guest(this)` (identity.md §I6.4).
+A pre-seeded pool of `$guest` objects, e.g. `guest_1`..`guest_8`, exists at boot. Guest pool objects are operational seed instances, not universal classes. Each has `parent = $guest`, `owner = $wiz`, `location = $nowhere`, no special flags, a display `name` mirrored into the `name` property, a non-empty `description`, `presence_in = []`, and `home = $nowhere`. When a client presents `auth { token: "guest:<random>" }`, `allocateGuest` assigns one of the unbound guest objects to the new session. The pool refills as sessions are reaped: `$guest:on_disfunc` resets the guest's state and returns it to the free pool via `$system:return_guest(this)` (identity.md §I6.4).
 
 For the demo, 8 guests is enough for a small cohort. Real worlds would mint guests on demand or scale the pool to expected concurrent traffic. Each guest's description states that it is a pre-seeded temporary player and exists to give local users or agents a stable guest actor.
 

@@ -61,6 +61,7 @@ const LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION = "2026-05-03-taskspace
 const LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION = "2026-05-02-prog-editor-room";
 const LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION = "2026-05-02-prog-editor-nowhere";
 const LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION = "2026-05-04-demo-spaces-no-auto-presence";
+const LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION = "2026-05-04-drop-session-id-property";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -104,7 +105,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION, only: "taskspace" },
   { id: LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION, only: "prog" },
-  { id: LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION }
+  { id: LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION },
+  { id: LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -294,6 +296,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
   run(LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
   runDemoSpacesNoAutoPresenceMigration(world);
+  runDropSessionIdPropertyMigration(world);
   return covered;
 }
 
@@ -466,6 +469,22 @@ function runPinboardV02RepairMigration(world: WooWorld, names: readonly string[]
     if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
   markMigrationApplied(world, LOCAL_CATALOG_PINBOARD_V02_REPAIR_MIGRATION);
+}
+
+function runDropSessionIdPropertyMigration(world: WooWorld): void {
+  if (migrationApplied(world, LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION)) return;
+  // session_id was a $player property used as a write-only mirror of the
+  // session table. Removed from the seed; this clears the def from $player
+  // and any own values left on descendants in upgraded worlds. deleteProp
+  // tracks the deletion through the persistence layer so storage rows go
+  // too — not just the in-memory copy.
+  for (const id of Array.from(world.objects.keys())) {
+    const obj = world.object(id);
+    if (obj.propertyDefs.has("session_id") || obj.properties.has("session_id") || obj.propertyVersions.has("session_id")) {
+      world.deleteProp(id, "session_id");
+    }
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION);
 }
 
 function runDemoSpacesNoAutoPresenceMigration(world: WooWorld): void {
