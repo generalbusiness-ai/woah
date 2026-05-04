@@ -95,7 +95,7 @@ Host-facing interfaces for runtime execution, transport, and client bootstrap ac
 - [rest.md](spec/protocol/rest.md) — HTTP+SSE REST API; six endpoints; `$me` (R1–R11)
 - [mcp.md](spec/protocol/mcp.md) — Model Context Protocol surface for LLM agents; dynamic per-location tools (M1–M8)
 - [browser-host.md](spec/protocol/browser-host.md) — transient host bootstrap (§18)
-- [routing.md](spec/protocol/routing.md) — `/objects/<id>` URL form, class-driven renderer dispatch, URL ↔ MCP-focus mirroring, `:locate()` / `:open_in_<view>()` verb conventions (AR1–AR13)
+- [routing.md](spec/protocol/routing.md) — `/objects/<id>` URL form, class-driven renderer dispatch, browser navigation vs MCP focus, `:locate()` / `:open_in_<view>()` verb conventions (AR1–AR13)
 
 ### Reference (Cloudflare)
 

@@ -8,9 +8,8 @@ status: draft
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
 How woo objects are addressed via URL, how clients dispatch renderers
-from class hierarchy, how URL state and per-actor MCP focus mirror
-each other, and the verb conventions that let cross-object navigation
-generalize across bundled and third-party content.
+from class hierarchy, and the verb conventions that let cross-object
+navigation generalize across bundled and third-party content.
 
 The substrate primitives this depends on (object id forms, corenames,
 actor focus list) are normative in
@@ -35,7 +34,6 @@ or an external agent to express the same jump.
 Goal: a single addressing model that
 
 - gives every navigation a URL,
-- maps URL ↔ MCP focus state 1:1,
 - lets new catalog classes acquire rendering and linking without an
   SPA code change,
 - stays human-readable when the object has a corename or seed name,
@@ -52,29 +50,31 @@ The canonical URL is `/objects/<id>` with an optional view hint.
 /                                          client root / dashboard
 /objects/$wiz                              corename
 /objects/the_pinboard                      catalog-seed instance name
-/objects/01H7QXKM6Z3KS9F2YR5W8ABCDE         ULID (post-allocator)
+/objects/%2301H7QXKM6Z3KS9F2YR5W8ABCDE      persistent ref / URL-encoded ULID
 /objects/$me                               dynamic corename → actor
 /objects/obj_pin_3?view=kanban             same pin, kanban renderer
 ```
 
-The `<id>` segment is one of the four address forms enumerated in
-[rest.md §R3](rest.md#r3-object-addresses):
+The `<id>` segment accepts the object reference forms from
+[rest.md §R2](rest.md#r2-identifiers), plus the seed/runtime names
+the current local and bundled deployments already expose:
 
 - `$<name>` — corename. URL-safe; no percent-encoding.
 - `<seed_name>` — catalog-seed instance name (`the_pinboard`,
   `the_chatroom`, `obj_pin_3`).
-- `<ulid>` — Crockford base32, when the deterministic allocator lands
-  (per [reference/cloudflare.md §R14.5](../reference/cloudflare.md#r145-id-determinism-status)).
+- `%23<ulid>` — URL-encoded persistent ref (`#` + Crockford base32),
+  when the deterministic allocator lands (per
+  [reference/cloudflare.md §R14.5](../reference/cloudflare.md#r145-id-determinism-status)).
 - `<runtime_counter>` — current `obj_*` / `the_*` runtime-counter form;
   honoured for compatibility, gradually displaced by ULIDs.
 
-All four resolve through the same path the REST surface uses today
-(`resolveRestObject`). URLs that arrive through a corename remain
+All forms resolve through the same object-resolution path the REST
+surface uses today. URLs that arrive through a corename remain
 correct when the underlying object's id changes — the corename is the
-indirection.
+indirection. `$me` is dynamic and resolves to the authenticated actor.
 
 The corresponding API path for a client to fetch the object's state is
-`/api/objects/<id>` ([rest.md §R6](rest.md#r6-object-shape)). The
+`/api/objects/<id>` ([rest.md §R4](rest.md#r4-describe)). The
 client-facing URL is `/objects/<id>` (no `/api` prefix); the worker
 serves the SPA bundle for any non-API path via the existing
 `not_found_handling = "single-page-application"` policy in
@@ -119,9 +119,12 @@ table approximately:
 | (anything else) | fallback: `:describe()` + verb list |
 
 For an object whose class isn't recognised, the fallback renderer
-surfaces the standard introspection output and the actor-callable verb
-set. This means addressing an unknown object never 404s in the client;
-it degrades to a generic view.
+fetches `/api/objects/<id>` and surfaces the permission-filtered
+introspection output and actor-callable verb set. This means
+addressing an existing but unknown object never 404s in the client; it
+degrades to a generic view. If the API returns `E_OBJNF`, the client
+renders a not-found view. If the API returns `E_PERM`, the client
+renders a no-access view per AR10.
 
 A `?view=` value the client knows about overrides the default. Values
 the client doesn't recognise fall back to the class default rather
@@ -129,34 +132,23 @@ than failing.
 
 ---
 
-## AR5. URL ↔ MCP focus
+## AR5. Human navigation and MCP focus
 
-`$actor.focus_list` is the canonical "what am I looking at" state per
-actor (per [features.md / mcp.md](../protocol/mcp.md)). URL state in
-any client is a presentation of focus:
+`$actor.focus_list` remains the MCP working set: agents use it to make
+objects reachable through tools. Browser URL navigation is human UI
+state. The two concepts are related but not the same contract:
 
-- A client navigating to `/objects/X` SHOULD call `$me:focus(X)` (or
-  the equivalent) before rendering, so the actor's focus reflects the
-  navigation.
-- An agent calling `$me:focus(X)` causes any client connected as the
-  same actor to navigate to `/objects/X` (subject to that client's
-  own UX — a paused or backgrounded tab MAY queue rather than jump).
+- A human client navigating to `/objects/X` MAY call `$me:focus(X)` as
+  a convenience so the object also joins the actor's MCP working set.
+- A client MUST NOT treat arbitrary `$me:focus(X)` calls as browser
+  navigation commands. Agents use MCP focus for their own working set;
+  their focus changes should not make a human browser tab jump.
+- If a deployment wants shared human/agent co-navigation, it should be
+  an explicit collaboration feature layered on top of this spec, not
+  default URL behavior.
 
-Two consequences worth pinning:
-
-- **Bidirectional unification.** SPA URL changes and MCP focus changes
-  drive the same per-actor state. An agent and a human sharing an
-  actor see the same world position.
-- **Primary vs. auxiliary focus.** The focus list is bounded (default
-  32 per `$actor.focus_list` semantics). The URL reflects only the
-  *primary* focus — typically the most recently navigated-to object.
-  Agents that focus additional objects (peripheral monitoring) keep
-  those in the focus list without affecting the URL.
-
-A future refinement separates "primary focus" (URL-bound) from
-"auxiliary focus" (additional reachability) explicitly. For v1, the
-client implements primary-focus tracking locally; the substrate's
-`focus_list` carries everything.
+For v1, URL state is the client's primary navigation state. MCP focus
+is optional integration state.
 
 ---
 
@@ -266,18 +258,19 @@ When the deterministic allocator lands (per [reference/cloudflare.md
 
 - Catalog seeds and corenames keep their names. URLs that addressed
   `the_pinboard` or `$wiz` continue to work.
-- Runtime-created persistent objects emit ULIDs as their canonical
-  id. URLs for those objects start showing the ULID form.
-- `:describe()` returns the ULID in its `id` field; clients display
-  it in detail panes and "copy link" affordances.
+- Runtime-created persistent objects emit persistent refs (`#` +
+  ULID) as their canonical id. URLs for those objects start showing
+  the URL-encoded persistent-ref form.
+- `:describe()` returns the persistent ref in its `id` field; clients
+  display it in detail panes and "copy link" affordances.
 - The "share link" affordance prefers the most stable form available
-  for the object — corename if present, else seed name, else ULID,
-  else the runtime counter form.
+  for the object — corename if present, else seed name, else
+  persistent ref, else the runtime counter form.
 
 URLs are **the** primary surface where ULIDs become user-visible.
 Today's `obj_the_pinboard_3`-style ids are deployment-local; ULIDs
 are globally unique and survive world resets and snapshot moves.
-Bookmarking `/objects/01H7QXKM…` is durable across that lifecycle in
+Bookmarking `/objects/%2301H7QXKM…` is durable across that lifecycle in
 a way bookmarking `/objects/obj_the_pinboard_3` is not.
 
 The URL bar may show whichever form the user navigated through; the
@@ -311,8 +304,8 @@ actor, not the sharer's.
 
 Clients SHOULD use the browser History API (`pushState` /
 `replaceState`) so back / forward work natively. No additional
-substrate hooks are needed; navigation is purely client state plus a
-focus update on the server.
+substrate hooks are needed; navigation is client state. An
+implementation MAY also update `$actor.focus_list` per AR5.
 
 Restoring a tab from history MUST re-fetch the object's current state
 (the world may have moved since the URL was first visited). Clients
@@ -329,8 +322,8 @@ A client conforms to this section if:
    dispatches to the matching renderer (AR2, AR4).
 2. In-app navigation updates the URL via History API or equivalent
    (AR11).
-3. URL changes update `$actor.focus_list` to include the addressed
-   object as the primary focus (AR5).
+3. Browser URL changes do not require MCP focus changes, and MCP focus
+   changes do not drive browser navigation (AR5).
 4. `?view=<name>` is honoured when the renderer recognises the value;
    unknown values fall back to the class default (AR3, AR4).
 5. Navigation generation for "share link" and cross-view jumps
@@ -347,6 +340,24 @@ A class conforms to this section if:
 
 The substrate is unchanged by this spec — every requirement is on
 clients and class authors.
+
+### AR12.1. Minimum implementation profile
+
+A useful first implementation may ship direct URL restoration before
+all catalog classes have navigation verbs. The minimum profile is:
+
+1. Parse `/objects/<id>` and `?view=<name>` from the browser URL.
+2. Fetch `/api/objects/<id>` and dispatch by class hierarchy, including
+   generic, not-found, and no-access fallbacks.
+3. Update the URL when the user navigates between already-known bundled
+   renderers.
+4. Treat MCP focus as optional integration state, not as browser
+   navigation input.
+
+That profile is enough for refresh/back/share-by-copying-the-current
+URL. `:locate()` blocks only generated share links and catalog-authored
+navigation targets. `:open_in_<view>()` blocks only generic cross-view
+bridge affordances. Neither blocks basic object-addressed routing.
 
 ---
 
@@ -396,10 +407,10 @@ isn't in this revision.
   `$actor.bookmarks` property; not in v1. Per-actor state already
   exists for focus; bookmarks are a separate persistent store.
 
-- **Primary-vs-auxiliary focus split (AR5).** v1 clients implement
-  primary-focus tracking locally; the substrate's `focus_list`
-  carries everything. A clean substrate split into "primary" and
-  "auxiliary" focus is a follow-up.
+- **Primary-vs-auxiliary focus split (AR5).** v1 treats browser
+  navigation and MCP focus as separate surfaces. A clean substrate
+  split into "primary" and "auxiliary" focus may still be useful for
+  agent tooling, but it is not required for URL routing.
 
 - **Server-side rendering / SEO.** A non-SPA HTML response for
   `/objects/<id>` (so crawlers and link-preview unfurlers get

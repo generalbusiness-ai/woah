@@ -24,7 +24,8 @@ GET   /api/objects/{id-or-name}/log?from=N&limit=M
 GET   /api/objects/{id-or-name}/stream
 ```
 
-Six endpoints. Everything is an object; identifiers are ULIDs or corenames.
+Six endpoints. Everything is an object; identifiers are object refs,
+corenames, or implementation-local object ids.
 
 ---
 
@@ -35,6 +36,9 @@ The path segment `{id-or-name}` accepts:
 - A ULID with `#` sigil: `#01HXYZAB...` (URL-encode the `#` as `%23`).
 - A corename: `$wiz`, `$dubspace`, `$me`. The `$` is URL-safe; no encoding needed.
 - A transient ref: `~3@%23<host-ulid>` (URL-encode the qualifier).
+- An implementation-local object id already present in the world, such
+  as a bundled seed/runtime id (`the_pinboard`, `obj_pin_3`). These are
+  deployment-local compatibility ids, not portable object refs.
 
 Static corenames resolve via `$system.<name>` lookup; dynamic corenames (`$me`) resolve per-request — see R8.
 
