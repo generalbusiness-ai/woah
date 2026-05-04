@@ -839,10 +839,19 @@ describe("local catalogs", () => {
 
     const outsider = world.auth("guest:sticky-room-note-outsider");
     await world.directCall("enter-hot-tub-sticky-outsider", outsider.actor, "the_hot_tub", "enter", []);
+    // Outsider can't read the note's text, so the chat planner routes the
+    // take to the room and `room_take`'s own contents-only match throws
+    // `I don't see "nuclear codes" here.`
     const privateTextMatch = await world.directCall("take-private-note-text", outsider.actor, "the_hot_tub", "command_plan", ["take nuclear codes"]);
     expect(privateTextMatch.op).toBe("result");
     if (privateTextMatch.op === "result") {
-      expect(privateTextMatch.result).toMatchObject({ ok: false, route: "huh", target: "the_hot_tub", verb: "huh", text: "take nuclear codes" });
+      expect(privateTextMatch.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "take", args: ["nuclear codes"] });
+    }
+    const privateTextTake = await world.call("take-private-note-text-call", outsider.id, "the_hot_tub", { actor: outsider.actor, target: "the_hot_tub", verb: "take", args: ["nuclear codes"] });
+    expect(privateTextTake.op).toBe("applied");
+    if (privateTextTake.op === "applied") {
+      const err = privateTextTake.observations.find((obs) => obs.type === "$error");
+      expect(err?.code).toBe("E_INVARG");
     }
   });
 
@@ -1358,11 +1367,13 @@ describe("local catalogs", () => {
       expect(takePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["lamp"] });
     }
 
+    // "get whatever" should route to the room's take verb so room_take owns
+    // the missing-match error (it knows the room's contents better than the
+    // chat planner's broader visibility set).
     const missingTakePlan = await world.directCall("plan-take-missing", session.actor, "the_chatroom", "command_plan", ["get whatever"]);
     expect(missingTakePlan.op).toBe("result");
     if (missingTakePlan.op === "result") {
-      expect(missingTakePlan.result).toMatchObject({ ok: false, route: "huh", target: "the_chatroom", verb: "huh", text: "get whatever" });
-      expect(missingTakePlan.observations).toContainEqual(expect.objectContaining({ type: "huh", source: "the_chatroom", actor: session.actor, text: "get whatever" }));
+      expect(missingTakePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["whatever"] });
     }
 
     const bareDropPlan = await world.directCall("plan-drop-bare", session.actor, "the_chatroom", "command_plan", ["drop"]);
