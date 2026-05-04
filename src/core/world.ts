@@ -5316,40 +5316,12 @@ export class WooWorld {
     const prefix: ObjRef[] = [];
     const contains: ObjRef[] = [];
     const remoteSummaries = await this.objectSummariesForLook(ctx, candidates);
-    for (const id of candidates) {
-      const names = [id];
-      const aliases: string[] = [];
-      if (await this.remoteHostForObject(id, ctx.hostMemo)) {
-        const summary = remoteSummaries.summaries.get(id) ?? await this.objectSummaryForLook(ctx, id);
-        if (summary) {
-          names.push(titleFromSummary(id, summary));
-          if (Array.isArray(summary.aliases)) aliases.push(...summary.aliases.map((item) => String(item)));
-        } else {
-          try {
-            const remoteName = await this.getPropChecked(ctx.progr, id, "name", ctx.hostMemo);
-            if (typeof remoteName === "string") names.push(remoteName);
-          } catch {
-            // Remote object id remains matchable even when display metadata is absent.
-          }
-          try {
-            const remoteAliases = await this.getPropChecked(ctx.progr, id, "aliases", ctx.hostMemo);
-            if (Array.isArray(remoteAliases)) aliases.push(...remoteAliases.map((item) => String(item)));
-          } catch {
-            // Aliases are optional for matching.
-          }
-        }
-      } else if (this.objects.has(id)) {
-        const obj = this.object(id);
-        names.push(obj.name);
-        try {
-          names.push(await this.titleForLook(ctx, ctx.thisObj, id));
-        } catch {
-          // Matching remains available by object id/name if a custom title fails.
-        }
-        await this.addLocalNoteMatchNames(ctx, id, names);
-        const localAliases = this.propOrNull(id, "aliases");
-        if (Array.isArray(localAliases)) aliases.push(...localAliases.map((item) => String(item)));
-      }
+    // Per-candidate name/alias enrichment is independent — fan it out in
+    // parallel. With ~10 candidates and per-candidate verb dispatches
+    // (titleForLook, $note text), the serial form was the dominant cost of
+    // an unhandled chat utterance like "well this is fun".
+    const enriched = await Promise.all(candidates.map((id) => this.enrichMatchCandidate(ctx, id, remoteSummaries.summaries.get(id) ?? null)));
+    for (const { id, names, aliases } of enriched) {
       const nameValues = names.filter(Boolean).map((item) => String(item).toLowerCase());
       const aliasValues = aliases.map((item) => item.toLowerCase());
       if (nameValues.includes(lower)) exact.push(id);
@@ -5358,6 +5330,43 @@ export class WooWorld {
       else if (wanted.length >= 2 && [...nameValues, ...aliasValues].some((item) => item.includes(lower))) contains.push(id);
     }
     return this.resolveObjectMatch(exact.length > 0 ? exact : alias.length > 0 ? alias : prefix.length > 0 ? prefix : contains);
+  }
+
+  private async enrichMatchCandidate(ctx: CallContext, id: ObjRef, summary: HostObjectSummary | null): Promise<{ id: ObjRef; names: string[]; aliases: string[] }> {
+    const names: string[] = [id];
+    const aliases: string[] = [];
+    if (await this.remoteHostForObject(id, ctx.hostMemo)) {
+      const resolved = summary ?? await this.objectSummaryForLook(ctx, id);
+      if (resolved) {
+        names.push(titleFromSummary(id, resolved));
+        if (Array.isArray(resolved.aliases)) aliases.push(...resolved.aliases.map((item) => String(item)));
+      } else {
+        try {
+          const remoteName = await this.getPropChecked(ctx.progr, id, "name", ctx.hostMemo);
+          if (typeof remoteName === "string") names.push(remoteName);
+        } catch {
+          // Remote object id remains matchable even when display metadata is absent.
+        }
+        try {
+          const remoteAliases = await this.getPropChecked(ctx.progr, id, "aliases", ctx.hostMemo);
+          if (Array.isArray(remoteAliases)) aliases.push(...remoteAliases.map((item) => String(item)));
+        } catch {
+          // Aliases are optional for matching.
+        }
+      }
+      return { id, names, aliases };
+    }
+    if (!this.objects.has(id)) return { id, names, aliases };
+    const obj = this.object(id);
+    names.push(obj.name);
+    const [title] = await Promise.all([
+      this.titleForLook(ctx, ctx.thisObj, id).catch(() => null),
+      this.addLocalNoteMatchNames(ctx, id, names)
+    ]);
+    if (typeof title === "string") names.push(title);
+    const localAliases = this.propOrNull(id, "aliases");
+    if (Array.isArray(localAliases)) aliases.push(...localAliases.map((item) => String(item)));
+    return { id, names, aliases };
   }
 
   private async addLocalNoteMatchNames(ctx: CallContext, id: ObjRef, names: string[]): Promise<void> {
