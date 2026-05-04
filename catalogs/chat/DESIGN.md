@@ -41,6 +41,7 @@ The chat verbs use the **direct live interaction** pattern from [core.md §C13](
 | `:look` / `:who` | direct (read) | none |
 | direction verbs / `:go` | direct | actor presence/location |
 | `:take` / `:drop` | direct | object location |
+| `:give` (on `$portable`) | direct | object location; private — no room broadcast |
 | `:enter` / `:leave` | direct | session/presence (persistent state on `$actor.presence_in` and `$space.subscribers`) |
 | `:command_plan` | direct parser | none; returns the concrete route/target/verb/args |
 | `:command` | direct dispatcher | compatibility wrapper for direct-only plans |
@@ -88,6 +89,15 @@ supplies generic primitives: `set_presence`, `moveto`, `observe_to_space`,
 woocode on `$room`: the matcher remains a trusted primitive, but portable
 checks, user-facing text, `moveto`, and `taken` / `dropped` observations are
 catalog-authored behavior.
+
+`:give(recipient)` lives on `$portable` (the LambdaMOO pattern: the verb is
+on the carryable, dispatched via the matched dobj). The chat planner
+recognises `give <thing> to <person>` (also `at`, also `hand`) and routes
+to `dobj:give(iobjstr)`. The verb body validates the giver is holding
+the item, matches the recipient in `location(actor)`, calls `:moveto` so
+the recipient's `:acceptable` hook gates the transfer, and confirms the
+move landed before tell-ing the giver and recipient. Transfers are
+private — no room-wide observation, matching LambdaMOO's `$thing:give`.
 
 Inside each verb body: `this` = the consumer space (the room being talked in), `definer` = the `$conversational` feature, `progr` = the feature's owner. Observations are emitted to `this.subscribers`, not to the feature's own subscribers (which would be empty).
 

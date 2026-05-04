@@ -42,6 +42,64 @@ const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   return { id: this, title: title, description: description, carrying: carried };
 }`;
 
+const PLAYER_INVENTORY_SOURCE = `verb :inventory() rxd {
+  let items = [];
+  let names = [];
+  for item in contents(this) {
+    let item_title = "";
+    try { item_title = item:title(); } except err { item_title = ""; }
+    if (!item_title) { item_title = to_string(item); }
+    items = items + [{ id: item, title: item_title }];
+    names = names + [item_title];
+  }
+  let text = "";
+  if (length(names) == 0) { text = "You are empty-handed."; }
+  else if (length(names) == 1) { text = "You are carrying " + names[1] + "."; }
+  else {
+    let joined = "";
+    let i = 1;
+    for n in names {
+      if (i == 1) { joined = n; }
+      else if (i == length(names)) { joined = joined + ", and " + n; }
+      else { joined = joined + ", " + n; }
+      i = i + 1;
+    }
+    text = "You are carrying " + joined + ".";
+  }
+  tell(this, text);
+  return { items: items, text: text };
+}`;
+
+const PLAYER_HOME_SOURCE = `verb :home() rxd {
+  let dest = this.home;
+  if (dest == null || dest == $nowhere) { tell(this, "You don't have a home set."); return null; }
+  let here = location(this);
+  if (dest == here) { tell(this, "You are already home."); return dest; }
+  // LambdaCore $player:home calls this:moveto(this.home) so the destination's
+  // :acceptable / enterfunc gates the move. We do the same — and then reconcile
+  // presence and observations on the source/destination spaces afterwards, so
+  // that a refused move (location unchanged) leaves no spurious announce.
+  moveto(this, dest);
+  let landed = location(this);
+  if (landed != dest) {
+    tell(this, "Either home doesn't want you, or you don't really want to go.");
+    return null;
+  }
+  if (here != null && (here in this.presence_in)) {
+    set_presence(here, false);
+    observe_to_space(here, { type: "left", actor: this, room: here, destination: dest, text: this.name + " goes home.", ts: now() });
+  }
+  try {
+    set_presence(dest, true);
+    observe_to_space(dest, { type: "entered", actor: this, room: dest, origin: here, text: this.name + " arrives home.", ts: now() });
+  } except err {
+    // Destination isn't a space — moveto landed us in a non-room container.
+    // No presence to set, no audience to announce to.
+  }
+  tell(this, "You go home.");
+  return dest;
+}`;
+
 export function createWorld(options: { repository?: WorldRepository & Partial<ObjectRepository>; catalogs?: readonly string[] | false } = {}): WooWorld {
   const world = new WooWorld(options.repository);
   const stored = options.repository?.load();
@@ -287,6 +345,8 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$root", "title", "default_title", "verb :title() rxd { return this.name; }", { directCallable: true });
   native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
   sourceVerb(world, "$actor", "look_self", ACTOR_LOOK_SELF_SOURCE, { directCallable: true });
+  sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, { directCallable: true, toolExposed: true, aliases: ["i@nventory", "inv"] });
+  sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, { directCallable: true, toolExposed: true, aliases: ["@home"] });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });
   native(world, "$player", "tell", "player_tell", "verb :tell(text) rxd { ... }", { directCallable: true });

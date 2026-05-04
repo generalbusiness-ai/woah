@@ -10,6 +10,8 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
+- cold-start browser experience
+- @describe me as...
 - look at guest -> show their contents
 - dm (outside of a room), chats and channels
 - are lists-of-text ok? that's a mooism that we don't really need and might cause problems later
@@ -23,7 +25,7 @@ The sections below distinguish three flavors of pending item:
 - migrate `the_dubspace`, `the_taskspace`, and `the_chatroom` manifests to declare `instances_self_host: true` on `$dubspace` / `$taskspace` / `$chatroom` (or `$room`) at the class, instead of stamping `host_placement: "self"` on each instance. Wire `create()` to compute `host_placement` from the parent chain. Keep `host_placement` as the runtime projection. Manifest-migration story per `spec/semantics/objects.md §4.2`.
 - mid-RPC origin-host crash drops the awaiting task: the v1 `awaiting_call` removal trades a real durability story for simplicity (`spec/semantics/tasks.md §16.3`). If a verb does many cross-host RPCs and the origin host evicts mid-flight, the in-memory task is lost. Revisit if the workload makes this hurt.
 - native demo mechanics remain in `WooWorld.registerNativeHandlers()` (`room_take`, `room_drop`, command parsing, match helpers). Movement (`:enter`, `:leave`, directions, `:go`) has moved back into chat woocode; keep shrinking the native list as the DSL can express object matching and portable checks cleanly.
-- ~~cross-host containment primitive~~ — `moveObjectChecked()` now routes to the object's host, writes `location` there, and mirrors old/new container `contents` through the host bridge. Remaining work: deployed/Miniflare smoke for the Worker RPC path and broader route stamping for runtime-created non-anchored objects.
+- ~~cross-host containment primitive~~ — `moveObjectChecked()` now routes to the object's host, writes `location` there, and mirrors old/new container `contents` through the host bridge. Worker-routed fake-DO smoke now covers room enter/go, inventory take/drop, and pinboard add/move/edit/list through Directory-resolved host objects. Remaining work: live-deploy or Miniflare smoke against real workerd APIs, plus broader route stamping for runtime-created non-anchored objects.
 - deferred host effect batching — cross-host source verbs currently return generic effects (`actor_presence`, `space_subscriber`, `move_object`) and the origin host applies each one as a separate host-bridge operation. A single room move can be four fetches. Fine for first-light; batch by target host into one `apply_effects` RPC if movement or mounted-space activity gets hot.
 - MCP catalog discovery (CT11) — `catalogs/<name>/agent_manifest.json` and the `/.well-known/mcp.json` route are spec-only today (`spec/discovery/catalogs.md §CT11`). Runtime tool discovery just consults `tool_exposed` + reachability. Wire the manifest path once first-light agents start consuming it.
 - catalog uninstall — the runtime now supports catalog install/list/update/migration_state, but not safe uninstall. Implement only after the §CT9 checks can prove no live instances, references, feature attachments, or log/snapshot dependencies would be broken.

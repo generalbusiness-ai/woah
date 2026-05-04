@@ -132,6 +132,8 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 | `:tell(text...)` rxd | any... | Deliver text output directly to this player. This is the LambdaCore `notify`/`:tell` output path adapted to observations. |
 | `:tell_lines(lines)` rxd | list | Deliver a sequence of text lines to this player. |
 | `:help(topic?)` rxd | str? | Search contextual help DBs and global `$system.help_dbs`, then deliver rendered help lines to the player. Aliases: `?`, `info`, `information`, `@help`. |
+| `:inventory()` rxd | — | Tell the player a one-line summary of `contents(this)` (LambdaMOO's "You are empty-handed." / "You are carrying X, Y, and Z.") and return `{items, text}`. Woocode seeded on `$player`. Aliases: `i`, `inv`, `inventory`. Tool-exposed. |
+| `:home()` rxd | — | Send the player to `this.home` via `home:enter(this)`, so the destination's `enterfunc` and presence handling fire. No-ops with a tell when home is unset or already current. Woocode seeded on `$player`. Alias: `@home`. Tool-exposed. |
 
 ### B2.8 `$guest` verbs
 

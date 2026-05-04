@@ -1459,6 +1459,103 @@ describe("local catalogs", () => {
     expect(world.objectRoutes().find((route) => route.id === "the_towel")).toEqual({ id: "the_towel", host: "world", anchor: null });
   });
 
+  it("dispatches give, inventory, and home through LambdaMOO-shaped seed verbs", async () => {
+    const world = createWorld();
+    const giver = world.auth("guest:give-giver");
+    const receiver = world.auth("guest:give-receiver");
+
+    await world.directCall("giver-enter", giver.actor, "the_chatroom", "enter", []);
+    await world.directCall("receiver-enter", receiver.actor, "the_chatroom", "enter", []);
+
+    // Empty inventory.
+    const empty = await world.directCall("inv-empty", giver.actor, giver.actor, "inventory", []);
+    expect(empty.op).toBe("result");
+    if (empty.op === "result") {
+      expect(empty.result).toMatchObject({ items: [], text: "You are empty-handed." });
+    }
+
+    // Pick up the lamp, then verify inventory reports it.
+    const take = await world.directCall("take-lamp-give", giver.actor, "the_chatroom", "take", ["lamp"]);
+    expect(take.op).toBe("result");
+    expect(world.object("the_lamp").location).toBe(giver.actor);
+
+    const carrying = await world.directCall("inv-one", giver.actor, giver.actor, "inventory", []);
+    expect(carrying.op).toBe("result");
+    if (carrying.op === "result") {
+      expect(carrying.result).toMatchObject({ items: [{ id: "the_lamp", title: "Brass Lamp" }], text: "You are carrying Brass Lamp." });
+    }
+
+    // Plan and execute "give lamp to <receiver>". The planner dispatches on
+    // the matched dobj (the_lamp) — LambdaMOO-style — and routes to its :give.
+    const recvName = world.object(receiver.actor).name; // "Guest N"
+    const givePlan = await world.directCall("plan-give", giver.actor, "the_chatroom", "command_plan", [`give lamp to ${recvName}`]);
+    expect(givePlan.op).toBe("result");
+    if (givePlan.op === "result") {
+      expect(givePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_lamp", verb: "give", args: [recvName] });
+    }
+
+    const give = await world.directCall("give-lamp", giver.actor, "the_lamp", "give", [recvName]);
+    expect(give.op).toBe("result");
+    if (give.op === "result") {
+      expect(give.result).toMatchObject({ item: "the_lamp", recipient: receiver.actor });
+      // Private tells go to giver and recipient; no public room observation.
+      expect(give.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "text", target: giver.actor, text: expect.stringContaining("You hand Brass Lamp to") }),
+        expect.objectContaining({ type: "text", target: receiver.actor, text: expect.stringContaining("hands you Brass Lamp") })
+      ]));
+      expect(give.observations.find((obs) => obs.type === "given")).toBeUndefined();
+    }
+    expect(world.object("the_lamp").location).toBe(receiver.actor);
+
+    // Giving to yourself.
+    const giverName = world.object(giver.actor).name;
+    const takeBack = await world.directCall("take-back", receiver.actor, "the_chatroom", "take", ["lamp"]);
+    expect(takeBack.op).toBe("error"); // can't take from another actor
+    // Recipient hands it back so the giver has it again for the self-give test.
+    const handBack = await world.directCall("hand-back", receiver.actor, "the_lamp", "give", [giverName]);
+    expect(handBack.op).toBe("result");
+    expect(world.object("the_lamp").location).toBe(giver.actor);
+
+    const selfGive = await world.directCall("self-give", giver.actor, "the_lamp", "give", [giverName]);
+    expect(selfGive.op).toBe("error");
+    if (selfGive.op === "error") {
+      expect(selfGive.error.code).toBe("E_INVARG");
+      expect(selfGive.error.message).toMatch(/yourself/i);
+    }
+
+    // Default home: a fresh guest's `home` is `$nowhere`. `:home` must not
+    // E_VERBNF on a missing $nowhere:enter — it should land on the friendly
+    // "no home set" tell and leave the actor where they are.
+    expect(world.getProp(giver.actor, "home")).toBe("$nowhere");
+    const noHome = await world.directCall("default-home", giver.actor, giver.actor, "home", []);
+    expect(noHome.op).toBe("result");
+    if (noHome.op === "result") {
+      expect(noHome.result).toBeNull();
+      expect(noHome.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "text", target: giver.actor, text: expect.stringContaining("don't have a home") })
+      ]));
+    }
+    expect(world.object(giver.actor).location).toBe("the_chatroom");
+    expect(world.hasPresence(giver.actor, "the_chatroom")).toBe(true);
+
+    // Set home to a real room, walk to a different room, then `home` should
+    // teleport the actor home with the right presence/announce reconciliation.
+    world.setProp(giver.actor, "home", "the_chatroom");
+    const goDeck = await world.directCall("go-deck", giver.actor, "the_chatroom", "southeast", []);
+    expect(goDeck.op).toBe("result");
+    expect(world.object(giver.actor).location).toBe("the_deck");
+
+    const homePlan = await world.directCall("plan-home", giver.actor, "the_deck", "command_plan", ["home"]);
+    expect(homePlan.op).toBe("result");
+    if (homePlan.op === "result") {
+      expect(homePlan.result).toMatchObject({ ok: true, route: "direct", target: giver.actor, verb: "home", args: [] });
+    }
+    const home = await world.directCall("go-home", giver.actor, giver.actor, "home", []);
+    expect(home.op).toBe("result");
+    expect(world.hasPresence(giver.actor, "the_chatroom")).toBe(true);
+    expect(world.hasPresence(giver.actor, "the_deck")).toBe(false);
+  });
+
   it("repairs stale chat room seed metadata and missing room contents", () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", [
