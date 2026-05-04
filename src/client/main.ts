@@ -701,7 +701,10 @@ function projectPinboard(world: any, meta: any) {
 function pinboardNotesFromContents(world: any, boardId: string | undefined, layoutValue: any) {
   const contents = Array.isArray(world.objects?.[boardId ?? ""]?.contents) ? world.objects[boardId ?? ""].contents : [];
   const layout = layoutValue && typeof layoutValue === "object" && !Array.isArray(layoutValue) ? layoutValue : {};
-  return contents.map((id: string) => {
+  // pinboard:enter does `move(actor, this)`, so contents includes guests as
+  // well as pins. Server-side `:list_notes` filters by `isa(pin, $note)`;
+  // we approximate that here with a parent check on the bundled $pin class.
+  return contents.filter((id: string) => world.objects?.[id]?.parent === "$pin").map((id: string) => {
     const obj = world.objects?.[id] ?? {};
     const props = obj.props ?? {};
     const entry = layout[id] && typeof layout[id] === "object" && !Array.isArray(layout[id]) ? layout[id] : {};
@@ -2545,15 +2548,19 @@ function bindPinboard() {
   });
   document.querySelector<HTMLFormElement>("[data-pinboard-create]")?.addEventListener("submit", (event) => {
     event.preventDefault();
-    const textInput = document.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]");
-    const colorInput = document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]");
-    const text = textInput?.value.trim() ?? "";
-    if (!text) return;
-    const placement = newPinNotePlacement();
-    const color = normalizePinboardStickyColor(colorInput?.value, state.world?.pinboard?.palette);
-    rememberPinboardNewColor(color);
-    pinboardCall("add_note", [text, color, placement.x, placement.y, placement.w, placement.h]);
-    if (textInput) textInput.value = "";
+    try {
+      const textInput = document.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]");
+      const colorInput = document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]");
+      const text = textInput?.value.trim() ?? "";
+      if (!text) return;
+      const placement = newPinNotePlacement();
+      const color = normalizePinboardStickyColor(colorInput?.value, state.world?.pinboard?.palette);
+      rememberPinboardNewColor(color);
+      pinboardCall("add_note", [text, color, placement.x, placement.y, placement.w, placement.h]);
+      if (textInput) textInput.value = "";
+    } catch (err) {
+      console.error("pinboard add_note failed", err);
+    }
   });
   document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]")?.addEventListener("change", (event) => {
     rememberPinboardNewColor((event.currentTarget as HTMLSelectElement).value);
