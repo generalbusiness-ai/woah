@@ -151,6 +151,9 @@ let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
 let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
 const pinNoteClientZ = new Map<string, number>();
+let pinboardTextHydrationRequestedBoard = "";
+let pinboardTextHydrationRequestedSignature = "";
+let pinboardTextHydrationRequested = false;
 let chatHistory = loadChatHistory();
 let chatHistoryCursor = chatHistory.length;
 let chatHistoryDraft = "";
@@ -367,6 +370,7 @@ async function refresh() {
   state.chatPresent = Array.isArray(state.world?.chat?.present) ? state.world.chat.present : state.chatPresent;
   syncTaskSelection();
   audio?.sync(effectiveDubspace(), state.clockOffset);
+  hydratePinboardNotesTextIfNeeded(state.world?.pinboard);
   render();
 }
 
@@ -522,6 +526,37 @@ function pinboardNotesFromContents(world: any, boardId: string | undefined, layo
       z: entry.z
     };
   });
+}
+
+function pinboardNotesHaveMissingText(notes: any[]) {
+  return (Array.isArray(notes) ? notes : []).some((note) => {
+    const text = note?.text;
+    if (text === undefined || text === null) return true;
+    return false;
+  });
+}
+
+function pinboardNotesSignature(notes: any[]) {
+  return (Array.isArray(notes) ? notes : []).map((note) => String(note?.id ?? "")).filter(Boolean).sort().join("|");
+}
+
+function hydratePinboardNotesTextIfNeeded(pinboard: any) {
+  const board = pinboard?.board;
+  const boardId = typeof board?.id === "string" ? board.id : "";
+  const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
+  if (!canSendDirect()) return;
+  if (!pinboardNotesHaveMissingText(notes)) return;
+  if (!boardId) return;
+  const signature = pinboardNotesSignature(notes);
+  const boardChanged = pinboardTextHydrationRequestedBoard !== boardId || pinboardTextHydrationRequestedSignature !== signature;
+  if (boardChanged) {
+    pinboardTextHydrationRequested = false;
+    pinboardTextHydrationRequestedBoard = boardId;
+    pinboardTextHydrationRequestedSignature = signature;
+  }
+  if (pinboardNotesRefreshPending || pinboardTextHydrationRequested) return;
+  pinboardTextHydrationRequested = true;
+  refreshPinboardNotes();
 }
 
 function normalizePinboardNotes(notes: any[], previousNotes: any[] = []) {
@@ -2894,6 +2929,9 @@ function refreshPinboardNotes() {
     if (state.tab === "pinboard") render();
   }, () => {
     pinboardNotesRefreshPending = false;
+    // Allow the next /api/state arrival to retry hydration if a transient
+    // failure (cold remote DO, network blip) ate this list_notes call.
+    pinboardTextHydrationRequested = false;
   });
 }
 
