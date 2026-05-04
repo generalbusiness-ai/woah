@@ -189,15 +189,25 @@ wss.on("connection", (ws) => {
       },
       session: () => attachedSession(ws),
       send: (_connection, frameValue) => ws.send(JSON.stringify(frameValue)),
-      call: (frameId, session, space, message) => world.call(frameId, session.sessionId, space, message),
-      direct: (frameId, session, target, verb, args) => world.directCall(frameId, session.actor, target, verb, args),
+      call: (frameId, session, space, message) => {
+        world.touchSessionInput(session.sessionId);
+        return world.call(frameId, session.sessionId, space, message);
+      },
+      direct: (frameId, session, target, verb, args) => {
+        world.touchSessionInput(session.sessionId);
+        return world.directCall(frameId, session.actor, target, verb, args);
+      },
       replay: (frameId, session, space, fromValue, limitValue) => {
+        // Replay is recovery, not user input — does NOT touch lastInputAt.
         if (!world.hasPresence(session.actor, space)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
         const from = Math.max(1, Number(fromValue ?? 1));
         const limit = Math.min(Math.max(1, Number(limitValue ?? 100)), 500);
         return { op: "replay", id: frameId, space, from, entries: world.replay(space, from, limit) };
       },
-      deliverInput: (session, input) => world.deliverInput(session.actor, input),
+      deliverInput: (session, input) => {
+        world.touchSessionInput(session.sessionId);
+        return world.deliverInput(session.actor, input);
+      },
       broadcastApplied: (frameValue, originator) => broadcastApplied(frameValue, originator),
       broadcastTaskResult,
       broadcastLiveEvents

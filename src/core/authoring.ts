@@ -579,6 +579,8 @@ const VALID_BUILTINS = new Set([
   "tell",
   "dispatch",
   "collect_prop",
+  "is_connected",
+  "idle_seconds",
   "builder_create_object",
   "builder_chparent",
   "builder_recycle",

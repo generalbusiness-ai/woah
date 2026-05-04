@@ -247,6 +247,7 @@ export class PersistentObjectDO {
         serverName: "woo",
         dispatch: {
           call: async (sessionId, actor, space, message) => {
+            world.touchSessionInput(sessionId);
             const session = { sessionId, actor };
             const host = await this.resolveObjectHost(space, WORLD_HOST);
             const result = host === WORLD_HOST
@@ -256,6 +257,7 @@ export class PersistentObjectDO {
             return result;
           },
           direct: async (sessionId, actor, target, verb, args) => {
+            world.touchSessionInput(sessionId);
             const session = { sessionId, actor };
             const host = await this.resolveObjectHost(target, WORLD_HOST);
             return host === WORLD_HOST
@@ -1283,6 +1285,7 @@ export class PersistentObjectDO {
       session: () => this.liveAttachment(world, ws),
       send: (_connection, frameValue) => ws.send(JSON.stringify(frameValue)),
       call: async (frameId, session, space, messageValue) => {
+        world.touchSessionInput(session.sessionId);
         const host = await this.resolveObjectHost(space, WORLD_HOST);
         const result = host === WORLD_HOST
           ? await world.call(frameId, session.sessionId, space, messageValue)
@@ -1293,6 +1296,7 @@ export class PersistentObjectDO {
         return result;
       },
       direct: async (frameId, session, target, verb, args) => {
+        world.touchSessionInput(session.sessionId);
         const host = await this.resolveObjectHost(target, WORLD_HOST);
         return host === WORLD_HOST
           ? await world.directCall(
@@ -1305,6 +1309,7 @@ export class PersistentObjectDO {
           : await this.forwardWsDirect(world, host, frameId, session, target, verb, args);
       },
       replay: async (frameId, session, space, fromValue, limitValue) => {
+        // Replay is recovery, not user input — does NOT touch lastInputAt.
         const host = await this.resolveObjectHost(space, WORLD_HOST);
         if (host !== WORLD_HOST) {
           return this.forwardWsReplay(world, host, frameId, session, space, fromValue, limitValue);
@@ -1314,7 +1319,10 @@ export class PersistentObjectDO {
         const limit = Math.min(Math.max(1, Number(limitValue ?? 100)), 500);
         return { op: "replay", id: frameId, space, from, entries: world.replay(space, from, limit) };
       },
-      deliverInput: (session, input) => world.deliverInput(session.actor, input),
+      deliverInput: (session, input) => {
+        world.touchSessionInput(session.sessionId);
+        return world.deliverInput(session.actor, input);
+      },
       broadcastApplied: (frameValue, originator) => this.handleAppliedFrame(world, frameValue, originator),
       broadcastTaskResult: (result) => this.broadcastTaskResult(world, result),
       broadcastLiveEvents: (result) => this.broadcastLiveEvents(world, result)

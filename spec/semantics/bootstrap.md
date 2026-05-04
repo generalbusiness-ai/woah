@@ -128,6 +128,7 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 
 | Verb | Args | Purpose |
 |---|---|---|
+| `:look_self()` rxd | — | Player view. Calls `pass()` to inherit `$actor:look_self`'s carrying-aware shape, then appends one of three idle-status sentences modeled on LambdaCore: `<name> is sleeping.` when `is_connected(this)` is false; `<name> is awake and looks alert.` when connected and `idle_seconds(this) < 60`; otherwise `<name> is awake, but has been staring off into space for N minutes.` Connection and idle state come from `is_connected` / `idle_seconds` substrate builtins (see [builtins.md §19.7](builtins.md#197-sessions)). |
 | `:on_disfunc()` | — | Disfunc hook called at session reap. Default body is a no-op; `$guest` overrides. See [identity.md §I6.4](identity.md#i64-guest-reset-the-on_disfunc-convention). |
 | `:moveto(target)` | obj | Move this player to `target.contents`. Used by disfunc bodies. |
 | `:tell(text...)` rxd | any... | Deliver text output directly to this player. This is the LambdaCore `notify`/`:tell` output path adapted to observations. |

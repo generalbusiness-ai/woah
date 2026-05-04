@@ -70,6 +70,32 @@ const PLAYER_INVENTORY_SOURCE = `verb :inventory() rxd {
   return { items: items, text: text };
 }`;
 
+const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
+  let base = pass();
+  let line = "";
+  if (!is_connected(this)) {
+    line = this.name + " is sleeping.";
+  } else {
+    let idle = idle_seconds(this);
+    if (idle == null || idle < 60) {
+      line = this.name + " is awake and looks alert.";
+    } else {
+      let mins = floor(idle / 60);
+      let unit = " minute";
+      if (mins != 1) { unit = " minutes"; }
+      line = this.name + " is awake, but has been staring off into space for " + to_string(mins) + unit + ".";
+    }
+  }
+  let description = "";
+  if (typeof(base) == "map" && has(base, "description")) {
+    if (typeof(base["description"]) == "string") { description = base["description"]; }
+  }
+  if (description) { description = description + " " + line; }
+  else { description = line; }
+  base["description"] = description;
+  return base;
+}`;
+
 const ROOT_SET_DESCRIPTION_SOURCE = `verb :set_description(desc) rxd {
   if (typeof(desc) != "string") {
     raise { code: "E_TYPE", message: "set_description requires a string", value: desc };
@@ -363,6 +389,7 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, { directCallable: true, toolExposed: true });
   sourceVerb(world, "$actor", "look_self", ACTOR_LOOK_SELF_SOURCE, { directCallable: true });
+  sourceVerb(world, "$player", "look_self", PLAYER_LOOK_SELF_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, { directCallable: true, toolExposed: true, aliases: ["i@nventory", "inv"] });
   sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, { directCallable: true, toolExposed: true, aliases: ["@home"] });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });

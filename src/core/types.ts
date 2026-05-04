@@ -216,6 +216,11 @@ export type Session = {
   lastDetachAt: number | null;
   tokenClass: "guest" | "bearer" | "apikey";
   attachedSockets: Set<string>;
+  /** Wall-clock ms of the most recent meaningful input frame on this session.
+   * In-memory only — not persisted. Bumped on session create, socket attach,
+   * and WS/REST ingress for op: call | direct | input. Drives the LambdaMOO-
+   * shaped `idle_seconds` / `is_connected` builtins. */
+  lastInputAt: number;
 };
 
 export type CompileDiagnostic = {

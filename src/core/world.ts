@@ -36,6 +36,10 @@ const GUEST_SESSION_TTL_MS = 5 * 60_000;
 const CREDENTIAL_SESSION_GRACE_MS = 5 * 60_000;
 const CREDENTIAL_SESSION_TTL_MS = 24 * 60 * 60_000;
 const SUBSCRIBER_SCRUB_FLOOR_MS = 5_000;
+// "Connected" for non-WebSocket sessions (REST, MCP) means "received input
+// within this window". Past it, a stateless caller without a live socket
+// reads as "sleeping" — same as a WS user whose connection has dropped.
+const IDLE_PRESENCE_LIVE_WINDOW_MS = 5 * 60_000;
 
 type ResolvedVerb = {
   definer: ObjRef;
@@ -978,7 +982,8 @@ export class WooWorld {
       expiresAt: now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
-      attachedSockets: new Set()
+      attachedSockets: new Set(),
+      lastInputAt: now
     };
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
@@ -1009,7 +1014,8 @@ export class WooWorld {
       expiresAt: expiresAt ?? now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
-      attachedSockets: new Set()
+      attachedSockets: new Set(),
+      lastInputAt: now
     };
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
@@ -1041,10 +1047,54 @@ export class WooWorld {
     this.withPersistenceDeferred(() => {
       session.attachedSockets.add(socketId);
       session.lastDetachAt = null;
-      session.expiresAt = Math.max(session.expiresAt, Date.now() + this.sessionTtl(session.tokenClass));
+      const now = Date.now();
+      session.expiresAt = Math.max(session.expiresAt, now + this.sessionTtl(session.tokenClass));
+      session.lastInputAt = now;
       this.persistSession(session);
       this.persist();
     });
+  }
+
+  /** Mark a session as having received meaningful user input. Updates the
+   * in-memory `lastInputAt` only — does not persist. Called from authenticated
+   * WS / REST ingress for `op: call | direct | input` (and on socket attach,
+   * inline above). NOT called from `world.directCall` or `world.call`,
+   * because many of those callers are internal/test/system paths without a
+   * real user behind them; the gating happens at the protocol edge instead. */
+  touchSessionInput(sessionId: string, now: number = Date.now()): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.lastInputAt = now;
+  }
+
+  /** Most recent input timestamp across any of `actor`'s sessions, regardless
+   * of whether a WebSocket is currently attached. Returns null only when
+   * `actor` has no session at all. The socket-attached gate that used to
+   * live here erased non-WS transports — REST and MCP ingress is real input
+   * and the idle reading should reflect it. */
+  actorLastInputAt(actor: ObjRef): number | null {
+    let latest: number | null = null;
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor) continue;
+      if (latest === null || session.lastInputAt > latest) latest = session.lastInputAt;
+    }
+    return latest;
+  }
+
+  /** True iff `actor` has any session that is currently driving the world.
+   * "Currently driving" means either a WebSocket socket is attached, or the
+   * session received non-WS input within the live window. The window lets
+   * stateless transports (REST, MCP) register as connected while they are
+   * actively making calls without keeping a socket open; once input stops,
+   * they fall through to "sleeping" the same way a closed WS does. */
+  actorIsConnected(actor: ObjRef): boolean {
+    const liveCutoff = Date.now() - IDLE_PRESENCE_LIVE_WINDOW_MS;
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor) continue;
+      if (session.attachedSockets.size > 0) return true;
+      if (session.lastInputAt >= liveCutoff) return true;
+    }
+    return false;
   }
 
   detachSocket(sessionId: string, socketId: string): void {
@@ -3856,7 +3906,11 @@ export class WooWorld {
       expiresAt,
       lastDetachAt,
       tokenClass,
-      attachedSockets: new Set()
+      attachedSockets: new Set(),
+      // lastInputAt isn't persisted; on cold rehydrate, treat as just-active
+      // rather than restoring some old timestamp from `started`. Otherwise
+      // every freshly-rehydrated DO would show huge idle for everyone.
+      lastInputAt: now
     };
   }
 

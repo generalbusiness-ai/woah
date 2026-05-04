@@ -135,6 +135,9 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
     }
 
     if (request.method === "POST" && route.rest.length === 2 && route.rest[0] === "calls") {
+      // Authenticated input from a real client — count it for idle tracking.
+      // Replay/state/property reads above don't reach this branch.
+      world.touchSessionInput(session.id);
       const body = await request.readJson();
       const verb = route.rest[1];
       const args = Array.isArray(body.args) ? body.args as WooValue[] : [];

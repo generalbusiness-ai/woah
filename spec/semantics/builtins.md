@@ -145,6 +145,30 @@ presence primitive. It cannot set presence for another actor.
 `connected_players()`, `connection_name(player)`, `boot_player(player)`,  
 `notify(player, event)` — equivalent to `emit(player, event)`.
 
+`is_connected(actor)` returns `true` iff any session for `actor` is currently
+driving the world: either it has at least one attached WebSocket socket, or
+it received non-WS input within the live window (5 minutes). The dual
+signal lets stateless transports (REST, MCP) register as connected while
+they make tool calls without keeping a socket open. Past the window, a
+session with no attached socket falls through to "sleeping" — same as a
+WS user whose connection has dropped.
+
+`idle_seconds(actor)` returns the integer number of whole seconds since the
+most recent meaningful input frame from any of `actor`'s sessions, or
+`null` if the actor has no session at all. The reading is independent of
+socket attachment; a recently-active REST/MCP session reports a real idle
+even though no socket is open.
+
+"Meaningful input" is `op: call | direct | input` ingress at the WS, REST,
+or MCP boundary, plus session creation and socket attach. Ping, state
+projection, replay/catchup, and session resume do not reset idle.
+`lastInputAt` is in-memory only and cold-rehydrates as "just active." Both
+builtins read across multiple sessions for the same actor (a player on
+browser + agent), so `is_connected` is OR over sessions and `idle_seconds`
+is the most-recent input across them. The LambdaCore `$player:look_self`
+override uses these to surface `is sleeping` / `awake and looks alert` /
+`staring off into space for N minutes`.
+
 ### 19.8 Wizard-only
 
 `shutdown(reason)`, `dump_database()`, `load_database()`,  

@@ -1424,7 +1424,8 @@ describe("taskspace", () => {
       expiresAt: Date.now() + 60_000,
       lastDetachAt: null,
       tokenClass: "bearer",
-      attachedSockets: new Set()
+      attachedSockets: new Set(),
+      lastInputAt: Date.now()
     });
     const create = await callInTaskspace(world, assignee.id, "create", message(assignee.actor, "the_taskspace", "create_task", ["Wizard check", ""]));
     const task = create.op === "applied" ? (create.observations[0].task as string) : "";

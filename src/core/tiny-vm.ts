@@ -110,6 +110,7 @@ const BUILTIN_NAMES = [
   "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
   "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "random", "contents", "location", "task_perms",
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
+  "is_connected", "idle_seconds",
   "builder_create_object", "builder_chparent", "builder_recycle", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
@@ -871,6 +872,15 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const obj = frame.ctx.world.object(assertObj(builtinArgs[0]));
         const flag = assertString(builtinArgs[1]);
         return (obj.flags as Record<string, boolean | undefined>)[flag] === true;
+      }
+      case "is_connected": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_connected expects one actor");
+        return frame.ctx.world.actorIsConnected(assertObj(builtinArgs[0]));
+      }
+      case "idle_seconds": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "idle_seconds expects one actor");
+        const at = frame.ctx.world.actorLastInputAt(assertObj(builtinArgs[0]));
+        return at === null ? null : Math.max(0, Math.floor((Date.now() - at) / 1000));
       }
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");

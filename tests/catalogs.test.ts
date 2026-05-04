@@ -1616,6 +1616,93 @@ describe("local catalogs", () => {
     expect(world.getProp(guest.actor, "description")).toBe("");
   });
 
+  it("surfaces idle/connected presence via $player:look_self and the substrate readers", async () => {
+    const world = createWorld();
+    const guest = world.auth("guest:idle-a");
+    const actor = guest.actor;
+
+    // Fresh auth counts the session-create as input on the live window —
+    // even before any WS is attached, the actor is "connected" because they
+    // just authed. This matches REST/MCP-only flows that never attach a WS.
+    expect(world.actorIsConnected(actor)).toBe(true);
+    expect(world.actorLastInputAt(actor)).not.toBeNull();
+
+    // Attach a socket — adds the WS-attached signal but doesn't change the
+    // is-connected outcome (already true via the live window).
+    world.attachSocket(guest.id, "ws-idle-a");
+    expect(world.actorIsConnected(actor)).toBe(true);
+    expect(world.actorLastInputAt(actor)).not.toBeNull();
+
+    // :look on a fresh session — connected, idle ~0s → "awake and looks alert."
+    const alert = await world.directCall("idle-look-fresh", actor, actor, "look_self", []);
+    expect(alert.op).toBe("result");
+    if (alert.op === "result") {
+      expect((alert.result as Record<string, unknown>).description).toMatch(/is awake and looks alert/);
+    }
+
+    // Push lastInputAt back 65s and look again — should report "staring off."
+    const session = world.sessions.get(guest.id)!;
+    session.lastInputAt = Date.now() - 65_000;
+    const staring = await world.directCall("idle-look-staring", actor, actor, "look_self", []);
+    expect(staring.op).toBe("result");
+    if (staring.op === "result") {
+      expect((staring.result as Record<string, unknown>).description).toMatch(/staring off into space for 1 minute/);
+    }
+
+    // /api/state-equivalent reads MUST NOT reset idle. Simulating the projection:
+    void world.state(actor);
+    expect(world.actorLastInputAt(actor)).toBe(session.lastInputAt);
+
+    // A real call/direct frame DOES touch — exercise via a chat say.
+    await world.directCall("idle-bump-via-direct", actor, actor, "look_self", []);
+    // Direct call through the WS protocol layer would call touchSessionInput;
+    // simulate that ingress here so the in-memory state matches the wire.
+    world.touchSessionInput(guest.id);
+    expect(Date.now() - world.actorLastInputAt(actor)!).toBeLessThan(1_000);
+
+    // Multi-session for one actor: detached + active. Idle reflects the active.
+    const secondSession = world.createSessionForActor(actor, "guest");
+    world.attachSocket(secondSession.id, "ws-idle-a-2");
+    secondSession.lastInputAt = Date.now() - 5_000; // active session is 5s idle
+    session.lastInputAt = Date.now() - 600_000; // first session is 10min stale
+    world.detachSocket(session.id, "ws-idle-a"); // first session has no live socket
+    expect(world.actorIsConnected(actor)).toBe(true); // second session is still attached
+    const idleAcrossSessions = (Date.now() - world.actorLastInputAt(actor)!) / 1_000;
+    expect(idleAcrossSessions).toBeLessThan(60); // takes the most-recent input
+
+    // Detach all sockets — but the second session just had recent input, so the
+    // dual-signal predicate keeps the actor "connected" until the live window
+    // closes. This is the path REST/MCP-only callers ride, and a freshly-
+    // detached WS user gets the same brief grace.
+    world.detachSocket(secondSession.id, "ws-idle-a-2");
+    expect(world.actorIsConnected(actor)).toBe(true);
+
+    // Push every session's lastInputAt past the 5-minute live window — now
+    // there's no socket and no recent input on any transport, so the actor
+    // reads as sleeping.
+    for (const s of world.sessions.values()) {
+      if (s.actor === actor) s.lastInputAt = Date.now() - 6 * 60_000;
+    }
+    expect(world.actorIsConnected(actor)).toBe(false);
+    const sleeping = await world.directCall("idle-look-sleeping", actor, actor, "look_self", []);
+    expect(sleeping.op).toBe("result");
+    if (sleeping.op === "result") {
+      expect((sleeping.result as Record<string, unknown>).description).toMatch(/is sleeping/);
+    }
+
+    // REST/MCP-only path: a session that never attaches a WS, but has a fresh
+    // touch from non-WS ingress, must still read as connected and alert.
+    const restGuest = world.auth("guest:idle-rest");
+    expect(restGuest.attachedSockets.size).toBe(0);
+    world.touchSessionInput(restGuest.id);
+    expect(world.actorIsConnected(restGuest.actor)).toBe(true);
+    const restAlert = await world.directCall("idle-rest-alert", restGuest.actor, restGuest.actor, "look_self", []);
+    expect(restAlert.op).toBe("result");
+    if (restAlert.op === "result") {
+      expect((restAlert.result as Record<string, unknown>).description).toMatch(/is awake and looks alert/);
+    }
+  });
+
   it("repairs stale chat room seed metadata and missing room contents", () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", [
