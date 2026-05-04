@@ -2160,7 +2160,12 @@ function renderChatLine(line: ChatLine) {
     return `<div class="chat-line told"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.from))} -> ${escapeHtml(actorLabel(line.to))}</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
   }
   if (line.kind === "huh") {
-    return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>I don't understand "${escapeHtml(line.text ?? "")}".</span></div>`;
+    // Prefer the planner's reason ("You don't have 'hmmm'.") when set —
+    // otherwise the user just sees a generic "I don't understand 'X'."
+    // even though the substrate told us why specifically. The reason
+    // field is already populated upstream from the huh observation.
+    const detail = typeof line.reason === "string" && line.reason ? line.reason : `I don't understand "${line.text ?? ""}".`;
+    return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(detail)}</span></div>`;
   }
   if (line.kind === "error") {
     return `<div class="chat-line error"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "That didn't work.")}</span></div>`;
