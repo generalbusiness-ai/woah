@@ -29,6 +29,11 @@ type AppState = {
   compileResult?: any;
 };
 
+type RouteLocation = {
+  objectId: string;
+  view?: string;
+};
+
 type ChatLine = {
   kind: "text" | "said" | "said_to" | "said_as" | "emoted" | "posed" | "quoted" | "self_pointed" | "told" | "entered" | "left" | "looked" | "who" | "blocked_exit" | "taken" | "dropped" | "huh" | "dubspace_activity" | "dubspace_entered" | "dubspace_left" | "pinboard_activity" | "pinboard_entered" | "pinboard_left" | "system" | "error";
   actor?: string;
@@ -142,6 +147,15 @@ const PINBOARD_VIEWPORT_MIN_MS = 110;
 const PINBOARD_MAP_DEFAULT_ASPECT = 0.42;
 const SPACE_CHAT_MIN_HEIGHT = 96;
 const SPACE_CHAT_MAX_VIEWPORT_RATIO = 0.35;
+const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
+  chat: "chat",
+  dubspace: "dubspace",
+  pinboard: "pinboard",
+  taskspace: "taskspace",
+  ide: "ide",
+  editor: "ide",
+  kanban: "taskspace"
+};
 let reconnectDelayMs = reconnectBaseDelayMs;
 let reconnectTimer: number | undefined;
 let heartbeatTimer: number | undefined;
@@ -157,6 +171,8 @@ let pinboardTextHydrationRequested = false;
 let chatHistory = loadChatHistory();
 let chatHistoryCursor = chatHistory.length;
 let chatHistoryDraft = "";
+let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, location.search);
+let routeInitialized = false;
 state.spaceChatHeights = loadSpaceChatHeights();
 
 connect();
@@ -165,6 +181,9 @@ window.addEventListener("resize", () => {
   normalizeSpaceChatHeights();
   schedulePinboardViewportPublish();
   window.requestAnimationFrame(updatePinboardMapViewports);
+});
+window.addEventListener("popstate", () => {
+  applyLocationRoute("replace");
 });
 
 function connect() {
@@ -359,6 +378,170 @@ function writeStorage(key: string, value: string) {
   }
 }
 
+function parseLocationRoute(pathname: string, search: string): RouteLocation | null {
+  if (!pathname.startsWith("/objects/")) return null;
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.length < 2 || parts[0] !== "objects") return null;
+  const rawObject = parts[1] ?? "";
+  if (!rawObject) return null;
+  try {
+    const objectId = decodeURIComponent(rawObject);
+    const searchParams = new URLSearchParams(search);
+    const view = searchParams.get("view") ?? undefined;
+    return { objectId: String(objectId), view: view && view.trim() ? view.trim() : undefined };
+  } catch {
+    return null;
+  }
+}
+
+function tabFromViewHint(view?: string): AppState["tab"] | undefined {
+  if (!view) return undefined;
+  return TAB_FROM_VIEW[view.trim().toLowerCase()];
+}
+
+function objectIdForTab(tab: AppState["tab"]): string {
+  if (tab === "chat") return chatRoom();
+  if (tab === "dubspace") return dubspaceSpace();
+  if (tab === "pinboard") return pinboardSpace();
+  if (tab === "taskspace") return state.selectedTask && state.world?.taskspace?.tasks?.[state.selectedTask] ? state.selectedTask : taskspaceSpace();
+  if (tab === "ide") return state.selectedObject || defaultSelectedObject();
+  return "";
+}
+
+function canonicalRouteForCurrentState(tab: AppState["tab"] = state.tab): RouteLocation | null {
+  const objectId = objectIdForTab(tab);
+  if (!objectId) return null;
+  return { objectId };
+}
+
+function canonicalRoutePath(route: RouteLocation): string {
+  // Keep canonical-readable corenames (e.g. `$wiz`) in the URL for readability.
+  // For non-corenames, keep percent-encoding behavior for path safety.
+  const objectPathPart = /^\$[A-Za-z0-9_]+$/.test(route.objectId)
+    ? route.objectId
+    : encodeURIComponent(route.objectId);
+
+  // Canonical routing prefers inferred tabs from object identity over the
+  // transient `view=` hint in the URL.
+  return `/objects/${objectPathPart}`;
+}
+
+function syncUrlFromCurrentState(mode: "replace" | "push" = "replace") {
+  const route = canonicalRouteForCurrentState();
+  if (!route) return;
+  const next = canonicalRoutePath(route);
+  const current = `${location.pathname}${location.search}`;
+  if (current === next) {
+    if (mode === "replace") {
+      history.replaceState({}, "", current);
+    }
+    return;
+  }
+  if (mode === "replace") history.replaceState({}, "", next);
+  else history.pushState({}, "", next);
+}
+
+function routeForObjectId(objectId: string): AppState["tab"] {
+  if (objectId === chatRoom()) return "chat";
+  if (objectId === dubspaceSpace()) return "dubspace";
+  if (objectId === pinboardSpace()) return "pinboard";
+  if (state.world?.taskspace?.tasks?.[objectId]) return "taskspace";
+  if (state.world?.objects?.[objectId]) return "ide";
+  return "chat";
+}
+
+function applyLocationRoute(mode: "replace" | "push", route: RouteLocation | null = parseLocationRoute(location.pathname, location.search)) {
+  if (!route || !route.objectId) {
+    syncUrlFromCurrentState(mode);
+    return;
+  }
+  const ensureTabPresence = (tab: AppState["tab"]) => {
+    if (tab === "dubspace") enterDubspace();
+    if (tab === "pinboard") enterPinboard();
+  };
+  const viewTab = tabFromViewHint(route.view);
+  if (viewTab) {
+    if (viewTab === "taskspace" && state.world?.taskspace?.tasks?.[route.objectId]) setSelectedTask(route.objectId, { apply: false });
+    if (viewTab === "ide" && state.world?.objects?.[route.objectId]) setSelectedObject(route.objectId, { apply: false });
+    if (viewTab === "taskspace" && !state.world?.taskspace?.tasks?.[route.objectId]) setSelectedTask(firstMatchingTask(
+      Array.isArray(state.world?.taskspace?.root_tasks) ? state.world.taskspace.root_tasks : [],
+      state.world?.taskspace?.tasks ?? {},
+      activeTaskStatuses()
+    ), { apply: false });
+    setTab(viewTab, { mode, leaveCurrent: true }, () => {
+      ensureTabPresence(viewTab);
+    });
+    return;
+  }
+
+  const inferredTab = routeForObjectId(route.objectId);
+  if (inferredTab === "taskspace" && state.world?.taskspace?.tasks?.[route.objectId]) {
+    setSelectedTask(route.objectId, { apply: false });
+    setTab(inferredTab, { mode, leaveCurrent: true }, () => {
+      ensureTabPresence(inferredTab);
+    });
+    return;
+  }
+  if (inferredTab === "ide" && state.world?.objects?.[route.objectId]) {
+    setSelectedObject(route.objectId, { apply: false });
+    setTab(inferredTab, { mode, leaveCurrent: true }, () => {
+      ensureTabPresence(inferredTab);
+    });
+    return;
+  }
+  setTab(inferredTab, { mode, leaveCurrent: true }, () => {
+    ensureTabPresence(inferredTab);
+  });
+}
+
+function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leaveCurrent?: boolean } = {}, done?: () => void) {
+  const mode = options.mode ?? "push";
+  const leaveCurrent = options.leaveCurrent ?? true;
+  const current = state.tab;
+  const finalize = () => {
+    if (state.tab !== tab) state.tab = tab;
+    syncUrlFromCurrentState(mode);
+    if (typeof done === "function") done();
+    render();
+  };
+  if (current === tab) {
+    syncUrlFromCurrentState(mode);
+    if (typeof done === "function") done();
+    render();
+    return;
+  }
+  if (!leaveCurrent) {
+    finalize();
+    return;
+  }
+  if (current === "dubspace" && tab !== "dubspace") {
+    leaveDubspace(finalize);
+    return;
+  }
+  if (current === "pinboard" && tab !== "pinboard") {
+    leavePinboard(finalize);
+    return;
+  }
+  finalize();
+}
+
+function setSelectedTask(id: string | undefined, options: { apply?: boolean } = {}) {
+  if (typeof id !== "string" || !id) {
+    if (options.apply !== false) syncTaskSelection();
+    return;
+  }
+  state.selectedTask = id;
+  if (options.apply !== false) syncTaskSelection();
+}
+
+function setSelectedObject(id: string, options: { apply?: boolean } = {}) {
+  state.selectedObject = id;
+  if (options.apply !== false) {
+    syncUrlFromCurrentState("replace");
+    render();
+  }
+}
+
 async function refresh() {
   refreshDebounceTimer = null;
   refreshDebouncePending = false;
@@ -369,6 +552,17 @@ async function refresh() {
   state.clockOffset = Number(state.world.server_time ?? Date.now()) - Date.now();
   state.chatPresent = Array.isArray(state.world?.chat?.present) ? state.world.chat.present : state.chatPresent;
   syncTaskSelection();
+  if (!routeInitialized) {
+    routeInitialized = true;
+    if (startupRoute) {
+      applyLocationRoute("replace", startupRoute);
+      startupRoute = null;
+    } else {
+      syncUrlFromCurrentState("replace");
+    }
+  } else {
+    syncUrlFromCurrentState("replace");
+  }
   audio?.sync(effectiveDubspace(), state.clockOffset);
   hydratePinboardNotesTextIfNeeded(state.world?.pinboard);
   render();
@@ -761,12 +955,10 @@ function receiveLiveEvent(observation: any) {
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
     if (String(observation?.actor ?? "") === state.actor) {
       if (observation?.type === "pinboard_entered" && state.tab !== "pinboard") {
-        state.tab = "pinboard";
-        render();
+        setTab("pinboard", { mode: "push", leaveCurrent: false });
       } else if (observation?.type === "pinboard_left" && state.tab === "pinboard") {
         clearPinboardViewports();
-        state.tab = "chat";
-        render();
+        setTab("chat", { mode: "push", leaveCurrent: false });
       }
     }
     scheduleRefresh();
@@ -778,14 +970,12 @@ function receiveLiveEvent(observation: any) {
       if (observation?.type === "dubspace_entered") {
         addDubspaceOperator(state.actor);
         if (state.tab !== "dubspace") {
-          state.tab = "dubspace";
-          render();
+          setTab("dubspace", { mode: "push", leaveCurrent: false });
         }
       } else if (observation?.type === "dubspace_left") {
         removeDubspaceOperator(state.actor);
         if (state.tab === "dubspace") {
-          state.tab = "chat";
-          render();
+          setTab("chat", { mode: "push", leaveCurrent: false });
         }
       }
     }
@@ -1019,12 +1209,12 @@ function bindCommon() {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       const next = button.dataset.tab as AppState["tab"];
-      if (state.tab === "dubspace" && next !== "dubspace") leaveDubspace();
-      if (state.tab === "pinboard" && next !== "pinboard") leavePinboard();
-      state.tab = next;
-      render();
-      if (next === "dubspace") enterDubspace();
-      if (next === "pinboard") enterPinboard();
+      const wasDifferent = state.tab !== next;
+      setTab(next, { mode: "push" }, () => {
+        if (!wasDifferent) return;
+        if (next === "dubspace") enterDubspace();
+        if (next === "pinboard") enterPinboard();
+      });
     });
   });
   document.querySelector<HTMLButtonElement>("[data-observations-toggle]")?.addEventListener("click", () => {
@@ -1667,7 +1857,11 @@ function chatSystemText(observation: any): string | undefined {
 }
 
 function chatObservationSource(observation: any): string | undefined {
-  for (const key of ["source", "room", "board", "space"]) {
+  // Prefer fields that name the room/space the observation belongs in (for the
+  // chat panel filter). `source` is the emitter (e.g. the cockatoo), which
+  // isn't always a $space — falling back to it would filter out cockatoo_* and
+  // similar object-emitted observations from the chat feed.
+  for (const key of ["room", "space", "board", "source"]) {
     const value = observation?.[key];
     if (typeof value === "string" && value) return value;
   }
@@ -1792,6 +1986,7 @@ function setCurrentChatRoom(room: string) {
     state.world.chat = projectChat(state.world, state.world.chatMeta);
   }
   if (state.actor && !state.chatPresent.includes(state.actor)) state.chatPresent = [...state.chatPresent, state.actor];
+  syncUrlFromCurrentState("replace");
 }
 
 function renderChat() {
@@ -1977,17 +2172,23 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
   const target = String(plan?.target ?? "");
   if (verb === "enter" && target === dubspaceSpace()) {
     setDubspaceOperators(result);
-    state.tab = "dubspace";
+    setTab("dubspace", { mode: "push", leaveCurrent: false });
     void refresh().then(() => focusSpaceChatInput(target));
-    render();
     focusSpaceChatInput(target);
+    return;
+  }
+  if ((verb === "leave" || verb === "out") && target === pinboardSpace()) {
+    setPinboardPresent(result);
+    clearPinboardViewports();
+    setTab("chat", { mode: "push", leaveCurrent: false });
+    void refresh();
+    focusChatInput();
     return;
   }
   if (verb === "enter" && target === pinboardSpace()) {
     setPinboardPresent(result);
-    state.tab = "pinboard";
+    setTab("pinboard", { mode: "push", leaveCurrent: false });
     void refresh().then(() => focusSpaceChatInput(target));
-    render();
     focusSpaceChatInput(target);
     return;
   }
@@ -2339,8 +2540,7 @@ function bindPinboard() {
   document.querySelector<HTMLButtonElement>("[data-pinboard-enter]")?.addEventListener("click", enterPinboard);
   document.querySelector<HTMLButtonElement>("[data-pinboard-leave]")?.addEventListener("click", () => {
     leavePinboard(() => {
-      state.tab = "chat";
-      render();
+      setTab("chat", { mode: "push", leaveCurrent: false });
     });
   });
   document.querySelector<HTMLFormElement>("[data-pinboard-create]")?.addEventListener("submit", (event) => {
@@ -3182,9 +3382,10 @@ function bindTaskspace() {
   });
   document.querySelectorAll<HTMLButtonElement>("[data-select-task]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.selectedTask = button.dataset.selectTask!;
-      state.taskExpanded[state.selectedTask] = state.taskExpanded[state.selectedTask] ?? true;
-      render();
+      const id = button.dataset.selectTask!;
+      setSelectedTask(id, { apply: false });
+      state.taskExpanded[id] = state.taskExpanded[id] ?? true;
+      setTab("taskspace", { mode: "push", leaveCurrent: false });
     });
   });
   const id = state.selectedTask;
@@ -3265,8 +3466,7 @@ function renderIde() {
 
 function bindIde() {
   document.querySelector<HTMLSelectElement>("[data-object-select]")?.addEventListener("change", (event) => {
-    state.selectedObject = (event.target as HTMLSelectElement).value;
-    render();
+    setSelectedObject((event.target as HTMLSelectElement).value);
   });
   document.querySelector<HTMLButtonElement>("[data-compile]")?.addEventListener("click", async () => {
     const source = document.querySelector<HTMLTextAreaElement>("[data-source]")!.value;

@@ -79,7 +79,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd { let state = this.mood; if (this.gagged) { state = \"gagged\"; } observe({ type: \"cockatoo_seen\", source: this, actor: actor, mood: state, ts: now() }); return { description: this.description, mood: state, phrase_count: length(this.phrases) }; }"
+          "source": "verb :look() rxd { let state = this.mood; if (this.gagged) { state = \"gagged\"; } observe({ type: \"cockatoo_seen\", source: this, room: location(this), actor: actor, mood: state, ts: now() }); return { description: this.description, mood: state, phrase_count: length(this.phrases) }; }"
         },
         {
           "name": "squawk",
@@ -92,7 +92,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :squawk() rxd { if (this.gagged) { observe({ type: \"cockatoo_muffled\", source: this, actor: actor, ts: now() }); return \"*muffled noises*\"; } let phrases = this.phrases; if (length(phrases) == 0) { return \"\"; } let phrase = phrases[random(length(phrases)) + 1]; observe({ type: \"cockatoo_squawk\", source: this, actor: actor, text: phrase, ts: now() }); return phrase; }"
+          "source": "verb :squawk() rxd { let here = location(this); if (this.gagged) { observe({ type: \"cockatoo_muffled\", source: this, room: here, actor: actor, ts: now() }); return \"*muffled noises*\"; } let phrases = this.phrases; if (length(phrases) == 0) { return \"\"; } let phrase = phrases[random(length(phrases)) + 1]; observe({ type: \"cockatoo_squawk\", source: this, room: here, actor: actor, text: phrase, ts: now() }); return phrase; }"
         },
         {
           "name": "teach",
@@ -103,7 +103,7 @@
               "phrase"
             ]
           },
-          "source": "verb :teach(phrase) rx { if (typeof(phrase) != \"string\") { raise { code: \"E_TYPE\", message: \"teach requires a string phrase\", value: phrase }; } if (!phrase) { raise { code: \"E_INVARG\", message: \"teach requires a non-empty phrase\" }; } this.phrases = this.phrases + [phrase]; observe({ type: \"cockatoo_taught\", source: this, actor: actor, phrase: phrase, ts: now() }); return length(this.phrases); }"
+          "source": "verb :teach(phrase) rx { if (typeof(phrase) != \"string\") { raise { code: \"E_TYPE\", message: \"teach requires a string phrase\", value: phrase }; } if (!phrase) { raise { code: \"E_INVARG\", message: \"teach requires a non-empty phrase\" }; } this.phrases = this.phrases + [phrase]; observe({ type: \"cockatoo_taught\", source: this, room: location(this), actor: actor, phrase: phrase, ts: now() }); return length(this.phrases); }"
         },
         {
           "name": "pluck",
@@ -113,7 +113,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :pluck() rxd { observe({ type: \"cockatoo_pluck\", source: this, actor: actor, text: \"*EEEEEEK!*\", ts: now() }); return true; }"
+          "source": "verb :pluck() rxd { observe({ type: \"cockatoo_pluck\", source: this, room: location(this), actor: actor, text: \"*EEEEEEK!*\", ts: now() }); return true; }"
         },
         {
           "name": "shake",
@@ -123,7 +123,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :shake() rxd { let reactions = this.shake_reactions; if (length(reactions) == 0) { return \"\"; } let reaction = reactions[random(length(reactions)) + 1]; observe({ type: \"cockatoo_shake\", source: this, actor: actor, reaction: reaction, ts: now() }); return reaction; }"
+          "source": "verb :shake() rxd { let reactions = this.shake_reactions; if (length(reactions) == 0) { return \"\"; } let reaction = reactions[random(length(reactions)) + 1]; observe({ type: \"cockatoo_shake\", source: this, room: location(this), actor: actor, reaction: reaction, ts: now() }); return reaction; }"
         },
         {
           "name": "feed",
@@ -135,7 +135,7 @@
               "food?"
             ]
           },
-          "source": "verb :feed(food) rxd { let snack = food; if (!snack) { snack = \"birdseed\"; } observe({ type: \"cockatoo_fed\", source: this, actor: actor, food: snack, ts: now() }); return snack; }"
+          "source": "verb :feed(food) rxd { let snack = food; if (!snack) { snack = \"birdseed\"; } observe({ type: \"cockatoo_fed\", source: this, room: location(this), actor: actor, food: snack, ts: now() }); return snack; }"
         },
         {
           "name": "gag",
@@ -144,7 +144,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :gag() rx { this.gagged = true; observe({ type: \"cockatoo_gagged\", source: this, actor: actor, ts: now() }); return true; }"
+          "source": "verb :gag() rx { this.gagged = true; observe({ type: \"cockatoo_gagged\", source: this, room: location(this), actor: actor, ts: now() }); return true; }"
         },
         {
           "name": "ungag",
@@ -153,7 +153,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :ungag() rx { this.gagged = false; observe({ type: \"cockatoo_ungagged\", source: this, actor: actor, ts: now() }); return true; }"
+          "source": "verb :ungag() rx { this.gagged = false; observe({ type: \"cockatoo_ungagged\", source: this, room: location(this), actor: actor, ts: now() }); return true; }"
         }
       ]
     }
