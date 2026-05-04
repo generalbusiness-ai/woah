@@ -23,6 +23,7 @@ type AppState = {
   selectedTask?: string;
   taskExpanded: Record<string, boolean>;
   taskStatusFilter: Record<string, boolean>;
+  pinboardNewText: string;
   pinboardNewColor: string;
   pinboardView: PinboardView;
   pinboardViewports: Record<string, PinboardViewportPresence>;
@@ -103,6 +104,7 @@ const state: AppState = {
   selectedObject: "",
   taskExpanded: {},
   taskStatusFilter: { open: true, claimed: true, in_progress: true, blocked: true, done: false },
+  pinboardNewText: "",
   pinboardNewColor: "",
   pinboardView: { x: 0, y: 0, scale: 1 },
   pinboardViewports: {}
@@ -2444,7 +2446,7 @@ function renderPinboardCreate(palette: string[]) {
   const selected = normalizePinboardStickyColor(state.pinboardNewColor, palette);
   return `
     <form class="panel pinboard-create" data-pinboard-create>
-      <textarea data-pinboard-new-text placeholder="New note"></textarea>
+      <textarea data-pinboard-new-text placeholder="New note">${escapeHtml(state.pinboardNewText)}</textarea>
       <select data-pinboard-new-color>${pinboardPalette(palette).map((color) => `<option value="${escapeHtml(color)}" ${color === selected ? "selected" : ""}>${escapeHtml(color)}</option>`).join("")}</select>
       <button>Add Note</button>
     </form>
@@ -2551,16 +2553,20 @@ function bindPinboard() {
     try {
       const textInput = document.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]");
       const colorInput = document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]");
-      const text = textInput?.value.trim() ?? "";
+      const text = (textInput?.value ?? state.pinboardNewText).trim();
       if (!text) return;
       const placement = newPinNotePlacement();
       const color = normalizePinboardStickyColor(colorInput?.value, state.world?.pinboard?.palette);
       rememberPinboardNewColor(color);
       pinboardCall("add_note", [text, color, placement.x, placement.y, placement.w, placement.h]);
+      state.pinboardNewText = "";
       if (textInput) textInput.value = "";
     } catch (err) {
       console.error("pinboard add_note failed", err);
     }
+  });
+  document.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]")?.addEventListener("input", (event) => {
+    state.pinboardNewText = (event.currentTarget as HTMLTextAreaElement).value;
   });
   document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]")?.addEventListener("change", (event) => {
     rememberPinboardNewColor((event.currentTarget as HTMLSelectElement).value);
@@ -3132,7 +3138,7 @@ function refreshPinboardNotes() {
   direct(board, "list_notes", [], (result) => {
     pinboardNotesRefreshPending = false;
     if (!Array.isArray(result) || !state.world?.pinboard) return;
-    state.world.pinboard.notes = normalizePinboardNotes(result);
+    state.world.pinboard.notes = normalizePinboardNotes(result, state.world.pinboard.notes);
     if (state.tab === "pinboard") render();
   }, () => {
     pinboardNotesRefreshPending = false;
