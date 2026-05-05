@@ -66,7 +66,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | Verb | Args | Purpose |
 |---|---|---|
 | `:say(text)` | str | Public utterance. Emits `said {actor, text}` to the room audience (live; not stored). |
-| `:say_to(recipient, text)` | obj, str | Directed public utterance from backtick syntax (`` `recipient text ``). For player recipients, emits `said_to` to the room (directed but in-room speech). For non-player recipients that define `:on_say_to(text)`, dispatches to `recipient:on_say_to(text)` so the object can interpret the utterance as a command (e.g. `` `filter 500 `` calls `filter_1:on_say_to("500")`). The hook name is distinct from `$player:tell` so the LambdaMOO output contract on players is not overloaded. |
+| `:say_to(recipient, text)` | obj, str | Directed public utterance from backtick syntax (`` `recipient text ``). For player recipients, emits `said_to` to the room audience except the recipient, and a targeted `text` observation whose body is `<speaker name> [to you] <text>`. If the recipient is the speaker, no targeted text is emitted and the public `said_to` remains visible to the speaker. For non-player recipients that define `:on_say_to(text)`, dispatches to `recipient:on_say_to(text)` so the object can interpret the utterance as a command (e.g. `` `filter 500 `` calls `filter_1:on_say_to("500")`). The hook name is distinct from `$player:tell` so the LambdaMOO output contract on players is not overloaded. |
 | `:say_as(style, text)` | str, str | Styled public utterance from `[style] text`. Emits `said_as`. |
 | `:emote(text)` | str | Third-person action. Emits `emoted {actor, text}`. |
 | `:pose(text)` / `:quote(text)` / `:self(text)` | str | Small LambdaCore-flavored speech forms for `]`, `|`, and `<`. |
@@ -145,7 +145,7 @@ Inside each verb body: `this` = the consumer space (the room being talked in), `
 
 ```woo
 declare_event $conversational "said"    { source: obj, actor: obj, text: str };
-declare_event $conversational "said_to" { source: obj, actor: obj, to: obj, text: str };
+declare_event $conversational "said_to" { source: obj, actor: obj, to: obj, text: str, _audience_override?: list<obj> };
 declare_event $conversational "said_as" { source: obj, actor: obj, style: str, text: str };
 declare_event $conversational "emoted"  { source: obj, actor: obj, text: str };
 declare_event $conversational "posed"   { source: obj, actor: obj, text: str };

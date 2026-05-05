@@ -1576,6 +1576,48 @@ describe("local catalogs", () => {
     expect(world.hasPresence(giver.actor, "the_deck")).toBe(false);
   });
 
+  it("renders directed public speech in woocode with recipient-specific text", async () => {
+    const world = createWorld();
+    const speaker = world.auth("guest:directed-speaker");
+    const recipient = world.auth("guest:directed-recipient");
+    const bystander = world.auth("guest:directed-bystander");
+
+    await world.directCall("directed-speaker-enter", speaker.actor, "the_chatroom", "enter", []);
+    await world.directCall("directed-recipient-enter", recipient.actor, "the_chatroom", "enter", []);
+    await world.directCall("directed-bystander-enter", bystander.actor, "the_chatroom", "enter", []);
+
+    const said = await world.directCall("directed-say-to", speaker.actor, "the_chatroom", "say_to", [recipient.actor, "hi!"]);
+    expect(said.op).toBe("result");
+    if (said.op === "result") {
+      const publicIndex = said.observations.findIndex((obs) => obs.type === "said_to");
+      const recipientIndex = said.observations.findIndex((obs) => obs.type === "text" && obs.target === recipient.actor);
+      expect(said.observations[publicIndex]).toMatchObject({ type: "said_to", actor: speaker.actor, to: recipient.actor, text: "hi!" });
+      expect(said.observations[recipientIndex]).toMatchObject({
+        type: "text",
+        target: recipient.actor,
+        text: `${world.object(speaker.actor).name} [to you] hi!`
+      });
+      expect(said.observationAudiences?.[publicIndex]).toEqual(expect.arrayContaining([speaker.actor, bystander.actor]));
+      expect(said.observationAudiences?.[publicIndex]).not.toContain(recipient.actor);
+      expect(said.observationAudiences?.[recipientIndex]).toEqual([recipient.actor]);
+    }
+
+    const selfSaid = await world.directCall("directed-say-self", speaker.actor, "the_chatroom", "say_to", [speaker.actor, "self-check"]);
+    expect(selfSaid.op).toBe("result");
+    if (selfSaid.op === "result") {
+      const publicIndex = selfSaid.observations.findIndex((obs) => obs.type === "said_to");
+      const targetedText = selfSaid.observations.find((obs) => obs.type === "text" && obs.target === speaker.actor);
+      expect(selfSaid.observations[publicIndex]).toMatchObject({
+        type: "said_to",
+        actor: speaker.actor,
+        to: speaker.actor,
+        text: "self-check"
+      });
+      expect(targetedText).toBeUndefined();
+      expect(selfSaid.observationAudiences?.[publicIndex]).toContain(speaker.actor);
+    }
+  });
+
   it("dispatches @describe through $root:set_description with self/owner/wizard perms", async () => {
     const world = createWorld();
     const guest = world.auth("guest:describe-self");
