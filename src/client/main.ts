@@ -1,4 +1,5 @@
 import "./styles.css";
+import { createWooClientFramework, liveProjectionKey, type ProjectionPatch } from "./framework";
 
 type AppState = {
   socket?: WebSocket;
@@ -8,7 +9,6 @@ type AppState = {
   world?: any;
   audioOn: boolean;
   clockOffset: number;
-  liveControls: Record<string, { value: any; actor: string; at: number }>;
   cueSlots: Record<string, boolean>;
   cuePlaying: Record<string, boolean>;
   cueControls: Record<string, any>;
@@ -90,7 +90,6 @@ const state: AppState = {
   tab: "chat",
   audioOn: false,
   clockOffset: 0,
-  liveControls: {},
   cueSlots: {},
   cuePlaying: {},
   cueControls: {},
@@ -111,6 +110,7 @@ const state: AppState = {
 };
 
 let audio: DubAudio | undefined;
+const ui = createWooClientFramework();
 const sessionKey = "woo.session";
 const chatHistoryKey = "woo.chat.history";
 const pinboardNewColorKey = "woo.pinboard.newColor";
@@ -167,15 +167,6 @@ let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
 let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
 const pinNoteClientZ = new Map<string, number>();
-// Optimistic position/size cache for pins the user just moved or resized.
-// Renders prefer these values over the server's note record until a
-// pin_moved / pin_resized observation arrives confirming the new value.
-// Without this, a stray render between pointerup and the server's applied
-// frame snaps the note back to its old position briefly before re-moving.
-// Each entry has a wall-clock fallback expiry so a dropped frame doesn't
-// pin the cache forever.
-type PinboardOptimisticPatch = { x?: number; y?: number; w?: number; h?: number; expiresAt: number };
-const pendingPinPatches = new Map<string, PinboardOptimisticPatch>();
 const PINBOARD_OPTIMISTIC_TTL_MS = 5_000;
 let pinboardTextHydrationRequestedBoard = "";
 let pinboardTextHydrationRequestedSignature = "";
@@ -235,6 +226,7 @@ function connect() {
     }
     if (frame.op === "applied") {
       if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
+      ui.ingestAppliedFrame(frame);
       const observations = frame.observations ?? [];
       const pinboardAnimations = capturePinboardAnimations(observations);
       const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
@@ -262,11 +254,16 @@ function connect() {
       animatePinboardNotes(pinboardAnimations);
     }
     if (frame.op === "event") {
+      ui.ingestLiveObservation(frame.observation);
       receiveLiveEvent(frame.observation);
     }
     if (frame.op === "result") {
       const handler = pendingDirect.get(frame.id);
       if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
+      for (const observation of frame.observations ?? []) {
+        ui.ingestLiveObservation(observation);
+        receiveLiveEvent(observation);
+      }
       if (handler) {
         pendingDirect.delete(frame.id);
         handler(frame.result);
@@ -603,6 +600,7 @@ async function refresh() {
   if (!response.ok) return;
   const previousChatRoom = lastObservedChatRoom;
   state.world = adaptWorld(await response.json());
+  ui.ingestWorld(state.world);
   const currentChatRoom = chatRoom();
   if (previousChatRoom && previousChatRoom !== currentChatRoom) {
     // Mark the bottom of the room the actor just left, so when they return
@@ -805,7 +803,7 @@ function hydratePinboardNotesTextIfNeeded(pinboard: any) {
   const boardId = typeof board?.id === "string" ? board.id : "";
   const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
   if (!canSendDirect()) return;
-  if (!state.actor || !Array.isArray(pinboard?.present) || !pinboard.present.includes(state.actor)) return;
+  if (!pinboardActorPresent()) return;
   if (!pinboardNotesHaveMissingText(notes)) return;
   if (!boardId) return;
   const signature = pinboardNotesSignature(notes);
@@ -949,14 +947,10 @@ function effectiveDubspace() {
       }
     ])
   );
-  const now = Date.now();
-  for (const [key, item] of Object.entries(state.liveControls)) {
-    if (now - item.at > 1600) {
-      delete state.liveControls[key];
-      continue;
-    }
-    const [target, name] = key.split(":");
-    if (copy[target]) copy[target].props[name] = item.value;
+  ui.prune();
+  for (const id of Object.keys(copy)) {
+    const projected = ui.observe(id);
+    if (projected) copy[id].props = { ...copy[id].props, ...projected.props };
   }
   for (const [slot, cue] of Object.entries(state.cueSlots)) {
     if (cue && copy[slot]) copy[slot].props.playing = state.cuePlaying[slot] === true;
@@ -970,7 +964,7 @@ function effectiveDubspace() {
 
 function sendPreviewControl(target: string, name: string, value: any) {
   const key = liveKey(target, name);
-  state.liveControls[key] = { value, actor: state.actor ?? "", at: Date.now() };
+  ui.projection.applyLive(liveProjectionKey("gesture_progress", target, `prop.${name}`), [{ subject: target, props: { [name]: value } }]);
   audio?.sync(effectiveDubspace(), state.clockOffset);
   const last = directThrottle.get(key) ?? 0;
   if (Date.now() - last < 35) return;
@@ -1077,8 +1071,6 @@ function trimObservations() {
 }
 
 function receiveLiveControl(observation: any) {
-  const key = liveKey(observation.target, observation.name);
-  state.liveControls[key] = { value: observation.value, actor: observation.actor, at: Date.now() };
   const input = findControlInput(String(observation.target), String(observation.name));
   if (input && document.activeElement !== input) setControlInputValue(input, observation.value);
   audio?.sync(effectiveDubspace(), state.clockOffset);
@@ -1131,7 +1123,7 @@ function syncPitchInput(input: HTMLInputElement) {
 
 function forgetLiveControls(observations: any[]) {
   for (const obs of observations) {
-    if (obs.type === "control_changed" && obs.target && obs.name) delete state.liveControls[liveKey(String(obs.target), String(obs.name))];
+    if (obs.type === "control_changed" && obs.target && obs.name) ui.projection.clearLive(liveProjectionKey("gesture_progress", String(obs.target), `prop.${String(obs.name)}`));
   }
 }
 
@@ -1158,9 +1150,7 @@ function syncTaskSelection() {
 }
 
 function pruneLiveControls() {
-  const before = Object.keys(state.liveControls).length;
-  void effectiveDubspace();
-  if (Object.keys(state.liveControls).length === before) return;
+  if (!ui.prune()) return;
   audio?.sync(effectiveDubspace(), state.clockOffset);
   if (state.tab === "dubspace") render();
 }
@@ -2377,7 +2367,7 @@ function renderPinboard() {
   const pinboard = state.world?.pinboard;
   const board = pinboard?.board;
   const present = Array.isArray(pinboard?.present) ? pinboard.present : [];
-  const inBoard = Boolean(state.actor && present.includes(state.actor));
+  const inBoard = pinboardActorPresent();
   const viewport = pinboard?.viewport ?? { w: 960, h: 560 };
   const width = pinNoteNumber(viewport.w, 960);
   const height = pinNoteNumber(viewport.h, 560);
@@ -2579,34 +2569,28 @@ function renderPinboardCreate(palette: string[]) {
 
 function setPendingPinPatch(id: string, patch: { x?: number; y?: number; w?: number; h?: number }) {
   if (!id) return;
-  const existing = pendingPinPatches.get(id);
-  pendingPinPatches.set(id, {
-    x: patch.x ?? existing?.x,
-    y: patch.y ?? existing?.y,
-    w: patch.w ?? existing?.w,
-    h: patch.h ?? existing?.h,
-    expiresAt: Date.now() + PINBOARD_OPTIMISTIC_TTL_MS
-  });
+  ui.projection.applyOptimistic(`pinboard:${id}`, [pinboardPlacementPatch(id, patch)], PINBOARD_OPTIMISTIC_TTL_MS);
 }
 
 function clearPendingPinPatch(id: string) {
-  if (id) pendingPinPatches.delete(id);
+  if (id) ui.projection.clearOptimistic(`pinboard:${id}`);
 }
 
 function applyPendingPinPatch<T extends { x: number; y: number; w: number; h: number }>(id: string, base: T): T {
-  const pending = pendingPinPatches.get(id);
+  ui.prune();
+  const pending = ui.observe(id)?.catalogState.pinboard_note;
   if (!pending) return base;
-  if (pending.expiresAt < Date.now()) {
-    pendingPinPatches.delete(id);
-    return base;
-  }
   return {
     ...base,
-    x: pending.x ?? base.x,
-    y: pending.y ?? base.y,
-    w: pending.w ?? base.w,
-    h: pending.h ?? base.h
+    x: pinNoteNumber(pending.x, base.x),
+    y: pinNoteNumber(pending.y, base.y),
+    w: pinNoteNumber(pending.w, base.w),
+    h: pinNoteNumber(pending.h, base.h)
   };
+}
+
+function pinboardPlacementPatch(id: string, patch: { x?: number; y?: number; z?: number; w?: number; h?: number }): ProjectionPatch {
+  return { subject: id, catalogState: { pinboard_note: patch } };
 }
 
 function renderPinNote(note: any, editable: boolean, palette: string[]) {
@@ -3102,7 +3086,8 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 }
 
 function pinboardActorPresent() {
-  return Boolean(state.actor && state.world?.session?.current_location === "the_pinboard");
+  const board = pinboardSpace();
+  return Boolean(state.actor && board && state.world?.session?.current_location === board);
 }
 
 function panPinboardBy(dx: number, dy: number) {
@@ -3263,7 +3248,7 @@ function leavePinboard(done?: () => void) {
     done?.();
     return;
   }
-  if (!Array.isArray(state.world?.pinboard?.present) || !state.world.pinboard.present.includes(state.actor)) {
+  if (!pinboardActorPresent()) {
     done?.();
     return;
   }
@@ -3314,6 +3299,7 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
     pinboardNotesRefreshPending = false;
     if (!Array.isArray(result) || !state.world?.pinboard) return;
     state.world.pinboard.notes = normalizePinboardNotes(result, state.world.pinboard.notes);
+    ui.ingestWorld(state.world);
     if (state.tab === "pinboard") render();
   }, () => {
     pinboardNotesRefreshPending = false;

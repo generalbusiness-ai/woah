@@ -21,8 +21,12 @@ in [discovery/catalogs.md](../discovery/catalogs.md), and the object model in
 
 ## UCM1. Scope and status
 
-This is a **draft** design for the browser client framework. It is not the
-current implemented client.
+This is a **draft** design for the browser client framework. An initial
+implementation slice exists in `src/client/framework.ts`: catalog UI
+registration, frame resolution, frame-local state/actions, observation
+normalization, and consistent projection layers. The current SPA still uses
+legacy tab renderers for most mounted UI; catalogs have not yet been moved to
+catalog-shipped modules.
 
 The model has six goals:
 
