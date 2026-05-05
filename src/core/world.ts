@@ -115,6 +115,7 @@ export type HostBridge = {
   describeObject?(nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<HostObjectSummary>;
   describeObjects?(nameActor: ObjRef, readActor: ObjRef, objRefs: ObjRef[], memo?: HostOperationMemo): Promise<Record<ObjRef, HostObjectSummary>>;
   resolveVerb?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary | null>;
+  isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
   dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
   moveObject(objRef: ObjRef, targetRef: ObjRef, options?: { suppressMirrorHost?: string | null }): Promise<MoveObjectResult>;
@@ -4532,6 +4533,21 @@ export class WooWorld {
 
   isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef): boolean {
     return this.inheritsFrom(objRef, ancestorRef);
+  }
+
+  isDescendantOfChecked(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): boolean | Promise<boolean> {
+    if (objRef === ancestorRef) return true;
+    if (this.objects.has(objRef)) return this.inheritsFrom(objRef, ancestorRef);
+    return this.remoteIsDescendantOfChecked(objRef, ancestorRef, memo);
+  }
+
+  private async remoteIsDescendantOfChecked(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
+    if (await this.remoteHostForObject(objRef, memo)) {
+      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      return await this.hostBridge.isDescendantOf(objRef, ancestorRef, memo);
+    }
+    this.object(objRef);
+    return false;
   }
 
   private async updatePresenceChecked(actor: ObjRef, space: ObjRef, present: boolean, ctx?: CallContext): Promise<boolean> {

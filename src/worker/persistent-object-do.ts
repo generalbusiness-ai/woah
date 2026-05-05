@@ -539,6 +539,20 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `verb:${target}:${verbName}`, read);
         return await read();
       },
+      isDescendantOf: async (objRef, ancestorRef, memo) => {
+        const read = async (): Promise<boolean> => {
+          const host = await hostForObject(objRef, memo);
+          if (!host || host === localHost) return world.isDescendantOf(objRef, ancestorRef);
+          const response = await this.forwardInternalChecked<{ result: boolean }>(
+            host,
+            "/__internal/remote-is-descendant",
+            { obj: objRef, ancestor: ancestorRef }
+          );
+          return response.result === true;
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `isa:${objRef}:${ancestorRef}`, read);
+        return await read();
+      },
       location: async (objRef, memo) => {
         const read = async (): Promise<ObjRef | null> => {
           const host = await hostForObject(objRef, memo);
@@ -1089,6 +1103,12 @@ export class PersistentObjectDO {
         const verbName = String(body.verb ?? "");
         const { verb } = world.resolveVerb(target, verbName);
         return jsonResponse({ name: verb.name, direct_callable: verb.direct_callable === true });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/remote-is-descendant") {
+        const obj = String(body.obj ?? "") as ObjRef;
+        const ancestor = String(body.ancestor ?? "") as ObjRef;
+        return jsonResponse({ result: world.isDescendantOf(obj, ancestor) });
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-location") {

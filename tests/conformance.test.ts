@@ -178,6 +178,10 @@ class LocalHostBridge implements HostBridge {
     return this.worldFor(objRef).object(objRef).location;
   }
 
+  async isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef): Promise<boolean> {
+    return await this.worldFor(objRef).isDescendantOfChecked(objRef, ancestorRef);
+  }
+
   async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
     const remote = this.worldFor(startAt ?? target);
     return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt);

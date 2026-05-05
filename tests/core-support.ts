@@ -113,6 +113,7 @@ export class LocalHostBridge implements HostBridge {
   readonly getPropCalls = new Map<string, number>();
   readonly describeCalls = new Map<string, number>();
   readonly describeManyCalls: ObjRef[][] = [];
+  readonly isaCalls = new Map<string, number>();
 
   constructor(
     readonly localHost: string,
@@ -169,6 +170,16 @@ export class LocalHostBridge implements HostBridge {
 
   async location(objRef: ObjRef): Promise<ObjRef | null> {
     return this.worldFor(objRef).object(objRef).location;
+  }
+
+  async isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
+    const key = `isa:${objRef}:${ancestorRef}`;
+    const read = async () => {
+      this.isaCalls.set(key, (this.isaCalls.get(key) ?? 0) + 1);
+      return await this.worldFor(objRef).isDescendantOfChecked(objRef, ancestorRef, memo);
+    };
+    if (!memo) return await read();
+    return await memoizeTestOperation(memo.reads, key, read);
   }
 
   async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {

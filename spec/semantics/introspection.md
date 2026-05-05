@@ -88,7 +88,7 @@ The introspection convention is built on these builtins (existing or near-existi
 | `verbs(obj)` | list<str> | Callable verb names visible on `obj`; duplicate local slots with the same name may appear more than once when an implementation exposes the raw slot list. |
 | `parents(obj)` | list<obj> | Inheritance chain root-ward, excluding `obj` itself. |
 | `children(obj)` | list<obj> | Direct inheritance children of `obj`. |
-| `is_a(obj, class)` | bool | Whether `class` appears in `parents(obj)` or equals `obj`. |
+| `is_a(obj, class)` | bool | Whether `class` appears in `parents(obj)` or equals `obj`; host-transparent for valid cross-host object refs. |
 | `verb_info(obj, descriptor)` | map | `{slot, name, owner, perms, arg_spec}` for the resolved verb on `obj`; descriptor is a name or 1-based local slot. |
 | `property_info(obj, name)` | map | `{owner, perms, defined_on, type_hint, has_value}`. |
 | `declared_schemas(obj)` | list<str> | Event types this object has declared schemas for. |

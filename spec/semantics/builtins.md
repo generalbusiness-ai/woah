@@ -18,7 +18,7 @@ Builtins are functions, not verbs. They are registered with stable indices for t
 ### 19.1 Core
 
 `to_string(v)` (alias `tostr`), `to_int(v)` (alias `toint`), `to_float(v)` (alias `tofloat`), `toobj(v)`, `typeof(v)`, `length(v)`,  
-`is_a(obj, parent_obj)`, `parents(obj)`, `children(obj)`,  
+`is_a(obj, parent_obj)` (DSL compatibility spelling: `isa`), `parents(obj)`, `children(obj)`,
 `now()` → ms epoch, `ftime()` → high-res wall time,  
 `raise(err)`, `random(n)`.
 
@@ -49,6 +49,12 @@ convert values explicitly before joining.
 `set_property_info(obj, name, expected_version, info)`,  
 `delete_property(obj, name, expected_version)`, `property_info`, `properties(obj)`, `verbs(obj)`,  
 `move(obj, new_location)`.
+
+`is_a(obj, parent_obj)` is a host-transparent ancestry predicate for valid
+object references. If `obj` is owned by another host, the runtime asks that host
+to evaluate the parent chain and returns the same boolean the local predicate
+would return. It raises only for invalid object refs or infrastructure failure;
+ordinary cross-host placement does not change the result.
 
 `collect_prop(list<obj>, name)` performs an order-preserving batch of readable
 property lookups and returns the resulting list of property values in input

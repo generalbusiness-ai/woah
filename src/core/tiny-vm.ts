@@ -523,7 +523,8 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         }
         case "BUILTIN": {
           const builtinArgs = popArgs(numeric(operand2, "builtin argc"));
-          push(await callBuiltin(operand, builtinArgs, current));
+          const fast = tryFastBuiltin(operand, builtinArgs, current);
+          push(fast.handled ? fast.value : await callBuiltin(operand, builtinArgs, current));
           break;
         }
 
@@ -914,7 +915,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       }
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");
-        return frame.ctx.world.isDescendantOf(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]));
+        return frame.ctx.world.isDescendantOfChecked(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), frame.ctx.hostMemo);
       }
       case "random": {
         const n = numeric(builtinArgs[0], "random argument");
@@ -946,7 +947,11 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "all_locations": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "all_locations expects one object");
         const obj = assertObj(builtinArgs[0]);
-        if (frame.ctx.world.isDescendantOf(obj, "$actor")) return frame.ctx.world.allLocationsForActor(obj);
+        const actorCheck = frame.ctx.world.isDescendantOfChecked(obj, "$actor", frame.ctx.hostMemo);
+        if (isPromiseLike(actorCheck) ? await actorCheck : actorCheck) {
+          if (await frame.ctx.world.isRemoteObject(obj, frame.ctx.hostMemo)) return await frame.ctx.world.getHostBridge()?.actorSessionLocations?.(obj, frame.ctx.hostMemo) ?? [];
+          return frame.ctx.world.allLocationsForActor(obj);
+        }
         const loc = await frame.ctx.world.objectLocationChecked(obj, frame.ctx.hostMemo);
         return loc ? [loc] : [];
       }
@@ -1295,4 +1300,25 @@ function estimateSize(value: WooValue): number {
   if (typeof value === "string") return value.length * 2;
   if (Array.isArray(value)) return 16 + value.reduce<number>((sum, item) => sum + estimateSize(item), 0);
   return 16 + Object.entries(value as Record<string, WooValue>).reduce<number>((sum, [key, item]) => sum + key.length * 2 + estimateSize(item), 0);
+}
+
+type FastBuiltinResult = { handled: true; value: WooValue } | { handled: false };
+
+function tryFastBuiltin(nameOrIndex: WooValue | undefined, builtinArgs: WooValue[], frame: VmFrame): FastBuiltinResult {
+  const name = typeof nameOrIndex === "number"
+    ? BUILTIN_NAMES[nameOrIndex]
+    : typeof nameOrIndex === "string"
+      ? nameOrIndex
+      : "";
+  if (name !== "isa") return { handled: false };
+  if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");
+  const obj = assertObj(builtinArgs[0]);
+  const ancestor = assertObj(builtinArgs[1]);
+  if (obj === ancestor) return { handled: true, value: true };
+  if (!frame.ctx.world.objects.has(obj)) return { handled: false };
+  return { handled: true, value: frame.ctx.world.isDescendantOf(obj, ancestor) };
+}
+
+function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
+  return value !== null && typeof value === "object" && typeof (value as Promise<T>).then === "function";
 }
