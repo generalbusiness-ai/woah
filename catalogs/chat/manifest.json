@@ -143,7 +143,7 @@
               "origin?"
             ]
           },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } for item in contents(this) { if (isa(item, $space) && item != origin) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (isa(item, $space) && item != origin) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
         },
         {
           "name": "match_exit",
@@ -779,14 +779,14 @@
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text", "origin?"] },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
         },
         {
           "name": "hear_parent_announce",
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } return true; }"
+          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
         },
         {
           "name": "say",
@@ -849,7 +849,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } return true; }"
+          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
         }
       ]
     }

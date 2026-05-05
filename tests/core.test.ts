@@ -1142,6 +1142,35 @@ describe("woo core", () => {
     }
   });
 
+  it("routes transparent announcements once to child and parent room sessions", async () => {
+    const world = createWorld();
+    const speaker = world.auth("guest:transparent-announcer");
+    const inside = world.auth("guest:transparent-announcement-inside");
+    const outside = world.auth("guest:transparent-announcement-outside");
+
+    await world.directCall("transparent-ann-outside-enter", outside.actor, "the_chatroom", "enter", [], { sessionId: outside.id });
+    await world.directCall("transparent-ann-speaker-enter", speaker.actor, "the_dubspace", "enter", [], { sessionId: speaker.id });
+    await world.directCall("transparent-ann-inside-enter", inside.actor, "the_dubspace", "enter", [], { sessionId: inside.id });
+
+    const announced = await world.directCall("transparent-announcement", speaker.actor, "the_dubspace", "announce_all", ["pulse"], { sessionId: speaker.id });
+
+    expect(announced.op).toBe("result");
+    if (announced.op === "result") {
+      const textObservations = announced.observations.filter((observation) => observation.type === "text");
+      expect(textObservations.map((observation) => observation.target).sort()).toEqual([speaker.actor, inside.actor, outside.actor].sort());
+      expect(textObservations.filter((observation) => observation.target === speaker.actor)).toHaveLength(1);
+      expect(textObservations.filter((observation) => observation.target === inside.actor)).toHaveLength(1);
+      expect(textObservations.filter((observation) => observation.target === outside.actor)).toHaveLength(1);
+      const sessionsByTarget = Object.fromEntries(textObservations.map((observation, index) => [
+        String(observation.target),
+        announced.observationSessionAudiences?.[index] ?? []
+      ]));
+      expect(sessionsByTarget[speaker.actor]).toEqual([speaker.id]);
+      expect(sessionsByTarget[inside.actor]).toEqual([inside.id]);
+      expect(sessionsByTarget[outside.actor]).toEqual([outside.id]);
+    }
+  });
+
   it("lets semitransparent spaces hear parent announcements without forwarding local speech out", async () => {
     const world = createWorld();
     const outside = world.auth("guest:rain-outside");

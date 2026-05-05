@@ -90,6 +90,28 @@ overrides public speech forms so each utterance is observed locally and also
 forwarded to `location(this)`. It also implements `:hear_parent_announce`, so
 announcements in the containing room are heard inside.
 
+The speech overrides use `pass(...)` to invoke `$conversational`'s
+emit-locally body and then add a single `observe_to_space(parent, ...)` for
+the upward forward — keeping the local-emit logic in one place so the two
+classes don't drift.
+
+The `:announce_all_but(ignore, text, origin?)` chain takes an optional
+`origin` parameter. When `$transparent` forwards an announcement upward, it
+passes `this` as `origin`. The parent's `$room:announce_all_but` skips the
+matching child during its `contents(this)` iteration, so listeners in the
+originating space don't get the announcement twice (once from the local
+loop, once from the parent looping back via `:hear_parent_announce`).
+Cycle protection by construction.
+
+**Multi-session, multi-location actors** (the LambdaMOO single-actor model
+extended for the SPA's multi-tab UX, see
+[identity.md](../../spec/semantics/identity.md)): an actor with one session
+in the dubspace and another in the chatroom will see a `said` observation
+delivered to *each* session. The dubspace tab shows it routed via the
+dubspace audience; the chat tab shows it routed via the chatroom audience.
+Same line, two feeds, intentional. The feed in each tab reflects what its
+session hears in the room it's actually in.
+
 `$semitransparent < $conversational` is the cone-of-silence variant: it hears
 parent announcements through `:hear_parent_announce`, but inherited public
 speech stays local. Concrete contained rooms can attach it for cases like a

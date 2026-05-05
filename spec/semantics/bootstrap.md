@@ -414,7 +414,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:look_self()` | — | Compose room title, description, present actors, and visible contents. Pure view producer; the chat dispatcher emits private `looked`. |
 | `:announce(text)` | str | Tell everyone in the room except `actor`. |
 | `:announce_all(text)` | str | Tell every subscribed actor in the room. |
-| `:announce_all_but(ignore, text)` | list, str | Tell every subscribed actor except those listed. |
+| `:announce_all_but(ignore, text, origin?)` | list, str, obj? | Tell every subscribed actor except those listed. `origin` is used by transparent nested spaces so parent announcement fan-out does not loop back into the originating child. |
 | `:match_exit(name)` | str | Resolve a name through `this.exits`, returning an `$exit` or `$failed_match`. |
 | direction verbs / `:go(exit)` | str | Find an exit object and call `exit:invoke()`. |
 | `:acceptable(obj)` / `:enterfunc(obj)` / `:exitfunc(obj)` | obj | Default moveto hooks. |
