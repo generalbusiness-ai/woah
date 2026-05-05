@@ -34,6 +34,21 @@ ok()     { echo "  ${GREEN}ok${NC}    $*"; }
 warn()   { echo "  ${YELLOW}warn${NC}  $*"; }
 fail()   { echo "  ${RED}FAIL${NC}  $*" >&2; exit 1; }
 
+POSTFLIGHT_SESSIONS=()
+cleanup_postflight_sessions() {
+  local sid status
+  for sid in "${POSTFLIGHT_SESSIONS[@]:-}"; do
+    [[ -n "$sid" ]] || continue
+    status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+      -X DELETE "$WORKER_URL/api/session" \
+      -H "authorization: Session $sid" 2>/dev/null || true)
+    if [[ "$status" != "200" && "$status" != "401" && "$status" != "404" ]]; then
+      warn "postflight session cleanup for $sid returned $status"
+    fi
+  done
+}
+trap cleanup_postflight_sessions EXIT
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)          DRY_RUN=1 ;;
@@ -202,6 +217,7 @@ auth_out=$(curl -sS --max-time 10 -X POST "$WORKER_URL/api/auth" \
 sid=$(echo "$auth_out" | node -e \
   'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).session||"")}catch{console.log("")}})')
 [[ -n "$sid" ]] || fail "auth failed: $auth_out"
+POSTFLIGHT_SESSIONS+=("$sid")
 ok "auth: session=$sid"
 
 # /api/state — exercises gateway + cluster aggregate. Capture the body so
@@ -266,6 +282,7 @@ ws_session=$(node --input-type=module -e "
   ws.on('error', (err) => { clearTimeout(t); console.error('socket: ' + err.message); process.exit(1); });
 " 2>&1) || fail "ws handshake failed: $ws_session"
 [[ "$ws_session" =~ ^session- ]] || fail "ws handshake unexpected reply: $ws_session"
+POSTFLIGHT_SESSIONS+=("$ws_session")
 ok "ws handshake: session=$ws_session"
 
 # Wizard claim with a decoy token. On a claimed world this returns

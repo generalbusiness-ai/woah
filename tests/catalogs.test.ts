@@ -748,6 +748,17 @@ describe("local catalogs", () => {
     expect(rejectedDrop.op).toBe("applied");
     if (rejectedDrop.op === "applied") expect(rejectedDrop.observations.find((obs) => obs.type === "$error")?.code).toBe("E_INVARG");
 
+    const deckTowel = "pinboard_deck_towel";
+    world.createObject({ id: deckTowel, parent: "$thing", name: "towel", owner: session.actor, location: "the_deck" });
+    const rejectedDeckDrop = await world.call("pinboard-drop-deck-towel", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "drop", args: [deckTowel] });
+    expect(rejectedDeckDrop.op).toBe("applied");
+    if (rejectedDeckDrop.op === "applied") {
+      expect(rejectedDeckDrop.observations.find((obs) => obs.type === "$error")).toMatchObject({
+        code: "E_INVARG",
+        message: `You are not carrying ${deckTowel}.`
+      });
+    }
+
     const left = await world.directCall("pinboard-out", session.actor, "the_pinboard", "out", []);
     expect(left.op).toBe("result");
     expect(world.object(session.actor).location).toBe("the_deck");

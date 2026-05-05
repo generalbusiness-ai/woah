@@ -1,6 +1,6 @@
 ---
 name: pinboard
-version: 0.3.0
+version: 0.3.1
 spec_version: v1
 license: MIT
 description: Spatial bulletin board demo built from first-class $pin < $note objects.

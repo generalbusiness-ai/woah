@@ -75,6 +75,12 @@ export class DirectoryDO {
         return json({ ok: true });
       }
 
+      if (request.method === "POST" && url.pathname === "/unregister-session") {
+        const body = await readJson(request);
+        this.unregisterSession(String(body.session_id ?? ""));
+        return json({ ok: true });
+      }
+
       if (request.method === "POST" && url.pathname === "/resolve-session") {
         const body = await readJson(request);
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
@@ -151,6 +157,11 @@ export class DirectoryDO {
       session.current_location,
       Date.now()
     );
+  }
+
+  private unregisterSession(sessionId: string): void {
+    if (!sessionId) return;
+    this.state.storage.sql.exec("DELETE FROM session_route WHERE session_id = ?", sessionId);
   }
 
   private resolveSession(sessionId: string): SessionRoute | null {

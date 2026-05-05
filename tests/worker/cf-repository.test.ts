@@ -681,6 +681,58 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("ends REST sessions and removes Directory session routes", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-session-end-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: undefined,
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, env);
+    (env as any).DIRECTORY = new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    });
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    const directoryHealth = async (): Promise<Record<string, unknown>> => {
+      const request = await signInternalRequest(env, new Request("https://woo.internal/healthz"));
+      const response = await directory.fetch(request);
+      return await response.json() as Record<string, unknown>;
+    };
+
+    try {
+      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: "guest:cf-session-end" })
+      }));
+      expect(auth.ok).toBe(true);
+      const { session } = await auth.json() as { session: string };
+      expect(await directoryHealth()).toMatchObject({ sessions: 1 });
+
+      const ended = await gateway.fetch(new Request("https://woo.test/api/session", {
+        method: "DELETE",
+        headers: { authorization: `Session ${session}` }
+      }));
+      expect(ended.ok).toBe(true);
+      expect(await ended.json()).toMatchObject({ ok: true, session });
+      expect(await directoryHealth()).toMatchObject({ sessions: 0 });
+
+      const staleState = await gateway.fetch(new Request("https://woo.test/api/state", {
+        headers: { authorization: `Session ${session}` }
+      }));
+      expect(staleState.status).toBe(401);
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("publishes Worker-installed self-hosted tap objects before serving host seeds", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");

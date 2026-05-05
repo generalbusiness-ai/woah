@@ -1153,6 +1153,13 @@ export class WooWorld {
     return false;
   }
 
+  endSession(sessionId: string): boolean {
+    if (!this.sessions.has(sessionId)) return false;
+    this.reapSession(sessionId);
+    this.persist(true);
+    return true;
+  }
+
   primarySessionForActor(actor: ObjRef): Session | null {
     let best: Session | null = null;
     for (const session of this.sessions.values()) {

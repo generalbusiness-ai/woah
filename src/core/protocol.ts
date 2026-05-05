@@ -34,6 +34,7 @@ export type RestProtocolHost = {
   requireSession(request: RestProtocolRequest): Session;
   authenticateToken(token: string): Session | Promise<Session>;
   onAuthenticated?(session: Session): void | Promise<void>;
+  onSessionEnded?(session: Session): void | Promise<void>;
   state(actor: ObjRef): unknown | Promise<unknown>;
   installTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
   updateTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
@@ -69,6 +70,13 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
     if (request.method === "GET" && request.pathname === "/api/state") {
       const session = host.requireSession(request);
       return jsonProtocol(withSessionProjection(await host.state(session.actor), world, session));
+    }
+
+    if (request.method === "DELETE" && request.pathname === "/api/session") {
+      const session = host.requireSession(request);
+      world.endSession(session.id);
+      await host.onSessionEnded?.(session);
+      return jsonProtocol({ ok: true, session: session.id });
     }
 
     if (request.method === "POST" && request.pathname === "/api/tap/install") {

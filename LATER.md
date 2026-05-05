@@ -40,6 +40,7 @@ The sections below distinguish three flavors of pending item:
 - verb alias wildcard lint/deprecation — `literal*` is currently a broad wildcard while `literal@` is LambdaCore-style abbreviation. First-party catalogs now use `@`, but the engine still accepts trailing `*` for compatibility. Add catalog/install warnings for aliases with a single trailing `*` and no `@`; later decide whether to reserve `*` or keep it as explicit glob syntax.
 - host-scoped local catalog repair retry state — host repair currently logs and defers when a partial slice cannot resolve a manifest reference. That is correct for transient stale seeds, but a permanently broken manifest can warn on every cold init. Add per-host backoff or "skip until manifest version changes" state if this gets noisy.
 - `collect_prop` host-grouped batching — the builtin currently shares the frame memo and can run direct-call reads in parallel, but it still issues one RPC per remote object. Group by resolved host and add a bulk property-read host RPC if profiling shows large remote lists (task summaries, room rosters) getting hot.
+- cross-host value-level predicates — builtins that read like pure predicates (`isa`, `parent`, and adjacent ancestry/introspection helpers) still assume host-local object records in places. A remote-but-valid objref can therefore surface as `E_OBJNF` from inside an ordinary guard. Either make these host-transparent, or fail with a typed remote/indeterminate error so woocode authors can produce useful user-facing messages.
 
 ## structure
 

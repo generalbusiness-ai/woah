@@ -17,6 +17,8 @@ The two wire formats target the same model. WebSocket is the right shape for cli
 
 ```
 POST  /api/auth
+DELETE /api/session
+GET   /api/state
 GET   /api/objects/{id-or-name}
 GET   /api/objects/{id-or-name}/properties/{name}
 POST  /api/objects/{id-or-name}/calls/{verb}
@@ -24,7 +26,7 @@ GET   /api/objects/{id-or-name}/log?from=N&limit=M
 GET   /api/objects/{id-or-name}/stream
 ```
 
-Six endpoints. Everything is an object; identifiers are object refs,
+Eight endpoints. Everything is an object; identifiers are object refs,
 corenames, or implementation-local object ids.
 
 ---
@@ -60,6 +62,12 @@ returns: { actor: ObjRef, session: string }
 - `session:<id>` — resume an existing live session.
 
 Subsequent requests carry the session id as `Authorization: Session <id>`. The session id is opaque server-side state — no signing, no claims, no expiry beyond the session timeout — so baseline REST has no JWT machinery requirement.
+
+`DELETE /api/session` ends the presented session immediately and returns
+`{ ok: true, session }`. Implementations MUST remove the session from their
+local session store before returning. Distributed implementations SHOULD also
+remove any session-routing record used for cross-host dispatch; stale best-effort
+routes must fail closed through the normal session validation path.
 
 `GET /api/state` returns the actor-readable world projection plus
 `session: { id, actor, current_location }` for the presented session. The

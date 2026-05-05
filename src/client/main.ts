@@ -2,6 +2,7 @@ import "./styles.css";
 import chatManifest from "../../catalogs/chat/manifest.json";
 import demoworldManifest from "../../catalogs/demoworld/manifest.json";
 import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
+import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import type { ChatLine, ChatSpaceData, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 
@@ -220,9 +221,12 @@ function connect() {
       if (shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
     }
     if (frame.op === "applied") {
-      if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
       ui.ingestAppliedFrame(frame);
       const observations = frame.observations ?? [];
+      receiveAppliedFrameErrors(frame, observations);
+      // Sequenced verb raises arrive as `$error` observations inside applied
+      // frames, so keep the pending handler until those observations route.
+      if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
       const pinboardAnimations = capturePinboardAnimations(observations);
       const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
       if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
@@ -1988,10 +1992,11 @@ function receiveChatError(error: any) {
   });
 }
 
-function chatErrorText(error: any): string {
-  if (typeof error?.message === "string" && error.message.trim()) return error.message;
-  if (typeof error?.code === "string" && error.code.trim()) return error.code;
-  return "That didn't work.";
+function receiveAppliedFrameErrors(frame: any, observations: any[]) {
+  const errors = appliedFrameErrorObservations({ observations });
+  if (errors.length === 0) return;
+  const errorHandler = typeof frame.id === "string" ? pendingFrameErrors.get(frame.id) : undefined;
+  for (const error of errors) (errorHandler ?? receiveChatError)(error);
 }
 
 function chatLineKind(observation: any): ChatLine["kind"] {

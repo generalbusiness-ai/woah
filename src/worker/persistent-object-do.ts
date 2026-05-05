@@ -172,6 +172,8 @@ export class PersistentObjectDO {
         world,
         authenticateToken: (token) => this.authenticateToken(world, token),
         requireSession: () => this.requireRestSession(world, request),
+        onAuthenticated: (session) => this.registerSessionRoute(session),
+        onSessionEnded: (session) => this.unregisterSessionRoute(session.id),
         state: (actor) => this.aggregateState(world, actor),
         installTap: async (actor, body) => {
           if (!gatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap install is only available on the world gateway host");
@@ -1283,6 +1285,21 @@ export class PersistentObjectDO {
       // Directory registration accelerates cross-DO routing. The local auth
       // result remains authoritative for this host; routed object calls fail
       // closed if the Directory cannot resolve the session.
+    }
+  }
+
+  private async unregisterSessionRoute(sessionId: string): Promise<void> {
+    try {
+      const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/unregister-session`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ session_id: sessionId })
+      }));
+      await this.env.DIRECTORY.get(id).fetch(request);
+    } catch {
+      // Local session deletion is authoritative; stale Directory routes expire
+      // closed on their normal TTL if best-effort cleanup misses.
     }
   }
 
