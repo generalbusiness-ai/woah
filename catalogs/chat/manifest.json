@@ -139,10 +139,11 @@
           "arg_spec": {
             "args": [
               "ignore",
-              "text"
+              "text",
+              "origin?"
             ]
           },
-          "source": "verb :announce_all_but(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } for item in contents(this) { if (isa(item, $space)) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } for item in contents(this) { if (isa(item, $space) && item != origin) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
         },
         {
           "name": "match_exit",
@@ -678,7 +679,7 @@
               "actor?"
             ]
           },
-          "source": "verb :leave(who) rxd { moveto(actor, actor.home); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); return this.subscribers; }"
+          "source": "verb :leave(who) rxd { moveto(actor, actor.home); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); let remaining = []; for s in this.subscribers { if (s != actor) { remaining = remaining + [s]; } } return remaining; }"
         },
         {
           "name": "huh",
@@ -777,8 +778,8 @@
           "name": "announce_all_but",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :announce_all_but(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } let parent = location(this); if (parent != null && parent != this) { try { parent:announce_all_but(ignore, text); } except err { } } return true; }"
+          "arg_spec": { "args": ["ignore", "text", "origin?"] },
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { tell(listener, text); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
         },
         {
           "name": "hear_parent_announce",
@@ -793,7 +794,7 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["text"] },
-          "source": "verb :say(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say requires text\" }; } observe({ type: \"said\", actor: actor, text: text, ts: now() }); let parent = location(this); if (parent != null && parent != this) { observe_to_space(parent, { type: \"said\", actor: actor, text: text, ts: now() }); } return true; }"
+          "source": "verb :say(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"said\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "emote",
@@ -801,7 +802,7 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["text"] },
-          "source": "verb :emote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"emote requires text\" }; } observe({ type: \"emoted\", actor: actor, text: text, ts: now() }); let parent = location(this); if (parent != null && parent != this) { observe_to_space(parent, { type: \"emoted\", actor: actor, text: text, ts: now() }); } return true; }"
+          "source": "verb :emote(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"emoted\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "say_as",
@@ -809,7 +810,7 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["style", "text"] },
-          "source": "verb :say_as(style, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_as requires text\" }; } observe({ type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); let parent = location(this); if (parent != null && parent != this) { observe_to_space(parent, { type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); } return true; }"
+          "source": "verb :say_as(style, text) rxd { pass(style, text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "pose",
@@ -817,7 +818,7 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["text"] },
-          "source": "verb :pose(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"pose requires text\" }; } observe({ type: \"posed\", actor: actor, text: text, ts: now() }); let parent = location(this); if (parent != null && parent != this) { observe_to_space(parent, { type: \"posed\", actor: actor, text: text, ts: now() }); } return true; }"
+          "source": "verb :pose(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"posed\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "quote",
@@ -825,7 +826,7 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["text"] },
-          "source": "verb :quote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"quote requires text\" }; } observe({ type: \"quoted\", actor: actor, text: text, ts: now() }); let parent = location(this); if (parent != null && parent != this) { observe_to_space(parent, { type: \"quoted\", actor: actor, text: text, ts: now() }); } return true; }"
+          "source": "verb :quote(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"quoted\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "self",
@@ -833,7 +834,7 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["text"] },
-          "source": "verb :self(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"self requires text\" }; } observe({ type: \"self_pointed\", actor: actor, text: text, ts: now() }); let parent = location(this); if (parent != null && parent != this) { observe_to_space(parent, { type: \"self_pointed\", actor: actor, text: text, ts: now() }); } return true; }"
+          "source": "verb :self(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"self_pointed\", actor: actor, text: text, ts: now() }); } return true; }"
         }
       ]
     },

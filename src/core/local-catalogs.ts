@@ -64,6 +64,8 @@ const LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION = "2026-05-04-demo-sp
 const LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION = "2026-05-04-drop-session-id-property";
 const LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION = "2026-05-04-chat-transparent-feature";
 const LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION = "2026-05-04-drop-presence-in-property";
+const LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION = "2026-05-04-chat-room-exits-restore";
+const LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION = "2026-05-04-chat-room-leave-filter";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -110,7 +112,9 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION },
   { id: LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION },
-  { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION }
+  { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION },
+  { id: LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION },
+  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -303,6 +307,8 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runDropSessionIdPropertyMigration(world);
   runChatTransparentFeatureMigration(world, names);
   runDropPresenceInPropertyMigration(world);
+  runChatRoomExitsRestoreMigration(world);
+  runChatRoomLeaveFilterMigration(world, names);
   return covered;
 }
 
@@ -502,6 +508,68 @@ function runDropPresenceInPropertyMigration(world: WooWorld): void {
     }
   }
   markMigrationApplied(world, LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION);
+}
+
+function runChatRoomExitsRestoreMigration(world: WooWorld): void {
+  if (migrationApplied(world, LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION)) return;
+  if (!world.objects.has("$exit") || !world.objects.has("$room")) {
+    markMigrationApplied(world, LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION);
+    return;
+  }
+  // For each $exit instance, register itself under (source room, name) so we
+  // can rebuild source rooms' exits maps from the exits' own metadata.
+  const desired = new Map<ObjRef, Map<string, ObjRef>>();
+  for (const id of Array.from(world.objects.keys())) {
+    if (!world.isDescendantOf(id, "$exit")) continue;
+    const source = world.propOrNull(id, "source");
+    const name = world.propOrNull(id, "name");
+    if (typeof source !== "string" || typeof name !== "string") continue;
+    if (!world.objects.has(source as ObjRef)) continue;
+    const sourceMap = desired.get(source as ObjRef) ?? new Map<string, ObjRef>();
+    sourceMap.set(name, id);
+    desired.set(source as ObjRef, sourceMap);
+  }
+  const isValidExit = (target: unknown): target is ObjRef =>
+    typeof target === "string" && world.objects.has(target as ObjRef) && world.isDescendantOf(target as ObjRef, "$exit");
+  for (const id of Array.from(world.objects.keys())) {
+    if (!world.isDescendantOf(id, "$room")) continue;
+    const current = world.propOrNull(id, "exits");
+    const start: Record<string, unknown> = current && typeof current === "object" && !Array.isArray(current)
+      ? { ...(current as Record<string, unknown>) }
+      : {};
+    const expected = desired.get(id);
+    let changed = false;
+    if (expected) {
+      for (const [direction, target] of expected.entries()) {
+        if (start[direction] !== target) {
+          start[direction] = target;
+          changed = true;
+        }
+      }
+    }
+    for (const direction of Object.keys(start)) {
+      if (!isValidExit(start[direction])) {
+        delete start[direction];
+        changed = true;
+      }
+    }
+    if (changed) world.setProp(id, "exits", start as WooValue);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION);
+}
+
+function runChatRoomLeaveFilterMigration(world: WooWorld, names: readonly string[]): void {
+  if (!names.includes("chat")) return;
+  if (!localCatalogInstalled(world, "chat")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION)) return;
+  const leave = world.objects.has("$room") ? world.ownVerbExact("$room", "leave") : null;
+  if (!leave || !leave.source.includes("for s in this.subscribers")) {
+    const result = runLocalCatalogSchemaPlan(world, "chat", LOCAL_CATALOGS.get("chat")!, "gateway", "world", {
+      allowImplementationHints: true
+    });
+    if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION);
 }
 
 function runChatTransparentFeatureMigration(world: WooWorld, names: readonly string[]): void {
