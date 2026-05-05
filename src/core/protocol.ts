@@ -140,6 +140,11 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
     const session = host.requireSession(request);
     const target = resolveRestObject(host, route.id, session, request);
 
+    if (request.method === "GET" && route.rest.length === 1 && route.rest[0] === "ui-snapshot") {
+      const surface = request.query("surface") ?? "default";
+      return jsonProtocol(await world.overlaySnapshotForActor(session.actor, target, surface, session.id));
+    }
+
     if (request.method === "GET" && route.rest.length === 0) {
       return jsonProtocol(world.describeForActor(target, session.actor));
     }

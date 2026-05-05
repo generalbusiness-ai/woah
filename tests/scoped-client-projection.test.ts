@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { handleRestProtocolRequest, handleWsProtocolFrame, type RestProtocolRequest } from "../src/core/protocol";
-import type { ObjRef, Session } from "../src/core/types";
+import { publicAppliedFrame, type ObjRef, type Session } from "../src/core/types";
 import type { DeferredHostEffect, WooWorld } from "../src/core/world";
 import { LocalHostBridge } from "./core-support";
 
@@ -10,6 +10,16 @@ function get(pathname: string, headers: Record<string, string> = {}): RestProtoc
     method: "GET",
     pathname,
     query: () => null,
+    header: (name) => headers[name.toLowerCase()] ?? null,
+    readJson: async () => ({})
+  };
+}
+
+function getWithQuery(pathname: string, query: Record<string, string>, headers: Record<string, string> = {}): RestProtocolRequest {
+  return {
+    method: "GET",
+    pathname,
+    query: (name) => query[name] ?? null,
     header: (name) => headers[name.toLowerCase()] ?? null,
     readJson: async () => ({})
   };
@@ -95,6 +105,55 @@ describe("scoped client projection", () => {
     expect(sent[0]).toMatchObject({ op: "session", actor: session.actor, session: session.id, resumed: false });
   });
 
+  it("includes enriched movement results on sequenced applied frames", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:scoped-sequenced-move");
+    const entered = await world.directCall("enter-for-sequenced-move", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    expect(entered.op).toBe("result");
+
+    const frame = await world.call("sequenced-move-with-here", session.id, "the_chatroom", {
+      actor: session.actor,
+      target: "exit_living_room_southeast",
+      verb: "move",
+      args: [session.actor]
+    });
+
+    expect(frame.op).toBe("applied");
+    if (frame.op !== "applied") throw new Error("expected applied frame");
+    expect(frame.result).toMatchObject({
+      room: "the_deck",
+      here: {
+        id: "the_deck",
+        name: "Deck"
+      }
+    });
+    const here = (frame.result as Record<string, any>).here;
+    expect(here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(here.exits.some((exit: { direction?: string }) => exit.direction === "west")).toBe(true);
+  });
+
+  it("strips caller-only id and result from public applied frames", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:public-applied-frame");
+    const entered = await world.directCall("enter-public-applied-frame", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    expect(entered.op).toBe("result");
+    const frame = await world.call("move-public-applied-frame", session.id, "the_chatroom", {
+      actor: session.actor,
+      target: "exit_living_room_southeast",
+      verb: "move",
+      args: [session.actor]
+    });
+
+    expect(frame.op).toBe("applied");
+    if (frame.op !== "applied") throw new Error("expected applied frame");
+    expect(frame.id).toBe("move-public-applied-frame");
+    expect(frame.result).toBeDefined();
+    const publicFrame = publicAppliedFrame(frame);
+    expect(publicFrame.id).toBeUndefined();
+    expect(publicFrame.result).toBeUndefined();
+    expect(publicFrame.observations).toEqual(frame.observations);
+  });
+
   it("returns null here when the session has no room or space context", async () => {
     const world = createWorld();
     const session = world.auth("guest:scoped-nowhere");
@@ -140,6 +199,33 @@ describe("scoped client projection", () => {
     expect(body.here.exits.some((exit: { direction?: string }) => exit.direction === "south")).toBe(true);
     expect(body.here.props.secret_room_note).toBeNull();
     expect(Array.isArray(body.inventory)).toBe(true);
+  });
+
+  it("serves scoped overlay snapshots without reading the full world state", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:overlay-snapshot");
+    const result = await handleRestProtocolRequest(getWithQuery("/api/objects/the_pinboard/ui-snapshot", { surface: "pinboard" }), {
+      world,
+      requireSession: () => session,
+      authenticateToken: () => session,
+      state: () => {
+        throw new Error("overlay snapshots must not call full world state");
+      },
+      broadcastApplied: async () => undefined,
+      broadcastLiveEvents: async () => undefined
+    });
+
+    expect(result.handled).toBe(true);
+    if (!result.handled || "raw" in result) throw new Error("unexpected raw protocol result");
+    expect(result.status).toBe(200);
+    const body = result.body as Record<string, any>;
+    expect(body).toMatchObject({
+      surface: "pinboard",
+      subject: "the_pinboard",
+      room: { id: "the_pinboard", name: "Pinboard" }
+    });
+    expect(body.cursor.spaces.the_pinboard.next_seq).toEqual(expect.any(Number));
+    expect(body.objects.some((object: { id?: string }) => object.id === "the_pinboard")).toBe(true);
   });
 
   it("adds here to direct move and enter results while preserving legacy fields", async () => {

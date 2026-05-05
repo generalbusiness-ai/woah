@@ -22,13 +22,14 @@ GET   /api/state
 GET   /api/me
 GET   /api/catalogs/ui
 GET   /api/objects/{id-or-name}
+GET   /api/objects/{id-or-name}/ui-snapshot?surface=S
 GET   /api/objects/{id-or-name}/properties/{name}
 POST  /api/objects/{id-or-name}/calls/{verb}
 GET   /api/objects/{id-or-name}/log?from=N&limit=M
 GET   /api/objects/{id-or-name}/stream
 ```
 
-Ten endpoints. Everything is an object; identifiers are object refs,
+Eleven endpoints. Everything is an object; identifiers are object refs,
 corenames, or implementation-local object ids.
 
 ---
@@ -109,6 +110,15 @@ and integrity policy. `objects` and `seeds` entries are catalog-install metadata
 for resolution/debugging and are not a stable contract for choosing runtime
 subjects.
 
+`GET /api/objects/{id-or-name}/ui-snapshot?surface=S` returns a scoped overlay
+snapshot for a tool/component subject. The response shape is
+`{ surface, subject, cursor, room, objects }`: `room` is a shallow
+`RoomSnapshot` when the subject is a space-like object, `objects` is the
+permission-filtered object-summary set needed to render that overlay, and
+`cursor` covers the overlay subject's sequenced stream. This endpoint is the
+overlay counterpart to `/api/me`; it MUST NOT serialize the full world object
+map.
+
 Credentialed auth extends the vocabulary per [auth.md §A3](../identity/auth.md#a3-token-vocabulary-extended): `bearer:<jwt>`, `apikey:<id>:<secret>`, `oauth_code:<provider>:<code>`, `recovery:<token>`. Bearer tokens use `Authorization: Bearer <jwt>` with signature/claims validation. The endpoint shape is unchanged; only the accepted vocabulary expands.
 
 An implementation that doesn't ship credentialed auth returns `400 E_INVARG` for `bearer:`/`apikey:`/`oauth_code:` tokens. An implementation that ships credentialed auth accepts both vocabularies.
@@ -153,7 +163,7 @@ returns: applied frame (sequenced) OR direct verb result
 
 The body-level `space` field determines whether the call is sequenced — this is the load-bearing distinction:
 
-- **`space` is set** → sequenced through that `$space`. The runtime constructs the message `{ actor, target: id-or-name, verb, args }` and dispatches it through `space:call`. Returns `{ space, seq, message, observations, ts }`.
+- **`space` is set** → sequenced through that `$space`. The runtime constructs the message `{ actor, target: id-or-name, verb, args }` and dispatches it through `space:call`. Returns `{ space, seq, message, observations, ts, result }`.
 - **`space` is null** → direct dispatch on the target. Allowed only for verbs annotated `direct_callable: true` (§R12). For verbs without this annotation, returns `403 E_DIRECT_DENIED`. Returns `{ result, observations }`.
 
 The natural agent shape is sequenced: `POST /api/objects/$task_42/calls/transition` with body `{ args: ["design-review"], space: "$taskspace" }`. The same call without `space` is rejected because `:transition` is not direct-callable. This makes "mutate through a space" the obvious path, not something callers must remember to wrap.
@@ -165,12 +175,13 @@ In both cases:
 - `id` is a client-chosen correlation token; idempotent retry returns the same response within the cache window (5 min, per [wire.md §17.4](wire.md#174-the-applied-push-model)).
 - `body` is an optional map carrying additional named arguments per the verb's `arg_spec`.
 
-Direct movement/entry verbs that return an object-shaped `{ room, here_request:
-true, ... }` result also include `here`, a shallow room snapshot in the same
-shape as `/api/me.here`. Older clients may continue to use `room` and
-`look_deferred`; scoped clients can hydrate the destination without a follow-up
-`:look` call. `look_deferred` is legacy and does not itself request snapshot
-enrichment.
+Movement/entry verbs that return an object-shaped `{ room, here_request: true,
+... }` result also include `here`, a shallow room snapshot in the same shape as
+`/api/me.here`. This applies to both direct and sequenced calls; for WebSocket
+sequenced calls, the result is delivered only to the originating client. Older
+clients may continue to use `room` and `look_deferred`; scoped clients can
+hydrate the destination without a follow-up `:look` call. `look_deferred` is
+legacy and does not itself request snapshot enrichment.
 
 When move execution defers cross-host presence writes, the returned `here`
 snapshot must still include the moving actor if the presented session's current

@@ -547,17 +547,18 @@ contract, not an implemented component API, and the SPA still uses
 
 ### Phase 3: client scoped-state flag
 
-Status: initial opt-in slice implemented behind `?scopedProjection` (also
-accepted as `?api=me`). The legacy `/api/state` path remains the default.
+Status: chat/current-room scoped projection is now the default browser path.
+The legacy `/api/state` path remains available during migration with
+`?api=state` or `?legacyState`.
 
-- The flagged client boots and reconnects from `/api/me` plus
+- The client boots and reconnects from `/api/me` plus
   `/api/catalogs/ui`, using `ETag`/`If-None-Match` for the catalog UI index.
-- The flagged client builds a small compatibility shell from `self`,
+- The client builds a small compatibility shell from `self`,
   `session`, `here`, `inventory`, and catalog UI metadata instead of fetching
   `/api/state`.
 - The framework ingests `/api/me` as scoped snapshots (`me`, `here`, and
   restored overlay handles).
-- The flagged client sends its last cursor on WS auth. v1 server auth replies
+- The client sends its last cursor on WS auth. v1 server auth replies
   `resumed: false`, so the client hydrates `/api/me` and then requests replay
   from the returned cursor.
 - In scoped mode, `scheduleRefresh()` is disabled; applied/task/replay frames
@@ -566,20 +567,59 @@ accepted as `?api=me`). The legacy `/api/state` path remains the default.
   locations in scoped mode.
 - Direct move/enter results that carry `here` atomically replace the scoped
   `here` snapshot before rendering.
+- Sequenced applied frames now carry the invoking verb's return value for the
+  originator only. Non-origin WS clients, SSE streams, and MCP broadcast queues
+  receive a public applied frame with `id` and `result` stripped. This lets
+  typed movement commands apply `result.here` in the scoped client without
+  leaking caller-only return data.
 - The scoped replay cursor advances on every sequenced frame the client sees,
   so a reconnect after movement does not replay from the original boot cursor.
+- Playwright covers the default chat boot path: `/objects/the_chatroom`
+  enters, moves Living Room -> Deck -> Living Room by typed commands, keeps
+  focus in the chat input, and fails if `/api/state` is fetched.
 
-Open after this slice: sequenced command results still do not carry return
-values in applied frames, so only direct move/enter paths can apply
-`result.here` directly. Replay observation reduction is basic and chat-focused.
+Open after this slice: replay observation reduction is basic and chat-focused.
 The scoped `here.present_actors` reducer currently handles `entered` and
 `left`; actor summary updates such as renames/descriptions still need generic
 summary reducers. The `adaptScopedWorld` object map is a compatibility shim
-for legacy renderers and is intentionally not the full world.
-Dubspace, pinboard, and taskspace still need Phase 4 overlay snapshots before
-the flagged client can replace the production UI end to end.
+for legacy renderers and is intentionally not the full world. Dubspace,
+pinboard, and taskspace still need Phase 4 overlay snapshots before the
+client can replace the production UI end to end. During that bridge window,
+opening a non-chat tool surface intentionally falls back to the legacy
+`/api/state` model.
 
 ### Phase 4: migrate controls and overlays
+
+Status: initial overlay-snapshot bridge implemented.
+
+- Added generic `GET /api/objects/<id>/ui-snapshot?surface=<surface>`.
+  It returns `{ surface, subject, cursor, room, objects }` and does not call
+  the full `/api/state` projection.
+- Dubspace, pinboard, and taskspace tabs load scoped overlay snapshots and
+  merge them into the temporary compatibility world instead of switching the
+  SPA to `/api/state`.
+- Overlay snapshot requests are coalesced per `(surface, subject)` while
+  in flight, so first activation from both the tab click path and `setTab()`
+  does not double-fetch the same snapshot.
+- The IDE/global object browser still intentionally falls back to the legacy
+  state projection. Leaving the IDE for an ordinary chat/tool tab re-enables
+  the scoped projection path and rehydrates `/api/me` if needed.
+- Dubspace `control_changed` observations now update the local compatibility
+  object/control projection before syncing audio, so typed commands such as
+  `filter 500` do not wait for a later UI gesture to become visible.
+- Playwright blocks `/api/state` while opening dubspace, pinboard, and
+  taskspace, proving ordinary tool-tab navigation is now on scoped overlays.
+
+Open after this slice: the current renderers still consume a compatibility
+world assembled from scoped snapshots. Full Phase 4 still needs native
+framework reads for each renderer and proper observation reducers for task
+creation/movement, pin add/delete/text edits, and all dubspace control changes.
+Bundled demo object ids are used only as a transitional route allowlist; custom
+installed worlds need a runtime scoped-route feed before their object URLs can
+default to scoped mode. The `leave` path still has a small `markLeftChatRoom`
+helper parallel to `applyScopedMoveResult`; once leave verbs return a scoped
+snapshot or explicit `$nowhere` location, that should collapse into the same
+move-result path.
 
 - Migrate dubspace controls/audio to `ui.observe`.
 - Migrate pinboard rendering to generic projection state.

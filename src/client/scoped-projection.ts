@@ -12,6 +12,7 @@ export type ScopedProjectionStateModel = {
   here?: any;
   inventory: any[];
   overlays: Record<string, any>;
+  overlaySnapshots?: Record<string, any>;
   error?: string;
 };
 

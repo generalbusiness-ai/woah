@@ -75,7 +75,8 @@ Reserved for transient hosts (see [browser-host.md](browser-host.md)):
 //   seq           — assigned sequence number
 //   message       — the message that was applied
 //   observations  — list of observation maps emitted during apply (durable)
-{ op: "applied", id?: string, space: ObjRef, seq: int, message: Map, observations: Map[] }
+//   result        — verb return value; present only for the originating client
+{ op: "applied", id?: string, space: ObjRef, seq: int, message: Map, observations: Map[], result?: Value }
 
 // A direct call completed. Any observations emitted by that call are delivered
 // separately as op:"event" frames to the call's live audience.
@@ -130,8 +131,14 @@ Browsers do not see audience fields directly on pushed `event` frames; the host 
 
 When an actor is connected, the player host sends `applied` frames for every sequenced call applied to spaces the actor is observing — including calls the actor itself originated.
 
-- For the originator, `id` matches the `op: "call"` they sent. They use this to pair the reply with their pending call, run any reconcile logic (§17.6), and discard the optimistic prediction.
-- For other observers, `id` is absent. They consume the applied frame as a state-update event.
+- For the originator, `id` matches the `op: "call"` they sent. The frame may
+  also carry `result`, the invoked verb's return value. They use this to pair
+  the reply with their pending call, apply caller-scoped results such as
+  `result.here`, run any reconcile logic (§17.6), and discard the optimistic
+  prediction. The originator receives this frame even if the call changes their
+  post-apply presence so they are no longer in the source space audience.
+- For other observers, `id` and `result` are absent. They consume the applied
+  frame as a state-update event.
 
 There is no separate subscribe/unsubscribe frame in the baseline wire. Membership in a space (which determines whether the host pushes its `applied` stream to a given client) is a server-side decision driven by the session's relationship to the space — typically session presence (`session_subscribers`) or explicit ownership.
 

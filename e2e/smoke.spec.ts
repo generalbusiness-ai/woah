@@ -71,6 +71,40 @@ test("chat route mounts bundled UI while state is still cold-starting", async ({
   await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
 });
 
+test("chat boot uses /api/me and moves without /api/state", async ({ page }) => {
+  const stateCalls: string[] = [];
+  await page.route("**/api/state", async (route) => {
+    stateCalls.push(route.request().url());
+    await route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "E_TEST", message: "/api/state should not be used by scoped chat" } })
+    });
+  });
+
+  await page.goto("/objects/the_chatroom");
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
+  await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
+
+  await page.getByRole("button", { name: "Enter" }).click();
+  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator(".toolbar h1")).toHaveText("Living Room");
+  await expect(page.locator("[data-chat-input]")).toBeFocused();
+
+  await page.locator("[data-chat-input]").fill("se");
+  await page.locator("[data-chat-input]").press("Enter");
+  await expect(page.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
+  await expect(page.locator("[data-chat-input]")).toBeFocused();
+  await expect(page.locator(".chat-feed")).toContainText("se");
+
+  await page.locator("[data-chat-input]").fill("west");
+  await page.locator("[data-chat-input]").press("Enter");
+  await expect(page.locator(".toolbar h1")).toHaveText("Living Room", { timeout: 5_000 });
+  await expect(page.locator("[data-chat-input]")).toBeFocused();
+  expect(stateCalls).toEqual([]);
+});
+
 test("switches between tabs", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
@@ -90,6 +124,34 @@ test("switches between tabs", async ({ page }) => {
 
   await page.getByRole("button", { name: "Chat" }).click();
   await expect(page.getByRole("button", { name: "Chat" })).toHaveClass(/active/);
+});
+
+test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
+  const stateCalls: string[] = [];
+  await page.route("**/api/state", async (route) => {
+    stateCalls.push(route.request().url());
+    await route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "E_TEST", message: "/api/state should not be used by scoped overlays" } })
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+
+  await page.getByRole("button", { name: "Dubspace" }).click();
+  await expect(page.locator(".toolbar h1")).toHaveText("Dubspace", { timeout: 5_000 });
+  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Pinboard" }).click();
+  await expect(page.locator(".pinboard-stage")).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Taskspace" }).click();
+  await expect(page.getByRole("button", { name: "Taskspace" })).toHaveClass(/active/);
+  await expect(page.locator(".task-create")).toBeVisible({ timeout: 5_000 });
+  expect(stateCalls).toEqual([]);
 });
 
 test("dubspace cue keeps loop controls local", async ({ page, request }) => {
@@ -412,7 +474,7 @@ test("pinboard shares viewport presence overlays", async ({ browser }) => {
 });
 
 test("chat controls follow room membership", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/?api=state");
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
 

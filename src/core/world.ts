@@ -115,6 +115,7 @@ export type HostBridge = {
   objectSummary(readActor: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<ScopedObjectSummary>;
   objectSummaries(readActor: ObjRef, objRefs: ObjRef[], memo?: HostOperationMemo): Promise<Record<ObjRef, ScopedObjectSummary>>;
   roomSnapshot(readActor: ObjRef, room: ObjRef, sessionId?: string | null, memo?: HostOperationMemo): Promise<RoomSnapshot>;
+  overlaySnapshot?(readActor: ObjRef, subject: ObjRef, surface: string, sessionId?: string | null, memo?: HostOperationMemo): Promise<OverlaySnapshot>;
   describeObject?(nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<HostObjectSummary>;
   describeObjects?(nameActor: ObjRef, readActor: ObjRef, objRefs: ObjRef[], memo?: HostOperationMemo): Promise<Record<ObjRef, HostObjectSummary>>;
   resolveVerb?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary | null>;
@@ -196,6 +197,14 @@ export type RoomSnapshot = {
   present_actors: ScopedObjectSummary[];
   contents: ScopedObjectSummary[];
   props?: Record<string, WooValue>;
+};
+
+export type OverlaySnapshot = {
+  surface: string;
+  subject: ObjRef;
+  cursor: MeSnapshot["cursor"];
+  room: RoomSnapshot | null;
+  objects: ScopedObjectSummary[];
 };
 
 export type MeSnapshot = {
@@ -1491,11 +1500,12 @@ export class WooWorld {
       this.logs.set(spaceRef, log);
 
       const observations: Observation[] = [];
-        const ctx: CallContext = {
-          world: this,
-          space: spaceRef,
-          seq,
-          session: sessionId,
+      let result: WooValue | undefined;
+      const ctx: CallContext = {
+        world: this,
+        space: spaceRef,
+        seq,
+        session: sessionId,
         actor: message.actor,
         player: message.actor,
         caller: "#-1",
@@ -1514,7 +1524,8 @@ export class WooWorld {
 
       try {
         await this.withBehaviorSavepoint(async () => {
-          await this.dispatch(ctx, message.target, message.verb, message.args);
+          result = await this.dispatch(ctx, message.target, message.verb, message.args);
+          result = await this.enrichScopedMoveResult(ctx, result);
         });
         logEntry.applied_ok = true;
       } catch (err) {
@@ -1536,7 +1547,7 @@ export class WooWorld {
       }
 
       logEntry.observations = cloneValue(observations as unknown as WooValue) as unknown as Observation[];
-      const frame = { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations };
+      const frame = { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations, result };
       this.persist(true);
       return frame;
     });
@@ -1544,7 +1555,7 @@ export class WooWorld {
     return frame;
   }
 
-    private async applyCallRepository(repo: ObjectRepository, id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
+  private async applyCallRepository(repo: ObjectRepository, id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
     const before = this.snapshotBehaviorState();
     const beforeLogs = this.snapshotLogs();
     const startedAt = Date.now();
@@ -1553,7 +1564,7 @@ export class WooWorld {
         this.validateMessage(message);
         const space = this.object(spaceRef);
         await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
-          this.authorizePresence(message.actor, spaceRef, sessionId);
+        this.authorizePresence(message.actor, spaceRef, sessionId);
         const seq = Number(this.getProp(spaceRef, "next_seq"));
         const ts = Date.now();
         this.setPropLocal(spaceRef, "next_seq", seq + 1);
@@ -1575,11 +1586,12 @@ export class WooWorld {
         this.bumpMutationVersion();
 
         const observations: Observation[] = [];
+        let result: WooValue | undefined;
         const ctx: CallContext = {
-            world: this,
-            space: spaceRef,
-            seq,
-            session: sessionId,
+          world: this,
+          space: spaceRef,
+          seq,
+          session: sessionId,
           actor: message.actor,
           player: message.actor,
           caller: "#-1",
@@ -1598,7 +1610,8 @@ export class WooWorld {
 
         try {
           await this.withBehaviorSavepoint(async () => {
-            await this.dispatch(ctx, message.target, message.verb, message.args);
+            result = await this.dispatch(ctx, message.target, message.verb, message.args);
+            result = await this.enrichScopedMoveResult(ctx, result);
           });
           logEntry.applied_ok = true;
         } catch (err) {
@@ -1628,7 +1641,7 @@ export class WooWorld {
           this.flushIncrementalState();
         });
         const audience = this.appliedFrameAudience(spaceRef, observations);
-        return { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations, ...audience };
+        return { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations, result, ...audience };
       });
       this.recordMetric({ kind: "applied", space: spaceRef, seq: frame.seq, verb: message.verb, ms: Date.now() - startedAt });
       return frame;
@@ -1750,6 +1763,32 @@ export class WooWorld {
       present_actors: presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
       contents: contentRefs.map((id) => contents[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
       props: roomSummary.props
+    };
+  }
+
+  async overlaySnapshotForActor(actor: ObjRef, subject: ObjRef, surface = "default", sessionId: string | null = null, memo: HostOperationMemo = createHostOperationMemo()): Promise<OverlaySnapshot> {
+    if (await this.remoteHostForObject(subject, memo)) {
+      if (!this.hostBridge?.overlaySnapshot) throw wooError("E_INTERNAL", "remote host bridge overlay snapshots unavailable");
+      return await this.hostBridge.overlaySnapshot(actor, subject, surface, sessionId, memo);
+    }
+
+    const room = await this.spaceLikeOrRemote(subject, memo)
+      ? await this.roomSnapshotForActor(actor, subject, sessionId, memo)
+      : null;
+    const refs = new Set<ObjRef>([subject]);
+    for (const id of await this.objectContents(subject, memo)) refs.add(id);
+    if (room) {
+      for (const item of room.present_actors) refs.add(item.id);
+      for (const item of room.contents) refs.add(item.id);
+      for (const item of room.exits) refs.add(item.id);
+    }
+    const summaries = await this.scopedObjectSummaries(actor, Array.from(refs), memo);
+    return {
+      surface,
+      subject,
+      cursor: await this.projectionCursor([subject], memo),
+      room,
+      objects: Array.from(refs).map((id) => summaries[id]).filter((item): item is ScopedObjectSummary => item !== undefined)
     };
   }
 

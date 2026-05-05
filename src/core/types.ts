@@ -83,9 +83,14 @@ export type AppliedFrame = {
   ts: number;
   message: Message;
   observations: Observation[];
+  result?: WooValue;
   audienceSessions?: string[];
   observationSessionAudiences?: string[][];
 };
+
+export function publicAppliedFrame(frame: AppliedFrame): AppliedFrame {
+  return { ...frame, id: undefined, result: undefined };
+}
 
 export type DirectResultFrame = {
   op: "result";

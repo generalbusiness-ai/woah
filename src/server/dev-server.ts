@@ -10,6 +10,7 @@ import { appliedFromLogEntry, handleRestProtocolRequest, handleWsProtocolFrame, 
 import { normalizeError, type ParkedTaskRun } from "../core/world";
 import {
   directedRecipients,
+  publicAppliedFrame,
   wooError,
   type AppliedFrame,
   type DirectResultFrame,
@@ -266,14 +267,16 @@ function authoringEnabled(): boolean {
 
 function broadcastApplied(frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
   const audienceSessions = frame.audienceSessions ? new Set(frame.audienceSessions) : null;
+  const publicFrame = publicAppliedFrame(frame);
+  if (originator && originator.readyState === WebSocket.OPEN) originator.send(JSON.stringify(frame));
   for (const [ws, session] of sockets) {
+    if (ws === originator) continue;
     if (ws.readyState !== ws.OPEN) continue;
     if (audienceSessions ? !audienceSessions.has(session.sessionId) : !world.hasPresence(session.actor, frame.space)) continue;
-    const visibleFrame = ws === originator ? frame : { ...frame, id: undefined };
-    ws.send(JSON.stringify(visibleFrame));
+    ws.send(JSON.stringify(publicFrame));
   }
-  broadcastAppliedSse(frame);
-  mcpGateway.routeAppliedFrame(frame, originMcpSessionId ?? null);
+  broadcastAppliedSse(publicFrame);
+  mcpGateway.routeAppliedFrame(publicFrame, originMcpSessionId ?? null);
 }
 
 function broadcastTaskResult(result: ParkedTaskRun): void {

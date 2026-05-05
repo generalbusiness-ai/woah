@@ -41,7 +41,7 @@ import {
   type RestProtocolRequest
 } from "../core/protocol";
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
-import { directedRecipients, wooError } from "../core/types";
+import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SerializedWorld } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
@@ -52,7 +52,7 @@ import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 
 // Re-import WooWorld type. Note `import type` must reach the world module
 // without dragging Node-only deps into the Worker bundle.
-import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, HostOperationMemo, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../core/world";
+import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, HostOperationMemo, MoveObjectResult, OverlaySnapshot, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../core/world";
 
 export interface Env {
   WOO: DurableObjectNamespace;
@@ -524,6 +524,19 @@ export class PersistentObjectDO {
           );
         };
         if (memo) return await memoizeHostOperation(memo.reads, `room-snapshot:${readActor}:${room}:${sessionId ?? ""}`, read);
+        return await read();
+      },
+      overlaySnapshot: async (readActor, subject, surface, sessionId, memo) => {
+        const read = async (): Promise<OverlaySnapshot> => {
+          const host = await hostForObject(subject, memo);
+          if (!host || host === localHost) return await world.overlaySnapshotForActor(readActor, subject, surface, sessionId ?? null, memo);
+          return await this.forwardInternalChecked<OverlaySnapshot>(
+            host,
+            "/__internal/overlay-snapshot",
+            { read_actor: readActor, subject, surface, session_id: sessionId ?? null }
+          );
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `overlay-snapshot:${readActor}:${subject}:${surface}:${sessionId ?? ""}`, read);
         return await read();
       },
       describeObject: async (nameActor, readActor, objRef, memo) => {
@@ -1150,6 +1163,14 @@ export class PersistentObjectDO {
         return jsonResponse(await world.roomSnapshotForActor(readActor, room, sessionId));
       }
 
+      if (request.method === "POST" && pathname === "/__internal/overlay-snapshot") {
+        const readActor = String(body.read_actor ?? "") as ObjRef;
+        const subject = String(body.subject ?? "") as ObjRef;
+        const surface = String(body.surface ?? "default");
+        const sessionId = typeof body.session_id === "string" ? body.session_id : null;
+        return jsonResponse(await world.overlaySnapshotForActor(readActor, subject, surface, sessionId));
+      }
+
       if (request.method === "POST" && pathname === "/__internal/remote-describe") {
         const readActor = String(body.read_actor ?? "") as ObjRef;
         const obj = String(body.obj ?? "") as ObjRef;
@@ -1695,14 +1716,24 @@ export class PersistentObjectDO {
     private broadcastApplied(world: WooWorld, frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
       const startedAt = Date.now();
       const data = JSON.stringify(frame);
-      const dataNoId = JSON.stringify({ ...frame, id: undefined });
+      const publicFrame = publicAppliedFrame(frame);
+      const dataNoId = JSON.stringify(publicFrame);
       let audienceSize = 0;
+      if (originator?.readyState === WebSocket.OPEN) {
+        try {
+          originator.send(data);
+          audienceSize += 1;
+        } catch {
+          // socket gone; webSocketClose will clean up
+        }
+      }
       const sendSockets = (sockets: Set<WebSocket> | undefined): void => {
         if (!sockets) return;
         for (const ws of sockets) {
+          if (ws === originator) continue;
           audienceSize += 1;
           try {
-            ws.send(ws === originator ? data : dataNoId);
+            ws.send(dataNoId);
           } catch {
             // socket gone; webSocketClose will clean up
           }
@@ -1716,7 +1747,7 @@ export class PersistentObjectDO {
           for (const actor of audience) sendSockets(this.socketsByActor.get(actor));
         }
       }
-    this.mcpGateway?.routeAppliedFrame(frame, originMcpSessionId ?? null);
+    this.mcpGateway?.routeAppliedFrame(publicFrame, originMcpSessionId ?? null);
     world.recordMetric({ kind: "broadcast", audience_size: audienceSize, obs_count: frame.observations.length, ms: Date.now() - startedAt });
   }
 

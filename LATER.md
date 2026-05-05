@@ -10,6 +10,9 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
+- "enter" just re-enters, which shouldn't be a thing
+- chat transparency isn't really working
+- better enter/leave messages; and for dubspace/pinboard/etc
 - santa's workshop
 - djspace
 - dubspace bpm
