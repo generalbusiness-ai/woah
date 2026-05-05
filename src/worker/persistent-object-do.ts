@@ -100,6 +100,7 @@ export class PersistentObjectDO {
   // (from world.presenceActorsIn) and looks up sockets directly. Built
   // on rehydrate and maintained on attach/detach.
   private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
+  private socketsBySession = new Map<string, Set<WebSocket>>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -299,12 +300,13 @@ export class PersistentObjectDO {
       // (hydrateSession in world.ts:1256). Re-attach each surviving socket
       // so presence-filtered broadcasts reach those clients again and the
       // session reap path doesn't expire actively-connected sessions.
-      this.socketsByActor.clear();
+        this.socketsByActor.clear();
+        this.socketsBySession.clear();
       for (const ws of this.state.getWebSockets()) {
         const att = this.attachment(ws);
         if (att && world.sessions?.has(att.sessionId)) {
           world.attachSocket(att.sessionId, att.socketId);
-          this.indexAddSocket(att.actor, ws);
+            this.indexAddSocket(att.sessionId, att.actor, ws);
         }
       }
       this.world = world;
@@ -550,10 +552,12 @@ export class PersistentObjectDO {
         if (!host || host === localHost) return await world.hostDispatch(ctx, target, verbName, args, startAt);
         const response = await this.forwardInternalChecked<{
           result: WooValue;
-          observations?: Observation[];
-          audience_actors?: ObjRef[];
-          observation_audiences?: ObjRef[][];
-          deferred_host_effects?: DeferredHostEffect[];
+            observations?: Observation[];
+            audience_actors?: ObjRef[];
+            observation_audiences?: ObjRef[][];
+            audience_sessions?: string[];
+            observation_session_audiences?: string[][];
+            deferred_host_effects?: DeferredHostEffect[];
         }>(host, "/__internal/remote-dispatch", {
           ctx: this.serializedCallContext(ctx),
           target,
@@ -567,12 +571,14 @@ export class PersistentObjectDO {
         // Surface authoritative audience info from the source DO so the
         // gateway's directCallNow uses it instead of recomputing from stale
         // local state.
-        if (response.audience_actors || response.observation_audiences) {
-          (ctx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][] } }).crossHostAudience = {
-            audienceActors: response.audience_actors,
-            observationAudiences: response.observation_audiences
-          };
-        }
+          if (response.audience_actors || response.observation_audiences || response.audience_sessions || response.observation_session_audiences) {
+            (ctx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] } }).crossHostAudience = {
+              audienceActors: response.audience_actors,
+              observationAudiences: response.observation_audiences,
+              audienceSessions: response.audience_sessions,
+              observationSessionAudiences: response.observation_session_audiences
+            };
+          }
         if (Array.isArray(response.deferred_host_effects)) {
           if (ctx.deferHostEffect) {
             for (const effect of response.deferred_host_effects) ctx.deferHostEffect(effect);
@@ -619,21 +625,49 @@ export class PersistentObjectDO {
         }
         await this.forwardInternalChecked(host, "/__internal/mirror-contents", { container: containerRef, obj: objRef, present });
       },
-      setActorPresence: async (actor, space, present) => {
+      setActorPresence: async (actor, space, present, sessionId) => {
         const host = await hostForObject(actor);
         if (!host || host === localHost) {
-          world.setActorPresence(actor, space, present);
+          world.setActorPresence(actor, space, present, sessionId);
           return;
         }
-        await this.forwardInternalChecked(host, "/__internal/actor-presence", { actor, space, present });
+        await this.forwardInternalChecked(host, "/__internal/actor-presence", { actor, space, present, session: sessionId ?? null });
       },
-      setSpaceSubscriber: async (space, actor, present) => {
+      setSpaceSubscriber: async (space, actor, present, sessionId) => {
         const host = await hostForObject(space);
         if (!host || host === localHost) {
-          world.setSpaceSubscriber(space, actor, present);
+          world.setSpaceSubscriber(space, actor, present, sessionId);
           return;
         }
-        await this.forwardInternalChecked(host, "/__internal/space-subscriber", { space, actor, present });
+        await this.forwardInternalChecked(host, "/__internal/space-subscriber", { space, actor, present, session: sessionId ?? null });
+      },
+      spaceAudienceSessions: async (space, actors, memo) => {
+        const read = async (): Promise<string[]> => {
+          const host = await hostForObject(space, memo);
+          if (!host || host === localHost) return world.presenceSessionIdsIn(space, actors);
+          const response = await this.forwardInternalChecked<{ sessions: string[] }>(
+            host,
+            "/__internal/space-audience-sessions",
+            { space, actors: actors ?? null }
+          );
+          return Array.isArray(response.sessions) ? response.sessions.filter((item): item is string => typeof item === "string") : [];
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `space-audience:${space}:${(actors ?? []).join(",")}`, read);
+        return await read();
+      },
+      actorSessionLocations: async (actor, memo) => {
+        const read = async (): Promise<ObjRef[]> => {
+          const host = await hostForObject(actor, memo);
+          if (!host || host === localHost) return world.allLocationsForActor(actor);
+          const response = await this.forwardInternalChecked<{ locations: ObjRef[] }>(
+            host,
+            "/__internal/actor-session-locations",
+            { actor }
+          );
+          return Array.isArray(response.locations) ? response.locations.filter((item): item is ObjRef => typeof item === "string") : [];
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `actor-locations:${actor}`, read);
+        return await read();
       },
       contents: async (objRef, memo) => {
         const read = async (): Promise<ObjRef[]> => {
@@ -716,8 +750,9 @@ export class PersistentObjectDO {
   private serializedCallContext(ctx: CallContext): Record<string, unknown> {
     return {
       space: ctx.space,
-      seq: ctx.seq,
-      actor: ctx.actor,
+        seq: ctx.seq,
+        session: ctx.session,
+        actor: ctx.actor,
       player: ctx.player,
       caller: ctx.caller,
       callerPerms: ctx.callerPerms,
@@ -920,11 +955,19 @@ export class PersistentObjectDO {
         const audienceActors = Array.isArray(body.audience_actors)
           ? body.audience_actors.filter((item): item is ObjRef => typeof item === "string")
           : undefined;
-        const observationAudiences = Array.isArray(body.observation_audiences)
-          ? body.observation_audiences.map((audience) => (
-              Array.isArray(audience) ? audience.filter((item): item is ObjRef => typeof item === "string") : []
-            ))
-          : undefined;
+          const observationAudiences = Array.isArray(body.observation_audiences)
+            ? body.observation_audiences.map((audience) => (
+                Array.isArray(audience) ? audience.filter((item): item is ObjRef => typeof item === "string") : []
+              ))
+            : undefined;
+          const audienceSessions = Array.isArray(body.audience_sessions)
+            ? body.audience_sessions.filter((item): item is string => typeof item === "string")
+            : undefined;
+          const observationSessionAudiences = Array.isArray(body.observation_session_audiences)
+            ? body.observation_session_audiences.map((audience) => (
+                Array.isArray(audience) ? audience.filter((item): item is string => typeof item === "string") : []
+              ))
+            : undefined;
         const observations = Array.isArray(body.observations)
           ? body.observations.filter((item): item is Record<string, WooValue> & { type: string } => (
               item !== null &&
@@ -934,7 +977,7 @@ export class PersistentObjectDO {
             ))
           : [];
         if (!audience) throw wooError("E_INVARG", "broadcast-live-events requires audience");
-        this.broadcastLiveEvents(world, { op: "result", result: null, observations, audience, audienceActors, observationAudiences });
+          this.broadcastLiveEvents(world, { op: "result", result: null, observations, audience, audienceActors, observationAudiences, audienceSessions, observationSessionAudiences });
         return jsonResponse({ ok: true });
       }
 
@@ -976,7 +1019,7 @@ export class PersistentObjectDO {
           String(body.target ?? "") as ObjRef,
           String(body.verb ?? ""),
           Array.isArray(body.args) ? body.args as WooValue[] : [],
-          { deferHostEffect: (effect) => deferredHostEffects.push(effect) }
+            { sessionId: session.id, deferHostEffect: (effect) => deferredHostEffects.push(effect) }
         );
         return jsonResponse(result.op === "result" ? { ...result, deferred_host_effects: deferredHostEffects } : result);
       }
@@ -1062,10 +1105,11 @@ export class PersistentObjectDO {
           : { actor, target, verb, args };
         const deferredHostEffects: DeferredHostEffect[] = [];
         const ctx: CallContext = {
-          world,
-          space: String(rawCtx.space ?? "#-1") as ObjRef,
-          seq: Number(rawCtx.seq ?? -1),
-          actor,
+            world,
+            space: String(rawCtx.space ?? "#-1") as ObjRef,
+            seq: Number(rawCtx.seq ?? -1),
+            session: typeof rawCtx.session === "string" ? rawCtx.session : null,
+            actor,
           player,
           caller: String(rawCtx.caller ?? "#-1") as ObjRef,
           callerPerms: String(rawCtx.callerPerms ?? rawCtx.progr ?? actor) as ObjRef,
@@ -1089,13 +1133,15 @@ export class PersistentObjectDO {
         // gateway's local view of a self-hosted space is stale and would
         // mis-filter the WS/MCP fan-out. Returned to the caller so the
         // gateway's broadcastLiveEvents has accurate audience information.
-        const audiences = world.computeDirectLiveAudiences(target, observations);
+        const audiences = await world.computeDirectLiveAudiences(target, observations);
         return jsonResponse({
           result,
-          observations,
-          audience_actors: audiences.audienceActors,
-          observation_audiences: audiences.observationAudiences,
-          deferred_host_effects: deferredHostEffects
+            observations,
+            audience_actors: audiences.audienceActors,
+            observation_audiences: audiences.observationAudiences,
+            audience_sessions: audiences.audienceSessions,
+            observation_session_audiences: audiences.observationSessionAudiences,
+            deferred_host_effects: deferredHostEffects
         });
       }
 
@@ -1122,7 +1168,8 @@ export class PersistentObjectDO {
         world.setActorPresence(
           String(body.actor ?? "") as ObjRef,
           String(body.space ?? "") as ObjRef,
-          body.present === true
+          body.present === true,
+          typeof body.session === "string" ? body.session : undefined
         );
         return jsonResponse({ ok: true });
       }
@@ -1131,9 +1178,21 @@ export class PersistentObjectDO {
         world.setSpaceSubscriber(
           String(body.space ?? "") as ObjRef,
           String(body.actor ?? "") as ObjRef,
-          body.present === true
+          body.present === true,
+          typeof body.session === "string" ? body.session : undefined
         );
         return jsonResponse({ ok: true });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/space-audience-sessions") {
+        const actors = Array.isArray(body.actors)
+          ? body.actors.filter((item): item is ObjRef => typeof item === "string")
+          : undefined;
+        return jsonResponse({ sessions: world.presenceSessionIdsIn(String(body.space ?? "") as ObjRef, actors) });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/actor-session-locations") {
+        return jsonResponse({ locations: world.allLocationsForActor(String(body.actor ?? "") as ObjRef) });
       }
 
       if (request.method === "POST" && pathname === "/__internal/contents") {
@@ -1172,9 +1231,8 @@ export class PersistentObjectDO {
     if (world.objects.has(actor)) return;
     const parent = world.objects.has("$player") ? "$player" : world.objects.has("$actor") ? "$actor" : null;
     world.createObject({ id: actor, name: actor, parent, owner: actor });
-    // No explicit property writes: `presence_in` already inherits the right
-    // default (`[]`) from $actor, and writing it here just adds a redundant
-    // per-actor row at every (actor × host) first-touch.
+    // No explicit property writes: first-touch actor stubs only need identity
+    // and ancestry for permission checks.
   }
 
   // ---- auth helpers (port from dev-server.ts) ----
@@ -1275,12 +1333,12 @@ export class PersistentObjectDO {
         const previous = this.attachment(ws);
         if (previous) {
           world.detachSocket(previous.sessionId, previous.socketId);
-          this.indexRemoveSocket(previous.actor, ws);
+            this.indexRemoveSocket(previous.sessionId, previous.actor, ws);
         }
         const socketId = `ws-${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         world.attachSocket(session.id, socketId);
         ws.serializeAttachment({ sessionId: session.id, actor: session.actor, socketId });
-        this.indexAddSocket(session.actor, ws);
+          this.indexAddSocket(session.id, session.actor, ws);
       },
       session: () => this.liveAttachment(world, ws),
       send: (_connection, frameValue) => ws.send(JSON.stringify(frameValue)),
@@ -1299,13 +1357,14 @@ export class PersistentObjectDO {
         world.touchSessionInput(session.sessionId);
         const host = await this.resolveObjectHost(target, WORLD_HOST);
         return host === WORLD_HOST
-          ? await world.directCall(
-              frameId,
-              session.actor,
-              target,
-              verb,
-              args
-            )
+            ? await world.directCall(
+                frameId,
+                session.actor,
+                target,
+                verb,
+                args,
+                { sessionId: session.sessionId }
+              )
           : await this.forwardWsDirect(world, host, frameId, session, target, verb, args);
       },
       replay: async (frameId, session, space, fromValue, limitValue) => {
@@ -1334,7 +1393,7 @@ export class PersistentObjectDO {
     const att = this.attachment(ws);
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
-      this.indexRemoveSocket(att.actor, ws);
+        this.indexRemoveSocket(att.sessionId, att.actor, ws);
     }
     try {
       ws.close();
@@ -1348,22 +1407,31 @@ export class PersistentObjectDO {
     const att = this.attachment(ws);
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
-      this.indexRemoveSocket(att.actor, ws);
+        this.indexRemoveSocket(att.sessionId, att.actor, ws);
     }
   }
 
-  private indexAddSocket(actor: ObjRef, ws: WebSocket): void {
-    let set = this.socketsByActor.get(actor);
-    if (!set) { set = new Set(); this.socketsByActor.set(actor, set); }
-    set.add(ws);
-  }
+    private indexAddSocket(sessionId: string, actor: ObjRef, ws: WebSocket): void {
+      let set = this.socketsByActor.get(actor);
+      if (!set) { set = new Set(); this.socketsByActor.set(actor, set); }
+      set.add(ws);
+      let sessionSet = this.socketsBySession.get(sessionId);
+      if (!sessionSet) { sessionSet = new Set(); this.socketsBySession.set(sessionId, sessionSet); }
+      sessionSet.add(ws);
+    }
 
-  private indexRemoveSocket(actor: ObjRef, ws: WebSocket): void {
-    const set = this.socketsByActor.get(actor);
-    if (!set) return;
-    set.delete(ws);
-    if (set.size === 0) this.socketsByActor.delete(actor);
-  }
+    private indexRemoveSocket(sessionId: string, actor: ObjRef, ws: WebSocket): void {
+      const set = this.socketsByActor.get(actor);
+      if (set) {
+        set.delete(ws);
+        if (set.size === 0) this.socketsByActor.delete(actor);
+      }
+      const sessionSet = this.socketsBySession.get(sessionId);
+      if (sessionSet) {
+        sessionSet.delete(ws);
+        if (sessionSet.size === 0) this.socketsBySession.delete(sessionId);
+      }
+    }
 
   // ---- WS helpers ----
 
@@ -1484,16 +1552,13 @@ export class PersistentObjectDO {
     };
   }
 
-  private broadcastApplied(world: WooWorld, frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
-    const startedAt = Date.now();
-    const data = JSON.stringify(frame);
-    const dataNoId = JSON.stringify({ ...frame, id: undefined });
-    let audienceSize = 0;
-    const audience = world.presenceActorsIn(frame.space);
-    if (audience) {
-      for (const actor of audience) {
-        const sockets = this.socketsByActor.get(actor);
-        if (!sockets) continue;
+    private broadcastApplied(world: WooWorld, frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
+      const startedAt = Date.now();
+      const data = JSON.stringify(frame);
+      const dataNoId = JSON.stringify({ ...frame, id: undefined });
+      let audienceSize = 0;
+      const sendSockets = (sockets: Set<WebSocket> | undefined): void => {
+        if (!sockets) return;
         for (const ws of sockets) {
           audienceSize += 1;
           try {
@@ -1502,8 +1567,15 @@ export class PersistentObjectDO {
             // socket gone; webSocketClose will clean up
           }
         }
+      };
+      if (frame.audienceSessions) {
+        for (const sessionId of frame.audienceSessions) sendSockets(this.socketsBySession.get(sessionId));
+      } else {
+        const audience = world.presenceActorsIn(frame.space);
+        if (audience) {
+          for (const actor of audience) sendSockets(this.socketsByActor.get(actor));
+        }
       }
-    }
     this.mcpGateway?.routeAppliedFrame(frame, originMcpSessionId ?? null);
     world.recordMetric({ kind: "broadcast", audience_size: audienceSize, obs_count: frame.observations.length, ms: Date.now() - startedAt });
   }
@@ -1533,17 +1605,23 @@ export class PersistentObjectDO {
 
   private broadcastLiveEvents(world: WooWorld, result: DirectResultFrame, originMcpSessionId?: string | null): void {
     if (!result.audience) return;
-    const startedAt = Date.now();
-    let audienceSize = 0;
-    result.observations.forEach((observation, index) => {
-      const frame: LiveEventFrame = { op: "event", observation };
-      audienceSize += this.broadcastLiveEvent(world, frame, result.audience!, result.observationAudiences?.[index] ?? result.audienceActors);
-    });
+      const startedAt = Date.now();
+      let audienceSize = 0;
+      result.observations.forEach((observation, index) => {
+        const frame: LiveEventFrame = { op: "event", observation };
+        audienceSize += this.broadcastLiveEvent(
+          world,
+          frame,
+          result.audience!,
+          result.observationAudiences?.[index] ?? result.audienceActors,
+          result.observationSessionAudiences?.[index] ?? result.audienceSessions
+        );
+      });
     this.mcpGateway?.routeLiveEvents(result, originMcpSessionId ?? null);
     world.recordMetric({ kind: "broadcast", audience_size: audienceSize, obs_count: result.observations.length, ms: Date.now() - startedAt });
   }
 
-  private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[]): number {
+    private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[]): number {
     const data = JSON.stringify(frame);
     const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
     let delivered = 0;
@@ -1554,12 +1632,16 @@ export class PersistentObjectDO {
         try { ws.send(data); } catch { /* gone */ }
       }
     };
-    if (directedTo || directedFrom) {
-      if (directedTo) sendAll(this.socketsByActor.get(directedTo));
-      if (directedFrom && directedFrom !== directedTo) sendAll(this.socketsByActor.get(directedFrom));
-      return delivered;
-    }
-    const actorsIter: Iterable<ObjRef> | null = audienceActors
+      if (directedTo || directedFrom) {
+        if (directedTo) sendAll(this.socketsByActor.get(directedTo));
+        if (directedFrom && directedFrom !== directedTo) sendAll(this.socketsByActor.get(directedFrom));
+        return delivered;
+      }
+      if (audienceSessions) {
+        for (const sessionId of audienceSessions) sendAll(this.socketsBySession.get(sessionId));
+        return delivered;
+      }
+      const actorsIter: Iterable<ObjRef> | null = audienceActors
       ? audienceActors
       : world.presenceActorsIn(audience);
     if (!actorsIter) return delivered;

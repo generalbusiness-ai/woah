@@ -40,7 +40,7 @@ ordering.
 - Assignee per task.
 - Message/activity timeline.
 - Artifact reference list.
-- Ephemeral embedded chat on `the_taskspace` using `chat:$conversational`.
+- Ephemeral embedded chat on `the_taskspace` using `chat:$transparent`.
 
 ## Persistent State
 
@@ -107,7 +107,7 @@ Each observation the taskspace emits has a defined payload shape:
 | `artifact_attached` | `{task: obj, ref: map}` | After `:add_artifact`. |
 
 All observations include `type` and `source` (the taskspace itself). All are persistent (sequenced via the taskspace).
-The embedded chat uses direct `$conversational` verbs, so chat observations are
+The embedded chat uses direct `$transparent` / `$conversational` verbs, so chat observations are
 live-only and do not enter the task lifecycle log.
 
 ## Minimal Interactions

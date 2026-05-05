@@ -191,11 +191,12 @@ CREATE TABLE space_snapshot (
 CREATE TABLE session (
   id             TEXT PRIMARY KEY,         -- session_id (random 128-bit)
   actor          TEXT NOT NULL,            -- objref of bound actor
-  started        INTEGER NOT NULL,
-  expires_at     INTEGER NOT NULL,
-  last_detach_at INTEGER,                  -- null while attached
-  token_class    TEXT NOT NULL             -- "guest" | "bearer" | "apikey"
-);
+    started        INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    last_detach_at INTEGER,                  -- null while attached
+    token_class    TEXT NOT NULL,            -- "guest" | "bearer" | "apikey"
+    current_location TEXT                    -- session-scoped current location
+  );
 
 -- Live websocket ids are not persisted. The in-memory connection registry is
 -- rebuilt from current connections; persisting socket ids creates orphaned

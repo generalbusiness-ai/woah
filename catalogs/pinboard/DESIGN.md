@@ -71,7 +71,7 @@ because it shares those verbs, not because of cross-tree inheritance.
 | `palette` | `$pinboard` | Allowed colors when `add_note` accepts a color. `white` is accepted as UI shorthand for `null`, not stored. |
 | `viewport` | `$pinboard` | Default viewport dimensions for clients. |
 | `mount_room` | `$pinboard` | Optional room that hosts this pinboard for room-level activity events. |
-| chat feature | `the_pinboard` seed instance | The bundled demo board attaches ephemeral `chat:$conversational`. Utterances are live observations, not durable pinboard log entries. When `$persistent_conversational` lands, the seed hook can swap to that durable feature. |
+| chat feature | `the_pinboard` seed instance | The bundled demo board attaches ephemeral `chat:$transparent`. Utterances are live observations, not durable pinboard log entries, and public speech is also heard in the containing room. When `$persistent_conversational` lands, the seed hook can swap to the durable transparent variant. |
 | `contents` | `$kanban_board` (built-in) | Pins currently on the kanban board. |
 | `columns` | `$kanban_board` | Ordered list of column records: `{id, title, cards}`. |
 | `next_column_id` | `$kanban_board` | Monotone counter for generated stable column ids. |

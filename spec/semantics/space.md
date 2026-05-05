@@ -7,7 +7,7 @@ status: implemented
 
 > Part of the [woo specification](../../SPEC.md). Layer: **semantics**.
 
-`$space` is woo's coordination workhorse: a `$sequenced_log` subclass that adds dispatch, subscribers, and observation broadcast on top of the underlying append-only sequence primitive. This document is the normative behavior of `$space:call` and the related lifecycle. The lower-level append/read primitive lives in [sequenced-log.md](sequenced-log.md). The conceptual framing is in [core.md §C4–§C6](core.md).
+`$space` is woo's coordination workhorse: a `$sequenced_log` subclass that adds dispatch, session-scoped presence, and observation broadcast on top of the underlying append-only sequence primitive. This document is the normative behavior of `$space:call` and the related lifecycle. The lower-level append/read primitive lives in [sequenced-log.md](sequenced-log.md). The conceptual framing is in [core.md §C4–§C6](core.md).
 
 The split: `$sequenced_log` provides atomically-allocated seqs and a durable message log; `$space` provides the dispatch loop, the audience model, and the applied-frame contract. Almost every coordination use case is a `$space`; alternative subclasses ([sequenced-log.md §SL6](sequenced-log.md#sl6-other-plausible-subclasses)) are possible without runtime changes.
 
@@ -21,7 +21,8 @@ A space has the inherited fields from `$sequenced_log` ([sequenced-log.md §SL1]
 
 | Field | Meaning |
 |---|---|
-| `subscribers` | list<obj>; actors observing this space's applied frames. |
+| `session_subscribers` | list<map>; authoritative live-session audience entries, each `{session, actor}`. |
+| `subscribers` | list<obj>; compatibility actor set derived from `session_subscribers`. Older catalog/UI code may read it, but new behavior should not write it directly. |
 
 Spaces may carry additional materialized state — the dubspace's `delay_feedback`, a chat room's `topic`. That state is the result of applying messages.
 
@@ -39,7 +40,7 @@ Spaces may carry additional materialized state — the dubspace's `delay_feedbac
 6. **On success:** commit mutations from step 5; observations from step 5 are queued for delivery.
 7. **On parked continuation:** if the behavior executes `SUSPEND`, `READ`, or another operation that parks the VM stack, commit the parking record and any mutations before the parking point, then deliver the applied frame for this message. The later wake/input is a new sequenced message (normally a runtime `$resume` frame; see [tasks.md §16.2](tasks.md#162-suspend-across-host-eviction) and [§16.6](tasks.md#166-read-tasks)) with a fresh seq allocated at resume time.
 8. **On failure (any raised err during step 5):** roll back mutations from step 5; the message remains in the log at its assigned `seq`; an `error` observation is queued describing the failure.
-9. **Deliver `applied` frame.** Push `{op: "applied", id?, space, seq, message, observations}` to subscribers (per [protocol/wire.md §17.4](../protocol/wire.md#174-the-applied-push-model)).
+9. **Deliver `applied` frame.** Push `{op: "applied", id?, space, seq, message, observations, audience_sessions?, observation_session_audiences?}` to the live sessions present in the space (per [protocol/wire.md §17.4](../protocol/wire.md#174-the-applied-push-model)). Actor-level `subscribers` is a compatibility projection, not the authoritative fan-out key.
 
 ---
 
@@ -93,7 +94,7 @@ The log is the audit trail. Wizards can read it; ordinary actors can read entrie
 
 The log records **messages** — the things that caused state changes. Observations emitted while applying a sequenced message are captured in that message's `applied` frame ([§S2](#s2-the-call-lifecycle) step 9) and are replay-visible as consequences of the message that produced them.
 
-Observations from **direct calls** to verbs on this space (e.g., `the_room:say("hi")`, when `:say` is direct-callable) are *not* in the log. They flow live to subscribers and are gone after delivery, per [events.md §12.6](events.md#126-observation-durability-follows-invocation-route). Being a `$space` does not make every emit on the object durable; the route of the emitting verb does.
+Observations from **direct calls** to verbs on this space (e.g., `the_room:say("hi")`, when `:say` is direct-callable) are *not* in the log. They flow live to the space's session audience and are gone after delivery, per [events.md §12.6](events.md#126-observation-durability-follows-invocation-route). Being a `$space` does not make every emit on the object durable; the route of the emitting verb does.
 
 ---
 

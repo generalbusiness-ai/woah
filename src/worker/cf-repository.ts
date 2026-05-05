@@ -508,9 +508,9 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
 
   saveSession(record: SerializedSession): void {
     this.sql.exec(
-      "INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class, current_location) VALUES (?, ?, ?, ?, ?, ?, ?)",
       record.id, record.actor, record.started,
-      record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest"
+      record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest", record.currentLocation ?? null
     );
   }
 
@@ -637,6 +637,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
     // CF Workers SQL doesn't support multi-statement exec in one call, so each
     // CREATE TABLE / CREATE INDEX runs separately.
     for (const stmt of SQL_SCHEMA_STATEMENTS) this.sql.exec(stmt);
+    this.ensureColumn("session", "current_location", "TEXT");
     this.ensureColumn("space_message", "observations", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureNullableSpaceMessageOutcome();
     this.ensureColumn("verb", "flags", "TEXT NOT NULL DEFAULT '{}'");

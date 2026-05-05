@@ -82,8 +82,8 @@ SSE event ids (`<log-id>:<seq>`) likewise reference `$sequenced_log` descendants
 
 `$space` is the v1 coordination workhorse. It adds:
 
-- `subscribers` list and presence-derived audience.
-- `call(message)` — protocol/host sequenced dispatch: validates, authorizes, appends through the host log primitive, runs the target verb, emits an applied frame to subscribers. See [space.md §S2](space.md#s2-the-call-lifecycle).
+- `session_subscribers` plus the compatibility `subscribers` actor projection.
+- `call(message)` — protocol/host sequenced dispatch: validates, authorizes, appends through the host log primitive, runs the target verb, emits an applied frame to the session audience. See [space.md §S2](space.md#s2-the-call-lifecycle).
 - `:replay(from, limit)` — object-visible public wrapper over the host log read operation.
 - `:on_applied(_event)` — reserved snapshot-triggering hook ([space.md §S7](space.md#s7-snapshots)); not installed by the v0 seed graph.
 - Single-threaded execution discipline ([space.md §S9](space.md#s9-single-threaded-by-construction)) — a subclass discipline, not a `$sequenced_log` rule.

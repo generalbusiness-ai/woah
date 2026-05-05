@@ -38,6 +38,7 @@ type VmFrame = {
 export type SerializedVmContext = {
   space: ObjRef;
   seq: number;
+  session?: string | null;
   actor: ObjRef;
   player: ObjRef;
   caller: ObjRef;
@@ -110,6 +111,7 @@ const BUILTIN_NAMES = [
   "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
   "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "random", "contents", "location", "task_perms",
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
+  "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
   "builder_create_object", "builder_chparent", "builder_recycle", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
@@ -925,7 +927,32 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       }
       case "location": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "location expects one object");
-        return await frame.ctx.world.objectLocationChecked(assertObj(builtinArgs[0]), frame.ctx.hostMemo);
+        const obj = assertObj(builtinArgs[0]);
+        if (obj === frame.ctx.actor && frame.ctx.session) return frame.ctx.world.currentLocationForSession(frame.ctx.session);
+        return await frame.ctx.world.objectLocationChecked(obj, frame.ctx.hostMemo);
+      }
+      case "current_location": {
+        if (builtinArgs.length !== 0) throw wooError("E_INVARG", "current_location expects no arguments");
+        return frame.ctx.world.currentLocationForSession(frame.ctx.session);
+      }
+      case "current_session": {
+        if (builtinArgs.length !== 0) throw wooError("E_INVARG", "current_session expects no arguments");
+        return frame.ctx.session;
+      }
+      case "session_location": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "session_location expects one session id");
+        return frame.ctx.world.currentLocationForSession(String(builtinArgs[0] ?? ""));
+      }
+      case "all_locations": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "all_locations expects one object");
+        const obj = assertObj(builtinArgs[0]);
+        if (frame.ctx.world.isDescendantOf(obj, "$actor")) return frame.ctx.world.allLocationsForActor(obj);
+        const loc = await frame.ctx.world.objectLocationChecked(obj, frame.ctx.hostMemo);
+        return loc ? [loc] : [];
+      }
+      case "primary_session": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "primary_session expects one actor");
+        return frame.ctx.world.primarySessionForActor(assertObj(builtinArgs[0]))?.id ?? null;
       }
       case "task_perms":
         if (builtinArgs.length !== 0) throw wooError("E_INVARG", "task_perms expects no arguments");
@@ -1101,8 +1128,9 @@ function serializeVmFrames(frames: VmFrame[]): SerializedVmTask {
 function serializeVmFrame(frame: VmFrame): SerializedVmFrame {
   return {
     ctx: {
-      space: frame.ctx.space,
-      seq: frame.ctx.seq,
+        space: frame.ctx.space,
+        seq: frame.ctx.seq,
+        session: frame.ctx.session,
       actor: frame.ctx.actor,
       player: frame.ctx.player,
       caller: frame.ctx.caller,
@@ -1129,9 +1157,10 @@ function serializeVmFrame(frame: VmFrame): SerializedVmFrame {
 
 function hydrateVmFrame(world: CallContext["world"], frame: SerializedVmFrame, observations: Observation[]): VmFrame {
   const ctx: CallContext = {
-    world,
-    space: frame.ctx.space,
-    seq: frame.ctx.seq,
+      world,
+      space: frame.ctx.space,
+      seq: frame.ctx.seq,
+      session: frame.ctx.session ?? null,
     actor: frame.ctx.actor,
     player: frame.ctx.player,
     caller: frame.ctx.caller,

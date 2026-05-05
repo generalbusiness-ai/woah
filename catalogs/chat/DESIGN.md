@@ -17,7 +17,7 @@ A canonical MOO surface — rooms, presence, talk, emote, tell — built as a fe
 
 ## Goal
 
-Show that woo's MOO-shaped composition works in practice: chat behavior is a *feature*, not an inheritance, so any `$space` (a `$chatroom`, a `$taskspace`, a `$dubspace`) can opt into it by attaching `$conversational` to its `features` list.
+Show that woo's MOO-shaped composition works in practice: chat behavior is a *feature*, not an inheritance, so any `$space` can opt into it by attaching `$conversational` or one of its acoustic variants (`$transparent`, `$semitransparent`) to its `features` list.
 
 This is the demo that retires the question "do feature objects pull their weight?" If the chat experiment composes cleanly with the other demos, the answer is yes.
 
@@ -42,11 +42,11 @@ The chat verbs use the **direct live interaction** pattern from [core.md §C13](
 | direction verbs / `:go` | direct | actor presence/location |
 | `:take` / `:drop` | direct | object location |
 | `:give` (on `$portable`) | direct | object location; private — no room broadcast |
-| `:enter` / `:leave` | direct | session/presence (persistent state on `$actor.presence_in` and `$space.subscribers`) |
+| `:enter` / `:leave` | direct | session current location and `$space.session_subscribers` |
 | `:command_plan` | direct parser | none; returns the concrete route/target/verb/args |
 | `:command` | direct dispatcher | compatibility wrapper for direct-only plans |
 
-Because the chat verbs route directly, every observation they emit is live-only by [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route): pushed to subscribers, never stored. A late-joining client sees no scrollback. This matches MOO's `notify()` semantics. Object commands that mutate state can still route through the room's sequenced log; for example `teach bird "hello"` plans as a `$space:call` against the cockatoo, so the mutation and observation are replay-visible.
+Because the chat verbs route directly, every observation they emit is live-only by [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route): pushed to the room's session audience, never stored. A late-joining client sees no scrollback. This matches MOO's `notify()` semantics. Object commands that mutate state can still route through the room's sequenced log; for example `teach bird "hello"` plans as a `$space:call` against the cockatoo, so the mutation and observation are replay-visible.
 
 **Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a taskspace's `:claim`, `:transition`); chat traffic flows past it.
 
@@ -65,7 +65,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:say(text)` | str | Public utterance. Emits `said {actor, text}` to subscribers (live; not stored). |
+| `:say(text)` | str | Public utterance. Emits `said {actor, text}` to the room audience (live; not stored). |
 | `:say_to(recipient, text)` | obj, str | Directed public utterance from backtick syntax (`` `recipient text ``). For player recipients, emits `said_to` to the room (directed but in-room speech). For non-player recipients that define `:on_say_to(text)`, dispatches to `recipient:on_say_to(text)` so the object can interpret the utterance as a command (e.g. `` `filter 500 `` calls `filter_1:on_say_to("500")`). The hook name is distinct from `$player:tell` so the LambdaMOO output contract on players is not overloaded. |
 | `:say_as(style, text)` | str, str | Styled public utterance from `[style] text`. Emits `said_as`. |
 | `:emote(text)` | str | Third-person action. Emits `emoted {actor, text}`. |
@@ -74,18 +74,31 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
 | `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
 | `:who()` rxd | — | Returns the present-actor list and emits a private `who` observation to the caller. |
-| `:enter(actor?)` | obj? | Adds actor (defaults `actor`) to subscribers and to its `presence_in`; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
-| `:leave(actor?)` | obj? | Removes presence and emits room-originated `left`. |
+| `:enter(actor?)` | obj? | Moves the calling session into the room; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
+| `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |
 | `:huh(text, reason?)` | str, str? | Emits a parse-failure observation. |
 | `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, args, cmd}`. |
 | `:command(text)` | str | Compatibility wrapper for direct plans; richer clients should call `:command_plan` and then execute the plan. |
 
 Most `$conversational` verbs are portable source, including the command planner. `$match` still uses trusted local native implementation hints for tokenizer/object-matcher primitives. Public tap installs ignore those hints and still compile the source fallback.
 
+## Acoustic Features
+
+`$transparent < $conversational` is the embedded-space variant used by
+Dubspace, Pinboard, and Taskspace. It inherits the normal chat parser and
+overrides public speech forms so each utterance is observed locally and also
+forwarded to `location(this)`. It also implements `:hear_parent_announce`, so
+announcements in the containing room are heard inside.
+
+`$semitransparent < $conversational` is the cone-of-silence variant: it hears
+parent announcements through `:hear_parent_announce`, but inherited public
+speech stays local. Concrete contained rooms can attach it for cases like a
+rain curtain around a hot tub.
+
 Room entry/exit (`:enter`, `:leave`) is source woocode on `$conversational`.
 Geographic movement belongs to `$room` and `$exit` below. The core only
-supplies generic primitives: `set_presence`, `moveto`, `observe_to_space`,
-`tell`, and `location`. Carrying objects with `:take` and `:drop` is source
+supplies generic primitives: `moveto`, `observe_to_space`, `tell`, and
+`location`. Carrying objects with `:take` and `:drop` is source
 woocode on `$room`: the matcher remains a trusted primitive, but portable
 checks, user-facing text, `moveto`, and `taken` / `dropped` observations are
 catalog-authored behavior.
@@ -99,11 +112,11 @@ the recipient's `:acceptable` hook gates the transfer, and confirms the
 move landed before tell-ing the giver and recipient. Transfers are
 private — no room-wide observation, matching LambdaMOO's `$thing:give`.
 
-Inside each verb body: `this` = the consumer space (the room being talked in), `definer` = the `$conversational` feature, `progr` = the feature's owner. Observations are emitted to `this.subscribers`, not to the feature's own subscribers (which would be empty).
+Inside each verb body: `this` = the consumer space (the room being talked in), `definer` = the `$conversational` feature, `progr` = the feature's owner. Observations are routed to `this`'s session audience, not to the feature object's audience (which would be empty).
 
 ## Observation schemas
 
-`$conversational` declares schemas for each observation type so consumers (UIs, agents, conformance tests) have a contract on payload shape. Schemas describe shape only ([events.md §13](../../spec/semantics/events.md#13-schemas)); durability follows the route of the verb that emits each observation. All chat verbs are direct, so all observations below reach subscribers as live `event` frames, never as `applied` frames.
+`$conversational` declares schemas for each observation type so consumers (UIs, agents, conformance tests) have a contract on payload shape. Schemas describe shape only ([events.md §13](../../spec/semantics/events.md#13-schemas)); durability follows the route of the verb that emits each observation. All chat verbs are direct, so all observations below reach the room session audience as live `event` frames, never as `applied` frames.
 
 ```woo
 declare_event $conversational "said"    { source: obj, actor: obj, text: str };
@@ -181,13 +194,13 @@ follow a successful movement result by calling `:look()` on that room.
 
 The room's chat behavior still comes from `$conversational`; exits and carrying are room mechanics, not feature mechanics.
 
-For embedded mode, `the_taskspace` (a `$taskspace`) gets the same feature attached at boot:
+For embedded mode, `the_taskspace` (a `$taskspace`) gets the transparent chat feature attached at boot:
 
 ```
-the_taskspace.features = [$conversational]
+the_taskspace.features = [$transparent]
 ```
 
-Now `the_taskspace:say("starting standup")` works. The utterance is a direct call, so the `said` observation is live-only — pushed to taskspace subscribers, separate from the taskspace's own sequenced log of task mutations.
+Now `the_taskspace:say("starting standup")` works. The utterance is a direct call, so the `said` observation is live-only — pushed to taskspace's session audience, separate from the taskspace's own sequenced log of task mutations.
 
 ## Seeded Rooms And Things
 
@@ -208,7 +221,7 @@ Because it is anchored to the living room, the cockatoo is intentionally absent 
 
 What's intentionally not (yet) here: **self-driven timer chatter**. The canonical LambdaMOO cockatoo activated and squawked on a fork loop with a random delay. Woo's runtime supports parked/forked tasks, but the DSL does not yet expose `fork(seconds) { ... }` or a `schedule(seconds, target, verb, args)` builtin. Once it does, the cockatoo will become the first useful demo of woo's parked-task system: install a watchdog verb that schedules itself, with random interval and random phrase pick. Until then, squawking is actor-driven only.
 
-**When the timer lands, gate it on presence.** A cockatoo that schedules a wakeup every N seconds against an empty room would keep the chatroom DO out of CF hibernation indefinitely — DO billing is by active wall time, so a continuously-self-squawking bird in an unattended room is a money-burning bird. Cheap mitigation, also true to the LambdaMOO `@activate` pattern: start the fork loop on `:enter` when subscribers transition from 0 → 1, cancel the next scheduled fork on `:leave` when subscribers go back to 0. That keeps DO wake-ups proportional to *actor presence* rather than wall clock; an empty chatroom hibernates as it would without the cockatoo.
+**When the timer lands, gate it on presence.** A cockatoo that schedules a wakeup every N seconds against an empty room would keep the chatroom DO out of CF hibernation indefinitely — DO billing is by active wall time, so a continuously-self-squawking bird in an unattended room is a money-burning bird. Cheap mitigation, also true to the LambdaMOO `@activate` pattern: start the fork loop on `:enter` when the session audience transitions from 0 → 1, cancel the next scheduled fork on `:leave` when it goes back to 0. That keeps DO wake-ups proportional to session presence rather than wall clock; an empty chatroom hibernates as it would without the cockatoo.
 
 **Determinism if the wake path is sequenced.** If the scheduled wake fires through `the_chatroom`'s sequenced log so other clients see the same squawk on replay, calling `random()` *inside* the resumed handler breaks replay determinism (per [space.md](../../spec/semantics/space.md)). Capture randomness at *schedule time* — the scheduler picks the next phrase and the next interval and passes both as args/body to the scheduled message — rather than re-rolling on the wake. That mirrors the LambdaMOO `fork` pattern, where the next-scheduled call is itself the value chosen at this tick.
 

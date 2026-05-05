@@ -231,7 +231,7 @@ describe("sqlite persistence", () => {
       firstRepo.propertySaves = [];
       const applied = await callInDubspace(firstWorld, session.id, "incremental-1", message(session.actor, "the_dubspace", "set_control", ["delay_1", "wet", 0.73]));
       expect(applied.op).toBe("applied");
-      expect(firstRepo.objectSaves).toEqual([]);
+        expect(firstRepo.objectSaves).toEqual(expect.arrayContaining([session.actor, "$nowhere", "the_dubspace"]));
       expect(firstRepo.propertySaves).toEqual(expect.arrayContaining(["the_dubspace.next_seq", "delay_1.wet"]));
       firstWorld.saveSnapshot("the_dubspace");
       firstRepo.close();

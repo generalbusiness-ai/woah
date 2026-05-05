@@ -692,13 +692,13 @@ The catalogs under `catalogs/` ship with this repository for two distinct purpos
 | Catalog | Role | Ship for general deployment? | Notes |
 |---|---|---|---|
 | `help` | **Foundational utility** | Yes | In-world help-database framework (`$help_db`). Other catalogs append entries; chat depends on it. |
-| `chat` | **Foundational utility** | Yes | Provides `$conversational` (feature object), `$match` (text-to-action scaffold), `$room`/`$exit` (room geography), `$chatroom` template, and `$portable`/`$furniture` base classes. **Seeds no instances** — install `demoworld` for the bundled Living Room demo. |
+| `chat` | **Foundational utility** | Yes | Provides `$conversational`, `$transparent`, and `$semitransparent` feature objects, `$match` (text-to-action scaffold), `$room`/`$exit` (room geography), `$chatroom` template, and `$portable`/`$furniture` base classes. **Seeds no instances** — install `demoworld` for the bundled Living Room demo. |
 | `note` | **Foundational utility** | Optional | Generic portable text-bearing thing. Subclassed by pinboard pins; useful as a standalone primitive. |
 | `prog` | **Foundational utility** | Optional | Builder/programmer authority tooling for in-world authoring. Required only for worlds that allow runtime programming. |
 | `demoworld` | **Demo seed** | No | The first-light demo's seed catalog: `$cockatoo` class plus the populated Living Room / Deck / Hot Tub set with exits, props, and the cockatoo. Owns the mount-point rooms that `dubspace` and `pinboard` reference. |
-| `dubspace` | **Demo application** | No | Shared dub-mix sound space. Seeds `the_dubspace` mounted in `demoworld:the_chatroom` with `chat:$conversational` attached; depends on `chat` + `demoworld`. |
-| `taskspace` | **Demo application** | No | Hierarchical task coordination. Seeds `the_taskspace` with `chat:$conversational` attached; depends on `chat` only (does not mount in any demoworld room). |
-| `pinboard` | **Demo application** | No | Spatial bulletin board. Seeds `the_pinboard` mounted in `demoworld:the_deck`; depends on `chat` + `note` + `demoworld`. |
+| `dubspace` | **Demo application** | No | Shared dub-mix sound space. Seeds `the_dubspace` mounted in `demoworld:the_chatroom` with `chat:$transparent` attached; depends on `chat` + `demoworld`. |
+| `taskspace` | **Demo application** | No | Hierarchical task coordination. Seeds `the_taskspace` with `chat:$transparent` attached; depends on `chat` only (does not mount in any demoworld room). |
+| `pinboard` | **Demo application** | No | Spatial bulletin board. Seeds `the_pinboard` mounted in `demoworld:the_deck` with `chat:$transparent` attached; depends on `chat` + `note` + `demoworld`. |
 
 **Foundational utilities** are reusable building blocks: a typical operator-deployed world will install some or all four. **Demo applications** are illustrative and runnable but are not part of the core feature set. The **demo seed** catalog (`demoworld`) is a thin wiring layer: it picks the names, locations, exits, and props that make the bundled demo a coherent place. An operator who wants the foundational classes without the bundled demo installs the four foundational catalogs and stops.
 

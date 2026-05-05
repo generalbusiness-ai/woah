@@ -83,6 +83,7 @@ export type CallContext = {
   world: WooWorld;
   space: ObjRef;
   seq: number;
+  session: string | null;
   actor: ObjRef;
   player: ObjRef;
   caller: ObjRef;
@@ -103,8 +104,8 @@ export type CallContext = {
 };
 
 export type DeferredHostEffect =
-  | { kind: "actor_presence"; actor: ObjRef; space: ObjRef; present: boolean }
-  | { kind: "space_subscriber"; space: ObjRef; actor: ObjRef; present: boolean }
+  | { kind: "actor_presence"; actor: ObjRef; space: ObjRef; present: boolean; session?: string }
+  | { kind: "space_subscriber"; space: ObjRef; actor: ObjRef; present: boolean; session?: string }
   | { kind: "move_object"; obj: ObjRef; target: ObjRef; suppress_mirror_host?: string | null };
 
 export type HostBridge = {
@@ -118,8 +119,10 @@ export type HostBridge = {
   dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
   moveObject(objRef: ObjRef, targetRef: ObjRef, options?: { suppressMirrorHost?: string | null }): Promise<MoveObjectResult>;
   mirrorContents(containerRef: ObjRef, objRef: ObjRef, present: boolean): Promise<void>;
-  setActorPresence(actor: ObjRef, space: ObjRef, present: boolean): Promise<void>;
-  setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean): Promise<void>;
+  setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void>;
+  setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void>;
+  spaceAudienceSessions?(space: ObjRef, actors?: ObjRef[], memo?: HostOperationMemo): Promise<string[]>;
+  actorSessionLocations?(actor: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]>;
   contents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]>;
   // Cross-host MCP reachability (spec/protocol/mcp.md §M3). Asks the host
   // owning each id for tool descriptors covering that id's tool-exposed verbs
@@ -171,6 +174,7 @@ export type ParkedTaskRun = {
 export type DirectCallOptions = {
   forceDirect?: boolean;
   forceReason?: string;
+  sessionId?: string | null;
   deferHostEffect?: (effect: DeferredHostEffect) => void;
 };
 
@@ -269,12 +273,14 @@ export class WooWorld {
   // second local behavior mutate the same in-memory state mid-savepoint.
   private hostQueue: Promise<unknown> = Promise.resolve();
   private metricsHook: ((event: MetricEvent) => void) | null = null;
-  // O(1) presence lookup. Mirrors the `subscribers` list-property on each
-  // $space and the `presence_in` list on each actor. Built lazily; kept in
-  // sync from setPropLocal so writes through the verb path stay coherent.
-  // importWorld resets `presenceIndexBuilt` to force a fresh scan.
+  // O(1) presence lookup. `session_subscribers` is authoritative for live
+  // sessions; `subscribers` remains a compatibility actor projection for
+  // catalog state and older worlds. Built lazily; kept in sync from
+  // setPropLocal so writes through the verb path stay coherent.
   private subscribersIndex = new Map<ObjRef, Set<ObjRef>>();
   private actorPresenceIndex = new Map<ObjRef, Set<ObjRef>>();
+  private sessionSubscribersIndex = new Map<ObjRef, Map<string, ObjRef>>();
+  private sessionSpacesIndex = new Map<string, Set<ObjRef>>();
   private presenceIndexBuilt = false;
   private lastSubscriberScrubAt = new Map<ObjRef, number>();
 
@@ -407,11 +413,10 @@ export class WooWorld {
     if (!target.properties.has(property.name)) {
       target.properties.set(property.name, cloneValue(property.defaultValue));
       target.propertyVersions.set(property.name, 1);
-      // Catalog migrations that add `subscribers`/`presence_in` with a
+      // Catalog migrations that add presence properties with a
       // non-empty default would otherwise bypass setPropLocal. Invalidate
-      // rather than incrementally updating: presence is the OR of two
-      // independent properties, so single-property provenance matters.
-      if (property.name === "subscribers" || property.name === "presence_in") {
+      // rather than incrementally updating.
+      if (property.name === "subscribers" || property.name === "session_subscribers") {
         this.invalidatePresenceIndex();
       }
     }
@@ -432,7 +437,7 @@ export class WooWorld {
     obj.properties.set(name, cloneValue(value));
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
     obj.modified = Date.now();
-    if (name === "subscribers" || name === "presence_in") {
+    if (name === "subscribers" || name === "session_subscribers") {
       this.invalidatePresenceIndex();
     }
   }
@@ -440,20 +445,32 @@ export class WooWorld {
   // Drop the in-memory presence index. The next read rebuilds it. Call
   // sites that mutate presence-related properties use this to avoid drift.
   // This intentionally invalidates instead of incrementally editing one
-  // relation: `hasPresence()` is true if either `actor.presence_in` or
-  // `space.subscribers` contains the relation, so an index entry has no
-  // single source of truth.
+  // relation: live presence comes from `session_subscribers`, while
+  // compatibility reads still consult `subscribers`.
   invalidatePresenceIndex(): void {
     this.presenceIndexBuilt = false;
     this.subscribersIndex.clear();
     this.actorPresenceIndex.clear();
+    this.sessionSubscribersIndex.clear();
+    this.sessionSpacesIndex.clear();
   }
 
   private ensurePresenceIndex(): void {
     if (this.presenceIndexBuilt) return;
     this.subscribersIndex.clear();
     this.actorPresenceIndex.clear();
+    this.sessionSubscribersIndex.clear();
+    this.sessionSpacesIndex.clear();
     for (const obj of this.objects.values()) {
+      const sessionSubs = obj.properties.get("session_subscribers");
+      if (Array.isArray(sessionSubs)) {
+        for (const entry of sessionSubs) {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+          const map = entry as Record<string, WooValue>;
+          if (typeof map.session !== "string" || typeof map.actor !== "string") continue;
+          this.indexSessionSubscriber(obj.id, map.session, map.actor);
+        }
+      }
       const subs = obj.properties.get("subscribers");
       if (Array.isArray(subs)) {
         const ids = subs.filter((item): item is ObjRef => typeof item === "string");
@@ -466,22 +483,17 @@ export class WooWorld {
           }
         }
       }
-      const pres = obj.properties.get("presence_in");
-      if (Array.isArray(pres)) {
-        const ids = pres.filter((item): item is ObjRef => typeof item === "string");
-        if (ids.length > 0) {
-          let spaces = this.actorPresenceIndex.get(obj.id);
-          if (!spaces) { spaces = new Set(); this.actorPresenceIndex.set(obj.id, spaces); }
-          for (const space of ids) {
-            spaces.add(space);
-            let subs2 = this.subscribersIndex.get(space);
-            if (!subs2) { subs2 = new Set(); this.subscribersIndex.set(space, subs2); }
-            subs2.add(obj.id);
-          }
-        }
-      }
     }
     this.presenceIndexBuilt = true;
+  }
+
+  private indexSessionSubscriber(space: ObjRef, sessionId: string, actor: ObjRef): void {
+    let sessions = this.sessionSubscribersIndex.get(space);
+    if (!sessions) { sessions = new Map(); this.sessionSubscribersIndex.set(space, sessions); }
+    sessions.set(sessionId, actor);
+    let spaces = this.sessionSpacesIndex.get(sessionId);
+    if (!spaces) { spaces = new Set(); this.sessionSpacesIndex.set(sessionId, spaces); }
+    spaces.add(space);
   }
 
   deleteProp(objRef: ObjRef, name: string): boolean {
@@ -494,7 +506,7 @@ export class WooWorld {
     if (!hadProperty) return false;
     obj.modified = Date.now();
     this.deletePersistedProperty(objRef, name);
-    if (name === "subscribers" || name === "presence_in") {
+    if (name === "subscribers" || name === "session_subscribers") {
       this.invalidatePresenceIndex();
     }
     this.persist();
@@ -982,6 +994,7 @@ export class WooWorld {
       expiresAt: now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
+      currentLocation: this.initialSessionLocation(actor),
       attachedSockets: new Set(),
       lastInputAt: now
     };
@@ -992,7 +1005,6 @@ export class WooWorld {
       // `world.sessions` is the source of truth for session lifecycle. The
       // formerly-written mirror property fired on every (actor × host)
       // first-touch and was a top-3 ambient writer.
-      this.ensureAutoPresence(actor);
     });
     return session;
   }
@@ -1014,6 +1026,7 @@ export class WooWorld {
       expiresAt: expiresAt ?? now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
+      currentLocation: this.initialSessionLocation(actor),
       attachedSockets: new Set(),
       lastInputAt: now
     };
@@ -1024,9 +1037,15 @@ export class WooWorld {
       // `world.sessions` is the source of truth for session lifecycle. The
       // formerly-written mirror property fired on every (actor × host)
       // first-touch and was a top-3 ambient writer.
-      this.ensureAutoPresence(actor);
     });
     return session;
+  }
+
+  private initialSessionLocation(actor: ObjRef): ObjRef {
+    const obj = this.object(actor);
+    const home = this.propOrNull(actor, "home");
+    if (obj.location && this.objects.has(obj.location)) return obj.location;
+    return typeof home === "string" && this.objects.has(home) ? home : "$nowhere";
   }
 
   claimWizardBootstrapSession(presentedToken: string, expectedToken: string | undefined): Session {
@@ -1121,6 +1140,49 @@ export class WooWorld {
     return false;
   }
 
+  primarySessionForActor(actor: ObjRef): Session | null {
+    let best: Session | null = null;
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor) continue;
+      if (this.sessionExpired(session, Date.now())) continue;
+      if (best === null || session.started < best.started || (session.started === best.started && session.id < best.id)) {
+        best = session;
+      }
+    }
+    return best;
+  }
+
+  private primarySessionForActorIncludingExpired(actor: ObjRef): Session | null {
+    let best: Session | null = null;
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor) continue;
+      if (best === null || session.started < best.started || (session.started === best.started && session.id < best.id)) {
+        best = session;
+      }
+    }
+    return best;
+  }
+
+  currentLocationForSession(sessionId: string | null | undefined): ObjRef | null {
+    if (!sessionId) return null;
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.sessionAlive(sessionId)) return null;
+    return session.currentLocation;
+  }
+
+  allLocationsForActor(actor: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor) continue;
+      if (!out.includes(session.currentLocation)) out.push(session.currentLocation);
+    }
+    if (out.length === 0) {
+      const loc = this.objects.get(actor)?.location ?? null;
+      if (loc) out.push(loc);
+    }
+    return out;
+  }
+
   hasPresence(actor: ObjRef, space: ObjRef): boolean {
     this.ensurePresenceIndex();
     const subs = this.subscribersIndex.get(space);
@@ -1136,6 +1198,27 @@ export class WooWorld {
   presenceActorsIn(space: ObjRef): ReadonlySet<ObjRef> | null {
     this.ensurePresenceIndex();
     return this.subscribersIndex.get(space) ?? null;
+  }
+
+  presenceSessionsIn(space: ObjRef): ReadonlyMap<string, ObjRef> | null {
+    this.ensurePresenceIndex();
+    return this.sessionSubscribersIndex.get(space) ?? null;
+  }
+
+  presenceSessionIdsIn(space: ObjRef, actors?: Iterable<ObjRef>): string[] {
+    const sessions = this.presenceSessionsIn(space);
+    if (!sessions) return [];
+    const actorSet = actors ? new Set(actors) : null;
+    const out: string[] = [];
+    for (const [sessionId, actor] of sessions) {
+      if (!actorSet || actorSet.has(actor)) out.push(sessionId);
+    }
+    return out.sort();
+  }
+
+  hasSessionPresence(sessionId: string, space: ObjRef): boolean {
+    this.ensurePresenceIndex();
+    return this.sessionSpacesIndex.get(sessionId)?.has(space) === true;
   }
 
   async call(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
@@ -1157,7 +1240,7 @@ export class WooWorld {
     }
     let frame: AppliedFrame | ErrorFrame;
     try {
-      frame = await this.applyCall(frameId, space, message);
+        frame = await this.applyCall(frameId, space, message, sessionId);
     } catch (err) {
       const error = normalizeError(err);
       frame = { op: "error", id: frameId, error };
@@ -1193,21 +1276,23 @@ export class WooWorld {
         throw wooError("E_DIRECT_DENIED", `direct call denied for ${target}:${verbName}`, { target, verb: verbName });
       }
       if (forceDirect && !wizard) throw wooError("E_PERM", "only wizards may force direct calls", { actor, target, verb: verbName });
-      if (forceDirect) this.recordWizardAction(actor, "force_direct", { target, verb: verbName, reason: options.forceReason ?? null });
-      const audience = this.directAudience(target);
-      const hostMemo = createHostOperationMemo();
-      if (audience) await this.scrubStaleSubscribersForSpace(audience, actor, this.chatPresent(audience), hostMemo);
-      if (audience && verb.skip_presence_check !== true && !forceDirect) this.authorizePresence(actor, audience);
-      const observations: Observation[] = [];
-      if (forceDirect) observations.push({ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target });
-      const message: Message = { actor, target, verb: verbName, args };
-      const deferredHostEffects: DeferredHostEffect[] = [];
+        if (forceDirect) this.recordWizardAction(actor, "force_direct", { target, verb: verbName, reason: options.forceReason ?? null });
+        const audience = this.directAudience(target);
+        const hostMemo = createHostOperationMemo();
+        const sessionId = options.sessionId === undefined ? this.primarySessionForActor(actor)?.id ?? null : options.sessionId;
+        if (audience) await this.scrubStaleSubscribersForSpace(audience, actor, this.chatPresent(audience), hostMemo);
+        if (audience && verb.skip_presence_check !== true && !forceDirect) this.authorizePresence(actor, audience, sessionId);
+        const observations: Observation[] = [];
+        if (forceDirect) observations.push({ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target });
+        const message: Message = { actor, target, verb: verbName, args };
+        const deferredHostEffects: DeferredHostEffect[] = [];
       let result: WooValue = null;
       let mutated = false;
       const dispatchCtx: CallContext = {
-        world: this,
-        space: audience ?? "#-1",
-        seq: -1,
+          world: this,
+          space: audience ?? "#-1",
+          seq: -1,
+          session: sessionId,
         actor,
         player: actor,
         caller: "#-1",
@@ -1253,18 +1338,20 @@ export class WooWorld {
       // Cross-host bridge stashes authoritative audience info on ctx; prefer
       // it over recomputing locally where the local subscriber/presence view
       // for self-hosted spaces is stale.
-      const crossHostAudience = (dispatchCtx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][] } }).crossHostAudience;
-      const liveAudiences = crossHostAudience ?? this.directLiveAudiences(audience, observations);
+        const crossHostAudience = (dispatchCtx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] } }).crossHostAudience;
+      const liveAudiences = crossHostAudience ?? await this.directLiveAudiences(audience, observations);
       this.recordMetric({ kind: "direct_call", target, verb: verbName, audience, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
       return {
         op: "result",
         id: frameId,
         result,
         observations,
-        audience,
-        audienceActors: liveAudiences.audienceActors,
-        observationAudiences: liveAudiences.observationAudiences
-      };
+          audience,
+          audienceActors: liveAudiences.audienceActors,
+          observationAudiences: liveAudiences.observationAudiences,
+          audienceSessions: liveAudiences.audienceSessions,
+          observationSessionAudiences: liveAudiences.observationSessionAudiences
+        };
     } catch (err) {
       const error = normalizeError(err);
       this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: null, observations: 0, ms: Date.now() - startedAt, status: "error", error: error.code });
@@ -1276,15 +1363,15 @@ export class WooWorld {
     return (this.logs.get(space) ?? []).filter((entry) => entry.seq >= from).slice(0, limit);
   }
 
-  async applyCall(id: string | undefined, spaceRef: ObjRef, message: Message): Promise<AppliedFrame> {
-    const repo = this.activeObjectRepository();
-    if (repo) return await this.applyCallRepository(repo, id, spaceRef, message);
+    async applyCall(id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
+      const repo = this.activeObjectRepository();
+      if (repo) return await this.applyCallRepository(repo, id, spaceRef, message, sessionId);
     const startedAt = Date.now();
     const frame = await this.withPersistencePaused(async () => {
       this.validateMessage(message);
       const space = this.object(spaceRef);
       await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
-      this.authorizePresence(message.actor, spaceRef);
+        this.authorizePresence(message.actor, spaceRef, sessionId);
       const nextSeq = Number(this.getProp(spaceRef, "next_seq"));
       const seq = nextSeq;
       this.setProp(spaceRef, "next_seq", nextSeq + 1);
@@ -1303,10 +1390,11 @@ export class WooWorld {
       this.logs.set(spaceRef, log);
 
       const observations: Observation[] = [];
-      const ctx: CallContext = {
-        world: this,
-        space: spaceRef,
-        seq,
+        const ctx: CallContext = {
+          world: this,
+          space: spaceRef,
+          seq,
+          session: sessionId,
         actor: message.actor,
         player: message.actor,
         caller: "#-1",
@@ -1355,7 +1443,7 @@ export class WooWorld {
     return frame;
   }
 
-  private async applyCallRepository(repo: ObjectRepository, id: string | undefined, spaceRef: ObjRef, message: Message): Promise<AppliedFrame> {
+    private async applyCallRepository(repo: ObjectRepository, id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
     const before = this.snapshotBehaviorState();
     const beforeLogs = this.snapshotLogs();
     const startedAt = Date.now();
@@ -1364,7 +1452,7 @@ export class WooWorld {
         this.validateMessage(message);
         const space = this.object(spaceRef);
         await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
-        this.authorizePresence(message.actor, spaceRef);
+          this.authorizePresence(message.actor, spaceRef, sessionId);
         const seq = Number(this.getProp(spaceRef, "next_seq"));
         const ts = Date.now();
         this.setPropLocal(spaceRef, "next_seq", seq + 1);
@@ -1387,9 +1475,10 @@ export class WooWorld {
 
         const observations: Observation[] = [];
         const ctx: CallContext = {
-          world: this,
-          space: spaceRef,
-          seq,
+            world: this,
+            space: spaceRef,
+            seq,
+            session: sessionId,
           actor: message.actor,
           player: message.actor,
           caller: "#-1",
@@ -1437,7 +1526,8 @@ export class WooWorld {
           repo.recordLogOutcome(spaceRef, seq, logEntry.applied_ok === true, observations, logEntry.error);
           this.flushIncrementalState();
         });
-        return { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations };
+        const audience = this.appliedFrameAudience(spaceRef, observations);
+        return { op: "applied" as const, id, space: spaceRef, seq, ts: logEntry.ts, message, observations, ...audience };
       });
       this.recordMetric({ kind: "applied", space: spaceRef, seq: frame.seq, verb: message.verb, ms: Date.now() - startedAt });
       return frame;
@@ -2263,6 +2353,12 @@ export class WooWorld {
     }
     if (this.isSpaceLike(destination)) {
       await this.updatePresenceChecked(actor, destination, true, ctx);
+    } else if (ctx.session) {
+      const session = this.sessions.get(ctx.session);
+      if (session && session.actor === actor) {
+        session.currentLocation = destination;
+        this.persistSession(session);
+      }
     }
     await this.moveObjectChecked(actor, destination);
     if (previousLocation && previousLocation !== destination && this.objects.has(actor) && this.objects.has(previousLocation) && this.isSpaceLike(previousLocation)) {
@@ -2567,9 +2663,12 @@ export class WooWorld {
    *  - `:exitfunc` / `:enterfunc` errors are swallowed (post-move hooks
    *    must not fail the move per the LambdaMOO contract).
    */
-  async movetoChecked(ctx: CallContext, objRef: ObjRef, targetRef: ObjRef): Promise<WooValue> {
-    this.assertCanMoveto(ctx, objRef);
-    const objRemote = await this.remoteHostForObject(objRef, ctx.hostMemo);
+    async movetoChecked(ctx: CallContext, objRef: ObjRef, targetRef: ObjRef): Promise<WooValue> {
+      this.assertCanMoveto(ctx, objRef);
+      if (this.objects.has(objRef) && this.inheritsFrom(objRef, "$actor")) {
+        return await this.movetoActorChecked(ctx, objRef, targetRef);
+      }
+      const objRemote = await this.remoteHostForObject(objRef, ctx.hostMemo);
     const targetRemote = await this.remoteHostForObject(targetRef, ctx.hostMemo);
     if (!objRemote) this.object(objRef);
     if (!targetRemote) this.object(targetRef);
@@ -2588,7 +2687,7 @@ export class WooWorld {
       return targetRef;
     }
 
-    if (!ctx.movetoStack) ctx.movetoStack = new Set<string>();
+      if (!ctx.movetoStack) ctx.movetoStack = new Set<string>();
     const marker = `${objRef}->${targetRef}`;
     const fresh = !ctx.movetoStack.has(marker);
     ctx.movetoStack.add(marker);
@@ -2619,10 +2718,45 @@ export class WooWorld {
       await this.invokeContainerHookSwallow(ctx, targetRef, "enterfunc", [objRef]);
     }
 
-    return targetRef;
-  }
+      return targetRef;
+    }
 
-  private assertCanMoveto(ctx: CallContext, objRef: ObjRef): void {
+    private async movetoActorChecked(ctx: CallContext, actor: ObjRef, targetRef: ObjRef): Promise<WooValue> {
+      if (!ctx.session) {
+        await this.moveObjectChecked(actor, targetRef);
+        return targetRef;
+      }
+      const session = this.sessions.get(ctx.session);
+      if (!session || session.actor !== actor) throw wooError("E_NOSESSION", "actor moveto requires the calling actor's live session", { actor, session: ctx.session });
+      if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.object(targetRef);
+      await this.invokeAcceptableHook(ctx, targetRef, actor);
+      const oldLocation = session.currentLocation;
+      if (oldLocation && (this.objects.has(oldLocation) || await this.remoteHostForObject(oldLocation, ctx.hostMemo))) {
+        await this.invokeContainerHookSwallow(ctx, oldLocation, "exitfunc", [actor]);
+      }
+      if (oldLocation && await this.spaceLikeOrRemote(oldLocation, ctx.hostMemo)) {
+        await this.updatePresenceChecked(actor, oldLocation, false, ctx);
+      }
+      session.currentLocation = targetRef;
+      this.persistSession(session);
+      if (this.primarySessionForActor(actor)?.id === session.id) {
+        if (ctx.deferHostEffect && await this.remoteHostForObject(actor, ctx.hostMemo)) {
+          this.mirrorRemoteMoveLocally(actor, targetRef);
+          ctx.deferHostEffect({ kind: "move_object", obj: actor, target: targetRef, suppress_mirror_host: this.hostBridge?.localHost ?? null });
+        } else {
+          await this.moveObjectChecked(actor, targetRef);
+        }
+      }
+      if (await this.spaceLikeOrRemote(targetRef, ctx.hostMemo)) {
+        await this.updatePresenceChecked(actor, targetRef, true, ctx);
+      }
+      if (this.objects.has(targetRef) || await this.remoteHostForObject(targetRef, ctx.hostMemo)) {
+        await this.invokeContainerHookSwallow(ctx, targetRef, "enterfunc", [actor]);
+      }
+      return targetRef;
+    }
+
+    private assertCanMoveto(ctx: CallContext, objRef: ObjRef): void {
     if (objRef === ctx.actor) return;
     if (this.isWizard(ctx.progr)) return;
     const obj = this.objects.get(objRef);
@@ -2719,13 +2853,20 @@ export class WooWorld {
     if (changed) this.persist();
   }
 
-  setActorPresence(actor: ObjRef, space: ObjRef, present: boolean): boolean {
-    return this.updateActorPresenceLocal(actor, space, present);
-  }
+    setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
+      if (present) {
+        const session = this.sessions.get(sessionId);
+        if (session && session.actor === actor) {
+          session.currentLocation = space;
+          this.persistSession(session);
+        }
+      }
+      return this.updateActorPresenceLocal(actor, space, present, sessionId);
+    }
 
-  setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean): boolean {
-    return this.updateSpaceSubscriberLocal(space, actor, present);
-  }
+    setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
+      return this.updateSpaceSubscriberLocal(space, actor, present, sessionId);
+    }
 
   async setPresenceForActor(actor: ObjRef, space: ObjRef, present: boolean, ctx?: CallContext): Promise<boolean> {
     return await this.updatePresenceChecked(actor, space, present, ctx);
@@ -2733,10 +2874,10 @@ export class WooWorld {
 
   async applyDeferredHostEffects(effects: DeferredHostEffect[]): Promise<void> {
     for (const effect of effects) {
-      if (effect.kind === "actor_presence") {
-        await this.setActorPresenceChecked(effect.actor, effect.space, effect.present);
-      } else if (effect.kind === "space_subscriber") {
-        await this.setSpaceSubscriberChecked(effect.space, effect.actor, effect.present);
+        if (effect.kind === "actor_presence") {
+          await this.setActorPresenceChecked(effect.actor, effect.space, effect.present, effect.session);
+        } else if (effect.kind === "space_subscriber") {
+          await this.setSpaceSubscriberChecked(effect.space, effect.actor, effect.present, effect.session);
       } else if (effect.kind === "move_object") {
         await this.moveObjectChecked(effect.obj, effect.target, { suppressMirrorHost: effect.suppress_mirror_host ?? null });
       }
@@ -3431,12 +3572,13 @@ export class WooWorld {
     return {
       id: session.id,
       actor: session.actor,
-      started: session.started,
-      expiresAt: session.expiresAt,
-      lastDetachAt: session.lastDetachAt,
-      tokenClass: session.tokenClass
-    };
-  }
+        started: session.started,
+        expiresAt: session.expiresAt,
+        lastDetachAt: session.lastDetachAt,
+        tokenClass: session.tokenClass,
+        currentLocation: session.currentLocation
+      };
+    }
 
   saveSnapshot(space: ObjRef): SpaceSnapshotRecord {
     const seq = Number(this.getProp(space, "next_seq")) - 1;
@@ -3889,10 +4031,10 @@ export class WooWorld {
     if (!Array.isArray(message.args)) throw wooError("E_INVARG", "message.args must be a list");
   }
 
-  private hydrateSession(
-    session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"] },
-    now: number
-  ): Session {
+    private hydrateSession(
+      session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; currentLocation?: ObjRef | null },
+      now: number
+    ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
     const lastDetachAt = session.lastDetachAt ?? now;
     const expiresAt = Math.max(
@@ -3904,9 +4046,10 @@ export class WooWorld {
       actor: session.actor,
       started: session.started,
       expiresAt,
-      lastDetachAt,
-      tokenClass,
-      attachedSockets: new Set(),
+        lastDetachAt,
+        tokenClass,
+        currentLocation: session.currentLocation && this.objects.has(session.currentLocation) ? session.currentLocation : this.initialSessionLocation(session.actor),
+        attachedSockets: new Set(),
       // lastInputAt isn't persisted; on cold rehydrate, treat as just-active
       // rather than restoring some old timestamp from `started`. Otherwise
       // every freshly-rehydrated DO would show huge idle for everyone.
@@ -3935,20 +4078,30 @@ export class WooWorld {
     return now >= session.lastDetachAt + this.sessionGrace(session.tokenClass);
   }
 
-  private reapSession(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-    const isGuest = this.inheritsFrom(session.actor, "$guest");
-    session.attachedSockets.clear();
-    this.killReadTasksFor(session.actor);
-    this.removeActorPresence(session.actor);
+    private reapSession(sessionId: string): void {
+      const session = this.sessions.get(sessionId);
+      if (!session) return;
+      const isGuest = this.inheritsFrom(session.actor, "$guest");
+      const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
+      session.attachedSockets.clear();
+      this.killReadTasksFor(session.actor);
+      this.removeSessionPresence(sessionId, session.actor);
     // session_id mirror is no longer written (see createSessionForActor /
     // ensureSessionForActor); the matching reset on reap would just rewrite
     // the inherited default.
-    this.sessions.delete(sessionId);
-    this.deletePersistedSession(sessionId);
-    if (isGuest) this.resetGuestOnDisconnect(session.actor);
-  }
+      this.sessions.delete(sessionId);
+      this.deletePersistedSession(sessionId);
+      if (wasPrimary && !isGuest) this.promoteActorPrimaryLocation(session.actor);
+      if (isGuest) this.resetGuestOnDisconnect(session.actor);
+    }
+
+    private promoteActorPrimaryLocation(actor: ObjRef): void {
+      const primary = this.primarySessionForActor(actor);
+      if (!primary) return;
+      if (this.objects.has(actor) && this.objects.get(actor)!.location !== primary.currentLocation) {
+        this.moveObject(actor, primary.currentLocation);
+      }
+    }
 
   private resetGuestOnDisconnect(actor: ObjRef): void {
     const homeValue = this.propOrNull(actor, "home");
@@ -3982,27 +4135,15 @@ export class WooWorld {
     }
   }
 
-  private removeActorPresence(actor: ObjRef): void {
-    const presence = this.propOrNull(actor, "presence_in");
-    if (Array.isArray(presence)) {
-      for (const space of presence) {
-        if (typeof space !== "string") continue;
-        if (this.objects.has(space)) {
-          this.updatePresence(actor, space, false);
-        } else if (this.hostBridge) {
-          // Remote space — fire-and-forget cleanup so the remote room's
-          // subscriber list doesn't accumulate stale entries when sessions
-          // expire here.
-          void this.hostBridge.setSpaceSubscriber(space, actor, false).catch(() => {
-            // best-effort cleanup; remote may be unreachable
-          });
-        }
+    private removeSessionPresence(sessionId: string, actor: ObjRef): void {
+      for (const obj of this.objects.values()) {
+        const raw = obj.properties.get("session_subscribers");
+        if (!Array.isArray(raw)) continue;
+        if (!raw.some((item) => !!item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, WooValue>).session === sessionId)) continue;
+        this.updateSpaceSubscriberLocal(obj.id, actor, false, sessionId);
       }
+      this.removeActorActiveLists(actor);
     }
-    const remaining = this.propOrNull(actor, "presence_in");
-    if (this.objects.has(actor) && Array.isArray(remaining) && remaining.length > 0) this.setProp(actor, "presence_in", []);
-    this.removeActorActiveLists(actor);
-  }
 
   private removeActorActiveLists(actor: ObjRef): void {
     for (const obj of this.objects.values()) {
@@ -4081,11 +4222,12 @@ export class WooWorld {
     }
   }
 
-  private authorizePresence(actor: ObjRef, space: ObjRef): void {
-    if (this.isWizard(actor)) return;
-    if (!this.hasPresence(actor, space)) {
-      throw wooError("E_PERM", `${actor} is not present in ${space}`);
-    }
+    private authorizePresence(actor: ObjRef, space: ObjRef, sessionId: string | null = null): void {
+      if (this.isWizard(actor)) return;
+      if (sessionId && (this.hasSessionPresence(sessionId, space) || this.currentLocationForSession(sessionId) === space)) return;
+      if (!this.hasPresence(actor, space)) {
+        throw wooError("E_PERM", `${actor} is not present in ${space}`);
+      }
   }
 
   private featureList(objRef: ObjRef): ObjRef[] {
@@ -4159,9 +4301,10 @@ export class WooWorld {
     const message: Message = { actor, target: feature, verb: "can_be_attached_by", args: [actor] };
     const observations: Observation[] = [];
     const ctx: CallContext = {
-      world: this,
-      space: "#-1",
-      seq: -1,
+        world: this,
+        space: "#-1",
+        seq: -1,
+        session: null,
       actor,
       player: actor,
       caller: "#-1",
@@ -4241,22 +4384,38 @@ export class WooWorld {
   // Compute the per-observation audience for a direct call from this host's
   // authoritative subscribers/presence view. Public so cross-host RPC handlers
   // can compute audience at the source DO before forwarding to broadcast.
-  computeDirectLiveAudiences(audience: ObjRef | null, observations: Observation[]): { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][] } {
-    return this.directLiveAudiences(audience, observations);
+  async computeDirectLiveAudiences(audience: ObjRef | null, observations: Observation[]): Promise<{ audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] }> {
+    return await this.directLiveAudiences(audience, observations);
   }
 
-  private directLiveAudiences(audience: ObjRef | null, observations: Observation[]): { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][] } {
+  private async directLiveAudiences(audience: ObjRef | null, observations: Observation[]): Promise<{ audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] }> {
     const actors = new Set<ObjRef>();
+    const sessions = new Set<string>();
     const observationAudiences: ObjRef[][] = [];
+    const observationSessionAudiences: string[][] = [];
     for (const observation of observations) {
       const present = this.observationAudienceActors(audience, observation) ?? [];
+      const presentSessions = await this.observationAudienceSessions(audience, observation) ?? [];
       observationAudiences.push(present);
+      observationSessionAudiences.push(presentSessions);
       for (const actor of present) actors.add(actor);
+      for (const session of presentSessions) sessions.add(session);
       delete (observation as Record<string, unknown>)._audience_override;
     }
     return {
       audienceActors: actors.size > 0 ? Array.from(actors) : undefined,
-      observationAudiences: observations.length > 0 ? observationAudiences : undefined
+      observationAudiences: observations.length > 0 ? observationAudiences : undefined,
+      audienceSessions: sessions.size > 0 ? Array.from(sessions) : undefined,
+      observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined
+    };
+  }
+
+  private appliedFrameAudience(space: ObjRef, observations: Observation[]): { audienceSessions?: string[]; observationSessionAudiences?: string[][] } {
+    const sessionMap = this.presenceSessionsIn(space);
+    const sessions = sessionMap ? Array.from(sessionMap.keys()) : [];
+    return {
+      audienceSessions: sessions.length > 0 ? sessions : undefined,
+      observationSessionAudiences: observations.length > 0 ? observations.map(() => sessions) : undefined
     };
   }
 
@@ -4295,16 +4454,54 @@ export class WooWorld {
     return present;
   }
 
-  private isSpaceLike(objRef: ObjRef): boolean {
-    try {
-      this.getProp(objRef, "next_seq");
-      return true;
-    } catch {
-      return false;
+  private async observationAudienceSessions(fallbackAudience: ObjRef | null, observation: Observation): Promise<string[] | undefined> {
+    const actors = this.observationAudienceActors(fallbackAudience, observation);
+    if (!actors) return undefined;
+    const actorSet = new Set(actors);
+    const source = typeof observation.source === "string" && this.objects.has(observation.source) && this.inheritsFrom(observation.source, "$space")
+      ? observation.source
+      : null;
+    const audience = source ?? fallbackAudience;
+    const sessionMap = audience ? this.presenceSessionsIn(audience) : null;
+    if (sessionMap) {
+      const sessions: string[] = [];
+      for (const [sessionId, actor] of sessionMap) {
+        if (actorSet.has(actor)) sessions.push(sessionId);
+      }
+      return sessions;
     }
+    if (audience && this.hostBridge && await this.remoteHostForObject(audience)) {
+      try {
+        return await this.hostBridge.spaceAudienceSessions?.(audience, actors) ?? [];
+      } catch {
+        // Remote audience lookup is best-effort; over-broadcasting to every
+        // session for these actors would violate session-location isolation.
+        return [];
+      }
+    }
+    const sessions: string[] = [];
+    for (const session of this.sessions.values()) {
+      if (actorSet.has(session.actor)) sessions.push(session.id);
+    }
+    return sessions;
   }
 
-  private inheritsFrom(objRef: ObjRef, ancestorRef: ObjRef): boolean {
+    private isSpaceLike(objRef: ObjRef): boolean {
+      try {
+        if (this.inheritsFrom(objRef, "$space")) return true;
+        this.getProp(objRef, "next_seq");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    private async spaceLikeOrRemote(objRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
+      if (this.objects.has(objRef)) return this.isSpaceLike(objRef);
+      return Boolean(await this.remoteHostForObject(objRef, memo));
+    }
+
+    private inheritsFrom(objRef: ObjRef, ancestorRef: ObjRef): boolean {
     let current: ObjRef | null = objRef;
     while (current) {
       if (current === ancestorRef) return true;
@@ -4317,115 +4514,118 @@ export class WooWorld {
     return this.inheritsFrom(objRef, ancestorRef);
   }
 
-  private ensurePresence(actor: ObjRef, space: ObjRef): void {
-    this.updatePresence(actor, space, true);
-  }
-
-  private ensureAutoPresence(actor: ObjRef): void {
-    for (const obj of this.objects.values()) {
-      if (!this.inheritsFrom(obj.id, "$space")) continue;
-      if (this.propOrNull(obj.id, "auto_presence") === true) this.ensurePresence(actor, obj.id);
-    }
-  }
-
-  private removePresence(actor: ObjRef, space: ObjRef): boolean {
-    return this.updatePresence(actor, space, false);
-  }
-
   private async updatePresenceChecked(actor: ObjRef, space: ObjRef, present: boolean, ctx?: CallContext): Promise<boolean> {
     const actorRemote = await this.remoteHostForObject(actor);
     const spaceRemote = await this.remoteHostForObject(space);
-    if (!actorRemote && !spaceRemote) return this.updatePresence(actor, space, present);
+    const sessionId = this.presenceSessionId(actor, ctx);
+    if (!actorRemote && !spaceRemote) return this.updatePresence(actor, space, present, sessionId);
     if (!this.hostBridge && (actorRemote || spaceRemote)) throw wooError("E_INTERNAL", "remote host bridge unavailable");
     if (ctx?.deferHostEffect) {
       let changed = false;
       if (actorRemote) {
-        ctx.deferHostEffect({ kind: "actor_presence", actor, space, present });
+        ctx.deferHostEffect({ kind: "actor_presence", actor, space, present, session: sessionId });
         changed = true;
       } else {
-        changed = this.updateActorPresenceLocal(actor, space, present) || changed;
+        changed = this.updateActorPresenceLocal(actor, space, present, sessionId) || changed;
       }
       if (spaceRemote) {
-        ctx.deferHostEffect({ kind: "space_subscriber", space, actor, present });
+        ctx.deferHostEffect({ kind: "space_subscriber", space, actor, present, session: sessionId });
         changed = true;
       } else {
-        changed = this.updateSpaceSubscriberLocal(space, actor, present) || changed;
+        changed = this.updateSpaceSubscriberLocal(space, actor, present, sessionId) || changed;
       }
       return changed;
     }
     let changed = false;
-    if (actorRemote) changed = (await this.setActorPresenceChecked(actor, space, present)) || changed;
-    else changed = this.updateActorPresenceLocal(actor, space, present) || changed;
-    if (spaceRemote) changed = (await this.setSpaceSubscriberChecked(space, actor, present)) || changed;
-    else changed = this.updateSpaceSubscriberLocal(space, actor, present) || changed;
+    if (actorRemote) changed = (await this.setActorPresenceChecked(actor, space, present, sessionId)) || changed;
+    else changed = this.updateActorPresenceLocal(actor, space, present, sessionId) || changed;
+    if (spaceRemote) changed = (await this.setSpaceSubscriberChecked(space, actor, present, sessionId)) || changed;
+    else changed = this.updateSpaceSubscriberLocal(space, actor, present, sessionId) || changed;
     return changed;
   }
 
-  private async setActorPresenceChecked(actor: ObjRef, space: ObjRef, present: boolean): Promise<boolean> {
+  private async setActorPresenceChecked(actor: ObjRef, space: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): Promise<boolean> {
     const actorRemote = await this.remoteHostForObject(actor);
-    if (!actorRemote) return this.updateActorPresenceLocal(actor, space, present);
+    if (!actorRemote) {
+      if (present) {
+        const session = this.sessions.get(sessionId);
+        if (session && session.actor === actor) {
+          session.currentLocation = space;
+          this.persistSession(session);
+        }
+      }
+      return this.updateActorPresenceLocal(actor, space, present, sessionId);
+    }
     if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-    await this.hostBridge.setActorPresence(actor, space, present);
+    await this.hostBridge.setActorPresence(actor, space, present, sessionId);
     return true;
   }
 
-  private async setSpaceSubscriberChecked(space: ObjRef, actor: ObjRef, present: boolean): Promise<boolean> {
+  private async setSpaceSubscriberChecked(space: ObjRef, actor: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): Promise<boolean> {
     const spaceRemote = await this.remoteHostForObject(space);
-    if (!spaceRemote) return this.updateSpaceSubscriberLocal(space, actor, present);
+    if (!spaceRemote) return this.updateSpaceSubscriberLocal(space, actor, present, sessionId);
     if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-    await this.hostBridge.setSpaceSubscriber(space, actor, present);
+    await this.hostBridge.setSpaceSubscriber(space, actor, present, sessionId);
     return true;
   }
 
-  private updatePresence(actor: ObjRef, space: ObjRef, present: boolean): boolean {
-    const actorChanged = this.updateActorPresenceLocal(actor, space, present);
-    const spaceChanged = this.updateSpaceSubscriberLocal(space, actor, present);
-    const changed = actorChanged || spaceChanged;
-    this.assertPresenceMirror(actor, space, present);
-    return changed;
+  private updatePresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
+    if (present) {
+      const session = this.sessions.get(sessionId);
+      if (session && session.actor === actor) {
+        session.currentLocation = space;
+        this.persistSession(session);
+      }
+    }
+    const actorChanged = this.updateActorPresenceLocal(actor, space, present, sessionId);
+    const spaceChanged = this.updateSpaceSubscriberLocal(space, actor, present, sessionId);
+    return actorChanged || spaceChanged;
   }
 
-  private updateActorPresenceLocal(actor: ObjRef, space: ObjRef, present: boolean): boolean {
+  private updateActorPresenceLocal(actor: ObjRef, space: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
+    void space;
+    void present;
+    void sessionId;
     this.object(actor);
-    const rawPresence = this.getProp(actor, "presence_in");
-    if (!Array.isArray(rawPresence)) throw wooError("E_TYPE", `${actor}.presence_in must be a list`, rawPresence);
-
-    const presence = rawPresence.filter((item): item is ObjRef => typeof item === "string");
-    const nextPresence = present ? addUnique(presence, space) : presence.filter((item) => item !== space);
-    const changed = !valuesEqual(nextPresence, rawPresence);
-    if (!changed) return false;
-
-    this.withPersistenceDeferred(() => {
-      this.setProp(actor, "presence_in", nextPresence);
-    });
-    return true;
+    return false;
   }
 
-  private updateSpaceSubscriberLocal(space: ObjRef, actor: ObjRef, present: boolean): boolean {
+  private updateSpaceSubscriberLocal(space: ObjRef, actor: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): boolean {
     this.object(space);
     const rawSubscribers = this.getProp(space, "subscribers");
     if (!Array.isArray(rawSubscribers)) throw wooError("E_TYPE", `${space}.subscribers must be a list`, rawSubscribers);
+    const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+    const parsedSessionSubscribers = Array.isArray(rawSessionSubscribers)
+      ? rawSessionSubscribers
+        .filter((item): item is Record<string, WooValue> => !!item && typeof item === "object" && !Array.isArray(item))
+        .map((item) => ({ session: String(item.session ?? ""), actor: String(item.actor ?? "") as ObjRef }))
+        .filter((item) => item.session && item.actor)
+      : [];
+    const sessionSubscribers = parsedSessionSubscribers.length > 0
+      ? parsedSessionSubscribers
+      : rawSubscribers
+        .filter((item): item is ObjRef => typeof item === "string")
+        .map((item) => ({ session: `legacy:${item}`, actor: item }));
+    const without = sessionSubscribers.filter((item) => item.session !== sessionId);
+    const nextSessionSubscribers = present ? [...without, { session: sessionId, actor }] : without;
+    const nextSubscribers = Array.from(new Set(nextSessionSubscribers.map((item) => item.actor))).sort();
 
-    const subscribers = rawSubscribers.filter((item): item is ObjRef => typeof item === "string");
-    const nextSubscribers = present ? addUnique(subscribers, actor) : subscribers.filter((item) => item !== actor);
-    const changed = !valuesEqual(nextSubscribers, rawSubscribers);
+    const changed = !valuesEqual(nextSubscribers, rawSubscribers) || !valuesEqual(nextSessionSubscribers, sessionSubscribers);
     if (!changed) return false;
 
     this.withPersistenceDeferred(() => {
+      this.setProp(space, "session_subscribers", nextSessionSubscribers as unknown as WooValue);
       this.setProp(space, "subscribers", nextSubscribers);
     });
     this.recordMetric({ kind: "subscribers_write", space, size: nextSubscribers.length, delta: present ? 1 : -1 });
     return true;
   }
 
-  private assertPresenceMirror(actor: ObjRef, space: ObjRef, expected: boolean): void {
-    const presence = this.getProp(actor, "presence_in");
-    const subscribers = this.getProp(space, "subscribers");
-    const actorHasSpace = Array.isArray(presence) && presence.includes(space);
-    const spaceHasActor = Array.isArray(subscribers) && subscribers.includes(actor);
-    if (actorHasSpace !== spaceHasActor || actorHasSpace !== expected) {
-      throw wooError("E_INTERNAL", "presence mirror invariant failed", { actor, space, actor_has_space: actorHasSpace, space_has_actor: spaceHasActor });
-    }
+  private presenceSessionId(actor: ObjRef, ctx?: CallContext): string {
+    // No-session callers still need a stable row key for bridge-era
+    // subscribers. These legacy rows are bounded to internal/replay paths and
+    // are superseded by real session rows whenever a live actor enters.
+    return ctx?.session ?? this.primarySessionForActor(actor)?.id ?? `legacy:${actor}`;
   }
 
   private async runParkedTask(task: ParkedTaskRecord, input?: WooValue): Promise<ParkedTaskRun> {
@@ -4452,9 +4652,10 @@ export class WooWorld {
       const observations: Observation[] = [];
       const hostSpace = "#-1";
       const ctx: CallContext = {
-        world: this,
-        space: hostSpace,
-        seq: -1,
+          world: this,
+          space: hostSpace,
+          seq: -1,
+          session: null,
         actor,
         player,
         caller: "#-1",
@@ -4693,9 +4894,10 @@ export class WooWorld {
 
   private resumeContext(serialized: Record<string, WooValue>, message: Message, observations: Observation[], space: ObjRef, seq: number): CallContext {
     return {
-      world: this,
-      space,
-      seq,
+        world: this,
+        space,
+        seq,
+        session: typeof serialized.session === "string" ? serialized.session : null,
       actor: assertObj(serialized.actor),
       player: assertObj(serialized.player),
       caller: "#-1",
@@ -4731,9 +4933,8 @@ export class WooWorld {
     this.createObject({ id, name: displayName, parent: this.objects.has("$guest") ? "$guest" : "$player", owner: "$wiz", location: this.objects.has("$nowhere") ? "$nowhere" : null });
     this.setProp(id, "name", displayName);
     this.setProp(id, "description", "Dynamically allocated guest player. It can be bound to a temporary session and gives a local user or agent a stable actor for first-light testing.");
-    // presence_in/session_id/home defaults already come from the parent
-    // chain ($actor.presence_in=[], $player.session_id=null, $player.home="$nowhere").
-    // Skipping the explicit writes saves three property rows per allocation.
+    // Home defaults already come from the parent chain. Session identity lives
+    // in `world.sessions`, so there is no actor-side session_id mirror to seed.
     return id;
   }
 
@@ -4838,9 +5039,9 @@ export class WooWorld {
     this.sessionCounter = savepoint.sessionCounter;
     this.guestFreePool = new Set(savepoint.guestFreePool);
     this.restorePersistenceDirtyState(savepoint.persistence);
-    // The index mirrors `subscribers`/`presence_in` properties on objects we
-    // just rolled back. Drop it so the next read rebuilds from the restored
-    // property values.
+    // The index mirrors session_subscribers plus compatibility presence
+    // properties on objects we just rolled back. Drop it so the next read
+    // rebuilds from the restored property values.
     this.invalidatePresenceIndex();
   }
 
@@ -4880,9 +5081,11 @@ export class WooWorld {
   }
 
   private async publicCommandLocation(ctx: CallContext, actor: ObjRef, value: WooValue | undefined): Promise<ObjRef | null> {
-    const location = typeof value === "string"
-      ? value as ObjRef
-      : await this.objectLocationChecked(actor, ctx.hostMemo).catch(() => null);
+      const location = typeof value === "string"
+        ? value as ObjRef
+        : actor === ctx.actor && ctx.session
+          ? this.currentLocationForSession(ctx.session)
+          : await this.objectLocationChecked(actor, ctx.hostMemo).catch(() => null);
     await this.assertPublicCommandLocation(ctx, actor, location);
     return location;
   }
@@ -4894,7 +5097,9 @@ export class WooWorld {
     }
     if (location === actor) return;
 
-    const actorLocation = await this.objectLocationChecked(actor, ctx.hostMemo).catch(() => null);
+      const actorLocation = actor === ctx.actor && ctx.session
+        ? this.currentLocationForSession(ctx.session)
+        : await this.objectLocationChecked(actor, ctx.hostMemo).catch(() => null);
     if (actorLocation === location) return;
     try {
       if (this.hasPresence(actor, location)) return;
@@ -4927,30 +5132,16 @@ export class WooWorld {
 
   private async canSeeCommandObject(ctx: CallContext, target: ObjRef): Promise<boolean> {
     if (this.isWizard(ctx.actor)) return true;
-    if (target === ctx.caller) return true;
-    // When the *caller* of this introspection is a $space (e.g. the chat
-    // planner's command_plan running on a room, then invoking
-    // `$match:match_verb` from inside `:say_to`), trust that space to
-    // introspect its own contents and anchored objects. We check `ctx.caller`,
-    // not `ctx.thisObj`, because `ctx.thisObj` is whatever object holds the
-    // current verb (`$match` for match_verb). publicCommandLocation reads
-    // actor.location via a cross-host RPC that can transiently fail or return
-    // null during cold-start, leaving commandVisibleCandidates empty even
-    // though the target is reachable from the calling space.
-    const caller = ctx.caller;
-    if (typeof caller === "string" && caller && this.objects.has(caller) && this.inheritsFrom(caller, "$space")) {
-      const here = await this.objectContents(caller, ctx.hostMemo).catch(() => [] as ObjRef[]);
-      if (here.includes(target)) return true;
-      // Symmetric check: if the target claims this space as its location or
-      // anchor, allow even when the space's contents Set is out of sync
-      // (cross-host mirror lag, or partial migration).
-      const targetLocation = await this.propOrNullForActorAsync(ctx.progr, target, "location", ctx.hostMemo);
-      if (targetLocation === caller) return true;
-      const targetAnchor = await this.propOrNullForActorAsync(ctx.progr, target, "anchor", ctx.hostMemo);
-      if (targetAnchor === caller) return true;
-    }
     const location = await this.publicCommandLocation(ctx, ctx.actor, undefined);
-    return (await this.commandVisibleCandidates(ctx, ctx.actor, location)).includes(target);
+    if ((await this.commandVisibleCandidates(ctx, ctx.actor, location)).includes(target)) return true;
+    const caller = ctx.caller;
+    if (typeof caller === "string" && caller.length > 0 && this.objects.has(caller) && this.inheritsFrom(caller, "$space")) {
+      const callerContents = await this.objectContents(caller, ctx.hostMemo).catch((): ObjRef[] => []);
+      if (callerContents.includes(target)) return true;
+      const targetLocation = await this.propOrNullForActorAsync(ctx.actor, target, "location", ctx.hostMemo).catch(() => null);
+      if (targetLocation === caller) return true;
+    }
+    return false;
   }
 
   private registerNativeHandlers(): void {
@@ -5132,6 +5323,7 @@ export class WooWorld {
   }
 
   private async scrubStaleSubscribersForSpace(space: ObjRef, progr: ObjRef, subscribers: ObjRef[], memo?: HostOperationMemo): Promise<ObjRef[]> {
+    void progr;
     if (!this.objects.has(space) || subscribers.length === 0) return subscribers;
     const now = Date.now();
     const last = this.lastSubscriberScrubAt.get(space) ?? 0;
@@ -5140,12 +5332,11 @@ export class WooWorld {
     const kept: ObjRef[] = [];
     const stale: ObjRef[] = [];
     await Promise.all(subscribers.map(async (actor) => {
-      const presence = await this.propOrNullForActorAsync(progr, actor, "presence_in", memo);
-      if (!Array.isArray(presence)) {
-        kept.push(actor);
-        return;
-      }
-      if (presence.includes(space)) kept.push(actor);
+      const remote = await this.remoteHostForObject(actor, memo);
+      const locations = remote
+        ? await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? []
+        : this.allLocationsForActor(actor);
+      if (locations.includes(space)) kept.push(actor);
       else stale.push(actor);
     }));
     for (const actor of stale) this.updateSpaceSubscriberLocal(space, actor, false);

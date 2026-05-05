@@ -62,12 +62,20 @@ class RemoteToolBridge implements HostBridge {
     this.worldFor(containerRef).mirrorContents(containerRef, objRef, present);
   }
 
-  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(actor).setActorPresence(actor, space, present);
+  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(actor).setActorPresence(actor, space, present, sessionId);
   }
 
-  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(space).setSpaceSubscriber(space, actor, present);
+  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(space).setSpaceSubscriber(space, actor, present, sessionId);
+  }
+
+  async spaceAudienceSessions(space: ObjRef, actors?: ObjRef[]): Promise<string[]> {
+    return this.worldFor(space).presenceSessionIdsIn(space, actors);
+  }
+
+  async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    return this.worldFor(actor).allLocationsForActor(actor);
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -688,12 +696,13 @@ describe("McpGateway", () => {
     }, { "mcp-token": "guest:mcp-remote-contents" }));
     const sessionId = init.headers.get("mcp-session-id");
     expect(sessionId).toBeTruthy();
-    const actor = Array.from(home.sessions.values())[0]?.actor;
+    const wooSession = Array.from(home.sessions.values())[0];
+    const actor = wooSession?.actor;
     expect(actor).toBeTruthy();
     home.object(actor!).location = "remote_gallery";
+    wooSession!.currentLocation = "remote_gallery";
     home.object("remote_gallery").contents.add(actor!);
-    home.setProp(actor!, "presence_in", ["remote_gallery"]);
-    remote.setProp("remote_gallery", "subscribers", [actor!]);
+    remote.setSpaceSubscriber("remote_gallery", actor!, true, wooSession!.id);
 
     const list = await gateway.handle(jsonRpcRequest("http://t/mcp", {
       jsonrpc: "2.0",

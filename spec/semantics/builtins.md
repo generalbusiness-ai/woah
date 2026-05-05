@@ -97,7 +97,18 @@ requires that the new parent be owned by the programmer or `fertile`, and reject
 cycles with `E_RECMOVE`.
 
 `location(obj)` returns the object's current container (`obj.location`) or
-`null`. It is a behavior-readable core field, not a property lookup.
+`null`, except when `obj == actor` inside a session-bound task: then it returns
+that session's current location. This keeps command parsing and room verbs scoped
+to the tab/tool session that issued the call. It is a behavior-readable core
+field, not a property lookup.
+
+`current_session()` returns the current session id or `null` for host/bootstrap
+tasks. `current_location()` returns the current session's location or `null`.
+`session_location(id)` returns that live session's location or `null`.
+`primary_session(actor)` returns the actor's primary live session id or `null`.
+`all_locations(obj)` returns the deduplicated current locations for all live
+sessions of an actor; for non-actors it returns the object's ordinary location
+as a singleton list, or `[]` when there is none.
 
 `dispatch(obj, verb, args?, start_at?)` invokes the normal verb-dispatch path
 from source code, using the current task permissions. Catalog code that wants to
@@ -131,14 +142,17 @@ caller-controlled work; non-wizard frames cannot use it to escalate.
 `event_schema(obj, type)`, `declare_event(obj, type, schema)`.
 
 `observe_to_space(space, event)` records `event` on the current invocation route
-but routes live delivery to the subscribers of `space`. It is for ordinary
+but routes live delivery to the session audience of `space`. It is for ordinary
 object behavior such as a mounted pinboard or control surface emitting visible
 activity to its containing room; it does not make the containing-room relation a
 core property.
 
-`set_presence(space, present)` updates the current actor's presence mirror for a
-space (`actor.presence_in` and `space.subscribers`) through the host-safe
-presence primitive. It cannot set presence for another actor.
+`set_presence(space, present)` updates the current actor/session's presence in a
+space through the host-safe presence primitive. The authoritative storage is
+`space.session_subscribers`; `space.subscribers` is an actor-level projection
+derived from those session rows. New catalog movement code should prefer
+`moveto(actor, space)`, which updates the calling session's current location and
+presence together. `set_presence` cannot set presence for another actor.
 
 ### 19.7 Sessions
 

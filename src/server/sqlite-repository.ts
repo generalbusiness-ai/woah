@@ -150,14 +150,16 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       }
 
       const hasAttachmentColumn = this.tableColumns("session").has("attachment");
+      const hasCurrentLocationColumn = this.tableColumns("session").has("current_location");
       const insertSession = this.db.prepare(
         hasAttachmentColumn
-          ? "INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class, attachment) VALUES (?, ?, ?, ?, ?, ?, ?)"
-          : "INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class) VALUES (?, ?, ?, ?, ?, ?)"
+          ? `INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}, attachment) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""}, ?)`
+          : `INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""})`
       );
       for (const session of world.sessions) {
         const values = [session.id, session.actor, session.started, session.expiresAt ?? null, session.lastDetachAt ?? null, session.tokenClass ?? "guest"];
-        insertSession.run(...(hasAttachmentColumn ? [...values, "{}"] : values));
+        const withCurrent = hasCurrentLocationColumn ? [...values, session.currentLocation ?? null] : values;
+        insertSession.run(...(hasAttachmentColumn ? [...withCurrent, "{}"] : withCurrent));
       }
 
       const insertLog = this.db.prepare("INSERT INTO space_message(space_id, seq, ts, actor, message, observations, applied_ok, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -420,13 +422,15 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
   saveSession(record: SerializedSession): void {
     const hasAttachmentColumn = this.tableColumns("session").has("attachment");
+    const hasCurrentLocationColumn = this.tableColumns("session").has("current_location");
     const stmt = this.db.prepare(
       hasAttachmentColumn
-        ? "INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class, attachment) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        : "INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class) VALUES (?, ?, ?, ?, ?, ?)"
+        ? `INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}, attachment) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""}, ?)`
+        : `INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""})`
     );
     const values = [record.id, record.actor, record.started, record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest"];
-    stmt.run(...(hasAttachmentColumn ? [...values, "{}"] : values));
+    const withCurrent = hasCurrentLocationColumn ? [...values, record.currentLocation ?? null] : values;
+    stmt.run(...(hasAttachmentColumn ? [...withCurrent, "{}"] : withCurrent));
   }
 
   deleteSession(session_id: string): void {
@@ -493,6 +497,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     this.ensureColumn("session", "expires_at", "INTEGER");
     this.ensureColumn("session", "last_detach_at", "INTEGER");
     this.ensureColumn("session", "token_class", "TEXT NOT NULL DEFAULT 'guest'");
+    this.ensureColumn("session", "current_location", "TEXT");
     this.ensureColumn("space_message", "observations", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureNullableSpaceMessageOutcome();
     this.ensureColumn("verb", "flags", "TEXT NOT NULL DEFAULT '{}'");

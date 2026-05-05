@@ -61,6 +61,12 @@ returns: { actor: ObjRef, session: string }
 
 Subsequent requests carry the session id as `Authorization: Session <id>`. The session id is opaque server-side state — no signing, no claims, no expiry beyond the session timeout — so baseline REST has no JWT machinery requirement.
 
+`GET /api/state` returns the actor-readable world projection plus
+`session: { id, actor, current_location }` for the presented session. The
+projection's object graph may include compatibility presence mirrors, but
+clients that need to know where this tab/tool session is should read
+`session.current_location`.
+
 Credentialed auth extends the vocabulary per [auth.md §A3](../identity/auth.md#a3-token-vocabulary-extended): `bearer:<jwt>`, `apikey:<id>:<secret>`, `oauth_code:<provider>:<code>`, `recovery:<token>`. Bearer tokens use `Authorization: Bearer <jwt>` with signature/claims validation. The endpoint shape is unchanged; only the accepted vocabulary expands.
 
 An implementation that doesn't ship credentialed auth returns `400 E_INVARG` for `bearer:`/`apikey:`/`oauth_code:` tokens. An implementation that ships credentialed auth accepts both vocabularies.

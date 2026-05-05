@@ -132,7 +132,7 @@ Operators may override per world via `$server_options.session_*`.
 While at least one live connection is attached, the session is not reaped for ordinary timeout. When no live connections are attached and either `session.last_detach_at + grace < now` or `now > session.expires_at`, the runtime reaps:
 
 1. Kill any `READ` tasks for this actor (`E_INTRPT`).
-2. Remove the actor from every space's `subscribers` list and from `actor.presence_in`. Pair the two; they're a mirror. In hosted deployments, the actor and space can live on different hosts; if a remote subscriber cleanup fails, later authoritative reads of the space audience may confirm that `actor.presence_in` no longer contains the space and lazily remove the stale `space.subscribers` entry.
+2. Remove this session from every space's `session_subscribers` list. The runtime derives the `space.subscribers` actor set from remaining live session entries. In hosted deployments, the actor and space can live on different hosts; if a remote subscriber cleanup fails, later authoritative reads of the space audience may confirm stale entries and lazily remove them.
 3. Call `actor:on_disfunc()` if defined. This is where guest reset happens (§I6.4). Errors are caught and logged; reap continues.
 4. Delete the session record.
 
@@ -170,10 +170,10 @@ The disfunc runs with `progr = this.owner` (typically `$wiz`), so it has authori
 
 ## I7. Baseline permissions
 
-For bundled demos, the default policy is "any authenticated guest with presence in the space can call." Concretely:
+For bundled demos, the default policy is "any authenticated guest with a live session present in the space can call." Concretely:
 
-- `$space:call` accepts any actor whose objref is recorded in the space's presence set.
-- A presence record is created on session establishment if the actor is to participate.
+- `$space:call` accepts any actor/session pair recorded in the space's `session_subscribers` set, with `space.subscribers` maintained as a compatibility actor projection.
+- A presence record is created by explicit movement (`:enter`, exit movement, or another `moveto(actor, space)` path), not merely by session establishment.
 - No per-verb perm gating beyond presence.
 
 This is the simplest possible policy. It works for the dubspace demo (every connected actor can wiggle every knob) and is *almost* enough for the taskspace demo, with one obvious refinement.

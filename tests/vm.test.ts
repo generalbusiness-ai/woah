@@ -48,6 +48,7 @@ function vmCtx(world: ReturnType<typeof createWorld>, actor: string, target: str
     world,
     space: "the_dubspace",
     seq: 1000,
+    session: null,
     actor,
     player: actor,
     caller: "#-1",
@@ -96,10 +97,11 @@ describe("v0.5 in-memory VM", () => {
     if (applied.op === "applied") expect(applied.observations).toEqual([]);
     expect(await world.dispatch(
       {
-        world,
-        space: "the_dubspace",
-        seq: 99,
-        actor,
+          world,
+          space: "the_dubspace",
+          seq: 99,
+          session: null,
+          actor,
         player: actor,
         caller: "#-1",
         callerPerms: actor,
@@ -156,10 +158,11 @@ describe("v0.5 in-memory VM", () => {
     expect(applied.op).toBe("applied");
     expect(await world.dispatch(
       {
-        world,
-        space: "the_dubspace",
-        seq: 100,
-        actor,
+          world,
+          space: "the_dubspace",
+          seq: 100,
+          session: null,
+          actor,
         player: actor,
         caller: "#-1",
         callerPerms: actor,
@@ -222,10 +225,11 @@ describe("v0.5 in-memory VM", () => {
 
     expect(await world.dispatch(
       {
-        world,
-        space: "the_dubspace",
-        seq: 101,
-        actor,
+          world,
+          space: "the_dubspace",
+          seq: 101,
+          session: null,
+          actor,
         player: actor,
         caller: "#-1",
         callerPerms: actor,
@@ -271,10 +275,11 @@ describe("v0.5 in-memory VM", () => {
     expect(
       await world.dispatch(
         {
-          world,
-          space: "the_dubspace",
-          seq: 104,
-          actor,
+            world,
+            space: "the_dubspace",
+            seq: 104,
+            session: null,
+            actor,
           player: actor,
           caller: "#-1",
           callerPerms: actor,
@@ -361,10 +366,11 @@ describe("v0.5 in-memory VM", () => {
       await expect(
         world.dispatch(
           {
-            world,
-            space: "the_dubspace",
-            seq: 102,
-            actor,
+              world,
+              space: "the_dubspace",
+              seq: 102,
+              session: null,
+              actor,
             player: actor,
             caller: "#-1",
             callerPerms: actor,
@@ -414,10 +420,11 @@ describe("v0.5 in-memory VM", () => {
     expect(
       await world.dispatch(
         {
-          world,
-          space: "the_dubspace",
-          seq: 103,
-          actor,
+            world,
+            space: "the_dubspace",
+            seq: 103,
+            session: null,
+            actor,
           player: actor,
           caller: "#-1",
           callerPerms: actor,

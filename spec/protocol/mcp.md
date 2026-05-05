@@ -54,12 +54,12 @@ The wrappers exist because some MCP clients discover tools once, cache aggressiv
 
 | Scope | Meaning |
 |---|---|
-| `active` | Bounded default: actor, current location, inventory, presence spaces, and focused objects. Does not expand every room/space contents entry. |
+| `active` | Bounded default: actor, current session location, other live actor locations, inventory, and focused objects. Does not expand every room/space contents entry. |
 | `here` | Current location plus visible non-actor contents. |
 | `focus` | Focused objects only. |
 | `object` | One reachable object named by `object`. |
 | `space` | One reachable space named by `object`, or current location if omitted, plus visible non-actor contents. |
-| `all` | All directly reachable categories: actor, current location, current-location contents, inventory, presence spaces, and focused objects. It does not expand every presence/focus space's contents; use `space` for that deliberate scan. |
+| `all` | All directly reachable categories: actor, current session location, current-location contents, inventory, other live actor locations, and focused objects. It does not expand every non-current location or focus object's contents; use `space` for that deliberate scan. |
 
 The result shape is `{scope, object, query, limit, cursor, next_cursor, total, tools}`. `query` is a case-insensitive filter over tool name, object, verb, aliases, and description. `include_schema` asks the server to include the JSON input schema in each summary; it is off by default to keep discovery compact.
 
@@ -154,16 +154,16 @@ same-name verbs as separate tools.
 The dynamic tool set at any moment is computed against the actor's **reachable scope**, the union of:
 
 1. **Self.** The actor object — for actor-owned verbs (`@quit`, `@home`, `wait`, `focus`, etc.).
-2. **Current location.** `actor.location` and the verbs defined on it. In a chat room, this is where `:say`/`:look`/`:enter` come from. The location remains reachable even when the location object is remote-hosted and absent from the gateway's local object table; the gateway uses the host route to enumerate it.
-3. **Location contents.** Non-actor objects in `actor.location.contents` for which the actor has read access. In `the_chatroom` this surfaces `the_cockatoo:squawk`, `the_lamp:take`, etc. Other actors in the same container are visible to room verbs such as `:look`/`:who`, but their actor maintenance verbs are not exposed as tools.
+2. **Current location.** The MCP session's `current_location` and the verbs defined on it. In a chat room, this is where `:say`/`:look`/`:enter` come from. The location remains reachable even when the location object is remote-hosted and absent from the gateway's local object table; the gateway uses the host route to enumerate it.
+3. **Location contents.** Non-actor objects in the session current location's contents for which the actor has read access. In `the_chatroom` this surfaces `the_cockatoo:squawk`, `the_lamp:take`, etc. Other actors in the same container are visible to room verbs such as `:look`/`:who`, but their actor maintenance verbs are not exposed as tools.
 4. **Inventory.** Non-actor objects in `actor.contents`. After `take lamp`, the lamp's verbs follow the actor between rooms.
-5. **Presence spaces.** Spaces the actor is subscribed to via `actor.presence_in`. This is how `the_dubspace` and `the_taskspace` show up in the tool list when the actor is "in" them — even when the actor is *physically* located in a chatroom that frames them. Presence is the woo notion of "I'm in this space" and it's what governs the tool list more than physical location does.
+5. **Other live locations.** Spaces returned by `all_locations(actor)`, excluding this session's current location. This lets an agent discover that the same actor has another live tab/tool session in `the_dubspace` without reading any actor-side presence mirror.
 6. **Working set.** Objects the actor has explicitly added to its scope via `$actor:focus(target)` (§M3.1). This is how task refs returned from `the_taskspace:list_tasks()` become callable: the agent calls `focus(t-7)` and `t-7`'s verbs (`claim`, `set_status`, `add_subtask`) join the tool list. Bounded; capped per implementation policy (default 32 entries).
 7. **Catalog-visible singletons.** Objects the catalog registry advertises as visible to this actor's class/role (per [discovery/catalogs.md](../discovery/catalogs.md)). Ordinary actors usually see nothing here; wizard actors get whatever wizard-discoverable singletons the catalog declares. There is no hardcoded list of "universal corenames" in the protocol — visibility is data-driven from the catalog registry, not from the MCP spec.
 
 Full tool enumeration is **lazy** and **not the default**. Standard MCP `tools/list` returns stable control tools plus a bounded `active` dynamic projection. `woo_list_reachable_tools` uses the same bounded default unless the agent explicitly asks for `here`, `focus`, `object`, `space`, or `all`. A canonical `woo_call(object, verb, args?)` resolves only the requested reachable object/verb. Ordinary tool calls do not force a full cross-host enumeration after they run.
 
-After a tool call, the gateway may compute a cheap local reachability signal (location, inventory, presence spaces, working set, local object versions). If that signal changes, it sends `notifications/tools/list_changed` only to MCP sessions bound to that actor. A change to Alice's tool list must not notify Bob's session; otherwise one actor's move/focus can force every connected agent to re-enumerate cross-host tools. The notification is a hint, not a freshness barrier: clients that tolerate stale tool lists for one turn can ignore it; clients that don't should re-list before their next decision or use `woo_list_reachable_tools` / `woo_call`.
+After a tool call, the gateway may compute a cheap local reachability signal (current location, other live locations, inventory, working set, local object versions). If that signal changes, it sends `notifications/tools/list_changed` only to MCP sessions bound to that actor. A change to Alice's tool list must not notify Bob's session; otherwise one actor's move/focus can force every connected agent to re-enumerate cross-host tools. The notification is a hint, not a freshness barrier: clients that tolerate stale tool lists for one turn can ignore it; clients that don't should re-list before their next decision or use `woo_list_reachable_tools` / `woo_call`.
 
 Containment cycles and re-entrant rooms (a room as the contents of another room — see the chat catalog's hot tub) are walked once; the algorithm is a BFS bounded by the reachability set's natural boundary (objects not in any of the seven categories above).
 
@@ -230,7 +230,7 @@ Queue retention is bounded by both depth (default cap 4096 observations) and age
 
 The queue receives:
 
-- **Applied frames** for spaces the actor has presence in — same fan-out as WS subscribers.
+- **Applied frames** for spaces this MCP session is present in — same session-audience fan-out as WS clients.
 - **Direct events** addressed to the actor per the audience model ([events.md §12.7](../semantics/events.md#127-observation-audience-and-direct-message-routing)): `told`, `looked` to the actor, etc.
 - **Self-observations** the actor's own calls emit are returned in the **call's own response**, not queued. The verb's body emits to `ctx.observations`; that array travels with the result.
 

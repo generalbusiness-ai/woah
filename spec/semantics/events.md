@@ -61,7 +61,7 @@ Events emitted by a single task are delivered in emit order to each target. Even
 Observation durability is not a per-event flag. It is determined by the **invocation route** of the verb that called `emit`. There is one `emit` primitive; its delivery contract is read from the call context.
 
 - **`emit` during a `$space:call`.** Observations are captured into the resulting `applied` frame's `observations` list ([space.md §S2](space.md#s2-the-call-lifecycle) step 9). Replay-visible because the sequenced call itself is replay-visible — replaying the message re-runs the verb body and re-emits the observation, or an implementation may persist/cache applied frames as an optimization. Audit-visible as part of the applied result. The observation is not a separate event-log entry and has no independent seq.
-- **`emit` during a direct call.** Observations are pushed live to the targeted subscribers and not stored anywhere. No seq, no replay, no gap recovery. If the subscriber wasn't connected when the call happened, the observation is lost.
+- **`emit` during a direct call.** Observations are pushed live to the targeted session audience and not stored anywhere. No seq, no replay, no gap recovery. If a recipient session wasn't connected when the call happened, the observation is lost.
 
 Same opcode, same emit shape, two delivery contracts — but the contract is an automatic consequence of where the emit ran, not a flag the author sets.
 
@@ -91,13 +91,20 @@ A direct-call result carries two optional fields alongside `observations`:
 
 ```
 {
-  result, observations,
-  audience_actors:        [actor, ...],     // union of all per-observation audiences
-  observation_audiences:  [[actor, ...], ...] // one entry per observation, parallel array
-}
-```
+    result, observations,
+    audience_actors:        [actor, ...],     // union of all per-observation audiences
+    observation_audiences:  [[actor, ...], ...], // one entry per observation, parallel array
+    audience_sessions:     [session, ...],
+    observation_session_audiences: [[session, ...], ...]
+  }
+  ```
 
-Both are advisory hints to transports. If absent, a transport falls back to the original presence-based filter ("push to anyone with presence in the audience space"). If present, the transport restricts push to the listed actors.
+These are advisory hints to transports. If the session fields are present,
+session-scoped transports filter by session first; this is what keeps two tabs
+for the same actor in different spaces from receiving each other's room events.
+If only actor fields are present, transports filter by actor. If absent, a
+transport falls back to the original presence-based filter ("push to anyone with
+presence in the audience space").
 
 **How the audience is computed.** For each observation:
 
@@ -115,17 +122,21 @@ The set of types treated as direct messages is **closed and explicit** in v1 —
 | `told` | `to`, `from` | Whisper / private message from one actor to another (the LambdaCore `:tell` shape). |
 | `text` | `target` (recipient only — no echo to `actor`) | The substrate `tell()` primitive's emission. Targeted text delivered straight to one player's connection — independent of whether the calling verb has a space audience. Required so verbs running off any `$space` (e.g. `$portable:give`, `$player:inventory` invoked on a player) still reach their recipient. The `actor` field carries the sender for display, not for routing; verbs that want the sender to also see the line emit their own `tell(actor, …)` (the `:give` / `:take` / `:drop` pattern). |
 
-Future additions (`whispered`, `paged`, `pm`) require a spec amendment so all transports update in lockstep. Catalogs that want directed semantics for a non-listed type today should set `to`/`from` and use the `told` type; otherwise the observation broadcasts to the audience space's full subscriber list.
+Future additions (`whispered`, `paged`, `pm`) require a spec amendment so all transports update in lockstep. Catalogs that want directed semantics for a non-listed type today should set `to`/`from` and use the `told` type; otherwise the observation broadcasts to the audience space's full session audience.
 
-> **Sequenced-call caveat (v1).** Directed observations are routed to recipients only when they flow through a *direct* call's live-event broadcast path. Observations embedded in an `applied` frame from a sequenced call are broadcast to the space's audience as a unit, so a directed observation inside one would leak to all room subscribers. In practice no v1 catalog verb emits directed observations (`text`, `told`) inside a sequenced call — all `tell()`-style chat affordances (`:take`, `:drop`, `:give`, `:inventory`, `:home`, `:set_description`) are direct. New sequenced verbs that need directed text should `dispatch(target, "tell", [text])` rather than emit `text` observations themselves; if a future feature requires both sequencing *and* directed observations, the broadcast layer needs a separate filter to split directed observations out of the applied frame before fan-out.
+> **Sequenced-call caveat (v1).** Directed observations are routed to recipients only when they flow through a *direct* call's live-event broadcast path. Observations embedded in an `applied` frame from a sequenced call are broadcast to the space's audience as a unit, so a directed observation inside one would leak to the full room session audience. In practice no v1 catalog verb emits directed observations (`text`, `told`) inside a sequenced call — all `tell()`-style chat affordances (`:take`, `:drop`, `:give`, `:inventory`, `:home`, `:set_description`) are direct. New sequenced verbs that need directed text should `dispatch(target, "tell", [text])` rather than emit `text` observations themselves; if a future feature requires both sequencing *and* directed observations, the broadcast layer needs a separate filter to split directed observations out of the applied frame before fan-out.
 
 #### 12.7.2 Receiver behavior
 
-The `audience_actors` and `observation_audiences` fields are **filtering hints**, not authority claims. Transports use them to avoid pushing irrelevant observations; permission checks (verb-x at emit, read perms at observe) still run independently. A misbehaving runtime that omitted these fields would over-broadcast but not leak privileged data — emit-time perms already gate what gets observed in the first place.
+The audience fields are **filtering hints**, not authority claims. Transports use
+them to avoid pushing irrelevant observations; permission checks (verb-x at
+emit, read perms at observe) still run independently. A misbehaving runtime that
+omitted these fields would over-broadcast but not leak privileged data —
+emit-time perms already gate what gets observed in the first place.
 
 ### 12.8 Sequenced calls with gap recovery
 
-The pattern an event-sourced object uses to give subscribers a totally-ordered stream they can replay over. See [space.md](space.md) for the full normative behavior of `$space:call`; this section is the *consumer-facing* sequencing pattern.
+The pattern an event-sourced object uses to give observing sessions a totally-ordered stream they can replay over. See [space.md](space.md) for the full normative behavior of `$space:call`; this section is the *consumer-facing* sequencing pattern.
 
 **Producer side** (the object that owns the log):
 
@@ -134,7 +145,7 @@ verb $space:call(message) {
   this.next_seq = this.next_seq + 1;
   let seq = this.next_seq;
   // append to log + apply to materialized state (omitted)
-  emit($space.subscribers, { type: "applied", source: this, seq: seq, message: message });
+  // host fans out the applied frame to this.session_subscribers
   return seq;
 }
 

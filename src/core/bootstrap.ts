@@ -128,12 +128,13 @@ const PLAYER_HOME_SOURCE = `verb :home() rxd {
     tell(this, "Either home doesn't want you, or you don't really want to go.");
     return null;
   }
-  if (here != null && (here in this.presence_in)) {
-    set_presence(here, false);
-    observe_to_space(here, { type: "left", actor: this, room: here, destination: dest, text: this.name + " goes home.", ts: now() });
+  if (here != null && here != dest && here != $nowhere) {
+    try {
+      observe_to_space(here, { type: "left", actor: this, room: here, destination: dest, text: this.name + " goes home.", ts: now() });
+    } except err {
+    }
   }
   try {
-    set_presence(dest, true);
     observe_to_space(dest, { type: "entered", actor: this, room: dest, origin: here, text: this.name + " arrives home.", ts: now() });
   } except err {
     // Destination isn't a space — moveto landed us in a non-room container.
@@ -227,7 +228,6 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "subscribers",
   "operators",
   "last_snapshot_seq",
-  "presence_in",
   "focus_list",
   "bootstrap_token_used",
   "wizard_actions",
@@ -351,7 +351,6 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "catalog_migration_records", []);
   define(world, "$system", "help_dbs", [], "list<obj>", "r");
   define(world, "$root", "help", null, "obj|list<obj>|null", "r");
-  define(world, "$actor", "presence_in", [], "list<obj>", "r");
   define(world, "$actor", "features", [], "list<obj>", "r");
   define(world, "$actor", "features_version", 0, "int", "r");
   define(world, "$actor", "focus_list", [], "list<obj>", "r");
@@ -363,6 +362,7 @@ function seedUniversal(world: WooWorld): void {
   // a one-shot migration drops any own def/values on $player and its
   // descendants for upgraded worlds.
   define(world, "$space", "next_seq", 1, "int", "r");
+  define(world, "$space", "session_subscribers", [], "list<map>", "r");
   define(world, "$space", "subscribers", [], "list<obj>", "r");
   define(world, "$space", "last_snapshot_seq", 0, "int", "r");
   define(world, "$space", "features", [], "list<obj>", "r");
@@ -447,7 +447,6 @@ function seedGuests(world: WooWorld): void {
     // of the default empty string. Catalog seed_hooks already do this via
     // setNameIfMissing; bootstrap had to do it explicitly.
     world.setProp(id, "name", displayName);
-    seedProp(world, id, "presence_in", []);
     seedProp(world, id, "home", "$nowhere");
     removeSeedProperty(world, id, "attached_sockets");
   }

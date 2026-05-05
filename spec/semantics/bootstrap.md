@@ -19,7 +19,7 @@ This is the contract the implementation must produce on first start; without it,
 2. **`$system` (`#0`)** is created with the reserved ULID `00000000000000000000000000`. `parent = null`.
 3. **Remaining universal seed objects** are created in dependency order: `$root` → `$actor` → `$player` → `$wiz` / `$guest`, `$sequenced_log` → `$space`, `$thing` → `$catalog`, plus `$catalog_registry` and `$nowhere`. Corenames registered in Directory.
 4. **Configured local catalogs** are installed in dependency order. The bundled set is split between foundational class libraries (`@local:help`, `@local:chat`, `@local:note`, `@local:prog`), the demo seed catalog (`@local:demoworld`), and demo applications (`@local:dubspace`, `@local:pinboard`, `@local:taskspace`); see [catalogs.md §CT15](../discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo) for roles. The normative source is the catalog manifests; bootstrap no longer hard-seeds demo classes and instances directly.
-5. **Catalog scaffold and demo instances** are created by the configured local catalogs. The Living Room / Deck / Hot Tub set, `the_cockatoo`, exits, and props come from `@local:demoworld`. `the_dubspace` is seeded by `@local:dubspace` mounted in `demoworld:the_chatroom`; `the_pinboard` by `@local:pinboard` in `demoworld:the_deck`; `the_taskspace` by `@local:taskspace`. `:add_feature` calls attach `$conversational` (from `chat`) to the rooms and to `the_taskspace` (running as wizard at boot, satisfying both attach-policy gates).
+5. **Catalog scaffold and demo instances** are created by the configured local catalogs. The Living Room / Deck / Hot Tub set, `the_cockatoo`, exits, and props come from `@local:demoworld`. `the_dubspace` is seeded by `@local:dubspace` mounted in `demoworld:the_chatroom`; `the_pinboard` by `@local:pinboard` in `demoworld:the_deck`; `the_taskspace` by `@local:taskspace`. `:add_feature` calls attach `$conversational` to ordinary rooms and `$transparent` (from `chat`) to embedded demo spaces, running as wizard at boot and satisfying both attach-policy gates.
 6. **Guest player pool** is pre-seeded so first connections don't need to mint identities.
 
 Boot is idempotent: running it twice should be a no-op (each seed is created only if its corename isn't already mapped). This makes test setup and dev-restart trivial.
@@ -43,12 +43,12 @@ the target for runtime-created objects, but it is not active in v1.
 |---|---|---|---|---|---|---|---|
 | `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]` | `:return_guest(guest)` | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
 | `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement`, `help` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
-| `$actor` | class | `$root` | `$wiz` | — | Defines `presence_in`, `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
+| `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
 | `$player` | class | `$actor` | `$wiz` | — | Defines `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
 | `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc()` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
 | `$sequenced_log` | class | `$root` | `$wiz` | — | Inherits descriptive slots | Host operations `append(message)`, `read(from,limit)` | Append-only sequenced log base class. `$space` and registry-like coordination objects inherit its sequence/replay shape. |
-| `$space` | class | `$sequenced_log` | `$wiz` | — | Defines `next_seq`, `subscribers`, `last_snapshot_seq`, `features`, `features_version`, `auto_presence` | `:replay(from_seq,limit)`, `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)` | Coordination base class: one local sequence, applied-frame history, present subscribers, and feature-extended direct verbs. Room composition is catalog-level behavior, not part of `$space`. |
+| `$space` | class | `$sequenced_log` | `$wiz` | — | Defines `next_seq`, `session_subscribers`, `subscribers`, `last_snapshot_seq`, `features`, `features_version`, `auto_presence` | `:replay(from_seq,limit)`, `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)` | Coordination base class: one local sequence, applied-frame history, present sessions/subscribers, and feature-extended direct verbs. Room composition is catalog-level behavior, not part of `$space`. |
 | `$thing` | class | `$root` | `$wiz` | fertile | Inherits descriptive slots | `:can_be_attached_by(actor)`, `:moveto(target)` | Simple non-actor base for addressable stateful objects. Fertile so programmer actors can create ordinary owned objects. |
 | `$catalog` | class | `$thing` | `$wiz` | — | Defines `catalog_name`, `alias`, `version`, `tap`, `objects`, `seeds`, `provenance` | Inherits root/thing verbs | Base class for installed catalog records. Instances record provenance and created refs for introspection and uninstall planning. |
 | `$catalog_registry` | singleton space | `$space` | `$wiz` | — | Own values for `$space` state plus `installed_catalogs=[]` | `:install(manifest,frontmatter,alias,provenance)`, `:list()` | Sequenced registry space for catalog install/update/uninstall operations. See [catalogs.md §CT5](../discovery/catalogs.md#ct5-install). |
@@ -98,7 +98,6 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 
 | Property | Type | Default | Notes |
 |---|---|---|---|
-| `presence_in` | list<obj> | `[]` | Spaces the actor is currently in. |
 | `features` | list<obj> | `[]` | Feature objects contributing verbs to this actor. See [features.md](features.md). |
 | `features_version` | int | 0 | Monotonic counter incremented on feature-list changes; used for verb-lookup cache invalidation. |
 | `focus_list` | list<obj> | `[]` | Actor-scoped list of focused objects/spaces for MCP tool discovery and agent attention. |
@@ -159,11 +158,12 @@ directly on `$sequenced_log`.
 | Property | Type | Default | Notes |
 |---|---|---|---|
 | `next_seq` | int | 1 | The next seq to assign. Reserved; written only by the host append primitive. |
-| `subscribers` | list<obj> | `[]` | Actors observing this space's applied frames. |
+| `session_subscribers` | list<map> | `[]` | Authoritative session presence entries, each `{session, actor}`. Maintained by session movement and `set_presence`. |
+| `subscribers` | list<obj> | `[]` | Compatibility actor set derived from `session_subscribers`; used by older catalog/UI code while session-scoped routing is adopted. |
 | `last_snapshot_seq` | int | 0 | Highest seq covered by a snapshot. Used for snapshot triggering and log truncation. |
 | `features` | list<obj> | `[]` | Feature objects contributing verbs to this space. See [features.md](features.md). |
 | `features_version` | int | 0 | Monotonic counter; verb-lookup cache invalidation. |
-| `auto_presence` | bool | false | If true, new sessions automatically enter this space. This is a generic placement/presence policy used by bundled app spaces that should be immediately usable without an explicit `:enter`. |
+| `auto_presence` | bool | false | Legacy catalog flag retained for older installed worlds. New session placement is explicit: clients/catalog verbs call `:enter`/`moveto`, which updates the session current location and `session_subscribers`. New code should not rely on automatic runtime entry from this property. |
 
 ### B2.11 `$space` verbs
 
@@ -178,8 +178,8 @@ The sequenced call lifecycle described as `$space:call` in the semantics docs is
 the protocol/host entrypoint, not a bootstrapped object-visible verb in v0.
 Likewise `snapshot`, explicit `subscribe`/`unsubscribe`, and `on_applied` remain
 reserved conventions until the full core grows object-level wrappers for them.
-Current presence/catalog verbs update `subscribers` directly under ordinary
-permission checks.
+Current movement/catalog verbs update `session_subscribers`; the runtime keeps
+`subscribers` as a compatibility projection.
 
 ### B2.12 `$thing` verbs
 
@@ -359,14 +359,16 @@ builtin; no task-specific native runtime handler is required.
 
 ## B5. Local catalog: Chat classes and scaffolding
 
-> The `chat` catalog is a **foundational utility** ([catalogs.md §CT15](../discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo)): `$conversational` (feature object), `$match` (text-to-action scaffold), `$room`/`$exit` (room geography), `$chatroom` (template), and `$portable`/`$furniture` (base classes). It seeds **no instances** — the bundled Living Room demo lives in the separate `demoworld` catalog. Canonical source: `catalogs/chat/manifest.json` and [`catalogs/chat/DESIGN.md`](../../catalogs/chat/DESIGN.md). The classes below are documented for convenience; behavior is whatever the manifest installs.
+> The `chat` catalog is a **foundational utility** ([catalogs.md §CT15](../discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo)): `$conversational`, `$transparent`, and `$semitransparent` (feature objects), `$match` (text-to-action scaffold), `$room`/`$exit` (room geography), `$chatroom` (template), and `$portable`/`$furniture` (base classes). It seeds **no instances** — the bundled Living Room demo lives in the separate `demoworld` catalog. Canonical source: `catalogs/chat/manifest.json` and [`catalogs/chat/DESIGN.md`](../../catalogs/chat/DESIGN.md). The classes below are documented for convenience; behavior is whatever the manifest installs.
 
 | Corename | Parent | Anchor | Description |
 |---|---|---|---|
 | `$match` | `$thing` | n/a | Chat-shaped text-to-action scaffold. It tokenizes input, resolves visible objects, resolves verbs using runtime lookup, and returns structured command maps. Ordinary worlds can omit it if they do not expose text-command surfaces. |
 | `$failed_match` | `$thing` | n/a | Stable sentinel returned by `$match:match_object` when no visible object matches. It is a value object, not an exception. |
 | `$ambiguous_match` | `$thing` | n/a | Stable sentinel returned by `$match:match_object` when multiple visible objects match at the same priority tier. It lets callers ask users to disambiguate without exceptions. |
-| `$conversational` | `$thing` | n/a | Feature object carrying chat verbs. Attached to `$actor`- or `$space`-descended consumers via `:add_feature($conversational)` per [features.md](features.md). Its verbs run with `this` = the consumer; observation routing emits to `this.subscribers`. |
+| `$conversational` | `$thing` | n/a | Feature object carrying chat verbs. Attached to `$actor`- or `$space`-descended consumers via `:add_feature($conversational)` per [features.md](features.md). Its verbs run with `this` = the consumer; observation routing uses the consumer space's session audience. |
+| `$transparent` | `$conversational` | n/a | Feature object for acoustically transparent embedded spaces. It inherits chat verbs, forwards public local speech to `location(this)`, and receives parent room announcements through `:hear_parent_announce`. |
+| `$semitransparent` | `$conversational` | n/a | Feature object for cone-of-silence embedded spaces. It inherits chat verbs and receives parent room announcements, but local public speech stays local. |
 | `$room` | `$space` | n/a | LambdaCore-shaped room base. Owns room look composition, `exits`, direction verbs, announce helpers, and carry/drop verbs. |
 | `$exit` | `$thing` | source room | First-class exit object with `source`, `dest`, and movement message properties. Direction verbs call room `:match_exit`, then invoke the matched exit. |
 | `$chatroom` | `$room` | own host | Standalone room class. Chat behavior comes from `$conversational`; room geography and contents behavior come from `$room`. |
@@ -419,8 +421,9 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:take(name)` / `:drop(name)` | str | Catalog woocode. Match visible/carryable objects and move them between room contents and actor inventory with `moveto`; emits `taken` / `dropped`. The substrate supplies matching and movement primitives, not the English or room command policy. |
 
 `$exit:invoke()` calls `$exit:move(actor)`. `$exit:move(who)` sends private
-leave/arrival text to `who`, calls `moveto(who, dest)`, updates room presence,
-and emits `left` / `entered` observations to the source and destination rooms.
+leave/arrival text to `who`, calls `moveto(who, dest)`, and emits `left` /
+`entered` observations to the source and destination rooms. The core `moveto`
+path updates the calling session's current location and session presence.
 It returns `{room: dest, from: source, exit, look_deferred: true}`. Unlike
 LambdaCore's `$room:enterfunc`, the server turn does not also render
 `dest:look_self()`; clients and agents that want the destination description
@@ -451,14 +454,14 @@ Schemas describe shape only ([events.md §13](events.md#13-schemas)); durability
 
 ### B5.5 Feature attachment at boot
 
-The bootstrap step that creates `the_chatroom` (B6) and `the_taskspace` (B6) ends with:
+The bootstrap step that creates demo chat surfaces ends with:
 
 ```woo
 the_chatroom:add_feature($conversational);    // running as wizard at boot
-the_taskspace:add_feature($conversational);
+the_dubspace:add_feature($transparent);
+the_pinboard:add_feature($transparent);
+the_taskspace:add_feature($transparent);
 ```
-
-`the_dubspace` does *not* receive `$conversational` by default — its primary surface is sound coordination, and a feature catalog can be added per-deployment.
 
 ---
 
@@ -470,7 +473,7 @@ the_taskspace:add_feature($conversational);
 |---|---|---|---|
 | `$nowhere` | `$thing` | n/a | Seed default-home for players whose `home` is null. Holds disconnected guests after `:on_disfunc` and any object reparented to `null` location during recycle. Wizard-owned, no contents-emitted observations. |
 | `the_dubspace` | `$dubspace` | n/a (own host root) | The first runnable sound-space instance. It owns the sequenced coordination surface for four loop slots, one channel, one filter, one delay, and one default scene. |
-| `the_taskspace` | `$taskspace` | n/a (own host root) | The first runnable task coordination space. It owns the sequenced timeline and anchored task tree used by people or agents to create, claim, discuss, and complete work. Boots with `features: [$conversational]` so `:say`/`:emote`/`:enter`/`:leave` are available alongside task verbs. |
+| `the_taskspace` | `$taskspace` | n/a (own host root) | The first runnable task coordination space. It owns the sequenced timeline and anchored task tree used by people or agents to create, claim, discuss, and complete work. Boots with `features: [$transparent]` so `:say`/`:emote`/`:enter`/`:leave` are available alongside task verbs and public speech reaches the containing audience when mounted. |
 | `the_chatroom` | `$chatroom` | n/a (own host root) | The first runnable chat room. Standalone surface for testing the chat client and `$match` parser; carries `features: [$conversational]` set at boot. |
 
 For the dubspace, the demo creates the four loop slots, one channel, one filter, one delay, one percussion loop, and one scene as anchored children:
@@ -504,7 +507,7 @@ For the taskspace, no instances exist at boot — tasks are created at runtime b
 
 ## B7. Guest player pool
 
-A pre-seeded pool of `$guest` objects, e.g. `guest_1`..`guest_8`, exists at boot. Guest pool objects are operational seed instances, not universal classes. Each has `parent = $guest`, `owner = $wiz`, `location = $nowhere`, no special flags, a display `name` mirrored into the `name` property, a non-empty `description`, `presence_in = []`, and `home = $nowhere`. When a client presents `auth { token: "guest:<random>" }`, `allocateGuest` assigns one of the unbound guest objects to the new session. The pool refills as sessions are reaped: `$guest:on_disfunc` resets the guest's state and returns it to the free pool via `$system:return_guest(this)` (identity.md §I6.4).
+A pre-seeded pool of `$guest` objects, e.g. `guest_1`..`guest_8`, exists at boot. Guest pool objects are operational seed instances, not universal classes. Each has `parent = $guest`, `owner = $wiz`, `location = $nowhere`, no special flags, a display `name` mirrored into the `name` property, a non-empty `description`, and `home = $nowhere`. When a client presents `auth { token: "guest:<random>" }`, `allocateGuest` assigns one of the unbound guest objects to the new session. The pool refills as sessions are reaped: `$guest:on_disfunc` resets the guest's state and returns it to the free pool via `$system:return_guest(this)` (identity.md §I6.4).
 
 For the demo, 8 guests is enough for a small cohort. Real worlds would mint guests on demand or scale the pool to expected concurrent traffic. Each guest's description states that it is a pre-seeded temporary player and exists to give local users or agents a stable guest actor.
 

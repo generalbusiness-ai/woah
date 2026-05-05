@@ -62,6 +62,8 @@ const LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION = "2026-05-02-prog-editor-room";
 const LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION = "2026-05-02-prog-editor-nowhere";
 const LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION = "2026-05-04-demo-spaces-no-auto-presence";
 const LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION = "2026-05-04-drop-session-id-property";
+const LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION = "2026-05-04-chat-transparent-feature";
+const LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION = "2026-05-04-drop-presence-in-property";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -106,7 +108,9 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_PROG_EDITOR_ROOM_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION },
-  { id: LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION }
+  { id: LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION },
+  { id: LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION },
+  { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -297,6 +301,8 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_PROG_EDITOR_NOWHERE_MIGRATION, { reconcileSeedHooks: true, only: "prog" });
   runDemoSpacesNoAutoPresenceMigration(world);
   runDropSessionIdPropertyMigration(world);
+  runChatTransparentFeatureMigration(world, names);
+  runDropPresenceInPropertyMigration(world);
   return covered;
 }
 
@@ -487,25 +493,95 @@ function runDropSessionIdPropertyMigration(world: WooWorld): void {
   markMigrationApplied(world, LOCAL_CATALOG_DROP_SESSION_ID_PROPERTY_MIGRATION);
 }
 
+function runDropPresenceInPropertyMigration(world: WooWorld): void {
+  if (migrationApplied(world, LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION)) return;
+  for (const id of Array.from(world.objects.keys())) {
+    const obj = world.object(id);
+    if (obj.propertyDefs.has("presence_in") || obj.properties.has("presence_in") || obj.propertyVersions.has("presence_in")) {
+      world.deleteProp(id, "presence_in");
+    }
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION);
+}
+
+function runChatTransparentFeatureMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION)) return;
+  const transparentConsumers = transparentFeatureConsumers();
+  if (chatTransparentFeaturePostcondition(world, names, transparentConsumers)) {
+    markMigrationApplied(world, LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION);
+    return;
+  }
+  if (names.includes("chat") && localCatalogInstalled(world, "chat")) {
+    const result = runLocalCatalogSchemaPlan(world, "chat", LOCAL_CATALOGS.get("chat")!, "gateway", "world", {
+      allowImplementationHints: true,
+      reconcileClassVerbs: true
+    });
+    if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
+  }
+  for (const name of ["dubspace", "pinboard", "taskspace"]) {
+    if (!names.includes(name) || !localCatalogInstalled(world, name)) continue;
+    const result = runLocalCatalogSchemaPlan(world, name, LOCAL_CATALOGS.get(name)!, "gateway", "world", {
+      allowImplementationHints: true,
+      reconcileSeedHooks: true,
+      reconcileClassVerbs: true
+    });
+    if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
+  }
+  for (const consumer of transparentConsumers) {
+    if (!world.objects.has(consumer) || !world.objects.has("$transparent")) continue;
+    const raw = world.propOrNull(consumer, "features");
+    const features = Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
+    const next = ["$transparent", ...features.filter((item) => item !== "$transparent" && item !== "$conversational")];
+    if (features.length === next.length && features.every((item, index) => item === next[index])) continue;
+    world.setProp(consumer, "features", next);
+    world.setProp(consumer, "features_version", Number(world.propOrNull(consumer, "features_version") ?? 0) + 1);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION);
+}
+
+function transparentFeatureConsumers(): ObjRef[] {
+  const out: ObjRef[] = [];
+  for (const name of ["dubspace", "pinboard", "taskspace"]) {
+    const manifest = LOCAL_CATALOGS.get(name);
+    for (const hook of manifest?.seed_hooks ?? []) {
+      if (hook.kind === "attach_feature" && hook.feature === "chat:$transparent" && typeof hook.consumer === "string") {
+        out.push(hook.consumer as ObjRef);
+      }
+    }
+  }
+  return out;
+}
+
+function chatTransparentFeaturePostcondition(world: WooWorld, names: readonly string[], transparentConsumers: readonly ObjRef[]): boolean {
+  if (names.includes("chat") && localCatalogInstalled(world, "chat")) {
+    if (!world.objects.has("$transparent") || !world.objects.has("$semitransparent")) return false;
+    const announce = world.objects.has("$room") ? world.ownVerbExact("$room", "announce_all_but") : null;
+    if (!announce?.source.includes("hear_parent_announce")) return false;
+  }
+  for (const name of ["dubspace", "pinboard", "taskspace"]) {
+    if (!names.includes(name) || !localCatalogInstalled(world, name)) continue;
+    const manifest = LOCAL_CATALOGS.get(name);
+    for (const def of manifest?.classes ?? []) {
+      if (def.parent === "$space" && world.objects.has(def.local_name) && world.object(def.local_name).parent !== "$space") return false;
+    }
+  }
+  for (const consumer of transparentConsumers) {
+    if (!world.objects.has(consumer)) continue;
+    const raw = world.propOrNull(consumer, "features");
+    const features = Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
+    if (features[0] !== "$transparent" || features.includes("$conversational")) return false;
+  }
+  return true;
+}
+
 function runDemoSpacesNoAutoPresenceMigration(world: WooWorld): void {
   if (migrationApplied(world, LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION)) return;
-  const drop = new Set<ObjRef>();
   for (const id of Array.from(world.objects.keys())) {
     if (!world.isDescendantOf(id, "$space")) continue;
     if (world.propOrNull(id, "auto_presence") !== true) continue;
-    drop.add(id);
     world.setProp(id, "auto_presence", false);
     const subscribers = world.propOrNull(id, "subscribers");
     if (Array.isArray(subscribers) && subscribers.length > 0) world.setProp(id, "subscribers", []);
-  }
-  if (drop.size > 0) {
-    for (const id of Array.from(world.objects.keys())) {
-      if (!world.isDescendantOf(id, "$actor")) continue;
-      const presence = world.propOrNull(id, "presence_in");
-      if (!Array.isArray(presence) || presence.length === 0) continue;
-      const next = presence.filter((entry) => typeof entry !== "string" || !drop.has(entry));
-      if (next.length !== presence.length) world.setProp(id, "presence_in", next);
-    }
   }
   markMigrationApplied(world, LOCAL_CATALOG_DEMO_SPACES_NO_AUTO_PRESENCE_MIGRATION);
 }

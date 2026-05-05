@@ -142,11 +142,11 @@ describe("local catalogs", () => {
     const taskspace = readManifest("taskspace");
     expect(chat.depends).toEqual(["@local:help"]);
     expect(dubspace.depends).toEqual(["@local:chat", "@local:demoworld"]);
-    expect(dubspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_dubspace", feature: "chat:$conversational" });
+    expect(dubspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_dubspace", feature: "chat:$transparent" });
     expect(pinboard.depends).toEqual(["@local:chat", "@local:note", "@local:demoworld"]);
-    expect(pinboard.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_pinboard", feature: "chat:$conversational" });
+    expect(pinboard.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_pinboard", feature: "chat:$transparent" });
     expect(taskspace.depends).toEqual(["@local:chat", "@local:note"]);
-    expect(taskspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskspace", feature: "chat:$conversational" });
+    expect(taskspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskspace", feature: "chat:$transparent" });
   });
 
   it("keeps mounted demo-space enter and leave verbs portable", async () => {
@@ -515,7 +515,7 @@ describe("local catalogs", () => {
     expect(world.ownVerb("$dubspace", "set_drum_step")?.kind).toBe("bytecode");
     expect(world.ownVerb("$dubspace", "save_scene")?.kind).toBe("bytecode");
     expect(world.ownVerb("$dubspace", "enter")?.kind).toBe("bytecode");
-    expect(world.verbInfo("the_dubspace", "say").definer).toBe("$conversational");
+    expect(world.verbInfo("the_dubspace", "say").definer).toBe("$transparent");
 
     const session = world.auth("guest:catalog-dubspace");
     const actor = session.actor;
@@ -684,7 +684,7 @@ describe("local catalogs", () => {
     const note = added.observations.find((obs) => obs.type === "note_added")?.note as Record<string, unknown>;
     const pin = String(note.id);
 
-    expect(world.verbInfo("the_pinboard", "say").definer).toBe("$conversational");
+    expect(world.verbInfo("the_pinboard", "say").definer).toBe("$transparent");
     const sayPlan = await world.directCall("pinboard-say-plan", session.actor, "the_pinboard", "command_plan", ["hello board"]);
     expect(sayPlan.op).toBe("result");
     if (sayPlan.op === "result") {
@@ -1197,11 +1197,12 @@ describe("local catalogs", () => {
       expect(dubspaceChatPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "say", args: ["hello dubspace"] });
     }
 
-    expect(installVerb(world, "$chatroom", "tag", `verb :tag(text) rx {
-  observe({ type: "tagged", source: this, actor: actor, text: text });
-  return text;
-}`, null).ok).toBe(true);
-    const stringArgPlan = await world.directCall("plan-string-room-verb", first.actor, "the_chatroom", "command_plan", ["tag lamp"]);
+      expect(installVerb(world, "$chatroom", "tag", `verb :tag(text) rx {
+    observe({ type: "tagged", source: this, actor: actor, text: text });
+    return text;
+  }`, null).ok).toBe(true);
+      await world.directCall("return-chat-for-string-plan", first.actor, "the_chatroom", "enter", []);
+      const stringArgPlan = await world.directCall("plan-string-room-verb", first.actor, "the_chatroom", "command_plan", ["tag lamp"]);
     expect(stringArgPlan.op).toBe("result");
     if (stringArgPlan.op === "result") {
       expect(stringArgPlan.result).toMatchObject({ ok: true, route: "sequenced", target: "the_chatroom", verb: "tag", args: ["lamp"] });
@@ -1800,21 +1801,24 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-01-chat-nowhere-portables-repair");
   });
 
-  it("clears auto_presence on demo spaces and drops them from existing actor presence_in", () => {
+  it("clears auto_presence on demo spaces and removes obsolete actor presence_in state", () => {
     const world = createWorld();
     expect(world.getProp("the_dubspace", "auto_presence")).toBe(false);
     expect(world.getProp("the_taskspace", "auto_presence")).toBe(false);
 
     // Simulate a deployed world: actors auto-present in demo spaces, spaces
-    // listing those actors as subscribers, and the migration ledger missing
-    // the cleanup entry.
+    // listing those actors as subscribers, and the migration ledgers missing
+    // the cleanup entries.
     const session = world.auth("guest:auto-presence-cleanup");
+    world.defineProperty("$actor", { name: "presence_in", defaultValue: [], owner: "$wiz", perms: "r", typeHint: "list<obj>" });
     world.setProp(session.actor, "presence_in", ["the_dubspace", "the_taskspace"]);
     world.setProp("the_dubspace", "auto_presence", true);
     world.setProp("the_taskspace", "auto_presence", true);
     world.setProp("the_dubspace", "subscribers", [session.actor]);
     world.setProp("the_taskspace", "subscribers", [session.actor]);
-    const ledger = (world.getProp("$system", "applied_migrations") as string[]).filter((id) => id !== "2026-05-04-demo-spaces-no-auto-presence");
+    const ledger = (world.getProp("$system", "applied_migrations") as string[]).filter(
+      (id) => id !== "2026-05-04-demo-spaces-no-auto-presence" && id !== "2026-05-04-drop-presence-in-property"
+    );
     world.setProp("$system", "applied_migrations", ledger);
 
     installLocalCatalogs(world);
@@ -1823,13 +1827,14 @@ describe("local catalogs", () => {
     expect(world.getProp("the_taskspace", "auto_presence")).toBe(false);
     expect(world.getProp("the_dubspace", "subscribers")).toEqual([]);
     expect(world.getProp("the_taskspace", "subscribers")).toEqual([]);
-    expect(world.getProp(session.actor, "presence_in")).toEqual([]);
+    expect(world.propOrNull(session.actor, "presence_in")).toBeNull();
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-04-demo-spaces-no-auto-presence");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-04-drop-presence-in-property");
 
     // Fresh auths after the migration must not pick up auto-presence either —
     // demo spaces have no business pre-subscribing arriving agents.
     const fresh = world.auth("guest:auto-presence-fresh");
-    expect(world.getProp(fresh.actor, "presence_in")).toEqual([]);
+    expect(world.propOrNull(fresh.actor, "presence_in")).toBeNull();
   });
 
   it("repairs stale catalog tool exposure for agent-visible taskspace and dubspace verbs", () => {
@@ -1939,7 +1944,8 @@ describe("local catalogs", () => {
 
     const migratedEnter = world.ownVerb("$conversational", "enter");
     expect(migratedEnter?.kind).toBe("bytecode");
-    expect(migratedEnter?.source).toContain("set_presence");
+      expect(migratedEnter?.source).toContain("moveto(actor, this)");
+      expect(migratedEnter?.source).not.toContain("set_presence");
     const migratedLook = world.ownVerb("$conversational", "look");
     expect(migratedLook?.kind).toBe("bytecode");
     expect(migratedLook?.source).toContain("look_at");

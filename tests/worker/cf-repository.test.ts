@@ -229,12 +229,20 @@ class FakeHostBridge implements HostBridge {
     this.worldFor(containerRef).mirrorContents(containerRef, objRef, present);
   }
 
-  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(actor).setActorPresence(actor, space, present);
+  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(actor).setActorPresence(actor, space, present, sessionId);
   }
 
-  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(space).setSpaceSubscriber(space, actor, present);
+  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(space).setSpaceSubscriber(space, actor, present, sessionId);
+  }
+
+  async spaceAudienceSessions(space: ObjRef, actors?: ObjRef[]): Promise<string[]> {
+    return this.worldFor(space).presenceSessionIdsIn(space, actors);
+  }
+
+  async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    return this.worldFor(actor).allLocationsForActor(actor);
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -316,11 +324,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       roomHost.setProp("cf_remote_room", "features", ["$conversational"]);
       roomHost.setProp("cf_remote_room", "aliases", ["remote room"]);
       if (!roomHost.objects.has(actor)) roomHost.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
-      roomHost.setActorPresence(actor, "cf_remote_room", true);
+        roomHost.setActorPresence(actor, "cf_remote_room", true);
 
-      home.object(actor).location = "cf_remote_room";
-      home.setActorPresence(actor, "cf_remote_room", true);
-      home.createObject({ id: "cf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz", location: "cf_remote_room" });
+        home.object(actor).location = "cf_remote_room";
+        home.sessions.get(session.id)!.currentLocation = "cf_remote_room";
+        home.setActorPresence(actor, "cf_remote_room", true);
+        home.createObject({ id: "cf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
+        home.object("cf_home_widget").location = "cf_remote_room";
       home.setProp("cf_home_widget", "aliases", ["widget"]);
       home.addVerb("cf_home_widget", {
         kind: "native",

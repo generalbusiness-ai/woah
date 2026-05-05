@@ -202,12 +202,20 @@ class LocalHostBridge implements HostBridge {
     this.worldFor(containerRef).mirrorContents(containerRef, objRef, present);
   }
 
-  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(actor).setActorPresence(actor, space, present);
+  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(actor).setActorPresence(actor, space, present, sessionId);
   }
 
-  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(space).setSpaceSubscriber(space, actor, present);
+  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(space).setSpaceSubscriber(space, actor, present, sessionId);
+  }
+
+  async spaceAudienceSessions(space: ObjRef, actors?: ObjRef[]): Promise<string[]> {
+    return this.worldFor(space).presenceSessionIdsIn(space, actors);
+  }
+
+  async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    return this.worldFor(actor).allLocationsForActor(actor);
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -421,10 +429,11 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         })
       );
       const ctx: CallContext = {
-        world: home,
-        space: "the_dubspace",
-        seq: 1,
-        actor: session.actor,
+          world: home,
+          space: "the_dubspace",
+          seq: 1,
+          session: null,
+          actor: session.actor,
         player: session.actor,
         caller: "#-1",
         callerPerms: session.actor,
@@ -531,36 +540,39 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const roomABridge = new LocalHostBridge("room-a", worlds, routes);
       const roomBBridge = new LocalHostBridge("room-b", worlds, routes);
       roomA.setHostBridge(roomABridge);
-      roomB.setHostBridge(roomBBridge);
+        roomB.setHostBridge(roomBBridge);
 
-      roomA.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
-      home.setActorPresence(actor, "the_chatroom", true);
+        roomA.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
+        home.sessions.get(session.id)!.currentLocation = "the_chatroom";
+        roomA.ensureSessionForActor(session.id, actor, "guest").currentLocation = "the_chatroom";
+        home.setActorPresence(actor, "the_chatroom", true);
       roomA.setActorPresence(actor, "the_chatroom", true);
       roomA.setSpaceSubscriber("the_chatroom", actor, true);
 
       // Witness in the source room; should see Alice's "left" but never the
       // destination-room "entered" event when she walks out.
-      const witness = home.auth("guest:conf-cross-host-witness").actor;
+      const witnessSession = home.auth("guest:conf-cross-host-witness");
+      const witness = witnessSession.actor;
       routes.set(witness, "home");
       roomA.createObject({ id: witness, name: witness, parent: "$guest", owner: "$wiz" });
-      home.setActorPresence(witness, "the_chatroom", true);
-      roomA.setActorPresence(witness, "the_chatroom", true);
-      roomA.setSpaceSubscriber("the_chatroom", witness, true);
+      home.sessions.get(witnessSession.id)!.currentLocation = "the_chatroom";
+      roomA.ensureSessionForActor(witnessSession.id, witness, "guest").currentLocation = "the_chatroom";
+      roomA.setSpaceSubscriber("the_chatroom", witness, true, witnessSession.id);
 
       const moveEffects: DeferredHostEffect[] = [];
-      const moved = await roomA.directCall("walk-se", actor, "the_chatroom", "southeast", [], {
-        deferHostEffect: (effect) => moveEffects.push(effect)
-      });
+        const moved = await roomA.directCall("walk-se", actor, "the_chatroom", "southeast", [], {
+          sessionId: session.id,
+          deferHostEffect: (effect) => moveEffects.push(effect)
+        });
       expect(moved.op).toBe("result");
       if (moved.op === "result") {
         expect(moved.result).toMatchObject({ room: "the_deck", look_deferred: true });
       }
-      expect(moveEffects.map((effect) => effect.kind)).toEqual(["move_object", "actor_presence", "actor_presence", "space_subscriber"]);
+        expect(moveEffects.map((effect) => effect.kind)).toEqual(["actor_presence", "move_object", "actor_presence", "space_subscriber"]);
       await home.applyDeferredHostEffects(moveEffects);
       expect(roomABridge.contentsCalls.get("the_deck") ?? 0).toBe(0);
       expect(home.object(actor).location).toBe("the_deck");
-      expect(home.hasPresence(actor, "the_chatroom")).toBe(false);
-      expect(home.hasPresence(actor, "the_deck")).toBe(true);
+      expect(home.allLocationsForActor(actor)).toEqual(["the_deck"]);
       expect(roomA.getProp("the_chatroom", "subscribers")).not.toContain(actor);
       expect(roomB.getProp("the_deck", "subscribers")).toContain(actor);
       expect(roomB.object("the_deck").contents.has(actor)).toBe(true);
@@ -576,18 +588,19 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         expect(enteredIdx).toBeGreaterThanOrEqual(0);
         expect(audiences[leftIdx]).toContain(witness);
         expect(audiences[enteredIdx] ?? []).not.toContain(witness);
-      }
+        }
 
-      const tubEffects: DeferredHostEffect[] = [];
-      const enterTub = await roomB.directCall("enter-tub", actor, "the_hot_tub", "enter", [], {
-        deferHostEffect: (effect) => tubEffects.push(effect)
-      });
+        const tubEffects: DeferredHostEffect[] = [];
+        roomB.ensureSessionForActor(session.id, actor, "guest").currentLocation = "the_deck";
+        const enterTub = await roomB.directCall("enter-tub", actor, "the_hot_tub", "enter", [], {
+          sessionId: session.id,
+          deferHostEffect: (effect) => tubEffects.push(effect)
+        });
       expect(enterTub.op).toBe("result");
       if (enterTub.op === "result") expect(enterTub.result).toMatchObject({ room: "the_hot_tub", look_deferred: true });
       expect(tubEffects.map((effect) => effect.kind)).toEqual(["actor_presence", "move_object", "actor_presence"]);
       await home.applyDeferredHostEffects(tubEffects);
-      expect(home.hasPresence(actor, "the_deck")).toBe(false);
-      expect(home.hasPresence(actor, "the_hot_tub")).toBe(true);
+      expect(home.allLocationsForActor(actor)).toEqual(["the_hot_tub"]);
       expect(roomB.getProp("the_deck", "subscribers")).not.toContain(actor);
       expect(roomB.getProp("the_hot_tub", "subscribers")).toContain(actor);
       expect(roomB.object("the_deck").contents.has(actor)).toBe(false);
@@ -599,8 +612,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       });
       expect(tubOut.op).toBe("result");
       await home.applyDeferredHostEffects(tubOutEffects);
-      expect(home.hasPresence(actor, "the_deck")).toBe(true);
-      expect(home.hasPresence(actor, "the_hot_tub")).toBe(false);
+      expect(home.allLocationsForActor(actor)).toEqual(["the_deck"]);
       expect(roomB.getProp("the_deck", "subscribers")).toContain(actor);
       expect(roomB.getProp("the_hot_tub", "subscribers")).not.toContain(actor);
 
@@ -612,12 +624,11 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       if (west.op === "result") {
         expect(west.result).toMatchObject({ room: "the_chatroom", look_deferred: true });
       }
-      expect(westEffects.map((effect) => effect.kind)).toEqual(["move_object", "actor_presence", "actor_presence", "space_subscriber"]);
+        expect(westEffects.map((effect) => effect.kind)).toEqual(["actor_presence", "move_object", "actor_presence", "space_subscriber"]);
       await home.applyDeferredHostEffects(westEffects);
       expect(roomBBridge.contentsCalls.get("the_chatroom") ?? 0).toBe(0);
       expect(home.object(actor).location).toBe("the_chatroom");
-      expect(home.hasPresence(actor, "the_chatroom")).toBe(true);
-      expect(home.hasPresence(actor, "the_deck")).toBe(false);
+      expect(home.allLocationsForActor(actor)).toEqual(["the_chatroom"]);
       expect(roomA.getProp("the_chatroom", "subscribers")).toContain(actor);
       expect(roomB.getProp("the_deck", "subscribers")).not.toContain(actor);
       if (west.op === "result") {
@@ -653,8 +664,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     try {
       const home = homeHarness.world;
       const roomHost = roomHarness.world;
-      const stale = home.auth("guest:conf-stale-subscriber").actor;
-      const watcher = home.auth("guest:conf-live-subscriber").actor;
+        const stale = home.auth("guest:conf-stale-subscriber").actor;
+        const watcherSession = home.auth("guest:conf-live-subscriber");
+        const watcher = watcherSession.actor;
       const worlds = new Map<string, WooWorld>([
         ["home", home],
         ["room", roomHost]
@@ -671,9 +683,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       roomHost.setProp("conf_scrub_room", "subscribers", [stale, watcher]);
       roomHost.setProp("conf_scrub_room", "features", ["$conversational"]);
       home.setActorPresence(watcher, "conf_scrub_room", true);
-      // Isolation setup: this test is only about presence/subscriber mirror
-      // repair, so location is direct-mutated instead of going through :enter.
-      home.object(watcher).location = "conf_scrub_room";
+        // Isolation setup: this test is only about presence/subscriber mirror
+        // repair, so location is direct-mutated instead of going through :enter.
+        home.object(watcher).location = "conf_scrub_room";
+        home.sessions.get(watcherSession.id)!.currentLocation = "conf_scrub_room";
 
       const denied = await roomHost.directCall("stale-who", stale, "conf_scrub_room", "who", []);
       expect(denied.op).toBe("error");
@@ -718,11 +731,13 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       roomHost.setProp("conf_remote_room", "features", ["$conversational"]);
       roomHost.setProp("conf_remote_room", "aliases", ["remote room"]);
       if (!roomHost.objects.has(actor)) roomHost.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
-      roomHost.setActorPresence(actor, "conf_remote_room", true);
+        roomHost.setActorPresence(actor, "conf_remote_room", true);
 
-      home.object(actor).location = "conf_remote_room";
-      home.setActorPresence(actor, "conf_remote_room", true);
-      home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz", location: "conf_remote_room" });
+        home.object(actor).location = "conf_remote_room";
+        home.sessions.get(session.id)!.currentLocation = "conf_remote_room";
+        home.setActorPresence(actor, "conf_remote_room", true);
+        home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
+        home.object("conf_home_widget").location = "conf_remote_room";
       home.setProp("conf_home_widget", "aliases", ["widget"]);
       home.addVerb("conf_home_widget", {
         kind: "native",

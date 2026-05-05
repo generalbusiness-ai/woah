@@ -27,9 +27,10 @@ and has its own focused UI. Entering that UI means the actor is at the
 controls; the mounted room observes the enter/exit activity.
 
 The seeded `the_dubspace` instance also attaches ephemeral
-`chat:$conversational`, so the focused Dubspace UI can include the same compact
-space-local chat used by Pinboard and Taskspace. These utterances are live
-observations from `the_dubspace`, separate from the sequenced control log.
+`chat:$transparent`, so the focused Dubspace UI can include the same compact
+space-local chat used by Pinboard and Taskspace while forwarding public speech
+to its containing room. These utterances are live observations from
+`the_dubspace`, separate from the sequenced control log.
 
 ## Core Requirement
 

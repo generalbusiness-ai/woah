@@ -297,6 +297,52 @@ Woo-core should learn from these structures without inheriting LambdaCore's
 full command set, mail system, help system, editor stack, or text-first
 assumptions as core requirements.
 
+### C11.1 Verb naming: in-fiction vs meta (the `@` convention)
+
+LambdaMOO/LambdaCore split user-facing verbs into two registers using the
+`@` prefix as a strong cultural convention. **woo follows this convention**
+for any verb exposed to a chat-shaped command surface.
+
+| Register | Examples | Mutates |
+|---|---|---|
+| In-fiction (no prefix) | `take`, `drop`, `look`, `say`, `go`, `north`, `enter`, `who`, `home` | The fiction (your character takes the mug; you walk north) |
+| Meta / authoring (`@`-prefixed) | `@describe`, `@dig`, `@create`, `@set`, `@list`, `@show`, `@move-to`, `@verb`, `@property`, `@whoami`, `@quit` | World structure (description text, layout, properties, verbs, exits, identity) |
+
+The parser doesn't treat `@` specially — it's part of the verb name in
+the resolved verb table — but the convention pays off:
+
+- **Two registers in one namespace.** A piece of furniture can have a
+  `:describe` verb (returns its in-world description) without colliding
+  with `@describe` (the authoring command that mutates description text).
+- **In-character speech is safe.** When a player types `"describe yourself"`
+  or `take note dig from box`, the parser doesn't risk dispatching to a
+  builder verb.
+- **Discoverability.** `@verbs` cluster together in command help; players
+  learn that "if it starts with `@`, I'm in builder mode."
+
+**Guidance.** When adding a verb to a catalog or seed class:
+
+- If the verb represents an in-fiction action (the character does it inside
+  the world), name it without prefix: `:take`, `:say`, `:enter`,
+  `:set_description` (not exposed as a chat command directly), `:emote`.
+- If the verb mutates *world structure* (descriptions, layout, objects,
+  classes, properties, exits, identity), expose it through a chat-grammar
+  alias starting with `@`: `@describe <thing> as <text>` lowering to
+  `:set_description`; `@dig <direction>` lowering to a builder verb.
+- The `@`-prefix is on the *command grammar* surface, not necessarily on
+  the underlying verb name. The chat planner accepts `@describe`,
+  `describe`, and `@desc` as aliases that all route to `:set_description`.
+  Catalogs may keep underscore-named verb implementations and accept
+  `@`-prefixed grammar in `:command_plan`.
+- Some verbs have both forms: LambdaCore has both `home` (in-fiction "head
+  home") and `@home` (admin force-teleport). Both are valid; their
+  semantics differ slightly. New duplicates should be deliberate.
+
+This is naming guidance, not a substrate rule. The substrate verb name
+table is opaque to the parser; nothing breaks if a catalog ignores the
+convention. But following it keeps user-visible behavior predictable
+across catalogs and aligns with decades of MOO precedent.
+
 ---
 
 ## C12. Direct messages vs space-mediated messages
@@ -323,7 +369,7 @@ Verb-call decisions break into two independent choices. Observation durability i
 
 The axes are independent. A direct call may mutate persistent state (it just doesn't enter any space's log). A read-only verb usually emits nothing at all and mutates nothing.
 
-> **Observation durability follows the invocation route.** Observations emitted while applying a sequenced `$space:call` are part of the resulting applied frame and replay-visible. Observations emitted from a direct call are live-only — pushed to subscribers, never stored. See [events.md §12.6](events.md#126-observation-durability-follows-invocation-route).
+> **Observation durability follows the invocation route.** Observations emitted while applying a sequenced `$space:call` are part of the resulting applied frame and replay-visible. Observations emitted from a direct call are live-only — pushed to the targeted session audience, never stored. See [events.md §12.6](events.md#126-observation-durability-follows-invocation-route).
 
 This collapses what looked like a third axis into a consequence. To make an observation durable, route the call that emits it through `$space:call`. To keep it live-only, call directly. There is no separate "ephemeral" flag to set.
 

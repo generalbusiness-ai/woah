@@ -198,12 +198,20 @@ class LocalHostBridge implements HostBridge {
     this.worldFor(containerRef).mirrorContents(containerRef, objRef, present);
   }
 
-  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(actor).setActorPresence(actor, space, present);
+  async setActorPresence(actor: ObjRef, space: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(actor).setActorPresence(actor, space, present, sessionId);
   }
 
-  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean): Promise<void> {
-    this.worldFor(space).setSpaceSubscriber(space, actor, present);
+  async setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void> {
+    this.worldFor(space).setSpaceSubscriber(space, actor, present, sessionId);
+  }
+
+  async spaceAudienceSessions(space: ObjRef, actors?: ObjRef[]): Promise<string[]> {
+    return this.worldFor(space).presenceSessionIdsIn(space, actors);
+  }
+
+  async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    return this.worldFor(actor).allLocationsForActor(actor);
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -300,10 +308,11 @@ describe("woo core", () => {
     try {
       await world.dispatch(
         {
-          world,
-          space: "the_dubspace",
-          seq: 1,
-          actor,
+            world,
+            space: "the_dubspace",
+            seq: 1,
+            session: null,
+            actor,
           player: actor,
           caller: "#-1",
           callerPerms: actor,
@@ -338,10 +347,11 @@ describe("woo core", () => {
     try {
       await world.dispatch(
         {
-          world,
-          space: "the_dubspace",
-          seq: 2,
-          actor,
+            world,
+            space: "the_dubspace",
+            seq: 2,
+            session: null,
+            actor,
           player: actor,
           caller: "#-1",
           callerPerms: actor,
@@ -410,10 +420,11 @@ describe("woo core", () => {
     );
 
     const ctx: CallContext = {
-      world: home,
-      space: "the_dubspace",
-      seq: 1,
-      actor,
+        world: home,
+        space: "the_dubspace",
+        seq: 1,
+        session: null,
+        actor,
       player: actor,
       caller: "#-1",
       callerPerms: actor,
@@ -614,7 +625,7 @@ describe("woo core", () => {
     if (entered.op !== "result") return;
     expect(entered.observations.map((obs) => obs.type)).toEqual(["pinboard_entered", "pinboard_activity"]);
     expect(entered.observations[1]).toMatchObject({ source: "the_deck", board: "the_pinboard", actor: actor.actor });
-    expect(entered.observationAudiences?.[0]).toEqual([actor.actor]);
+    expect(entered.observationAudiences?.[0]).toEqual([]);
     expect(entered.observationAudiences?.[1]).toEqual([watcher.actor]);
   });
 
@@ -806,13 +817,13 @@ describe("woo core", () => {
     expect(() => world.object("the_dubspace")).toThrow(/E_OBJNF|object not found/);
     expect(world.getProp("$catalog_registry", "installed_catalogs")).toEqual([]);
     const session = world.auth("guest:clean");
-    expect(world.getProp(session.actor, "presence_in")).toEqual([]);
+    expect(world.allLocationsForActor(session.actor)).toEqual(["$nowhere"]);
 
     installLocalCatalogs(world, ["chat", "demoworld", "taskspace", "dubspace"]);
     expect(world.object("the_chatroom").parent).toBe("$chatroom");
     expect(world.object("the_taskspace").parent).toBe("$taskspace");
     expect(world.object("the_dubspace").parent).toBe("$dubspace");
-    expect(world.verbInfo("the_taskspace", "say").definer).toBe("$conversational");
+    expect(world.verbInfo("the_taskspace", "say").definer).toBe("$transparent");
   });
 
   it("exports host-scoped worlds for routed cluster hosts", async () => {
@@ -1079,9 +1090,153 @@ describe("woo core", () => {
     expect(world.hasPresence(session.actor, "the_chatroom")).toBe(true);
   });
 
+  it("tracks current location per session for the same actor", async () => {
+    const world = createWorld();
+    const primary = world.auth("guest:multi-location");
+    const actor = primary.actor;
+    const secondary = world.ensureSessionForActor("zz-secondary-location-session", actor, "guest");
+
+    expect((await world.directCall("primary-enter-chat", actor, "the_chatroom", "enter", [], { sessionId: primary.id })).op).toBe("result");
+    expect((await world.directCall("secondary-enter-dubspace", actor, "the_dubspace", "enter", [], { sessionId: secondary.id })).op).toBe("result");
+
+    expect(world.currentLocationForSession(primary.id)).toBe("the_chatroom");
+    expect(world.currentLocationForSession(secondary.id)).toBe("the_dubspace");
+    expect(world.object(actor).location).toBe("the_chatroom");
+    expect(world.hasSessionPresence(primary.id, "the_chatroom")).toBe(true);
+    expect(world.hasSessionPresence(primary.id, "the_dubspace")).toBe(false);
+    expect(world.hasSessionPresence(secondary.id, "the_chatroom")).toBe(false);
+    expect(world.hasSessionPresence(secondary.id, "the_dubspace")).toBe(true);
+    expect(new Set(world.allLocationsForActor(actor))).toEqual(new Set(["the_chatroom", "the_dubspace"]));
+  });
+
+  it("routes live observations to sessions in the source space, not every actor session", async () => {
+    const world = createWorld();
+    const primary = world.auth("guest:session-audience");
+    const actor = primary.actor;
+    const secondary = world.ensureSessionForActor("secondary-audience-session", actor, "guest");
+
+    await world.directCall("audience-primary-chat", actor, "the_chatroom", "enter", [], { sessionId: primary.id });
+    await world.directCall("audience-secondary-dubspace", actor, "the_dubspace", "enter", [], { sessionId: secondary.id });
+    const said = await world.directCall("audience-say", actor, "the_chatroom", "say", ["hello"], { sessionId: primary.id });
+
+    expect(said.op).toBe("result");
+    if (said.op === "result") {
+      expect(said.audienceSessions).toEqual([primary.id]);
+      expect(said.observationSessionAudiences).toEqual([[primary.id]]);
+    }
+  });
+
+  it("forwards transparent embedded-space speech upward without sending local frames to unrelated sessions", async () => {
+    const world = createWorld();
+    const outside = world.auth("guest:transparent-outside");
+    const inside = world.auth("guest:transparent-inside");
+
+    await world.directCall("transparent-outside-enter", outside.actor, "the_chatroom", "enter", [], { sessionId: outside.id });
+    await world.directCall("transparent-inside-enter", inside.actor, "the_dubspace", "enter", [], { sessionId: inside.id });
+    const said = await world.directCall("transparent-say", inside.actor, "the_dubspace", "say", ["beat"], { sessionId: inside.id });
+
+    expect(said.op).toBe("result");
+    if (said.op === "result") {
+      expect(said.observations.map((observation) => observation.source)).toEqual(["the_dubspace", "the_chatroom"]);
+      expect(said.observationSessionAudiences).toEqual([[inside.id], [outside.id]]);
+    }
+  });
+
+  it("lets semitransparent spaces hear parent announcements without forwarding local speech out", async () => {
+    const world = createWorld();
+    const outside = world.auth("guest:rain-outside");
+    const inside = world.auth("guest:rain-inside");
+    world.createObject({ id: "rain_curtain", name: "Rain Curtain", parent: "$space", owner: "$wiz", location: "the_chatroom" });
+    world.setProp("rain_curtain", "features", ["$semitransparent"]);
+    world.setProp("rain_curtain", "features_version", 1);
+
+    await world.directCall("rain-outside-enter", outside.actor, "the_chatroom", "enter", [], { sessionId: outside.id });
+    await world.directCall("rain-inside-enter", inside.actor, "rain_curtain", "enter", [], { sessionId: inside.id });
+    const local = await world.directCall("rain-local-say", inside.actor, "rain_curtain", "say", ["hush"], { sessionId: inside.id });
+    expect(local.op).toBe("result");
+    if (local.op === "result") {
+      expect(local.observations.map((observation) => observation.source)).toEqual(["rain_curtain"]);
+      expect(local.observationSessionAudiences).toEqual([[inside.id]]);
+    }
+
+    const outsideAnnouncement = await world.directCall("rain-parent-announce", outside.actor, "the_chatroom", "announce_all", ["storm"], { sessionId: outside.id });
+    expect(outsideAnnouncement.op).toBe("result");
+    if (outsideAnnouncement.op === "result") {
+      expect(outsideAnnouncement.observations.filter((observation) => observation.type === "text").map((observation) => observation.target).sort()).toEqual([inside.actor, outside.actor].sort());
+    }
+  });
+
+  it("keeps same-actor co-occupant sessions subscribed when one leaves", async () => {
+    const world = createWorld();
+    const primary = world.auth("guest:co-occupant");
+    const actor = primary.actor;
+    const secondary = world.ensureSessionForActor("secondary-co-occupant-session", actor, "guest");
+
+    await world.directCall("co-primary-enter", actor, "the_chatroom", "enter", [], { sessionId: primary.id });
+    await world.directCall("co-secondary-enter", actor, "the_chatroom", "enter", [], { sessionId: secondary.id });
+    expect(world.presenceSessionIdsIn("the_chatroom", [actor]).sort()).toEqual([primary.id, secondary.id].sort());
+    expect(world.getProp("the_chatroom", "subscribers")).toEqual([actor]);
+
+    await world.directCall("co-secondary-leave", actor, "the_chatroom", "leave", [], { sessionId: secondary.id });
+    expect(world.hasSessionPresence(primary.id, "the_chatroom")).toBe(true);
+    expect(world.hasSessionPresence(secondary.id, "the_chatroom")).toBe(false);
+    expect(world.getProp("the_chatroom", "subscribers")).toEqual([actor]);
+    expect(world.allLocationsForActor(actor)).toContain("the_chatroom");
+  });
+
+  it("breaks primary-session ties by session id", () => {
+    const world = createWorld();
+    const primary = world.auth("guest:primary-tie");
+    const actor = primary.actor;
+    const earlierId = world.ensureSessionForActor("session-0000-primary-tie", actor, "guest");
+    primary.started = 1234;
+    earlierId.started = 1234;
+
+    expect(world.primarySessionForActor(actor)?.id).toBe("session-0000-primary-tie");
+  });
+
+  it("uses remote space session audience instead of every actor session", async () => {
+    const home = createWorld();
+    const remote = createWorld();
+    const primary = home.auth("guest:remote-session-audience");
+    const actor = primary.actor;
+    const secondary = home.ensureSessionForActor("secondary-remote-session-audience", actor, "guest");
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["remote", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      [actor, "home"],
+      ["remote_room", "remote"]
+    ]);
+    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
+    remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
+    home.createObject({ id: "emitter", name: "Emitter", parent: "$thing", owner: "$wiz", location: "remote_room" });
+    home.registerNativeHandler("emit_remote_room", (ctx) => {
+      ctx.observe({ type: "remote_ping", source: "remote_room", _audience_override: [actor] } as WooValue as Record<string, WooValue> & { type: string });
+      return true;
+    });
+    home.addVerb("emitter", { ...nativeVerb("emit_remote", "emit_remote_room"), direct_callable: true, skip_presence_check: true });
+    remote.setSpaceSubscriber("remote_room", actor, true, primary.id);
+    home.sessions.get(primary.id)!.currentLocation = "remote_room";
+    home.sessions.get(secondary.id)!.currentLocation = "the_chatroom";
+
+    const result = await home.directCall("remote-session-audience", actor, "emitter", "emit_remote", [], { sessionId: secondary.id });
+
+    expect(result.op).toBe("result");
+    if (result.op === "result") {
+      expect(result.audienceSessions).toEqual([primary.id]);
+      expect(result.observationSessionAudiences).toEqual([[primary.id]]);
+    }
+  });
+
   it("keeps detached guest sessions resumable during grace", async () => {
     const world = createWorld();
     const session = world.auth("guest:grace");
+    const entered = await world.directCall("grace-enter-chat", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    expect(entered.op).toBe("result");
     world.attachSocket(session.id, "ws-1");
     world.detachSocket(session.id, "ws-1");
     expect(world.sessions.get(session.id)?.lastDetachAt).toEqual(expect.any(Number));
@@ -1089,7 +1244,36 @@ describe("woo core", () => {
     const resumed = world.auth(`session:${session.id}`);
     world.attachSocket(resumed.id, "ws-2");
     expect(resumed.actor).toBe(session.actor);
+    expect(resumed.currentLocation).toBe("the_chatroom");
     expect(world.sessions.get(session.id)?.lastDetachAt).toBeNull();
+  });
+
+  it("promotes the next-oldest player session location when primary reaps", async () => {
+    const world = createWorld();
+    const actor = "player_primary_promotion";
+    world.createObject({ id: actor, name: "Primary Promotion Player", parent: "$player", owner: actor, location: "$nowhere" });
+    world.setProp(actor, "name", "Primary Promotion Player");
+    world.setProp(actor, "home", "$nowhere");
+
+    const oldest = world.createSessionForActor(actor, "bearer");
+    const middle = world.ensureSessionForActor("session-primary-promotion-middle", actor, "bearer");
+    const newest = world.ensureSessionForActor("session-primary-promotion-newest", actor, "bearer");
+    oldest.started = 100;
+    middle.started = 200;
+    newest.started = 300;
+
+    expect((await world.directCall("primary-promotion-oldest-enter", actor, "the_chatroom", "enter", [], { sessionId: oldest.id })).op).toBe("result");
+    expect((await world.directCall("primary-promotion-middle-enter", actor, "the_dubspace", "enter", [], { sessionId: middle.id })).op).toBe("result");
+    expect((await world.directCall("primary-promotion-newest-enter", actor, "the_taskspace", "enter", [], { sessionId: newest.id })).op).toBe("result");
+    expect(world.primarySessionForActor(actor)?.id).toBe(oldest.id);
+    expect(world.object(actor).location).toBe("the_chatroom");
+
+    oldest.expiresAt = Date.now() - 1;
+    expect(world.reapExpiredSessions()).toEqual([oldest.id]);
+    expect(world.primarySessionForActor(actor)?.id).toBe(middle.id);
+    expect(world.object(actor).location).toBe("the_dubspace");
+    expect(world.currentLocationForSession(middle.id)).toBe("the_dubspace");
+    expect(world.currentLocationForSession(newest.id)).toBe("the_taskspace");
   });
 
   it("does not expire a session while a socket is attached", async () => {
@@ -1125,6 +1309,7 @@ describe("woo core", () => {
     const enterDubspace = await world.directCall("enter-dubspace-before-reap", actor, "the_dubspace", "enter", []);
     expect(enterDubspace.op).toBe("result");
     expect(world.getProp("the_dubspace", "operators")).toEqual([actor]);
+    await world.directCall("return-chat-before-reap", actor, "the_chatroom", "enter", []);
     const takeLamp = await world.directCall("take-lamp-before-reap", actor, "the_chatroom", "take", ["lamp"]);
     expect(takeLamp.op).toBe("result");
     expect(world.object("the_lamp").location).toBe(actor);
@@ -1237,7 +1422,7 @@ describe("woo core", () => {
     const first = world.auth("guest:first");
     const second = world.auth("guest:second");
     expect(world.verbInfo("the_chatroom", "say").definer).toBe("$conversational");
-    expect(world.verbInfo("the_taskspace", "say").definer).toBe("$conversational");
+    expect(world.verbInfo("the_taskspace", "say").definer).toBe("$transparent");
 
     const enterFirst = await world.directCall("enter-first", first.actor, "the_chatroom", "enter", []);
     const enterSecond = await world.directCall("enter-second", second.actor, "the_chatroom", "enter", []);
@@ -1311,9 +1496,9 @@ describe("woo core", () => {
     world.createObject({ id: "owned_space", parent: "$space", owner: session.actor });
     world.createObject({ id: "owned_feature", parent: "$thing", owner: session.actor });
     world.setProp("owned_space", "next_seq", 1);
-    world.setProp("owned_space", "subscribers", [session.actor]);
+    world.setSpaceSubscriber("owned_space", session.actor, true, session.id);
     world.setProp("owned_space", "last_snapshot_seq", 0);
-    world.setProp(session.actor, "presence_in", [...(world.getProp(session.actor, "presence_in") as string[]), "owned_space"]);
+    world.sessions.get(session.id)!.currentLocation = "owned_space";
 
     const add = await world.call("add-feature", session.id, "owned_space", message(session.actor, "owned_space", "add_feature", ["owned_feature"]));
     expect(add.op).toBe("applied");
@@ -1340,9 +1525,9 @@ describe("woo core", () => {
     const session = world.auth("guest:chat-feature-owner");
     world.createObject({ id: "owned_chat_space", parent: "$space", owner: session.actor });
     world.setProp("owned_chat_space", "next_seq", 1);
-    world.setProp("owned_chat_space", "subscribers", [session.actor]);
+    world.setSpaceSubscriber("owned_chat_space", session.actor, true, session.id);
     world.setProp("owned_chat_space", "last_snapshot_seq", 0);
-    world.setProp(session.actor, "presence_in", [...(world.getProp(session.actor, "presence_in") as string[]), "owned_chat_space"]);
+    world.sessions.get(session.id)!.currentLocation = "owned_chat_space";
 
     const add = await world.call("add-conversational", session.id, "owned_chat_space", message(session.actor, "owned_chat_space", "add_feature", ["$conversational"]));
     expect(add.op).toBe("applied");
@@ -1423,9 +1608,10 @@ describe("taskspace", () => {
       started: Date.now(),
       expiresAt: Date.now() + 60_000,
       lastDetachAt: null,
-      tokenClass: "bearer",
-      attachedSockets: new Set(),
-      lastInputAt: Date.now()
+        tokenClass: "bearer",
+        attachedSockets: new Set(),
+        lastInputAt: Date.now(),
+        currentLocation: "$nowhere"
     });
     const create = await callInTaskspace(world, assignee.id, "create", message(assignee.actor, "the_taskspace", "create_task", ["Wizard check", ""]));
     const task = create.op === "applied" ? (create.observations[0].task as string) : "";
@@ -1901,10 +2087,11 @@ describe("authoring", () => {
 }`, null).ok).toBe(true);
 
     const ctx = {
-      world,
-      space: "the_dubspace",
-      seq: 110,
-      actor,
+        world,
+        space: "the_dubspace",
+        seq: 110,
+        session: null,
+        actor,
       player: actor,
       caller: "#-1",
       callerPerms: actor,

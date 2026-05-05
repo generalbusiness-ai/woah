@@ -26,6 +26,7 @@ export type SerializedSession = {
   expiresAt?: number;
   lastDetachAt?: number | null;
   tokenClass?: "guest" | "bearer" | "apikey";
+  currentLocation?: ObjRef | null;
 };
 
 export type SpaceSnapshotRecord = {

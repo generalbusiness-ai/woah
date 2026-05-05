@@ -83,6 +83,8 @@ export type AppliedFrame = {
   ts: number;
   message: Message;
   observations: Observation[];
+  audienceSessions?: string[];
+  observationSessionAudiences?: string[][];
 };
 
 export type DirectResultFrame = {
@@ -93,6 +95,8 @@ export type DirectResultFrame = {
   audience: ObjRef | null;
   audienceActors?: ObjRef[];
   observationAudiences?: ObjRef[][];
+  audienceSessions?: string[];
+  observationSessionAudiences?: string[][];
 };
 
 export type LiveEventFrame = {
@@ -233,6 +237,7 @@ export type Session = {
   expiresAt: number;
   lastDetachAt: number | null;
   tokenClass: "guest" | "bearer" | "apikey";
+  currentLocation: ObjRef;
   attachedSockets: Set<string>;
   /** Wall-clock ms of the most recent meaningful input frame on this session.
    * In-memory only — not persisted. Bumped on session create, socket attach,

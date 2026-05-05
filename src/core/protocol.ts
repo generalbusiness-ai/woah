@@ -12,7 +12,7 @@ import {
   type WooValue
 } from "./types";
 import { localCatalogStatuses } from "./local-catalogs";
-import { normalizeError, type ParkedTaskRun, type WooWorld } from "./world";
+import { normalizeError, type DirectCallOptions, type ParkedTaskRun, type WooWorld } from "./world";
 
 const MAX_WS_FRAME_BYTES = 256 * 1024;
 
@@ -46,7 +46,7 @@ export type RestProtocolHost = {
     target: ObjRef,
     verb: string,
     args: WooValue[],
-    options: { forceDirect?: boolean; forceReason?: string }
+    options: DirectCallOptions
   ): Promise<DirectResultFrame | ErrorFrame>;
   broadcastApplied(frame: AppliedFrame): void | Promise<void>;
   broadcastLiveEvents(result: DirectResultFrame): void | Promise<void>;
@@ -68,7 +68,7 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
 
     if (request.method === "GET" && request.pathname === "/api/state") {
       const session = host.requireSession(request);
-      return jsonProtocol(await host.state(session.actor));
+      return jsonProtocol(withSessionProjection(await host.state(session.actor), world, session));
     }
 
     if (request.method === "POST" && request.pathname === "/api/tap/install") {
@@ -172,15 +172,17 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
       const forceDirect = request.header("x-woo-force-direct") === "1";
       const direct = host.directCall ?? ((frameId, directActor, directTarget, directVerb, directArgs, directOptions) =>
         world.directCall(frameId, directActor, directTarget, directVerb, directArgs, directOptions));
-      const result = await direct(id, actor, target, verb, args, { forceDirect, forceReason: "REST X-Woo-Force-Direct" });
+      const result = await direct(id, actor, target, verb, args, { forceDirect, forceReason: "REST X-Woo-Force-Direct", sessionId: session.id });
       if (result.op === "error") return errorProtocol(result.error);
       await host.broadcastLiveEvents(result);
       return jsonProtocol({
-        result: result.result,
-        observations: result.observations,
-        audience_actors: result.audienceActors,
-        observation_audiences: result.observationAudiences
-      });
+          result: result.result,
+          observations: result.observations,
+          audience_actors: result.audienceActors,
+          observation_audiences: result.observationAudiences,
+          audience_sessions: result.audienceSessions,
+          observation_session_audiences: result.observationSessionAudiences
+        });
     }
 
     if (request.method === "GET" && route.rest.length === 1 && route.rest[0] === "log") {
@@ -468,6 +470,19 @@ export function parseWsProtocolFrame(raw: string | ArrayBuffer | ArrayBufferView
 function rawFrameBytes(raw: string | ArrayBuffer | ArrayBufferView): number {
   if (typeof raw === "string") return new TextEncoder().encode(raw).byteLength;
   return raw.byteLength;
+}
+
+function withSessionProjection(payload: unknown, world: WooWorld, session: Session): unknown {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  return {
+    ...(payload as Record<string, unknown>),
+    session: {
+      id: session.id,
+      actor: session.actor,
+      current_location: world.currentLocationForSession(session.id),
+      all_locations: world.allLocationsForActor(session.actor)
+    }
+  };
 }
 
 function frameId(value: unknown): string | undefined {

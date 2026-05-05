@@ -174,14 +174,19 @@ semantics, not a particular authoring trick.
 Instance composition is equally valid:
 
 ```
-the_pinboard.features = [$conversational]
+the_pinboard.features = [$transparent]
 ```
 
 or:
 
 ```
-the_pinboard.features = [$persistent_conversational]
+the_pinboard.features = [$persistent_conversational]   // if no acoustic forwarding is needed
 ```
+
+For an embedded board that should keep the acoustic behavior of
+`$transparent`, the durable catalog should provide the corresponding
+persistent transparent feature rather than stacking two features with
+overlapping speech verbs.
 
 The generic `$pinboard` class should remain able to stand alone.
 Attaching conversation to a demo instance is an instance-level

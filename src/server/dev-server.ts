@@ -195,7 +195,7 @@ wss.on("connection", (ws) => {
       },
       direct: (frameId, session, target, verb, args) => {
         world.touchSessionInput(session.sessionId);
-        return world.directCall(frameId, session.actor, target, verb, args);
+        return world.directCall(frameId, session.actor, target, verb, args, { sessionId: session.sessionId });
       },
       replay: (frameId, session, space, fromValue, limitValue) => {
         // Replay is recovery, not user input — does NOT touch lastInputAt.
@@ -265,8 +265,10 @@ function authoringEnabled(): boolean {
 }
 
 function broadcastApplied(frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
+  const audienceSessions = frame.audienceSessions ? new Set(frame.audienceSessions) : null;
   for (const [ws, session] of sockets) {
-    if (ws.readyState !== ws.OPEN || !world.hasPresence(session.actor, frame.space)) continue;
+    if (ws.readyState !== ws.OPEN) continue;
+    if (audienceSessions ? !audienceSessions.has(session.sessionId) : !world.hasPresence(session.actor, frame.space)) continue;
     const visibleFrame = ws === originator ? frame : { ...frame, id: undefined };
     ws.send(JSON.stringify(visibleFrame));
   }
@@ -290,19 +292,27 @@ function broadcastTaskResult(result: ParkedTaskRun): void {
 function broadcastLiveEvents(result: DirectResultFrame, originMcpSessionId?: string | null): void {
   if (!result.audience) return;
   result.observations.forEach((observation, index) => {
-    broadcastLiveEvent({ op: "event", observation }, result.audience!, result.observationAudiences?.[index] ?? result.audienceActors);
+    broadcastLiveEvent(
+      { op: "event", observation },
+      result.audience!,
+      result.observationAudiences?.[index] ?? result.audienceActors,
+      result.observationSessionAudiences?.[index] ?? result.audienceSessions
+    );
   });
   mcpGateway.routeLiveEvents(result, originMcpSessionId ?? null);
 }
 
-function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[]): void {
+function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[]): void {
   const data = JSON.stringify(frame);
   const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
   const audienceSet = audienceActors ? new Set(audienceActors) : null;
+  const sessionSet = audienceSessions ? new Set(audienceSessions) : null;
   for (const [ws, session] of sockets) {
     if (ws.readyState !== ws.OPEN) continue;
     if (directedTo || directedFrom) {
       if (session.actor !== directedTo && session.actor !== directedFrom) continue;
+    } else if (sessionSet) {
+      if (!sessionSet.has(session.sessionId)) continue;
     } else if (audienceSet) {
       if (!audienceSet.has(session.actor)) continue;
     } else if (!world.hasPresence(session.actor, audience)) {

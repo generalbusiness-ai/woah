@@ -134,13 +134,14 @@ export class McpHost {
   // ----- external observation routing (broadcast-side fan-out) -----
 
   // Called by the runtime's broadcastApplied path (dev-server / worker DO).
-  // For each MCP session whose actor has presence in the frame's space — and
-  // who isn't the originator — enqueue the applied frame's observations.
+  // Prefer the frame's session audience; older frames fall back to actor
+  // presence in the frame's space.
   routeAppliedFrame(frame: AppliedFrame, originSessionId?: string | null): void {
     if (!frame.observations.length) return;
+    const sessionAudience = frame.audienceSessions ? new Set(frame.audienceSessions) : null;
     for (const [sessionId, queue] of this.queues) {
       if (originSessionId && sessionId === originSessionId) continue;
-      if (!this.actorSubscribes(queue.actor, frame.space)) continue;
+      if (sessionAudience ? !sessionAudience.has(sessionId) : !this.actorSubscribes(queue.actor, frame.space)) continue;
       for (const observation of frame.observations) this.enqueueFor(sessionId, observation);
     }
   }
@@ -153,6 +154,16 @@ export class McpHost {
     const observations = result.observations ?? [];
     for (let i = 0; i < observations.length; i++) {
       const observation = observations[i];
+      const sessionAudience = result.observationSessionAudiences?.[i] ?? result.audienceSessions ?? null;
+      if (sessionAudience) {
+        const sessionSet = new Set(sessionAudience);
+        for (const sessionId of sessionSet) {
+          if (originSessionId && sessionId === originSessionId) continue;
+          if (!this.queues.has(sessionId)) continue;
+          this.enqueueFor(sessionId, observation);
+        }
+        continue;
+      }
       const audience = result.observationAudiences?.[i] ?? result.audienceActors ?? this.implicitAudience(observation, result.audience ?? null);
       if (!audience) continue;
       const audienceSet = new Set(audience);
@@ -212,9 +223,11 @@ export class McpHost {
     };
     add(actor, "self");
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
-    if (actorObj?.location) add(actorObj.location, "location", false);
-    if (actorObj?.location && this.world.objects.has(actorObj.location) && this.descendsFrom(actorObj.location, "$space")) {
-      for (const id of this.world.object(actorObj.location).contents) {
+    const activeLocations = this.world.allLocationsForActor(actor);
+    const currentLocation = actorObj?.location ?? activeLocations[0] ?? null;
+    if (currentLocation) add(currentLocation, "location", false);
+    if (currentLocation && this.world.objects.has(currentLocation) && this.descendsFrom(currentLocation, "$space")) {
+      for (const id of this.world.object(currentLocation).contents) {
         if (this.isOtherActor(actor, id)) continue;
         if (this.actorCanSee(actor, id)) add(id, "contents");
       }
@@ -223,10 +236,7 @@ export class McpHost {
       if (this.isOtherActor(actor, id)) continue;
       if (this.actorCanSee(actor, id)) add(id, "inventory");
     }
-    const presence = actorObj ? this.world.propOrNull(actor, "presence_in") : null;
-    if (Array.isArray(presence)) for (const id of presence) {
-      if (typeof id === "string") add(id, "presence", false);
-    }
+    for (const id of activeLocations) if (id !== currentLocation) add(id, "presence", false);
     const focusList = this.focusListOf(actor);
     for (const id of focusList) {
       if (this.world.objects.has(id)) {
@@ -353,8 +363,8 @@ export class McpHost {
     const remoteCandidates = new Set<ObjRef>();
     const remoteExpandCandidates = new Set<ObjRef>();
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
-    const currentLocation = actorObj?.location ?? null;
-    const presence = this.stringListProp(actor, "presence_in");
+    const activeLocations = this.world.allLocationsForActor(actor);
+    const currentLocation = actorObj?.location ?? activeLocations[0] ?? null;
     const focus = this.focusListOf(actor);
     const reachable = this.reachable(actor);
     const reachableIds = new Set(reachable.map((entry) => entry.id));
@@ -366,7 +376,7 @@ export class McpHost {
     };
     const addIfReachable = (id: ObjRef | null | undefined): void => {
       if (!id) return;
-      if (id === actor || id === currentLocation || reachableIds.has(id) || presence.includes(id) || focus.includes(id)) add(id);
+      if (id === actor || id === currentLocation || reachableIds.has(id) || activeLocations.includes(id) || focus.includes(id)) add(id);
     };
     const addContents = (space: ObjRef | null | undefined): void => {
       if (!space || !this.world.objects.has(space) || !this.descendsFrom(space, "$space")) return;
@@ -384,7 +394,7 @@ export class McpHost {
         add(actor, false);
         add(currentLocation);
         if (actorObj) for (const id of actorObj.contents) addIfReachable(id);
-        for (const id of presence) add(id);
+        for (const id of activeLocations) add(id);
         for (const id of focus) add(id);
         break;
       case "here":
@@ -407,7 +417,7 @@ export class McpHost {
       }
       case "all":
         for (const { id } of reachable) add(id);
-        for (const id of presence) {
+        for (const id of activeLocations) {
           add(id);
         }
         for (const id of focus) {
@@ -497,10 +507,7 @@ export class McpHost {
     const candidates = new Set<ObjRef>();
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
     if (actorObj?.location) candidates.add(actorObj.location);
-    const presence = actorObj ? this.world.propOrNull(actor, "presence_in") : null;
-    if (Array.isArray(presence)) for (const id of presence) {
-      if (typeof id === "string") candidates.add(id);
-    }
+    for (const id of this.world.allLocationsForActor(actor)) candidates.add(id);
     for (const id of this.focusListOf(actor)) candidates.add(id);
     candidates.delete(actor);
     const remote: ObjRef[] = [];
@@ -644,7 +651,7 @@ export class McpHost {
       try {
         const result = this.dispatchHooks.direct
           ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args)
-          : await this.world.directCall(undefined, actor, tool.object, tool.verb, args);
+          : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
         // Self observations are returned in the call result; do NOT route them
         // back into this session's queue — that would deliver them twice.

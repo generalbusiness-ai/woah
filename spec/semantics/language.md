@@ -93,7 +93,9 @@ target. `observe_to_space(space, event)` is the same observation operation with
 delivery audience taken from `space`; catalog objects use it for room-visible
 activity when the emitting object is a mounted space on another host.
 `location(obj)` returns the object's current container without treating
-`location` as a user-defined property.
+`location` as a user-defined property. When `obj` is the calling actor and
+the call has a live session, it returns that session's `current_location`;
+otherwise it returns the stored object location mirror.
 
 ### 7.3 Expressions
 

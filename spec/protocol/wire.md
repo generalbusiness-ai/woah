@@ -117,11 +117,11 @@ One JSON object per WebSocket message. No binary frames in v1.
 
 Direct-call results carry a per-observation audience, computed by the runtime that emitted them. The mechanism is normative in [../semantics/events.md §12.7](../semantics/events.md#127-observation-audience-and-direct-message-routing); the wire-level shape is:
 
-- The REST/RPC `result` envelope for a direct call optionally includes `audience_actors: [actor, ...]` (the union audience for all observations) and `observation_audiences: [[actor, ...], ...]` (one entry per observation, parallel to `observations`).
-- The host that fans out to attached WebSockets uses `observation_audiences[i]` (when present) to filter the `op: "event"` push for observation `i`. If absent, it falls back to "push to anyone with presence in the audience space."
+- The REST/RPC `result` envelope for a direct call optionally includes `audience_actors: [actor, ...]` (the union audience for all observations), `observation_audiences: [[actor, ...], ...]` (one entry per observation, parallel to `observations`), `audience_sessions: [session, ...]`, and `observation_session_audiences: [[session, ...], ...]`.
+- The host that fans out to attached WebSockets uses `observation_session_audiences[i]` first when present, then `audience_sessions`, then `observation_audiences[i]`, then `audience_actors`, to filter the `op: "event"` push for observation `i`. If absent, it falls back to "push to sessions present in the audience space."
 - Directed observations (currently only `told`, per events.md §12.7.1) are routed by `to`/`from` even when `observation_audiences` is missing — this is the legacy fallback path.
 
-Browsers do not see `audience_actors` / `observation_audiences` directly; the host has already filtered. They appear in REST/RPC responses for clients that want to know who would have received each observation.
+Browsers do not see audience fields directly on pushed `event` frames; the host has already filtered. They appear in REST/RPC responses for clients that want to know who would have received each observation.
 
 ### 17.4 The `applied` push model
 
@@ -130,7 +130,7 @@ When an actor is connected, the player host sends `applied` frames for every seq
 - For the originator, `id` matches the `op: "call"` they sent. They use this to pair the reply with their pending call, run any reconcile logic (§17.6), and discard the optimistic prediction.
 - For other observers, `id` is absent. They consume the applied frame as a state-update event.
 
-There is no separate subscribe/unsubscribe frame in the baseline wire. Membership in a space (which determines whether the host pushes its `applied` stream to a given client) is a server-side decision driven by the actor's relationship to the space — typically presence-based (the actor is in the space) or explicit ownership.
+There is no separate subscribe/unsubscribe frame in the baseline wire. Membership in a space (which determines whether the host pushes its `applied` stream to a given client) is a server-side decision driven by the session's relationship to the space — typically session presence (`session_subscribers`) or explicit ownership.
 
 If a client's connection is interrupted and reconnects, gap recovery follows the pattern in [../semantics/events.md §12.8](../semantics/events.md#128-sequenced-calls-with-gap-recovery): the client tracks the highest `seq` per space it has applied, calls `space:replay(from, limit)` to backfill, then resumes the live stream.
 

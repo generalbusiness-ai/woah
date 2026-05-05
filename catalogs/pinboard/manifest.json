@@ -1,6 +1,6 @@
 {
   "name": "pinboard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "spec_version": "v1",
   "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
@@ -136,7 +136,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :enter() rxd { let old = location(actor); if (old != null && old != this && old in actor.presence_in) { set_presence(old, false); } move(actor, this); set_presence(this, true); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
+          "source": "verb :enter() rxd { let old = location(actor); moveto(actor, this); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
         },
         {
           "name": "leave",
@@ -146,7 +146,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } set_presence(this, false); move(actor, dest); if (dest != $nowhere) { set_presence(dest, true); } let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
+          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return this.subscribers; }"
         },
         {
           "name": "out",
@@ -461,7 +461,7 @@
     {
       "kind": "attach_feature",
       "consumer": "the_pinboard",
-      "feature": "chat:$conversational"
+      "feature": "chat:$transparent"
     }
   ]
 }

@@ -120,8 +120,8 @@ A typical first interaction for a fresh agent:
 
 ```
 1. agent connects, gets actor objref via op: "session"
-2. agent calls #my_actor:describe() — sees own attributes and `presence_in`
-3. agent picks a space from presence_in, calls space:describe()
+2. agent inspects the session state (`current_location`) or calls the actor's location tools
+3. agent calls the current space's `:describe()`
 4. agent sees verbs available on the space
 5. agent calls space's listing verb (e.g. :list_tasks)
 6. for each interesting object, agent calls obj:describe() to see its verbs

@@ -228,10 +228,9 @@ function connect() {
       requestReplay(socket);
       // Auto-enter the default chat room once per session: a freshly auth'd
       // guest otherwise lands on the chat tab "in the room" only because the
-      // SPA was reading a possibly-stale subscribers projection. With the
-      // canonical actorPresentInSpace check now sourced from `presence_in`,
-      // a new guest reads as outside; ensureSpacePresence is idempotent so
-      // an already-present actor (session resume) makes this a no-op.
+      // SPA was reading a possibly-stale subscribers projection. The current
+      // session location is authoritative; ensureSpacePresence is idempotent
+      // so an already-present actor (session resume) makes this a no-op.
       ensureSpacePresence(chatRoom(), () => render(), () => render());
     }
     if (frame.op === "applied") {
@@ -368,16 +367,17 @@ function stopHeartbeat() {
 }
 
 function authToken() {
-  const session = readStorage(sessionKey);
+  const session = readSessionStorage(sessionKey);
   return session ? `session:${session}` : "guest:local";
 }
 
 function storeSession(session: string | undefined) {
-  if (session) writeStorage(sessionKey, session);
+  if (session) writeSessionStorage(sessionKey, session);
 }
 
 function clearSession() {
   try {
+    sessionStorage.removeItem(sessionKey);
     localStorage.removeItem(sessionKey);
   } catch {
     // Ignore storage failures; auth falls back to a fresh guest.
@@ -405,11 +405,28 @@ function readStorage(key: string) {
   }
 }
 
+function readSessionStorage(key: string) {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 function writeStorage(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
   } catch {
     // Local storage is an optimization for reconnect continuity.
+  }
+}
+
+function writeSessionStorage(key: string, value: string) {
+  try {
+    sessionStorage.setItem(key, value);
+    localStorage.removeItem(key);
+  } catch {
+    // Session storage is an optimization for reconnect continuity.
   }
 }
 
@@ -747,7 +764,7 @@ function projectPinboard(world: any, meta: any) {
 function pinboardNotesFromContents(world: any, boardId: string | undefined, layoutValue: any) {
   const contents = Array.isArray(world.objects?.[boardId ?? ""]?.contents) ? world.objects[boardId ?? ""].contents : [];
   const layout = layoutValue && typeof layoutValue === "object" && !Array.isArray(layoutValue) ? layoutValue : {};
-  // pinboard:enter does `move(actor, this)`, so contents includes guests as
+  // pinboard:enter moves the active session to the board, so contents includes guests as
   // well as pins. Server-side `:list_notes` filters by `isa(pin, $note)`;
   // we approximate that here with a parent check on the bundled $pin class.
   return contents.filter((id: string) => world.objects?.[id]?.parent === "$pin").map((id: string) => {
@@ -876,16 +893,17 @@ function callWithError(space: string, target: string, verb: string, args: any[] 
 }
 
 function actorPresenceList(actor: string): string[] {
-  const raw = state.world?.objects?.[actor]?.props?.presence_in;
-  return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === "string") : [];
+  if (actor === state.actor) {
+    const locations = state.world?.session?.all_locations;
+    if (Array.isArray(locations)) return locations.filter((id): id is string => typeof id === "string");
+  }
+  return [];
 }
 
 function actorPresentInSpace(space: string) {
   const actor = state.actor;
   if (!actor) return false;
-  // Reads from `actor.presence_in` rather than `space.subscribers` —
-  // the actor's own list is local-write and never goes stale via a
-  // failed cross-host cleanup the way the room's mirror can.
+  if (state.world?.session?.current_location === space) return true;
   return actorPresenceList(actor).includes(space);
 }
 
@@ -2090,14 +2108,7 @@ function setCurrentChatRoom(room: string) {
 function renderChat() {
   const room = state.world?.chat?.room;
   const present = state.chatPresent;
-  // Canonical "am I in this room?" reads the actor's own presence_in, not
-  // the room's projected subscribers. The latter can be momentarily stale
-  // when a recycled guest id has a leftover entry from a prior session
-  // whose cross-host cleanup failed; the lazy scrub on next verb call
-  // would drop the actor and we'd be showing the in-room UI for a user
-  // the substrate doesn't actually consider present.
-  const myPresence = state.actor ? actorPresenceList(state.actor) : [];
-  const inRoom = Boolean(state.actor && room?.id && myPresence.includes(room.id));
+  const inRoom = Boolean(state.actor && room?.id && actorPresentInSpace(room.id));
   const lines = chatLinesForSpace(chatRoom());
   if (!inRoom) {
     const canEnter = canSendDirect();
@@ -3091,7 +3102,7 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 }
 
 function pinboardActorPresent() {
-  return Boolean(state.actor && Array.isArray(state.world?.pinboard?.present) && state.world.pinboard.present.includes(state.actor));
+  return Boolean(state.actor && state.world?.session?.current_location === "the_pinboard");
 }
 
 function panPinboardBy(dx: number, dy: number) {
@@ -3262,9 +3273,9 @@ function leavePinboard(done?: () => void) {
     done?.();
     // The :leave verb also moves the actor back to mount_room and updates that
     // room's subscribers; the result only carries the pinboard's subscribers.
-    // Without a refresh, the chat tab reads a stale actor.presence_in and shows
-    // its "Enter the room" placeholder for an actor the server has already
-    // re-roomed.
+    // Without a refresh, the chat tab can read a stale session projection and
+    // show its "Enter the room" placeholder for a session the server has
+    // already re-roomed.
     void refresh();
     if (state.tab === "pinboard") render();
   });
