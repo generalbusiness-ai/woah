@@ -4,8 +4,13 @@
 # Phases: preflight → build → deploy → postflight. Any failure aborts loud.
 # Overrides exist for hotfix flows but should not be the default path.
 #
-# Usage: scripts/deploy.sh [--dirty] [--allow-branch=<x>] [--skip-tests]
-#                          [--skip-postflight] [--help]
+# Usage: scripts/deploy.sh [--dry-run] [--dirty] [--allow-branch=<x>]
+#                          [--skip-tests] [--skip-postflight] [--help]
+#
+# --dry-run validates the deploy without uploading: runs preflight gates and
+# build, then `wrangler deploy --dry-run` (no upload, no version id, no
+# postflight). Implies leniency on dirty tree / unpushed HEAD and skips the
+# CF token + secret-list checks, which only matter for a real upload.
 
 set -euo pipefail
 
@@ -16,11 +21,12 @@ ALLOW_DIRTY=0
 ALLOW_BRANCH=""
 SKIP_TESTS=0
 SKIP_POSTFLIGHT=0
+DRY_RUN=0
 EXPECTED_BRANCH="main"
 WORKER_URL="${WOO_WORKER_URL:-https://woo.hughpyle.workers.dev}"
 
 usage() {
-  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 banner() { echo; echo "${BOLD}== $* ==${NC}"; }
@@ -30,6 +36,7 @@ fail()   { echo "  ${RED}FAIL${NC}  $*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dry-run)          DRY_RUN=1 ;;
     --dirty)            ALLOW_DIRTY=1 ;;
     --allow-branch=*)   ALLOW_BRANCH="${1#--allow-branch=}" ;;
     --skip-tests)       SKIP_TESTS=1 ;;
@@ -39,6 +46,13 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Dry-run has no upload, no published version, and no postflight target,
+# so the working-tree / push-state gates are irrelevant — relax them.
+if [[ $DRY_RUN -eq 1 ]]; then
+  ALLOW_DIRTY=1
+  SKIP_POSTFLIGHT=1
+fi
 
 cd "$(dirname "$0")/.."
 
@@ -87,23 +101,26 @@ elif [[ "$local_head" != "$remote_head" ]]; then
 fi
 ok "git: HEAD=${local_head:0:10} pushed"
 
-# CF token
-if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -f "$HOME/.config/cloudflare/woo.token" ]]; then
-  CLOUDFLARE_API_TOKEN=$(cat "$HOME/.config/cloudflare/woo.token")
-  export CLOUDFLARE_API_TOKEN
-fi
-[[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
-  || fail "CLOUDFLARE_API_TOKEN unset and ~/.config/cloudflare/woo.token missing"
-ok "cf token present"
+# CF token + secrets are only needed for a real upload.
+if [[ $DRY_RUN -eq 1 ]]; then
+  warn "dry-run: skipping cf token + secret-list checks"
+else
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -f "$HOME/.config/cloudflare/woo.token" ]]; then
+    CLOUDFLARE_API_TOKEN=$(cat "$HOME/.config/cloudflare/woo.token")
+    export CLOUDFLARE_API_TOKEN
+  fi
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
+    || fail "CLOUDFLARE_API_TOKEN unset and ~/.config/cloudflare/woo.token missing"
+  ok "cf token present"
 
-# required secrets
-secret_list=$(npx wrangler secret list 2>&1) \
-  || fail "wrangler secret list failed:\n$secret_list"
-for required in WOO_INITIAL_WIZARD_TOKEN WOO_INTERNAL_SECRET; do
-  echo "$secret_list" | grep -q "\"$required\"" \
-    || fail "wrangler secret '$required' not set — run: npx wrangler secret put $required"
-  ok "secret: $required set"
-done
+  secret_list=$(npx wrangler secret list 2>&1) \
+    || fail "wrangler secret list failed:\n$secret_list"
+  for required in WOO_INITIAL_WIZARD_TOKEN WOO_INTERNAL_SECRET; do
+    echo "$secret_list" | grep -q "\"$required\"" \
+      || fail "wrangler secret '$required' not set — run: npx wrangler secret put $required"
+    ok "secret: $required set"
+  done
+fi
 
 # Durable Object class-history migrations are CF deployment bookkeeping. The
 # check keeps wrangler.toml's final migrated class set aligned with bindings.
@@ -134,6 +151,16 @@ ok "spa bundled to dist/"
 # ===========================================================================
 banner "Deploy"
 # ===========================================================================
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  deploy_out=$(npx wrangler deploy --dry-run 2>&1) \
+    || { echo "$deploy_out" | tail -30; fail "wrangler deploy --dry-run failed"; }
+  echo "$deploy_out" | tail -10 | sed "s/^/  ${DIM}|${NC} /"
+  ok "wrangler dry-run validated bundle + bindings (no upload)"
+  echo
+  echo "${GREEN}${BOLD}dry-run ok${NC} (nothing deployed)"
+  exit 0
+fi
 
 deploy_out=$(npx wrangler deploy 2>&1) \
   || { echo "$deploy_out" | tail -30; fail "wrangler deploy failed"; }
