@@ -36,7 +36,7 @@ type RouteLocation = {
 };
 
 type ChatLine = {
-  kind: "text" | "said" | "said_to" | "said_as" | "emoted" | "posed" | "quoted" | "self_pointed" | "told" | "entered" | "left" | "looked" | "who" | "blocked_exit" | "taken" | "dropped" | "huh" | "dubspace_activity" | "dubspace_entered" | "dubspace_left" | "pinboard_activity" | "pinboard_entered" | "pinboard_left" | "system" | "error";
+  kind: "text" | "input" | "separator" | "said" | "said_to" | "said_as" | "emoted" | "posed" | "quoted" | "self_pointed" | "told" | "entered" | "left" | "looked" | "who" | "blocked_exit" | "taken" | "dropped" | "huh" | "dubspace_activity" | "dubspace_entered" | "dubspace_left" | "pinboard_activity" | "pinboard_entered" | "pinboard_left" | "system" | "error";
   actor?: string;
   from?: string;
   to?: string;
@@ -577,12 +577,23 @@ function setSelectedObject(id: string, options: { apply?: boolean } = {}) {
   }
 }
 
+let lastObservedChatRoom = "";
+
 async function refresh() {
   refreshDebounceTimer = null;
   refreshDebouncePending = false;
   const response = await fetch("/api/state", { headers: authHeaders() });
   if (!response.ok) return;
+  const previousChatRoom = lastObservedChatRoom;
   state.world = adaptWorld(await response.json());
+  const currentChatRoom = chatRoom();
+  if (previousChatRoom && previousChatRoom !== currentChatRoom) {
+    // Mark the bottom of the room the actor just left, so when they return
+    // the room's prior chat (including their `> enter tub` input echo) is
+    // visually behind a "you were away" boundary.
+    pushChatLine({ kind: "separator", source: previousChatRoom, ts: Date.now() }, false);
+  }
+  lastObservedChatRoom = currentChatRoom;
   if (!state.selectedObject || !state.world.objects?.[state.selectedObject]) state.selectedObject = defaultSelectedObject();
   state.clockOffset = Number(state.world.server_time ?? Date.now()) - Date.now();
   state.chatPresent = Array.isArray(state.world?.chat?.present) ? state.world.chat.present : state.chatPresent;
@@ -2135,6 +2146,12 @@ function chatLinesForSpace(space: string): ChatLine[] {
 
 function renderChatLine(line: ChatLine) {
   const time = line.ts ? new Date(line.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  if (line.kind === "input") {
+    return `<div class="chat-line input"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "")}</span></div>`;
+  }
+  if (line.kind === "separator") {
+    return `<div class="chat-line separator"></div>`;
+  }
   if (line.kind === "said") {
     return `<div class="chat-line said"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.actor))}</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
   }
@@ -2192,11 +2209,9 @@ function bindChat() {
     if (!text) return;
     rememberChatInput(text);
     state.chatDraft = "";
+    if (input) input.value = "";
     sendChatInput(chatRoom(), text);
-    if (input) {
-      input.value = "";
-      input.focus();
-    }
+    document.querySelector<HTMLInputElement>("[data-chat-input]")?.focus();
   });
   document.querySelector<HTMLButtonElement>("[data-chat-enter]")?.addEventListener("click", enterChat);
   document.querySelector<HTMLButtonElement>("[data-chat-leave]")?.addEventListener("click", () => {
@@ -2244,6 +2259,8 @@ function focusSpaceChatInput(space: string) {
 
 function sendChatInput(space: string, text: string) {
   if (!space) return;
+  // Local-only echo so the feed reads as a transcript; never emitted server-side.
+  pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
   ensureSpacePresence(space, () => {
     direct(space, "command_plan", [text], (plan) => executeChatPlan(space, plan, text), receiveChatError);
   }, receiveChatError);
@@ -2757,11 +2774,9 @@ function bindSpaceChatPanel(panel: HTMLElement) {
     if (!text) return;
     rememberChatInput(text);
     setSpaceChatDraft(space, "");
+    if (input) input.value = "";
     sendChatInput(space, text);
-    if (input) {
-      input.value = "";
-      input.focus();
-    }
+    panel.querySelector<HTMLInputElement>("[data-space-chat-input]")?.focus();
   });
   if (panel && "ResizeObserver" in window) {
     const observer = new ResizeObserver((entries) => {
@@ -3245,6 +3260,12 @@ function leavePinboard(done?: () => void) {
     setPinboardPresent(result);
     clearPinboardViewports();
     done?.();
+    // The :leave verb also moves the actor back to mount_room and updates that
+    // room's subscribers; the result only carries the pinboard's subscribers.
+    // Without a refresh, the chat tab reads a stale actor.presence_in and shows
+    // its "Enter the room" placeholder for an actor the server has already
+    // re-roomed.
+    void refresh();
     if (state.tab === "pinboard") render();
   });
 }
