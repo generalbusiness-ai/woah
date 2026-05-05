@@ -115,7 +115,8 @@ const BUILTIN_NAMES = [
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
-  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "str_join", "collect_prop"
+  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "str_join", "collect_prop",
+  "to_int", "to_float"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -774,6 +775,33 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return typeName(builtinArgs[0]);
       case "to_string":
         return typeof builtinArgs[0] === "string" ? builtinArgs[0] : JSON.stringify(builtinArgs[0]);
+      case "to_int": {
+        const v = builtinArgs[0];
+        if (typeof v === "number") return Math.trunc(v);
+        if (typeof v === "boolean") return v ? 1 : 0;
+        if (typeof v === "string") {
+          const trimmed = v.trim();
+          if (!trimmed) return 0;
+          const n = Number(trimmed);
+          if (!Number.isFinite(n)) return 0;
+          return Math.trunc(n);
+        }
+        if (v === null) return 0;
+        return 0;
+      }
+      case "to_float": {
+        const v = builtinArgs[0];
+        if (typeof v === "number") return v;
+        if (typeof v === "boolean") return v ? 1 : 0;
+        if (typeof v === "string") {
+          const trimmed = v.trim();
+          if (!trimmed) return 0;
+          const n = Number(trimmed);
+          return Number.isFinite(n) ? n : 0;
+        }
+        if (v === null) return 0;
+        return 0;
+      }
       case "str_trim":
         return assertString(builtinArgs[0] ?? "").trim();
       case "str_lower":

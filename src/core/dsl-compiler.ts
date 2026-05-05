@@ -133,7 +133,7 @@ const FRAME_GLOBALS = new Map<string, string>([
 ]);
 
 const BUILTINS = new Set([
-  "length", "keys", "values", "has", "typeof", "to_string", "tostr", "min", "max", "floor", "ceil", "round", "abs",
+  "length", "keys", "values", "has", "typeof", "to_string", "tostr", "to_int", "toint", "to_float", "tofloat", "min", "max", "floor", "ceil", "round", "abs",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join",
   "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "random", "contents", "location", "task_perms", "caller_perms",
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "collect_prop",
@@ -1117,7 +1117,11 @@ class Codegen {
     }
     if (!BUILTINS.has(name)) throw new CompileError("E_COMPILE", `unknown builtin: ${name}`, expr.span);
     for (const arg of expr.args) this.compileExpr(arg);
-    this.emit("BUILTIN", name === "tostr" ? "to_string" : name, expr.args.length);
+    let canonical = name;
+    if (name === "tostr") canonical = "to_string";
+    else if (name === "toint") canonical = "to_int";
+    else if (name === "tofloat") canonical = "to_float";
+    this.emit("BUILTIN", canonical, expr.args.length);
   }
 
   private compileInterpolation(expr: InterpExpr): void {

@@ -17,7 +17,7 @@ Builtins are functions, not verbs. They are registered with stable indices for t
 
 ### 19.1 Core
 
-`tostr(v)`, `toint(v)`, `tofloat(v)`, `toobj(v)`, `typeof(v)`, `length(v)`,  
+`to_string(v)` (alias `tostr`), `to_int(v)` (alias `toint`), `to_float(v)` (alias `tofloat`), `toobj(v)`, `typeof(v)`, `length(v)`,  
 `is_a(obj, parent_obj)`, `parents(obj)`, `children(obj)`,  
 `now()` → ms epoch, `ftime()` → high-res wall time,  
 `raise(err)`, `random(n)`.

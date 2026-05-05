@@ -548,6 +548,8 @@ const VALID_BUILTINS = new Set([
   "typeof",
   "to_string",
   "tostr",
+  "to_int",
+  "to_float",
   "min",
   "max",
   "floor",
