@@ -846,12 +846,13 @@ input[type="range"] {
   grid-template-columns: minmax(0, 1fr) 230px;
   gap: 1rem;
   align-items: stretch;
-  height: calc(100dvh - 5.25rem);
+  height: calc(100dvh - 5.25rem - var(--space-chat-h, 180px) - 0.8rem);
   min-height: 0;
 }
 
 .pinboard-layout.has-space-chat {
-  height: 100%;
+  height: auto;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -859,16 +860,18 @@ input[type="range"] {
   height: calc(100dvh - 5.25rem);
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(420px, calc(100dvh - 5.25rem - var(--space-chat-h, 180px) - 0.8rem)) auto;
   gap: 0.8rem;
   overflow: hidden;
 }
 
 .pinboard-work {
   min-height: 0;
+  height: 100%;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0.25rem;
+  overflow: hidden;
 }
 
 .pinboard-create {
@@ -893,6 +896,12 @@ input[type="range"] {
   min-height: 1.9rem;
   padding-block: 0.28rem;
   line-height: 1.2;
+}
+
+.pinboard-create-placeholder {
+  min-height: 2.85rem;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .pinboard-stage-panel,
@@ -996,6 +1005,11 @@ input[type="range"] {
   overflow: hidden;
   padding: 0;
   min-height: 420px;
+}
+
+.pinboard-layout:not(.has-space-chat) .pinboard-stage-panel {
+  min-height: 0;
+  height: calc(100dvh - 5.25rem - var(--space-chat-h, 180px) - 0.8rem - 2.85rem - 0.25rem);
 }
 
 [data-pinboard-map-shell] {
@@ -1414,6 +1428,11 @@ textarea {
   .pinboard-layout {
     grid-template-columns: 1fr;
     height: auto;
+  }
+
+  .pinboard-layout .pinboard-stage-panel {
+    min-height: 420px;
+    height: min(70vh, 560px);
   }
 
   .pinboard-create {

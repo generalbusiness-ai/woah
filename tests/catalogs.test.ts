@@ -515,6 +515,7 @@ describe("local catalogs", () => {
     expect(world.ownVerb("$dubspace", "set_drum_step")?.kind).toBe("bytecode");
     expect(world.ownVerb("$dubspace", "save_scene")?.kind).toBe("bytecode");
     expect(world.ownVerb("$dubspace", "enter")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$dubspace", "out")?.kind).toBe("bytecode");
     expect(world.verbInfo("the_dubspace", "say").definer).toBe("$transparent");
 
     const session = world.auth("guest:catalog-dubspace");
@@ -546,6 +547,18 @@ describe("local catalogs", () => {
     }
     expect(world.getProp("delay_1", "feedback")).toBe(0.44);
 
+    const filterPlan = await world.directCall("dubspace-filter-plan", actor, "the_dubspace", "command_plan", ["filter 500"]);
+    expect(filterPlan.op).toBe("result");
+    if (filterPlan.op === "result") {
+      expect(filterPlan.result).toMatchObject({ ok: true, route: "direct", target: "filter_1", verb: "on_say_to", args: ["500"] });
+    }
+    const filtered = await world.directCall("dubspace-filter", actor, "filter_1", "on_say_to", ["500"]);
+    expect(filtered.op).toBe("result");
+    if (filtered.op === "result") {
+      expect(filtered.observations).toContainEqual(expect.objectContaining({ type: "control_changed", target: "filter_1", name: "cutoff", value: 500 }));
+    }
+    expect(world.getProp("filter_1", "cutoff")).toBe(500);
+
     await callInDubspace(world, session.id, "drum", { actor, target: "the_dubspace", verb: "set_drum_step", args: ["tone", 3, true] });
     await callInDubspace(world, session.id, "tempo", { actor, target: "the_dubspace", verb: "set_tempo", args: [250] });
     const pattern = world.getProp("drum_1", "pattern") as Record<string, boolean[]>;
@@ -558,7 +571,13 @@ describe("local catalogs", () => {
     await callInDubspace(world, session.id, "recall", { actor, target: "the_dubspace", verb: "recall_scene", args: ["default_scene"] });
     expect(world.getProp("delay_1", "feedback")).toBe(0.44);
 
-    const left = await world.directCall("dubspace-leave", actor, "the_dubspace", "leave", []);
+    const outPlan = await world.directCall("dubspace-out-plan", actor, "the_dubspace", "command_plan", ["out"]);
+    expect(outPlan.op).toBe("result");
+    if (outPlan.op === "result") {
+      expect(outPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "out", args: [] });
+    }
+
+    const left = await world.directCall("dubspace-out", actor, "the_dubspace", "out", []);
     expect(left.op).toBe("result");
     if (left.op === "result") {
       expect(left.result).toEqual([]);

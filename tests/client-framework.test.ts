@@ -89,6 +89,26 @@ describe("client UI framework projection", () => {
     expect(ui.observe("delay_1")?.props.feedback).toBe(0.25);
   });
 
+  it("applies direct control_changed observations as live projection until refresh", () => {
+    const ui = createWooClientFramework();
+    ui.ingestWorld({
+      objects: {
+        filter_1: { id: "filter_1", name: "filter", props: { cutoff: 1000 } }
+      }
+    });
+
+    ui.ingestLiveObservation({ type: "control_changed", target: "filter_1", name: "cutoff", value: 500 });
+    expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
+
+    ui.ingestWorld({
+      objects: {
+        filter_1: { id: "filter_1", name: "filter", props: { cutoff: 500 } }
+      }
+    });
+    ui.prune(Date.now() + 2_000);
+    expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
+  });
+
   it("keeps independent live fields on separate coalesced layers", () => {
     const ui = createWooClientFramework();
     ui.ingestWorld({

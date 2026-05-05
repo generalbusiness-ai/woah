@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -275,6 +275,31 @@
             "args": []
           },
           "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let next = []; for item in this.operators { if (item != actor) { next = next + [item]; } } this.operators = next; let text = actor.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return this.operators; }"
+        },
+        {
+          "name": "out",
+          "aliases": [
+            "o@ut"
+          ],
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :out() rxd { return this:leave(); }"
+        },
+        {
+          "name": "command_plan",
+          "perms": "rxd",
+          "direct_callable": true,
+          "arg_spec": {
+            "args": [
+              "input"
+            ]
+          },
+          "source": "verb :command_plan(input) rxd { let text = str_trim(input); let lower = str_lower(text); if (!text) { return this:huh_plan(input, \"empty command\"); } if (lower == \"out\" || lower == \"o\" || lower == \"leave\") { let verb_name = \"out\"; if (lower == \"leave\") { verb_name = \"leave\"; } return { ok: true, route: \"direct\", space: null, target: this, verb: verb_name, args: [], cmd: { text: text, actor: actor } }; } if (lower == \"look\" || lower == \"l\") { return { ok: true, route: \"direct\", space: null, target: this, verb: \"look\", args: [], cmd: { text: text, actor: actor } }; } if (str_starts(lower, \"filter \")) { let rest = str_trim(str_slice(text, 8)); if (rest) { return { ok: true, route: \"direct\", space: null, target: \"filter_1\", verb: \"on_say_to\", args: [rest], cmd: { text: text, actor: actor } }; } } if (str_starts(text, \"/me \")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [str_trim(str_slice(text, 5))], cmd: { text: text, actor: actor } }; } if (str_starts(text, \":\") && length(text) > 1) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [str_trim(str_slice(text, 2))], cmd: { text: text, actor: actor } }; } if (str_starts(lower, \"say \")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [str_trim(str_slice(text, 5))], cmd: { text: text, actor: actor } }; } if (!str_starts(text, \"/\")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [text], cmd: { text: text, actor: actor } }; } return this:huh_plan(text, \"I don't see \" + text + \".\"); }"
         },
         {
           "name": "set_control",

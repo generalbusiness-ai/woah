@@ -44,6 +44,33 @@ test("loads shell and renders nav", async ({ page }) => {
   expect(consoleErrors, `console/page errors: ${consoleErrors.join(" | ")}`).toEqual([]);
 });
 
+test("chat route mounts bundled UI while state is still cold-starting", async ({ page }) => {
+  let releaseState: (() => void) | undefined;
+  let delayedState = false;
+  const stateGate = new Promise<void>((resolve) => {
+    releaseState = resolve;
+  });
+  await page.route("**/api/state", async (route) => {
+    if (!delayedState) {
+      delayedState = true;
+      await stateGate;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/objects/the_chatroom");
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
+  await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
+  await expect(page.locator(".chat-empty-panel")).toBeVisible();
+  await page.getByRole("button", { name: "Enter" }).click();
+  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+
+  releaseState?.();
+  await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
+});
+
 test("switches between tabs", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
@@ -75,6 +102,15 @@ test("dubspace cue keeps loop controls local", async ({ page, request }) => {
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   await page.getByRole("button", { name: "Dubspace" }).click();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  const miniChatInput = page.locator("[data-space-chat-input]");
+  await expect(miniChatInput).toBeVisible();
+  await expect(miniChatInput).toBeFocused();
+  await expect(page.locator("woo-space-chat-panel .space-chat-head span")).toHaveText("Dubspace");
+  await miniChatInput.fill("filter 500");
+  await miniChatInput.press("Enter");
+  await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("filter 500");
+  await expect(page.locator('[aria-label="Filter cutoff"]')).toHaveValue("500");
+  await expect(page.locator(".filter-strip [data-control-readout]")).toHaveText("500 Hz");
   await expect(page.locator(".dubspace-presence")).toContainText("Guest");
   await expect(page.locator("[data-audio]")).toHaveText("Audio Off");
   await page.locator("[data-audio]").click();
@@ -130,6 +166,13 @@ test("dubspace cue keeps loop controls local", async ({ page, request }) => {
       return current.objects.slot_1.props;
     })
     .toMatchObject({ freq: localFreq, gain: localGain });
+
+  await miniChatInput.fill("out");
+  await miniChatInput.press("Enter");
+  await expect(page).toHaveURL(/\/objects\/the_chatroom$/);
+  await expect(page.locator(".toolbar h1")).toHaveText("Living Room");
+  await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
+  await expect(page.locator("woo-chat-space .chat-line.separator")).toHaveCount(1);
 });
 
 test("narrow layout keeps nav tabs on one row", async ({ page }) => {
@@ -165,6 +208,34 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await expect(page.locator(".pinboard-stage")).toBeVisible();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  const firstPaintStageHeights = await page.locator(".pinboard-stage-panel").evaluate(async (panel) => {
+    const samples: number[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      samples.push(panel.getBoundingClientRect().height);
+    }
+    return samples;
+  });
+  expect(Math.min(...firstPaintStageHeights)).toBeGreaterThan(300);
+  expect(Math.max(...firstPaintStageHeights) - Math.min(...firstPaintStageHeights)).toBeLessThan(80);
+  const pinboardHeights = await page.locator(".pinboard-layout").evaluate((layout) => {
+    const stage = layout.querySelector(".pinboard-stage-panel");
+    const presence = layout.querySelector(".pinboard-presence");
+    return {
+      stage: stage?.getBoundingClientRect().height ?? 0,
+      presence: presence?.getBoundingClientRect().height ?? 0
+    };
+  });
+  expect(pinboardHeights.stage).toBeGreaterThan(300);
+  expect(pinboardHeights.stage).toBeGreaterThan(pinboardHeights.presence * 0.85);
+  await expect(page.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible();
+  const miniChatInput = page.locator("[data-space-chat-input]");
+  await expect(miniChatInput).toBeVisible();
+  await expect(miniChatInput).toBeFocused();
+  await expect(page.locator("woo-space-chat-panel .space-chat-head span")).toHaveText("Pinboard");
+  await miniChatInput.fill("look");
+  await miniChatInput.press("Enter");
+  await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("look");
 
   await page.locator("[data-pinboard-new-text]").fill("Bring the towel to the hot tub");
   await page.locator("[data-pinboard-new-color]").selectOption("blue");

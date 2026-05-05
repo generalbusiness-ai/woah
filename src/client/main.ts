@@ -1,5 +1,6 @@
 import "./styles.css";
 import chatManifest from "../../catalogs/chat/manifest.json";
+import demoworldManifest from "../../catalogs/demoworld/manifest.json";
 import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import type { ChatLine, ChatSpaceData, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
@@ -102,6 +103,7 @@ const state: AppState = {
 
 let audio: DubAudio | undefined;
 const ui = createWooClientFramework();
+const bundledDefaultChatRoom = String((demoworldManifest as any).seed_hooks?.find((hook: any) => hook?.kind === "create_instance" && hook?.class === "$chatroom")?.as ?? "");
 const sessionKey = "woo.session";
 const chatHistoryKey = "woo.chat.history";
 const pinboardNewColorKey = "woo.pinboard.newColor";
@@ -235,6 +237,7 @@ function connect() {
         }
       }
       forgetLiveControls(observations);
+      for (const observation of observations) if (isControlChangedObservation(observation)) receiveControlChangedObservation(observation);
       rememberTaskObservations(observations, typeof frame.id === "string" ? frame.id : undefined);
       for (const observation of observations) if (isChatObservation(observation)) receiveChatEvent(observation, false);
       state.observations.unshift({ seq: frame.seq, space: frame.space, observations, message: frame.message });
@@ -441,7 +444,7 @@ function tabFromViewHint(view?: string): AppState["tab"] | undefined {
 }
 
 function objectIdForTab(tab: AppState["tab"]): string {
-  if (tab === "chat") return chatRoom();
+  if (tab === "chat") return activeChatRoom();
   if (tab === "dubspace") return dubspaceSpace();
   if (tab === "pinboard") return pinboardSpace();
   if (tab === "taskspace") return state.selectedTask && state.world?.taskspace?.tasks?.[state.selectedTask] ? state.selectedTask : taskspaceSpace();
@@ -483,7 +486,7 @@ function syncUrlFromCurrentState(mode: "replace" | "push" = "replace") {
 }
 
 function routeForObjectId(objectId: string): AppState["tab"] {
-  if (objectId === chatRoom()) return "chat";
+  if (objectId === activeChatRoom()) return "chat";
   if (objectId === dubspaceSpace()) return "dubspace";
   if (objectId === pinboardSpace()) return "pinboard";
   if (state.world?.taskspace?.tasks?.[objectId]) return "taskspace";
@@ -584,6 +587,8 @@ function setSelectedObject(id: string, options: { apply?: boolean } = {}) {
 }
 
 let lastObservedChatRoom = "";
+const chatSeparatorMinIntervalMs = 2_000;
+const lastChatSeparatorAtBySource = new Map<string, number>();
 
 async function refresh() {
   refreshDebounceTimer = null;
@@ -598,7 +603,7 @@ async function refresh() {
     // Mark the bottom of the room the actor just left, so when they return
     // the room's prior chat (including their `> enter tub` input echo) is
     // visually behind a "you were away" boundary.
-    pushChatLine({ kind: "separator", source: previousChatRoom, ts: Date.now() }, false);
+    pushChatSeparator(previousChatRoom, false);
   }
   lastObservedChatRoom = currentChatRoom;
   if (!state.selectedObject || !state.world.objects?.[state.selectedObject]) state.selectedObject = defaultSelectedObject();
@@ -835,8 +840,9 @@ function buildChatMeta(world: any) {
   const rooms = objectsByParent(world, catalogClass(chat, "$chatroom"));
   const occupied = rooms.find((id) => Array.isArray(world.objects?.[id]?.props?.subscribers) && world.objects[id].props.subscribers.includes(state.actor));
   const seededEntry = Object.values(demo?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
+  const defaultRoom = seededEntry ?? rooms[0];
   const current = occupied ?? seededEntry ?? rooms[0];
-  return { room: current, rooms };
+  return { room: current, rooms, defaultRoom };
 }
 
 function projectChat(world: any, meta: any) {
@@ -867,6 +873,17 @@ function pinboardSpace() {
 
 function chatRoom() {
   return String(state.world?.chatMeta?.room ?? "");
+}
+
+function defaultChatRoom() {
+  return String(state.world?.chatMeta?.defaultRoom ?? "");
+}
+
+function activeChatRoom() {
+  const room = chatRoom();
+  if (room) return room;
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  return state.tab === "chat" && route?.objectId === bundledDefaultChatRoom ? route.objectId : "";
 }
 
 function call(space: string, target: string, verb: string, args: any[] = []) {
@@ -1017,8 +1034,10 @@ function receiveLiveEvent(observation: any) {
     const placementChanged = applyPinboardPlacementObservation(observation);
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
     if (String(observation?.actor ?? "") === state.actor) {
-      if (observation?.type === "pinboard_entered" && state.tab !== "pinboard") {
-        setTab("pinboard", { mode: "push", leaveCurrent: false });
+      if (observation?.type === "pinboard_entered") {
+        markNestedSpaceDeparture(pinboardSpace());
+        if (state.tab !== "pinboard") setTab("pinboard", { mode: "push", leaveCurrent: false });
+        requestSpaceChatFocus(pinboardSpace());
       } else if (observation?.type === "pinboard_left" && state.tab === "pinboard") {
         clearPinboardViewports();
         setTab("chat", { mode: "push", leaveCurrent: false });
@@ -1033,9 +1052,9 @@ function receiveLiveEvent(observation: any) {
     if (String(observation?.actor ?? "") === state.actor) {
       if (observation?.type === "dubspace_entered") {
         addDubspaceOperator(state.actor);
-        if (state.tab !== "dubspace") {
-          setTab("dubspace", { mode: "push", leaveCurrent: false });
-        }
+        markNestedSpaceDeparture(dubspaceSpace());
+        if (state.tab !== "dubspace") setTab("dubspace", { mode: "push", leaveCurrent: false });
+        requestSpaceChatFocus(dubspaceSpace());
       } else if (observation?.type === "dubspace_left") {
         removeDubspaceOperator(state.actor);
         if (state.tab === "dubspace") {
@@ -1047,6 +1066,11 @@ function receiveLiveEvent(observation: any) {
   }
   if (isChatObservation(observation)) {
     receiveChatEvent(observation);
+    return;
+  }
+  if (isControlChangedObservation(observation)) {
+    receiveControlChangedObservation(observation);
+    scheduleRefresh();
     return;
   }
   if (observation?.type === "gesture_progress") {
@@ -1063,6 +1087,16 @@ function trimObservations() {
 }
 
 function receiveLiveControl(observation: any) {
+  const input = findControlInput(String(observation.target), String(observation.name));
+  if (input && document.activeElement !== input) setControlInputValue(input, observation.value);
+  audio?.sync(effectiveDubspace(), state.clockOffset);
+}
+
+function isControlChangedObservation(observation: any) {
+  return String(observation?.type ?? "") === "control_changed";
+}
+
+function receiveControlChangedObservation(observation: any) {
   const input = findControlInput(String(observation.target), String(observation.name));
   if (input && document.activeElement !== input) setControlInputValue(input, observation.value);
   audio?.sync(effectiveDubspace(), state.clockOffset);
@@ -1100,6 +1134,7 @@ function setControlInputValue(input: HTMLInputElement, value: any) {
     return;
   }
   input.value = String(value);
+  syncControlInputReadout(input, value);
 }
 
 function syncPitchInput(input: HTMLInputElement) {
@@ -1111,6 +1146,13 @@ function syncPitchInput(input: HTMLInputElement) {
   const hz = switchEl?.querySelector<HTMLElement>("[data-pitch-hz]");
   if (note) note.textContent = pitch.note;
   if (hz) hz.textContent = `${Math.round(pitch.freq)} Hz`;
+}
+
+function syncControlInputReadout(input: HTMLInputElement, value: any = input.value) {
+  if (input.dataset.name !== "cutoff") return;
+  const readout = input.closest<HTMLElement>(".filter-strip")?.querySelector<HTMLElement>("[data-control-readout]");
+  const numeric = Number(value);
+  if (readout && Number.isFinite(numeric)) readout.textContent = `${Math.round(numeric)} Hz`;
 }
 
 function forgetLiveControls(observations: any[]) {
@@ -1400,7 +1442,7 @@ function renderFilterStrip(filter: any) {
         <span>Filter</span>
       </div>
       <input class="vertical-fader" aria-label="Filter cutoff" data-control data-target="${escapeHtml(target)}" data-name="cutoff" type="range" min="80" max="5000" step="1" value="${escapeHtml(String(cutoff))}">
-      <span class="fader-readout">${escapeHtml(String(Math.round(Number(cutoff))))} Hz</span>
+      <span class="fader-readout" data-control-readout>${escapeHtml(String(Math.round(Number(cutoff))))} Hz</span>
     </div>
   `;
 }
@@ -1538,6 +1580,7 @@ function enterDubspace() {
   direct(space, "enter", [], (result) => {
     setDubspaceOperators(result);
     if (state.tab === "dubspace") render();
+    requestSpaceChatFocus(space);
   });
 }
 
@@ -1648,7 +1691,7 @@ function renderStepRow(voice: string, label: string, row: boolean[]) {
 }
 
 function enterChat() {
-  const room = chatRoom();
+  const room = activeChatRoom();
   if (!room || !canSendDirect()) return;
   direct(room, "enter", [], (result) => {
     setCurrentChatRoom(room);
@@ -1989,6 +2032,30 @@ function pushChatLine(line: ChatLine, shouldRender = true) {
   if (shouldRender && currentTabHasChatPanel()) render();
 }
 
+function pushChatSeparator(source: string, shouldRender = true) {
+  if (!source) return;
+  const now = Date.now();
+  const recent = lastChatSeparatorAtBySource.get(source) ?? 0;
+  if (now - recent < chatSeparatorMinIntervalMs) return;
+  lastChatSeparatorAtBySource.set(source, now);
+  pushChatLine({ kind: "separator", source, ts: now }, shouldRender);
+}
+
+function nestedSpaceParentRoom(space: string): string {
+  const obj = state.world?.objects?.[space];
+  const mountRoom = obj?.props?.mount_room;
+  if (typeof mountRoom === "string" && mountRoom) return mountRoom;
+  const location = obj?.location;
+  return typeof location === "string" ? location : "";
+}
+
+function markNestedSpaceDeparture(space: string) {
+  const parentRoom = nestedSpaceParentRoom(space);
+  // Moving into a nested feature-space mounted under the default room leaves
+  // chatMeta.room unchanged, so refresh() cannot infer the away boundary.
+  if (parentRoom && parentRoom === chatRoom() && parentRoom === defaultChatRoom()) pushChatSeparator(parentRoom, false);
+}
+
 function currentTabHasChatPanel(): boolean {
   return ["chat", "dubspace", "pinboard", "taskspace"].includes(state.tab);
 }
@@ -2117,12 +2184,12 @@ function mountChatComponent() {
   bindChatComponentEvents(element);
   const room = state.world?.chat?.room;
   const present = state.chatPresent;
-  const inRoom = Boolean(state.actor && room?.id && actorPresentInSpace(room.id));
-  const lines = chatLinesForSpace(chatRoom());
-  const subject = chatRoom();
+  const subject = activeChatRoom();
+  const inRoom = Boolean(state.actor && subject && (actorPresentInSpace(subject) || present.includes(state.actor)));
+  const lines = chatLinesForSpace(subject);
   element.subject = subject;
   element.woo = createChatWooContext(subject, chatLineActorRefs(lines));
-  element.data = {
+  setCustomElementData(element, {
     roomName: String(room?.name ?? "Room"),
     roomDescription: String(room?.description ?? ""),
     lines,
@@ -2130,16 +2197,27 @@ function mountChatComponent() {
     draft: state.chatDraft,
     inRoom,
     canSend: canSendDirect()
-  };
-  scrollChatFeedToEnd(element.querySelector<HTMLElement>(".chat-feed") ?? ".chat-feed");
+  }, () => scrollChatFeedToEnd(element.querySelector<HTMLElement>(".chat-feed") ?? ".chat-feed"));
 }
 
 function chatFrameComponentTag(): string | null {
-  const subject = chatRoom();
-  const resolved = subject ? ui.catalogUi.resolveFrame(subject, undefined, clientClassDistance) : undefined;
+  const subject = activeChatRoom();
+  const resolved = subject && state.world?.objects?.[subject] ? ui.catalogUi.resolveFrame(subject, undefined, clientClassDistance) : undefined;
   const firstMainNode = resolved?.frame.regions.main?.[0];
   const component = firstMainNode ? ui.catalogUi.component(firstMainNode.component, resolved?.catalog.alias) : undefined;
-  return component?.declaration.tag ?? null;
+  return (component ?? ui.catalogUi.component("chat.space", "chat"))?.declaration.tag ?? null;
+}
+
+function setCustomElementData<T>(element: HTMLElement & { data?: T }, data: T, afterRender?: () => void) {
+  const assign = () => {
+    element.data = data;
+    afterRender?.();
+  };
+  if (customElements.get(element.localName)) {
+    assign();
+    return;
+  }
+  void customElements.whenDefined(element.localName).then(assign);
 }
 
 function clientClassDistance(subject: string, classRef: string): number | false {
@@ -2182,7 +2260,7 @@ function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData })
     rememberChatInput(text);
     state.chatDraft = "";
     if (detail.input) detail.input.value = "";
-    void (element.woo?.send(text, chatRoom()) ?? Promise.resolve(sendChatInput(chatRoom(), text)));
+    void (element.woo?.send(text, activeChatRoom()) ?? Promise.resolve(sendChatInput(activeChatRoom(), text)));
     focusChatInput();
   });
   element.addEventListener("woo-chat-recipient", (event) => {
@@ -2270,6 +2348,11 @@ function focusSpaceChatInput(space: string) {
   });
 }
 
+function requestSpaceChatFocus(space: string) {
+  if (!space) return;
+  for (const delay of [0, 50, 150, 400, 900]) window.setTimeout(() => focusSpaceChatInput(space), delay);
+}
+
 function sendChatInput(space: string, text: string) {
   if (!space) return;
   // Local-only echo so the feed reads as a transcript; never emitted server-side.
@@ -2302,8 +2385,15 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
   if (verb === "enter" && target === dubspaceSpace()) {
     setDubspaceOperators(result);
     setTab("dubspace", { mode: "push", leaveCurrent: false });
-    void refresh().then(() => focusSpaceChatInput(target));
-    focusSpaceChatInput(target);
+    void refresh().then(() => requestSpaceChatFocus(target));
+    requestSpaceChatFocus(target);
+    return;
+  }
+  if ((verb === "leave" || verb === "out") && target === dubspaceSpace()) {
+    setDubspaceOperators(result);
+    setTab("chat", { mode: "push", leaveCurrent: false });
+    void refresh();
+    focusChatInput();
     return;
   }
   if ((verb === "leave" || verb === "out") && target === pinboardSpace()) {
@@ -2318,8 +2408,8 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
     setPinboardPresent(result);
     setTab("pinboard", { mode: "push", leaveCurrent: false });
     refreshPinboardNotes({ force: true });
-    void refresh().then(() => focusSpaceChatInput(target));
-    focusSpaceChatInput(target);
+    void refresh().then(() => requestSpaceChatFocus(target));
+    requestSpaceChatFocus(target);
     return;
   }
   if (verb === "who") {
@@ -2354,7 +2444,7 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
 }
 
 function refreshChatLook() {
-  const room = chatRoom();
+  const room = activeChatRoom();
   if (!room) return;
   direct(room, "look", [], applyLookResult, receiveChatError);
 }
@@ -2366,7 +2456,7 @@ function applyLookResult(result: any) {
   // with them hides the chat UI for anyone not also inside the board, since
   // renderChat treats !present.includes(state.actor) as "you must enter".
   const lookedId = typeof result?.id === "string" ? result.id : "";
-  if (lookedId && lookedId !== chatRoom()) return;
+  if (lookedId && lookedId !== activeChatRoom()) return;
   state.chatPresent = present;
 }
 
@@ -2398,9 +2488,9 @@ function renderPinboard() {
     </section>
   `;
   const layout = `
-    <section class="pinboard-layout ${inBoard ? "has-space-chat" : ""}" data-space-chat-layout="${escapeHtml(board.id)}">
+    <section class="pinboard-layout ${inBoard ? "has-space-chat" : ""}" data-space-chat-layout="${escapeHtml(board.id)}" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
       <div class="pinboard-work">
-        ${inBoard ? renderPinboardCreate(pinboard.palette) : ""}
+        ${inBoard ? renderPinboardCreate(pinboard.palette) : renderPinboardCreatePlaceholder()}
         <div class="panel pinboard-stage-panel">
           <div class="pinboard-stage" data-pinboard-stage style="${pinboardStageStyle(width, height, view)}">
             <div class="pinboard-zoom-controls" aria-label="Pinboard zoom controls">
@@ -2433,7 +2523,14 @@ function renderPinboard() {
 function renderSpaceChatPanel(space: string) {
   const height = Math.round(spaceChatHeight(space));
   const component = ui.catalogUi.component("chat.space-mini", "chat");
-  const tag = component?.declaration.tag ?? "woo-space-chat-panel";
+  const tag = component?.declaration.tag;
+  if (!tag) {
+    return `
+      <section class="panel space-chat-panel" data-space-chat-missing="${escapeHtml(space)}" style="height:${height}px">
+        <p class="chat-empty">No chat UI is registered for this space.</p>
+      </section>
+    `;
+  }
   return `<${tag} class="panel space-chat-panel" data-space-chat-panel data-space-chat-space="${escapeHtml(space)}" style="height:${height}px"></${tag}>`;
 }
 
@@ -2572,6 +2669,10 @@ function renderPinboardCreate(palette: string[]) {
       <button>Add Note</button>
     </form>
   `;
+}
+
+function renderPinboardCreatePlaceholder() {
+  return `<div class="panel pinboard-create pinboard-create-placeholder" aria-hidden="true"></div>`;
 }
 
 function setPendingPinPatch(id: string, patch: { x?: number; y?: number; w?: number; h?: number }) {
@@ -2766,12 +2867,13 @@ function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChat
   const lines = chatLinesForSpace(space);
   panel.subject = space;
   panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
-  panel.data = {
+  setCustomElementData(panel, {
     space,
+    spaceName: objectName(state.world, space),
     lines,
     draft: spaceChatDraft(space),
     height: Math.round(spaceChatHeight(space))
-  };
+  }, () => panel.scrollFeedToEnd?.());
   bindSpaceChatComponentEvents(panel);
   if ("ResizeObserver" in window && panel.dataset.spaceChatResizeObserved !== "true") {
     panel.dataset.spaceChatResizeObserved = "true";
@@ -2782,7 +2884,6 @@ function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChat
     observer.observe(panel);
   }
   bindSpaceChatResize(panel);
-  panel.scrollFeedToEnd?.();
 }
 
 function bindSpaceChatComponentEvents(panel: HTMLElement & WooElement) {
@@ -3267,6 +3368,7 @@ function enterPinboard() {
     setPinboardPresent(result);
     refreshPinboardNotes({ force: true });
     if (state.tab === "pinboard") render();
+    requestSpaceChatFocus(board);
   });
 }
 

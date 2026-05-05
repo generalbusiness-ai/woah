@@ -24,6 +24,7 @@ export type ChatSpaceData = {
 
 export type SpaceChatPanelData = {
   space: string;
+  spaceName?: string;
   lines: ChatLine[];
   draft: string;
   height: number;
@@ -168,14 +169,15 @@ export class WooSpaceChatPanelElement extends HTMLElement {
   }
 
   private render() {
-    const space = this.model.space || this.subject || "";
+    const space = this.model.space || this.subject || this.dataset.spaceChatSpace || "";
+    const spaceName = this.model.spaceName || this.woo?.observe(space)?.name || space;
     this.dataset.spaceChatSpace = space;
     this.style.height = `${Math.round(this.model.height)}px`;
     this.innerHTML = `
       <div class="space-chat-resizer" data-space-chat-resizer role="separator" aria-orientation="horizontal" aria-label="Resize space chat"></div>
       <div class="space-chat-head">
         <h2>Chat</h2>
-        <span>${escapeHtml(space)}</span>
+        <span>${escapeHtml(spaceName)}</span>
       </div>
       <div class="chat-feed space-chat-feed" data-space-chat-feed aria-live="polite">
         ${this.model.lines.map((line) => renderChatLineHtml(line, (id) => this.actorLabel(id))).join("") || `<div class="chat-empty">No chat events yet.</div>`}
@@ -189,7 +191,7 @@ export class WooSpaceChatPanelElement extends HTMLElement {
   }
 
   private bind() {
-    const space = this.model.space || this.subject || "";
+    const space = this.model.space || this.subject || this.dataset.spaceChatSpace || "";
     const input = this.querySelector<HTMLInputElement>("[data-space-chat-input]");
     input?.addEventListener("input", () => this.dispatch("draft", { space, value: input.value }));
     input?.addEventListener("keydown", (event) => {

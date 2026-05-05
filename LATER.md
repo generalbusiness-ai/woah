@@ -10,6 +10,7 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
+- santa's workshop
 - djspace
 - dubspace bpm
 - make the couch a transparent room; "sit", "up"/off/out

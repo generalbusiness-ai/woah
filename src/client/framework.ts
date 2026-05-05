@@ -538,7 +538,7 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
   });
   registry.observation({
     types: ["control_changed"],
-    route: "sequenced",
+    route: "both",
     reduce: (draft, envelope) => {
       const obs = envelope.observation;
       const target = String(obs.target ?? "");

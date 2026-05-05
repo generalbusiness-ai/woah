@@ -75,13 +75,15 @@ describe("chat catalog UI components", () => {
     document.body.append(element);
     element.data = {
       space: "the_pinboard",
+      spaceName: "Pinboard",
       lines: [{ kind: "emoted", actor: "guest_2", text: "waves" }],
       draft: "mini",
       height: 160
     };
 
     expect(element.dataset.spaceChatSpace).toBe("the_pinboard");
-    expect(element.querySelector(".space-chat-head")?.textContent).toContain("the_pinboard");
+    expect(element.querySelector(".space-chat-head")?.textContent).toContain("Pinboard");
+    expect(element.querySelector(".space-chat-head")?.textContent).not.toContain("the_pinboard");
     expect(element.querySelector(".space-chat-feed")?.textContent).toContain("Guest Two waves");
     expect(element.querySelector<HTMLInputElement>("[data-space-chat-input]")?.value).toBe("mini");
 
@@ -95,5 +97,24 @@ describe("chat catalog UI components", () => {
 
     expect(detail).toMatchObject({ text: "mini send", space: "the_pinboard" });
     expect(detail?.input).toBe(input);
+  });
+
+  it("preserves declarative mini-chat space before host data binding", () => {
+    const element = document.createElement("woo-space-chat-panel") as WooSpaceChatPanelElement;
+    element.dataset.spaceChatSpace = "the_pinboard";
+    document.body.append(element);
+
+    expect(element.dataset.spaceChatSpace).toBe("the_pinboard");
+    expect(element.querySelector<HTMLInputElement>("[data-space-chat-input]")?.dataset.spaceChatSpace).toBe("the_pinboard");
+
+    let detail: Record<string, unknown> | undefined;
+    element.addEventListener("woo-chat-submit", (event) => {
+      detail = (event as CustomEvent<Record<string, unknown>>).detail;
+    });
+    const input = element.querySelector<HTMLInputElement>("[data-space-chat-input]")!;
+    input.value = "look";
+    element.querySelector<HTMLFormElement>("[data-space-chat-form]")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+
+    expect(detail).toMatchObject({ text: "look", space: "the_pinboard" });
   });
 });
