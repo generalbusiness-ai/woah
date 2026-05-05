@@ -143,7 +143,7 @@
               "origin?"
             ]
           },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (isa(item, $space) && item != origin) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
         },
         {
           "name": "match_exit",

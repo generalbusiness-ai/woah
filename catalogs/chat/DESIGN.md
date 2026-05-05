@@ -97,11 +97,14 @@ classes don't drift.
 
 The `:announce_all_but(ignore, text, origin?)` chain takes an optional
 `origin` parameter. When `$transparent` forwards an announcement upward, it
-passes `this` as `origin`. The parent's `$room:announce_all_but` skips the
-matching child during its `contents(this)` iteration, so listeners in the
-originating space don't get the announcement twice (once from the local
-loop, once from the parent looping back via `:hear_parent_announce`).
-Cycle protection by construction.
+passes `this` as `origin`. The parent's `$room:announce_all_but` skips that
+origin during its `contents(this)` iteration, then probes the remaining
+contents for the `:hear_parent_announce` protocol with `$match:match_verb`.
+This is deliberately protocol-based rather than `isa(item, $space)`: rooms
+may contain cross-host objects, and synchronous class checks are host-local.
+Listeners in the originating space therefore don't get the announcement twice
+(once from the local loop, once from the parent looping back via
+`:hear_parent_announce`). Cycle protection by construction.
 
 **Multi-session, multi-location actors** (the LambdaMOO single-actor model
 extended for the SPA's multi-tab UX, see
