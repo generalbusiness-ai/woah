@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import chatManifest from "../catalogs/chat/manifest.json";
 import { CatalogUiRegistry, createWooClientFramework } from "../src/client/framework";
 
 describe("client UI framework projection", () => {
@@ -172,5 +173,30 @@ describe("catalog UI registry", () => {
     registry.defineTag("pinboard", "pinboard-ui", "woo-pinboard-board", ctor, customElementsLike);
     expect(defined.get("woo-pinboard-board")).toBe(ctor);
     expect(() => registry.defineTag("pinboard", "pinboard-ui", "woo-undeclared", ctor, customElementsLike)).toThrow(/not declared/);
+  });
+
+  it("registers the bundled chat.space component declaration", () => {
+    const registry = new CatalogUiRegistry();
+    expect(registry.installCatalogUi({
+      alias: "chat",
+      catalog: "chat",
+      objects: { "$space": "$space", "$chatroom": "$chatroom" },
+      ui: (chatManifest as any).ui
+    })).toEqual([]);
+
+    expect(registry.resolveComponentId("chat.space", "chat")).toBe("chat:chat.space");
+    expect(registry.component("chat.space", "chat")?.declaration).toMatchObject({
+      tag: "woo-chat-space",
+      module: "chat-ui",
+      surface: "chat",
+      subject: "$space"
+    });
+    expect(registry.component("chat.space-mini", "chat")?.declaration).toMatchObject({
+      tag: "woo-space-chat-panel",
+      module: "chat-ui",
+      surface: "space-chat",
+      subject: "$space"
+    });
+    expect(registry.resolveFrame("$chatroom", undefined, () => false)?.frame.id).toBe("chat.room");
   });
 });

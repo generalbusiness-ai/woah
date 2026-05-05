@@ -1,5 +1,8 @@
 import "./styles.css";
-import { createWooClientFramework, liveProjectionKey, type ProjectionPatch } from "./framework";
+import chatManifest from "../../catalogs/chat/manifest.json";
+import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
+import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import type { ChatLine, ChatSpaceData, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 
 type AppState = {
   socket?: WebSocket;
@@ -33,18 +36,6 @@ type AppState = {
 type RouteLocation = {
   objectId: string;
   view?: string;
-};
-
-type ChatLine = {
-  kind: "text" | "input" | "separator" | "said" | "said_to" | "said_as" | "emoted" | "posed" | "quoted" | "self_pointed" | "told" | "entered" | "left" | "looked" | "who" | "blocked_exit" | "taken" | "dropped" | "huh" | "dubspace_activity" | "dubspace_entered" | "dubspace_left" | "pinboard_activity" | "pinboard_entered" | "pinboard_left" | "system" | "error";
-  actor?: string;
-  from?: string;
-  to?: string;
-  style?: string;
-  reason?: string;
-  source?: string;
-  text?: string;
-  ts?: number;
 };
 
 type RenderFocusSnapshot = {
@@ -178,6 +169,7 @@ let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, l
 let routeInitialized = false;
 state.spaceChatHeights = loadSpaceChatHeights();
 
+installBundledCatalogUi();
 connect();
 window.setInterval(pruneLiveControls, 700);
 window.addEventListener("resize", () => {
@@ -917,7 +909,7 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
   direct(space, "enter", [], onReady, onError);
 }
 
-function direct(target: string, verb: string, args: any[] = [], onResult?: (result: any) => void, onError?: (error: any) => void) {
+function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void) {
   const id = crypto.randomUUID();
   if (onResult) pendingDirect.set(id, onResult);
   if (onError) pendingFrameErrors.set(id, onError);
@@ -1184,10 +1176,10 @@ function render() {
   `;
 
   bindCommon();
+  if (state.tab === "chat") mountChatComponent();
   if (state.tab === "dubspace") bindDubspace();
   if (state.tab === "taskspace") bindTaskspace();
   if (state.tab === "pinboard") bindPinboard();
-  if (state.tab === "chat") bindChat();
   if (state.tab === "ide") bindIde();
   if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
 }
@@ -1291,6 +1283,22 @@ function bindCommon() {
   });
 }
 
+function installBundledCatalogUi() {
+  const uiManifest = (chatManifest as any).ui;
+  if (!uiManifest) return;
+  // Bundled-catalog mode registers statically imported source. Installed remote
+  // catalogs should go through CatalogUiRegistry.loadModule() with the resolved
+  // artifact URL from the manifest entry.
+  const diagnostics = ui.catalogUi.installCatalogUi({
+    alias: "chat",
+    catalog: "chat",
+    objects: { "$space": "$space", "$chatroom": "$chatroom" },
+    ui: uiManifest
+  } satisfies CatalogUiPackage);
+  if (diagnostics.length > 0) throw new Error(`bundled chat UI manifest is invalid: ${diagnostics.join("; ")}`);
+  ui.catalogUi.registerModuleExports("chat", "chat-ui", chatUiModule, ui.observations);
+}
+
 function renderDubspace() {
   const dub = effectiveDubspace();
   const meta = state.world?.dubspaceMeta ?? {};
@@ -1331,35 +1339,37 @@ function renderDubspace() {
       <button data-save-scene>Save Scene</button>
       <button data-recall-scene>Recall Scene</button>
     </section>
-    <section class="dubspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(spaceId)}" style="--space-chat-h:${Math.round(spaceChatHeight(spaceId))}px">
-      <div class="dubspace-work">
-        <div class="grid">
-          <article class="panel loop-console-panel">
-            <div class="panel-head"><h2>Loops</h2></div>
-            <div class="loop-console">${slots.map((id: string, index: number) => renderLoopStrip(id, index + 1, dub)).join("")}${renderFilterStrip(filter)}</div>
-          </article>
-          <article class="panel">
-            <h2>Delay</h2>
-            ${slider(meta.delay, "send", delay.send ?? 0.3)}
-            ${slider(meta.delay, "time", delay.time ?? 0.25)}
-            ${slider(meta.delay, "feedback", delay.feedback ?? 0.35)}
-            ${slider(meta.delay, "wet", delay.wet ?? 0.4)}
-          </article>
-          <article class="panel sequencer">
-            <div class="panel-head">
-              <h2>Percussion</h2>
-              <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
-            </div>
-            <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(drum.bpm ?? 118))}"><span>${escapeHtml(String(drum.bpm ?? 118))}</span></label>
-            <div class="steps">
-              ${drumVoices.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
-            </div>
-          </article>
+    <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(spaceId)}" style="--space-chat-h:${Math.round(spaceChatHeight(spaceId))}px">
+      <section class="dubspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(spaceId)}">
+        <div class="dubspace-work">
+          <div class="grid">
+            <article class="panel loop-console-panel">
+              <div class="panel-head"><h2>Loops</h2></div>
+              <div class="loop-console">${slots.map((id: string, index: number) => renderLoopStrip(id, index + 1, dub)).join("")}${renderFilterStrip(filter)}</div>
+            </article>
+            <article class="panel">
+              <h2>Delay</h2>
+              ${slider(meta.delay, "send", delay.send ?? 0.3)}
+              ${slider(meta.delay, "time", delay.time ?? 0.25)}
+              ${slider(meta.delay, "feedback", delay.feedback ?? 0.35)}
+              ${slider(meta.delay, "wet", delay.wet ?? 0.4)}
+            </article>
+            <article class="panel sequencer">
+              <div class="panel-head">
+                <h2>Percussion</h2>
+                <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
+              </div>
+              <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(drum.bpm ?? 118))}"><span>${escapeHtml(String(drum.bpm ?? 118))}</span></label>
+              <div class="steps">
+                ${drumVoices.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
+              </div>
+            </article>
+          </div>
         </div>
-      </div>
-      ${renderDubspacePresence(operators)}
+        ${renderDubspacePresence(operators)}
+      </section>
+      ${renderSpaceChatPanel(spaceId)}
     </section>
-    ${spaceId ? renderSpaceChatPanel(spaceId) : ""}
   `;
 }
 
@@ -2096,126 +2106,57 @@ function setCurrentChatRoom(room: string) {
 }
 
 function renderChat() {
+  const tag = chatFrameComponentTag();
+  if (!tag) return `<section class="panel"><p class="empty-state">No chat UI is registered for this room.</p></section>`;
+  return `<${tag} data-chat-space-host></${tag}>`;
+}
+
+function mountChatComponent() {
+  const element = document.querySelector<WooElement & { data?: ChatSpaceData }>("[data-chat-space-host]");
+  if (!element) return;
+  bindChatComponentEvents(element);
   const room = state.world?.chat?.room;
   const present = state.chatPresent;
   const inRoom = Boolean(state.actor && room?.id && actorPresentInSpace(room.id));
   const lines = chatLinesForSpace(chatRoom());
-  if (!inRoom) {
-    const canEnter = canSendDirect();
-    return `
-      <section class="toolbar">
-        <h1>${escapeHtml(room?.name ?? "Room")}</h1>
-        <button data-chat-enter ${canEnter ? "" : "disabled"}>Enter</button>
-      </section>
-      <section class="chat-layout solo">
-        <div class="panel chat-empty-panel">
-          <p>${escapeHtml(canEnter ? room?.description ?? "Enter the room to chat." : "Connecting...")}</p>
-        </div>
-      </section>
-    `;
-  }
-  return `
-    <section class="toolbar">
-      <h1>${escapeHtml(room?.name ?? "Room")}</h1>
-      <button data-chat-leave>Leave</button>
-      <button data-chat-look>Look</button>
-    </section>
-    <section class="chat-layout">
-      <div class="panel chat-panel">
-        <div class="chat-feed" aria-live="polite">
-          ${lines.map(renderChatLine).join("") || `<div class="chat-empty">${escapeHtml(room?.description ?? "No chat events yet.")}</div>`}
-        </div>
-        <form class="chat-form" data-chat-form>
-          <input data-chat-input autocomplete="off" placeholder="say something — or :waves, look cockatoo, tell guest_2 hi" value="${escapeHtml(state.chatDraft)}" />
-          <button>Send</button>
-        </form>
-      </div>
-      <aside class="panel chat-presence">
-        <h2>Present</h2>
-        <div class="presence-list">
-          ${present.map((id: string) => `<button data-chat-recipient="${escapeHtml(id)}">${escapeHtml(actorLabel(id))}<span>${escapeHtml(id)}</span></button>`).join("") || "<p>No actors present.</p>"}
-        </div>
-      </aside>
-    </section>
-  `;
+  const subject = chatRoom();
+  element.subject = subject;
+  element.woo = createChatWooContext(subject, chatLineActorRefs(lines));
+  element.data = {
+    roomName: String(room?.name ?? "Room"),
+    roomDescription: String(room?.description ?? ""),
+    lines,
+    present,
+    draft: state.chatDraft,
+    inRoom,
+    canSend: canSendDirect()
+  };
+  scrollChatFeedToEnd(element.querySelector<HTMLElement>(".chat-feed") ?? ".chat-feed");
 }
 
-function chatLinesForSpace(space: string): ChatLine[] {
-  if (!space) return [];
-  return state.chatFeed.filter((line) => !line.source || line.source === space);
+function chatFrameComponentTag(): string | null {
+  const subject = chatRoom();
+  const resolved = subject ? ui.catalogUi.resolveFrame(subject, undefined, clientClassDistance) : undefined;
+  const firstMainNode = resolved?.frame.regions.main?.[0];
+  const component = firstMainNode ? ui.catalogUi.component(firstMainNode.component, resolved?.catalog.alias) : undefined;
+  return component?.declaration.tag ?? null;
 }
 
-function renderChatLine(line: ChatLine) {
-  const time = line.ts ? new Date(line.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-  if (line.kind === "input") {
-    return `<div class="chat-line input"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "")}</span></div>`;
+function clientClassDistance(subject: string, classRef: string): number | false {
+  let current: string | undefined = subject;
+  for (let distance = 0; current; distance += 1) {
+    if (current === classRef) return distance;
+    const parent: unknown = state.world?.objects?.[current]?.parent;
+    current = typeof parent === "string" && parent !== current ? parent : undefined;
   }
-  if (line.kind === "separator") {
-    return `<div class="chat-line separator"></div>`;
-  }
-  if (line.kind === "said") {
-    return `<div class="chat-line said"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.actor))}</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "said_to") {
-    return `<div class="chat-line said"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.actor))} [to ${escapeHtml(actorLabel(line.to))}]</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "said_as") {
-    return `<div class="chat-line said"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.actor))} [${escapeHtml(line.style ?? "says")}]</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "emoted") {
-    return `<div class="chat-line emote"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(actorLabel(line.actor))} ${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "posed") {
-    return `<div class="chat-line emote"><span class="chat-time">${escapeHtml(time)}</span><span>[${escapeHtml(actorLabel(line.actor))} ${escapeHtml(line.text ?? "")}]</span></div>`;
-  }
-  if (line.kind === "quoted") {
-    return `<div class="chat-line said"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.actor))} |</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "self_pointed") {
-    return `<div class="chat-line emote"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(actorLabel(line.actor))} &lt;- ${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "told") {
-    return `<div class="chat-line told"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.from))} -> ${escapeHtml(actorLabel(line.to))}</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
-  }
-  if (line.kind === "huh") {
-    // Prefer the planner's reason ("You don't have 'hmmm'.") when set —
-    // otherwise the user just sees a generic "I don't understand 'X'."
-    // even though the substrate told us why specifically. The reason
-    // field is already populated upstream from the huh observation.
-    const detail = typeof line.reason === "string" && line.reason ? line.reason : `I don't understand "${line.text ?? ""}".`;
-    return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(detail)}</span></div>`;
-  }
-  if (line.kind === "error") {
-    return `<div class="chat-line error"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "That didn't work.")}</span></div>`;
-  }
-  if (line.kind === "entered" || line.kind === "left") {
-    const text = line.text ?? `${actorLabel(line.actor)} ${line.kind === "entered" ? "entered" : "left"}.`;
-    return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(text)}</span></div>`;
-  }
-  return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "")}</span></div>`;
+  return false;
 }
 
-function bindChat() {
-  const chatInput = document.querySelector<HTMLInputElement>("[data-chat-input]");
-  chatInput?.addEventListener("keydown", (event) => navigateChatHistory(event, chatInput));
-  chatInput?.addEventListener("input", (event) => {
-    state.chatDraft = (event.currentTarget as HTMLInputElement).value;
-    chatHistoryCursor = chatHistory.length;
-    chatHistoryDraft = state.chatDraft;
-  });
-  document.querySelector<HTMLFormElement>("[data-chat-form]")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const input = document.querySelector<HTMLInputElement>("[data-chat-input]");
-    const text = input?.value.trim() ?? "";
-    if (!text) return;
-    rememberChatInput(text);
-    state.chatDraft = "";
-    if (input) input.value = "";
-    sendChatInput(chatRoom(), text);
-    document.querySelector<HTMLInputElement>("[data-chat-input]")?.focus();
-  });
-  document.querySelector<HTMLButtonElement>("[data-chat-enter]")?.addEventListener("click", enterChat);
-  document.querySelector<HTMLButtonElement>("[data-chat-leave]")?.addEventListener("click", () => {
+function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData }) {
+  if (element.dataset.chatEventsBound === "true") return;
+  element.dataset.chatEventsBound = "true";
+  element.addEventListener("woo-chat-enter", enterChat);
+  element.addEventListener("woo-chat-leave", () => {
     const room = chatRoom();
     if (!room) return;
     direct(room, "leave", [], (result) => {
@@ -2223,17 +2164,78 @@ function bindChat() {
       if (state.tab === "chat") render();
     }, receiveChatError);
   });
-  document.querySelector<HTMLButtonElement>("[data-chat-look]")?.addEventListener("click", refreshChatLook);
-  document.querySelectorAll<HTMLButtonElement>("[data-chat-recipient]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const input = document.querySelector<HTMLInputElement>("[data-chat-input]");
-      if (!input) return;
-      state.chatDraft = `/tell ${button.dataset.chatRecipient} `;
-      input.value = state.chatDraft;
-      input.focus();
-    });
+  element.addEventListener("woo-chat-look", refreshChatLook);
+  element.addEventListener("woo-chat-draft", (event) => {
+    const value = String((event as CustomEvent<{ value?: unknown }>).detail?.value ?? "");
+    state.chatDraft = value;
+    chatHistoryCursor = chatHistory.length;
+    chatHistoryDraft = state.chatDraft;
   });
-  scrollChatFeedToEnd();
+  element.addEventListener("woo-chat-history", (event) => {
+    const detail = (event as CustomEvent<{ event?: KeyboardEvent; input?: HTMLInputElement }>).detail ?? {};
+    if (detail.event && detail.input) navigateChatHistory(detail.event, detail.input);
+  });
+  element.addEventListener("woo-chat-submit", (event) => {
+    const detail = (event as CustomEvent<{ text?: unknown; input?: HTMLInputElement }>).detail ?? {};
+    const text = String(detail.text ?? "").trim();
+    if (!text) return;
+    rememberChatInput(text);
+    state.chatDraft = "";
+    if (detail.input) detail.input.value = "";
+    void (element.woo?.send(text, chatRoom()) ?? Promise.resolve(sendChatInput(chatRoom(), text)));
+    focusChatInput();
+  });
+  element.addEventListener("woo-chat-recipient", (event) => {
+    const actor = String((event as CustomEvent<{ actor?: unknown }>).detail?.actor ?? "");
+    if (!actor) return;
+    state.chatDraft = `/tell ${actor} `;
+    render();
+    focusChatInput();
+  });
+}
+
+function createChatWooContext(subject: string, extraRefs: string[] = []): WooContext {
+  const frameId = `chat:${subject || "room"}`;
+  ui.frames.ensureFrame(frameId, subject, "default");
+  const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...(state.actor ? [state.actor] : [])].filter(Boolean));
+  return {
+    actor: state.actor ?? null,
+    frame: {
+      id: frameId,
+      subject,
+      view: "default",
+      get: (key) => ui.frames.frame(frameId)?.values[key],
+      set: (key, value) => ui.frames.emit({ type: "set_frame_state", frame: frameId, key, value })
+    },
+    neighborhood: {
+      subject,
+      refs: [...neighborhoodRefs],
+      related: {},
+      has: (ref) => neighborhoodRefs.has(ref)
+    },
+    observe: (ref) => neighborhoodRefs.has(ref) ? ui.observe(ref) ?? null : null,
+    send: async (command, space = subject) => {
+      sendChatInput(space, command);
+      return null;
+    },
+    directCall: (target, verb, args = []) => new Promise((resolve, reject) => {
+      direct(target, verb, args, resolve, reject);
+    }),
+    emit: (action) => ui.frames.emit(action)
+  };
+}
+
+function chatLinesForSpace(space: string): ChatLine[] {
+  if (!space) return [];
+  return state.chatFeed.filter((line) => !line.source || line.source === space);
+}
+
+function chatLineActorRefs(lines: ChatLine[]): string[] {
+  const refs = new Set<string>();
+  for (const line of lines) {
+    for (const value of [line.actor, line.from, line.to]) if (typeof value === "string" && value) refs.add(value);
+  }
+  return [...refs];
 }
 
 function scrollChatFeedToEnd(target: string | HTMLElement = ".chat-feed") {
@@ -2244,6 +2246,11 @@ function scrollChatFeedToEnd(target: string | HTMLElement = ".chat-feed") {
 
 function focusChatInput() {
   window.requestAnimationFrame(() => {
+    const component = document.querySelector<WooElement & { focusComposer?: () => void }>("[data-chat-space-host]");
+    if (component?.focusComposer) {
+      component.focusComposer();
+      return;
+    }
     const input = document.querySelector<HTMLInputElement>("[data-chat-input]");
     input?.focus();
     if (input) input.setSelectionRange(input.value.length, input.value.length);
@@ -2252,6 +2259,11 @@ function focusChatInput() {
 
 function focusSpaceChatInput(space: string) {
   window.requestAnimationFrame(() => {
+    const component = document.querySelector<WooElement & { focusComposer?: () => void }>(`[data-space-chat-panel][data-space-chat-space="${cssAttrValue(space)}"]`);
+    if (component?.focusComposer) {
+      component.focusComposer();
+      return;
+    }
     const input = document.querySelector<HTMLInputElement>(`[data-space-chat-input][data-space-chat-space="${cssAttrValue(space)}"]`);
     input?.focus();
     if (input) input.setSelectionRange(input.value.length, input.value.length);
@@ -2379,12 +2391,14 @@ function renderPinboard() {
       <section class="panel"><p class="empty-state">No pinboard catalog instance is installed.</p></section>
     `;
   }
-  return `
+  const toolbar = `
     <section class="toolbar pinboard-toolbar">
       <h1>${escapeHtml(board.name ?? "Pinboard")}</h1>
       ${inBoard ? `<button data-pinboard-leave>Leave</button>` : `<button data-pinboard-enter ${canSendDirect() ? "" : "disabled"}>Enter</button>`}
     </section>
-    <section class="pinboard-layout has-space-chat" data-space-chat-layout="${escapeHtml(board.id)}" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
+  `;
+  const layout = `
+    <section class="pinboard-layout ${inBoard ? "has-space-chat" : ""}" data-space-chat-layout="${escapeHtml(board.id)}">
       <div class="pinboard-work">
         ${inBoard ? renderPinboardCreate(pinboard.palette) : ""}
         <div class="panel pinboard-stage-panel">
@@ -2405,29 +2419,22 @@ function renderPinboard() {
         <div data-pinboard-map-shell>${renderPinboardMap(notes, present, width, height)}</div>
       </aside>
     </section>
-    ${inBoard ? renderSpaceChatPanel(board.id) : ""}
+  `;
+  if (!inBoard) return `${toolbar}${layout}`;
+  return `
+    ${toolbar}
+    <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(board.id)}" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
+      ${layout}
+      ${renderSpaceChatPanel(board.id)}
+    </section>
   `;
 }
 
 function renderSpaceChatPanel(space: string) {
-  const lines = chatLinesForSpace(space);
   const height = Math.round(spaceChatHeight(space));
-  return `
-    <section class="panel space-chat-panel" data-space-chat-panel data-space-chat-space="${escapeHtml(space)}" style="height:${height}px">
-      <div class="space-chat-resizer" data-space-chat-resizer role="separator" aria-orientation="horizontal" aria-label="Resize space chat"></div>
-      <div class="space-chat-head">
-        <h2>Chat</h2>
-        <span>${escapeHtml(space)}</span>
-      </div>
-      <div class="chat-feed space-chat-feed" data-space-chat-feed aria-live="polite">
-        ${lines.map(renderChatLine).join("") || `<div class="chat-empty">No chat events yet.</div>`}
-      </div>
-      <form class="chat-form space-chat-form" data-space-chat-form data-space-chat-space="${escapeHtml(space)}">
-        <input data-space-chat-input data-space-chat-space="${escapeHtml(space)}" autocomplete="off" placeholder="say something, /me waves, look, drop note" value="${escapeHtml(spaceChatDraft(space))}" />
-        <button>Send</button>
-      </form>
-    </section>
-  `;
+  const component = ui.catalogUi.component("chat.space-mini", "chat");
+  const tag = component?.declaration.tag ?? "woo-space-chat-panel";
+  return `<${tag} class="panel space-chat-panel" data-space-chat-panel data-space-chat-space="${escapeHtml(space)}" style="height:${height}px"></${tag}>`;
 }
 
 function renderPinboardMap(notes: any[], present: string[], width: number, height: number) {
@@ -2751,29 +2758,23 @@ function bindPinboard() {
 }
 
 function bindSpaceChatPanels() {
-  document.querySelectorAll<HTMLElement>("[data-space-chat-panel]").forEach(bindSpaceChatPanel);
+  document.querySelectorAll<HTMLElement & WooElement & { data?: SpaceChatPanelData; scrollFeedToEnd?: () => void }>("[data-space-chat-panel]").forEach(bindSpaceChatPanel);
 }
 
-function bindSpaceChatPanel(panel: HTMLElement) {
+function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChatPanelData; scrollFeedToEnd?: () => void }) {
   const space = panel.dataset.spaceChatSpace ?? "";
-  const input = panel.querySelector<HTMLInputElement>("[data-space-chat-input]");
-  input?.addEventListener("keydown", (event) => navigateChatHistory(event, input));
-  input?.addEventListener("input", (event) => {
-    setSpaceChatDraft(space, (event.currentTarget as HTMLInputElement).value);
-    chatHistoryCursor = chatHistory.length;
-    chatHistoryDraft = spaceChatDraft(space);
-  });
-  panel.querySelector<HTMLFormElement>("[data-space-chat-form]")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const text = input?.value.trim() ?? "";
-    if (!text) return;
-    rememberChatInput(text);
-    setSpaceChatDraft(space, "");
-    if (input) input.value = "";
-    sendChatInput(space, text);
-    panel.querySelector<HTMLInputElement>("[data-space-chat-input]")?.focus();
-  });
-  if (panel && "ResizeObserver" in window) {
+  const lines = chatLinesForSpace(space);
+  panel.subject = space;
+  panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
+  panel.data = {
+    space,
+    lines,
+    draft: spaceChatDraft(space),
+    height: Math.round(spaceChatHeight(space))
+  };
+  bindSpaceChatComponentEvents(panel);
+  if ("ResizeObserver" in window && panel.dataset.spaceChatResizeObserved !== "true") {
+    panel.dataset.spaceChatResizeObserved = "true";
     const observer = new ResizeObserver((entries) => {
       const height = entries[0]?.contentRect.height;
       if (typeof height === "number" && Math.abs(height - spaceChatHeight(space)) > 1) saveSpaceChatHeight(space, height);
@@ -2781,7 +2782,34 @@ function bindSpaceChatPanel(panel: HTMLElement) {
     observer.observe(panel);
   }
   bindSpaceChatResize(panel);
-  scrollChatFeedToEnd(panel.querySelector<HTMLElement>("[data-space-chat-feed]") ?? undefined);
+  panel.scrollFeedToEnd?.();
+}
+
+function bindSpaceChatComponentEvents(panel: HTMLElement & WooElement) {
+  if (panel.dataset.spaceChatEventsBound === "true") return;
+  panel.dataset.spaceChatEventsBound = "true";
+  panel.addEventListener("woo-chat-draft", (event) => {
+    const detail = (event as CustomEvent<{ space?: unknown; value?: unknown }>).detail ?? {};
+    const space = String(detail.space ?? panel.dataset.spaceChatSpace ?? "");
+    setSpaceChatDraft(space, String(detail.value ?? ""));
+    chatHistoryCursor = chatHistory.length;
+    chatHistoryDraft = spaceChatDraft(space);
+  });
+  panel.addEventListener("woo-chat-history", (event) => {
+    const detail = (event as CustomEvent<{ event?: KeyboardEvent; input?: HTMLInputElement }>).detail ?? {};
+    if (detail.event && detail.input) navigateChatHistory(detail.event, detail.input);
+  });
+  panel.addEventListener("woo-chat-submit", (event) => {
+    const detail = (event as CustomEvent<{ space?: unknown; text?: unknown; input?: HTMLInputElement }>).detail ?? {};
+    const space = String(detail.space ?? panel.dataset.spaceChatSpace ?? "");
+    const text = String(detail.text ?? "").trim();
+    if (!space || !text) return;
+    rememberChatInput(text);
+    setSpaceChatDraft(space, "");
+    if (detail.input) detail.input.value = "";
+    void (panel.woo?.send(text, space) ?? Promise.resolve(sendChatInput(space, text)));
+    focusSpaceChatInput(space);
+  });
 }
 
 function bindSpaceChatResize(panel: HTMLElement | null) {
@@ -3338,20 +3366,22 @@ function renderTaskspace() {
         ${taskStatuses.map((status) => renderStatusFilter(status, statusCounts[status] ?? 0)).join("")}
       </div>
     </section>
-    <section class="taskspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(space)}" style="--space-chat-h:${Math.round(spaceChatHeight(space))}px">
-      <div class="panel tree">
-        <div class="task-create">
-          <input data-new-title placeholder="Root task title" />
-          <input data-new-description placeholder="Description" />
-          <button data-create-task>Create</button>
+    <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(space)}" style="--space-chat-h:${Math.round(spaceChatHeight(space))}px">
+      <section class="taskspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(space)}">
+        <div class="panel tree">
+          <div class="task-create">
+            <input data-new-title placeholder="Root task title" />
+            <input data-new-description placeholder="Description" />
+            <button data-create-task>Create</button>
+          </div>
+          <div class="task-tree-list">
+            ${renderedRoots || `<div class="empty-state">${allTasks.length > 0 ? "No tasks match the selected statuses." : "No tasks yet."}</div>`}
+          </div>
         </div>
-        <div class="task-tree-list">
-          ${renderedRoots || `<div class="empty-state">${allTasks.length > 0 ? "No tasks match the selected statuses." : "No tasks yet."}</div>`}
-        </div>
-      </div>
-      <div class="panel inspector">${selected ? renderTaskInspector(selected, tasks) : `<div class="empty-state">Select a task.</div>`}</div>
+        <div class="panel inspector">${selected ? renderTaskInspector(selected, tasks) : `<div class="empty-state">Select a task.</div>`}</div>
+      </section>
+      ${space ? renderSpaceChatPanel(space) : ""}
     </section>
-    ${space ? renderSpaceChatPanel(space) : ""}
   `;
 }
 
@@ -3930,8 +3960,4 @@ class DubAudio {
     osc.start(t);
     osc.stop(t + 0.13);
   }
-}
-
-function escapeHtml(value: string) {
-  return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]!);
 }

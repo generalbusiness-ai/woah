@@ -21,6 +21,10 @@ export function liveProjectionKey(type: string, subject: string, discriminator?:
   return ["live", type, subject, discriminator].filter((part) => part !== undefined && part !== "").map(String).join(":");
 }
 
+export function escapeHtml(value: unknown): string {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char] ?? char));
+}
+
 export type DeliveredObservation = {
   route: WooObservationRoute;
   seq?: number;
@@ -147,6 +151,38 @@ export type WooComponentRegistry = {
   defineTag(tag: string, ctor: CustomElementConstructor): void;
 };
 
+export type WooNeighborhood = {
+  subject: string;
+  refs: readonly string[];
+  related: Readonly<Record<string, string | null>>;
+  has(ref: string): boolean;
+};
+
+export type WooFrameContext = {
+  id: string;
+  subject: string;
+  view?: string;
+  get(key: string): unknown;
+  set(key: string, value: unknown): boolean;
+};
+
+export type WooContext = {
+  actor: string | null;
+  frame: WooFrameContext;
+  neighborhood: WooNeighborhood;
+  observe(ref: string): ObjectProjection | null;
+  send(command: string, space?: string): Promise<unknown>;
+  directCall(target: string, verb: string, args?: unknown[]): Promise<unknown>;
+  emit(action: WooUiAction): boolean;
+};
+
+export type WooElement = HTMLElement & {
+  woo?: WooContext;
+  subject?: string;
+  related?: Record<string, string | null>;
+  node?: UiNodeDecl;
+};
+
 type ProjectionLayer = {
   patches: Map<string, ProjectionPatch>;
   expiresAt?: number;
@@ -224,6 +260,17 @@ export class CatalogUiRegistry {
     if (!pkg) throw new Error(`unknown catalog UI alias: ${alias}`);
     if (!(pkg.ui.modules ?? []).some((module) => module.id === moduleId)) throw new Error(`unknown UI module ${moduleId} for ${alias}`);
     const mod = await importModule(url);
+    mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
+    mod.registerWooObservationHandlers?.(observations);
+    this.loadedModules.add(key);
+  }
+
+  registerModuleExports(alias: string, moduleId: string, mod: ModuleExports, observations: ObservationRegistry): void {
+    const key = `${alias}:${moduleId}`;
+    if (this.loadedModules.has(key)) return;
+    const pkg = this.catalogs.get(alias);
+    if (!pkg) throw new Error(`unknown catalog UI alias: ${alias}`);
+    if (!(pkg.ui.modules ?? []).some((module) => module.id === moduleId)) throw new Error(`unknown UI module ${moduleId} for ${alias}`);
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
     this.loadedModules.add(key);
@@ -430,6 +477,7 @@ export class WooClientFramework {
   readonly projection = new ClientProjection();
   readonly observations = new ObservationRegistry(this.projection);
   readonly frames = new FrameStateStore();
+  readonly catalogUi = new CatalogUiRegistry();
 
   constructor() {
     registerCoreObservationHandlers(this.observations);

@@ -7,6 +7,48 @@
   "depends": [
     "@local:help"
   ],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "chat-ui",
+        "entry": "ui/chat-space.ts"
+      }
+    ],
+    "components": [
+      {
+        "id": "chat.space",
+        "module": "chat-ui",
+        "tag": "woo-chat-space",
+        "surface": "chat",
+        "subject": "$space",
+        "neighborhood": {
+          "include": ["subject", "subscribers", "actor"]
+        }
+      },
+      {
+        "id": "chat.space-mini",
+        "module": "chat-ui",
+        "tag": "woo-space-chat-panel",
+        "surface": "space-chat",
+        "subject": "$space",
+        "neighborhood": {
+          "include": ["subject", "subscribers", "actor"]
+        }
+      }
+    ],
+    "frames": [
+      {
+        "id": "chat.room",
+        "subject": "$chatroom",
+        "view": "default",
+        "layout": "space-workspace",
+        "regions": {
+          "main": [{ "component": "chat.space", "subject": "this" }]
+        }
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$match",

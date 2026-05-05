@@ -165,6 +165,10 @@ textarea {
   overflow: auto;
 }
 
+woo-chat-space {
+  display: block;
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -443,9 +447,8 @@ input[type="range"] {
 }
 
 .taskspace-layout.has-space-chat {
-  height: calc(100dvh - 5.25rem - var(--space-chat-h, 180px) - 0.8rem);
+  height: 100%;
   min-height: 0;
-  margin-bottom: 0.8rem;
   overflow: hidden;
 }
 
@@ -824,9 +827,8 @@ input[type="range"] {
 }
 
 .dubspace-layout.has-space-chat {
-  height: calc(100dvh - 5.25rem - var(--space-chat-h, 180px) - 0.8rem);
+  height: 100%;
   min-height: 0;
-  margin-bottom: 0.8rem;
   overflow: hidden;
 }
 
@@ -844,9 +846,22 @@ input[type="range"] {
   grid-template-columns: minmax(0, 1fr) 230px;
   gap: 1rem;
   align-items: stretch;
-  height: calc(100dvh - 5.25rem - var(--space-chat-h, 180px) - 0.8rem);
+  height: calc(100dvh - 5.25rem);
   min-height: 0;
-  margin-bottom: 0.8rem;
+}
+
+.pinboard-layout.has-space-chat {
+  height: 100%;
+  overflow: hidden;
+}
+
+.space-chat-shell {
+  height: calc(100dvh - 5.25rem);
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0.8rem;
+  overflow: hidden;
 }
 
 .pinboard-work {
@@ -902,7 +917,7 @@ input[type="range"] {
   height: var(--space-chat-h, 180px);
   min-height: 96px;
   max-height: 35vh;
-  overflow: auto;
+  overflow: hidden;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 0.45rem;
