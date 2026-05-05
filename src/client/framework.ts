@@ -4,18 +4,43 @@ export type ObjectProjection = {
   id: string;
   name?: string;
   owner?: string;
-  parent?: string;
-  location?: string;
+  parent?: string | null;
+  ancestors?: string[];
+  features?: string[];
+  aliases?: string[];
+  description?: string | null;
+  location?: string | null;
   props: Record<string, unknown>;
   catalogState: Record<string, Record<string, unknown>>;
 };
 
 export type ProjectionPatch = {
   subject: string;
+  // Identity/summary fields (`name`, `parent`, `location`, etc.) live here.
   fields?: Record<string, unknown>;
+  // World object properties live here.
   props?: Record<string, unknown>;
+  // Catalog-derived projection state lives here, grouped by catalog key.
   catalogState?: Record<string, Record<string, unknown>>;
 };
+
+export type ProjectionSnapshot = {
+  scope: string;
+  objects: unknown[];
+};
+
+export type ProjectionOptimisticReconcile = "drop_on_applied" | "drop_on_error" | "keep_until_changed";
+
+export type ProjectionCallOptions = {
+  optimistic?: {
+    id?: string;
+    patches: ProjectionPatch[];
+    ttlMs?: number;
+    reconcile?: ProjectionOptimisticReconcile;
+  };
+};
+
+export type ProjectionSubscriber = (value: ObjectProjection | undefined, ref: string) => void;
 
 export function liveProjectionKey(type: string, subject: string, discriminator?: string): string {
   return ["live", type, subject, discriminator].filter((part) => part !== undefined && part !== "").map(String).join(":");
@@ -171,8 +196,9 @@ export type WooContext = {
   frame: WooFrameContext;
   neighborhood: WooNeighborhood;
   observe(ref: string): ObjectProjection | null;
-  send(command: string, space?: string): Promise<unknown>;
-  directCall(target: string, verb: string, args?: unknown[]): Promise<unknown>;
+  call(target: string, verb: string, args?: unknown[], options?: ProjectionCallOptions): Promise<unknown>;
+  send(command: string, space?: string, options?: ProjectionCallOptions): Promise<unknown>;
+  directCall(target: string, verb: string, args?: unknown[], options?: ProjectionCallOptions): Promise<unknown>;
   emit(action: WooUiAction): boolean;
 };
 
@@ -186,6 +212,13 @@ export type WooElement = HTMLElement & {
 type ProjectionLayer = {
   patches: Map<string, ProjectionPatch>;
   expiresAt?: number;
+  revision: number;
+};
+
+type OptimisticCallRecord = {
+  layerId: string;
+  revision: number;
+  reconcile: ProjectionOptimisticReconcile;
 };
 
 const LIVE_TTL_MS = 1_600;
@@ -297,17 +330,26 @@ export class CatalogUiRegistry {
 
 export class ClientProjection {
   private canonical = new Map<string, ObjectProjection>();
+  private scopedCanonical = new Map<string, Map<string, ObjectProjection>>();
+  private scopeOrder: string[] = [];
   private sequenced = new Map<string, ProjectionPatch>();
   private live = new Map<string, ProjectionLayer>();
   private optimistic = new Map<string, ProjectionLayer>();
+  private optimisticCalls = new Map<string, OptimisticCallRecord>();
+  private subscribers = new Map<string, Set<ProjectionSubscriber>>();
 
   ingestWorld(world: any) {
+    const changed = new Set(this.canonical.keys());
+    this.scopedCanonical.clear();
+    this.scopeOrder = [];
     this.canonical.clear();
     for (const [id, obj] of Object.entries(world?.objects ?? {})) {
       this.canonical.set(id, normalizeObjectProjection(id, obj));
+      changed.add(id);
     }
     for (const [id, obj] of Object.entries(world?.dubspace ?? {})) {
       this.upsertCanonicalObject(id, obj);
+      changed.add(id);
     }
     for (const note of Array.isArray(world?.pinboard?.notes) ? world.pinboard.notes : []) {
       const id = String(note?.id ?? "");
@@ -319,8 +361,33 @@ export class ClientProjection {
         },
         catalogState: { pinboard_note: pinboardNoteState(note) }
       });
+      changed.add(id);
     }
-    this.prune(Date.now());
+    this.pruneExpired(Date.now(), changed);
+    this.notify(changed);
+  }
+
+  ingestSnapshot(snapshot: ProjectionSnapshot): void;
+  ingestSnapshot(scope: string, objects: unknown[]): void;
+  ingestSnapshot(scopeOrSnapshot: string | ProjectionSnapshot, maybeObjects?: unknown[]) {
+    const scope = typeof scopeOrSnapshot === "string" ? scopeOrSnapshot : String(scopeOrSnapshot.scope ?? "");
+    const objects = typeof scopeOrSnapshot === "string" ? maybeObjects ?? [] : scopeOrSnapshot.objects;
+    if (!scope) return;
+    if (!this.scopedCanonical.has(scope)) {
+      this.scopedCanonical.set(scope, new Map());
+      this.scopeOrder.push(scope);
+    }
+    const next = new Map<string, ObjectProjection>();
+    for (const obj of Array.isArray(objects) ? objects : []) {
+      const id = objectProjectionId(obj);
+      if (!id) continue;
+      next.set(id, normalizeObjectProjection(id, obj));
+    }
+    const prev = this.scopedCanonical.get(scope) ?? new Map();
+    this.scopedCanonical.set(scope, next);
+    const changed = new Set<string>([...prev.keys(), ...next.keys()]);
+    for (const id of changed) this.rebuildCanonicalObject(id);
+    this.notify(changed);
   }
 
   observe(ref: string): ObjectProjection | undefined {
@@ -333,51 +400,108 @@ export class ClientProjection {
     return hasProjectionData(merged) ? merged : undefined;
   }
 
+  subscribe(ref: string, listener: ProjectionSubscriber, options: { emitCurrent?: boolean } = {}): () => void {
+    const id = String(ref ?? "");
+    if (!id) return () => {};
+    let listeners = this.subscribers.get(id);
+    if (!listeners) {
+      listeners = new Set();
+      this.subscribers.set(id, listeners);
+    }
+    listeners.add(listener);
+    if (options.emitCurrent === true) listener(this.observe(id), id);
+    return () => {
+      const current = this.subscribers.get(id);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) this.subscribers.delete(id);
+    };
+  }
+
   applySequenced(patches: ProjectionPatch[]) {
+    const changed = new Set<string>();
     for (const patch of patches) {
       const subject = String(patch.subject ?? "");
       if (!subject) continue;
       this.sequenced.set(subject, mergePatch(this.sequenced.get(subject), patch));
-      clearSubjectFromLayers(this.live, subject);
-      clearSubjectFromLayers(this.optimistic, subject);
+      clearPatchFieldsFromLayers(this.live, patch);
+      clearPatchFieldsFromLayers(this.optimistic, patch);
+      changed.add(subject);
     }
+    this.notify(changed);
   }
 
-  applyLive(id: string, patches: ProjectionPatch[], expiresMs = LIVE_TTL_MS) {
-    this.applyTimedLayer(this.live, id, patches, expiresMs);
+  applyLive(id: string, patches: ProjectionPatch[], expiresMs = LIVE_TTL_MS): number {
+    return this.applyTimedLayer(this.live, id, patches, expiresMs);
   }
 
-  applyOptimistic(id: string, patches: ProjectionPatch[], expiresMs = OPTIMISTIC_TTL_MS) {
-    this.applyTimedLayer(this.optimistic, id, patches, expiresMs);
+  applyOptimistic(id: string, patches: ProjectionPatch[], expiresMs = OPTIMISTIC_TTL_MS): number {
+    return this.applyTimedLayer(this.optimistic, id, patches, expiresMs);
+  }
+
+  applyOptimisticCall(callId: string, options: ProjectionCallOptions | undefined) {
+    const optimistic = options?.optimistic;
+    const id = String(callId ?? "");
+    if (!id || !optimistic || optimistic.patches.length === 0) return;
+    const layerId = String(optimistic.id ?? `call:${id}`);
+    const revision = this.applyOptimistic(layerId, optimistic.patches, optimistic.ttlMs ?? OPTIMISTIC_TTL_MS);
+    this.optimisticCalls.set(id, { layerId, revision, reconcile: optimistic.reconcile ?? "drop_on_applied" });
+  }
+
+  completeOptimisticCall(callId: string) {
+    const record = this.optimisticCalls.get(String(callId ?? ""));
+    if (!record) return;
+    this.optimisticCalls.delete(String(callId ?? ""));
+    if (record.reconcile === "drop_on_applied") this.clearOptimistic(record.layerId, record.revision);
+  }
+
+  failOptimisticCall(callId: string) {
+    const record = this.optimisticCalls.get(String(callId ?? ""));
+    if (!record) return;
+    this.optimisticCalls.delete(String(callId ?? ""));
+    this.clearOptimistic(record.layerId, record.revision);
   }
 
   clearLive(id: string) {
+    const subjects = subjectsInLayer(this.live.get(id));
     this.live.delete(id);
+    this.notify(subjects);
   }
 
-  clearOptimistic(id: string) {
+  clearOptimistic(id: string, revision?: number) {
+    const layer = this.optimistic.get(id);
+    if (revision !== undefined && layer?.revision !== revision) return;
+    const subjects = subjectsInLayer(layer);
     this.optimistic.delete(id);
+    this.notify(subjects);
   }
 
   clearOptimisticForSubject(subject: string) {
-    clearSubjectFromLayers(this.optimistic, subject);
+    if (clearSubjectFromLayers(this.optimistic, subject)) this.notify(new Set([subject]));
   }
 
   prune(now = Date.now()): boolean {
-    return pruneLayers(this.live, now) || pruneLayers(this.optimistic, now);
+    const changed = new Set<string>();
+    return this.pruneExpired(now, changed);
   }
 
-  private applyTimedLayer(target: Map<string, ProjectionLayer>, id: string, patches: ProjectionPatch[], expiresMs: number) {
+  private applyTimedLayer(target: Map<string, ProjectionLayer>, id: string, patches: ProjectionPatch[], expiresMs: number): number {
     const layerId = String(id ?? "");
-    if (!layerId) return;
-    const layer: ProjectionLayer = target.get(layerId) ?? { patches: new Map() };
+    if (!layerId) return 0;
+    const current = target.get(layerId);
+    const layer: ProjectionLayer = current ?? { patches: new Map(), revision: 0 };
+    const changed = new Set(subjectsInLayer(layer));
+    layer.revision += 1;
     layer.expiresAt = Date.now() + Math.max(0, expiresMs);
     for (const patch of patches) {
       const subject = String(patch.subject ?? "");
       if (!subject) continue;
       layer.patches.set(subject, mergePatch(layer.patches.get(subject), patch));
+      changed.add(subject);
     }
     target.set(layerId, layer);
+    this.notify(changed);
+    return layer.revision;
   }
 
   private upsertCanonicalObject(id: string, obj: unknown) {
@@ -388,6 +512,32 @@ export class ClientProjection {
     const current = this.canonical.get(id) ?? emptyObjectProjection(id);
     applyPatch(current, { subject: id, ...patch });
     this.canonical.set(id, current);
+  }
+
+  private rebuildCanonicalObject(id: string) {
+    let next: ObjectProjection | undefined;
+    for (const scope of this.scopeOrder) {
+      const scoped = this.scopedCanonical.get(scope)?.get(id);
+      if (!scoped) continue;
+      next = next ? mergeObjectProjection(next, scoped) : cloneObjectProjection(scoped);
+    }
+    if (next) this.canonical.set(id, next);
+    else this.canonical.delete(id);
+  }
+
+  private pruneExpired(now: number, changed: Set<string>): boolean {
+    const didPrune = pruneLayers(this.live, now, changed) || pruneLayers(this.optimistic, now, changed);
+    if (didPrune) this.notify(changed);
+    return didPrune;
+  }
+
+  private notify(refs: Set<string>) {
+    for (const ref of refs) {
+      const listeners = this.subscribers.get(ref);
+      if (!listeners || listeners.size === 0) continue;
+      const value = this.observe(ref);
+      for (const listener of [...listeners]) listener(value, ref);
+    }
   }
 }
 
@@ -511,6 +661,29 @@ export class WooClientFramework {
     return this.projection.observe(ref);
   }
 
+  subscribe(ref: string, listener: ProjectionSubscriber, options?: { emitCurrent?: boolean }) {
+    return this.projection.subscribe(ref, listener, options);
+  }
+
+  ingestSnapshot(snapshot: ProjectionSnapshot): void;
+  ingestSnapshot(scope: string, objects: unknown[]): void;
+  ingestSnapshot(scopeOrSnapshot: string | ProjectionSnapshot, maybeObjects?: unknown[]) {
+    if (typeof scopeOrSnapshot === "string") this.projection.ingestSnapshot(scopeOrSnapshot, maybeObjects ?? []);
+    else this.projection.ingestSnapshot(scopeOrSnapshot);
+  }
+
+  applyOptimisticCall(callId: string, options: ProjectionCallOptions | undefined) {
+    this.projection.applyOptimisticCall(callId, options);
+  }
+
+  completeOptimisticCall(callId: string) {
+    this.projection.completeOptimisticCall(callId);
+  }
+
+  failOptimisticCall(callId: string) {
+    this.projection.failOptimisticCall(callId);
+  }
+
   prune(now = Date.now()) {
     return this.projection.prune(now);
   }
@@ -591,16 +764,27 @@ class ProjectionDraft implements ClientProjectionDraft {
   }
 }
 
+function objectProjectionId(obj: unknown): string {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return "";
+  const id = (obj as { id?: unknown }).id;
+  return typeof id === "string" && id ? id : "";
+}
+
 function normalizeObjectProjection(id: string, obj: any): ObjectProjection {
   const props = obj?.props && typeof obj.props === "object" && !Array.isArray(obj.props) ? obj.props : {};
+  const catalogState = obj?.catalogState && typeof obj.catalogState === "object" && !Array.isArray(obj.catalogState) ? obj.catalogState : {};
   return {
     id,
     name: typeof obj?.name === "string" ? obj.name : undefined,
     owner: typeof obj?.owner === "string" ? obj.owner : undefined,
-    parent: typeof obj?.parent === "string" ? obj.parent : undefined,
-    location: typeof obj?.location === "string" ? obj.location : undefined,
+    parent: typeof obj?.parent === "string" || obj?.parent === null ? obj.parent : undefined,
+    ancestors: Array.isArray(obj?.ancestors) ? obj.ancestors.filter((item: unknown): item is string => typeof item === "string") : undefined,
+    features: Array.isArray(obj?.features) ? obj.features.filter((item: unknown): item is string => typeof item === "string") : undefined,
+    aliases: Array.isArray(obj?.aliases) ? obj.aliases.filter((item: unknown): item is string => typeof item === "string") : undefined,
+    description: typeof obj?.description === "string" || obj?.description === null ? obj.description : undefined,
+    location: typeof obj?.location === "string" || obj?.location === null ? obj.location : undefined,
     props: { ...props },
-    catalogState: {}
+    catalogState: Object.fromEntries(Object.entries(catalogState).filter(([, value]) => value && typeof value === "object" && !Array.isArray(value)).map(([key, value]) => [key, { ...(value as Record<string, unknown>) }]))
   };
 }
 
@@ -611,6 +795,9 @@ function emptyObjectProjection(id: string): ObjectProjection {
 function cloneObjectProjection(value: ObjectProjection): ObjectProjection {
   return {
     ...value,
+    ancestors: value.ancestors ? [...value.ancestors] : undefined,
+    features: value.features ? [...value.features] : undefined,
+    aliases: value.aliases ? [...value.aliases] : undefined,
     props: { ...value.props },
     catalogState: Object.fromEntries(Object.entries(value.catalogState).map(([key, fields]) => [key, { ...fields }]))
   };
@@ -623,6 +810,10 @@ function mergeObjectProjection(left: ObjectProjection, right: ObjectProjection):
       name: right.name,
       owner: right.owner,
       parent: right.parent,
+      ancestors: right.ancestors,
+      features: right.features,
+      aliases: right.aliases,
+      description: right.description,
       location: right.location
     }),
     props: { ...left.props, ...right.props },
@@ -631,7 +822,7 @@ function mergeObjectProjection(left: ObjectProjection, right: ObjectProjection):
 }
 
 function hasProjectionData(value: ObjectProjection): boolean {
-  return Boolean(value.name || value.owner || value.parent || value.location || Object.keys(value.props).length > 0 || Object.keys(value.catalogState).length > 0);
+  return Boolean(value.name || value.owner || value.parent || value.location || value.description || (value.ancestors?.length ?? 0) > 0 || (value.features?.length ?? 0) > 0 || (value.aliases?.length ?? 0) > 0 || Object.keys(value.props).length > 0 || Object.keys(value.catalogState).length > 0);
 }
 
 function applyPatch(target: ObjectProjection, patch: ProjectionPatch | undefined) {
@@ -681,10 +872,11 @@ function pinboardNoteState(note: any): Record<string, unknown> {
   return fields;
 }
 
-function pruneLayers(layers: Map<string, ProjectionLayer>, now: number): boolean {
+function pruneLayers(layers: Map<string, ProjectionLayer>, now: number, changedSubjects: Set<string>): boolean {
   let changed = false;
   for (const [id, layer] of layers) {
     if (layer.expiresAt !== undefined && layer.expiresAt < now) {
+      for (const subject of layer.patches.keys()) changedSubjects.add(subject);
       layers.delete(id);
       changed = true;
     }
@@ -700,6 +892,54 @@ function clearSubjectFromLayers(layers: Map<string, ProjectionLayer>, subject: s
     if (layer.patches.size === 0) layers.delete(id);
   }
   return changed;
+}
+
+function clearPatchFieldsFromLayers(layers: Map<string, ProjectionLayer>, patch: ProjectionPatch): boolean {
+  const subject = String(patch.subject ?? "");
+  if (!subject) return false;
+  let changed = false;
+  for (const [id, layer] of layers) {
+    const current = layer.patches.get(subject);
+    if (!current) continue;
+    const next = removePatchFields(current, patch);
+    if (isEmptyPatch(next)) layer.patches.delete(subject);
+    else layer.patches.set(subject, next);
+    if (layer.patches.size === 0) layers.delete(id);
+    changed = true;
+  }
+  return changed;
+}
+
+function removePatchFields(current: ProjectionPatch, applied: ProjectionPatch): ProjectionPatch {
+  const fields = removeKeys(current.fields, Object.keys(applied.fields ?? {}));
+  const props = removeKeys(current.props, Object.keys(applied.props ?? {}));
+  const catalogState: Record<string, Record<string, unknown>> = {};
+  for (const [key, value] of Object.entries(current.catalogState ?? {})) {
+    const next = removeKeys(value, Object.keys(applied.catalogState?.[key] ?? {}));
+    if (next && Object.keys(next).length > 0) catalogState[key] = next;
+  }
+  return {
+    subject: current.subject,
+    fields,
+    props,
+    catalogState: Object.keys(catalogState).length > 0 ? catalogState : undefined
+  };
+}
+
+function removeKeys(record: Record<string, unknown> | undefined, keys: string[]): Record<string, unknown> | undefined {
+  if (!record) return undefined;
+  if (keys.length === 0) return { ...record };
+  const copy = { ...record };
+  for (const key of keys) delete copy[key];
+  return Object.keys(copy).length > 0 ? copy : undefined;
+}
+
+function isEmptyPatch(patch: ProjectionPatch): boolean {
+  return !patch.fields && !patch.props && !patch.catalogState;
+}
+
+function subjectsInLayer(layer: ProjectionLayer | undefined): Set<string> {
+  return new Set(layer?.patches.keys() ?? []);
 }
 
 function livePatchDiscriminator(patch: ProjectionPatch): string {

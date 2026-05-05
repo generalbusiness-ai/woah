@@ -24,9 +24,10 @@ in [discovery/catalogs.md](../discovery/catalogs.md), and the object model in
 This is a **draft** design for the browser client framework. An initial
 implementation slice exists in `src/client/framework.ts`: catalog UI
 registration, frame resolution, frame-local state/actions, observation
-normalization, and consistent projection layers. The current SPA still uses
-legacy tab renderers for most mounted UI; catalogs have not yet been moved to
-catalog-shipped modules.
+normalization, scoped snapshot ingestion, projection subscriptions, consistent
+projection layers, and call-bound optimistic reconciliation. The current SPA
+still uses legacy tab renderers for most mounted UI; catalogs have not yet
+been moved to catalog-shipped modules.
 
 The model has six goals:
 
@@ -1195,16 +1196,16 @@ Optimistic patches use this shape:
 ```ts
 type ProjectionPatch = {
   subject: string;
+  fields?: Record<string, unknown>;
   props?: Record<string, unknown>;
-  catalog_state?: Record<string, unknown>;
+  catalogState?: Record<string, Record<string, unknown>>;
 };
 
 type OptimisticPatch = {
   id?: string;
   patches: ProjectionPatch[];
-  subjects?: string[];
-  expires_ms?: number;
-  reconcile?: "drop_on_applied" | "keep_until_changed" | "replace_on_result";
+  ttlMs?: number;
+  reconcile?: "drop_on_applied" | "drop_on_error" | "keep_until_changed";
 };
 
 type CallOptions = {
@@ -1238,9 +1239,10 @@ Reconciliation rules:
 - `keep_until_changed` keeps the optimistic patch until a later sequenced
   observation or snapshot changes one of the same patched fields. This is for
   continuous gestures where multiple in-flight calls may overlap.
-- `replace_on_result` lets a direct-call result explicitly replace or clear
-  the patch. It is only valid for direct calls whose result has no sequenced
-  applied frame.
+- `drop_on_error` keeps the optimistic patch after an applied/direct success
+  and removes it only if the associated call fails. This is for call paths
+  where a later observation or explicit component action will reconcile the
+  visible state.
 - Expired optimistic patches are removed and subscribers are notified. The
   default expiry is implementation-defined but SHOULD be short enough to avoid
   stale UI after a lost call id; 10 seconds is a reasonable default for v1.

@@ -123,6 +123,123 @@ describe("client UI framework projection", () => {
     expect(ui.observe("delay_1")?.props).toMatchObject({ feedback: 0.8, wet: 0.6 });
   });
 
+  it("clears only the sequenced field from live projection layers", () => {
+    const ui = createWooClientFramework();
+    ui.ingestWorld({
+      objects: {
+        delay_1: { id: "delay_1", name: "delay", props: { feedback: 0.25, wet: 0.1 } }
+      }
+    });
+
+    ui.ingestLiveObservation({ type: "gesture_progress", target: "delay_1", name: "feedback", value: 0.8 });
+    ui.ingestLiveObservation({ type: "gesture_progress", target: "delay_1", name: "wet", value: 0.6 });
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 11,
+      space: "the_dubspace",
+      observations: [{ type: "control_changed", target: "delay_1", name: "feedback", value: 0.4 }]
+    });
+
+    expect(ui.observe("delay_1")?.props).toMatchObject({ feedback: 0.4, wet: 0.6 });
+  });
+
+  it("ingests scoped snapshots without clearing unrelated scopes", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("here", [
+      { id: "room_1", name: "Room", parent: "$room", ancestors: ["$thing", "$space", "$room"], props: { topic: "old" } },
+      { id: "actor_1", name: "Guest 1", parent: "$guest", ancestors: ["$thing", "$actor", "$player", "$guest"] }
+    ]);
+    ui.ingestSnapshot("overlay:pinboard:board_1", [
+      { id: "note_1", name: "Note", parent: "$note", ancestors: ["$thing", "$note"], catalogState: { pinboard_note: { x: 10, y: 20 } } }
+    ]);
+
+    ui.ingestSnapshot("here", [
+      { id: "room_1", name: "Room", parent: "$room", ancestors: ["$thing", "$space", "$room"], props: { topic: "new" } }
+    ]);
+
+    expect(ui.observe("actor_1")).toBeUndefined();
+    expect(ui.observe("room_1")?.props.topic).toBe("new");
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 10, y: 20 });
+  });
+
+  it("notifies projection subscribers for snapshot, optimistic, and prune changes", () => {
+    const ui = createWooClientFramework();
+    const values: Array<unknown> = [];
+    ui.subscribe("note_1", (value) => values.push(value?.catalogState.pinboard_note ?? null));
+
+    ui.ingestSnapshot("overlay:pinboard:board_1", [
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { x: 10 } } }
+    ]);
+    ui.projection.applyOptimistic("drag:note_1", [
+      { subject: "note_1", catalogState: { pinboard_note: { x: 30 } } }
+    ], 1);
+    ui.prune(Date.now() + 10);
+
+    expect(values).toEqual([{ x: 10 }, { x: 30 }, { x: 10 }]);
+  });
+
+  it("reconciles optimistic patches by call id and explicit optimistic id", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:board_1", [
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { x: 10, y: 10 } } }
+    ]);
+
+    ui.applyOptimisticCall("call-1", {
+      optimistic: {
+        id: "pinboard:note_1:placement",
+        patches: [{ subject: "note_1", catalogState: { pinboard_note: { x: 40 } } }]
+      }
+    });
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 40, y: 10 });
+
+    ui.completeOptimisticCall("call-1");
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 10, y: 10 });
+
+    ui.applyOptimisticCall("call-2", {
+      optimistic: {
+        id: "pinboard:note_1:placement",
+        patches: [{ subject: "note_1", catalogState: { pinboard_note: { y: 90 } } }],
+        reconcile: "keep_until_changed"
+      }
+    });
+    ui.completeOptimisticCall("call-2");
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 10, y: 90 });
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 12,
+      space: "the_pinboard",
+      observations: [{ type: "pin_moved", pin: "note_1", x: 12, y: 12 }]
+    });
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 12, y: 12 });
+  });
+
+  it("does not let an older call clear a newer explicit optimistic layer", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:board_1", [
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { x: 10 } } }
+    ]);
+
+    ui.applyOptimisticCall("call-1", {
+      optimistic: {
+        id: "pinboard:note_1:placement",
+        patches: [{ subject: "note_1", catalogState: { pinboard_note: { x: 20 } } }]
+      }
+    });
+    ui.applyOptimisticCall("call-2", {
+      optimistic: {
+        id: "pinboard:note_1:placement",
+        patches: [{ subject: "note_1", catalogState: { pinboard_note: { x: 30 } } }]
+      }
+    });
+
+    ui.completeOptimisticCall("call-1");
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 30 });
+
+    ui.completeOptimisticCall("call-2");
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 10 });
+  });
+
   it("supports frame state and overlay actions as framework-owned UI state", () => {
     const ui = createWooClientFramework();
     ui.frames.ensureFrame("pinboard:main", "the_pinboard", "board");

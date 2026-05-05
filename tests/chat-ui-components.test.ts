@@ -21,6 +21,7 @@ function context(): WooContext {
       has: (ref) => ["the_chatroom", "guest_1", "guest_2", "guest_3"].includes(ref)
     },
     observe: (ref) => ({ id: ref, name: ref === "guest_2" ? "Guest Two" : ref === "guest_3" ? "Guest Three" : ref, props: {}, catalogState: {} }),
+    call: async () => null,
     send: async () => null,
     directCall: async () => null,
     emit: () => true

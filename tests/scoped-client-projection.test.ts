@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
-import { handleRestProtocolRequest, type RestProtocolRequest } from "../src/core/protocol";
+import { handleRestProtocolRequest, handleWsProtocolFrame, type RestProtocolRequest } from "../src/core/protocol";
 import type { ObjRef, Session } from "../src/core/types";
 import type { DeferredHostEffect, WooWorld } from "../src/core/world";
 import { LocalHostBridge } from "./core-support";
@@ -68,6 +68,31 @@ describe("scoped client projection", () => {
     expect(cached.handled).toBe(true);
     if (!cached.handled || "raw" in cached) throw new Error("unexpected raw protocol result");
     expect(cached.status).toBe(304);
+  });
+
+  it("accepts a scoped replay cursor on websocket auth but requires hydrate in v1", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:scoped-ws-cursor");
+    const sent: any[] = [];
+    await handleWsProtocolFrame("conn", {
+      op: "auth",
+      token: `session:${session.id}`,
+      cursor: { spaces: { the_chatroom: { next_seq: 3 } }, live: { resumable: false } }
+    }, {
+      authenticate: () => session,
+      attach: () => undefined,
+      session: () => null,
+      send: (_connection, frame) => sent.push(frame),
+      call: async () => { throw new Error("unexpected call"); },
+      direct: async () => { throw new Error("unexpected direct"); },
+      replay: async () => { throw new Error("unexpected replay"); },
+      deliverInput: async () => null,
+      broadcastApplied: async () => undefined,
+      broadcastTaskResult: async () => undefined,
+      broadcastLiveEvents: async () => undefined
+    });
+
+    expect(sent[0]).toMatchObject({ op: "session", actor: session.actor, session: session.id, resumed: false });
   });
 
   it("returns null here when the session has no room or space context", async () => {

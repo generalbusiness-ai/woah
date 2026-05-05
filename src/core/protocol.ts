@@ -415,7 +415,7 @@ export async function handleWsProtocolFrame<Connection>(
     if (op === "auth") {
       const session = await host.authenticate(String(frame.token ?? host.defaultAuthToken ?? ""), connection);
       await host.attach(connection, session);
-      host.send(connection, { op: "session", actor: session.actor, session: session.id });
+      host.send(connection, { op: "session", actor: session.actor, session: session.id, resumed: false });
       return;
     }
 

@@ -523,21 +523,61 @@ Phase 1 closeout risks to carry forward:
 
 ### Phase 2: framework projection completion
 
-- Add `ingestSnapshot(scope, objects)`.
-- Add projection subscriptions.
-- Add optimistic call options to `WooContext.call`, `directCall`, and `send`.
-- Add reconciliation by call id and by explicit optimistic id.
-- Move pinboard pending-patch helpers onto generic optimistic patches.
+Status: implemented in `src/client/framework.ts`, with the production SPA
+still mostly on the legacy renderers.
+
+- `ClientProjection.ingestSnapshot(scope, objects)` replaces only that
+  canonical scope and preserves unrelated scopes.
+- Projection subscriptions notify observers when snapshot, sequenced, live,
+  optimistic, or expiry changes affect a ref.
+- `ProjectionCallOptions` can attach optimistic patches to `call`,
+  `directCall`, and `send`-shaped host APIs.
+- Optimistic layers are associated with the outgoing call id and may also use
+  an explicit stable optimistic id. Reconciliation currently supports
+  `drop_on_applied`, `drop_on_error`, and `keep_until_changed`.
+- Sequenced reducers clear only the fields they update from live/optimistic
+  layers, so an applied `feedback` change does not erase an unrelated live
+  `wet` preview.
+- Pinboard move/resize now goes through generic optimistic call options
+  instead of a pinboard-only pending-patch map.
+
+Open after Phase 2: `WooContext.subscribeObservations()` is still a spec-level
+contract, not an implemented component API, and the SPA still uses
+`ingestWorld()` as a compatibility bridge until Phase 3 boots from `/api/me`.
 
 ### Phase 3: client scoped-state flag
 
-- Add a client flag that boots from `/api/me`.
-- Include the client's last cursor in the WS connect/auth path; if the server
-  can replay the gap it may resume without `/api/me`, otherwise the client full
-  hydrates and replays from the new cursor.
-- Render chat/current room from `state.here`.
-- Replace move handling with atomic `state.here = result.here`.
-- Keep `/api/state` fallback available during this phase.
+Status: initial opt-in slice implemented behind `?scopedProjection` (also
+accepted as `?api=me`). The legacy `/api/state` path remains the default.
+
+- The flagged client boots and reconnects from `/api/me` plus
+  `/api/catalogs/ui`, using `ETag`/`If-None-Match` for the catalog UI index.
+- The flagged client builds a small compatibility shell from `self`,
+  `session`, `here`, `inventory`, and catalog UI metadata instead of fetching
+  `/api/state`.
+- The framework ingests `/api/me` as scoped snapshots (`me`, `here`, and
+  restored overlay handles).
+- The flagged client sends its last cursor on WS auth. v1 server auth replies
+  `resumed: false`, so the client hydrates `/api/me` and then requests replay
+  from the returned cursor.
+- In scoped mode, `scheduleRefresh()` is disabled; applied/task/replay frames
+  no longer cause `/api/state` fetches.
+- Chat/current-room selectors read the scoped `here` snapshot and session
+  locations in scoped mode.
+- Direct move/enter results that carry `here` atomically replace the scoped
+  `here` snapshot before rendering.
+- The scoped replay cursor advances on every sequenced frame the client sees,
+  so a reconnect after movement does not replay from the original boot cursor.
+
+Open after this slice: sequenced command results still do not carry return
+values in applied frames, so only direct move/enter paths can apply
+`result.here` directly. Replay observation reduction is basic and chat-focused.
+The scoped `here.present_actors` reducer currently handles `entered` and
+`left`; actor summary updates such as renames/descriptions still need generic
+summary reducers. The `adaptScopedWorld` object map is a compatibility shim
+for legacy renderers and is intentionally not the full world.
+Dubspace, pinboard, and taskspace still need Phase 4 overlay snapshots before
+the flagged client can replace the production UI end to end.
 
 ### Phase 4: migrate controls and overlays
 

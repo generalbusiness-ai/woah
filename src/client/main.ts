@@ -3,7 +3,8 @@ import chatManifest from "../../catalogs/chat/manifest.json";
 import demoworldManifest from "../../catalogs/demoworld/manifest.json";
 import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
-import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { advanceProjectionCursor, idsFromRefsOrSummaries, scopedHerePresentActors, scopedModelWithCurrentLocation, scopedModelWithHere, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import type { ChatLine, ChatSpaceData, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 
 type AppState = {
@@ -12,6 +13,7 @@ type AppState = {
   session?: string;
   tab: "chat" | "dubspace" | "pinboard" | "taskspace" | "ide";
   world?: any;
+  scopedProjection?: ScopedProjectionStateModel;
   audioOn: boolean;
   clockOffset: number;
   cueSlots: Record<string, boolean>;
@@ -118,6 +120,10 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
+const scopedProjectionEnabled = (() => {
+  const params = new URLSearchParams(location.search);
+  return params.has("scopedProjection") || params.get("api") === "me";
+})();
 const chatHistoryLimit = 80;
 const drumVoices = [
   { id: "kick", label: "Kick" },
@@ -173,6 +179,9 @@ const PINBOARD_OPTIMISTIC_TTL_MS = 5_000;
 let pinboardTextHydrationRequestedBoard = "";
 let pinboardTextHydrationRequestedSignature = "";
 let pinboardTextHydrationRequested = false;
+let catalogUiEtag = "";
+let catalogUiCache: any;
+const installedCatalogUiAliases = new Set<string>();
 let chatHistory = loadChatHistory();
 let chatHistoryCursor = chatHistory.length;
 let chatHistoryDraft = "";
@@ -200,7 +209,8 @@ function connect() {
   socket.addEventListener("open", () => {
     reconnectDelayMs = reconnectBaseDelayMs;
     lastPongAt = Date.now();
-    sendSocket(socket, { op: "auth", token: authToken() });
+    const cursor = scopedProjectionEnabled ? state.scopedProjection?.cursor : undefined;
+    sendSocket(socket, cursor ? { op: "auth", token: authToken(), cursor } : { op: "auth", token: authToken() });
     startHeartbeat(socket);
   });
   socket.addEventListener("message", async (event) => {
@@ -221,7 +231,7 @@ function connect() {
         render();
       }
       requestReplay(socket);
-      if (shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
+      if (!scopedProjectionEnabled && shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
     }
     if (frame.op === "applied") {
       ui.ingestAppliedFrame(frame);
@@ -229,7 +239,11 @@ function connect() {
       receiveAppliedFrameErrors(frame, observations);
       // Sequenced verb raises arrive as `$error` observations inside applied
       // frames, so keep the pending handler until those observations route.
-      if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
+      if (typeof frame.id === "string") {
+        if (appliedFrameErrorObservations(observations).length > 0) ui.failOptimisticCall(frame.id);
+        else ui.completeOptimisticCall(frame.id);
+        pendingFrameErrors.delete(frame.id);
+      }
       const pinboardAnimations = capturePinboardAnimations(observations);
       const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
       if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
@@ -241,7 +255,7 @@ function connect() {
         const type = String(observation?.type ?? "");
         if (type === "pin_moved" || type === "pin_resized" || type === "note_moved" || type === "note_resized") {
           const pinId = String(observation?.pin ?? observation?.id ?? "");
-          if (pinId && applyPinboardPlacementObservation(observation)) clearPendingPinPatch(pinId);
+          if (pinId) applyPinboardPlacementObservation(observation);
         }
       }
       forgetLiveControls(observations);
@@ -267,6 +281,8 @@ function connect() {
         ui.ingestLiveObservation(observation);
         receiveLiveEvent(observation);
       }
+      applyScopedMoveResult(frame.result);
+      if (typeof frame.id === "string") ui.completeOptimisticCall(frame.id);
       if (handler) {
         pendingDirect.delete(frame.id);
         handler(frame.result);
@@ -280,6 +296,10 @@ function connect() {
     }
     if (frame.op === "replay") {
       for (const entry of frame.entries ?? []) {
+        if (scopedProjectionEnabled && Array.isArray(entry?.observations)) {
+          ui.ingestAppliedFrame({ op: "applied", seq: entry.seq, space: frame.space, observations: entry.observations });
+          for (const observation of entry.observations) if (isChatObservation(observation)) receiveChatEvent(observation, false);
+        }
         state.observations.unshift({ seq: entry.seq, space: frame.space, replay: true, message: entry.message, error: entry.error ?? null });
         rememberSeq(frame.space, entry.seq);
       }
@@ -290,6 +310,7 @@ function connect() {
     if (frame.op === "error") {
       const errorHandler = typeof frame.id === "string" ? pendingFrameErrors.get(frame.id) : undefined;
       if (typeof frame.id === "string") {
+        ui.failOptimisticCall(frame.id);
         pendingDirect.delete(frame.id);
         pendingFrameErrors.delete(frame.id);
         pendingTaskSelections.delete(frame.id);
@@ -385,6 +406,14 @@ function clearSession() {
 }
 
 function requestReplay(socket: WebSocket) {
+  if (scopedProjectionEnabled) {
+    const cursorSpaces = state.scopedProjection?.cursor?.spaces ?? {};
+    for (const [space, cursor] of Object.entries(cursorSpaces)) {
+      const from = Number(cursor?.next_seq ?? 0);
+      if (from > 0) sendSocket(socket, { op: "replay", id: crypto.randomUUID(), space, from, limit: 100 });
+    }
+    return;
+  }
   for (const space of Object.keys(state.world?.spaces ?? {})) {
     const from = Number(readStorage(`woo.lastSeq.${space}`) ?? "0") + 1;
     if (from > 1) sendSocket(socket, { op: "replay", id: crypto.randomUUID(), space, from, limit: 100 });
@@ -392,6 +421,13 @@ function requestReplay(socket: WebSocket) {
 }
 
 function rememberSeq(space: string, seq: number) {
+  if (scopedProjectionEnabled && state.scopedProjection) {
+    state.scopedProjection = {
+      ...state.scopedProjection,
+      cursor: advanceProjectionCursor(state.scopedProjection.cursor, space, seq)
+    };
+    if (state.world?.spaces?.[space]) state.world.spaces[space].next_seq = Math.max(Number(state.world.spaces[space].next_seq ?? 0), seq + 1);
+  }
   const key = `woo.lastSeq.${space}`;
   const current = Number(readStorage(key) ?? "0");
   if (seq > current) writeStorage(key, String(seq));
@@ -599,6 +635,10 @@ const chatSeparatorMinIntervalMs = 2_000;
 const lastChatSeparatorAtBySource = new Map<string, number>();
 
 async function refresh() {
+  if (scopedProjectionEnabled) {
+    await refreshScopedProjection();
+    return;
+  }
   refreshDebounceTimer = null;
   refreshDebouncePending = false;
   const response = await fetch("/api/state", { headers: authHeaders() });
@@ -652,6 +692,186 @@ async function refreshScopedProjectionSmoke() {
   }
 }
 
+async function refreshScopedProjection() {
+  refreshDebounceTimer = null;
+  refreshDebouncePending = false;
+  try {
+    const [meResponse, catalogs] = await Promise.all([
+      fetch("/api/me", { headers: authHeaders() }),
+      fetchCatalogUiIndex()
+    ]);
+    if (!meResponse.ok) throw new Error(`/api/me ${meResponse.status}`);
+    const me = await meResponse.json();
+    applyScopedProjectionSnapshot(me, catalogs);
+    state.scopedProjectionSmoke = scopedProjectionSmokeEnabled ? { me, catalogs } : state.scopedProjectionSmoke;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    state.scopedProjection = {
+      ...(state.scopedProjection ?? { inventory: [], overlays: {} }),
+      error: message,
+      inventory: state.scopedProjection?.inventory ?? [],
+      overlays: state.scopedProjection?.overlays ?? {}
+    };
+    if (scopedProjectionSmokeEnabled) state.scopedProjectionSmoke = { error: message };
+  }
+  render();
+}
+
+async function fetchCatalogUiIndex() {
+  const headers = catalogUiEtag ? authHeaders({ "if-none-match": catalogUiEtag }) : authHeaders();
+  const response = await fetch("/api/catalogs/ui", { headers });
+  if (response.status === 304 && catalogUiCache) return catalogUiCache;
+  if (!response.ok) throw new Error(`/api/catalogs/ui ${response.status}`);
+  const body = await response.json();
+  const nextEtag = response.headers.get("etag") ?? "";
+  catalogUiCache = body;
+  // Catalog UI modules/custom elements are loaded once per page lifetime in
+  // this migration slice. A changed ETag is observed here, but hot-swapping UI
+  // code safely waits for the installed-catalog loader work.
+  catalogUiEtag = nextEtag;
+  installCatalogUiIndex(body);
+  return body;
+}
+
+function installCatalogUiIndex(index: any) {
+  for (const pkg of Array.isArray(index?.catalogs) ? index.catalogs : []) {
+    if (!pkg?.ui || typeof pkg.alias !== "string" || typeof pkg.catalog !== "string") continue;
+    if (installedCatalogUiAliases.has(pkg.alias)) continue;
+    const diagnostics = ui.catalogUi.installCatalogUi(pkg as CatalogUiPackage);
+    if (diagnostics.length > 0) console.warn(`catalog UI diagnostics for ${pkg.alias}: ${diagnostics.join("; ")}`);
+    else installedCatalogUiAliases.add(pkg.alias);
+  }
+}
+
+function applyScopedProjectionSnapshot(me: any, catalogs: any) {
+  const previousChatRoom = lastObservedChatRoom;
+  const inventory = Array.isArray(me?.inventory) ? me.inventory : [];
+  const overlays = me?.overlays && typeof me.overlays === "object" && !Array.isArray(me.overlays) ? me.overlays : {};
+  state.actor = typeof me?.session?.actor === "string" ? me.session.actor : state.actor;
+  state.scopedProjection = {
+    me,
+    catalogs,
+    cursor: me?.cursor,
+    self: me?.self,
+    session: me?.session,
+    here: me?.here ?? null,
+    inventory,
+    overlays
+  };
+  state.world = adaptScopedWorld(me, catalogs);
+  ingestScopedSnapshots(me);
+  const currentChatRoom = chatRoom();
+  if (previousChatRoom && previousChatRoom !== currentChatRoom) pushChatSeparator(previousChatRoom, false);
+  lastObservedChatRoom = currentChatRoom;
+  state.clockOffset = Number(me?.server_time ?? Date.now()) - Date.now();
+  state.chatPresent = scopedHerePresentActors(me?.here);
+  if (!state.selectedObject || !state.world.objects?.[state.selectedObject]) state.selectedObject = defaultSelectedObject();
+  if (!routeInitialized) {
+    routeInitialized = true;
+    if (startupRoute) {
+      applyLocationRoute("replace", startupRoute);
+      startupRoute = null;
+    } else {
+      syncUrlFromCurrentState("replace");
+    }
+  } else {
+    syncUrlFromCurrentState("replace");
+  }
+}
+
+function ingestScopedSnapshots(me: any) {
+  const self = me?.self ? [me.self] : [];
+  const inventory = Array.isArray(me?.inventory) ? me.inventory : [];
+  ui.ingestSnapshot("me", [...self, ...inventory]);
+  ui.ingestSnapshot("here", roomSnapshotObjects(me?.here));
+  for (const [name, handle] of Object.entries(me?.overlays ?? {})) {
+    const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
+    if (subject) ui.ingestSnapshot(`overlay:${name}:${subject}`, [{ id: subject }]);
+  }
+}
+
+function roomSnapshotObjects(here: any): any[] {
+  if (!here || typeof here !== "object") return [];
+  return [
+    roomSnapshotAsObjectSummary(here),
+    ...arrayOfObjects(here.present_actors),
+    ...arrayOfObjects(here.contents),
+    ...arrayOfObjects(here.exits)
+  ];
+}
+
+function arrayOfObjects(value: any): any[] {
+  return Array.isArray(value) ? value.filter((item) => item && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function roomSnapshotAsObjectSummary(here: any): any {
+  return {
+    id: String(here.id ?? ""),
+    name: typeof here.name === "string" ? here.name : String(here.id ?? ""),
+    parent: here.parent,
+    ancestors: Array.isArray(here.ancestors) ? here.ancestors : [],
+    features: Array.isArray(here.features) ? here.features : [],
+    description: typeof here.description === "string" ? here.description : null,
+    props: {
+      ...(here.props && typeof here.props === "object" && !Array.isArray(here.props) ? here.props : {}),
+      description: typeof here.description === "string" ? here.description : undefined,
+      subscribers: scopedHerePresentActors(here)
+    }
+  };
+}
+
+function adaptScopedWorld(me: any, catalogs: any) {
+  // Compatibility shim for legacy renderers only. This is a scoped
+  // neighborhood, not `/api/state`: global scans over `objects` intentionally
+  // see only self, here, inventory, exits, contents, and visible actors.
+  const objects: Record<string, any> = {};
+  const add = (summary: any) => {
+    const id = typeof summary?.id === "string" ? summary.id : "";
+    if (!id) return;
+    objects[id] = scopedSummaryToLegacyObject(summary);
+  };
+  add(me?.self);
+  for (const item of Array.isArray(me?.inventory) ? me.inventory : []) add(item);
+  for (const item of roomSnapshotObjects(me?.here)) add(item);
+  const hereId = typeof me?.here?.id === "string" ? me.here.id : "";
+  const installed = Array.isArray(catalogs?.catalogs) ? catalogs.catalogs.map((catalog: any) => ({
+    alias: catalog.alias,
+    catalog: catalog.catalog,
+    version: catalog.version,
+    objects: catalog.objects ?? {},
+    seeds: catalog.seeds ?? {}
+  })) : [];
+  const world: any = {
+    server_time: me?.server_time,
+    objects,
+    spaces: Object.fromEntries(Object.keys(me?.cursor?.spaces ?? {}).map((space) => [space, { next_seq: me.cursor.spaces[space]?.next_seq }])),
+    catalogs: { installed },
+    session: me?.session ?? null,
+    scoped: true
+  };
+  world.chatMeta = { room: hereId, rooms: hereId ? [hereId] : [], defaultRoom: hereId };
+  world.chat = projectChat(world, world.chatMeta);
+  return world;
+}
+
+function scopedSummaryToLegacyObject(summary: any) {
+  const id = String(summary?.id ?? "");
+  const props = summary?.props && typeof summary.props === "object" && !Array.isArray(summary.props) ? { ...summary.props } : {};
+  if (typeof summary?.description === "string" && props.description === undefined) props.description = summary.description;
+  return {
+    id,
+    name: typeof summary?.name === "string" ? summary.name : id,
+    owner: typeof summary?.owner === "string" ? summary.owner : undefined,
+    parent: typeof summary?.parent === "string" ? summary.parent : undefined,
+    ancestors: Array.isArray(summary?.ancestors) ? summary.ancestors.map(String) : [],
+    features: Array.isArray(summary?.features) ? summary.features.map(String) : [],
+    aliases: Array.isArray(summary?.aliases) ? summary.aliases.map(String) : [],
+    location: typeof summary?.location === "string" || summary?.location === null ? summary.location : undefined,
+    contents: Array.isArray(summary?.contents) ? summary.contents.map(String) : undefined,
+    props
+  };
+}
+
 // Debounced refresh used by the live event paths. Each applied/task/replay
 // frame already carries observations the client applies locally; a full
 // `/api/state` projection is only needed to catch state the observations don't
@@ -661,6 +881,7 @@ const REFRESH_DEBOUNCE_MS = 750;
 let refreshDebounceTimer: number | null = null;
 let refreshDebouncePending = false;
 function scheduleRefresh() {
+  if (scopedProjectionEnabled) return;
   if (refreshDebounceTimer != null) return;
   refreshDebouncePending = true;
   refreshDebounceTimer = window.setTimeout(() => {
@@ -901,10 +1122,14 @@ function pinboardSpace() {
 }
 
 function chatRoom() {
+  // Migration note: new selectors should make the scoped branch primary.
+  // The `state.world` branch is the temporary `/api/state` compatibility tail.
+  if (scopedProjectionEnabled) return String(state.scopedProjection?.here?.id ?? "");
   return String(state.world?.chatMeta?.room ?? "");
 }
 
 function defaultChatRoom() {
+  if (scopedProjectionEnabled) return String(state.scopedProjection?.here?.id ?? "");
   return String(state.world?.chatMeta?.defaultRoom ?? "");
 }
 
@@ -915,20 +1140,29 @@ function activeChatRoom() {
   return state.tab === "chat" && route?.objectId === bundledDefaultChatRoom ? route.objectId : "";
 }
 
-function call(space: string, target: string, verb: string, args: any[] = []) {
+function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
-  sendFrame({ op: "call", id, space, message: { target, verb, args } });
+  ui.applyOptimisticCall(id, options);
+  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) ui.failOptimisticCall(id);
   return id;
 }
 
-function callWithError(space: string, target: string, verb: string, args: any[] = [], onError?: (error: any) => void) {
+function callWithError(space: string, target: string, verb: string, args: unknown[] = [], onError?: (error: any) => void, options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
+  ui.applyOptimisticCall(id, options);
   if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) pendingFrameErrors.delete(id);
+  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) {
+    ui.failOptimisticCall(id);
+    pendingFrameErrors.delete(id);
+  }
   return id;
 }
 
 function actorPresenceList(actor: string): string[] {
+  if (scopedProjectionEnabled && actor === state.actor) {
+    const locations = state.scopedProjection?.session?.all_locations;
+    return Array.isArray(locations) ? locations.filter((id): id is string => typeof id === "string") : [];
+  }
   if (actor === state.actor) {
     const locations = state.world?.session?.all_locations;
     if (Array.isArray(locations)) return locations.filter((id): id is string => typeof id === "string");
@@ -939,11 +1173,17 @@ function actorPresenceList(actor: string): string[] {
 function actorPresentInSpace(space: string) {
   const actor = state.actor;
   if (!actor) return false;
+  if (scopedProjectionEnabled) {
+    if (state.scopedProjection?.session?.current_location === space) return true;
+    if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
+    return actorPresenceList(actor).includes(space);
+  }
   if (state.world?.session?.current_location === space) return true;
   return actorPresenceList(actor).includes(space);
 }
 
 function shouldAutoEnterDefaultChatRoom() {
+  if (scopedProjectionEnabled) return false;
   const location = state.world?.session?.current_location;
   if (typeof location === "string" && location && location !== "$nowhere") {
     const room = chatRoom();
@@ -965,11 +1205,13 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
   direct(space, "enter", [], onReady, onError);
 }
 
-function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void) {
+function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
+  ui.applyOptimisticCall(id, options);
   if (onResult) pendingDirect.set(id, onResult);
   if (onError) pendingFrameErrors.set(id, onError);
   if (!sendFrame({ op: "direct", id, target, verb, args })) {
+    ui.failOptimisticCall(id);
     pendingDirect.delete(id);
     pendingFrameErrors.delete(id);
   }
@@ -1377,6 +1619,7 @@ function installBundledCatalogUi() {
     ui: uiManifest
   } satisfies CatalogUiPackage);
   if (diagnostics.length > 0) throw new Error(`bundled chat UI manifest is invalid: ${diagnostics.join("; ")}`);
+  installedCatalogUiAliases.add("chat");
   ui.catalogUi.registerModuleExports("chat", "chat-ui", chatUiModule, ui.observations);
 }
 
@@ -1738,9 +1981,10 @@ function enterChat() {
   const room = activeChatRoom();
   if (!room || !canSendDirect()) return;
   direct(room, "enter", [], (result) => {
+    applyScopedMoveResult(result);
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (result?.look_deferred === true) direct(room, "look", [], applyLookResult, receiveChatError);
+    if (!scopedProjectionEnabled && result?.look_deferred === true) direct(room, "look", [], applyLookResult, receiveChatError);
     if (state.tab === "chat") render();
   }, receiveChatError);
 }
@@ -1982,6 +2226,7 @@ function clearPinboardViewports() {
 }
 
 function receiveChatEvent(observation: any, shouldRender = true) {
+  applyScopedChatObservation(observation);
   const kind = chatLineKind(observation);
   const presentActors = Array.isArray(observation.present_actors) ? observation.present_actors.map(String) : [];
   // Only adopt present_actors as the chat sidebar list when the observation
@@ -2008,6 +2253,64 @@ function receiveChatEvent(observation: any, shouldRender = true) {
     text: typeof observation.text === "string" ? observation.text : chatSystemText(observation),
     ts: typeof observation.ts === "number" ? observation.ts : undefined
   }, shouldRender);
+}
+
+function applyScopedMoveResult(result: any) {
+  if (!scopedProjectionEnabled || !result || typeof result !== "object" || Array.isArray(result)) return;
+  if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
+  state.scopedProjection = scopedModelWithMoveResult(state.scopedProjection, result);
+  applyScopedProjectionModel();
+}
+
+function applyScopedHereSnapshot(here: any) {
+  if (!scopedProjectionEnabled || !here || typeof here !== "object" || Array.isArray(here)) return;
+  if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
+  state.scopedProjection = scopedModelWithHere(state.scopedProjection, here);
+  applyScopedProjectionModel();
+}
+
+function setScopedCurrentLocation(room: string) {
+  if (!scopedProjectionEnabled || !state.scopedProjection?.session) return;
+  state.scopedProjection = scopedModelWithCurrentLocation(state.scopedProjection, room);
+  applyScopedProjectionModel();
+}
+
+function applyScopedProjectionModel() {
+  if (!state.scopedProjection) return;
+  const here = state.scopedProjection.here;
+  state.world = adaptScopedWorld({
+    ...(state.scopedProjection.me ?? {}),
+    self: state.scopedProjection.self,
+    session: state.scopedProjection.session,
+    here: state.scopedProjection.here,
+    inventory: state.scopedProjection.inventory,
+    cursor: state.scopedProjection.cursor,
+    overlays: state.scopedProjection.overlays
+  }, state.scopedProjection.catalogs ?? catalogUiCache);
+  ui.ingestSnapshot("here", roomSnapshotObjects(here));
+  state.chatPresent = scopedHerePresentActors(here);
+  lastObservedChatRoom = typeof here?.id === "string" ? here.id : "";
+}
+
+function applyScopedChatObservation(observation: any) {
+  if (!scopedProjectionEnabled || !state.scopedProjection?.here || !observation || typeof observation !== "object" || Array.isArray(observation)) return;
+  const room = typeof observation.room === "string" ? observation.room : typeof observation.source === "string" ? observation.source : "";
+  if (room && room !== state.scopedProjection.here.id) return;
+  const actor = typeof observation.actor === "string" ? observation.actor : "";
+  if (!actor) return;
+  const type = String(observation.type ?? "");
+  const present = new Set(scopedHerePresentActors(state.scopedProjection.here));
+  if (type === "entered") present.add(actor);
+  if (type === "left") present.delete(actor);
+  if (type !== "entered" && type !== "left") return;
+  const summaries = new Map(arrayOfObjects(state.scopedProjection.here.present_actors).map((item) => [String(item.id ?? ""), item]));
+  if (type === "entered" && !summaries.has(actor)) summaries.set(actor, ui.observe(actor) ?? { id: actor, name: actor, props: {}, catalogState: {} });
+  state.scopedProjection.here = {
+    ...state.scopedProjection.here,
+    present_actors: [...present].map((id) => summaries.get(id) ?? { id, name: id })
+  };
+  state.chatPresent = [...present];
+  ui.ingestSnapshot("here", roomSnapshotObjects(state.scopedProjection.here));
 }
 
 function receiveChatError(error: any) {
@@ -2205,7 +2508,7 @@ function navigateChatHistory(event: KeyboardEvent, input: HTMLInputElement) {
 
 function setChatPresent(result: any) {
   if (Array.isArray(result)) state.chatPresent = result.map(String);
-  if (Array.isArray(result?.present_actors)) state.chatPresent = result.present_actors.map(String);
+  if (Array.isArray(result?.present_actors)) state.chatPresent = idsFromRefsOrSummaries(result.present_actors);
 }
 
 function setCurrentChatRoom(room: string) {
@@ -2338,12 +2641,13 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
       has: (ref) => neighborhoodRefs.has(ref)
     },
     observe: (ref) => neighborhoodRefs.has(ref) ? ui.observe(ref) ?? null : null,
+    call: async (target, verb, args = [], options) => callWithError(subject, target, verb, args, undefined, options),
     send: async (command, space = subject) => {
       sendChatInput(space, command);
       return null;
     },
-    directCall: (target, verb, args = []) => new Promise((resolve, reject) => {
-      direct(target, verb, args, resolve, reject);
+    directCall: (target, verb, args = [], options) => new Promise((resolve, reject) => {
+      direct(target, verb, args, resolve, reject, options);
     }),
     emit: (action) => ui.frames.emit(action)
   };
@@ -2426,19 +2730,20 @@ function executeChatPlan(currentSpace: string, plan: any, originalText: string) 
 }
 
 function renderChatCommandResult(plan: any, result: any, originalText: string) {
+  applyScopedMoveResult(result);
   const verb = String(plan?.verb ?? "");
   const target = String(plan?.target ?? "");
   if (verb === "enter" && target === dubspaceSpace()) {
     setDubspaceOperators(result);
     setTab("dubspace", { mode: "push", leaveCurrent: false });
-    void refresh().then(() => requestSpaceChatFocus(target));
+    if (!scopedProjectionEnabled) void refresh().then(() => requestSpaceChatFocus(target));
     requestSpaceChatFocus(target);
     return;
   }
   if ((verb === "leave" || verb === "out") && target === dubspaceSpace()) {
     setDubspaceOperators(result);
     setTab("chat", { mode: "push", leaveCurrent: false });
-    void refresh();
+    if (!scopedProjectionEnabled) void refresh();
     focusChatInput();
     return;
   }
@@ -2446,7 +2751,7 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
     setPinboardPresent(result);
     clearPinboardViewports();
     setTab("chat", { mode: "push", leaveCurrent: false });
-    void refresh();
+    if (!scopedProjectionEnabled) void refresh();
     focusChatInput();
     return;
   }
@@ -2454,7 +2759,7 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
     setPinboardPresent(result);
     setTab("pinboard", { mode: "push", leaveCurrent: false });
     refreshPinboardNotes({ force: true });
-    void refresh().then(() => requestSpaceChatFocus(target));
+    if (!scopedProjectionEnabled) void refresh().then(() => requestSpaceChatFocus(target));
     requestSpaceChatFocus(target);
     return;
   }
@@ -2470,8 +2775,8 @@ function renderChatCommandResult(plan: any, result: any, originalText: string) {
     const room = result.room;
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (result.look_deferred === true) direct(room, "look", [], applyLookResult, receiveChatError);
-    void refresh();
+    if (!scopedProjectionEnabled && result.look_deferred === true) direct(room, "look", [], applyLookResult, receiveChatError);
+    if (!scopedProjectionEnabled) void refresh();
     return;
   }
   if (verb === "enter") {
@@ -2689,7 +2994,7 @@ function estimatedPinboardViewport(width: number, height: number): PinNoteBox & 
 
 function pinNoteRecordBox(note: any): PinNoteBox {
   const id = String(note?.id ?? "");
-  return applyPendingPinPatch(id, {
+  return applyProjectedPinPatch(id, {
     x: pinNoteNumber(note?.x, 40),
     y: pinNoteNumber(note?.y, 40),
     w: pinNoteNumber(note?.w, 180),
@@ -2721,25 +3026,28 @@ function renderPinboardCreatePlaceholder() {
   return `<div class="panel pinboard-create pinboard-create-placeholder" aria-hidden="true"></div>`;
 }
 
-function setPendingPinPatch(id: string, patch: { x?: number; y?: number; w?: number; h?: number }) {
-  if (!id) return;
-  ui.projection.applyOptimistic(`pinboard:${id}`, [pinboardPlacementPatch(id, patch)], PINBOARD_OPTIMISTIC_TTL_MS);
+function pinboardPlacementOptimistic(id: string, patch: { x?: number; y?: number; w?: number; h?: number }): ProjectionCallOptions | undefined {
+  if (!id) return undefined;
+  return {
+    optimistic: {
+      id: `pinboard:${id}:placement`,
+      patches: [pinboardPlacementPatch(id, patch)],
+      ttlMs: PINBOARD_OPTIMISTIC_TTL_MS,
+      reconcile: "drop_on_applied"
+    }
+  };
 }
 
-function clearPendingPinPatch(id: string) {
-  if (id) ui.projection.clearOptimistic(`pinboard:${id}`);
-}
-
-function applyPendingPinPatch<T extends { x: number; y: number; w: number; h: number }>(id: string, base: T): T {
+function applyProjectedPinPatch<T extends { x: number; y: number; w: number; h: number }>(id: string, base: T): T {
   ui.prune();
-  const pending = ui.observe(id)?.catalogState.pinboard_note;
-  if (!pending) return base;
+  const projected = ui.observe(id)?.catalogState.pinboard_note;
+  if (!projected) return base;
   return {
     ...base,
-    x: pinNoteNumber(pending.x, base.x),
-    y: pinNoteNumber(pending.y, base.y),
-    w: pinNoteNumber(pending.w, base.w),
-    h: pinNoteNumber(pending.h, base.h)
+    x: pinNoteNumber(projected.x, base.x),
+    y: pinNoteNumber(projected.y, base.y),
+    w: pinNoteNumber(projected.w, base.w),
+    h: pinNoteNumber(projected.h, base.h)
   };
 }
 
@@ -2749,7 +3057,7 @@ function pinboardPlacementPatch(id: string, patch: { x?: number; y?: number; z?:
 
 function renderPinNote(note: any, editable: boolean, palette: string[]) {
   const id = String(note?.id ?? "");
-  const merged = applyPendingPinPatch(id, {
+  const merged = applyProjectedPinPatch(id, {
     x: pinNoteNumber(note?.x, 40),
     y: pinNoteNumber(note?.y, 40),
     w: pinNoteNumber(note?.w, 180),
@@ -3358,8 +3666,7 @@ function bindPinNoteDrag(handle: HTMLButtonElement) {
     const id = note.dataset.pinNote ?? "";
     const x = pinNoteNumber(note.dataset.x, 0);
     const y = pinNoteNumber(note.dataset.y, 0);
-    setPendingPinPatch(id, { x, y });
-    pinboardCall("move_pin", [id, x, y]);
+    pinboardCall("move_pin", [id, x, y], pinboardPlacementOptimistic(id, { x, y }));
   });
   handle.addEventListener("pointercancel", () => {
     active = false;
@@ -3399,8 +3706,7 @@ function bindPinNoteResize(handle: HTMLButtonElement) {
     const id = note.dataset.pinNote ?? "";
     const w = pinNoteNumber(note.dataset.w, 180);
     const h = pinNoteNumber(note.dataset.h, 110);
-    setPendingPinPatch(id, { w, h });
-    pinboardCall("resize_pin", [id, w, h]);
+    pinboardCall("resize_pin", [id, w, h], pinboardPlacementOptimistic(id, { w, h }));
   });
   handle.addEventListener("pointercancel", () => {
     active = false;
@@ -3451,7 +3757,7 @@ function setPinboardPresent(result: any) {
         ? result.present_actors
         : [];
   if (!state.world?.pinboard) return;
-  state.world.pinboard.present = present.map(String);
+  state.world.pinboard.present = idsFromRefsOrSummaries(present);
   const board = state.world.pinboard.board;
   if (board?.props) board.props.subscribers = state.world.pinboard.present;
   const presentActors = new Set(state.world.pinboard.present);
@@ -3460,14 +3766,14 @@ function setPinboardPresent(result: any) {
   }
 }
 
-function pinboardCall(verb: string, args: any[] = []) {
+function pinboardCall(verb: string, args: any[] = [], options?: ProjectionCallOptions) {
   const board = pinboardSpace();
-  if (board) call(board, board, verb, args);
+  if (board) call(board, board, verb, args, options);
 }
 
-function pinboardTargetCall(target: string, verb: string, args: any[] = []) {
+function pinboardTargetCall(target: string, verb: string, args: any[] = [], options?: ProjectionCallOptions) {
   const board = pinboardSpace();
-  if (board && target) call(board, target, verb, args);
+  if (board && target) call(board, target, verb, args, options);
 }
 
 function refreshPinboardNotes(options: { force?: boolean } = {}) {

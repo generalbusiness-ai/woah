@@ -21,7 +21,8 @@ WebSockets between client and player host. JSON frames. UTF-8. Values are encode
 
 ```ts
 // Establish session.
-{ op: "auth", token: string }
+// cursor is optional scoped-projection resume metadata from /api/me.
+{ op: "auth", token: string, cursor?: ProjectionCursor }
 
 // Make a sequenced call through a space.
 //   id        — client-chosen correlation token; echoed in the reply
@@ -62,7 +63,9 @@ Reserved for transient hosts (see [browser-host.md](browser-host.md)):
 ```ts
 // Session established; the client is bound to this actor.
 // The client stores session and presents it as session:<id> on reconnect.
-{ op: "session", actor: ObjRef, session: string }
+// resumed:false means the server did not use the supplied cursor and the
+// client must hydrate from /api/me before replaying from the returned cursor.
+{ op: "session", actor: ObjRef, session: string, resumed?: boolean }
 
 // A sequenced call has been applied. Carries the canonical seq and any
 // observations emitted during apply. Replayable: the same frame is reproduced
