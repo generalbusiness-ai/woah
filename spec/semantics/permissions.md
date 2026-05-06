@@ -20,7 +20,6 @@ Covers object flags, verb/property perms, the `progr` discipline, the trust boun
 | `wizard` | Object grants its `progr` activations bypass on perm checks. |
 | `programmer` | Actor may author/edit verbs and properties on objects it owns. |
 | `fertile` | Other users can `chparent` to this object. |
-| `recyclable` | Object can be destroyed via `recycle()`. |
 
 ### 11.2 Verb perms
 

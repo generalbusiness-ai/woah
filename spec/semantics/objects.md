@@ -23,7 +23,7 @@ Every object has:
 | `owner` | objref | The user object that controls this object. |
 | `location` | objref \| `#-1` | The object's container. May be remote. May change at runtime (this is what "moving" means). |
 | `anchor` | objref \| `null` | Atomicity scope. `null` (default) = no anchor cluster. Set = mutations to this object and to other objects sharing the anchor commit atomically together. **Immutable after creation.** Anchor does not by itself decide host placement — see §4.2. |
-| `flags` | bitset | `wizard`, `programmer`, `fertile`, `recyclable`. (See §11.) |
+| `flags` | bitset | `wizard`, `programmer`, `fertile`. (See §11.) |
 | `created`, `modified` | int (ms) | Audit. |
 
 It additionally has tables of:
@@ -59,6 +59,7 @@ Constraints:
 - Anchor relationships form a tree — no cycles. Anchoring places transitively: if `B.anchor = A` and `C.anchor = B`, then `C` shares an atomicity cluster with `A`.
 - **`anchor` is set at creation time and cannot be changed.** Re-anchoring would be a recursive host migration with task drain, routing redirects, and an atomicity-scope shift. v1 does not provide it. If an object truly needs to live in a different cluster, the answer is: create a new object in the target cluster, copy state, recycle the old. Routine "move this object to that container" is a `location` update — that's free and unrelated to anchor.
 - `anchor` is independent of `parent` (inheritance) and `location` (containment). The three axes don't constrain each other.
+- **Self-hosted instances cannot be anchored.** If the resolved class is self-hosted (`instances_self_host = true`, §4.2), `create()` rejects a non-null `anchor` argument with `E_INVARG`. Self-hosting and anchoring are alternative ways to designate a host root; combining them would route the instance to its own DO (rule 1 in §4.2 routing precedence) while declaring it a member of another cluster, which would break the co-residency guarantee that anchor-cluster atomicity depends on. Concretely: the anchored-descendants check in [recycle.md §RC3](recycle.md#rc3-bookkeeping) pre-flight A3 relies on every transitive descendant of `obj` being on `obj`'s host; a self-hosted-with-anchor instance would violate that. If a class needs to be both self-hosting and atomically coordinated with another cluster, the correct shape is to nest the cluster under the self-hosted root, not to anchor the self-hosted instance outward.
 
 Default: `anchor = null`. Use anchoring deliberately, when atomic coordination across a cluster is the design intent. The dubspace is the canonical example: `$mix`, `#delay`, `#channel`, `#scene` all anchor on `$mix`, share one host, and `$mix:call` mutates them atomically. Most objects in most worlds don't need an anchor.
 
@@ -106,7 +107,7 @@ Authority to instantiate self-hosting classes is narrower than ordinary `create(
 
 The implementation resolves an object id to a host in this order:
 
-1. **Self-hosted.** If the object's `host_placement = "self"`, the id is its own host.
+1. **Self-hosted.** If the object's `host_placement = "self"`, the id is its own host. Self-hosted instances always have `anchor = null` (per §4.1's create-time rejection rule); rules 1 and 2 are mutually exclusive by construction.
 2. **Anchored to a self-hosted root.** Else if the object's `anchor` (transitively) resolves to a self-hosted host, route there.
 3. **Directory record.** Else, the runtime stamps the executing host onto the object at `create()` and registers it in Directory; the route is fixed for the object's lifetime and does not vary with `location`.
 
@@ -120,6 +121,7 @@ The implementation resolves an object id to a host in this order:
 - Each container's `contents` is a **cache**: a set of object ids maintained on the container's host. When an object's `location` changes, the moving host RPCs the source container's host with `contents.delete(obj_id)` and the target container's host with `contents.add(obj_id)` immediately after writing `obj.location`. The container stores ids only; it does not cache titles, hosts, or other display data.
 - **Rendering enriches at read time.** When a verb such as `:look` walks `contents`, it resolves each member's host via Directory and dispatches `:title()` (and any other display verbs) per-host. The dispatched titles are not stored on the container.
 - The `contents` cache may drift if a push fails. A reconcile sweep — triggered on `:look` or by periodic policy — verifies each cache entry by querying the member's actual `location` via Directory and prunes ghosts. Ghost entries do not affect routing or correctness; they affect rendering until reconciled.
+- **Sink exception: `$nowhere`.** The bidirectional invariant has one documented exception: `$nowhere.contents` is not maintained. Setting `obj.location = $nowhere` writes only the object's own `location`; no RPC is dispatched to update `$nowhere.contents`. See [bootstrap.md §B2.15](bootstrap.md#b215-nowhere) for the rationale (avoiding a global write hotspot on disconnect/recycle/reset paths).
 
 The Directory tracks `id → host` only. Containment lives with the container; `location` is recorded on the object itself, not in Directory. See [reference/cloudflare.md §R1.1](../reference/cloudflare.md#r11-routing) for the wire-level mechanics.
 
@@ -184,7 +186,7 @@ The Directory host is a singleton holding small, read-mostly tables:
 - **Corename map**: `$system → ULID`, `$root_object → ULID`, `$wiz → ULID`, etc. Dozens of entries, edited only by wizards.
 - **World metadata**: bootstrap state, schema version.
 
-The Directory **is** the authoritative `id → host` route table (per §4.2 routing precedence step 3 and [reference/cloudflare.md §R1.1](../reference/cloudflare.md#r11-routing)), but it is read-cacheable and not on the create or dispatch hot path: hosts cache route lookups, self-hosted ids are computed without reading Directory, and most calls resolve from a local cache. Directory is **not** in the path of ID allocation.
+The Directory **is** the authoritative `id → host` route table (per §4.2 routing precedence step 3 and [reference/cloudflare.md §R1.1](../reference/cloudflare.md#r11-routing)), but it is read-cacheable and not on the create or dispatch hot path: hosts cache route lookups, self-hosted ids are computed without reading Directory, and most calls resolve from a local cache. Directory is **not** in the path of ID allocation. Route rows are immutable: the row written at creation persists for the lifetime of the world, including after the object is recycled — that is what lets stale refs continue to reach the tombstone host so the host can distinguish "recycled" from "never existed" (see [recycle.md §RC3](recycle.md#rc3-bookkeeping) step 9 and [reference/persistence.md §14.2.1](../reference/persistence.md#1421-tombstones)).
 
 There is no global object registry, by design. "All instances of `$room`" is answered by walking `children($room)` recursively. Operations requiring host enumeration (cleanup, stats, dump) go via the runtime's management plane (see [../reference/cloudflare.md §R2](../reference/cloudflare.md#r2-singleton-dos)), not the runtime API.
 
