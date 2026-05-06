@@ -138,9 +138,10 @@ export type HoroscopeTickResult = {
 
 export async function runHoroscopeTick(
   env: HoroscopePlugEnv,
-  deps: { fetchImpl?: typeof fetch } = {}
+  deps: { fetchImpl?: typeof fetch; now?: () => number } = {}
 ): Promise<HoroscopeTickResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const now = deps.now ?? Date.now;
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
   await client.authenticate(env.WOO_APIKEY);
 
@@ -189,6 +190,13 @@ export async function runHoroscopeTick(
       break;
     }
   }
+
+  await client.directCall(env.BLOCK_ID, "set_properties", [
+    {
+      last_pushed_at: now(),
+      last_error: errors.length > 0 ? errors[errors.length - 1].message : null
+    }
+  ]);
 
   return { block: env.BLOCK_ID, delivered, errors };
 }

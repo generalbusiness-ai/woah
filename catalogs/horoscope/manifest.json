@@ -10,7 +10,25 @@
       "local_name": "$horoscope_block",
       "parent": "$dispenser_block",
       "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, and calls :deliver to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
-      "properties": []
+      "properties": [],
+      "verbs": [
+        {
+          "name": "title",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :title() rxd { if (this.last_pushed_at == 0) { return this.name + \" (disconnected)\"; } return this.name; }"
+        },
+        {
+          "name": "look_self",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will arrive as a note in your inventory when the plug drains the queue.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
+        }
+      ]
     }
   ]
 }

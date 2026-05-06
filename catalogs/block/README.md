@@ -50,7 +50,7 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 | `:set_property(name, value)` | tier-gated | Single property write; emits `block_data`. |
 | `:set_properties(values)` | tier-gated | Bulk; atomic permission gate, one observation per name. |
 | `:get_data(name)` | rxd | Read a property by name; respects normal `r` perms. |
-| `:look()` / `:look_self()` | rxd | Returns `{id, title, description, last_pushed_at, last_error, summary, location}`. |
+| `:look()` / `:look_self()` | rxd | Returns `{id, title, description, last_pushed_at, last_error, summary, location}`. `:look` is command-shaped, so it appears in `@examine` / MCP obvious affordances. |
 | `:moveto(target)` | wizard | Block is anchored; non-wizard raises `E_PERM`. |
 | `:acceptable(object)` | rxd | Always false (nothing enters a block). |
 | `:mint_apikey(label?)` | owner/wizard | Mints an apikey bound to this block's actor. |

@@ -306,7 +306,7 @@ for any verb exposed to a chat-shaped command surface.
 | Register | Examples | Mutates |
 |---|---|---|
 | In-fiction (no prefix) | `take`, `drop`, `look`, `say`, `go`, `north`, `enter`, `who`, `home` | The fiction (your character takes the mug; you walk north) |
-| Meta / authoring (`@`-prefixed) | `@describe`, `@dig`, `@create`, `@set`, `@list`, `@show`, `@move-to`, `@verb`, `@property`, `@whoami`, `@quit` | World structure (description text, layout, properties, verbs, exits, identity) |
+| Meta / authoring (`@`-prefixed) | `@describe`, `@examine`, `@ways`, `@join`, `@who`, `@dig`, `@create`, `@set`, `@list`, `@show`, `@move-to`, `@verb`, `@property`, `@whoami`, `@quit` | World structure or out-of-fiction inspection/navigation (description text, layout, properties, verbs, exits, identity, connected users) |
 
 The parser doesn't treat `@` specially — it's part of the verb name in
 the resolved verb table — but the convention pays off:

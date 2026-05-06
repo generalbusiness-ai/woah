@@ -37,10 +37,17 @@ the plug's lifecycle.
 | Name | Kind | Notes |
 |---|---|---|
 | `current` | `scalar` | Headline current temperature with unit and label. |
-| `forecast` | `table` | Hourly forecast: columns + rows. |
+| `forecast` | `series` | Hourly forecast with temperature points and hourly detail rows. |
 | `history` | `series` | Recent observed values as a series. |
 | `last_pushed_at` | int | Inherited from `$block`; epoch ms of last plug push. |
 | `last_error` | str/null | Inherited from `$block`; most recent fetch failure. |
+
+## Look Surface
+
+`:title()` and `:look_self()` render the current scalar reading directly,
+for example `Temperature in Mountain View, CA: 72°F`, and include
+`last_updated` / `last_pushed_at` so room look and object look both show
+freshness instead of a raw JSON block.
 
 ## Provisioning
 

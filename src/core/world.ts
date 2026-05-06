@@ -5753,6 +5753,9 @@ export class WooWorld {
       return true;
     });
     this.nativeHandlers.set("player_help", (ctx, args) => this.playerHelp(ctx, args));
+    this.nativeHandlers.set("player_who", (ctx, args) => this.playerWho(ctx, args));
+    this.nativeHandlers.set("player_join", (ctx, args) => this.playerJoin(ctx, args));
+    this.nativeHandlers.set("player_examine", (ctx, args) => this.playerExamine(ctx, args));
     this.nativeHandlers.set("guest_on_disfunc", async (ctx) => {
       const homeValue = this.propOrNull(ctx.thisObj, "home");
       const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
@@ -6005,6 +6008,7 @@ export class WooWorld {
 
   private isActorForLook(item: ObjRef, present: ObjRef[]): boolean {
     if (present.includes(item)) return true;
+    if (this.objects.has(item) && this.objects.has("$block") && this.inheritsFrom(item, "$block")) return false;
     return this.objects.has(item) && this.inheritsFrom(item, "$actor");
   }
 
@@ -6086,6 +6090,332 @@ export class WooWorld {
       ts: Date.now()
     });
     return present;
+  }
+
+  private async playerWho(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
+    const requested = valueToText(args[0]).trim();
+    const players = requested
+      ? this.playerNameTokens(requested).map((name) => this.matchPlayerForCommand(name))
+      : this.connectedPlayers();
+    const missing = requested ? players.find((item) => !item) : null;
+    if (missing === null && requested) {
+      this.tellPlayer(ctx, ctx.actor, ["I don't recognize one of those players."]);
+      return [] as unknown as WooValue;
+    }
+    const unique = Array.from(new Set(players.filter((item): item is ObjRef => typeof item === "string")));
+    if (unique.length === 0) return [] as unknown as WooValue;
+    if (unique.length > 100) {
+      this.tellPlayer(ctx, ctx.actor, [
+        "You have requested a listing of ",
+        unique.length,
+        " players. Please specify fewer players or use a broader user listing."
+      ]);
+      return [] as unknown as WooValue;
+    }
+
+    const rows = await Promise.all(unique.map(async (player) => {
+      const location = this.objects.has(player) ? this.object(player).location : null;
+      const locationName = location && this.objects.has(location) ? await this.objectDisplayNameAsync(ctx.progr, location, ctx.hostMemo) : "Nowhere";
+      const stats = this.playerSessionStats(player);
+      return {
+        player,
+        name: await this.objectDisplayNameAsync(ctx.progr, player, ctx.hostMemo),
+        connected: stats.connected,
+        connected_at: stats.connectedAt,
+        connected_seconds: stats.connectedSeconds,
+        idle_seconds: stats.idleSeconds,
+        last_login_at: stats.lastLoginAt,
+        location,
+        location_name: locationName
+      };
+    }));
+
+    const lines = ["Player                 Conn      Idle   Location"];
+    for (const row of rows) {
+      const idle = row.connected
+        ? row.idle_seconds === null || row.idle_seconds < 60
+          ? "active"
+          : this.formatWhoDuration(row.idle_seconds)
+        : "sleep";
+      const connection = row.connected
+        ? this.formatWhoDuration(row.connected_seconds)
+        : this.formatWhoLastLogin(row.last_login_at);
+      lines.push(`${row.name.padEnd(22).slice(0, 22)} ${connection.padEnd(9).slice(0, 9)} ${idle.padEnd(6).slice(0, 6)} ${row.location_name}`);
+    }
+    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
+    ctx.observe({
+      type: "who",
+      source: ctx.thisObj,
+      actor: ctx.actor,
+      to: ctx.actor,
+      room: this.objects.get(ctx.actor)?.location ?? null,
+      present_actors: unique,
+      text: lines.join("\n"),
+      ts: Date.now()
+    });
+    return rows as unknown as WooValue;
+  }
+
+  private async playerJoin(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
+    if (ctx.thisObj !== ctx.actor && !this.isWizard(ctx.actor)) throw wooError("E_PERM", "players may only @join themselves", { actor: ctx.actor, target: ctx.thisObj });
+    const name = valueToText(args[0]).trim();
+    if (!name) {
+      this.tellPlayer(ctx, ctx.actor, ["Usage: @join <player>."]);
+      return null;
+    }
+    const target = this.matchPlayerForCommand(name);
+    if (!target) {
+      this.tellPlayer(ctx, ctx.actor, ["I don't recognize that player."]);
+      return null;
+    }
+    if (target === ctx.actor) {
+      this.tellPlayer(ctx, ctx.actor, ["There is little need to join yourself, unless you are split up."]);
+      return null;
+    }
+    const dest = this.objects.get(target)?.location ?? null;
+    if (!dest || dest === "$nowhere" || !this.objects.has(dest)) {
+      this.tellPlayer(ctx, ctx.actor, [await this.objectDisplayNameAsync(ctx.progr, target, ctx.hostMemo), " is nowhere."]);
+      return null;
+    }
+    const old = this.objects.get(ctx.actor)?.location ?? null;
+    if (old === dest) {
+      this.tellPlayer(ctx, ctx.actor, ["OK, you're there. You didn't need to actually move, though."]);
+      return { room: dest, from: old, here_request: true, look_deferred: true } as unknown as WooValue;
+    }
+    this.tellPlayer(ctx, ctx.actor, ["You visit ", await this.objectDisplayNameAsync(ctx.progr, target, ctx.hostMemo), "."]);
+    await this.movetoChecked(ctx, ctx.actor, dest);
+    const landed = this.objects.get(ctx.actor)?.location ?? null;
+    if (landed !== dest) {
+      this.tellPlayer(ctx, ctx.actor, ["Either that place doesn't want you, or you don't really want to go."]);
+      return null;
+    }
+    if (old && old !== dest && old !== "$nowhere") {
+      ctx.observe({ type: "left", source: old, actor: ctx.actor, room: old, destination: dest, text: `${this.object(ctx.actor).name} leaves.`, ts: Date.now() });
+    }
+    ctx.observe({ type: "entered", source: dest, actor: ctx.actor, room: dest, origin: old, text: `${this.object(ctx.actor).name} arrives.`, ts: Date.now() });
+    return { room: dest, from: old, target, here_request: true, look_deferred: true } as unknown as WooValue;
+  }
+
+  private async playerExamine(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
+    const name = valueToText(args[0]).trim();
+    if (!name) {
+      this.tellPlayer(ctx, ctx.actor, ["Usage: @examine <object>"]);
+      return null;
+    }
+    const location = this.objects.get(ctx.actor)?.location ?? null;
+    const match = await this.matchObjectForActorAsync(name, ctx, location, ctx.actor);
+    if (match.status === "ambiguous") {
+      this.tellPlayer(ctx, ctx.actor, ["I don't know which ", name, " you mean."]);
+      return null;
+    }
+    if (match.status !== "ok") {
+      this.tellPlayer(ctx, ctx.actor, ["I don't see ", name, " here."]);
+      return null;
+    }
+    const target = match.value;
+    if (await this.remoteHostForObject(target, ctx.hostMemo)) return await this.playerExamineRemote(ctx, target);
+    const obj = this.object(target);
+    const owner = obj.owner;
+    const aliasesValue = this.propOrNullForActor(ctx.actor, target, "aliases");
+    const aliases = Array.isArray(aliasesValue) ? aliasesValue.filter((item): item is string => typeof item === "string") : [];
+    const descriptionValue = this.propOrNullForActor(ctx.actor, target, "description");
+    const description = typeof descriptionValue === "string" && descriptionValue.length > 0 ? descriptionValue : "(No description set.)";
+    const contents = await this.objectContents(target, ctx.hostMemo).catch(() => [] as ObjRef[]);
+    const contentRows = await Promise.all(contents.map(async (item) => ({
+      id: item,
+      name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
+    })));
+    const obviousVerbs = this.obviousCommandSyntaxes(target, name);
+    const ownerName = this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : "a recycled player";
+    const lines = [
+      `${obj.name} (${target}) is owned by ${ownerName} (${owner}).`,
+      `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
+      description
+    ];
+    if (contentRows.length > 0) {
+      lines.push("Contents:");
+      for (const item of contentRows) lines.push(`  ${item.name} (${item.id})`);
+    }
+    if (obviousVerbs.length > 0) {
+      lines.push("Obvious verbs:");
+      lines.push(...obviousVerbs);
+    }
+    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
+    return {
+      target,
+      owner,
+      aliases,
+      description,
+      contents: contentRows,
+      obvious_verbs: obviousVerbs,
+      text: lines.join("\n")
+    } as unknown as WooValue;
+  }
+
+  private connectedPlayers(): ObjRef[] {
+    const seen = new Set<ObjRef>();
+    for (const session of this.sessions.values()) {
+      if (!this.actorIsConnected(session.actor)) continue;
+      if (!this.objects.has(session.actor) || !this.inheritsFrom(session.actor, "$player")) continue;
+      seen.add(session.actor);
+    }
+    return Array.from(seen).sort((left, right) => {
+      const leftName = this.object(left).name || left;
+      const rightName = this.object(right).name || right;
+      return leftName.localeCompare(rightName) || left.localeCompare(right);
+    });
+  }
+
+  private playerSessionStats(actor: ObjRef): { connected: boolean; connectedAt: number | null; connectedSeconds: number | null; idleSeconds: number | null; lastLoginAt: number | null } {
+    const now = Date.now();
+    const liveCutoff = now - IDLE_PRESENCE_LIVE_WINDOW_MS;
+    let connectedAt: number | null = null;
+    let lastInputAt: number | null = null;
+    let lastLoginAt: number | null = null;
+    for (const session of this.sessions.values()) {
+      if (session.actor !== actor) continue;
+      if (lastLoginAt === null || session.started > lastLoginAt) lastLoginAt = session.started;
+      if (lastInputAt === null || session.lastInputAt > lastInputAt) lastInputAt = session.lastInputAt;
+      const live = session.attachedSockets.size > 0 || session.lastInputAt >= liveCutoff;
+      if (live && (connectedAt === null || session.started < connectedAt)) connectedAt = session.started;
+    }
+    return {
+      connected: connectedAt !== null,
+      connectedAt,
+      connectedSeconds: connectedAt === null ? null : Math.max(0, Math.floor((now - connectedAt) / 1000)),
+      idleSeconds: connectedAt === null || lastInputAt === null ? null : Math.max(0, Math.floor((now - lastInputAt) / 1000)),
+      lastLoginAt
+    };
+  }
+
+  private formatWhoDuration(seconds: number | null): string {
+    if (seconds === null) return "-";
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h`;
+    return `${Math.floor(hours / 24)}d`;
+  }
+
+  private formatWhoLastLogin(at: number | null): string {
+    if (at === null) return "unknown";
+    return new Date(at).toISOString().slice(0, 10);
+  }
+
+  private async playerExamineRemote(ctx: CallContext, target: ObjRef): Promise<WooValue> {
+    const summary = await this.hostBridge?.describeObject?.(ctx.progr, ctx.actor, target, ctx.hostMemo).catch(() => null) ?? null;
+    const name = typeof summary?.name === "string" && summary.name.length > 0 ? summary.name : target;
+    const aliases = Array.isArray(summary?.aliases) ? summary.aliases.filter((item): item is string => typeof item === "string") : [];
+    const description = typeof summary?.description === "string" && summary.description.length > 0 ? summary.description : "(No description set.)";
+    const contents = await this.objectContents(target, ctx.hostMemo).catch(() => [] as ObjRef[]);
+    const contentRows = await Promise.all(contents.map(async (item) => ({
+      id: item,
+      name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
+    })));
+    const lines = [
+      `${name} (${target}) is on a remote host; owner and obvious verbs are unavailable here.`,
+      `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
+      description
+    ];
+    if (contentRows.length > 0) {
+      lines.push("Contents:");
+      for (const item of contentRows) lines.push(`  ${item.name} (${item.id})`);
+    }
+    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
+    return {
+      target,
+      owner: null,
+      aliases,
+      description,
+      contents: contentRows,
+      obvious_verbs: [],
+      remote: true,
+      text: lines.join("\n")
+    } as unknown as WooValue;
+  }
+
+  private playerNameTokens(input: string): string[] {
+    return input.split(/\s+/).map((token) => token.trim()).filter(Boolean);
+  }
+
+  private matchPlayerForCommand(input: string): ObjRef | null {
+    const wanted = input.trim().toLowerCase();
+    if (!wanted) return null;
+    const exact: ObjRef[] = [];
+    const prefix: ObjRef[] = [];
+    for (const [id, obj] of this.objects.entries()) {
+      if (!this.inheritsFrom(id, "$player")) continue;
+      const aliasesValue = this.propOrNull(id, "aliases");
+      const names = [id, obj.name, this.propOrNull(id, "name"), ...(Array.isArray(aliasesValue) ? aliasesValue : [])]
+        .filter((item): item is string => typeof item === "string" && item.length > 0)
+        .map((item) => item.toLowerCase());
+      if (names.includes(wanted)) exact.push(id);
+      else if (names.some((name) => name.startsWith(wanted))) prefix.push(id);
+    }
+    const matches = exact.length > 0 ? Array.from(new Set(exact)) : Array.from(new Set(prefix));
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  obviousCommandVerbs(target: ObjRef, options: { actor?: ObjRef; executableOnly?: boolean } = {}): VerbDef[] {
+    const dullClasses = new Set<ObjRef>(["$root", "$room", "$player", "$prog", "$builder"]);
+    const out: VerbDef[] = [];
+    const seen = new Set<string>();
+    for (const definer of this.localAncestry(target)) {
+      if (dullClasses.has(definer)) continue;
+      for (const verb of this.object(definer).verbs) {
+        if (!verb.perms.includes("r")) continue;
+        if (options.executableOnly && options.actor && !this.canExecuteVerb(options.actor, verb)) continue;
+        const syntax = this.formatCommandSyntax(verb, target);
+        if (!syntax) continue;
+        const key = `${verb.name}:${syntax}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(verb);
+      }
+    }
+    return out;
+  }
+
+  obviousCommandSyntaxes(target: ObjRef, objectName: string): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const verb of this.obviousCommandVerbs(target)) {
+      const syntax = this.formatCommandSyntax(verb, objectName);
+      if (!syntax || seen.has(syntax)) continue;
+      seen.add(syntax);
+      out.push(`  ${syntax}`);
+    }
+    return out;
+  }
+
+  private formatCommandSyntax(verb: VerbDef, objectName: string): string | null {
+    const command = verb.arg_spec && typeof verb.arg_spec === "object" && !Array.isArray(verb.arg_spec)
+      ? (verb.arg_spec.command as WooValue | undefined)
+      : undefined;
+    if (!command || typeof command !== "object" || Array.isArray(command)) return null;
+    const map = command as Record<string, WooValue>;
+    const dobj = typeof map.dobj === "string" ? map.dobj : "any";
+    const prep = typeof map.prep === "string" ? map.prep : Array.isArray(map.prep) ? String(map.prep[0] ?? "any") : "any";
+    const iobj = typeof map.iobj === "string" ? map.iobj : "any";
+    if (prep === "none" && iobj === "this") return null;
+    const names = [verb.name, ...(verb.aliases ?? [])]
+      .filter((name) => !name.startsWith("@"))
+      .map((name) => this.formatVerbNameForExamine(name));
+    if (names.length === 0) return null;
+    let rest = "";
+    if (dobj !== "none") rest += ` ${dobj === "this" ? objectName : "<anything>"}`;
+    if (prep !== "none") {
+      rest += ` ${prep === "any" ? "<anything>" : prep}`;
+      if (iobj !== "none") rest += ` ${iobj === "this" ? objectName : "<anything>"}`;
+    }
+    return `${names.join("/")}${rest}`;
+  }
+
+  private formatVerbNameForExamine(name: string): string {
+    return name
+      .replace(/\* /g, "<anything> ")
+      .replace(/\*$/g, "<anything>");
   }
 
   private async titleForLook(ctx: CallContext, room: ObjRef, item: ObjRef): Promise<string> {

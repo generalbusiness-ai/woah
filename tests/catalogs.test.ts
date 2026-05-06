@@ -1875,6 +1875,61 @@ describe("local catalogs", () => {
     expect(world.getProp(guest.actor, "description")).toBe("");
   });
 
+  it("dispatches LambdaCore-shaped @who, @join, @ways, and @examine commands", async () => {
+    const world = createWorld();
+    const first = world.auth("guest:lambdacore-commands-first");
+    const second = world.auth("guest:lambdacore-commands-second");
+    await world.directCall("lambda-enter-first", first.actor, "the_chatroom", "enter", []);
+    await world.directCall("lambda-enter-second", second.actor, "the_deck", "enter", []);
+
+    const whoPlan = await world.directCall("lambda-plan-who", first.actor, "the_chatroom", "command_plan", ["@who"]);
+    expect(whoPlan.op).toBe("result");
+    if (whoPlan.op === "result") {
+      expect(whoPlan.result).toMatchObject({ ok: true, route: "direct", target: first.actor, verb: "who_all", args: [""] });
+    }
+    const who = await world.command("lambda-who", first.id, "the_chatroom", "@who");
+    expect(who.op).toBe("result");
+    if (who.op === "result") {
+      expect(who.result).toEqual(expect.arrayContaining([
+        expect.objectContaining({ player: first.actor, location: "the_chatroom", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) }),
+        expect.objectContaining({ player: second.actor, location: "the_deck", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) })
+      ]));
+      expect(who.observations).toContainEqual(expect.objectContaining({ type: "who", actor: first.actor, present_actors: expect.arrayContaining([first.actor, second.actor]) }));
+    }
+
+    const secondSession = world.sessions.get(second.id);
+    if (secondSession) secondSession.lastInputAt = Date.now() - 1_000_000;
+    const namedSleeping = await world.command("lambda-who-sleeping", first.id, "the_chatroom", `@who ${second.actor}`);
+    expect(namedSleeping.op).toBe("result");
+    if (namedSleeping.op === "result") {
+      expect(namedSleeping.result).toEqual([
+        expect.objectContaining({ player: second.actor, connected: false, connected_seconds: null, last_login_at: expect.any(Number) })
+      ]);
+    }
+
+    const ways = await world.command("lambda-ways", first.id, "the_chatroom", "@ways");
+    expect(ways.op).toBe("result");
+    if (ways.op === "result") {
+      expect(ways.result).toMatchObject({ room: "the_chatroom", exits: expect.arrayContaining(["exit_living_room_southeast", "exit_living_room_south"]) });
+      expect(ways.observations).toContainEqual(expect.objectContaining({ type: "text", target: first.actor, text: expect.stringContaining("Obvious exits:") }));
+    }
+
+    const examine = await world.command("lambda-examine", first.id, "the_chatroom", "@examine lamp");
+    expect(examine.op).toBe("result");
+    if (examine.op === "result") {
+      expect(examine.result).toMatchObject({ target: "the_lamp", owner: "$wiz", obvious_verbs: expect.arrayContaining([expect.stringContaining("give")]) });
+      expect(examine.observations).toContainEqual(expect.objectContaining({ type: "text", target: first.actor, text: expect.stringContaining("Brass Lamp") }));
+    }
+
+    const join = await world.command("lambda-join", first.id, "the_chatroom", `@join ${second.actor}`);
+    expect(join.op).toBe("result");
+    if (join.op === "result") {
+      expect(join.result).toMatchObject({ room: "the_deck", from: "the_chatroom", target: second.actor, look_deferred: true });
+      expect(world.object(first.actor).location).toBe("the_deck");
+      expect(join.observations).toContainEqual(expect.objectContaining({ type: "text", target: first.actor, text: expect.stringContaining("You visit") }));
+    }
+  });
+
   it("surfaces idle/connected presence via $player:look_self and the substrate readers", async () => {
     const world = createWorld();
     const guest = world.auth("guest:idle-a");
@@ -2856,7 +2911,7 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "pending_orders")).toEqual([]);
     });
 
-    it("blocks-demo seeds the_weather in the chatroom and the_horoscope on the deck", () => {
+    it("blocks-demo seeds visible weather and horoscope blocks with useful look output", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["blocks-demo"]);
       // Weather panel: anchored in the chatroom, default config matches manifest seed.
@@ -2867,6 +2922,26 @@ describe("local catalogs", () => {
       expect(world.getProp("the_weather", "place")).toBe("Mountain View, CA");
       expect(world.getProp("the_weather", "units")).toBe("imperial");
       expect(world.getProp("the_weather", "forecast_hours")).toBe(12);
+      world.setProp("the_weather", "current", { kind: "scalar", value: 72, unit: "°F", label: "current_temperature" });
+      world.setProp("the_weather", "last_pushed_at", 1778073000000);
+      const weatherLook = await world.directCall("blocks-weather-look", "$wiz", "the_weather", "look_self", []);
+      expect(weatherLook.op).toBe("result");
+      if (weatherLook.op === "result") {
+        expect(weatherLook.result).toMatchObject({
+          title: "Temperature in Mountain View, CA: 72°F",
+          last_updated: 1778073000000,
+          description: expect.stringContaining("Last updated: 1778073000000")
+        });
+      }
+      const roomLook = await world.directCall("blocks-room-look", "$wiz", "the_chatroom", "look", []);
+      expect(roomLook.op).toBe("result");
+      if (roomLook.op === "result") {
+        expect(roomLook.result).toMatchObject({
+          contents: expect.arrayContaining([
+            expect.objectContaining({ id: "the_weather", title: "Temperature in Mountain View, CA: 72°F" })
+          ])
+        });
+      }
       // Horoscope machine: anchored on the deck, default rate limit + persona.
       expect(world.objects.has("the_horoscope")).toBe(true);
       expect(world.object("the_horoscope").parent).toBe("$horoscope_block");
@@ -2874,6 +2949,20 @@ describe("local catalogs", () => {
       expect(world.object("the_horoscope").anchor).toBe("the_deck");
       expect(world.getProp("the_horoscope", "rate_limit_seconds")).toBe(60);
       expect(world.getProp("the_horoscope", "system_prompt")).toMatch(/fortune-teller/i);
+      const horoscopeLook = await world.directCall("blocks-horoscope-look", "$wiz", "the_horoscope", "look_self", []);
+      expect(horoscopeLook.op).toBe("result");
+      if (horoscopeLook.op === "result") {
+        expect(horoscopeLook.result).toMatchObject({
+          status: "disconnected",
+          connected: false,
+          usage: expect.stringContaining("order Horoscope machine <sign or topic>")
+        });
+      }
+      const orderPlan = await world.directCall("blocks-horoscope-order-plan", "$wiz", "the_deck", "command_plan", ["order horoscope scorpio"]);
+      expect(orderPlan.op).toBe("result");
+      if (orderPlan.op === "result") {
+        expect(orderPlan.result).toMatchObject({ ok: true, target: "the_horoscope", verb: "order", args: ["scorpio"] });
+      }
     });
 
     it("$horoscope_block inherits the dispenser surface end-to-end", async () => {

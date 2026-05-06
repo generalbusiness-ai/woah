@@ -65,7 +65,8 @@ describe("runHoroscopeTick", () => {
       () => callReply({ ok: true, note: "note_1" }),
       () => callReply({ order_id: "ord_2", requester: "guest_6", request: "leo", ts: 1700000000001 }),
       () => callReply({ ok: true, note: "note_2" }),
-      () => callReply(null)
+      () => callReply(null),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
@@ -87,6 +88,9 @@ describe("runHoroscopeTick", () => {
 
     const deliver2 = calls[5];
     expect((deliver2.body as { args: unknown[] }).args).toEqual(["ord_2", "destiny calls."]);
+    const heartbeat = calls[7];
+    expect(heartbeat.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/set_properties");
+    expect((heartbeat.body as { args: [Record<string, unknown>] }).args[0]).toMatchObject({ last_pushed_at: expect.any(Number), last_error: null });
   });
 
   it("respects MAX_ORDERS_PER_TICK", async () => {
@@ -99,6 +103,7 @@ describe("runHoroscopeTick", () => {
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
       () => callReply({ ok: true }),
       () => callReply({ order_id: "ord_2", requester: "g", request: "x", ts: 2 }),
+      () => callReply({ ok: true }),
       () => callReply({ ok: true })
     ]);
 
@@ -114,7 +119,8 @@ describe("runHoroscopeTick", () => {
     const { fetchImpl, calls } = makeFetch([
       authReply,
       () => propertyReply("p"),
-      () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 })
+      () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
@@ -125,6 +131,8 @@ describe("runHoroscopeTick", () => {
     });
     // Plug never called :deliver.
     expect(calls.find((c) => c.url.includes("/calls/deliver"))).toBeUndefined();
+    const heartbeat = calls.find((c) => c.url.includes("/calls/set_properties"));
+    expect((heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error).toBe("model timeout");
   });
 
   it("does nothing if the queue is empty", async () => {
@@ -134,7 +142,8 @@ describe("runHoroscopeTick", () => {
     const { fetchImpl } = makeFetch([
       authReply,
       () => propertyReply("p"),
-      () => callReply(null)
+      () => callReply(null),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
@@ -151,7 +160,8 @@ describe("runHoroscopeTick", () => {
       () => propertyReply(null),
       () => callReply({ order_id: "ord_1", requester: "g", request: "scorpio", ts: 1 }),
       () => callReply({ ok: true }),
-      () => callReply(null)
+      () => callReply(null),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });

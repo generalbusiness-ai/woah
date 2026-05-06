@@ -74,7 +74,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": { "args": [], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": [] } },
           "source": "verb :look() rxd { return this:look_self(); }"
         },
         {

@@ -79,7 +79,8 @@ describe("runLoggedHoroscopeTick", () => {
       () => callReply({ ok: true, note: "note_1" }),
       () => callReply({ order_id: "ord_2", requester: "guest_6", request: "leo", ts: 2 }),
       () => callReply({ ok: true, note: "note_2" }),
-      () => callReply(null)
+      () => callReply(null),
+      () => callReply({ ok: true })
     ]);
 
     let tick = 1000;
@@ -122,7 +123,8 @@ describe("runLoggedHoroscopeTick", () => {
     const { fetchImpl } = makeFetch([
       authReply,
       () => propertyReply("p"),
-      () => callReply({ order_id: "ord_1", requester: "guest_x", request: "x", ts: 1 })
+      () => callReply({ order_id: "ord_1", requester: "guest_x", request: "x", ts: 1 }),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runLoggedHoroscopeTick(env, "cron", { fetchImpl });
@@ -150,7 +152,8 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
-      () => ({ status: 404, body: { error: { code: "E_OBJNF", message: "order not found" } } })
+      () => ({ status: 404, body: { error: { code: "E_OBJNF", message: "order not found" } } }),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runLoggedHoroscopeTick(env, "cron", { fetchImpl });
@@ -171,7 +174,8 @@ describe("runLoggedHoroscopeTick", () => {
     const { fetchImpl } = makeFetch([
       authReply,
       () => propertyReply("p"),
-      () => callReply(null)
+      () => callReply(null),
+      () => callReply({ ok: true })
     ]);
 
     const result = await runLoggedHoroscopeTick(env, "cron", { fetchImpl });
@@ -209,7 +213,8 @@ describe("runLoggedHoroscopeTick", () => {
     const { fetchImpl } = makeFetch([
       authReply,
       () => propertyReply("p"),
-      () => callReply(null)
+      () => callReply(null),
+      () => callReply({ ok: true })
     ]);
 
     await runLoggedHoroscopeTick(env, "cron", { fetchImpl });

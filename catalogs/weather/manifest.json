@@ -19,6 +19,32 @@
         { "name": "history", "type": "map", "default": {}, "perms": "r" },
         { "name": "writable_owner", "type": "list<str>", "default": ["place", "units", "forecast_hours"], "perms": "r" },
         { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error", "current", "forecast", "history"], "perms": "r" }
+      ],
+      "verbs": [
+        {
+          "name": "weather_line",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :weather_line() rxd { let current = this.current; let place = this.place; if (typeof(place) != \"string\" || !place) { place = \"this place\"; } if (typeof(current) == \"map\" && has(current, \"value\")) { let unit = \"\"; if (has(current, \"unit\") && current[\"unit\"]) { unit = current[\"unit\"]; } let label = \"Weather\"; if (has(current, \"label\") && current[\"label\"] == \"current_temperature\") { label = \"Temperature\"; } return label + \" in \" + place + \": \" + to_string(current[\"value\"]) + unit; } return \"Weather for \" + place + \": no current reading yet\"; }"
+        },
+        {
+          "name": "title",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :title() rxd { return this:weather_line(); }"
+        },
+        {
+          "name": "look_self",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :look_self() rxd { let line = this:weather_line(); let updated = this.last_pushed_at; let freshness = \"Last updated: never.\"; if (typeof(updated) == \"number\" && updated > 0) { freshness = \"Last updated: \" + to_string(updated) + \".\"; } let text = line + \". \" + freshness; if (this.last_error) { text = text + \" Error: \" + to_string(this.last_error) + \".\"; } return { id: this, title: line, description: text, current: this.current, forecast: this.forecast, history: this.history, last_pushed_at: updated, last_updated: updated, last_error: this.last_error, location: location(this) }; }"
+        }
       ]
     },
     {

@@ -152,6 +152,50 @@ const PLAYER_HOME_SOURCE = `verb :home() rxd {
   return dest;
 }`;
 
+const PLAYER_WAYS_SOURCE = `verb :ways(room_name) rxd {
+  let room = location(actor);
+  let requested = str_trim(room_name);
+  if (requested) {
+    let matched = $match:match_object(requested, room);
+    if (matched == $ambiguous_match) {
+      tell(actor, "I don't know which " + str_char(34) + requested + str_char(34) + " you mean.");
+      return null;
+    }
+    if (matched == $failed_match) {
+      tell(actor, "I don't see " + str_char(34) + requested + str_char(34) + " here.");
+      return null;
+    }
+    room = matched;
+  }
+  if (room == null || !isa(room, $room)) {
+    tell(actor, "You can only pry into the exits of a room.");
+    return null;
+  }
+  let exits = [];
+  let exit_map = room.exits;
+  for key in keys(exit_map) {
+    let exit = exit_map[key];
+    if (!(exit in exits)) {
+      let obvious = false;
+      try { obvious = exit.obvious; } except err { obvious = false; }
+      if (obvious) { exits = exits + [exit]; }
+    }
+  }
+  let labels = [];
+  for exit in exits {
+    let label = exit.name;
+    let aliases = [];
+    try { aliases = exit.aliases; } except err { aliases = []; }
+    if (length(aliases) > 0) { label = label + " (" + str_join(aliases, ", ") + ")"; }
+    labels = labels + [label];
+  }
+  let text = "";
+  if (length(labels) == 0) { text = "No obvious exits."; }
+  else { text = "Obvious exits: " + str_join(labels, ", ") + "."; }
+  tell(actor, text);
+  return { room: room, exits: exits, text: text };
+}`;
+
 export function createWorld(options: { repository?: WorldRepository & Partial<ObjectRepository>; catalogs?: readonly string[] | false } = {}): WooWorld {
   const world = new WooWorld(options.repository);
   const stored = options.repository?.load();
@@ -415,6 +459,30 @@ function seedUniversal(world: WooWorld): void {
     toolExposed: true,
     aliases: ["@home"],
     argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } }
+  });
+  native(world, "$player", "who_all", "player_who", "verb :who_all(names?) rxd { /* native: LambdaCore-style @who over connected players. */ }", {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["@who"],
+    argSpec: { args: ["names?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
+  });
+  native(world, "$player", "join_player", "player_join", "verb :join_player(name) rxd { /* native: LambdaCore-style @join <player>. */ }", {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["@join"],
+    argSpec: { args: ["name"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
+  });
+  sourceVerb(world, "$player", "ways", PLAYER_WAYS_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["@ways"],
+    argSpec: { args: ["room?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
+  });
+  native(world, "$player", "examine_detailed", "player_examine", "verb :examine_detailed(name) rxd { /* native: LambdaCore-style @examine with names, owner, description, contents, and obvious command verbs. */ }", {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["@exam*ine"],
+    argSpec: { args: ["name"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
   });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });

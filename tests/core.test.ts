@@ -420,6 +420,46 @@ describe("woo core", () => {
     }
   });
 
+  it("examines visible remote objects through host summaries instead of local object lookup", async () => {
+    const home = createWorld();
+    const remote = createWorld({ catalogs: false });
+    const session = home.auth("guest:remote-examine");
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["remote", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      ["remote_welcome_pin", "remote"]
+    ]);
+    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+
+    remote.createObject({ id: "remote_welcome_pin", name: "Remote Welcome Pin", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
+    remote.setProp("remote_welcome_pin", "description", "A pin hosted somewhere else.");
+    remote.setProp("remote_welcome_pin", "aliases", ["remote pin"]);
+    home.mirrorContents("the_chatroom", "remote_welcome_pin", true);
+    await home.directCall("remote-examine-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+
+    const examined = await home.directCall("remote-examine", session.actor, session.actor, "examine_detailed", ["remote pin"], { sessionId: session.id });
+
+    expect(examined.op).toBe("result");
+    if (examined.op === "result") {
+      expect(examined.result).toMatchObject({
+        target: "remote_welcome_pin",
+        owner: null,
+        remote: true,
+        aliases: ["remote pin"],
+        description: "A pin hosted somewhere else.",
+        obvious_verbs: []
+      });
+      expect(examined.observations).toContainEqual(expect.objectContaining({
+        type: "text",
+        target: session.actor,
+        text: expect.stringContaining("Remote Welcome Pin")
+      }));
+    }
+  });
+
   it("routes mounted-space direct observations to a remote room audience", async () => {
     const chat = createWorld();
     const pinboard = createWorld();

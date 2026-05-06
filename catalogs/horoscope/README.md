@@ -33,6 +33,21 @@ See [DESIGN.md](DESIGN.md) for design notes.
 | `system_prompt` | owner | Persona / instructions the LLM runs under. Inherited from `$dispenser_block`. |
 | `rate_limit_seconds` | owner | Per-requester order interval. Default 60s. Inherited from `$dispenser_block`. |
 | `pending_orders` | self | Queue of pending orders. Plug-managed. |
+| `last_pushed_at` | self | Plug heartbeat timestamp. `0` means the machine presents as disconnected. |
+| `last_error` | self | Last plug drain error, if any. |
+
+## Look Surface
+
+`:look_self()` reports `connected` / `disconnected`, queue count, and a
+usage line. From a room command surface, use:
+
+```text
+order horoscope scorpio
+order horoscope "the launch review"
+```
+
+The command returns a ticket immediately; the generated note appears when
+the plug next drains the queue.
 
 ## Provisioning
 
