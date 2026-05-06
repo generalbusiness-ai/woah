@@ -593,7 +593,7 @@ describe("local catalogs", () => {
     const left = await world.directCall("dubspace-out", actor, "the_dubspace", "out", []);
     expect(left.op).toBe("result");
     if (left.op === "result") {
-      expect(left.result).toEqual([]);
+      expect(left.result).toMatchObject({ room: "the_chatroom", operators: [], here_request: true, here: { id: "the_chatroom" } });
       expect(left.observations[0]).toMatchObject({ text: `${actorName} steps away from Dubspace.` });
     }
     expect(world.getProp("the_dubspace", "operators")).toEqual([]);

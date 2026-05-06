@@ -275,8 +275,26 @@ describe("scoped client projection", () => {
     });
     expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
     expect(body.here.exits.some((exit: { direction?: string }) => exit.direction === "south")).toBe(true);
+    expect(new Set(body.here.exits.map((exit: { id: string }) => exit.id)).size).toBe(body.here.exits.length);
     expect(body.here.props.secret_room_note).toBeNull();
+    expect(body.here.props.session_subscribers).toBeUndefined();
+    expect(body.here.present_actors.every((actor: { props?: unknown }) => actor.props === undefined)).toBe(true);
     expect(Array.isArray(body.inventory)).toBe(true);
+  });
+
+  it("keeps nested room snapshot summaries thin", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:scoped-thin-contents");
+    const entered = await world.directCall("scoped-thin-enter", session.actor, "the_deck", "enter", [], { sessionId: session.id });
+    expect(entered.op).toBe("result");
+
+    const body = await apiMe(world, session);
+    expect(body.here.id).toBe("the_deck");
+    expect(new Set(body.here.exits.map((exit: { id: string }) => exit.id)).size).toBe(body.here.exits.length);
+    expect(body.here.props.session_subscribers).toBeUndefined();
+    const pinboard = body.here.contents.find((item: { id?: string }) => item.id === "the_pinboard");
+    expect(pinboard).toBeDefined();
+    expect(pinboard.props).toBeUndefined();
   });
 
   it("serves scoped overlay snapshots without reading the full world state", async () => {
@@ -342,6 +360,21 @@ describe("scoped client projection", () => {
       here_request: true,
       look_deferred: true,
       here: { id: "the_deck", name: "Deck" }
+    });
+  });
+
+  it("adds here to feature-space leave results", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:feature-leave-result");
+    await world.directCall("feature-leave-result-enter", session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    const left = await world.directCall("feature-leave-result-out", session.actor, "the_dubspace", "out", [], { sessionId: session.id });
+    expect(left.op).toBe("result");
+    if (left.op !== "result") return;
+    expect(left.result).toMatchObject({
+      room: "the_chatroom",
+      here_request: true,
+      look_deferred: true,
+      here: { id: "the_chatroom", name: "Living Room" }
     });
   });
 

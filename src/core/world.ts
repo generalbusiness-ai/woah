@@ -1576,7 +1576,7 @@ export class WooWorld {
     if (currentHere !== here.id) return here;
     return {
       ...here,
-      present_actors: [...here.present_actors, await this.scopedObjectSummary(ctx.actor, ctx.actor, memo)]
+      present_actors: [...here.present_actors, this.thinScopedObjectSummary(await this.scopedObjectSummary(ctx.actor, ctx.actor, memo))]
     };
   }
 
@@ -1871,8 +1871,8 @@ export class WooWorld {
       features: roomSummary.features,
       description: roomSummary.description,
       exits,
-      present_actors: presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
-      contents: contentRefs.map((id) => contents[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
+      present_actors: presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item)),
+      contents: contentRefs.map((id) => contents[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item)),
       props: roomSummary.props
     };
   }
@@ -2007,7 +2007,10 @@ export class WooWorld {
   private localScopedObjectSummary(actor: ObjRef, objRef: ObjRef): ScopedObjectSummary {
     const obj = this.object(objRef);
     const props: Record<string, WooValue> = {};
-    for (const name of this.properties(objRef)) props[String(name)] = this.propOrNullForActor(actor, objRef, String(name));
+    for (const name of this.properties(objRef)) {
+      if (String(name) === "session_subscribers") continue;
+      props[String(name)] = this.propOrNullForActor(actor, objRef, String(name));
+    }
     const aliases = props.aliases;
     return {
       id: obj.id,
@@ -2021,6 +2024,11 @@ export class WooWorld {
       description: props.description ?? null,
       props
     };
+  }
+
+  private thinScopedObjectSummary(summary: ScopedObjectSummary): ScopedObjectSummary {
+    const { props: _props, catalogState: _catalogState, ...thin } = summary;
+    return thin;
   }
 
   private safeFeatureList(objRef: ObjRef): ObjRef[] {
@@ -2047,8 +2055,14 @@ export class WooWorld {
   private async exitSummariesForRoom(actor: ObjRef, room: ObjRef, memo: HostOperationMemo): Promise<RoomSnapshot["exits"]> {
     const raw = await this.propOrNullForActorAsync(actor, room, "exits", memo);
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-    const entries = Object.entries(raw as Record<string, WooValue>)
-      .filter((entry): entry is [string, ObjRef] => typeof entry[1] === "string")
+    const byExit = new Map<ObjRef, string>();
+    for (const [direction, exit] of Object.entries(raw as Record<string, WooValue>)) {
+      if (typeof exit !== "string") continue;
+      const existing = byExit.get(exit);
+      if (!existing || this.preferExitDirection(direction, existing)) byExit.set(exit, direction);
+    }
+    const entries = Array.from(byExit.entries())
+      .map(([exit, direction]): [string, ObjRef] => [direction, exit])
       .sort(([a], [b]) => a.localeCompare(b));
     return await Promise.all(entries.map(async ([direction, exit]) => {
       const summary = await this.scopedObjectSummary(actor, exit, memo);
@@ -2061,6 +2075,15 @@ export class WooWorld {
         dest: typeof dest === "string" ? dest : null
       };
     }));
+  }
+
+  private preferExitDirection(candidate: string, current: string): boolean {
+    const canonical = new Set(["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest", "out"]);
+    const candidateCanonical = canonical.has(candidate);
+    const currentCanonical = canonical.has(current);
+    if (candidateCanonical !== currentCanonical) return candidateCanonical;
+    if (candidate.length !== current.length) return candidate.length > current.length;
+    return candidate.localeCompare(current) < 0;
   }
 
   async builderCreateObject(actor: ObjRef, parentRef: ObjRef, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {

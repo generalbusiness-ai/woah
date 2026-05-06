@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -218,7 +218,7 @@
               "origin?"
             ]
           },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = $match:match_verb(\"hear_parent_announce\", item); if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = null; try { matched = $match:match_verb(\"hear_parent_announce\", item); } except err { matched = null; } if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
         },
         {
           "name": "match_exit",
@@ -790,7 +790,7 @@
               "actor?"
             ]
           },
-          "source": "verb :leave(who) rxd { moveto(actor, actor.home); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); let remaining = []; for s in this.subscribers { if (s != actor) { remaining = remaining + [s]; } } return remaining; }"
+          "source": "verb :leave(who) rxd { let dest = actor.home; if (dest == null) { dest = $nowhere; } moveto(actor, dest); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); let remaining = []; for s in this.subscribers { if (s != actor) { remaining = remaining + [s]; } } return { room: dest, present_actors: remaining, here_request: true, look_deferred: true }; }"
         },
         {
           "name": "huh",

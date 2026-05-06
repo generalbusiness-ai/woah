@@ -588,6 +588,12 @@ client can replace the production UI end to end. During that bridge window,
 opening a non-chat tool surface intentionally falls back to the legacy
 `/api/state` model.
 
+Room snapshots intentionally keep full props only on the immediate `here`
+room. Nested `contents`, `present_actors`, and `exits` use thin summaries
+without `props`, and scoped props omit `session_subscribers` because session ids
+are transport internals rather than UI projection data. Exits are deduped by
+exit object id so alias-heavy exit maps do not inflate `here.exits`.
+
 ### Phase 4: migrate controls and overlays
 
 Status: initial overlay-snapshot bridge implemented.
@@ -623,10 +629,10 @@ framework reads for pinboard/taskspace renderers and proper observation
 reducers for task creation/movement and pin add/delete/text edits.
 Bundled demo object ids are used only as a transitional route allowlist; custom
 installed worlds need a runtime scoped-route feed before their object URLs can
-default to scoped mode. The `leave` path still has a small `markLeftChatRoom`
-helper parallel to `applyScopedMoveResult`; once leave verbs return a scoped
-snapshot or explicit `$nowhere` location, that should collapse into the same
-move-result path.
+default to scoped mode. Chat, dubspace, and pinboard `leave`/`out` verbs now
+return move-shaped results with `here_request`; the client-side
+`markLeftChatRoom` helper is still present as migration glue and can be
+collapsed into the ordinary move-result path.
 
 - Finish dubspace by moving object-id/frame assembly out of `state.world`.
 - Migrate pinboard rendering to generic projection state.
