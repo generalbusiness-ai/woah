@@ -1,0 +1,30 @@
+name = "woo-horoscope-plug"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Drain the queue every minute. The block's :order verb optionally emits a
+# directed `text` wakeup; that path can land later as a websocket-attached
+# variant. For the demo, one-minute polling is fine.
+[triggers]
+crons = ["* * * * *"]
+
+# Workers AI binding. Free-tier daily-neuron quota covers the demo easily.
+[ai]
+binding = "AI"
+
+# Required environment variables (set via `wrangler secret put` for secrets):
+#   WOO_BASE_URL          - e.g. https://woo.example.com
+#   WOO_APIKEY            - secret. apikey:<id>:<secret> minted via :mint_apikey
+#   BLOCK_ID              - canonical block id, e.g. the_horoscope_block
+#   MAX_TOKENS            - optional, defaults to 350
+#   MAX_ORDERS_PER_TICK   - optional, defaults to 10
+#
+# Provisioning:
+#   wrangler secret put WOO_APIKEY
+#   wrangler deploy
+[vars]
+# WOO_BASE_URL = "https://woo.example.com"
+# BLOCK_ID = "the_horoscope_block"
+# MAX_TOKENS = "350"
+# MAX_ORDERS_PER_TICK = "10"

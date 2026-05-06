@@ -1,0 +1,42 @@
+{
+  "name": "weather",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "Weather block class — a $block subclass that displays current conditions, a forecast, and recent history for a configured place. Owner sets `place`, `units`, and `forecast_hours`; an external plug Worker (catalogs/weather/plug) fetches tomorrow.io on a schedule and pushes data via apikey-bound session.",
+  "license": "MIT",
+  "depends": ["@local:block"],
+  "classes": [
+    {
+      "local_name": "$weather_block",
+      "parent": "$block",
+      "description": "A weather display block. The owner configures `place` (a location string the upstream API understands, e.g. \"Mountain View, CA\"), `units` (\"metric\" or \"imperial\"), and `forecast_hours` (how many hours of forecast to surface). The plug pushes `current` as a scalar shape (headline temperature), `forecast` as a table (hourly), and `history` as a series. `last_pushed_at` and `last_error` ride the standard $block writable_self surface so :look surfaces freshness.",
+      "properties": [
+        { "name": "place", "type": "str", "default": "", "perms": "r" },
+        { "name": "units", "type": "str", "default": "metric", "perms": "r" },
+        { "name": "forecast_hours", "type": "int", "default": 12, "perms": "r" },
+        { "name": "current", "type": "map", "default": {}, "perms": "r" },
+        { "name": "forecast", "type": "map", "default": {}, "perms": "r" },
+        { "name": "history", "type": "map", "default": {}, "perms": "r" }
+      ],
+      "writable_owner": ["place", "units", "forecast_hours"],
+      "writable_self": ["last_pushed_at", "last_error", "current", "forecast", "history"]
+    },
+    {
+      "local_name": "$weather_block_metadata",
+      "parent": "$root",
+      "description": "Metadata holder for the weather catalog: keeps the default summary_props list separate from the live class so plug installers and UI introspection can read it without colliding with subclass overrides.",
+      "properties": [
+        { "name": "summary_props", "type": "list<str>", "default": ["current"], "perms": "r" }
+      ]
+    }
+  ],
+  "seed_hooks": [
+    {
+      "kind": "set_property",
+      "object": "$weather_block",
+      "property": "summary_props",
+      "value": ["current"],
+      "mode": "set"
+    }
+  ]
+}

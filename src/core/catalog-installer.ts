@@ -24,6 +24,20 @@ type CatalogObjectDef = {
   description?: string;
   properties?: CatalogPropertyDef[];
   verbs?: CatalogVerbDef[];
+  /** Names of properties that the class's `:set_property[ies]` verb (or
+   * other catalog-level write verbs) should permit the *owner* of an
+   * instance to write. Used by the $block tiered-write design: owner
+   * sets config knobs (e.g. weather block's `place`), the catalog's
+   * verb body consults this list to gate the write. The substrate just
+   * persists the list as a wizard-owned, public-read property on the
+   * class object so the woocode can read it via `this.writable_owner`. */
+  writable_owner?: string[];
+  /** Names of properties that the class's write verbs should permit
+   * "self" — i.e. the class's actor instance authenticated as itself —
+   * to write. The plug authenticates as the block actor and writes
+   * `current` / `forecast` / etc. via apikey. The catalog verb body
+   * checks `caller == this` against this list. */
+  writable_self?: string[];
 };
 
 type CatalogPropertyDef = {
@@ -468,6 +482,8 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
   const localSeeds = new Map<string, ObjRef>();
   const objectDefs = [...(manifest.classes ?? []), ...(manifest.features ?? [])];
   for (const def of objectDefs) localObjects.set(def.local_name, def.local_name);
+  const manifestDefs = new Map<string, CatalogObjectDef>(objectDefs.map((def) => [def.local_name, def]));
+  for (const def of objectDefs) validateWritabilityTiers(def, world, manifestDefs);
 
   for (const def of objectDefs) {
     const id = def.local_name;
@@ -475,6 +491,7 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
     world.createObject({ id, name: id, parent, owner: actor });
     setDescriptionIfEmpty(world, id, catalogDescription(def.description, id, manifest.name));
     for (const property of def.properties ?? []) installProperty(world, id, property, actor);
+    persistWritabilityTiers(world, id, def, actor);
     for (const verb of def.verbs ?? []) installVerbDef(world, id, verb, actor, allowImplementationHints, false);
   }
 
@@ -547,6 +564,8 @@ export function planCatalogSchemaMigration(world: WooWorld, manifest: CatalogMan
   const localSeeds = new Map<string, ObjRef>();
   const objectDefs = [...(manifest.classes ?? []), ...(manifest.features ?? [])];
   for (const def of objectDefs) localObjects.set(def.local_name, def.local_name);
+  const planManifestDefs = new Map<string, CatalogObjectDef>(objectDefs.map((def) => [def.local_name, def]));
+  for (const def of objectDefs) validateWritabilityTiers(def, world, planManifestDefs);
   const steps: CatalogSchemaPlanStep[] = [];
 
   for (const def of objectDefs) {
@@ -837,6 +856,7 @@ function applyCatalogSchemaPlanStep(
         world.chparentAuthoredObject(context.actor, step.object, parent);
       }
       setDescriptionIfEmpty(world, step.object, catalogDescription(step.def.description, step.object, manifest.name));
+      persistWritabilityTiers(world, step.object, step.def, context.actor);
       return;
     }
     case "ensure_property_def":
@@ -1489,6 +1509,164 @@ function setDescriptionIfEmpty(world: WooWorld, obj: ObjRef, description: string
   const existing = world.propOrNull(obj, "description");
   if (typeof existing === "string" && existing.length > 0) return;
   world.setProp(obj, "description", description);
+}
+
+// Property names that must not appear in writable_owner / writable_self.
+// `owner` is intrinsically read-only at the substrate layer; the rest are
+// either intrinsic fields (`name`, `description`, `aliases`, `flags`,
+// `parent`, `location`, `anchor`, `home`) routed through dedicated verbs,
+// or the tier-list properties themselves (preventing self-reference). The
+// list is closed; extending it requires an updated $block design note.
+const RESERVED_TIER_PROPERTY_NAMES: ReadonlySet<string> = new Set([
+  "owner",
+  "name",
+  "description",
+  "aliases",
+  "flags",
+  "parent",
+  "location",
+  "anchor",
+  "home",
+  "writable_owner",
+  "writable_self"
+]);
+
+// Validates the writable_owner / writable_self lists declared on a class
+// def. Throws E_CATALOG with a precise message on the first violation so
+// authoring tools can fix the manifest before install. Both lists must be
+// arrays of strings, disjoint from each other, drawn from the class's own
+// `properties` declaration OR an ancestor's property def (whether that
+// ancestor lives in the same manifest or already in the world), and free
+// of reserved names.
+function validateWritabilityTiers(
+  def: CatalogObjectDef,
+  world: WooWorld | undefined,
+  manifestDefs: Map<string, CatalogObjectDef>
+): void {
+  const owner = def.writable_owner;
+  const self = def.writable_self;
+  if (owner === undefined && self === undefined) return;
+  const declared = new Set((def.properties ?? []).map((property) => property.name));
+  const ownerSet = assertTierList(owner, "writable_owner", def.local_name);
+  const selfSet = assertTierList(self, "writable_self", def.local_name);
+  for (const name of [...ownerSet, ...selfSet]) {
+    if (RESERVED_TIER_PROPERTY_NAMES.has(name)) {
+      throw wooError(
+        "E_CATALOG",
+        `${def.local_name}: writability tier may not include reserved property "${name}"`,
+        { class: def.local_name, property: name }
+      );
+    }
+    if (!declared.has(name) && !ancestorPropertyExists(world, manifestDefs, def.parent, name)) {
+      throw wooError(
+        "E_CATALOG",
+        `${def.local_name}: writability tier references undeclared property "${name}"`,
+        { class: def.local_name, property: name }
+      );
+    }
+  }
+  for (const name of ownerSet) {
+    if (selfSet.has(name)) {
+      throw wooError(
+        "E_CATALOG",
+        `${def.local_name}: property "${name}" appears in both writable_owner and writable_self`,
+        { class: def.local_name, property: name }
+      );
+    }
+  }
+}
+
+// Walks the parent chain checking whether `name` is defined as a property
+// on any ancestor — either a class already installed in the world, or one
+// declared earlier in the same manifest (which has not been created yet
+// when validation runs). Returns false when the parent chain dead-ends in
+// neither place; that surfaces as the "undeclared property" error from
+// the caller. The same name appearing on the in-world ancestor and on
+// a same-manifest sibling is fine — both cases satisfy the predicate.
+function ancestorPropertyExists(
+  world: WooWorld | undefined,
+  manifestDefs: Map<string, CatalogObjectDef> | undefined,
+  parent: string,
+  name: string
+): boolean {
+  let current: string | null = parent;
+  // Defend against malformed manifests with a parent cycle by capping the
+  // walk at a generous depth.
+  for (let depth = 0; depth < 256 && current; depth += 1) {
+    const manifestDef: CatalogObjectDef | undefined = manifestDefs ? manifestDefs.get(current) : undefined;
+    if (manifestDef) {
+      if ((manifestDef.properties ?? []).some((property: CatalogPropertyDef) => property.name === name)) return true;
+      current = manifestDef.parent;
+      continue;
+    }
+    if (world && world.objects.has(current)) {
+      const obj = world.object(current);
+      if (obj.propertyDefs.has(name)) return true;
+      current = obj.parent;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+function assertTierList(list: string[] | undefined, field: string, klass: string): Set<string> {
+  if (list === undefined) return new Set();
+  if (!Array.isArray(list)) {
+    throw wooError("E_CATALOG", `${klass}: ${field} must be an array of property names`, { class: klass, field });
+  }
+  const seen = new Set<string>();
+  for (const name of list) {
+    if (typeof name !== "string" || name.length === 0) {
+      throw wooError("E_CATALOG", `${klass}: ${field} entries must be non-empty strings`, { class: klass, field, value: name as WooValue });
+    }
+    if (seen.has(name)) {
+      throw wooError("E_CATALOG", `${klass}: ${field} contains duplicate "${name}"`, { class: klass, field, property: name });
+    }
+    seen.add(name);
+  }
+  return seen;
+}
+
+// Persists writable_owner / writable_self as wizard-owned, public-read
+// properties on the class object. Catalog verb bodies read these via
+// `this.writable_owner` / `this.writable_self` to gate writes by tier.
+//
+// CRITICAL: instance reads of an inherited property fall through
+// `getProp` to the ancestor's *property def's defaultValue* — they do
+// NOT read the ancestor's own properties map. So the tier list has to
+// live in the def's defaultValue, not just in the class object's own
+// value, or `instance.writable_owner` returns []. We set both:
+// the def's defaultValue (so descendants inherit) and the class's own
+// value (so direct reads on the class itself are also up-to-date).
+//
+// A tier field is persisted on this class when the manifest declares
+// it explicitly, OR when no ancestor has the def yet. A subclass that
+// silently omits the field inherits the parent's def (and its
+// defaultValue) through the normal property chain — which is what
+// catalog authors expect when they want to extend rather than replace.
+// To narrow the inherited list, declare the field with the narrower
+// set; to drop it entirely, declare `[]`.
+//
+// Idempotent: re-publish bumps the def version and rewrites the value.
+function persistWritabilityTiers(world: WooWorld, obj: ObjRef, def: CatalogObjectDef, owner: ObjRef): void {
+  const target = world.object(obj);
+  const parent = target.parent;
+  for (const field of ["writable_owner", "writable_self"] as const) {
+    const declared = def[field] !== undefined;
+    if (!declared && ancestorPropertyExists(world, undefined, parent ?? "", field)) continue;
+    const value = (def[field] ?? []).slice();
+    const existing = target.propertyDefs.get(field);
+    world.defineProperty(obj, {
+      name: field,
+      defaultValue: value,
+      typeHint: "list<str>",
+      owner,
+      perms: "r",
+      version: existing ? existing.version + 1 : 1
+    });
+    world.setProp(obj, field, value);
+  }
 }
 
 function catalogDescription(description: string | undefined, subject: string, catalog: string): string {

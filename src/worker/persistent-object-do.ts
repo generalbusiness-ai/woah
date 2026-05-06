@@ -847,6 +847,7 @@ export class PersistentObjectDO {
       session_current_location: session?.currentLocation ?? null,
       session_expires_at: session?.expiresAt ?? null,
       session_token_class: session?.tokenClass ?? null,
+      session_apikey_id: session?.apikeyId ?? null,
       actor: ctx.actor,
       player: ctx.player,
       caller: ctx.caller,
@@ -1083,7 +1084,8 @@ export class PersistentObjectDO {
           String(body.actor ?? "") as ObjRef,
           Number(body.expires_at ?? 0),
           body.token_class,
-          typeof body.current_location === "string" ? body.current_location as ObjRef : undefined
+          typeof body.current_location === "string" ? body.current_location as ObjRef : undefined,
+          typeof body.apikey_id === "string" ? body.apikey_id : null
         );
         const raw = body.message && typeof body.message === "object" && !Array.isArray(body.message)
           ? body.message as Record<string, unknown>
@@ -1107,7 +1109,8 @@ export class PersistentObjectDO {
           String(body.actor ?? "") as ObjRef,
           Number(body.expires_at ?? 0),
           body.token_class,
-          typeof body.current_location === "string" ? body.current_location as ObjRef : undefined
+          typeof body.current_location === "string" ? body.current_location as ObjRef : undefined,
+          typeof body.apikey_id === "string" ? body.apikey_id : null
         );
         const deferredHostEffects: DeferredHostEffect[] = [];
         const result = await world.directCall(
@@ -1128,7 +1131,8 @@ export class PersistentObjectDO {
           String(body.actor ?? "") as ObjRef,
           Number(body.expires_at ?? 0),
           body.token_class,
-          typeof body.current_location === "string" ? body.current_location as ObjRef : undefined
+          typeof body.current_location === "string" ? body.current_location as ObjRef : undefined,
+          typeof body.apikey_id === "string" ? body.apikey_id : null
         );
         const space = String(body.space ?? "") as ObjRef;
         if (!world.hasPresence(session.actor, space)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
@@ -1239,7 +1243,8 @@ export class PersistentObjectDO {
             actor,
             Number(rawCtx.session_expires_at ?? 0),
             rawCtx.session_token_class,
-            typeof rawCtx.session_current_location === "string" ? rawCtx.session_current_location as ObjRef : undefined
+            typeof rawCtx.session_current_location === "string" ? rawCtx.session_current_location as ObjRef : undefined,
+            typeof rawCtx.session_apikey_id === "string" ? rawCtx.session_apikey_id : null
           );
         }
         const message = rawCtx.message && typeof rawCtx.message === "object" && !Array.isArray(rawCtx.message)
@@ -1362,12 +1367,14 @@ export class PersistentObjectDO {
     actor: ObjRef,
     expiresAt: number,
     rawTokenClass: unknown,
-    currentLocation?: ObjRef | null
+    currentLocation?: ObjRef | null,
+    apikeyId?: string | null
   ): Session {
     if (!sessionId || !actor) throw wooError("E_NOSESSION", "internal forwarded call requires session and actor");
     this.ensureInternalActor(world, actor);
     const tokenClass: Session["tokenClass"] = rawTokenClass === "guest" || rawTokenClass === "apikey" ? rawTokenClass : "bearer";
-    return world.ensureSessionForActor(sessionId, actor, tokenClass, Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined, currentLocation);
+    const apikeyIdValue = typeof apikeyId === "string" && apikeyId.length > 0 ? apikeyId : undefined;
+    return world.ensureSessionForActor(sessionId, actor, tokenClass, Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined, currentLocation, apikeyIdValue);
   }
 
   private ensureInternalActor(world: WooWorld, actor: ObjRef): void {
@@ -1398,7 +1405,8 @@ export class PersistentObjectDO {
           actor: session.actor,
           expires_at: session.expiresAt,
           token_class: session.tokenClass,
-          current_location: session.currentLocation
+          current_location: session.currentLocation,
+          apikey_id: session.apikeyId ?? null
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
@@ -1435,7 +1443,8 @@ export class PersistentObjectDO {
         internalActor as ObjRef,
         Number(request.headers.get("x-woo-internal-expires-at") ?? 0),
         request.headers.get("x-woo-internal-token-class"),
-        request.headers.get("x-woo-internal-current-location") as ObjRef | null
+        request.headers.get("x-woo-internal-current-location") as ObjRef | null,
+        request.headers.get("x-woo-internal-apikey-id")
       );
     }
     const header = request.headers.get("authorization") ?? "";
@@ -1709,6 +1718,7 @@ export class PersistentObjectDO {
       expires_at: local?.expiresAt ?? Date.now() + 5 * 60_000,
       token_class: local?.tokenClass ?? "bearer",
       current_location: local?.currentLocation ?? null,
+      ...(local?.apikeyId !== undefined ? { apikey_id: local.apikeyId } : {}),
       ...extra
     };
   }

@@ -1,0 +1,16 @@
+{
+  "name": "horoscope",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory carrying the generated text.",
+  "license": "MIT",
+  "depends": ["@local:dispenser"],
+  "classes": [
+    {
+      "local_name": "$horoscope_block",
+      "parent": "$dispenser_block",
+      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, and calls :deliver to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
+      "properties": []
+    }
+  ]
+}

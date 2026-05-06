@@ -14,6 +14,11 @@ type SessionRoute = {
   expires_at: number;
   token_class: Session["tokenClass"];
   current_location: ObjRef | null;
+  /** apikey record id when this session was minted from an apikey. Threaded
+   * through Directory so cross-host routed copies can learn the apikey id
+   * (and so revokeApiKey on a sibling host can tear them down). null for
+   * guest/bearer-class sessions. */
+  apikey_id: string | null;
   updated_at: number;
 };
 
@@ -70,6 +75,7 @@ export class DirectoryDO {
           expires_at: Number(body.expires_at ?? 0),
           token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
           current_location: typeof body.current_location === "string" ? body.current_location as ObjRef : null,
+          apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
           updated_at: Date.now()
         });
         return json({ ok: true });
@@ -109,6 +115,7 @@ export class DirectoryDO {
         expires_at INTEGER NOT NULL,
         token_class TEXT NOT NULL,
         current_location TEXT,
+        apikey_id TEXT,
         updated_at INTEGER NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS directory_meta (
@@ -119,6 +126,7 @@ export class DirectoryDO {
       this.state.storage.sql.exec(stmt);
     }
     this.ensureColumn("session_route", "current_location", "TEXT");
+    this.ensureColumn("session_route", "apikey_id", "TEXT");
   }
 
   private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): void {
@@ -149,12 +157,13 @@ export class DirectoryDO {
   private registerSession(session: SessionRoute): void {
     if (!session.session_id || !session.actor || !Number.isFinite(session.expires_at)) return;
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO session_route(session_id, actor, expires_at, token_class, current_location, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO session_route(session_id, actor, expires_at, token_class, current_location, apikey_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
       session.actor,
       session.expires_at,
       session.token_class,
       session.current_location,
+      session.apikey_id,
       Date.now()
     );
   }
@@ -167,7 +176,7 @@ export class DirectoryDO {
   private resolveSession(sessionId: string): SessionRoute | null {
     if (!sessionId) return null;
     const row = firstRow(this.state.storage.sql.exec(
-      "SELECT session_id, actor, expires_at, token_class, current_location, updated_at FROM session_route WHERE session_id = ?",
+      "SELECT session_id, actor, expires_at, token_class, current_location, apikey_id, updated_at FROM session_route WHERE session_id = ?",
       sessionId
     ));
     if (!row) return null;
@@ -182,6 +191,7 @@ export class DirectoryDO {
       expires_at: expiresAt,
       token_class: row.token_class === "guest" || row.token_class === "apikey" ? row.token_class : "bearer",
       current_location: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
+      apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
       updated_at: Number(row.updated_at)
     };
   }

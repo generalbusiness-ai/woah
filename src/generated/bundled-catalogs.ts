@@ -2,14 +2,19 @@
 // Do not hand-edit. Bundled catalogs are discovered from catalogs/*/manifest.json.
 
 import type { CatalogManifest } from "../core/catalog-installer";
-import manifest0 from "../../catalogs/chat/manifest.json";
-import manifest1 from "../../catalogs/demoworld/manifest.json";
-import manifest2 from "../../catalogs/dubspace/manifest.json";
-import manifest3 from "../../catalogs/help/manifest.json";
-import manifest4 from "../../catalogs/note/manifest.json";
-import manifest5 from "../../catalogs/pinboard/manifest.json";
-import manifest6 from "../../catalogs/prog/manifest.json";
-import manifest7 from "../../catalogs/taskspace/manifest.json";
+import manifest0 from "../../catalogs/block/manifest.json";
+import manifest1 from "../../catalogs/blocks-demo/manifest.json";
+import manifest2 from "../../catalogs/chat/manifest.json";
+import manifest3 from "../../catalogs/demoworld/manifest.json";
+import manifest4 from "../../catalogs/dispenser/manifest.json";
+import manifest5 from "../../catalogs/dubspace/manifest.json";
+import manifest6 from "../../catalogs/help/manifest.json";
+import manifest7 from "../../catalogs/horoscope/manifest.json";
+import manifest8 from "../../catalogs/note/manifest.json";
+import manifest9 from "../../catalogs/pinboard/manifest.json";
+import manifest10 from "../../catalogs/prog/manifest.json";
+import manifest11 from "../../catalogs/taskspace/manifest.json";
+import manifest12 from "../../catalogs/weather/manifest.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -17,12 +22,17 @@ export type BundledCatalogEntry = {
 };
 
 export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
-  { path: "catalogs/chat/manifest.json", manifest: manifest0 as unknown as CatalogManifest },
-  { path: "catalogs/demoworld/manifest.json", manifest: manifest1 as unknown as CatalogManifest },
-  { path: "catalogs/dubspace/manifest.json", manifest: manifest2 as unknown as CatalogManifest },
-  { path: "catalogs/help/manifest.json", manifest: manifest3 as unknown as CatalogManifest },
-  { path: "catalogs/note/manifest.json", manifest: manifest4 as unknown as CatalogManifest },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest5 as unknown as CatalogManifest },
-  { path: "catalogs/prog/manifest.json", manifest: manifest6 as unknown as CatalogManifest },
-  { path: "catalogs/taskspace/manifest.json", manifest: manifest7 as unknown as CatalogManifest }
+  { path: "catalogs/block/manifest.json", manifest: manifest0 as unknown as CatalogManifest },
+  { path: "catalogs/blocks-demo/manifest.json", manifest: manifest1 as unknown as CatalogManifest },
+  { path: "catalogs/chat/manifest.json", manifest: manifest2 as unknown as CatalogManifest },
+  { path: "catalogs/demoworld/manifest.json", manifest: manifest3 as unknown as CatalogManifest },
+  { path: "catalogs/dispenser/manifest.json", manifest: manifest4 as unknown as CatalogManifest },
+  { path: "catalogs/dubspace/manifest.json", manifest: manifest5 as unknown as CatalogManifest },
+  { path: "catalogs/help/manifest.json", manifest: manifest6 as unknown as CatalogManifest },
+  { path: "catalogs/horoscope/manifest.json", manifest: manifest7 as unknown as CatalogManifest },
+  { path: "catalogs/note/manifest.json", manifest: manifest8 as unknown as CatalogManifest },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest9 as unknown as CatalogManifest },
+  { path: "catalogs/prog/manifest.json", manifest: manifest10 as unknown as CatalogManifest },
+  { path: "catalogs/taskspace/manifest.json", manifest: manifest11 as unknown as CatalogManifest },
+  { path: "catalogs/weather/manifest.json", manifest: manifest12 as unknown as CatalogManifest }
 ];

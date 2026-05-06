@@ -249,6 +249,10 @@ export type Session = {
    * and WS/REST ingress for op: call | direct | input. Drives the LambdaMOO-
    * shaped `idle_seconds` / `is_connected` builtins. */
   lastInputAt: number;
+  /** The apikey record id this session was minted from, when tokenClass is
+   * "apikey". Lets revokeApiKey close live sessions whose credential was
+   * just revoked, instead of leaving them usable until expiry. */
+  apikeyId?: string;
 };
 
 export type CompileDiagnostic = {

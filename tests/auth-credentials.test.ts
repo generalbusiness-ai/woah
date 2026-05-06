@@ -111,29 +111,133 @@ describe("auth credentials: $system:set_object_flags / mint_session_for / api ke
     expectError(() => world.auth(`apikey:malformed`), "E_NOSESSION");
   });
 
-  it("revokeApiKey blocks future auths but does not invalidate existing sessions", () => {
+  it("revokeApiKey blocks future auths and closes sessions minted from the key", () => {
     const world = createWorld({ catalogs: false });
     const target = makeActor(world);
     const key = world.createApiKey("$wiz", target, null);
     const sess = world.auth(`apikey:${key.id}:${key.secret}`);
+    expect(sess.apikeyId).toBe(key.id);
     expect(world.revokeApiKey("$wiz", key.id)).toBe(true);
+    // Already-revoked records report false to disambiguate from "never existed".
     expect(world.revokeApiKey("$wiz", key.id)).toBe(false);
     expectError(() => world.auth(`apikey:${key.id}:${key.secret}`), "E_NOSESSION");
-    const resumed = world.auth(`session:${sess.id}`);
-    expect(resumed.id).toBe(sess.id);
+    // The session minted under the revoked key is gone — resume fails.
+    expectError(() => world.auth(`session:${sess.id}`), "E_NOSESSION");
   });
 
-  it("listApiKeys returns metadata only and is wizard-only", () => {
+  it("only sessions for the revoked key are closed; sibling keys keep working", () => {
+    const world = createWorld({ catalogs: false });
+    const target = makeActor(world);
+    const keyA = world.createApiKey("$wiz", target, "a");
+    const keyB = world.createApiKey("$wiz", target, "b");
+    const sessA = world.auth(`apikey:${keyA.id}:${keyA.secret}`);
+    const sessB = world.auth(`apikey:${keyB.id}:${keyB.secret}`);
+    world.revokeApiKey("$wiz", keyA.id);
+    expectError(() => world.auth(`session:${sessA.id}`), "E_NOSESSION");
+    expect(world.auth(`session:${sessB.id}`).id).toBe(sessB.id);
+  });
+
+  it("authApiKey writes last_seen_at on the key record", () => {
+    const world = createWorld({ catalogs: false });
+    const target = makeActor(world);
+    const key = world.createApiKey("$wiz", target, null);
+    const before = Date.now();
+    world.auth(`apikey:${key.id}:${key.secret}`);
+    const stored = world.getProp("$system", "api_keys") as Record<string, Record<string, unknown>>;
+    expect(typeof stored[key.id].last_seen_at).toBe("number");
+    expect(stored[key.id].last_seen_at as number).toBeGreaterThanOrEqual(before);
+  });
+
+  it("listApiKeys returns last_seen_at and revoked_at metadata, and is wizard-only", () => {
     const world = createWorld({ catalogs: false });
     const target = makeActor(world);
     const key = world.createApiKey("$wiz", target, "label-1");
+    world.auth(`apikey:${key.id}:${key.secret}`);
+    world.revokeApiKey("$wiz", key.id);
     const keys = world.listApiKeys("$wiz");
-    expect(keys.find((k) => k.id === key.id)).toMatchObject({ id: key.id, actor: target, label: "label-1" });
+    expect(keys.find((k) => k.id === key.id)).toMatchObject({
+      id: key.id,
+      actor: target,
+      label: "label-1",
+      last_seen_at: expect.any(Number),
+      revoked_at: expect.any(Number)
+    });
     expect(JSON.stringify(keys)).not.toContain(key.secret);
     expect(JSON.stringify(keys)).not.toContain("hash");
     expect(JSON.stringify(keys)).not.toContain("salt");
     const guest = world.auth("guest:nonwiz").actor;
     expectError(() => world.listApiKeys(guest), "E_PERM");
+  });
+
+  describe("owner-scoped apikey ops (for $block:mint_apikey etc.)", () => {
+    function makeOwnedActor(world: ReturnType<typeof createWorld>, owner: string): string {
+      const id = `obj_test_owned_actor_${nextId++}`;
+      world.createObject({ id, name: id, parent: "$player", owner, location: null });
+      return id;
+    }
+
+    it("createApiKeyForOwner permits the owner of the target to mint", () => {
+      const world = createWorld({ catalogs: false });
+      const owner = world.auth("guest:block-owner").actor;
+      const block = makeOwnedActor(world, owner);
+      const key = world.createApiKeyForOwner(owner, block, "owner-mint");
+      expect(key.actor).toBe(block);
+      const sess = world.auth(`apikey:${key.id}:${key.secret}`);
+      expect(sess.actor).toBe(block);
+    });
+
+    it("createApiKeyForOwner rejects when caller is not owner and not wizard", () => {
+      const world = createWorld({ catalogs: false });
+      const owner = world.auth("guest:owner-a").actor;
+      const stranger = world.auth("guest:owner-b").actor;
+      const block = makeOwnedActor(world, owner);
+      expectError(() => world.createApiKeyForOwner(stranger, block, null), "E_PERM");
+    });
+
+    it("createApiKeyForOwner permits a wizard regardless of ownership", () => {
+      const world = createWorld({ catalogs: false });
+      const owner = world.auth("guest:owner-c").actor;
+      const block = makeOwnedActor(world, owner);
+      // Wizard bypasses; useful for admin reissue when an owner is gone.
+      const key = world.createApiKeyForOwner("$wiz", block, "wizard-mint");
+      expect(key.actor).toBe(block);
+    });
+
+    it("revokeApiKey allows the bound actor's owner (no wizard required)", () => {
+      const world = createWorld({ catalogs: false });
+      const owner = world.auth("guest:owner-d").actor;
+      const block = makeOwnedActor(world, owner);
+      const key = world.createApiKeyForOwner(owner, block, null);
+      const sess = world.auth(`apikey:${key.id}:${key.secret}`);
+      expect(world.revokeApiKey(owner, key.id)).toBe(true);
+      expectError(() => world.auth(`session:${sess.id}`), "E_NOSESSION");
+    });
+
+    it("revokeApiKey rejects callers who are neither owner nor wizard", () => {
+      const world = createWorld({ catalogs: false });
+      const owner = world.auth("guest:owner-e").actor;
+      const stranger = world.auth("guest:owner-f").actor;
+      const block = makeOwnedActor(world, owner);
+      const key = world.createApiKey("$wiz", block, null);
+      expectError(() => world.revokeApiKey(stranger, key.id), "E_PERM");
+    });
+
+    it("listApiKeysForOwner returns only keys for actors the caller owns", () => {
+      const world = createWorld({ catalogs: false });
+      const ownerA = world.auth("guest:owner-g").actor;
+      const ownerB = world.auth("guest:owner-h").actor;
+      const blockA = makeOwnedActor(world, ownerA);
+      const blockB = makeOwnedActor(world, ownerB);
+      const keyA = world.createApiKeyForOwner(ownerA, blockA, "for-a");
+      const keyB = world.createApiKeyForOwner(ownerB, blockB, "for-b");
+      const seenByA = world.listApiKeysForOwner(ownerA).map((k) => k.id);
+      expect(seenByA).toContain(keyA.id);
+      expect(seenByA).not.toContain(keyB.id);
+      // Wizard sees everything.
+      const seenByWiz = world.listApiKeysForOwner("$wiz").map((k) => k.id);
+      expect(seenByWiz).toContain(keyA.id);
+      expect(seenByWiz).toContain(keyB.id);
+    });
   });
 
   it("api keys persist across world serialize/reload", () => {
@@ -145,5 +249,22 @@ describe("auth credentials: $system:set_object_flags / mint_session_for / api ke
     const sess = reloaded.auth(`apikey:${key.id}:${key.secret}`);
     expect(sess.actor).toBe(target);
     expect(sess.tokenClass).toBe("apikey");
+  });
+
+  it("session.apikeyId survives serialize/hydrate so post-restart revoke still tears the session down", () => {
+    const world = createWorld({ catalogs: false });
+    const target = makeActor(world);
+    const key = world.createApiKey("$wiz", target, "rehydrate");
+    const sess = world.auth(`apikey:${key.id}:${key.secret}`);
+    expect(sess.apikeyId).toBe(key.id);
+    // Round-trip through full serialize/reload — emulates a DO restart.
+    const dump = world.exportWorld();
+    const reloaded = createWorldFromSerialized(dump, { persist: false });
+    // The hydrated session must still know which apikey minted it, or the
+    // revoke walk below would leave session:<id> usable until normal expiry.
+    const hydrated = reloaded.sessions.get(sess.id);
+    expect(hydrated?.apikeyId).toBe(key.id);
+    expect(reloaded.revokeApiKey("$wiz", key.id)).toBe(true);
+    expectError(() => reloaded.auth(`session:${sess.id}`), "E_NOSESSION");
   });
 });

@@ -1,0 +1,39 @@
+{
+  "name": "blocks-demo",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "Demo wiring for the $block pattern: drops a weather block in the chatroom (\"living room\") and a horoscope vending machine on the deck. Pure seed hooks — adds no classes or verbs of its own; the production system installs only the class catalogs and the operator can pick whether to also install this demo bundle.",
+  "license": "MIT",
+  "depends": ["@local:weather", "@local:horoscope", "@local:demoworld"],
+  "seed_hooks": [
+    {
+      "kind": "create_instance",
+      "class": "$weather_block",
+      "as": "the_weather",
+      "name": "Weather panel",
+      "description": "A small weather panel on the wall by the door. It hums faintly. The current temperature, today's forecast, and recent history glow in soft monochrome.",
+      "anchor": "the_chatroom",
+      "location": "the_chatroom",
+      "properties": {
+        "aliases": ["weather", "panel", "thermometer"],
+        "place": "Mountain View, CA",
+        "units": "imperial",
+        "forecast_hours": 12
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$horoscope_block",
+      "as": "the_horoscope",
+      "name": "Horoscope machine",
+      "description": "A small wooden cabinet with a brass crank and a paper-tape slot, set against the deck railing. Drop a sign or topic in and it produces a slip of paper for you. The machine hums when an order is in flight.",
+      "anchor": "the_deck",
+      "location": "the_deck",
+      "properties": {
+        "aliases": ["horoscope", "machine", "cabinet"],
+        "system_prompt": "You are a wry, slightly weary fortune-teller running a vending machine on a porch deck. Reply in two short sentences for the asker's sign or topic. Be specific, concrete, and a little dry — never moralize, never warn, never apologize.",
+        "rate_limit_seconds": 60
+      }
+    }
+  ]
+}

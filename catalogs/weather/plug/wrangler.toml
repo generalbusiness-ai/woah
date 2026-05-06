@@ -1,0 +1,27 @@
+name = "woo-weather-plug"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Hourly push. Each tick makes 2 tomorrow.io calls (realtime + forecast).
+# Tomorrow.io free plan: 25 calls/hour, 500 calls/day. So one block uses
+# 2 of 25 hourly and 48 of 500 daily — comfortable for one or two blocks per
+# API key, tight for a dozen. Bump to weekly cron or a paid plan if scaling.
+[triggers]
+crons = ["0 * * * *"]
+
+# Required environment variables (set via `wrangler secret put` for secrets):
+#   WOO_BASE_URL          - e.g. https://woo.example.com
+#   WOO_APIKEY            - secret. apikey:<id>:<secret> minted via :mint_apikey
+#   TOMORROW_IO_API_KEY   - secret. https://app.tomorrow.io/development/keys
+#   BLOCK_ID              - canonical block id, e.g. the_weather_block
+#   FORECAST_HOURS        - optional, defaults to 24
+#
+# Provisioning:
+#   wrangler secret put WOO_APIKEY
+#   wrangler secret put TOMORROW_IO_API_KEY
+#   wrangler deploy
+[vars]
+# WOO_BASE_URL = "https://woo.example.com"
+# BLOCK_ID = "the_weather_block"
+# FORECAST_HOURS = "24"

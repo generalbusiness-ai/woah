@@ -64,7 +64,13 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
       }
       const session = await host.authenticateToken(token);
       await host.onAuthenticated?.(session);
-      return jsonProtocol({ actor: session.actor, session: session.id, expires_at: session.expiresAt, token_class: session.tokenClass });
+      return jsonProtocol({
+        actor: session.actor,
+        session: session.id,
+        expires_at: session.expiresAt,
+        token_class: session.tokenClass,
+        ...(session.apikeyId !== undefined ? { apikey_id: session.apikeyId } : {})
+      });
     }
 
     if (request.method === "GET" && request.pathname === "/api/state") {
