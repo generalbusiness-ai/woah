@@ -35,9 +35,11 @@ upstream, only the plug authors them. But blocks can also be interactive in
 the normal woo sense:
 
 - **Config / control props** are owner-writable (`writable_owner`). The
-  weather block's `location`, the database block's `connection_alias`, a
-  vending machine's `prompt_template`. The plug observes its own block's
-  prop-write observations and reacts to control changes.
+  weather block's `place` (which city to fetch), the database block's
+  `connection_alias`, a vending machine's `prompt_template`. The plug
+  observes its own block's prop-write observations and reacts to control
+  changes. (Config props must not collide with substrate-reserved names
+  like `location`, `home`, `aliases`.)
 - **Query / command verbs** are public (or per-class). `:ask` forwards a
   free-form query to the plug. `:order` enqueues work for the plug. These
   create reactive plug behavior without bypassing the read-only-data
@@ -50,6 +52,29 @@ the normal woo sense:
 So the invariant is sharper: **the substrate doesn't author the data, but
 the substrate fully owns the surface**. That's what makes blocks composable
 with the rest of woo.
+
+### Relationship to the LambdaMOO interactive-toy idiom
+
+The "publishes state with rich in-world verbs and observations" part of
+`$block` is not new — it's the LambdaMOO interactive-toy pattern. A
+generic contraption (LambdaMOO `#4528`) ships verbs like `pull`,
+`activate`, `do_interaction` and per-instance state pools (charm shapes,
+colors, non sequiturs, year-by-year usage history); a player invokes a
+verb in-world, the contraption picks a new variant, updates state,
+announces. The Underground Cowsino (`#1249`) is the same idiom at room
+scale — 25 verbs and 25 properties for banking, accounts, games, all
+mutated in-world.
+
+What `$block` adds is the **external authenticated principal** writing
+data via apikey: a long-lived non-actor process pushes state into the
+object from outside. Everything else — anchored placement, subclass
+verbs, owner-set config, observations on state change, rich UI bound to
+properties — is just the toy pattern.
+
+Implication: don't re-invent the toy idiom. `$block` specializes it for
+the external-source case. Subclasses that want pure in-world
+interactivity (no plug, just verbs that mutate self-state) are doing
+exactly what generic contraption did, on the woo substrate.
 
 Plug connection modes:
 
@@ -82,10 +107,10 @@ this note but explicitly out of scope for now.
 **Demo instances**
 
 - **Weather block** (`$weather_block`, in the living room). Plug calls
-  `tomorrow.io` for the configured location; sets `current` (scalar),
-  `forecast` (series, hourly out N hours), `history` (series, hourly
-  back N hours), `last_pushed_at`. Scheduled mode: hourly push +
-  disconnect.
+  `tomorrow.io` for the configured `place` (an owner-writable string like
+  "Mountain View, CA"); sets `current` (scalar), `forecast` (series,
+  hourly out N hours), `history` (series, hourly back N hours),
+  `last_pushed_at`. Scheduled mode: hourly push + disconnect.
 - **Horoscope vending machine** (`$horoscope_block`, on the deck). A
   `$dispenser_block`. You `:order("scorpio")` (or some other prompt)
   and a few seconds later receive a `$note` containing the horoscope.
@@ -148,39 +173,71 @@ This is the single most important operational topic and gets its own
 section. Plug credentials live outside woo (in the Worker's environment)
 and the lifecycle has to be deliberate.
 
-### Token model
+### What's already there
 
-Today's `apikey:` is wizard-equivalent and not actor-scoped. Extend it:
+`apikey:` is already actor-bound:
 
-- Auth registry stores `apikey` records as
-  `(id, secret_hash, actor, label, created_at, last_seen_at?, revoked_at?)`.
-- `authenticate("apikey:<id>:<secret>")` returns a session whose `actor` is
-  the registered actor and whose perms are exactly that actor's perms.
-- A token can be wizard-bound (existing behavior) or actor-bound (new). For
-  blocks, the actor is the block itself.
-- Token format: opaque random secret. No JWT claims, no embedded perms.
-  All authority derives from the registry record's `actor`.
-- Server stores `secret_hash` (argon2 or scrypt). The plaintext secret is
-  visible exactly once: at mint time, in the response to `:mint_apikey`.
+- `$system.api_keys[<id>] = { hash, salt, actor, label, created_at }`
+  — actor field has been there from the start
+  (`src/core/world.ts:1005, 1014–1018`).
+- `authenticate("apikey:<id>:<secret>")` resolves the record and returns a
+  session via `createSessionForActor(actor, "apikey")`
+  (`src/core/world.ts:983–1002`). The session's perms are exactly the
+  actor's perms.
+- `$system:create_api_key(actor, label?)` and `:revoke_api_key(id)` exist
+  as wizard-only natives (`src/core/bootstrap.ts:404–406`).
+- Tokens are opaque random secrets; salt + hash on disk, plaintext shown
+  exactly once at mint.
 
-A plug session has exactly the block's perms — no more, no less. A
-compromised token can corrupt its block's data; nothing else.
+So **actor-bound apikey is not the blocker**. What still needs to land:
+
+### What's missing
+
+- **Owner minting.** `create_api_key` is `canBypassPerms`-gated (wizard
+  only). For blocks, the block's owner must be able to mint a key for
+  *that block's actor*. New verb on `$block`:
+  `:mint_apikey(label)` — caller must be `this.owner` or wizard, target
+  is `this`. Calls into a less-restrictive variant of `createApiKey` that
+  permits "owner of target" rather than "wizard only."
+- **Durable `revoked_at`.** Today `revoke_api_key` deletes the record
+  (`src/core/world.ts:1028`). For audit and observability, mark
+  `revoked_at: <ts>` instead and have `authApiKey` reject records with a
+  non-null `revoked_at`. List/inspect APIs return both live and revoked
+  records.
+- **Session teardown on revoke.** Today the doc-string explicitly says
+  "Existing sessions minted from this key persist until their TTL"
+  (`src/core/bootstrap.ts:405`). For a real revocation story (suspected
+  leak), revoke must walk the session table and close any session whose
+  apikey id matches. Add an `apikey_id` field on apikey-class sessions so
+  this lookup is O(sessions) and trivially correct.
+- **`last_seen_at`.** Each successful `authApiKey` should write
+  `record.last_seen_at = Date.now()`. Surfaces in `:list_apikeys` and on
+  the block's `:look` ("plug last seen 2 minutes ago"). Needed both for
+  ops debugging and as the durable basis for the freshness indicator
+  when a plug disconnects between pushes.
+- **KDF upgrade.** Today `hashSource` is a fast hash
+  (`src/core/world.ts:1000, 1012`). For credential storage that should be
+  argon2 or scrypt with sane parameters. Migration: existing records keep
+  the old hash format, are upgraded on next successful authenticate.
+- **Owner-facing UX.** The `$block:mint_apikey` flow should return the
+  secret in a structured form the owner can paste verbatim into
+  `wrangler secret put`. The block's `:look` should surface "configured /
+  active / stale / never seen" states cleanly. `:list_apikeys` for owner
+  scope (returns only keys for actors the caller owns).
 
 ### Provisioning flow
 
 Owner-driven. The block is the unit of credential management.
 
-1. Owner creates the block: `@create_instance $horoscope_block` (or
-   whatever authoring verbs are current).
-2. Owner sets configuration props: `:set_property("location", ...)`,
-   `:set_property("system_prompt", ...)`.
+1. Owner creates the block: `@create_instance $horoscope_block`.
+2. Owner sets configuration props: `:set_property("system_prompt", ...)`,
+   `:set_property("description", ...)`.
 3. Owner mints the plug credential:
    ```
    :mint_apikey(label: "horoscope-cf-worker-prod")
    → { id: "ak_…", secret: "…visible-once…" }
    ```
-4. Owner pastes the secret into the plug Worker's `wrangler.toml` /
-   `wrangler secret put`:
+4. Owner pastes the secret into the plug Worker's secret store:
    ```
    wrangler secret put WOO_APIKEY
    ```
@@ -193,9 +250,10 @@ owner missed it, mint again.
 
 ### Rotation
 
-`:rotate_apikey(old_id)` mints a new credential and revokes the old one.
-The owner redeploys the Worker with the new secret. Brief gap (seconds)
-during which the old credential is rejected and the new one is live.
+Two calls: `:mint_apikey` (creates new) followed by `:revoke_apikey(old_id)`
+once the new Worker deploy is live. The intermediate window (multiple keys
+active) is fine — the substrate is happy with N concurrent valid keys.
+Blue/green deploy is the natural pattern.
 
 Rotation triggers:
 
@@ -278,28 +336,90 @@ Core `$block` verbs (most exposed via MCP `tool_exposed: true`):
   `E_TIMEOUT`. Most blocks don't need this and shouldn't pollute the agent
   tool list with it.
 
-Property writability tiers are **enumerated in the class manifest**:
+### Property writability tiers — what's actually new
+
+Property writes today are governed by per-property `r/w/c` permission
+letters and the property's `owner`, with wizard bypass. The principal
+that matters is the verb's `progr`, plus the calling actor for
+ownership-bypass. There is **no current notion of "the calling session's
+actor IS this object" or "the calling actor is this object's owner"** as
+a write-gate axis. So the tier model is a real schema and
+permission-model addition, not just a catalog declaration.
+
+Required pieces, in order of where they land:
+
+1. **Catalog manifest schema.** New optional keys on a class declaration:
+   ```json
+   {
+     "writable_owner": ["place", "units", "forecast_hours"],
+     "writable_self":  ["current", "forecast", "history",
+                        "last_pushed_at", "last_error"]
+   }
+   ```
+   Both lists name properties defined on the class (or inherited).
+   Subclass declarations *extend* the parent's lists; they don't replace
+   them.
+
+2. **Installer validation.** Catalog install rejects:
+   - Names that collide with substrate-reserved props (`location`,
+     `home`, `aliases`, `description`, `parent`, `owner`, `name`, etc.).
+   - Names not actually defined on the class chain.
+   - The same name appearing in both lists (each prop is in at most one
+     tier).
+   - A class that declares either tier but doesn't inherit from `$block`
+     (the tier model is `$block`-only).
+
+3. **Runtime enforcement point.** A new check in the property-write
+   pipeline (the `setPropForActor`-equivalent path), gated by class
+   inheritance from `$block`. Pseudo:
+   ```
+   if not isa(target, $block): use existing perm rules.
+   else if name in writable_self_chain(target):
+     allow iff session.actor == target  // plug case
+   else if name in writable_owner_chain(target):
+     allow iff session.actor == target.owner  // owner case
+   else:
+     fall through to existing perm rules.   // wizard, etc.
+   ```
+   The two new axes are "session.actor == target" and
+   "session.actor == target.owner" — neither exists as a perm primitive
+   today.
+
+4. **Tests.** Per tier:
+   - Plug-actor session can write `writable_self` props on its own
+     block, fails on others' blocks, fails on `writable_owner` props.
+   - Owner session can write `writable_owner` props on blocks they own,
+     fails on others' blocks, fails on `writable_self` props.
+   - Stranger fails on both tiers.
+   - Wizard bypasses both.
+   - Tier inheritance: subclass tiers union with parent tiers.
+   - Manifest-validation negatives: collision, undefined name, both-tier
+     name, non-`$block` class.
+
+5. **Migration.** New permission axis means existing `$block`-installed
+   instances (none yet) are fine; but if the tier defaults change later,
+   re-installs need to adjust. Spec the upgrade path now even though no
+   migrations are due in v1.
+
+### Property writability — short version
 
 ```json
 {
-  "writable_owner": ["location", "units", "forecast_hours", "label", "theme"],
+  "writable_owner": ["place", "units", "forecast_hours", "label"],
   "writable_self":  ["current", "forecast", "history", "last_pushed_at",
                      "last_error"]
 }
 ```
 
-- `writable_owner` — set by the block's owner (creator) at create / move /
-  reconfigure time. These are the per-class config knobs (the weather
-  block's location and units; the database block's connection alias).
-  Subclasses extend this list with class-specific config.
-- `writable_self` — set by the plug, authenticated as the block's actor.
-  These are the data props the UI renders.
-- Everything else (`home`, `aliases`, `description`, system props) — wizard
-  only. A compromised plug cannot overwrite these. A confused owner cannot
-  either.
+- `writable_owner` — owner sets, e.g. `place` and `units` on the weather
+  block. Subclasses extend.
+- `writable_self` — plug sets via apikey-bound session.
+- Everything else — wizard only. Substrate-reserved props
+  (`location`, `home`, `aliases`, `description`) cannot appear in
+  either list.
 
-`:set_property[ies]` consults the appropriate list based on the calling
-session's relationship to the block (owner vs self vs other). The substrate
+`:set_property[ies]` consults the lists based on the calling session's
+relationship to the block (owner vs self vs other). The substrate
 enforces; the catalog declares.
 
 ## Data shape vocabulary
@@ -345,13 +465,51 @@ Base `$block` property writes from the plug emit live observations:
 { type: "block_data", block: id, name, value, kind?, ts }
 ```
 
-Audience: the block and the room it anchors. Reducer (default): patch
-`projection.observe(block).props[name] = value`. Per-class reducers can do
-extra work (animations, derived props) but the default is one line.
+**Audience routing.** A block is an `$actor`, not a `$space`. Per
+`spec/semantics/events.md` §12.7, default audience is the source space if
+`observation.source` is a `$space` descendant, else the call's space
+argument. Without an explicit override, observations from a verb running
+on the block reach nobody — there's no room-shaped audience attached.
 
-Live route means: not in the space log, not sequenced, no replay. A reconnect
-just re-reads the current property values via `/api/me`'s `here.contents`
-summary plus on-demand `:get_data` fetches.
+`:set_property[ies]` therefore routes explicitly:
+
+```woo
+observe_to_space(location(this), {
+  type: "block_data", block: this, name, value, kind, ts: now()
+});
+```
+
+The block's containing room (`location(this)`) is the audience. People in
+the room see the data update; people elsewhere don't. This is a verb-body
+choice, not a substrate change — the primitive already exists.
+
+Reducer (default): patch `projection.observe(block).props[name] = value`.
+Per-class reducers can do extra work (animations, derived props) but the
+default is one line.
+
+Live route means: not in the space log, not sequenced, no replay. A
+reconnect just re-reads the current property values via `/api/me`'s
+`here.contents` summary plus on-demand `:get_data` fetches.
+
+**Plug receive path.** A plug session authenticated as the block actor is
+**not automatically subscribed** to the block's room. So `block_data`
+observations routed to `location(this)` don't reach the plug by default.
+That's correct: the plug doesn't need to receive its own writes.
+
+For events the plug *does* need (new orders on a dispenser block), use
+the **directed `text` observation** path
+(`spec/semantics/events.md §12.7.1`): `tell(this, payload)` queues a
+`text` observation to all sessions whose actor is `this` — i.e., all
+attached plug sessions, on whatever DO holds those sessions. This is
+already a substrate primitive and works cross-DO.
+
+The structured payload rides as the observation's body (a string with
+embedded JSON, since the v1 `text` shape is string-only). The plug
+parses it, treats it as a wakeup hint, and goes to the queue
+(`:next_pending` or `pending_orders`) for the authoritative read. A
+future spec amendment can add a directed-structured-event type if this
+proves common; for now the queue-as-truth design means string-shaped
+wakeups are sufficient.
 
 ### Sequencing is per-class
 
@@ -420,35 +578,31 @@ self-contained on the same provider as woo. Alternative hosting (GCP, a
 shared Python container, on-prem) remains possible — the WS API doesn't
 care where the plug runs — but isn't part of the build plan.
 
-## Agentic plugs
+## Agentic plugs and the queue-and-deliver pattern
 
-A plug is just an authenticated WS client; it can be:
+A plug is just an authenticated WS client. Deterministic (weather),
+reactive (database), or agentic (LLM-driven dispenser) — all identical
+from the substrate's view; only cadence and behavior differ.
 
-- **Deterministic** — scheduled fetch from a fixed API (weather block).
-- **Reactive** — listens for query observations on its block and answers
-  via `:answer` (database block).
-- **Agentic** — an LLM-driven chain. Receives a prompt observation, runs
-  whatever it wants outside woo (web search, code execution, model calls,
-  other tool use), produces an artifact, returns it through the block's
-  surface (vending machine).
+`fork` / `suspend` parking is planned but not yet in the VM. Even when
+it lands, cross-DO parking won't be the v1 shape (R6.2). Either way,
+the dispenser pattern below doesn't need it — and the entire pattern is
+woocode.
 
-From the substrate's view, all three are identical. The only difference is
-what the plug does with the data and how long the round-trip is. Latency
-budgets shift: a weather plug answers a `:ask` in <1s; a research-report
-plug takes 30s–5min and the verb has to be parked, not awaited.
+`pending_orders` on the block is the authoritative queue:
 
-The parked-task pattern (substrate-supported) is the right shape for any
-plug call whose answer is not immediately available:
+1. `:order(request)` appends a record, returns `{order_id, queued: true}`
+   synchronously.
+2. Plug session (connected as the block actor) sees the new work via
+   polling `pending_orders` or via a directed `text` wakeup hint
+   (`tell(this, payload)`). Wakeup is optional; queue is the truth.
+3. Plug processes outside woo, calls `:deliver(order_id, body)`.
+4. `:deliver` removes the entry, creates a `$note`, moves it to the
+   orderer's inventory.
+5. The note arriving in the orderer's hand is the delivery signal.
 
-1. Public verb is invoked, parks the task with an `order_id`.
-2. Plug receives the order observation, starts work outside woo.
-3. Plug calls `:answer(order_id, payload)` (or `:deliver(...)` for
-   artifact-producing variants).
-4. The parked task wakes; the original caller's frame resolves.
-
-Timeout default: per-class (database `:ask`: 30s; vending `:order`: 10min).
-On timeout the parked task wakes with `E_TIMEOUT` and the plug should still
-be allowed to deliver later, just with the order marked stale.
+Idempotency: `:deliver` is keyed on `order_id`. Lost wakeups don't
+matter — the plug catches up from the queue on next poll.
 
 ## `$dispenser_block`: the artifact-producing subclass
 
@@ -457,30 +611,48 @@ rather than updating display data.
 
 **Added properties**
 
-- `writable_owner`: `system_prompt`. (Description is already on `$block`
-  via `writable_owner`'s base; subclasses extend if they need more.)
-- `writable_self` (plug): `pending_orders` (ephemeral; for `:status` lookups).
+- `writable_owner`: `system_prompt` (subclasses extend).
+- `writable_self` (plug-writable): `pending_orders` — a list of
+  `{order_id, requester, request, ts}` records. Authoritative queue.
 
 **Added verbs**
 
-- `:order(request)` — public. Parks the task. Emits sequenced
-  `{type: "order_placed", order_id, requester, request, ts}`.
-- `:deliver(order_id, body)` — plug-only. Creates a `$note` with `body`,
-  sets `produced_by = this`, moves to the requester's inventory, wakes
-  the parked task. Emits sequenced
-  `{type: "delivered", order_id, note: id, ts}`.
-- `:cancel(order_id)` — requester, owner, or wizard. Wakes the parked task
-  with `E_CANCELED`.
-- `:status(order_id)` — public. Returns state from `pending_orders`.
+- `:order(request)` — public. Appends a record to `pending_orders` with a
+  fresh `order_id`. Returns `{order_id, queued: true}` synchronously —
+  no parking, no awaiting plug work. Emits sequenced
+  `{type: "order_placed", order_id, requester, request, ts}` to the
+  block's containing room (`observe_to_space(location(this), …)`).
+  Optionally emits a directed `text` wakeup to `this` (the block actor)
+  so plug sessions see "new work" without waiting for the next poll
+  cycle. The wakeup is a hint; the queue is the truth.
+- `:deliver(order_id, body)` — plug-only (writable_self perms applied as
+  a verb-call gate). Idempotent on `order_id`. Removes the matching
+  entry from `pending_orders`, creates a `$note` with `body`, sets
+  `produced_by = this` and `produced_at = now()`, moves the note into
+  the original requester's inventory. Emits sequenced
+  `{type: "delivered", order_id, note: id, ts}` to
+  `location(this)`. The note's arrival in the orderer's inventory is
+  what they actually see; the sequenced event is for room bystanders
+  ("the machine just dispensed something for guest_5").
+- `:cancel(order_id)` — requester, owner, or wizard. Removes the entry;
+  emits `{type: "canceled", order_id, ts}`.
+- `:next_pending()` — plug-only. Returns the oldest queued record (or
+  `null`). Convenience for plugs that prefer pulling one item at a time
+  rather than walking the whole list.
+- `:status(order_id)` — public. Returns the queue entry, or
+  `{state: "unknown"}` if not present (it's been delivered or canceled).
 
 The output `$note` carries `produced_by` and `produced_at`. UI renders a
 "from: <block name>" chip that links back. That's it for the back-reference
 story in v1; richer note interactivity is open-ended.
 
-Order/deliver events are **sequenced** so a reconnect during an order
-doesn't lose it. Everything else stays live. Why a note instead of a
-self-prop: notes are portable, have UI/perms already, and survive multiple
-orders. The block is a thin producer.
+`order_placed` and `delivered` are **sequenced** so a reconnect during an
+order doesn't lose room-visible activity. The queue itself survives any
+disconnect — it's a real persisted property — so the plug catches up by
+reading state on next poll regardless of which observations it missed.
+
+Why a note instead of a self-prop: notes are portable, have UI/perms
+already, and survive multiple orders. The block is a thin producer.
 
 ### Horoscope demo
 
@@ -488,16 +660,27 @@ orders. The block is a thin producer.
 
 - The owner sets two things: `description` (what the machine looks like)
   and `system_prompt` (what persona it speaks with).
-- You `:order("scorpio")` (or whatever). The plug Worker reads
-  `system_prompt + request`, calls a tiny Workers AI model, calls
-  `:deliver` with the result.
-- A `$note` lands in your inventory.
+- You `:order("scorpio")` (or whatever). The verb returns immediately
+  with `{order_id, queued: true}`; your request is now in the block's
+  `pending_orders` queue.
+- The plug Worker (woken by a directed `text` hint or its own cron poll)
+  reads the next entry, runs `@cf/meta/llama-3.2-1b-instruct` on Workers
+  AI with `system_prompt + request`, calls `:deliver(order_id, body)`.
+- A `$note` lands in your inventory. That's the visible delivery.
 
-That's the whole demo. No `tone`, no `house_style`, no `follow_up_url`,
-no `model` knob — the plug picks the model, the prompt is whatever the
-owner wrote, the request is whatever the orderer typed. Adding knobs is
-trivial later if needed; the demo's job is to show the pattern works
-end-to-end.
+Model choice: `@cf/meta/llama-3.2-1b-instruct` is the smallest
+instruction-tuned text-generation model on Workers AI (1B params, ~$0.20
+per million output tokens). At ~300–400 tokens output per horoscope, one
+order costs roughly $0.0001 — negligible for the demo, well-shaped for
+"follow a small system prompt and produce a paragraph or two." If the
+output ever feels under-cooked we can move up to `llama-3.2-3b-instruct`
+without changing anything else.
+
+That's the whole demo. No `tone`, no `house_style`, no `follow_up_url`
+— the plug picks the prompt-and-request shape, the queue lives on the
+block, and the note in your hand is how you know it's done. The whole
+pattern is woocode plus a small
+Worker.
 
 ## Persistent-WS blocks: scaling
 
@@ -526,10 +709,25 @@ freshness need; the cost gradient is steep.
 A 10Hz plug writing five props per push = 50 writes/sec to one DO, into the
 range where storage becomes the bottleneck.
 
-Add an **ephemeral property tier**: properties marked `ephemeral: true` live
-in the DO's in-memory map only, never persist. On DO eviction they are gone;
-the plug's next push re-populates them. For high-rate live data this is the
-correct semantics — the data is upstream-of-truth, the block is a cache.
+The mitigation here is an **ephemeral property tier** — properties that
+live in the DO's in-memory map only, skipping persistence — but this is
+explicitly **not** demo-path work. It's a substrate feature, not a base-
+class flag, because it touches:
+
+- Repository serialization (skip writes for keys flagged ephemeral).
+- DO eviction semantics (in-memory only — values disappear on eviction
+  and reappear on next plug push).
+- `/api/me` / `RoomSnapshot` summary contents (do ephemeral values appear
+  in summaries served to a freshly-connecting client? probably yes, with
+  a "transient" marker so renderers can tell).
+- The client projection `observe()` layering (canonical layer holds
+  in-memory transients with no persisted backing; reconnect doesn't
+  revive them, only the next plug push does).
+
+Neither demo (weather hourly push, horoscope on-demand order) is in the
+high-rate regime that requires this. **Ephemeral is deferred** until a
+demo or workload genuinely needs it. The shape sketched here is for
+future reference:
 
 ```json
 "properties": [
@@ -538,8 +736,10 @@ correct semantics — the data is upstream-of-truth, the block is a cache.
 ]
 ```
 
-The substrate skips the storage write for ephemeral props. Cold DO returns
-last-persisted data + the "unplugged" indicator until the plug catches up.
+When the time comes: a property declared `ephemeral: true` skips the
+storage write, lives in memory until eviction, gets a transient flag in
+summaries; cold DO returns last-persisted (or absent) data with the
+"unplugged" indicator until the plug catches up.
 
 ### Observation fan-out
 
@@ -616,7 +816,7 @@ Without them the design's "own DO per block" choice is taken on faith.
 
 Block creation is just `@create_instance $weather_block`. The standard
 authoring/builder verbs apply. After creation, the owner sets configuration
-properties (`location`, `units`, ...) using `:set_property` (their session,
+properties (`place`, `units`, ...) using `:set_property` (their session,
 their actor as `caller`, the prop in `writable_owner`).
 
 Then the owner mints an apikey via `:mint_apikey()` and pastes the secret
@@ -624,7 +824,7 @@ into the plug Worker's secret store (see Credential management).
 `wrangler deploy` and the plug starts.
 
 Reconfiguration is the same path: `:set_property` on a config prop. If a
-config change requires the plug to re-fetch (e.g., `location` change),
+config change requires the plug to re-fetch (e.g., `place` change),
 either:
 
 - The plug subscribes to observations on its own block and reacts to a
@@ -644,24 +844,37 @@ class-specific UIs can override.
 
 Things to settle as the build lands. Most have a leaning already.
 
-1. **Apikey extension shape.** Extend existing `apikey:` records with an
-   `actor` column, or introduce a parallel `block:` token class. Lean
-   extend — fewer auth code paths.
+1. **Owner-mint authorization.** Today `$system:create_api_key` is
+   wizard-only via `canBypassPerms` (`src/core/world.ts:1006`). For
+   block-owner minting we either (a) split into a new
+   `createBlockApiKey(actor, target, label)` that permits "owner of
+   target," or (b) generalize `createApiKey` to accept an authorization
+   predicate. Lean (a) — narrower surface, easier to audit. Wizard
+   retains the broader `:create_api_key` for non-block actors.
 2. **Property schema validation.** Validate writes against declared kind?
    Lean yes — fails loud during plug development.
 3. **Summary vs detail size enforcement.** Substrate-enforced cap, or
    convention. Lean enforced (truncate-and-warn, not reject).
-4. **`:order` parking timeout default.** 60s for horoscope; class-level
-   override with a small default.
+4. **Order TTL default.** Entries in `pending_orders` that the plug
+   never picks up should expire — otherwise a long-offline plug
+   accumulates ghost orders. Lean: 1 hour TTL on horoscope (configurable
+   per-class). Expired entries get a `:deliver`-equivalent that produces
+   a "machine was unattended" note rather than silently vanishing.
 5. **Concurrent plug sessions per apikey.** Reject second connect (single
    active session per key) or allow many for blue/green deploy? Lean
    allow-many at the apikey level, single-session-per-block enforced
    separately if at all.
 6. **Who can mint a plug apikey?** Owner. Wizard override.
-7. **Ephemeral prop on plug detach.** Stay until DO eviction; UI marks
-   stale. Don't clear.
-8. **Reconfigure protocol.** Plug listens to its own block's observations
-   and reacts. No new typed event needed.
+7. **Ephemeral prop semantics** — deferred until needed. When it lands:
+   stay until DO eviction; UI marks stale; don't clear on detach. (Not
+   on the demo path; weather and horoscope persist normally.)
+8. **Reconfigure protocol.** Plug is NOT auto-subscribed to its own
+   block's room audience. Two viable shapes: (a) plug re-reads
+   `system_prompt` (and any other config) on every poll cycle / order
+   processing — fresh state, no observation needed; (b) `:set_property`
+   on a `writable_owner` prop additionally emits a directed `text`
+   wakeup to `this`. Lean (a) — simpler, matches the queue-as-truth
+   pattern. (b) is a perf nicety if reconfigure latency matters.
 9. **Plug observability.** `last_error` is a `writable_self` prop the plug
    writes on failure; `:look` surfaces it. Already implied; confirm.
 10. **Generic vs class-specific UI ordering.** Frame resolution distance
@@ -671,15 +884,34 @@ Things to settle as the build lands. Most have a leaning already.
 
 What we will actually do, in order.
 
-1. **Actor-bound apikey.** Extend auth registry to record `(id, hash,
-   actor, label, created_at, last_seen_at, revoked_at)`. `authenticate`
-   returns a session with the registered actor's perms. `:mint_apikey`,
-   `:rotate_apikey`, `:revoke_apikey`, `:list_apikeys`. **Blocker for
-   everything else.**
-2. **`$block` base class.** Anchored verbs; `:set_property`,
-   `:set_properties`, `:get_data`, `:look`; `writable_self` and
-   `writable_owner` enforcement; ephemeral property tier; summary/detail
-   tiers; live observation route for `block_data`.
+1. **Apikey ops gap.** Actor-bound apikeys already exist. What's missing,
+   and is the actual blocker:
+   - Owner-minting: a `$block:mint_apikey(label)` verb gated on
+     `caller == this.owner` (not wizard-only).
+   - Durable `revoked_at` instead of map-delete; `authApiKey` rejects
+     records with non-null `revoked_at`.
+   - Session teardown on revoke: walk the session table, close any
+     session whose `apikey_id` matches.
+   - `last_seen_at`: write on each successful `authApiKey`.
+   - KDF upgrade: `hashSource` → argon2/scrypt; legacy records upgraded
+     on next successful authenticate.
+   - `:list_apikeys` scoped to "keys for actors I own" for non-wizards.
+   This is auth-package work, not a new token class.
+2. **`$block` base class** + the `writable_owner` / `writable_self`
+   schema and runtime enforcement. Substrate work, not just woocode:
+   - Catalog manifest schema additions for the two tier lists.
+   - Installer validation (collision with reserved names, well-formed
+     lists, `$block` ancestry check).
+   - Runtime gate in the property-write path: new principal-checks
+     "session.actor == target" and "session.actor == target.owner" as
+     the new perm axes.
+   - Tests per tier (plug, owner, stranger, wizard, subclass tier
+     inheritance, manifest-validation negatives).
+   - Plus the woocode: anchored verbs (`:moveto` raises, `:acceptable`
+     wizard-only); `:set_property`, `:set_properties`, `:get_data`,
+     `:look`; live observation route for `block_data`; summary/detail
+     tier filtering for `RoomSnapshot`. **Ephemeral props are NOT in
+     this step** — see open decision 7.
 3. **Canonical kinds and generic `<woo-block>` UI.** `scalar | series |
    table | geo` recognized; generic component renders any of them;
    text-dump fallback for unknown kinds.
@@ -689,14 +921,21 @@ What we will actually do, in order.
    - Plug: CF Worker with cron trigger, hourly. Reads tomorrow.io,
      pushes via WS, disconnects.
    - Demo: weather block in the living room, working end-to-end.
-5. **`$dispenser_block` base class.** Parked-task `:order` / `:deliver`
-   pattern; sequenced `order_placed` / `delivered` events; `$note`
-   creation with back-references; `:cancel`, `:status`.
+5. **`$dispenser_block` base class.** Queue-and-deliver pattern (no
+   parked tasks): `:order` appends to `pending_orders` and returns a
+   ticket synchronously; `:deliver(order_id, body)` removes the entry
+   and creates a `$note` moved to the requester. Sequenced
+   `order_placed` / `delivered` observations routed to `location(this)`.
+   Optional directed `text` wakeup to plug sessions. `:cancel`,
+   `:next_pending`, `:status`. Order TTL.
 6. **`$horoscope_block` + Worker plug.**
    - Catalog: class extending `$dispenser_block`. One owner-writable
      `system_prompt`. Description via the base block.
-   - Plug: CF Worker listening for `order_placed`, calls Workers AI tiny
-     model with `system_prompt + request`, calls `:deliver`.
+   - Plug: CF Worker. On wakeup (`text` hint or cron), reads
+     `pending_orders` (or `:next_pending`), runs
+     `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
+     `system_prompt + request`, calls `:deliver`. Idempotent on
+     `order_id`.
    - Demo: horoscope machine on the deck, end-to-end.
 7. **Audience cache for live observations.** Memoize per
    `(space, version)`. Validate with a small smoke (10 blocks, 1Hz,
