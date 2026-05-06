@@ -497,7 +497,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     env = {
       WOO_INITIAL_WIZARD_TOKEN: "cf-smoke-token",
       WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo",
       DIRECTORY: new FakeDurableObjectNamespace((name) => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
@@ -526,11 +526,21 @@ describe("CFObjectRepository production-shape coverage", () => {
       const enterChat = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
       expect(enterChat.status).toBe(200);
       expect(enterChat.body.observations).toContainEqual(expect.objectContaining({ type: "entered", room: "the_chatroom" }));
+      const chatLook = await post("/api/objects/the_chatroom/calls/look", { args: [] }, session);
+      expect(chatLook.status).toBe(200);
+      expect(chatLook.body.result).toMatchObject({
+        contents: expect.arrayContaining([expect.objectContaining({ id: "the_weather" })])
+      });
 
       const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session);
       expect(goDeck.status).toBe(200);
       expect(goDeck.body.result).toMatchObject({ room: "the_deck", from: "the_chatroom", look_deferred: true });
       expect(goDeck.body.observations).toContainEqual(expect.objectContaining({ type: "entered", room: "the_deck", origin: "the_chatroom" }));
+      const deckLook = await post("/api/objects/the_deck/calls/look", { args: [] }, session);
+      expect(deckLook.status).toBe(200);
+      expect(deckLook.body.result).toMatchObject({
+        contents: expect.arrayContaining([expect.objectContaining({ id: "the_horoscope" })])
+      });
       const deckState = await worker.fetch(new Request("https://woo.test/api/me", {
         headers: { authorization: `Session ${session}` }
       }), env, {});
