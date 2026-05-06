@@ -144,7 +144,7 @@ export function installLocalCatalogs(world: WooWorld, names: readonly string[] =
   const repairNames = localMigrationCatalogNames(world, requested);
   installMissingLocalCatalogDependencies(world, repairNames);
   const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
-  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered, requested.length === 0);
+  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered);
 }
 
 export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): boolean {
@@ -719,13 +719,21 @@ function runTaskspaceTaskNoteParentMigration(world: WooWorld, names: readonly st
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION);
 }
 
-function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>, forceVerify: boolean): void {
+function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>): void {
   for (const name of names) {
     if (!localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name)!;
     if (covered.has(name)) {
-      recordCoveredLocalCatalogSchemaPlan(world, name, manifest);
-      continue;
+      const status = catalogManifestStatus(world, manifest, {
+        tap: "@local",
+        alias: name,
+        actor: "$wiz",
+        allowImplementationHints: true
+      });
+      if (!catalogSchemaStatusNeedsSync(status)) {
+        recordCoveredLocalCatalogSchemaPlan(world, name, manifest);
+        continue;
+      }
     }
     const result = runLocalCatalogSchemaPlan(world, name, manifest, "gateway", "world", {
       allowImplementationHints: true,

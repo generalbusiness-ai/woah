@@ -92,6 +92,24 @@ without `$system` access:
   filters to keys bound to this block. Returns
   `{id, label, created_at, last_seen_at, revoked_at}` records.
 
+The minted credential used by plugs is the full token string
+`apikey:<id>:<secret>`. The id is part of the credential, not just
+metadata; `apikey:<secret>` is not the documented token form. Operators
+should validate the full token before storing it in Worker secrets:
+
+```bash
+export WOO_BASE_URL="https://woo.example.com"
+export WOO_APIKEY="apikey:<id>:<secret>"
+
+curl -fsS "$WOO_BASE_URL/api/auth" \
+  -H "content-type: application/json" \
+  --data "{\"token\":\"$WOO_APIKEY\"}"
+```
+
+Success returns `{ actor, session, token_class: "apikey", ... }`, with
+`actor` equal to the block object. `E_NOSESSION` means the key is unknown,
+malformed, secret-mismatched, or revoked.
+
 ## Look surface
 
 `:look_self()` returns `{id, title, description, last_pushed_at,
@@ -99,6 +117,11 @@ last_error, summary, location}`. The `summary` is built by reading each
 name in `this.summary_props`. Subclasses set `summary_props` to the small
 set of values that should always ride in the look output (e.g. for
 weather: `["current"]`).
+
+`:look()` wraps `:look_self()` and emits a caller-private `looked`
+observation, matching ordinary in-world look behavior. This matters even
+when command planning routes through the block directly: chat clients render
+the observation, not just the returned structured value.
 
 Although `$block` descends from `$actor` so plug credentials can bind
 directly to the block object, room look treats block instances as visible

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runWeatherTick, type WeatherPlugEnv } from "../src/index";
+import { normalizeTomorrowLocation, runWeatherTick, type WeatherPlugEnv } from "../src/index";
 
 type Call = { url: string; method: string; body?: unknown };
 type Reply = { status: number; body: unknown; headers?: Record<string, string> };
@@ -89,8 +89,10 @@ describe("runWeatherTick", () => {
     expect(calls[3].url).toBe("https://woo.example/api/objects/the_weather_block/properties/forecast_hours");
     expect(calls[4].url).toContain("api.tomorrow.io/v4/weather/realtime");
     expect(calls[4].url).toContain("units=imperial");
+    expect(new URL(calls[4].url).searchParams.get("location")).toBe("Mountain View CA");
     expect(calls[5].url).toContain("api.tomorrow.io/v4/weather/forecast");
     expect(calls[5].url).toContain("units=imperial");
+    expect(new URL(calls[5].url).searchParams.get("location")).toBe("Mountain View CA");
 
     const setProps = calls[6];
     expect(setProps.url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_properties");
@@ -193,5 +195,12 @@ describe("runWeatherTick", () => {
     expect(args[1]).toMatch(/rate-limited/i);
     expect(args[1]).toMatch(/retry after 120s/);
     expect(args[1]).toMatch(/25\/hour/);
+  });
+});
+
+describe("normalizeTomorrowLocation", () => {
+  it("keeps lat/lon coordinates intact but removes commas from named places", () => {
+    expect(normalizeTomorrowLocation("37.3861,-122.0839")).toBe("37.3861,-122.0839");
+    expect(normalizeTomorrowLocation("Mountain View, CA")).toBe("Mountain View CA");
   });
 });

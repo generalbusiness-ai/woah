@@ -50,12 +50,30 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 | `:set_property(name, value)` | tier-gated | Single property write; emits `block_data`. |
 | `:set_properties(values)` | tier-gated | Bulk; atomic permission gate, one observation per name. |
 | `:get_data(name)` | rxd | Read a property by name; respects normal `r` perms. |
-| `:look()` / `:look_self()` | rxd | Returns `{id, title, description, last_pushed_at, last_error, summary, location}`. `:look` is command-shaped, so it appears in `@examine` / MCP obvious affordances. |
+| `:look()` / `:look_self()` | rxd | Returns `{id, title, description, last_pushed_at, last_error, summary, location}`. `:look` also emits the caller-private `looked` observation, and is command-shaped so it appears in `@examine` / MCP obvious affordances. |
 | `:moveto(target)` | wizard | Block is anchored; non-wizard raises `E_PERM`. |
 | `:acceptable(object)` | rxd | Always false (nothing enters a block). |
 | `:mint_apikey(label?)` | owner/wizard | Mints an apikey bound to this block's actor. |
 | `:revoke_apikey(id)` | owner/wizard | Revokes a key (closes any sessions minted from it). |
 | `:list_apikeys()` | rxd | Returns the apikey records for this block. |
+
+After minting, store the returned credential as the full token string:
+`apikey:<id>:<secret>`. The id is part of the credential, not just
+metadata; `apikey:<secret>` is not the documented token form. Validate
+the full token before putting it into a plug's secret store:
+
+```bash
+export WOO_BASE_URL="https://woo.example.com"
+export WOO_APIKEY="apikey:<id>:<secret>"
+
+curl -fsS "$WOO_BASE_URL/api/auth" \
+  -H "content-type: application/json" \
+  --data "{\"token\":\"$WOO_APIKEY\"}"
+```
+
+A valid block key returns JSON with `actor` equal to the block id and
+`token_class: "apikey"`. `E_NOSESSION` means the id/secret pair is wrong,
+unknown, or revoked.
 
 ## Subclassing
 

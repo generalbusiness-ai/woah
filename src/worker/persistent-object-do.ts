@@ -549,10 +549,12 @@ export class PersistentObjectDO {
             return {
               name: world.object(objRef).name,
               description: world.propOrNullForActor(readActor, objRef, "description"),
-              aliases: world.propOrNullForActor(readActor, objRef, "aliases")
+              aliases: world.propOrNullForActor(readActor, objRef, "aliases"),
+              owner: world.object(objRef).owner,
+              obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
             };
           }
-          return await this.forwardInternalChecked<{ name: WooValue | null; description: WooValue | null; aliases: WooValue | null }>(
+          return await this.forwardInternalChecked<HostObjectSummary>(
             host,
             "/__internal/remote-describe",
             { name_actor: nameActor, read_actor: readActor, obj: objRef }
@@ -576,7 +578,9 @@ export class PersistentObjectDO {
             const summary = {
               name: world.object(objRef).name,
               description: world.propOrNullForActor(readActor, objRef, "description"),
-              aliases: world.propOrNullForActor(readActor, objRef, "aliases")
+              aliases: world.propOrNullForActor(readActor, objRef, "aliases"),
+              owner: world.object(objRef).owner,
+              obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
             };
             out[objRef] = summary;
             if (memo) memo.reads.set(key, Promise.resolve(summary));
@@ -1184,7 +1188,9 @@ export class PersistentObjectDO {
         return jsonResponse({
           name: world.object(obj).name,
           description: world.propOrNullForActor(readActor, obj, "description"),
-          aliases: world.propOrNullForActor(readActor, obj, "aliases")
+          aliases: world.propOrNullForActor(readActor, obj, "aliases"),
+          owner: world.object(obj).owner,
+          obvious_verbs: world.obviousCommandSyntaxes(obj, world.object(obj).name || obj)
         });
       }
 
@@ -1197,7 +1203,9 @@ export class PersistentObjectDO {
             objects[obj] = {
               name: world.object(obj).name,
               description: world.propOrNullForActor(readActor, obj, "description"),
-              aliases: world.propOrNullForActor(readActor, obj, "aliases")
+              aliases: world.propOrNullForActor(readActor, obj, "aliases"),
+              owner: world.object(obj).owner,
+              obvious_verbs: world.obviousCommandSyntaxes(obj, world.object(obj).name || obj)
             };
           } catch {
             // A stale route should not poison the whole batch; callers can

@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { createWorld } from "../../src/core/bootstrap";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
-import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
+import type { CallContext, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
 import { CFObjectRepository } from "../../src/worker/cf-repository";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
@@ -207,12 +207,14 @@ class FakeHostBridge implements HostBridge {
     return await this.worldFor(room).roomSnapshotForActor(readActor, room, sessionId ?? null);
   }
 
-  async describeObject(_nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef): Promise<{ name: WooValue | null; description: WooValue | null; aliases: WooValue | null }> {
+  async describeObject(_nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef): Promise<HostObjectSummary> {
     const world = this.worldFor(objRef);
     return {
       name: world.object(objRef).name,
       description: world.propOrNullForActor(readActor, objRef, "description"),
-      aliases: world.propOrNullForActor(readActor, objRef, "aliases")
+      aliases: world.propOrNullForActor(readActor, objRef, "aliases"),
+      owner: world.object(objRef).owner,
+      obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
     };
   }
 
@@ -531,6 +533,14 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(chatLook.body.result).toMatchObject({
         contents: expect.arrayContaining([expect.objectContaining({ id: "the_weather" })])
       });
+      const weatherLookCommand = await post("/api/objects/the_chatroom/calls/command", { args: ["look weather"] }, session);
+      expect(weatherLookCommand.status).toBe(200);
+      expect(weatherLookCommand.body.result).toMatchObject({ id: "the_weather" });
+      expect(weatherLookCommand.body.observations).toContainEqual(expect.objectContaining({
+        type: "looked",
+        room: "the_chatroom",
+        target: "the_weather"
+      }));
 
       const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session);
       expect(goDeck.status).toBe(200);

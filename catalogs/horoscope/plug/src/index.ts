@@ -140,7 +140,7 @@ export async function runHoroscopeTick(
   env: HoroscopePlugEnv,
   deps: { fetchImpl?: typeof fetch; now?: () => number } = {}
 ): Promise<HoroscopeTickResult> {
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now = deps.now ?? Date.now;
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
   await client.authenticate(env.WOO_APIKEY);

@@ -6,7 +6,7 @@ import { compileVerb, installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { InMemoryObjectRepository } from "../src/core/repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../src/core/types";
-import type { CallContext, DeferredHostEffect, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
+import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
 type Harness = {
@@ -169,12 +169,14 @@ class LocalHostBridge implements HostBridge {
     return await this.worldFor(room).roomSnapshotForActor(readActor, room, sessionId ?? null);
   }
 
-  async describeObject(_nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef): Promise<{ name: WooValue | null; description: WooValue | null; aliases: WooValue | null }> {
+  async describeObject(_nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef): Promise<HostObjectSummary> {
     const world = this.worldFor(objRef);
     return {
       name: world.object(objRef).name,
       description: world.propOrNullForActor(readActor, objRef, "description"),
-      aliases: world.propOrNullForActor(readActor, objRef, "aliases")
+      aliases: world.propOrNullForActor(readActor, objRef, "aliases"),
+      owner: world.object(objRef).owner,
+      obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
     };
   }
 

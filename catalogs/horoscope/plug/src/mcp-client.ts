@@ -65,7 +65,7 @@ export class WooMcpClient {
     const base = opts.baseUrl.replace(/\/+$/, "");
     this.endpoint = `${base}/mcp`;
     this.token = opts.token;
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.clientName = opts.clientName ?? "woo-plug";
     this.clientVersion = opts.clientVersion ?? "0.0.0";
   }

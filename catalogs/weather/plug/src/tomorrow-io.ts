@@ -60,7 +60,7 @@ export type TomorrowFetchOptions = {
 
 export async function fetchWeather(options: TomorrowFetchOptions): Promise<WeatherSnapshot> {
   const { apiKey, place } = options;
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const forecastHours = options.forecastHours ?? 24;
   const units: TomorrowUnits = options.units === "imperial" ? "imperial" : "metric";
   const tempUnit = units === "imperial" ? "°F" : "°C";

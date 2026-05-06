@@ -13,6 +13,7 @@
     "mcp:stdio": "tsx src/mcp/stdio.ts",
     "cf:migrations": "node scripts/sync-wrangler-do-migrations.mjs --write",
     "cf:migrations:check": "node scripts/sync-wrangler-do-migrations.mjs --check",
+    "plugs:bootstrap": "node scripts/bootstrap-demo-plugs.mjs",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",
     "pretest": "npm run catalog:index && npm run guard:object-names && npm run guard:catalog-migrations",
     "test": "vitest run tests",

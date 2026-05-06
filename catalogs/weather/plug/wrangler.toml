@@ -1,7 +1,7 @@
 name = "woo-weather-plug"
 main = "src/index.ts"
 compatibility_date = "2026-01-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
 # Hourly push. Each tick makes 2 tomorrow.io calls (realtime + forecast).
 # Tomorrow.io free plan: 25 calls/hour, 500 calls/day. So one block uses
@@ -22,6 +22,10 @@ crons = ["0 * * * *"]
 #   wrangler secret put TOMORROW_IO_API_KEY
 #   wrangler deploy
 [vars]
+# Deployment-specific values can be set as Worker variables or secrets.
+# The repo bootstrap script writes WOO_BASE_URL and BLOCK_ID with
+# `wrangler secret put` so this template stays reusable.
+#
 # WOO_BASE_URL = "https://woo.example.com"
 # BLOCK_ID = "the_weather_block"
-# FORECAST_HOURS = "24"
+# FORECAST_HOURS = "12"
