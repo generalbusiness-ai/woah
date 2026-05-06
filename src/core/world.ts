@@ -382,6 +382,29 @@ export class WooWorld {
     if (this.objectRepository) this.incrementalPersistenceEnabled = true;
   }
 
+  discardPendingPersistence(): void {
+    this.dirtyObjects.clear();
+    this.deletedObjects.clear();
+    this.dirtyProperties.clear();
+    this.dirtySessions.clear();
+    this.deletedSessions.clear();
+    this.dirtyTasks.clear();
+    this.deletedTasks.clear();
+    this.dirtyCounters = false;
+    this.persistenceDirty = false;
+  }
+
+  hasPendingPersistence(): boolean {
+    return this.persistenceDirty || this.hasDirtyPersistence();
+  }
+
+  markObjectChanged(objRef: ObjRef): void {
+    const obj = this.object(objRef);
+    obj.modified = Date.now();
+    this.persistObject(objRef);
+    this.persist();
+  }
+
   setHostBridge(bridge: HostBridge | null): void {
     this.hostBridge = bridge;
   }

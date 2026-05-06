@@ -67,6 +67,7 @@ export class DirectoryDO {
         const routes = Array.isArray(body.routes) ? body.routes : [];
         const startedAt = Date.now();
         try {
+          let writes = 0;
           this.state.storage.transactionSync(() => {
             for (const route of routes) {
               if (!route || typeof route !== "object") continue;
@@ -74,10 +75,10 @@ export class DirectoryDO {
               const id = typeof record.id === "string" ? record.id : "";
               const host = typeof record.host === "string" ? record.host : "";
               if (!id || !host) continue;
-              this.registerObject(id, host, typeof record.anchor === "string" ? record.anchor : null);
+              if (this.registerObject(id, host, typeof record.anchor === "string" ? record.anchor : null)) writes += 1;
             }
           });
-          this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "ok", routes: routes.length });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "ok", routes: routes.length, writes });
         } catch (err) {
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "error", routes: routes.length, error: metricErrorCode(err) });
           throw err;
@@ -147,7 +148,11 @@ export class DirectoryDO {
     this.ensureColumn("session_route", "apikey_id", "TEXT");
   }
 
-  private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): void {
+  private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): boolean {
+    const existing = firstRow(this.state.storage.sql.exec("SELECT host, anchor FROM object_route WHERE id = ?", id));
+    if (existing && String(existing.host) === host && (existing.anchor === null ? null : String(existing.anchor)) === anchor) {
+      return false;
+    }
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO object_route(id, host, anchor, updated_at) VALUES (?, ?, ?, ?)",
       id,
@@ -155,6 +160,7 @@ export class DirectoryDO {
       anchor,
       Date.now()
     );
+    return true;
   }
 
   private resolveObject(id: string, fallbackHost: string): ObjectRoute {

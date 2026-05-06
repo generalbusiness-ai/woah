@@ -213,7 +213,11 @@ export function createWorld(options: { repository?: WorldRepository & Partial<Ob
   if (stored) {
     world.importWorld(stored);
     world.withPersistencePaused(() => bootstrap(world, { catalogs: options.catalogs }));
-    world.persist();
+    if (world.hasPendingPersistence()) {
+      world.persist();
+    } else {
+      world.discardPendingPersistence();
+    }
   } else {
     world.withPersistencePaused(() => bootstrap(world, { catalogs: options.catalogs }));
     world.persist();
@@ -402,7 +406,10 @@ function seedUniversal(world: WooWorld): void {
   world.createObject({ id: "$sequenced_log", name: "$sequenced_log", parent: "$root", owner: "$wiz" });
   world.createObject({ id: "$space", name: "$space", parent: "$sequenced_log", owner: "$wiz" });
   world.createObject({ id: "$thing", name: "$thing", parent: "$root", owner: "$wiz" });
-  world.object("$thing").flags.fertile = true;
+  if (world.object("$thing").flags.fertile !== true) {
+    world.object("$thing").flags.fertile = true;
+    world.markObjectChanged("$thing");
+  }
   world.createObject({ id: "$catalog", name: "$catalog", parent: "$thing", owner: "$wiz" });
   world.createObject({ id: "$catalog_registry", name: "$catalog_registry", parent: "$space", owner: "$wiz" });
   world.createObject({ id: "$nowhere", name: "$nowhere", parent: "$thing", owner: "$wiz" });
@@ -575,7 +582,7 @@ function seedGuests(world: WooWorld): void {
     // display-name lookups (which read the property) get "Guest 1" instead
     // of the default empty string. Catalog seed_hooks already do this via
     // setNameIfMissing; bootstrap had to do it explicitly.
-    world.setProp(id, "name", displayName);
+    if (world.propOrNull(id, "name") !== displayName) world.setProp(id, "name", displayName);
     seedProp(world, id, "home", "$nowhere");
     removeSeedProperty(world, id, "attached_sockets");
   }
@@ -591,7 +598,10 @@ function seedGuests(world: WooWorld): void {
     const propValue = world.propOrNull(id, "name");
     const target = fieldName && fieldName !== id ? fieldName : `Guest ${match[1]}`;
     if (propValue !== target) world.setProp(id, "name", target);
-    if (!fieldName || fieldName === id) obj.name = target;
+    if (!fieldName || fieldName === id) {
+      obj.name = target;
+      world.markObjectChanged(id);
+    }
   }
 }
 
@@ -625,30 +635,38 @@ function seedProp(world: WooWorld, obj: ObjRef, name: string, value: WooValue): 
 
 function removeSeedProperty(world: WooWorld, obj: ObjRef, name: string): void {
   const target = world.object(obj);
-  target.propertyDefs.delete(name);
-  target.properties.delete(name);
-  target.propertyVersions.delete(name);
+  const removedDef = target.propertyDefs.delete(name);
+  const removedValue = target.properties.delete(name);
+  const removedVersion = target.propertyVersions.delete(name);
+  const changed = removedDef || removedValue || removedVersion;
+  if (changed) world.markObjectChanged(obj);
 }
 
 function reparentSeed(world: WooWorld, obj: ObjRef, parent: ObjRef): void {
   const target = world.object(obj);
   if (target.parent === parent) return;
-  if (target.parent && world.objects.has(target.parent)) world.object(target.parent).children.delete(obj);
+  const oldParent = target.parent;
+  if (oldParent && world.objects.has(oldParent)) world.object(oldParent).children.delete(obj);
   target.parent = parent;
   world.object(parent).children.add(obj);
+  world.markObjectChanged(obj);
+  if (oldParent && world.objects.has(oldParent)) world.markObjectChanged(oldParent);
+  world.markObjectChanged(parent);
 }
 
 function bytecode(world: WooWorld, obj: ObjRef, name: string, bytecodeValue: TinyBytecode, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; perms?: string } = {}): void {
   const existing = world.ownVerbExact(obj, name);
   if (existing) {
-    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existing.direct_callable || options.directCallable === true);
+    const existingDirectCallable = existing.direct_callable === true;
+    const existingSkipPresenceCheck = existing.skip_presence_check === true;
+    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existingDirectCallable || options.directCallable === true);
     const next = {
       ...existing,
       perms: parsedPerms.perms,
       direct_callable: parsedPerms.directCallable,
-      skip_presence_check: existing.skip_presence_check || options.skipPresenceCheck === true
+      skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true
     };
-    if (next.perms !== existing.perms || next.direct_callable !== existing.direct_callable || next.skip_presence_check !== existing.skip_presence_check) world.addVerb(obj, next);
+    if (next.perms !== existing.perms || next.direct_callable !== existingDirectCallable || next.skip_presence_check !== existingSkipPresenceCheck) world.addVerb(obj, next);
     return;
   }
   const parsedPerms = normalizeVerbPerms(options.perms ?? "rx", options.directCallable === true);
@@ -675,6 +693,9 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     throw new Error(`bootstrap source verb failed to compile: ${obj}:${name}`);
   }
   const existing = world.ownVerbExact(obj, name);
+  const existingDirectCallable = existing?.direct_callable === true;
+  const existingSkipPresenceCheck = existing?.skip_presence_check === true;
+  const existingToolExposed = existing?.tool_exposed === true;
   const parsedPerms = normalizeVerbPerms(options.perms ?? compiled.metadata?.perms ?? existing?.perms ?? "rx", options.directCallable === true);
   const next = {
     kind: "bytecode" as const,
@@ -689,17 +710,17 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     bytecode: { ...compiled.bytecode, version: (existing?.version ?? 0) + 1 },
     line_map: compiled.line_map ?? {},
     direct_callable: parsedPerms.directCallable,
-    skip_presence_check: existing?.skip_presence_check || options.skipPresenceCheck === true,
-    tool_exposed: existing?.tool_exposed || options.toolExposed === true
+    skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true,
+    tool_exposed: existingToolExposed || options.toolExposed === true
   };
   if (
     existing &&
     existing.kind === next.kind &&
     existing.source_hash === next.source_hash &&
     existing.perms === next.perms &&
-    existing.direct_callable === next.direct_callable &&
-    existing.skip_presence_check === next.skip_presence_check &&
-    existing.tool_exposed === next.tool_exposed &&
+    existingDirectCallable === next.direct_callable &&
+    existingSkipPresenceCheck === next.skip_presence_check &&
+    existingToolExposed === next.tool_exposed &&
     JSON.stringify(existing.aliases ?? []) === JSON.stringify(next.aliases ?? []) &&
     valuesEqual((existing.arg_spec ?? {}) as WooValue, (next.arg_spec ?? {}) as WooValue)
   ) return;
@@ -709,23 +730,26 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
 function native(world: WooWorld, obj: ObjRef, name: string, handler: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {
   const existing = world.ownVerbExact(obj, name);
   if (existing) {
-    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existing.direct_callable || options.directCallable === true);
+    const existingDirectCallable = existing.direct_callable === true;
+    const existingSkipPresenceCheck = existing.skip_presence_check === true;
+    const existingToolExposed = existing.tool_exposed === true;
+    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existingDirectCallable || options.directCallable === true);
     const aliases = options.aliases ?? existing.aliases;
     const argSpec = options.argSpec ?? existing.arg_spec;
     const next = {
       ...existing,
       perms: parsedPerms.perms,
       direct_callable: parsedPerms.directCallable,
-      skip_presence_check: existing.skip_presence_check || options.skipPresenceCheck === true,
-      tool_exposed: existing.tool_exposed || options.toolExposed === true,
+      skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true,
+      tool_exposed: existingToolExposed || options.toolExposed === true,
       aliases,
       arg_spec: argSpec
     };
     if (
       next.perms !== existing.perms ||
-      next.direct_callable !== existing.direct_callable ||
-      next.skip_presence_check !== existing.skip_presence_check ||
-      next.tool_exposed !== existing.tool_exposed ||
+      next.direct_callable !== existingDirectCallable ||
+      next.skip_presence_check !== existingSkipPresenceCheck ||
+      next.tool_exposed !== existingToolExposed ||
       JSON.stringify(next.aliases ?? []) !== JSON.stringify(existing.aliases ?? []) ||
       !valuesEqual((next.arg_spec ?? {}) as WooValue, (existing.arg_spec ?? {}) as WooValue)
     ) world.addVerb(obj, next);

@@ -348,7 +348,7 @@ export class PersistentObjectDO {
     if (scoped && freshSeed) scoped = mergeHostScopedSeed(scoped, freshSeed);
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
-    const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook });
+    const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook, persist: stored === null });
     // Run local catalog schema/data migration plans on this host's actual
     // slice. The gateway cannot convert state it does not own.
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });

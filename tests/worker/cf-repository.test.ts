@@ -314,7 +314,24 @@ describe("CFObjectRepository production-shape coverage", () => {
         expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_load", host_key: "world", stored: false }),
         expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_save", host_key: "world" }),
         expect.objectContaining({ kind: "startup_storage", phase: "directory_schema", host_key: "directory" }),
-        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects", host_key: "directory" })
+        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects", host_key: "directory", writes: 20 })
+      ]));
+
+      logs.length = 0;
+      const restartedGateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+      const restarted = await restartedGateway.fetch(new Request("https://woo.test/healthz"));
+      expect(restarted.ok).toBe(true);
+      const restartMetrics = logs
+        .filter((line) => line.startsWith("woo.metric "))
+        .map((line) => JSON.parse(line.slice("woo.metric ".length)) as Record<string, unknown>);
+      expect(restartMetrics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_load", host_key: "world", stored: true })
+      ]));
+      expect(restartMetrics).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_save", host_key: "world" })
+      ]));
+      expect(restartMetrics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects", host_key: "directory", writes: 0 })
       ]));
     } finally {
       logSpy.mockRestore();

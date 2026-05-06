@@ -1093,9 +1093,9 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
       JSON.stringify(existing.aliases ?? []) !== JSON.stringify(repaired.aliases ?? []) ||
       existing.perms !== repaired.perms ||
       JSON.stringify(existing.arg_spec ?? {}) !== JSON.stringify(repaired.arg_spec ?? {}) ||
-      existing.direct_callable !== repaired.direct_callable ||
-      existing.skip_presence_check !== repaired.skip_presence_check ||
-      existing.tool_exposed !== repaired.tool_exposed ||
+      (existing.direct_callable === true) !== (repaired.direct_callable === true) ||
+      (existing.skip_presence_check === true) !== (repaired.skip_presence_check === true) ||
+      (existing.tool_exposed === true) !== (repaired.tool_exposed === true) ||
       (repaired.kind !== "native" && Object.keys(existing.line_map ?? {}).length === 0);
     if (changed) world.addVerb(obj, repaired);
     return;
@@ -1632,9 +1632,9 @@ function catalogVerbDrift(actual: VerbDef, expected: VerbDef): string[] {
   if (stableStringify(actual.aliases ?? []) !== stableStringify(expected.aliases ?? [])) drift.push("aliases");
   if (actual.perms !== expected.perms) drift.push("perms");
   if (stableStringify(actual.arg_spec ?? {}) !== stableStringify(expected.arg_spec ?? {})) drift.push("arg_spec");
-  if (actual.direct_callable !== expected.direct_callable) drift.push("direct_callable");
-  if (actual.skip_presence_check !== expected.skip_presence_check) drift.push("skip_presence_check");
-  if (actual.tool_exposed !== expected.tool_exposed) drift.push("tool_exposed");
+  if ((actual.direct_callable === true) !== (expected.direct_callable === true)) drift.push("direct_callable");
+  if ((actual.skip_presence_check === true) !== (expected.skip_presence_check === true)) drift.push("skip_presence_check");
+  if ((actual.tool_exposed === true) !== (expected.tool_exposed === true)) drift.push("tool_exposed");
   if (expected.kind !== "native" && Object.keys(actual.line_map ?? {}).length === 0) drift.push("line_map");
   return drift;
 }

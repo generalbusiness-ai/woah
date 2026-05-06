@@ -10,7 +10,7 @@ import {
   type CatalogSchemaPlanApplyResult,
   type CatalogSchemaPlanScope
 } from "./catalog-installer";
-import type { ObjRef, WooValue } from "./types";
+import { valuesEqual, type ObjRef, type WooValue } from "./types";
 import type { WooWorld } from "./world";
 
 export type LocalCatalogName = string;
@@ -827,6 +827,7 @@ function recordLocalCatalogSchemaSync(world: WooWorld, name: string, id: string,
   if (!world.objects.has("$catalog_registry")) return;
   const raw = world.propOrNull("$catalog_registry", "installed_catalogs");
   if (!Array.isArray(raw)) return;
+  let changed = false;
   const next = raw.map((record) => {
     if (!record || typeof record !== "object" || Array.isArray(record)) return record;
     const item = record as Record<string, WooValue>;
@@ -835,19 +836,30 @@ function recordLocalCatalogSchemaSync(world: WooWorld, name: string, id: string,
     const provenance = item.provenance && typeof item.provenance === "object" && !Array.isArray(item.provenance)
       ? { ...(item.provenance as Record<string, WooValue>) }
       : {};
+    const objects = { ...mapValue(item.objects), ...manifestObjectRefs(manifest) };
+    const seeds = { ...mapValue(item.seeds), ...manifestSeedRefs(manifest) };
+    const nextProvenance = {
+      ...provenance,
+      local_schema_sync: id,
+      local_manifest_hash: manifestHash
+    };
+    if (
+      item.version === manifest.version &&
+      valuesEqual((item.objects ?? {}) as WooValue, objects as WooValue) &&
+      valuesEqual((item.seeds ?? {}) as WooValue, seeds as WooValue) &&
+      valuesEqual((item.provenance ?? {}) as WooValue, nextProvenance as WooValue)
+    ) return record;
+    changed = true;
     return {
       ...item,
       version: manifest.version,
       updated_at: Date.now(),
-      objects: { ...mapValue(item.objects), ...manifestObjectRefs(manifest) },
-      seeds: { ...mapValue(item.seeds), ...manifestSeedRefs(manifest) },
-      provenance: {
-        ...provenance,
-        local_schema_sync: id,
-        local_manifest_hash: manifestHash
-      }
+      objects,
+      seeds,
+      provenance: nextProvenance
     } as WooValue;
   });
+  if (!changed) return;
   world.setProp("$catalog_registry", "installed_catalogs", next as WooValue);
 }
 
