@@ -631,6 +631,20 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `verb:${target}:${verbName}`, read);
         return await read();
       },
+      commandVerbCandidates: async (target, verbName, memo) => {
+        const read = async () => {
+          const host = await hostForObject(target, memo);
+          if (!host || host === localHost) return world.commandVerbCandidateSummaries(target, verbName);
+          const response = await this.forwardInternalChecked<{ candidates?: Array<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }> }>(
+            host,
+            "/__internal/remote-command-verb-candidates",
+            { target, verb: verbName }
+          );
+          return Array.isArray(response.candidates) ? response.candidates : [];
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `command-verbs:${target}:${verbName}`, read);
+        return await read();
+      },
       isDescendantOf: async (objRef, ancestorRef, memo) => {
         const read = async (): Promise<boolean> => {
           const host = await hostForObject(objRef, memo);
@@ -1230,6 +1244,12 @@ export class PersistentObjectDO {
         const verbName = String(body.verb ?? "");
         const { verb } = world.resolveVerb(target, verbName);
         return jsonResponse({ name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/remote-command-verb-candidates") {
+        const target = String(body.target ?? "") as ObjRef;
+        const verbName = String(body.verb ?? "");
+        return jsonResponse({ candidates: world.commandVerbCandidateSummaries(target, verbName) });
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-is-descendant") {

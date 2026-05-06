@@ -141,6 +141,7 @@ export type HostBridge = {
   describeObject?(nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<HostObjectSummary>;
   describeObjects?(nameActor: ObjRef, readActor: ObjRef, objRefs: ObjRef[], memo?: HostOperationMemo): Promise<Record<ObjRef, HostObjectSummary>>;
   resolveVerb?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary | null>;
+  commandVerbCandidates?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary[]>;
   isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
   dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
@@ -6687,9 +6688,20 @@ export class WooWorld {
 
   private async commandVerbCandidates(ctx: CallContext, target: ObjRef, name: string): Promise<CommandVerbSummary[]> {
     if (await this.remoteHostForObject(target, ctx.hostMemo)) {
+      if (this.hostBridge?.commandVerbCandidates) {
+        try {
+          return await this.hostBridge.commandVerbCandidates(target, name, ctx.hostMemo);
+        } catch {
+          return [];
+        }
+      }
       const resolved = await this.tryResolveVerbForCommand(ctx, target, name);
       return resolved ? [resolved] : [];
     }
+    return this.commandVerbCandidateSummaries(target, name);
+  }
+
+  commandVerbCandidateSummaries(target: ObjRef, name: string): CommandVerbSummary[] {
     if (!this.objects.has(target)) return [];
     const out: CommandVerbSummary[] = [];
     const seen = new Set<string>();

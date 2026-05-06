@@ -203,6 +203,10 @@ export class LocalHostBridge implements HostBridge {
     }
   }
 
+  async commandVerbCandidates(target: ObjRef, verbName: string): Promise<Array<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>> {
+    return this.worldFor(target).commandVerbCandidateSummaries(target, verbName);
+  }
+
   async location(objRef: ObjRef): Promise<ObjRef | null> {
     return this.worldFor(objRef).object(objRef).location;
   }

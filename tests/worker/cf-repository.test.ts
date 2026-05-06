@@ -228,6 +228,10 @@ class FakeHostBridge implements HostBridge {
     }
   }
 
+  async commandVerbCandidates(target: ObjRef, verbName: string): Promise<Array<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>> {
+    return this.worldFor(target).commandVerbCandidateSummaries(target, verbName);
+  }
+
   async location(objRef: ObjRef): Promise<ObjRef | null> {
     return this.worldFor(objRef).object(objRef).location;
   }
@@ -443,6 +447,12 @@ describe("CFObjectRepository production-shape coverage", () => {
       const plan = await roomHost.directCall("cf-plan-cross-host-widget", actor, "cf_remote_room", "command_plan", ["ping widget"]);
       expect(plan.op).toBe("result");
       if (plan.op === "result") expect(plan.result).toMatchObject({ ok: true, route: "direct", target: "cf_home_widget", verb: "ping", args: [] });
+
+      const remoteRoomLook = await home.planCommand("cf-plan-remote-room-look-widget", session.id, "cf_remote_room", "look widget");
+      expect(remoteRoomLook.op).toBe("result");
+      if (remoteRoomLook.op === "result") {
+        expect(remoteRoomLook.result).toMatchObject({ ok: true, route: "direct", target: "cf_remote_room", verb: "look_at", args: ["cf_home_widget"] });
+      }
     } finally {
       roomHarness.cleanup();
       homeHarness.cleanup();
