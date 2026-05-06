@@ -2,7 +2,6 @@ import { BUNDLED_CATALOGS } from "../generated/bundled-catalogs";
 import {
   applyCatalogSchemaPlan,
   catalogManifestStatus,
-  catalogSchemaPlanIdentity,
   installCatalogManifest,
   planCatalogSchemaMigration,
   verifyCatalogSchemaPlan,
@@ -147,7 +146,7 @@ export function installLocalCatalogs(world: WooWorld, names: readonly string[] =
   const repairNames = localMigrationCatalogNames(world, requested);
   installMissingLocalCatalogDependencies(world, repairNames);
   const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
-  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered, requested.length === 0);
+  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered);
 }
 
 export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): boolean {
@@ -405,18 +404,9 @@ function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: bool
       recordCoveredHostCatalogSchemaPlan(world, host, manifest);
       continue;
     }
-    // Cold-host wake re-runs schema sync against every installed catalog. The
-    // plan id is a function of manifest content only, so when a previous host
-    // boot already recorded a completed plan for this exact manifest we can
-    // skip both planCatalogSchemaMigration (walks every class/verb/seed_hook)
-    // and verifyCatalogSchemaPlan (walks the world for status). Drift gets
-    // repaired by the gateway sync; the host trusts the previous record.
-    const planId = catalogSchemaPlanIdentity(manifest).id;
-    if (catalogMigrationRecordCompleted(world, planId, "host", host)) {
-      skipped += 1;
-      continue;
-    }
-    planned += 1;
+    // Verify even when this manifest's previous plan completed. A host slice
+    // can retain stale catalog metadata after a gateway repair, and the plan
+    // id alone cannot prove the local slice is still in sync.
     const result = runLocalCatalogSchemaPlan(world, name, manifest, "host", host, {
       allowImplementationHints: true,
       reconcileSeedHooks: true,
@@ -424,6 +414,10 @@ function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: bool
     });
     if (result.status === "failed") {
       console.warn("woo.local_catalog_host_schema_plan_failed", { catalog: name, host, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
+    } else if (result.steps.every((step) => step.status === "skipped")) {
+      skipped += 1;
+    } else {
+      planned += 1;
     }
   }
   if (planned > 0 || skipped > 0) {
@@ -728,43 +722,21 @@ function runTaskspaceTaskNoteParentMigration(world: WooWorld, names: readonly st
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION);
 }
 
-function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>, forceVerify: boolean): void {
+function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>): void {
   for (const name of names) {
     if (!localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name)!;
     if (covered.has(name)) {
-      recordCoveredLocalCatalogSchemaPlan(world, name, manifest);
-      continue;
-    }
-    // Fast-path: when not forcing verify, derive the plan id directly from the
-    // manifest (cheap) and skip both planCatalogSchemaMigration and
-    // verifyCatalogSchemaPlan if the migration record already covers it. The
-    // recorded manifest_hash on $catalog_registry must match too — that is the
-    // signal the manifest is byte-identical to the one that ran last time.
-    if (!forceVerify) {
-      const identity = catalogSchemaPlanIdentity(manifest);
-      if (
-        catalogMigrationRecordCompleted(world, identity.id, "gateway", "world") &&
-        localCatalogInstalledManifestHash(world, name) === identity.manifest_hash
-      ) {
-        markMigrationApplied(world, identity.id);
+      const status = catalogManifestStatus(world, manifest, {
+        tap: "@local",
+        alias: name,
+        actor: "$wiz",
+        allowImplementationHints: true
+      });
+      if (!catalogSchemaStatusNeedsSync(status)) {
+        recordCoveredLocalCatalogSchemaPlan(world, name, manifest);
         continue;
       }
-    }
-    const plan = planCatalogSchemaMigration(world, manifest, {
-      actor: "$wiz",
-      allowImplementationHints: true,
-      reconcileSeedHooks: true,
-      scope: "gateway",
-      host: "world"
-    });
-    if (
-      !forceVerify &&
-      catalogMigrationRecordCompleted(world, plan.id, "gateway", "world") &&
-      localCatalogInstalledManifestHash(world, name) === plan.manifest_hash
-    ) {
-      markMigrationApplied(world, plan.id);
-      continue;
     }
     const result = runLocalCatalogSchemaPlan(world, name, manifest, "gateway", "world", {
       allowImplementationHints: true,
@@ -773,23 +745,6 @@ function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly 
     if (result.status === "completed") markMigrationApplied(world, result.plan_id);
     else console.warn("woo.local_catalog_schema_plan_failed", { catalog: name, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
   }
-}
-
-function localCatalogInstalledManifestHash(world: WooWorld, name: string): string | null {
-  if (!world.objects.has("$catalog_registry")) return null;
-  const raw = world.propOrNull("$catalog_registry", "installed_catalogs");
-  if (!Array.isArray(raw)) return null;
-  for (const record of raw) {
-    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-    const item = record as Record<string, WooValue>;
-    if (item.tap !== "@local") continue;
-    if (item.alias !== name && item.catalog !== name) continue;
-    const provenance = item.provenance;
-    if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) return null;
-    const hash = (provenance as Record<string, WooValue>).local_manifest_hash;
-    return typeof hash === "string" ? hash : null;
-  }
-  return null;
 }
 
 function recordCoveredLocalCatalogSchemaPlan(world: WooWorld, name: string, manifest: CatalogManifest): void {

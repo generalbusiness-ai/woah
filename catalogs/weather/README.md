@@ -60,6 +60,21 @@ freshness instead of a raw JSON block.
 # wrangler deploy from catalogs/weather/plug
 ```
 
+Validate the minted token before storing it:
+
+```bash
+export WOO_BASE_URL="https://woo.example.com"
+export WOO_APIKEY="apikey:<id>:<secret>"
+
+curl -fsS "$WOO_BASE_URL/api/auth" \
+  -H "content-type: application/json" \
+  --data "{\"token\":\"$WOO_APIKEY\"}"
+```
+
+The response should include `actor` equal to the weather block and
+`token_class: "apikey"`. Use the full `apikey:<id>:<secret>` token;
+`apikey:<secret>` is not the documented token form.
+
 The plug Worker lives at [`plug/`](plug/). It runs on a Cloudflare cron
 schedule (hourly) and uses the REST `/api/objects/<id>/calls/<verb>`
 surface to push data via apikey-bound session.

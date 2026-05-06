@@ -437,6 +437,12 @@ describe("woo core", () => {
     remote.createObject({ id: "remote_welcome_pin", name: "Remote Welcome Pin", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
     remote.setProp("remote_welcome_pin", "description", "A pin hosted somewhere else.");
     remote.setProp("remote_welcome_pin", "aliases", ["remote pin"]);
+    remote.addVerb("remote_welcome_pin", {
+      ...nativeVerb("polish"),
+      perms: "rxd",
+      direct_callable: true,
+      arg_spec: { command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } }
+    });
     home.mirrorContents("the_chatroom", "remote_welcome_pin", true);
     await home.directCall("remote-examine-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
 
@@ -446,16 +452,16 @@ describe("woo core", () => {
     if (examined.op === "result") {
       expect(examined.result).toMatchObject({
         target: "remote_welcome_pin",
-        owner: null,
+        owner: "$wiz",
         remote: true,
         aliases: ["remote pin"],
         description: "A pin hosted somewhere else.",
-        obvious_verbs: []
+        obvious_verbs: expect.arrayContaining([expect.stringContaining("polish remote pin")])
       });
       expect(examined.observations).toContainEqual(expect.objectContaining({
         type: "text",
         target: session.actor,
-        text: expect.stringContaining("Remote Welcome Pin")
+        text: expect.stringContaining("Obvious verbs:")
       }));
     }
   });

@@ -31,9 +31,34 @@ The seed hooks create the in-world objects. The plug Workers are
 deployed separately because they live outside woo:
 
 ```bash
+npm run plugs:bootstrap
+```
+
+The script reads `WOO_BASE_URL`, `WOO_WIZARD_TOKEN` (or `WOO_APIKEY`, then
+`WOO_MCP_TOKEN`) for a wizard REST token, and `TOMORROW_IO_API_KEY` for
+weather. It mints fresh actor-bound apikeys for `the_weather` and
+`the_horoscope`, writes the deployment bindings and credentials to the
+corresponding Wrangler secrets, deploys both plug Workers, and triggers them
+immediately when `WEATHER_PLUG_URL` / `HOROSCOPE_PLUG_URL` are set.
+
+Use `npm run plugs:bootstrap -- --dry-run` to inspect the plan without
+touching woo or Wrangler. Use `--revoke-existing-labels` only when rotating
+the production demo credentials; it revokes older unrevoked keys with the
+same block actor and label after the new secrets have been stored and the
+deploys have completed.
+
+The equivalent manual flow is:
+
+```bash
 # In a session as the catalog owner (or wizard):
 $ woo>  the_weather:mint_apikey("weather-cf-worker-prod")
    { id: "ak_…", secret: "<one-time>" }
+
+$ export WOO_BASE_URL="https://woo.example.com"
+$ export WOO_APIKEY="apikey:<id>:<secret>"
+$ curl -fsS "$WOO_BASE_URL/api/auth" \
+    -H "content-type: application/json" \
+    --data "{\"token\":\"$WOO_APIKEY\"}"
 
 $ cd catalogs/weather/plug
 $ wrangler secret put WOO_APIKEY            # apikey:<id>:<secret>
@@ -43,10 +68,21 @@ $ wrangler deploy
 $ woo>  the_horoscope:mint_apikey("horoscope-cf-worker-prod")
    { id: "ak_…", secret: "<one-time>" }
 
+$ export WOO_APIKEY="apikey:<id>:<secret>"
+$ curl -fsS "$WOO_BASE_URL/api/auth" \
+    -H "content-type: application/json" \
+    --data "{\"token\":\"$WOO_APIKEY\"}"
+
 $ cd catalogs/horoscope/plug
 $ wrangler secret put WOO_APIKEY
 $ wrangler deploy
 ```
+
+The auth response should show `token_class: "apikey"` and `actor` equal to
+the block (`the_weather` or `the_horoscope`). `E_NOSESSION` means the
+token is malformed, unknown, secret-mismatched, or revoked. Use the full
+`apikey:<id>:<secret>` token; `apikey:<secret>` is not the documented
+token form.
 
 After deploy, the weather panel ticks hourly; the horoscope machine
 fulfills `:order` requests on a one-minute cron.

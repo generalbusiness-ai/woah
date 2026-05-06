@@ -98,7 +98,7 @@ export async function runWeatherTick(
   env: WeatherPlugEnv,
   deps: { fetchImpl?: typeof fetch } = {}
 ): Promise<WeatherTickResult> {
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
   await client.authenticate(env.WOO_APIKEY);
 
@@ -120,12 +120,13 @@ export async function runWeatherTick(
   const units: TomorrowUnits = unitsRaw === "imperial" ? "imperial" : "metric";
   const forecastHoursRaw = await client.getProperty(env.BLOCK_ID, "forecast_hours");
   const forecastHours = pickForecastHours(forecastHoursRaw, env.FORECAST_HOURS);
+  const tomorrowPlace = normalizeTomorrowLocation(place);
 
   let snapshot: WeatherSnapshot;
   try {
     snapshot = await fetchWeather({
       apiKey: env.TOMORROW_IO_API_KEY,
-      place,
+      place: tomorrowPlace,
       units,
       forecastHours,
       fetchImpl
@@ -145,6 +146,12 @@ export async function runWeatherTick(
   ]);
 
   return { block: env.BLOCK_ID, place, fetched_at: snapshot.fetched_at };
+}
+
+export function normalizeTomorrowLocation(place: string): string {
+  const trimmed = place.trim();
+  if (/^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(trimmed)) return trimmed;
+  return trimmed.replace(/,\s*/g, " ");
 }
 
 function pickForecastHours(blockValue: unknown, envValue: string | undefined): number | undefined {

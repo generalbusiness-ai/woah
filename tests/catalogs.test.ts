@@ -1160,6 +1160,36 @@ describe("local catalogs", () => {
       host: "the_pinboard",
       status: "completed"
     }));
+
+    const repaired = installVerb(host, "$pinboard", "list_notes", `verb :list_notes() rxd {
+  return this.notes;
+}`, worldVerb(host, "$pinboard", "list_notes").version);
+    expect(repaired.ok).toBe(true);
+    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("return this.notes");
+
+    runHostScopedLocalCatalogLifecycle(host, "the_pinboard");
+
+    expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("contents(this)");
+  });
+
+  it("runHostScopedLocalCatalogLifecycle verifies completed schema plans before trusting host metadata", { timeout: 30000 }, () => {
+    const host = createWorld();
+    runHostScopedLocalCatalogLifecycle(host, "the_chatroom");
+    const commandPlanRecords = host.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(commandPlanRecords).toContainEqual(expect.objectContaining({
+      plan_id: expect.stringMatching(/^local-catalog-schema:chat:/),
+      scope: "host",
+      host: "the_chatroom",
+      status: "completed"
+    }));
+
+    const lookAt = host.ownVerbExact("$conversational", "look_at")!;
+    host.addVerb("$conversational", { ...lookAt, arg_spec: { args: ["target"] }, version: lookAt.version + 1 });
+    expect(host.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toBeUndefined();
+
+    runHostScopedLocalCatalogLifecycle(host, "the_chatroom");
+
+    expect(host.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toMatchObject({ dobj: "object", args_from: ["dobj_prefix"] });
   });
 
   it("auto-syncs local catalog schema drift without a hand-authored boot migration", () => {
@@ -1410,6 +1440,17 @@ describe("local catalogs", () => {
     expect(lookMugPlan.op).toBe("result");
     if (lookMugPlan.op === "result") {
       expect(lookMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+    }
+
+    world.createObject({ id: "custom_look_probe", name: "custom look probe", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
+    const customLook = installVerb(world, "custom_look_probe", "look", `verb :look() rxd {
+  return { id: this, custom: true };
+}`, null, { argSpec: { command: { dobj: "this", prep: "any", iobj: "any", args_from: [] } } });
+    expect(customLook.ok).toBe(true);
+    const customLookPlan = await world.directCall("plan-custom-look-probe", first.actor, "the_chatroom", "command_plan", ["look custom look probe"]);
+    expect(customLookPlan.op).toBe("result");
+    if (customLookPlan.op === "result") {
+      expect(customLookPlan.result).toMatchObject({ ok: true, target: "custom_look_probe", verb: "look", args: [] });
     }
 
     const lookAtMugPlan = await world.directCall("plan-look-at-mug", first.actor, "the_chatroom", "command_plan", ["look at mug"]);
@@ -2972,6 +3013,15 @@ describe("local catalogs", () => {
           contents: expect.arrayContaining([
             expect.objectContaining({ id: "the_weather", title: "Temperature in Mountain View, CA: 72°F" })
           ])
+        });
+      }
+      const lookWeatherCommand = await world.directCall("blocks-look-weather-command", "$wiz", "the_chatroom", "command", ["look weather"]);
+      expect(lookWeatherCommand.op).toBe("result");
+      if (lookWeatherCommand.op === "result") {
+        expect(lookWeatherCommand.result).toMatchObject({ id: "the_weather" });
+        expect(lookWeatherCommand.observations.find((obs) => obs.type === "looked")).toMatchObject({
+          room: "the_chatroom",
+          target: "the_weather"
         });
       }
       // Horoscope machine: anchored on the deck, default rate limit + persona.

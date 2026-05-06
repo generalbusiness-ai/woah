@@ -49,6 +49,22 @@ Configure the block on the woo side first (owner sets `description` and
 wrangler secret put WOO_APIKEY            # apikey:<id>:<secret>
 ```
 
+Validate `WOO_APIKEY` against woo before storing it:
+
+```bash
+export WOO_BASE_URL="https://woo.example.com"
+export WOO_APIKEY="apikey:<id>:<secret>"
+
+curl -fsS "$WOO_BASE_URL/api/auth" \
+  -H "content-type: application/json" \
+  --data "{\"token\":\"$WOO_APIKEY\"}"
+```
+
+Success returns `token_class: "apikey"` and `actor` equal to the
+horoscope block. `E_NOSESSION` means the token is malformed, unknown,
+secret-mismatched, or revoked. Use the full `apikey:<id>:<secret>`
+token; `apikey:<secret>` is not the documented token form.
+
 Edit `wrangler.toml` to set `[vars] WOO_BASE_URL` and `[vars] BLOCK_ID`.
 
 ```bash

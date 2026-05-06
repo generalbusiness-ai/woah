@@ -1,7 +1,7 @@
 name = "woo-horoscope-plug"
 main = "src/index.ts"
 compatibility_date = "2026-01-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
 # Drain the queue every minute. The block's :order verb optionally emits a
 # directed `text` wakeup; that path can land later as a websocket-attached
@@ -24,6 +24,10 @@ binding = "AI"
 #   wrangler secret put WOO_APIKEY
 #   wrangler deploy
 [vars]
+# Deployment-specific values can be set as Worker variables or secrets.
+# The repo bootstrap script writes WOO_BASE_URL and BLOCK_ID with
+# `wrangler secret put` so this template stays reusable.
+#
 # WOO_BASE_URL = "https://woo.example.com"
 # BLOCK_ID = "the_horoscope_block"
 # MAX_TOKENS = "350"

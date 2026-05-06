@@ -43,7 +43,7 @@ export class WooClient {
 
   constructor(options: WooClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
   get currentSession(): WooSession | null {

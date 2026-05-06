@@ -162,6 +162,8 @@ export type HostObjectSummary = {
   name: WooValue | null;
   description: WooValue | null;
   aliases: WooValue | null;
+  owner?: WooValue | null;
+  obvious_verbs?: WooValue | null;
 };
 
 export type HostOperationMemo = {
@@ -6227,7 +6229,7 @@ export class WooWorld {
       return null;
     }
     const target = match.value;
-    if (await this.remoteHostForObject(target, ctx.hostMemo)) return await this.playerExamineRemote(ctx, target);
+    if (await this.remoteHostForObject(target, ctx.hostMemo)) return await this.playerExamineRemote(ctx, target, name);
     const obj = this.object(target);
     const owner = obj.owner;
     const aliasesValue = this.propOrNullForActor(ctx.actor, target, "aliases");
@@ -6317,18 +6319,23 @@ export class WooWorld {
     return new Date(at).toISOString().slice(0, 10);
   }
 
-  private async playerExamineRemote(ctx: CallContext, target: ObjRef): Promise<WooValue> {
+  private async playerExamineRemote(ctx: CallContext, target: ObjRef, matchedName: string): Promise<WooValue> {
     const summary = await this.hostBridge?.describeObject?.(ctx.progr, ctx.actor, target, ctx.hostMemo).catch(() => null) ?? null;
     const name = typeof summary?.name === "string" && summary.name.length > 0 ? summary.name : target;
+    const owner = typeof summary?.owner === "string" ? summary.owner : null;
     const aliases = Array.isArray(summary?.aliases) ? summary.aliases.filter((item): item is string => typeof item === "string") : [];
     const description = typeof summary?.description === "string" && summary.description.length > 0 ? summary.description : "(No description set.)";
+    const obviousVerbs = Array.isArray(summary?.obvious_verbs)
+      ? summary.obvious_verbs.filter((item): item is string => typeof item === "string")
+      : [];
     const contents = await this.objectContents(target, ctx.hostMemo).catch(() => [] as ObjRef[]);
     const contentRows = await Promise.all(contents.map(async (item) => ({
       id: item,
       name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
     })));
+    const ownerName = owner && this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : null;
     const lines = [
-      `${name} (${target}) is on a remote host; owner and obvious verbs are unavailable here.`,
+      owner ? `${name} (${target}) is owned by ${ownerName ?? owner} (${owner}).` : `${name} (${target}) is on a remote host.`,
       `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
       description
     ];
@@ -6336,17 +6343,28 @@ export class WooWorld {
       lines.push("Contents:");
       for (const item of contentRows) lines.push(`  ${item.name} (${item.id})`);
     }
+    const rewrittenObviousVerbs = obviousVerbs.map((syntax) => this.rewriteObviousSyntaxObjectName(syntax, name, matchedName));
+    if (rewrittenObviousVerbs.length > 0) {
+      lines.push("Obvious verbs:");
+      lines.push(...rewrittenObviousVerbs);
+    }
     for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
     return {
       target,
-      owner: null,
+      owner,
       aliases,
       description,
       contents: contentRows,
-      obvious_verbs: [],
+      obvious_verbs: rewrittenObviousVerbs,
       remote: true,
       text: lines.join("\n")
     } as unknown as WooValue;
+  }
+
+  private rewriteObviousSyntaxObjectName(syntax: string, remoteName: string, matchedName: string): string {
+    const replacement = matchedName.trim();
+    if (!replacement || replacement === remoteName) return syntax;
+    return syntax.replace(new RegExp(`\\b${escapeRegExp(remoteName)}\\b`, "g"), replacement);
   }
 
   private playerNameTokens(input: string): string[] {
@@ -7271,6 +7289,10 @@ function assertVerbNameDescriptor(value: WooValue): string {
 
 function titleFromSummary(fallback: ObjRef, summary: HostObjectSummary): string {
   return typeof summary.name === "string" && summary.name.length > 0 ? summary.name : fallback;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function valueToText(value: WooValue): string {

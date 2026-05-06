@@ -165,7 +165,9 @@ export class LocalHostBridge implements HostBridge {
       return {
         name: world.object(objRef).name,
         description: world.propOrNullForActor(readActor, objRef, "description"),
-        aliases: world.propOrNullForActor(readActor, objRef, "aliases")
+        aliases: world.propOrNullForActor(readActor, objRef, "aliases"),
+        owner: world.object(objRef).owner,
+        obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
       };
     };
     if (!memo) return await read();
@@ -182,7 +184,9 @@ export class LocalHostBridge implements HostBridge {
         return {
           name: world.object(objRef).name,
           description: world.propOrNullForActor(readActor, objRef, "description"),
-          aliases: world.propOrNullForActor(readActor, objRef, "aliases")
+          aliases: world.propOrNullForActor(readActor, objRef, "aliases"),
+          owner: world.object(objRef).owner,
+          obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
         };
       };
       out[objRef] = memo ? await memoizeTestOperation(memo.reads, key, read) : await read();

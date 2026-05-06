@@ -60,5 +60,20 @@ the plug next drains the queue.
 # wrangler deploy from catalogs/horoscope/plug
 ```
 
+Validate the minted token before storing it:
+
+```bash
+export WOO_BASE_URL="https://woo.example.com"
+export WOO_APIKEY="apikey:<id>:<secret>"
+
+curl -fsS "$WOO_BASE_URL/api/auth" \
+  -H "content-type: application/json" \
+  --data "{\"token\":\"$WOO_APIKEY\"}"
+```
+
+The response should include `actor` equal to the horoscope block and
+`token_class: "apikey"`. Use the full `apikey:<id>:<secret>` token;
+`apikey:<secret>` is not the documented token form.
+
 After deploy, `:order("scorpio")` returns immediately with a ticket;
 within ~60s a note arrives in the requester's inventory.
