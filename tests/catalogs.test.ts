@@ -3221,6 +3221,22 @@ describe("local catalogs", () => {
         const description = String((zipLook.result as Record<string, unknown>).description);
         expect(description).toBe("The weather panel shows that the temperature in 94043 was 58.62°F at May 6, 2026, 9:01 AM PDT.");
       }
+
+      world.setProp(blockId, "config_state", {
+        status: "error",
+        code: "E_BAD_PLACE",
+        message: "tomorrow.io could not fetch weather for \"94043\" - set place to a town name or zip code it recognizes",
+        place: "94043",
+        timezone: "America/Los_Angeles"
+      });
+      world.setProp(blockId, "last_error", "tomorrow.io could not fetch weather for \"94043\" - set place to a town name or zip code it recognizes");
+      const errorLook = await world.directCall("weather-error-look", "$wiz", blockId, "look_self", []);
+      expect(errorLook.op).toBe("result");
+      if (errorLook.op === "result") {
+        const result = errorLook.result as Record<string, unknown>;
+        expect(result.title).toBe("Weather for 94043: error");
+        expect(String(result.description)).toBe("Weather status: error for 94043. tomorrow.io could not fetch weather for \"94043\" - set place to a town name or zip code it recognizes. Last successful reading: 58.62°F at May 6, 2026, 9:01 AM PDT.");
+      }
     });
 
   });
