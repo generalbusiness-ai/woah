@@ -369,12 +369,13 @@ bridge affordances. Neither blocks basic object-addressed routing.
 Each item below is identified, deferred, and noted with the reason it
 isn't in this revision.
 
-- **Class → renderer registry as a runtime mechanism.** The bundled
-  SPA hardcodes its registry. A pluggable mechanism — per-catalog
-  `ui_manifest.json` declaring `class → renderer` mappings, or a
-  `.ui_renderer` property the SPA reads — is deferred until
-  third-party catalogs need their own renderers. For v1, adding a new
-  bundled-catalog class requires an SPA update.
+- **Remote catalog UI loading.** The object-addressed client uses
+  `woo-ui/v1` catalog frame declarations as the class-to-renderer registry.
+  Bundled first-party catalogs are statically imported by the SPA during the
+  local packaging transition. Loading third-party UI modules from catalog
+  artifacts, with content hashes and CSP policy, is specified by
+  [ui-component-model.md](ui-component-model.md) but remains gated by the
+  catalog trust model.
 
 - **Default-instance resolution from a class URL.**
   `/objects/$pinboard` ("show me a default pinboard") is not

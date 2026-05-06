@@ -8,6 +8,39 @@
     "@local:chat",
     "@local:demoworld"
   ],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "dubspace-ui",
+        "entry": "ui/dubspace-workspace.ts"
+      }
+    ],
+    "components": [
+      {
+        "id": "dubspace.workspace",
+        "module": "dubspace-ui",
+        "tag": "woo-dubspace-workspace",
+        "surface": "main",
+        "subject": "$dubspace",
+        "neighborhood": {
+          "include": ["subject", "contents", "subscribers", "actor"]
+        }
+      }
+    ],
+    "frames": [
+      {
+        "id": "dubspace.workspace",
+        "subject": "$dubspace",
+        "view": "default",
+        "layout": "space-workspace",
+        "regions": {
+          "main": [{ "component": "dubspace.workspace", "subject": "this" }],
+          "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
+        }
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$control",

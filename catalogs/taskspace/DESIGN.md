@@ -28,6 +28,14 @@ All task lifecycle changes are caused by sequenced calls. Current task state is
 the materialized result of applying those calls. No global clock is required for
 ordering.
 
+## UI
+
+The catalog declares `taskspace.workspace` as `<woo-taskspace-workspace>` in
+`ui/taskspace-workspace.ts`. The component owns the tree, inspector,
+status-filter controls, create forms, and embedded mini-chat mount point. The
+SPA host supplies scoped projection data and verb-call services; task UI events
+cross the boundary as `woo-taskspace-*` custom events.
+
 ## Surface
 
 - One shared taskspace.

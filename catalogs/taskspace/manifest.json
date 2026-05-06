@@ -5,6 +5,39 @@
   "description": "Hierarchical task coordination demo.",
   "license": "MIT",
   "depends": ["@local:chat", "@local:note"],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "taskspace-ui",
+        "entry": "ui/taskspace-workspace.ts"
+      }
+    ],
+    "components": [
+      {
+        "id": "taskspace.workspace",
+        "module": "taskspace-ui",
+        "tag": "woo-taskspace-workspace",
+        "surface": "main",
+        "subject": "$taskspace",
+        "neighborhood": {
+          "include": ["subject", "contents", "subscribers", "actor"]
+        }
+      }
+    ],
+    "frames": [
+      {
+        "id": "taskspace.workspace",
+        "subject": "$taskspace",
+        "view": "default",
+        "layout": "space-workspace",
+        "regions": {
+          "main": [{ "component": "taskspace.workspace", "subject": "this" }],
+          "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
+        }
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$taskspace",

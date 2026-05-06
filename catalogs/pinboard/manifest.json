@@ -9,6 +9,39 @@
     "@local:note",
     "@local:demoworld"
   ],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "pinboard-ui",
+        "entry": "ui/pinboard-board.ts"
+      }
+    ],
+    "components": [
+      {
+        "id": "pinboard.board",
+        "module": "pinboard-ui",
+        "tag": "woo-pinboard-board",
+        "surface": "main",
+        "subject": "$pinboard",
+        "neighborhood": {
+          "include": ["subject", "contents", "subscribers", "actor"]
+        }
+      }
+    ],
+    "frames": [
+      {
+        "id": "pinboard.board",
+        "subject": "$pinboard",
+        "view": "default",
+        "layout": "space-workspace",
+        "regions": {
+          "main": [{ "component": "pinboard.board", "subject": "this" }],
+          "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
+        }
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$pin",

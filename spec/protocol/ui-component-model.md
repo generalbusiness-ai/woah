@@ -25,9 +25,10 @@ This is a **draft** design for the browser client framework. An initial
 implementation slice exists in `src/client/framework.ts`: catalog UI
 registration, frame resolution, frame-local state/actions, observation
 normalization, scoped snapshot ingestion, projection subscriptions, consistent
-projection layers, and call-bound optimistic reconciliation. The current SPA
-still uses legacy tab renderers for most mounted UI; catalogs have not yet
-been moved to catalog-shipped modules.
+projection layers, and call-bound optimistic reconciliation. The bundled chat,
+dubspace, pinboard, and taskspace surfaces now mount catalog-shipped custom
+elements; the host client still supplies transport, audio, routing, and gesture
+service adapters while the frame-action layer matures.
 
 The model has six goals:
 
@@ -93,10 +94,9 @@ objects, verbs, properties, seed hooks, agent tools, and browser UI in one
 versioned package.
 
 The browser ABI is **custom elements**. Catalog components are ordinary Web
-Components registered with `customElements.define()`. The blessed first-party
-authoring framework is **Lit**, but Lit is not the ABI. A component written
-with vanilla custom elements or another framework is valid if it obeys this
-spec's runtime contract.
+Components registered with `customElements.define()`. The v1 first-party
+components use vanilla custom elements; Lit or another framework is valid if
+the component obeys this spec's runtime contract.
 
 The host client owns:
 
@@ -1458,14 +1458,18 @@ The first implementation should proceed in this order:
 7. Add frame-local state, UI actions, drag/drop action payloads, and overlay
    frame stack support.
 8. Provide core Web Components for `core.object-detail`, `core.presence`, and
-   `chat.space`, authored with Lit.
-9. Implement a hardcoded frame resolver that reproduces the current tab UI.
+   `chat.space`. Components are ordinary custom elements; Lit or another
+   helper library is optional and not part of the ABI.
+9. Implement a frame resolver that reproduces the current tab UI while using
+   catalog frame declarations when available.
 10. Move bundled frame declarations into catalog manifests.
 11. Move bundled UI components and observation handlers into catalog-local ESM
    modules.
 12. Enforce module hashing for non-local catalog UI.
-13. Remove legacy tab-specific assembly and global observation branches once
-    frames, projection, and observation handlers cover the shipped UI.
+13. Remove legacy tab-specific render scaffolding and global observation
+    branches once frames, projection, and observation handlers cover the
+    shipped UI. Host-owned service adapters may remain for transport, audio,
+    routing, and gestures that are not yet expressible as frame actions.
 
 This staged profile is non-normative, but implementations that follow it will
 preserve behavior while moving authority from the monolithic SPA into
@@ -1587,6 +1591,11 @@ normally a client/catalog packaging change, not a world-state migration:
 - Existing worlds whose client bundle still contains legacy tab renderers can
   run during the transition. The host may prefer catalog frames when available
   and fall back to legacy adapters only for bundled demos not yet migrated.
+- The bundled chat, dubspace, pinboard, and taskspace catalogs ship
+  catalog-local custom element modules and frame declarations in v1. The first
+  client mounts those surfaces through catalog UI declarations; the host still
+  supplies service adapters for WebSocket calls, audio, route state, and
+  pinboard drag/resize gestures.
 
 A migration is required if the UI refactor changes persisted world state, not
 because it changes presentation. Examples that do require migration handling:

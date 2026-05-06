@@ -4,10 +4,16 @@ import dubspaceManifest from "../../catalogs/dubspace/manifest.json";
 import pinboardManifest from "../../catalogs/pinboard/manifest.json";
 import taskspaceManifest from "../../catalogs/taskspace/manifest.json";
 import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
+import * as dubspaceUiModule from "../../catalogs/dubspace/ui/dubspace-workspace";
+import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
+import * as taskspaceUiModule from "../../catalogs/taskspace/ui/taskspace-workspace";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import type { ChatLine, ChatSpaceData, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
+import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
+import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
+import type { TaskspaceData } from "../../catalogs/taskspace/ui/taskspace-workspace";
 
 type AppState = {
   socket?: WebSocket;
@@ -2397,105 +2403,42 @@ async function ensureScopedProjectionReady() {
 }
 
 function installBundledCatalogUi() {
-  const uiManifest = (chatManifest as any).ui;
-  if (!uiManifest) return;
-  // Bundled-catalog mode registers statically imported source. Installed remote
-  // catalogs should go through CatalogUiRegistry.loadModule() with the resolved
-  // artifact URL from the manifest entry.
-  const diagnostics = ui.catalogUi.installCatalogUi({
-    alias: "chat",
-    catalog: "chat",
-    objects: { "$space": "$space", "$chatroom": "$chatroom" },
-    ui: uiManifest
-  } satisfies CatalogUiPackage);
-  if (diagnostics.length > 0) throw new Error(`bundled chat UI manifest is invalid: ${diagnostics.join("; ")}`);
-  installedCatalogUiAliases.add("chat");
-  ui.catalogUi.registerModuleExports("chat", "chat-ui", chatUiModule, ui.observations);
+  const bundled = [
+    { alias: "chat", manifest: chatManifest, objects: { "$space": "$space", "$chatroom": "$chatroom" }, modules: { "chat-ui": chatUiModule } },
+    { alias: "dubspace", manifest: dubspaceManifest, objects: { "$dubspace": "$dubspace" }, modules: { "dubspace-ui": dubspaceUiModule } },
+    { alias: "pinboard", manifest: pinboardManifest, objects: { "$pinboard": "$pinboard" }, modules: { "pinboard-ui": pinboardUiModule } },
+    { alias: "taskspace", manifest: taskspaceManifest, objects: { "$taskspace": "$taskspace" }, modules: { "taskspace-ui": taskspaceUiModule } }
+  ] as const;
+  for (const item of bundled) {
+    const uiManifest = (item.manifest as any).ui;
+    if (!uiManifest) continue;
+    // Bundled-catalog mode registers statically imported source. Installed remote
+    // catalogs should go through CatalogUiRegistry.loadModule() with the resolved
+    // artifact URL from the manifest entry.
+    const diagnostics = ui.catalogUi.installCatalogUi({
+      alias: item.alias,
+      catalog: item.alias,
+      objects: item.objects,
+      ui: uiManifest
+    } satisfies CatalogUiPackage);
+    if (diagnostics.length > 0) throw new Error(`bundled ${item.alias} UI manifest is invalid: ${diagnostics.join("; ")}`);
+    installedCatalogUiAliases.add(item.alias);
+    for (const [moduleId, mod] of Object.entries(item.modules)) {
+      ui.catalogUi.registerModuleExports(item.alias, moduleId, mod, ui.observations);
+    }
+  }
 }
 
 function renderDubspace() {
-  const dub = effectiveDubspace();
-  const meta = dubspaceMeta();
-  const space = meta.space ? dub[meta.space] : null;
-  const spaceId = typeof meta.space === "string" ? meta.space : "";
-  const operators = dubspaceOperators();
-  const inSpace = Boolean(state.actor && operators.includes(state.actor));
-  const slots = Array.isArray(meta.slots) ? meta.slots : [];
-  const filter = dub[meta.filter]?.props ?? {};
-  const delay = dub[meta.delay]?.props ?? {};
-  const drum = dub[meta.drum]?.props ?? {};
-  const pattern = normalizePattern(drum.pattern);
-  if (!space) {
+  const tag = toolFrameComponentTag(dubspaceSpace(), "dubspace.workspace", "dubspace");
+  if (!tag) {
     return `
       <section class="toolbar"><h1>Dubspace</h1></section>
-      <section class="panel"><p class="empty-state">No dubspace catalog instance is installed.</p></section>
+      <section class="panel"><p class="empty-state">No dubspace UI is registered for this space.</p></section>
     `;
   }
-  if (!inSpace) {
-    return `
-      <section class="toolbar">
-        <h1>${escapeHtml(space.name ?? "Dubspace")}</h1>
-        <button data-dubspace-enter ${canSendDirect() ? "" : "disabled"}>Enter</button>
-      </section>
-      <section class="dubspace-layout">
-        <div class="panel">
-          <p>${escapeHtml(String(space.props?.description ?? "Enter the dubspace to work at the controls."))}</p>
-        </div>
-        ${renderDubspacePresence(operators)}
-      </section>
-    `;
-  }
-  return `
-    <section class="toolbar dubspace-toolbar">
-      <h1>${escapeHtml(space.name ?? "Dubspace")}</h1>
-      <button data-dubspace-leave>Leave</button>
-      <button class="${state.audioOn ? "active" : ""}" data-audio aria-pressed="${state.audioOn}">Audio ${state.audioOn ? "On" : "Off"}</button>
-      <button data-save-scene>Save Scene</button>
-      <button data-recall-scene>Recall Scene</button>
-    </section>
-    <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(spaceId)}" style="--space-chat-h:${Math.round(spaceChatHeight(spaceId))}px">
-      <section class="dubspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(spaceId)}">
-        <div class="dubspace-work">
-          <div class="grid">
-            <article class="panel loop-console-panel">
-              <div class="panel-head"><h2>Loops</h2></div>
-              <div class="loop-console">${slots.map((id: string, index: number) => renderLoopStrip(id, index + 1, dub)).join("")}${renderFilterStrip(filter)}</div>
-            </article>
-            <article class="panel">
-              <h2>Delay</h2>
-              ${slider(meta.delay, "send", delay.send ?? 0.3)}
-              ${slider(meta.delay, "time", delay.time ?? 0.25)}
-              ${slider(meta.delay, "feedback", delay.feedback ?? 0.35)}
-              ${slider(meta.delay, "wet", delay.wet ?? 0.4)}
-            </article>
-            <article class="panel sequencer">
-              <div class="panel-head">
-                <h2>Percussion</h2>
-                <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
-              </div>
-              <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(drum.bpm ?? 118))}"><span>${escapeHtml(String(drum.bpm ?? 118))}</span></label>
-              <div class="steps">
-                ${drumVoices.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
-              </div>
-            </article>
-          </div>
-        </div>
-        ${renderDubspacePresence(operators)}
-      </section>
-      ${renderSpaceChatPanel(spaceId)}
-    </section>
-  `;
-}
-
-function renderDubspacePresence(operators: string[]) {
-  return `
-    <aside class="panel dubspace-presence">
-      <h2>At the controls</h2>
-      <div class="presence-list">
-        ${operators.map((id: string) => `<button disabled>${escapeHtml(actorLabel(id))}<span>${escapeHtml(id)}</span></button>`).join("") || "<p>No one is at the controls.</p>"}
-      </div>
-    </aside>
-  `;
+  const spaceId = dubspaceSpace();
+  return `<${tag} data-dubspace-workspace data-dubspace-space="${escapeHtml(spaceId)}"></${tag}>`;
 }
 
 function dubspaceOperators(): string[] {
@@ -2504,55 +2447,52 @@ function dubspaceOperators(): string[] {
   return Array.isArray(raw) ? raw.map(String) : [];
 }
 
-function renderFilterStrip(filter: any) {
-  const cutoff = filter.cutoff ?? 1000;
-  const target = dubspaceMeta().filter ?? "";
-  return `
-    <div class="filter-strip">
-      <div class="loop-strip-head">
-        <strong>F</strong>
-        <span>Filter</span>
-      </div>
-      <input class="vertical-fader" aria-label="Filter cutoff" data-control data-target="${escapeHtml(target)}" data-name="cutoff" type="range" min="80" max="5000" step="1" value="${escapeHtml(String(cutoff))}">
-      <span class="fader-readout" data-control-readout>${escapeHtml(String(Math.round(Number(cutoff))))} Hz</span>
-    </div>
-  `;
-}
-
-function renderLoopStrip(id: string, index: number, dub: any) {
-  const slot = dub[id]?.props ?? {};
-  const cue = state.cueSlots[id] === true;
-  const serverPlaying = projectedObjectView(id)?.props?.playing === true;
-  const buttonPlaying = cue ? state.cuePlaying[id] === true : serverPlaying;
-  const freq = slot.freq ?? defaultLoopFreq(index);
-  const pitch = loopPitch(freq);
-  return `
-    <div class="loop-strip ${slot.playing ? "playing" : ""} ${cue ? "cue-active" : ""}">
-      <div class="loop-strip-head">
-        <strong>${index}</strong>
-        <span>${escapeHtml(String(dub[id]?.name ?? id))}</span>
-      </div>
-      <button data-loop="${escapeHtml(id)}" data-playing="${buttonPlaying ? "true" : "false"}">${buttonPlaying ? "Stop" : "Start"}</button>
-      <input class="vertical-fader" aria-label="Loop ${index} gain" data-control data-target="${escapeHtml(id)}" data-name="gain" type="range" min="0" max="1" step="0.01" value="${escapeHtml(String(slot.gain ?? 0.75))}">
-      <div class="pitch-switch" style="--pitch-angle: ${pitch.angle}deg">
-        <div class="pitch-dial" data-pitch-dial aria-hidden="true"><span class="pitch-pointer"></span></div>
-        <input class="pitch-switch-input" aria-label="Loop ${index} pitch" data-control data-pitch-input data-target="${escapeHtml(id)}" data-name="freq" type="range" min="${PITCH_MIN_SEMITONE}" max="${PITCH_MAX_SEMITONE}" step="1" value="${pitch.semitone}">
-        <div class="pitch-readout"><strong data-pitch-note>${escapeHtml(pitch.note)}</strong><span data-pitch-hz>${escapeHtml(String(Math.round(pitch.freq)))} Hz</span></div>
-      </div>
-      <button class="cue-button ${cue ? "active" : ""}" data-cue-slot="${escapeHtml(id)}" aria-pressed="${cue}">CUE</button>
-    </div>
-  `;
-}
-
-function slider(obj: string, prop: string, value: number) {
-  return `<label>${escapeHtml(prop)} <input data-control data-target="${escapeHtml(obj)}" data-name="${escapeHtml(prop)}" type="range" min="0" max="1" step="0.01" value="${escapeHtml(String(value))}"></label>`;
-}
-
-function bindDubspace() {
+function mountToolSpaceChat(element: HTMLElement, space: string) {
+  const slot = element.querySelector<HTMLElement>("[data-tool-space-chat]");
+  if (!slot || !space) return;
+  slot.innerHTML = renderSpaceChatPanel(space);
   bindSpaceChatPanels();
-  document.querySelector<HTMLButtonElement>("[data-dubspace-enter]")?.addEventListener("click", enterDubspace);
-  document.querySelector<HTMLButtonElement>("[data-dubspace-leave]")?.addEventListener("click", () => leaveDubspace());
-  document.querySelector<HTMLButtonElement>("[data-audio]")?.addEventListener("click", async () => {
+}
+
+function mountDubspaceComponent() {
+  const element = document.querySelector<WooElement & { data?: DubspaceData }>("[data-dubspace-workspace]");
+  if (!element) return;
+  const dub = effectiveDubspace();
+  const meta = dubspaceMeta();
+  const spaceId = typeof meta.space === "string" ? meta.space : "";
+  const space = spaceId ? projectedObjectView(spaceId) ?? dub[spaceId] : null;
+  const operators = dubspaceOperators();
+  const lines = chatLinesForSpace(spaceId);
+  element.subject = spaceId;
+  element.woo = createChatWooContext(spaceId, [...chatLineActorRefs(lines), ...operators]);
+  setCustomElementData(element, {
+    spaceId,
+    spaceName: String(space?.name ?? "Dubspace"),
+    spaceDescription: String(space?.props?.description ?? space?.description ?? ""),
+    controls: dub,
+    slots: Array.isArray(meta.slots) ? meta.slots : [],
+    filter: meta.filter ?? "",
+    delay: meta.delay ?? "",
+    drum: meta.drum ?? "",
+    operators,
+    actor: state.actor ?? null,
+    inSpace: Boolean(state.actor && operators.includes(state.actor)),
+    canSend: canSendDirect(),
+    audioOn: state.audioOn,
+    cueSlots: state.cueSlots,
+    cuePlaying: state.cuePlaying
+  }, () => {
+    if (spaceId && operators.includes(state.actor ?? "")) mountToolSpaceChat(element, spaceId);
+  });
+  bindDubspaceComponentEvents(element);
+}
+
+function bindDubspaceComponentEvents(element: WooElement) {
+  if (element.dataset.dubspaceEventsBound === "true") return;
+  element.dataset.dubspaceEventsBound = "true";
+  element.addEventListener("woo-dubspace-enter", enterDubspace);
+  element.addEventListener("woo-dubspace-leave", () => leaveDubspace());
+  element.addEventListener("woo-dubspace-audio", async () => {
     audio ??= new DubAudio();
     if (state.audioOn) {
       await audio.stop();
@@ -2565,90 +2505,96 @@ function bindDubspace() {
     audio.sync(effectiveDubspace(), state.clockOffset);
     render();
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-loop]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const slot = button.dataset.loop!;
-      const playing = button.dataset.playing === "true";
-      if (state.cueSlots[slot]) {
-        state.cuePlaying[slot] = !playing;
-        audio?.sync(effectiveDubspace(), state.clockOffset);
-        render();
-        return;
-      }
-      callDubspaceMutation(playing ? "stop_loop" : "start_loop", [slot], dubspaceOptimisticProps(slot, { playing: !playing }, `${slot}:playing`));
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-cue-slot]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const slot = button.dataset.cueSlot!;
-      const wasCue = state.cueSlots[slot] === true;
-      if (wasCue) {
-        commitCueControls(slot);
-        state.cueSlots[slot] = false;
-        clearCueState(slot);
-      } else {
-        state.cueSlots[slot] = true;
-        state.cuePlaying[slot] = true;
-      }
+  element.addEventListener("woo-dubspace-loop", (event) => {
+    const detail = (event as CustomEvent<{ slot?: unknown; playing?: unknown }>).detail ?? {};
+    const slot = String(detail.slot ?? "");
+    const playing = detail.playing === true;
+    if (!slot) return;
+    if (state.cueSlots[slot]) {
+      state.cuePlaying[slot] = !playing;
       audio?.sync(effectiveDubspace(), state.clockOffset);
       render();
-    });
+      return;
+    }
+    callDubspaceMutation(playing ? "stop_loop" : "start_loop", [slot], dubspaceOptimisticProps(slot, { playing: !playing }, `${slot}:playing`));
   });
-  document.querySelectorAll<HTMLInputElement>("[data-control]").forEach((input) => {
-    input.addEventListener("input", () => {
-      const { target, name } = controlBinding(input);
-      syncPitchInput(input);
-      const value = controlInputValue(input);
-      if (state.cueSlots[target]) {
-        setCueControl(target, name, value);
-        return;
-      }
-      sendPreviewControl(target, name, value);
-    });
-    input.addEventListener("change", () => {
-      const { target, name } = controlBinding(input);
-      syncPitchInput(input);
-      const value = controlInputValue(input);
-      if (state.cueSlots[target]) {
-        setCueControl(target, name, value);
-        return;
-      }
-      const space = dubspaceSpace();
-      if (space) call(space, space, "set_control", [target, name, value], dubspaceOptimisticProps(target, { [name]: value }, `${target}:${name}`));
-    });
+  element.addEventListener("woo-dubspace-cue", (event) => {
+    const slot = String((event as CustomEvent<{ slot?: unknown }>).detail?.slot ?? "");
+    if (!slot) return;
+    const wasCue = state.cueSlots[slot] === true;
+    if (wasCue) {
+      commitCueControls(slot);
+      state.cueSlots[slot] = false;
+      clearCueState(slot);
+    } else {
+      state.cueSlots[slot] = true;
+      state.cuePlaying[slot] = true;
+    }
+    audio?.sync(effectiveDubspace(), state.clockOffset);
+    render();
   });
-  document.querySelectorAll<HTMLElement>("[data-pitch-dial]").forEach((dial) => bindPitchDial(dial));
-  document.querySelector<HTMLButtonElement>("[data-transport]")?.addEventListener("click", (event) => {
-    const mode = (event.currentTarget as HTMLButtonElement).dataset.transport;
+  element.addEventListener("woo-dubspace-control-preview", (event) => {
+    const detail = (event as CustomEvent<{ target?: unknown; name?: unknown; value?: unknown }>).detail ?? {};
+    const target = String(detail.target ?? "");
+    const name = String(detail.name ?? "");
+    const value = Number(detail.value);
+    if (!target || !name || !Number.isFinite(value)) return;
+    if (state.cueSlots[target]) {
+      setCueControl(target, name, value);
+      return;
+    }
+    sendPreviewControl(target, name, value);
+  });
+  element.addEventListener("woo-dubspace-control-commit", (event) => {
+    const detail = (event as CustomEvent<{ target?: unknown; name?: unknown; value?: unknown }>).detail ?? {};
+    const target = String(detail.target ?? "");
+    const name = String(detail.name ?? "");
+    const value = Number(detail.value);
+    if (!target || !name || !Number.isFinite(value)) return;
+    if (state.cueSlots[target]) {
+      setCueControl(target, name, value);
+      return;
+    }
+    const space = dubspaceSpace();
+    if (space) call(space, space, "set_control", [target, name, value], dubspaceOptimisticProps(target, { [name]: value }, `${target}:${name}`));
+  });
+  element.addEventListener("woo-dubspace-transport", (event) => {
+    const mode = String((event as CustomEvent<{ mode?: unknown }>).detail?.mode ?? "");
     const drum = dubspaceMeta().drum ?? "";
     const props = mode === "stop"
       ? { playing: false }
       : { playing: true, started_at: Date.now() + state.clockOffset };
     callDubspaceMutation(mode === "stop" ? "stop_transport" : "start_transport", [], dubspaceOptimisticProps(drum, props, `${drum}:transport`));
   });
-  document.querySelector<HTMLInputElement>("[data-tempo]")?.addEventListener("change", (event) => {
-    const bpm = Number((event.currentTarget as HTMLInputElement).value);
+  element.addEventListener("woo-dubspace-tempo", (event) => {
+    const bpm = Number((event as CustomEvent<{ bpm?: unknown }>).detail?.bpm);
     const drum = dubspaceMeta().drum ?? "";
-    callDubspaceMutation("set_tempo", [bpm], dubspaceOptimisticProps(drum, { bpm }, `${drum}:bpm`));
+    if (Number.isFinite(bpm)) callDubspaceMutation("set_tempo", [bpm], dubspaceOptimisticProps(drum, { bpm }, `${drum}:bpm`));
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-step]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const [voice, step] = button.dataset.step!.split(":");
-      const enabled = button.dataset.enabled !== "true";
-      const drum = dubspaceMeta().drum ?? "";
-      const pattern = patternWithStep(projectedObjectView(drum)?.props?.pattern, voice, Number(step), enabled);
-      callDubspaceMutation("set_drum_step", [voice, Number(step), enabled], dubspaceOptimisticProps(drum, { pattern }, `${drum}:pattern`));
-    });
+  element.addEventListener("woo-dubspace-step", (event) => {
+    const detail = (event as CustomEvent<{ voice?: unknown; step?: unknown; enabled?: unknown }>).detail ?? {};
+    const voice = String(detail.voice ?? "");
+    const step = Number(detail.step);
+    const enabled = detail.enabled === true;
+    const drum = dubspaceMeta().drum ?? "";
+    const pattern = patternWithStep(projectedObjectView(drum)?.props?.pattern, voice, step, enabled);
+    callDubspaceMutation("set_drum_step", [voice, step, enabled], dubspaceOptimisticProps(drum, { pattern }, `${drum}:pattern`));
   });
-  document.querySelector<HTMLButtonElement>("[data-save-scene]")?.addEventListener("click", () => {
+  element.addEventListener("woo-dubspace-save-scene", () => {
     const space = dubspaceSpace();
     if (space) call(space, space, "save_scene", [`Scene ${new Date().toLocaleTimeString()}`]);
   });
-  document.querySelector<HTMLButtonElement>("[data-recall-scene]")?.addEventListener("click", () => {
+  element.addEventListener("woo-dubspace-recall-scene", () => {
     const space = dubspaceSpace();
     const scene = dubspaceMeta().scene;
     if (space && scene) call(space, space, "recall_scene", [scene]);
   });
+}
+
+function bindDubspace() {
+  mountDubspaceComponent();
+  bindSpaceChatPanels();
+  document.querySelectorAll<HTMLElement>("[data-pitch-dial]").forEach((dial) => bindPitchDial(dial));
 }
 
 function enterDubspace() {
@@ -3369,6 +3315,13 @@ function chatFrameComponentTag(): string | null {
   return (component ?? ui.catalogUi.component("chat.space", "chat"))?.declaration.tag ?? null;
 }
 
+function toolFrameComponentTag(subject: string, fallbackComponent: string, declaringAlias: string): string | null {
+  const resolved = subject ? ui.catalogUi.resolveFrame(subject, undefined, clientClassDistance) : undefined;
+  const firstMainNode = resolved?.frame.regions.main?.[0];
+  const component = firstMainNode ? ui.catalogUi.component(firstMainNode.component, resolved?.catalog.alias) : undefined;
+  return (component ?? ui.catalogUi.component(fallbackComponent, declaringAlias))?.declaration.tag ?? null;
+}
+
 function setCustomElementData<T>(element: HTMLElement & { data?: T }, data: T, afterRender?: () => void) {
   const assign = () => {
     element.data = data;
@@ -3648,58 +3601,15 @@ function actorLabel(id: string | undefined) {
 }
 
 function renderPinboard() {
-  const pinboard = pinboardModel();
-  const board = pinboard?.board;
-  const present = Array.isArray(pinboard?.present) ? pinboard.present : [];
-  const inBoard = pinboardActorPresent();
-  const viewport = pinboard?.viewport ?? { w: 960, h: 560 };
-  const width = pinNoteNumber(viewport.w, 960);
-  const height = pinNoteNumber(viewport.h, 560);
-  const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
-  const view = normalizedPinboardView();
-  if (!board) {
+  const tag = toolFrameComponentTag(pinboardSpace(), "pinboard.board", "pinboard");
+  if (!tag) {
     return `
       <section class="toolbar"><h1>Pinboard</h1></section>
-      <section class="panel"><p class="empty-state">No pinboard catalog instance is installed.</p></section>
+      <section class="panel"><p class="empty-state">No pinboard UI is registered for this board.</p></section>
     `;
   }
-  const toolbar = `
-    <section class="toolbar pinboard-toolbar">
-      <h1>${escapeHtml(board.name ?? "Pinboard")}</h1>
-      ${inBoard ? `<button data-pinboard-leave>Leave</button>` : `<button data-pinboard-enter ${canSendDirect() ? "" : "disabled"}>Enter</button>`}
-    </section>
-  `;
-  const layout = `
-    <section class="pinboard-layout ${inBoard ? "has-space-chat" : ""}" data-space-chat-layout="${escapeHtml(board.id)}" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
-      <div class="pinboard-work">
-        ${inBoard ? renderPinboardCreate(pinboard.palette) : renderPinboardCreatePlaceholder()}
-        <div class="panel pinboard-stage-panel">
-          <div class="pinboard-stage" data-pinboard-stage style="${pinboardStageStyle(width, height, view)}">
-            <div class="pinboard-zoom-controls" aria-label="Pinboard zoom controls">
-              <button data-pinboard-zoom="out" aria-label="Zoom out">-</button>
-              <span data-pinboard-zoom-label>${Math.round(view.scale * 100)}%</span>
-              <button data-pinboard-zoom="in" aria-label="Zoom in">+</button>
-            </div>
-            <div class="pinboard-canvas" data-pinboard-canvas style="${pinboardViewStyle(view)}">
-              ${notes.map((note: any) => renderPinNote(note, inBoard, pinboard.palette)).join("") || `<div class="pinboard-empty">${escapeHtml(inBoard ? "Add a note to start." : "Enter the pinboard to add or move notes.")}</div>`}
-            </div>
-          </div>
-        </div>
-      </div>
-      <aside class="panel pinboard-presence">
-        <h2>Presence</h2>
-        <div data-pinboard-map-shell>${renderPinboardMap(notes, present, width, height, pinboard.palette)}</div>
-      </aside>
-    </section>
-  `;
-  if (!inBoard) return `${toolbar}${layout}`;
-  return `
-    ${toolbar}
-    <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(board.id)}" style="--space-chat-h:${Math.round(spaceChatHeight(board.id))}px">
-      ${layout}
-      ${renderSpaceChatPanel(board.id)}
-    </section>
-  `;
+  const boardId = pinboardSpace();
+  return `<${tag} data-pinboard-board data-pinboard-space="${escapeHtml(boardId)}"></${tag}>`;
 }
 
 function renderSpaceChatPanel(space: string) {
@@ -3833,30 +3743,6 @@ function pinNoteRecordBox(note: any): PinNoteBox {
   });
 }
 
-function pinboardStageStyle(width: number, height: number, view = normalizedPinboardView()) {
-  return `--pinboard-w:${width}px; --pinboard-h:${height}px; ${pinboardGridStyle(view)}`;
-}
-
-function pinboardGridStyle(view = normalizedPinboardView()) {
-  const grid = PINBOARD_GRID_SIZE * view.scale;
-  return `--pinboard-grid-size:${roundCss(grid)}px; --pinboard-grid-x:${roundCss(mod(view.x, grid))}px; --pinboard-grid-y:${roundCss(mod(view.y, grid))}px;`;
-}
-
-function renderPinboardCreate(palette: string[]) {
-  const selected = normalizePinboardStickyColor(state.pinboardNewColor, palette);
-  return `
-    <form class="panel pinboard-create" data-pinboard-create>
-      <textarea data-pinboard-new-text placeholder="New note">${escapeHtml(state.pinboardNewText)}</textarea>
-      <select data-pinboard-new-color>${pinboardPalette(palette).map((color) => `<option value="${escapeHtml(color)}" ${color === selected ? "selected" : ""}>${escapeHtml(color)}</option>`).join("")}</select>
-      <button>Add Note</button>
-    </form>
-  `;
-}
-
-function renderPinboardCreatePlaceholder() {
-  return `<div class="panel pinboard-create pinboard-create-placeholder" aria-hidden="true"></div>`;
-}
-
 function pinboardPlacementOptimistic(id: string, patch: { x?: number; y?: number; w?: number; h?: number }): ProjectionCallOptions | undefined {
   if (!id) return undefined;
   return {
@@ -3898,57 +3784,6 @@ function pinboardPlacementPatch(id: string, patch: { x?: number; y?: number; z?:
   return { subject: id, catalogState: { pinboard_note: patch } };
 }
 
-function renderPinNote(note: any, editable: boolean, palette: string[]) {
-  const id = String(note?.id ?? "");
-  const merged = applyProjectedPinPatch(id, {
-    x: pinNoteNumber(note?.x, 40),
-    y: pinNoteNumber(note?.y, 40),
-    w: pinNoteNumber(note?.w, 180),
-    h: pinNoteNumber(note?.h, 110)
-  });
-  const x = merged.x;
-  const y = merged.y;
-  const w = merged.w;
-  const h = merged.h;
-  const serverZ = pinNoteNumber(note?.z, 1);
-  const clientZ = pinNoteClientZ.get(id) ?? 0;
-  const z = Math.max(serverZ, clientZ);
-  const color = pinNoteColor(note, palette);
-  const text = pinNoteText(note?.text);
-  const meta = pinNoteMeta(note);
-  const aria = [text || "Pinboard note", meta.replace(/\n/g, "; ")].filter(Boolean).join("; ");
-  const action = pinNoteAction(note, editable);
-  const writable = pinNoteWritable(note, editable);
-  return `
-    <article class="pin-note pin-note-${escapeHtml(color)}" data-pin-note="${escapeHtml(id)}" data-note-meta="${escapeHtml(meta)}" title="${escapeHtml(meta)}" aria-label="${escapeHtml(aria)}" data-x="${x}" data-y="${y}" data-w="${w}" data-h="${h}" style="left:${x}px; top:${y}px; width:${w}px; height:${h}px; z-index:${z}">
-      <div class="pin-note-head">
-        <button class="pin-note-drag" data-pin-note-drag ${editable ? "" : "disabled"} aria-label="Move note">::</button>
-        <select data-pin-note-color="${escapeHtml(id)}" ${writable ? "" : "disabled"}>${pinboardPalette(palette).map((item) => `<option value="${escapeHtml(item)}" ${item === color ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}</select>
-        ${action ? `<button data-pin-note-action="${escapeHtml(action.verb)}" data-pin-note-id="${escapeHtml(id)}" aria-label="${escapeHtml(action.label)}">${escapeHtml(action.text)}</button>` : ""}
-      </div>
-      <textarea data-pin-note-text="${escapeHtml(id)}" data-original="${escapeHtml(text)}" ${writable ? "" : "readonly"}>${escapeHtml(text)}</textarea>
-      <button class="pin-note-resize" data-pin-note-resize ${editable ? "" : "disabled"} aria-label="Resize note"></button>
-    </article>
-  `;
-}
-
-function pinNoteWritable(note: any, editable: boolean): boolean {
-  if (!editable || !state.actor) return false;
-  const owner = typeof note?.owner === "string" ? note.owner : typeof note?.author === "string" ? note.author : "";
-  const writers = Array.isArray(note?.writers) ? note.writers.map(String) : [];
-  return owner === state.actor || writers.includes(state.actor);
-}
-
-function pinNoteAction(note: any, editable: boolean): { verb: "take" | "eject"; label: string; text: string } | null {
-  if (!editable || !state.actor) return null;
-  const owner = typeof note?.owner === "string" ? note.owner : typeof note?.author === "string" ? note.author : "";
-  const board = pinboardModel()?.board;
-  const boardOwner = typeof board?.owner === "string" ? board.owner : "";
-  if (owner === state.actor) return { verb: "take", label: "Take note", text: "x" };
-  if (boardOwner === state.actor) return { verb: "eject", label: "Eject note", text: "x" };
-  return null;
-}
-
 function pinNoteText(value: any): string {
   if (Array.isArray(value)) return value.map((line) => typeof line === "string" ? line : String(line ?? "")).join("\n");
   return typeof value === "string" ? value : "";
@@ -3975,78 +3810,90 @@ function rememberPinboardNewColor(value: unknown, palette: any = pinboardModel()
   writeStorage(pinboardNewColorKey, color);
 }
 
-function pinNoteMeta(note: any): string {
-  const author = typeof note?.author === "string" ? actorLabel(note.author) : "unknown";
-  const created = pinNoteTimestamp(note?.created_at);
-  const updatedBy = typeof note?.updated_by === "string" ? actorLabel(note.updated_by) : "";
-  const updated = pinNoteTimestamp(note?.updated_at);
-  const lines = [`Created by ${author}${created ? ` at ${created}` : ""}`];
-  if (updatedBy && (note?.updated_by !== note?.author || note?.updated_at !== note?.created_at)) {
-    lines.push(`Last edited by ${updatedBy}${updated ? ` at ${updated}` : ""}`);
+function mountPinboardComponent() {
+  const element = document.querySelector<WooElement & { data?: PinboardData }>("[data-pinboard-board]");
+  if (!element) return;
+  const pinboard = pinboardModel();
+  const board = pinboard?.board;
+  const boardId = board?.id ? String(board.id) : pinboardSpace();
+  const present = Array.isArray(pinboard?.present) ? pinboard.present.map(String) : [];
+  const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
+  const actorRefs = new Set<string>([...present]);
+  for (const note of notes) {
+    for (const ref of [note?.author, note?.owner, note?.updated_by]) if (typeof ref === "string") actorRefs.add(ref);
   }
-  return lines.join("\n");
+  element.subject = boardId;
+  element.woo = createChatWooContext(boardId, [...actorRefs]);
+  setCustomElementData(element, {
+    boardId,
+    boardName: String(board?.name ?? "Pinboard"),
+    boardOwner: typeof board?.owner === "string" ? board.owner : undefined,
+    notes,
+    present,
+    palette: pinboard?.palette ?? [],
+    viewport: pinboard?.viewport ?? { w: 960, h: 560 },
+    view: normalizedPinboardView(),
+    actor: state.actor ?? null,
+    inBoard: pinboardActorPresent(),
+    canSend: canSendDirect(),
+    newText: state.pinboardNewText,
+    newColor: state.pinboardNewColor,
+    viewports: state.pinboardViewports
+  }, () => {
+    if (boardId && pinboardActorPresent()) mountToolSpaceChat(element, boardId);
+  });
+  bindPinboardComponentEvents(element);
 }
 
-function pinNoteTimestamp(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-    : "";
-}
-
-function bindPinboard() {
-  document.querySelector<HTMLButtonElement>("[data-pinboard-enter]")?.addEventListener("click", enterPinboard);
-  document.querySelector<HTMLButtonElement>("[data-pinboard-leave]")?.addEventListener("click", () => {
+function bindPinboardComponentEvents(element: WooElement) {
+  if (element.dataset.pinboardEventsBound === "true") return;
+  element.dataset.pinboardEventsBound = "true";
+  element.addEventListener("woo-pinboard-enter", enterPinboard);
+  element.addEventListener("woo-pinboard-leave", () => {
     leavePinboard(() => {
       setTab("chat", { mode: "push", leaveCurrent: false });
     });
   });
-  document.querySelector<HTMLFormElement>("[data-pinboard-create]")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    try {
-      const textInput = document.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]");
-      const colorInput = document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]");
-      const text = (textInput?.value ?? state.pinboardNewText).trim();
-      if (!text) return;
-      const placement = newPinNotePlacement();
-      const color = normalizePinboardStickyColor(colorInput?.value, pinboardModel()?.palette);
-      rememberPinboardNewColor(color);
-      pinboardCall("add_note", [text, color, placement.x, placement.y, placement.w, placement.h]);
-      state.pinboardNewText = "";
-      if (textInput) textInput.value = "";
-    } catch (err) {
-      console.error("pinboard add_note failed", err);
-    }
+  element.addEventListener("woo-pinboard-create", (event) => {
+    const detail = (event as CustomEvent<{ text?: unknown; color?: unknown }>).detail ?? {};
+    const text = String(detail.text ?? state.pinboardNewText).trim();
+    if (!text) return;
+    const placement = newPinNotePlacement();
+    const color = normalizePinboardStickyColor(detail.color, pinboardModel()?.palette);
+    rememberPinboardNewColor(color);
+    pinboardCall("add_note", [text, color, placement.x, placement.y, placement.w, placement.h]);
+    state.pinboardNewText = "";
   });
-  document.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]")?.addEventListener("input", (event) => {
-    state.pinboardNewText = (event.currentTarget as HTMLTextAreaElement).value;
+  element.addEventListener("woo-pinboard-draft", (event) => {
+    state.pinboardNewText = String((event as CustomEvent<{ value?: unknown }>).detail?.value ?? "");
   });
-  document.querySelector<HTMLSelectElement>("[data-pinboard-new-color]")?.addEventListener("change", (event) => {
-    rememberPinboardNewColor((event.currentTarget as HTMLSelectElement).value);
+  element.addEventListener("woo-pinboard-new-color", (event) => {
+    rememberPinboardNewColor((event as CustomEvent<{ color?: unknown }>).detail?.color, pinboardModel()?.palette);
   });
-  document.querySelectorAll<HTMLTextAreaElement>("[data-pin-note-text]").forEach((input) => {
-    input.addEventListener("blur", () => {
-      const id = input.dataset.pinNoteText ?? "";
-      const text = input.value;
-      if (!id || text === input.dataset.original) return;
-      input.dataset.original = text;
-      const lines = text.split(/\r?\n/);
-      pinboardTargetCall(id, "set_text", [lines], pinboardNoteOptimistic(id, { text: lines }));
-    });
+  element.addEventListener("woo-pinboard-note-text", (event) => {
+    const detail = (event as CustomEvent<{ id?: unknown; text?: unknown; original?: unknown }>).detail ?? {};
+    const id = String(detail.id ?? "");
+    const text = String(detail.text ?? "");
+    if (!id || text === String(detail.original ?? "")) return;
+    pinboardTargetCall(id, "set_text", [text.split(/\r?\n/)], pinboardNoteOptimistic(id, { text: text.split(/\r?\n/) }));
   });
-  document.querySelectorAll<HTMLSelectElement>("[data-pin-note-color]").forEach((select) => {
-    select.addEventListener("change", () => {
-      const id = select.dataset.pinNoteColor ?? "";
-      rememberPinboardNewColor(select.value);
-      if (id) pinboardTargetCall(id, "set_color", [select.value], pinboardNoteOptimistic(id, { color: select.value === "white" ? null : select.value }));
-    });
+  element.addEventListener("woo-pinboard-note-color", (event) => {
+    const detail = (event as CustomEvent<{ id?: unknown; color?: unknown }>).detail ?? {};
+    const id = String(detail.id ?? "");
+    const color = String(detail.color ?? "");
+    rememberPinboardNewColor(color);
+    if (id) pinboardTargetCall(id, "set_color", [color], pinboardNoteOptimistic(id, { color: color === "white" ? null : color }));
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-pin-note-action]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const id = button.dataset.pinNoteId ?? "";
-      const verb = button.dataset.pinNoteAction === "eject" ? "eject" : "take";
-      if (id) pinboardCall(verb, [id]);
-    });
+  element.addEventListener("woo-pinboard-note-action", (event) => {
+    const detail = (event as CustomEvent<{ id?: unknown; verb?: unknown }>).detail ?? {};
+    const id = String(detail.id ?? "");
+    const verb = detail.verb === "eject" ? "eject" : "take";
+    if (id) pinboardCall(verb, [id]);
   });
+}
+
+function bindPinboard() {
+  mountPinboardComponent();
   document.querySelectorAll<HTMLButtonElement>("[data-pin-note-drag]").forEach(bindPinNoteDrag);
   document.querySelectorAll<HTMLButtonElement>("[data-pin-note-resize]").forEach(bindPinNoteResize);
   document.querySelectorAll<HTMLElement>("[data-pin-note]").forEach((note) => {
@@ -4323,10 +4170,6 @@ function normalizedPinboardView(): PinboardView {
   const y = Number.isFinite(Number(current.y)) ? Number(current.y) : 0;
   if (scale !== current.scale || x !== current.x || y !== current.y) state.pinboardView = { x, y, scale };
   return state.pinboardView;
-}
-
-function pinboardViewStyle(view = normalizedPinboardView()) {
-  return `transform: translate(${roundCss(view.x)}px, ${roundCss(view.y)}px) scale(${roundCss(view.scale)});`;
 }
 
 function applyPinboardView(options: { animate?: boolean } = {}) {
@@ -4698,189 +4541,15 @@ function pinboardPalette(palette: any): string[] {
 }
 
 function renderTaskspace() {
-  const taskspace = taskspaceModel();
-  const space = taskspaceSpace();
-  const tasks = taskspace?.tasks ?? {};
-  const roots = Array.isArray(taskspace?.root_tasks) ? taskspace.root_tasks : [];
-  const selected = state.selectedTask ? tasks[state.selectedTask] : undefined;
-  const allTasks = Object.values(tasks);
-  const statusCounts = countTasksByStatus(allTasks);
-  const active = activeTaskStatuses();
-  const visibleCount = allTasks.filter((task) => taskMatchesStatus(task, active)).length;
-  const renderedRoots = roots.map((id: string) => renderTaskNode(id, tasks, 0, active)).join("");
-  return `
-    <section class="toolbar task-toolbar">
-      <h1>Taskspace</h1>
-      <div class="task-summary">
-        <span>${visibleCount}/${allTasks.length} tasks</span>
-        ${taskStatuses.map((status) => renderStatusFilter(status, statusCounts[status] ?? 0)).join("")}
-      </div>
-    </section>
-    <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(space)}" style="--space-chat-h:${Math.round(spaceChatHeight(space))}px">
-      <section class="taskspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(space)}">
-        <div class="panel tree">
-          <div class="task-create">
-            <input data-new-title placeholder="Root task title" />
-            <input data-new-description placeholder="Description" />
-            <button data-create-task>Create</button>
-          </div>
-          <div class="task-tree-list">
-            ${renderedRoots || `<div class="empty-state">${allTasks.length > 0 ? "No tasks match the selected statuses." : "No tasks yet."}</div>`}
-          </div>
-        </div>
-        <div class="panel inspector">${selected ? renderTaskInspector(selected, tasks) : `<div class="empty-state">Select a task.</div>`}</div>
-      </section>
-      ${space ? renderSpaceChatPanel(space) : ""}
-    </section>
-  `;
-}
-
-function renderStatusFilter(status: string, count: number): string {
-  const active = state.taskStatusFilter[status] !== false;
-  return `
-    <button class="status-pill status-filter ${statusClass(status)} ${active ? "active" : ""}" data-task-status="${escapeHtml(status)}" aria-pressed="${active}">
-      ${escapeHtml(statusLabel(status))}: ${count}
-    </button>
-  `;
-}
-
-function renderTaskNode(id: string, tasks: any, depth: number, active: Set<string>): string {
-  const task = tasks[id];
-  if (!task) return "";
-  const props = task.props;
-  const subtasks = Array.isArray(props.subtasks) ? props.subtasks : [];
-  const renderedChildren = subtasks.map((child: string) => renderTaskNode(child, tasks, depth + 1, active)).join("");
-  const matches = taskMatchesStatus(task, active);
-  if (!matches && !renderedChildren) return "";
-  const expanded = state.taskExpanded[id] !== false;
-  const reqStats = requirementStats(props.requirements);
-  const selected = state.selectedTask === id;
-  return `
-    <div class="task-node" style="--depth:${depth}">
-      <div class="task-row ${selected ? "selected" : ""} ${matches ? "" : "filtered-context"}">
-        <button class="task-toggle" data-toggle-task="${escapeHtml(id)}" aria-label="Toggle ${escapeHtml(String(props.title ?? id))}" ${subtasks.length === 0 ? "disabled" : ""}>${subtasks.length === 0 ? "" : expanded ? "-" : "+"}</button>
-        <button class="task-select" data-select-task="${escapeHtml(id)}">
-          <span class="task-title">${escapeHtml(String(props.title ?? id))}</span>
-          <span class="task-meta">
-            <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
-            <span>${escapeHtml(String(props.assignee ? actorLabel(String(props.assignee)) : "unassigned"))}</span>
-            <span>${reqStats.checked}/${reqStats.total} req</span>
-          </span>
-        </button>
-      </div>
-      ${expanded && renderedChildren ? `<div class="children">${renderedChildren}</div>` : ""}
-    </div>
-  `;
-}
-
-function renderTaskInspector(task: any, tasks: any) {
-  const props = task.props;
-  const requirements = Array.isArray(props.requirements) ? props.requirements : [];
-  const messages = Array.isArray(props.messages) ? props.messages : [];
-  const artifacts = Array.isArray(props.artifacts) ? props.artifacts : [];
-  const subtasks = Array.isArray(props.subtasks) ? props.subtasks : [];
-  const reqStats = requirementStats(requirements);
-  return `
-    <div class="task-inspector-head">
-      <div>
-        <h2>${escapeHtml(String(props.title ?? task.id ?? ""))}</h2>
-        <p>${escapeHtml(String(props.description ?? "No description."))}</p>
-      </div>
-      <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
-    </div>
-    <div class="task-facts">
-      <div><strong>ID</strong><span>${escapeHtml(task.id)}</span></div>
-      <div><strong>Assignee</strong><span>${escapeHtml(String(props.assignee ? actorLabel(String(props.assignee)) : "none"))}</span></div>
-      <div><strong>Requirements</strong><span>${reqStats.checked}/${reqStats.total}</span></div>
-      <div><strong>Subtasks</strong><span>${subtasks.length}</span></div>
-    </div>
-    <div class="button-row task-actions">
-      <button data-task-action="claim">Claim</button>
-      <button data-task-action="release">Release</button>
-      ${["open", "in_progress", "blocked", "done"].map((status) => `<button class="${String(props.status) === status ? "active" : ""}" data-task-action="status:${status}">${escapeHtml(statusLabel(status))}</button>`).join("")}
-    </div>
-    <section class="task-section">
-      <h3>Subtasks</h3>
-      <div class="inline-form"><input data-subtask-title placeholder="Subtask title"><input data-subtask-description placeholder="Description"><button data-add-subtask>Add</button></div>
-      <div class="related-list">${subtasks.map((id: string) => renderRelatedTask(id, tasks)).join("") || `<div class="empty-state">No subtasks.</div>`}</div>
-    </section>
-    <section class="task-section">
-      <h3>Requirements</h3>
-      <div class="inline-form"><input data-requirement placeholder="Requirement"><button data-add-requirement>Add</button></div>
-      <ul class="checklist">${requirements
-        .map((item: any, index: number) => `<li><label><input data-check-req="${index}" type="checkbox" ${item.checked ? "checked" : ""}> <span>${escapeHtml(String(item.text ?? ""))}</span></label></li>`)
-        .join("") || `<li class="empty-state">No requirements.</li>`}</ul>
-    </section>
-    <section class="task-section">
-      <h3>Messages</h3>
-      <div class="inline-form"><input data-message placeholder="Message"><button data-add-message>Add</button></div>
-      <div class="activity-list">${messages.map(renderTaskMessage).join("") || `<div class="empty-state">No messages.</div>`}</div>
-    </section>
-    <section class="task-section">
-      <h3>Artifacts</h3>
-      <div class="inline-form"><input data-artifact placeholder="https://example.com/artifact"><button data-add-artifact>Add</button></div>
-      <div class="artifact-list">${artifacts.map(renderArtifact).join("") || `<div class="empty-state">No artifacts.</div>`}</div>
-    </section>
-  `;
-}
-
-function renderRelatedTask(id: string, tasks: any) {
-  const task = tasks[id];
-  if (!task) return "";
-  const props = task.props ?? {};
-  return `
-    <button class="related-task" data-select-task="${escapeHtml(id)}">
-      <span>${escapeHtml(String(props.title ?? id))}</span>
-      <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
-    </button>
-  `;
-}
-
-function renderTaskMessage(item: any) {
-  const actor = typeof item?.actor === "string" ? actorLabel(item.actor) : "unknown";
-  const ts = typeof item?.ts === "number" ? new Date(item.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
-  return `
-    <div class="activity-item">
-      <div><strong>${escapeHtml(actor)}</strong><span>${escapeHtml(ts)}</span></div>
-      <p>${escapeHtml(String(item?.body ?? ""))}</p>
-    </div>
-  `;
-}
-
-function renderArtifact(item: any) {
-  const ref = String(item?.ref ?? "");
-  const kind = String(item?.kind ?? "external");
-  const label = ref || "artifact";
-  const body = ref.startsWith("http")
-    ? `<a href="${escapeHtml(ref)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
-    : `<span>${escapeHtml(label)}</span>`;
-  return `<div class="artifact-item"><span>${escapeHtml(kind)}</span>${body}</div>`;
-}
-
-function requirementStats(requirements: any) {
-  const items = Array.isArray(requirements) ? requirements : [];
-  return {
-    total: items.length,
-    checked: items.filter((item) => item?.checked === true).length
-  };
-}
-
-function countTasksByStatus(tasks: any[]) {
-  const counts: Record<string, number> = {};
-  for (const task of tasks) {
-    const status = String((task as any)?.props?.status ?? "open");
-    counts[status] = (counts[status] ?? 0) + 1;
+  const tag = toolFrameComponentTag(taskspaceSpace(), "taskspace.workspace", "taskspace");
+  if (!tag) {
+    return `
+      <section class="toolbar"><h1>Taskspace</h1></section>
+      <section class="panel"><p class="empty-state">No taskspace UI is registered for this space.</p></section>
+    `;
   }
-  return counts;
-}
-
-function statusClass(status: string) {
-  return `status-${status.replace(/[^a-z0-9_-]/gi, "_") || "unknown"}`;
-}
-
-function statusLabel(status: string) {
-  if (status === "in_progress") return "in progress";
-  return status || "unknown";
+  const space = taskspaceSpace();
+  return `<${tag} data-taskspace-workspace data-taskspace-space="${escapeHtml(space)}"></${tag}>`;
 }
 
 function activeTaskStatuses() {
@@ -4927,83 +4596,110 @@ function taskspaceCall(target: string, verb: string, args: unknown[] = [], onCal
   }, receiveChatError);
 }
 
-function bindTaskspace() {
-  bindSpaceChatPanels();
-  document.querySelectorAll<HTMLButtonElement>("[data-task-status]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const status = button.dataset.taskStatus!;
-      state.taskStatusFilter[status] = state.taskStatusFilter[status] === false;
-      syncTaskSelection();
-      render();
-    });
+function mountTaskspaceComponent() {
+  const element = document.querySelector<WooElement & { data?: TaskspaceData }>("[data-taskspace-workspace]");
+  if (!element) return;
+  const taskspace = taskspaceModel();
+  const space = taskspaceSpace();
+  const tasks = taskspace?.tasks ?? {};
+  const refs = new Set<string>([space]);
+  for (const task of Object.values(tasks) as any[]) {
+    const assignee = task?.props?.assignee;
+    if (typeof assignee === "string") refs.add(assignee);
+    for (const message of Array.isArray(task?.props?.messages) ? task.props.messages : []) {
+      if (typeof message?.actor === "string") refs.add(message.actor);
+    }
+  }
+  element.subject = space;
+  element.woo = createChatWooContext(space, [...refs]);
+  setCustomElementData(element, {
+    space,
+    tasks,
+    rootTasks: Array.isArray(taskspace?.root_tasks) ? taskspace.root_tasks : [],
+    selectedTask: state.selectedTask,
+    expanded: state.taskExpanded,
+    statusFilter: state.taskStatusFilter
+  }, () => {
+    if (space) mountToolSpaceChat(element, space);
   });
-  document.querySelector<HTMLButtonElement>("[data-create-task]")?.addEventListener("click", () => {
-    const titleInput = document.querySelector<HTMLInputElement>("[data-new-title]");
-    const descriptionInput = document.querySelector<HTMLInputElement>("[data-new-description]");
-    const title = titleInput?.value.trim() || "Untitled";
-    const description = descriptionInput?.value.trim() || "";
+  bindTaskspaceComponentEvents(element);
+}
+
+function bindTaskspaceComponentEvents(element: WooElement) {
+  if (element.dataset.taskspaceEventsBound === "true") return;
+  element.dataset.taskspaceEventsBound = "true";
+  element.addEventListener("woo-taskspace-status-filter", (event) => {
+    const status = String((event as CustomEvent<{ status?: unknown }>).detail?.status ?? "");
+    if (!status) return;
+    state.taskStatusFilter[status] = state.taskStatusFilter[status] === false;
+    syncTaskSelection();
+    render();
+  });
+  element.addEventListener("woo-taskspace-create", (event) => {
+    const detail = (event as CustomEvent<{ title?: unknown; description?: unknown }>).detail ?? {};
+    const title = String(detail.title ?? "").trim() || "Untitled";
+    const description = String(detail.description ?? "").trim();
     const space = taskspaceSpace();
     if (space) taskspaceCall(space, "create_task", [title, description], (id) => pendingTaskSelections.add(id));
-    if (titleInput) titleInput.value = "";
-    if (descriptionInput) descriptionInput.value = "";
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-toggle-task]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const id = button.dataset.toggleTask!;
-      state.taskExpanded[id] = state.taskExpanded[id] === false;
-      render();
-    });
+  element.addEventListener("woo-taskspace-toggle", (event) => {
+    const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
+    if (!id) return;
+    state.taskExpanded[id] = state.taskExpanded[id] === false;
+    render();
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-select-task]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const id = button.dataset.selectTask!;
-      setSelectedTask(id, { apply: false });
-      state.taskExpanded[id] = state.taskExpanded[id] ?? true;
-      setTab("taskspace", { mode: "push", leaveCurrent: false });
-    });
+  element.addEventListener("woo-taskspace-select", (event) => {
+    const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
+    if (!id) return;
+    setSelectedTask(id, { apply: false });
+    state.taskExpanded[id] = state.taskExpanded[id] ?? true;
+    setTab("taskspace", { mode: "push", leaveCurrent: false });
   });
-  const id = state.selectedTask;
-  if (!id) return;
-  document.querySelectorAll<HTMLButtonElement>("[data-task-action]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const action = button.dataset.taskAction!;
-      if (action === "claim" || action === "release") taskspaceCall(id, action, []);
-      if (action.startsWith("status:")) taskspaceCall(id, "set_status", [action.slice("status:".length)]);
-    });
+  element.addEventListener("woo-taskspace-task-action", (event) => {
+    const id = state.selectedTask;
+    const action = String((event as CustomEvent<{ action?: unknown }>).detail?.action ?? "");
+    if (!id) return;
+    if (action === "claim" || action === "release") taskspaceCall(id, action, []);
+    if (action.startsWith("status:")) taskspaceCall(id, "set_status", [action.slice("status:".length)]);
   });
-  document.querySelector<HTMLButtonElement>("[data-add-subtask]")?.addEventListener("click", () => {
-    const titleInput = document.querySelector<HTMLInputElement>("[data-subtask-title]");
-    const descriptionInput = document.querySelector<HTMLInputElement>("[data-subtask-description]");
-    const title = titleInput?.value.trim() || "Subtask";
-    const description = descriptionInput?.value.trim() || "";
+  element.addEventListener("woo-taskspace-add-subtask", (event) => {
+    const id = state.selectedTask;
+    if (!id) return;
+    const detail = (event as CustomEvent<{ title?: unknown; description?: unknown }>).detail ?? {};
+    const title = String(detail.title ?? "").trim() || "Subtask";
+    const description = String(detail.description ?? "").trim();
     state.taskExpanded[id] = true;
     taskspaceCall(id, "add_subtask", [title, description], (callId) => pendingTaskSelections.add(callId));
-    if (titleInput) titleInput.value = "";
-    if (descriptionInput) descriptionInput.value = "";
   });
-  document.querySelector<HTMLButtonElement>("[data-add-requirement]")?.addEventListener("click", () => {
-    const input = document.querySelector<HTMLInputElement>("[data-requirement]");
-    const text = input?.value.trim() || "Requirement";
+  element.addEventListener("woo-taskspace-add-requirement", (event) => {
+    const id = state.selectedTask;
+    if (!id) return;
+    const text = String((event as CustomEvent<{ text?: unknown }>).detail?.text ?? "").trim() || "Requirement";
     taskspaceCall(id, "add_requirement", [text]);
-    if (input) input.value = "";
   });
-  document.querySelectorAll<HTMLInputElement>("[data-check-req]").forEach((input) => {
-    input.addEventListener("change", () => {
-      taskspaceCall(id, "check_requirement", [Number(input.dataset.checkReq), input.checked]);
-    });
+  element.addEventListener("woo-taskspace-check-requirement", (event) => {
+    const id = state.selectedTask;
+    if (!id) return;
+    const detail = (event as CustomEvent<{ index?: unknown; checked?: unknown }>).detail ?? {};
+    taskspaceCall(id, "check_requirement", [Number(detail.index), detail.checked === true]);
   });
-  document.querySelector<HTMLButtonElement>("[data-add-message]")?.addEventListener("click", () => {
-    const input = document.querySelector<HTMLInputElement>("[data-message]");
-    const body = input?.value.trim() || "Update";
+  element.addEventListener("woo-taskspace-add-message", (event) => {
+    const id = state.selectedTask;
+    if (!id) return;
+    const body = String((event as CustomEvent<{ body?: unknown }>).detail?.body ?? "").trim() || "Update";
     taskspaceCall(id, "add_message", [body]);
-    if (input) input.value = "";
   });
-  document.querySelector<HTMLButtonElement>("[data-add-artifact]")?.addEventListener("click", () => {
-    const input = document.querySelector<HTMLInputElement>("[data-artifact]");
-    const ref = input?.value.trim() || "https://example.com";
+  element.addEventListener("woo-taskspace-add-artifact", (event) => {
+    const id = state.selectedTask;
+    if (!id) return;
+    const ref = String((event as CustomEvent<{ ref?: unknown }>).detail?.ref ?? "").trim() || "https://example.com";
     taskspaceCall(id, "add_artifact", [{ kind: ref.startsWith("http") ? "url" : "external", ref }]);
-    if (input) input.value = "";
   });
+}
+
+function bindTaskspace() {
+  mountTaskspaceComponent();
+  bindSpaceChatPanels();
 }
 
 function renderIde() {

@@ -31,6 +31,15 @@ own verbs. v0.2 inherits all of that from `$portable`, `$note`, and
 `$space`.  You can move `$pin` objects anywhere in the system if you like,
 carry them from pinboard to kanban and back again.
 
+## UI
+
+The catalog declares `pinboard.board` as `<woo-pinboard-board>` in
+`ui/pinboard-board.ts`. The component owns the board markup: create form,
+canvas, notes, minimap, presence panel, and embedded mini-chat mount point. The
+SPA host supplies scoped projection data, verb-call services, and the current
+pinboard view; drag/resize gesture plumbing remains host-owned until the frame
+action model carries those gestures directly.
+
 ## Class graph
 
 Two independent inheritance trees, each rooted under `$thing`:

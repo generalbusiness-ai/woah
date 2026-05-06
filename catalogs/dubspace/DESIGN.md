@@ -42,6 +42,15 @@ All coordinated mutations in the demo are caused by sequenced messages. Current
 mix state is the materialized result of applying those messages, plus snapshots
 for fast reload. No world-level clock is required for ordering.
 
+## UI
+
+The catalog declares `dubspace.workspace` as `<woo-dubspace-workspace>` in
+`ui/dubspace-workspace.ts`. The component owns the workstation markup for loop
+slots, filter, delay, percussion, operator presence, and the embedded mini-chat
+mount point. The SPA host supplies scoped projection data, audio services, and
+transport callbacks; the component communicates back through `woo-dubspace-*`
+custom events rather than private host DOM bindings.
+
 ## Surface
 
 - One shared space.
