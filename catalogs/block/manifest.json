@@ -2,39 +2,61 @@
   "name": "block",
   "version": "0.1.0",
   "spec_version": "v1",
-  "description": "Anchored data-display actor. A $block bridges woo to an outside-world data source: an external plug authenticates as the block's actor (apikey-bound) and pushes property values into the block's writable_self surface; the block's owner sets configuration via writable_owner. Subclass for concrete data shapes (weather, ticker, dispenser).",
+  "description": "Anchored data-display actor. A $block bridges woo to an outside-world data source: an external plug authenticates as the block's actor (apikey-bound) and pushes property values through tier-gated write verbs; the block's owner sets configuration through the same verbs. Permissions follow the LambdaMOO :is_*_by convention — overrideable per-class verbs that gate every state mutation.",
   "license": "MIT",
-  "depends": [],
+  "depends": ["@local:perm"],
   "classes": [
     {
       "local_name": "$block",
       "parent": "$actor",
-      "description": "Base class for plug-driven data display. Anchored: a block stays at its placement and rejects becoming a container. Property writes are tier-gated: writable_owner is settable by the block's owner (config), writable_self is settable by the block's actor (the plug, authenticated via apikey). Wizard always bypasses. Property writes emit a live block_data observation to the containing space; the substrate does not log block_data, so reconnecting clients re-read current values via :get_data.",
+      "description": "Base class for plug-driven data display. Anchored: a block stays at its placement and rejects becoming a container. Property writes go through :set_property[ies], which gate on this:is_writable_by_property(actor, name) — the LambdaMOO-shaped per-class hook. Default property policy grants wizard bypass, grants self-write of names in writable_self (so an apikey-bound plug session writes its own data props), and grants owner-write of names in writable_owner (so the block's owner sets config without touching the plug surface). Subclasses override the verb for richer policy; the writable_owner / writable_self lists are the conventional default-impl data.",
       "properties": [
         { "name": "last_pushed_at", "type": "int", "default": 0, "perms": "r" },
         { "name": "last_error", "type": "any", "default": null, "perms": "r" },
-        { "name": "summary_props", "type": "list<str>", "default": [], "perms": "r" }
+        { "name": "summary_props", "type": "list<str>", "default": [], "perms": "r" },
+        { "name": "writable_owner", "type": "list<str>", "default": [], "perms": "r" },
+        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error"], "perms": "r" }
       ],
-      "writable_owner": [],
-      "writable_self": ["last_pushed_at", "last_error"],
       "verbs": [
+        {
+          "name": "is_writable_by",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["who"] },
+          "source": "verb :is_writable_by(who) rxd { if (\"the_perm\":controls(who, this)) { return true; } if (who == this) { return true; } return false; }"
+        },
+        {
+          "name": "is_readable_by",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["who"] },
+          "source": "verb :is_readable_by(who) rxd { return true; }"
+        },
+        {
+          "name": "is_writable_by_property",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["who", "name"] },
+          "source": "verb :is_writable_by_property(who, name) rxd { if (has_flag(who, \"wizard\")) { return true; } if (who == this && name in this.writable_self) { return true; } if (who == this.owner && name in this.writable_owner) { return true; } return false; }"
+        },
         {
           "name": "set_property",
           "perms": "rx",
           "direct_callable": true,
           "skip_presence_check": true,
-          "tool_exposed": true,
           "arg_spec": { "args": ["name", "value"] },
-          "source": "verb :set_property(name, value) rx { if (typeof(name) != \"string\" || !name) { raise { code: \"E_INVARG\", message: \"set_property requires a non-empty name\", value: name }; } let ok = false; if (has_flag(actor, \"wizard\")) { ok = true; } else if (actor == this && name in this.writable_self) { ok = true; } else if (actor == this.owner && name in this.writable_owner) { ok = true; } if (!ok) { raise { code: \"E_PERM\", message: \"property is not writable by this actor\", value: { property: name, actor: actor } }; } this.(name) = value; let here = location(this); if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"block_data\", block: this, name: name, value: value, ts: now() }); } return value; }"
+          "source": "verb :set_property(name, value) rx { if (typeof(name) != \"string\" || !name) { raise { code: \"E_INVARG\", message: \"set_property requires a non-empty name\", value: name }; } if (!this:is_writable_by_property(actor, name)) { raise { code: \"E_PERM\", message: \"property is not writable by this actor\", value: { property: name, actor: actor } }; } this.(name) = value; let here = location(this); if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"block_data\", block: this, name: name, value: value, ts: now() }); } return value; }"
         },
         {
           "name": "set_properties",
           "perms": "rx",
           "direct_callable": true,
           "skip_presence_check": true,
-          "tool_exposed": true,
           "arg_spec": { "args": ["values"] },
-          "source": "verb :set_properties(values) rx { if (typeof(values) != \"map\") { raise { code: \"E_INVARG\", message: \"set_properties requires a map\", value: values }; } let is_wiz = has_flag(actor, \"wizard\"); let is_self = actor == this; let is_owner = actor == this.owner; let names = keys(values); for n in names { let ok = is_wiz; if (!ok && is_self && n in this.writable_self) { ok = true; } if (!ok && is_owner && n in this.writable_owner) { ok = true; } if (!ok) { raise { code: \"E_PERM\", message: \"property is not writable by this actor\", value: { property: n, actor: actor } }; } } let audience = location(this); let routable = audience != null && isa(audience, $space); let ts = now(); for n in names { let v = values[n]; this.(n) = v; if (routable) { observe_to_space(audience, { type: \"block_data\", block: this, name: n, value: v, ts: ts }); } } return values; }"
+          "source": "verb :set_properties(values) rx { if (typeof(values) != \"map\") { raise { code: \"E_INVARG\", message: \"set_properties requires a map\", value: values }; } let names = keys(values); for n in names { if (!this:is_writable_by_property(actor, n)) { raise { code: \"E_PERM\", message: \"property is not writable by this actor\", value: { property: n, actor: actor } }; } } let audience = location(this); let routable = audience != null && isa(audience, $space); let ts = now(); for n in names { let v = values[n]; this.(n) = v; if (routable) { observe_to_space(audience, { type: \"block_data\", block: this, name: n, value: v, ts: ts }); } } return values; }"
         },
         {
           "name": "get_data",
@@ -43,7 +65,7 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["name"] },
-          "source": "verb :get_data(name) rxd { if (typeof(name) != \"string\" || !name) { raise { code: \"E_INVARG\", message: \"get_data requires a non-empty name\", value: name }; } return this.(name); }"
+          "source": "verb :get_data(name) rxd { if (typeof(name) != \"string\" || !name) { raise { code: \"E_INVARG\", message: \"get_data requires a non-empty name\", value: name }; } if (!this:is_readable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot read this block\", value: this }; } return this.(name); }"
         },
         {
           "name": "look",

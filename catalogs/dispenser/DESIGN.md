@@ -39,15 +39,23 @@ second call returns
 `{order_id, delivered: false, reason: "unknown_or_already_delivered"}`
 rather than producing a duplicate note.
 
-## Rate limiting
+## Admission limits
 
 Per-requester interval enforced by `rate_limit_seconds` (default 60s).
 The verb consults `this.last_request_at[requester]` and rejects with
 `E_RATE_LIMIT` if too soon, including a `retry_in_seconds` hint in the
 error value. Set `rate_limit_seconds` to `0` to disable.
 
-The check runs *before* the queue append, so a flooded requester does
-not pollute the queue with rejected orders.
+Three owner-writable caps cover the cases a requester-level limit cannot:
+`block_cooldown_seconds` (default 5) throttles the block across all
+requesters, `max_pending_orders` (default 50) bounds the queue, and
+`max_request_chars` (default 200) bounds each request body. Set the
+cooldown to `0` to disable it; set either `max_*` value to `0` for
+unbounded.
+
+All checks run *before* the queue append, so rejected orders do not
+pollute the queue. The mutating queue append lives in an internal helper
+verb and is not direct-callable; public callers enter through `:order`.
 
 ## Sequencing
 

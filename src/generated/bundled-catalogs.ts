@@ -11,10 +11,11 @@ import manifest5 from "../../catalogs/dubspace/manifest.json";
 import manifest6 from "../../catalogs/help/manifest.json";
 import manifest7 from "../../catalogs/horoscope/manifest.json";
 import manifest8 from "../../catalogs/note/manifest.json";
-import manifest9 from "../../catalogs/pinboard/manifest.json";
-import manifest10 from "../../catalogs/prog/manifest.json";
-import manifest11 from "../../catalogs/taskspace/manifest.json";
-import manifest12 from "../../catalogs/weather/manifest.json";
+import manifest9 from "../../catalogs/perm/manifest.json";
+import manifest10 from "../../catalogs/pinboard/manifest.json";
+import manifest11 from "../../catalogs/prog/manifest.json";
+import manifest12 from "../../catalogs/taskspace/manifest.json";
+import manifest13 from "../../catalogs/weather/manifest.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -31,8 +32,9 @@ export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
   { path: "catalogs/help/manifest.json", manifest: manifest6 as unknown as CatalogManifest },
   { path: "catalogs/horoscope/manifest.json", manifest: manifest7 as unknown as CatalogManifest },
   { path: "catalogs/note/manifest.json", manifest: manifest8 as unknown as CatalogManifest },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest9 as unknown as CatalogManifest },
-  { path: "catalogs/prog/manifest.json", manifest: manifest10 as unknown as CatalogManifest },
-  { path: "catalogs/taskspace/manifest.json", manifest: manifest11 as unknown as CatalogManifest },
-  { path: "catalogs/weather/manifest.json", manifest: manifest12 as unknown as CatalogManifest }
+  { path: "catalogs/perm/manifest.json", manifest: manifest9 as unknown as CatalogManifest },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest10 as unknown as CatalogManifest },
+  { path: "catalogs/prog/manifest.json", manifest: manifest11 as unknown as CatalogManifest },
+  { path: "catalogs/taskspace/manifest.json", manifest: manifest12 as unknown as CatalogManifest },
+  { path: "catalogs/weather/manifest.json", manifest: manifest13 as unknown as CatalogManifest }
 ];

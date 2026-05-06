@@ -9,11 +9,17 @@ authenticates as the block's actor via an apikey credential.
 
 The substrate primitives that make this work:
 
-- **Writability tiers** (`writable_owner`, `writable_self`) declared on
-  the class manifest, persisted as inheritable property definitions on
-  the class object. The catalog's `:set_property` body checks
-  `name in this.writable_self` (or `_owner`) and `actor == this` (or
-  `this.owner`) before writing.
+- **Writability tiers** (`writable_owner`, `writable_self`) declared as
+  ordinary class properties in woocode catalogs. The catalog's
+  `:set_property` body checks `this:is_writable_by_property(actor, name)`;
+  the default implementation grants wizard bypass, then consults those
+  lists with `actor == this` for plug-owned data writes and
+  `actor == this.owner` for owner config.
+- **LambdaMOO-style permission helpers.** `$block` depends on the
+  `perm` catalog and uses `"the_perm":controls(who, this)` as the
+  owner-or-wizard baseline. Subclasses can override
+  `:is_readable_by`, `:is_writable_by`, or
+  `:is_writable_by_property` without substrate changes.
 - **Apikey credential bound to the block's actor.** The block's owner
   mints a key via `:mint_apikey(label)` (substrate native
   `$system:create_api_key_for_owner`), pastes the secret into the plug's
@@ -42,16 +48,19 @@ A `$block` instance has:
 | `writable_self` | block's actor (the plug) | data: pushed values, freshness, error state |
 | (other) | wizard only | intrinsic / restricted |
 
-`:set_property(name, value)` is the single entry point; it consults the
-tier lists on `this` (which inherit through the class chain).
+`:set_property(name, value)` is the single entry point; it consults
+`:is_writable_by_property(actor, name)` on `this`. The base
+implementation grants wizard bypass, then reads the tier lists on
+`this`, which inherit through the class property chain.
 `:set_properties(values)` bulk-writes with an atomic permission gate
 (validate all names first, then write all).
 
-The substrate stores `writable_owner` and `writable_self` as wizard-owned,
-public-read properties on the class object; instance reads inherit via
-the property-def `defaultValue` walk. Subclass declarations *should*
-extend the parent's lists explicitly — manifest authoring convention,
-not a substrate guarantee.
+`writable_owner` and `writable_self` are not substrate fields. They are
+public-read class properties installed by the catalog like any other
+property, and instance reads inherit via the normal property-def
+`defaultValue` walk. Subclass declarations *should* extend the parent's
+lists explicitly — manifest authoring convention, not a substrate
+guarantee.
 
 ## Observation route
 

@@ -22,12 +22,13 @@ an apikey credential) and pushes property values into the block's
 `writable_owner` surface; everyone else is read-only. Wizard always
 bypasses.
 
-The substrate publishes the *shape*; the plug owns the *data*. Subclasses
+The catalog publishes the *shape*; the plug owns the *data*. Subclasses
 specialize for concrete domains (weather, ticker, dispenser).
 
 See [DESIGN.md](DESIGN.md) for the full pattern, including:
 
-- writability tiers (`writable_owner`, `writable_self`)
+- writability tiers (`writable_owner`, `writable_self`) as ordinary
+  class properties
 - live `block_data` observation route (no sequencing, no replay)
 - credential management (mint/revoke/list apikeys via the block)
 - summary-vs-detail tier filtering for `RoomSnapshot`
@@ -60,5 +61,4 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 
 Concrete block classes set their own `writable_owner` (config knobs) and
 extend `writable_self` (data fields). Tier lists are inherited via the
-property-def chain — the substrate stores them as wizard-owned, public-read
-properties on the class object.
+property-def chain. They are catalog data, not special substrate fields.

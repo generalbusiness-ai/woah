@@ -16,10 +16,10 @@
         { "name": "forecast_hours", "type": "int", "default": 12, "perms": "r" },
         { "name": "current", "type": "map", "default": {}, "perms": "r" },
         { "name": "forecast", "type": "map", "default": {}, "perms": "r" },
-        { "name": "history", "type": "map", "default": {}, "perms": "r" }
-      ],
-      "writable_owner": ["place", "units", "forecast_hours"],
-      "writable_self": ["last_pushed_at", "last_error", "current", "forecast", "history"]
+        { "name": "history", "type": "map", "default": {}, "perms": "r" },
+        { "name": "writable_owner", "type": "list<str>", "default": ["place", "units", "forecast_hours"], "perms": "r" },
+        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error", "current", "forecast", "history"], "perms": "r" }
+      ]
     },
     {
       "local_name": "$weather_block_metadata",

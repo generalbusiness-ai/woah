@@ -1,0 +1,43 @@
+{
+  "name": "perm",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "LambdaMOO-shaped permission utilities. The substrate already gives r/w/c property flags + owner, r/x/d verb flags + owner, and wizard bypass via the canBypassPerms check; everything fine-grained lives in woocode. This catalog supplies the small set of helpers that LambdaCore's $perm_utils exposes: :controls(who, what), :requires_perm(who, what, message), and the per-class :is_writable_by(who) / :is_readable_by(who) / :is_executable_by(who) convention used by $note, $block, and other catalog classes.",
+  "license": "MIT",
+  "depends": [],
+  "classes": [
+    {
+      "local_name": "$perm",
+      "parent": "$root",
+      "description": "Wizard-owned permission helper. Catalog code calls `\"the_perm\":controls(actor, target)` from verb bodies; direct calls are also allowed for diagnostics. Mirrors LambdaCore's $perm_utils:controls — \"who has authority over what\" — true if `who` is wizard or `who == what.owner`. Subclasses or sibling helper classes can extend with policy-specific checks (e.g. role membership), but the substrate-level bypass + owner check is the universal floor.",
+      "properties": [],
+      "verbs": [
+        {
+          "name": "controls",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["who", "what"] },
+          "source": "verb :controls(who, what) rxd { if (has_flag(who, \"wizard\")) { return true; } if (typeof(what) != \"string\") { return false; } return what.owner == who; }"
+        },
+        {
+          "name": "requires_perm",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["who", "what", "message_text?"] },
+          "source": "verb :requires_perm(who, what, message_text) rxd { if (this:controls(who, what)) { return true; } let msg = message_text; if (typeof(msg) != \"string\" || !msg) { msg = \"permission denied\"; } raise { code: \"E_PERM\", message: msg, value: { who: who, what: what } }; }"
+        }
+      ]
+    }
+  ],
+  "seed_hooks": [
+    {
+      "kind": "create_instance",
+      "class": "$perm",
+      "as": "the_perm",
+      "name": "Permission helpers",
+      "description": "Singleton instance of $perm. Catalog code calls verbs as `\"the_perm\":controls(actor, target)` rather than addressing the class directly. The class itself stays a pure interface; instance lets verbs dispatch normally."
+    }
+  ]
+}

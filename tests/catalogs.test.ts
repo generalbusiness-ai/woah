@@ -2344,7 +2344,26 @@ describe("local catalogs", () => {
   });
 
   describe("writability tiers", () => {
-    function writabilityManifest(overrides: Partial<RuntimeCatalogManifest> = {}, classOverrides: Record<string, unknown> = {}): RuntimeCatalogManifest {
+    // Tier lists are ordinary class properties: the substrate has no
+    // special knowledge of them. The catalog convention is that
+    // `writable_owner` and `writable_self` are list<str> property defaults
+    // that the per-class :is_writable_by_property(who, name) verb consults.
+    // Subclasses extend the lists by redeclaring the property with a
+    // wider default; the substrate's normal property-def chain handles
+    // inheritance.
+    function tiersClass(propertyOverrides: Array<{ name: string; default?: unknown; type?: string }> = []): RuntimeCatalogManifest {
+      const baseProps = [
+        { name: "place", type: "str", default: "", perms: "r" },
+        { name: "units", type: "str", default: "metric", perms: "r" },
+        { name: "current", type: "map", default: {}, perms: "r" },
+        { name: "history", type: "list", default: [], perms: "r" },
+        { name: "writable_owner", type: "list<str>", default: ["place", "units"], perms: "r" },
+        { name: "writable_self", type: "list<str>", default: ["current", "history"], perms: "r" }
+      ];
+      const merged = baseProps.map((p) => propertyOverrides.find((o) => o.name === p.name) ?? p);
+      for (const o of propertyOverrides) {
+        if (!baseProps.some((p) => p.name === o.name)) merged.push(o);
+      }
       return {
         name: "tiers-demo",
         version: "0.1.0",
@@ -2354,108 +2373,127 @@ describe("local catalogs", () => {
           {
             local_name: "$tiers_block",
             parent: "$root",
-            description: "Test block class for writability tiers.",
-            properties: [
-              { name: "place", type: "str", default: "" },
-              { name: "units", type: "str", default: "metric" },
-              { name: "current", type: "map", default: {} },
-              { name: "history", type: "list", default: [] }
-            ],
-            writable_owner: ["place", "units"],
-            writable_self: ["current", "history"],
-            ...classOverrides
-          }
-        ],
-        ...overrides
-      } as unknown as RuntimeCatalogManifest;
-    }
-
-    it("persists writable_owner and writable_self as wizard-owned, public-read class properties", () => {
-      const world = createWorld({ catalogs: false });
-      installCatalogManifest(world, writabilityManifest(), { tap: "@local", alias: "tiers-demo" });
-      expect(world.getProp("$tiers_block", "writable_owner")).toEqual(["place", "units"]);
-      expect(world.getProp("$tiers_block", "writable_self")).toEqual(["current", "history"]);
-      const ownerDef = world.object("$tiers_block").propertyDefs.get("writable_owner");
-      expect(ownerDef?.owner).toBe("$wiz");
-      expect(ownerDef?.perms).toBe("r");
-      const selfDef = world.object("$tiers_block").propertyDefs.get("writable_self");
-      expect(selfDef?.owner).toBe("$wiz");
-      expect(selfDef?.perms).toBe("r");
-    });
-
-    it("defaults to empty arrays when the manifest omits both tier fields", () => {
-      const world = createWorld({ catalogs: false });
-      installCatalogManifest(
-        world,
-        writabilityManifest({}, { writable_owner: undefined, writable_self: undefined }),
-        { tap: "@local", alias: "tiers-demo" }
-      );
-      expect(world.getProp("$tiers_block", "writable_owner")).toEqual([]);
-      expect(world.getProp("$tiers_block", "writable_self")).toEqual([]);
-    });
-
-    it("normalizes a re-published manifest that drops a tier entry (no stale grants)", () => {
-      const world = createWorld({ catalogs: false });
-      installCatalogManifest(world, writabilityManifest(), { tap: "@local", alias: "tiers-demo" });
-      expect(world.getProp("$tiers_block", "writable_owner")).toEqual(["place", "units"]);
-      // Re-publish with a narrower owner-tier list; repair must overwrite, not merge.
-      const narrower = writabilityManifest({}, { writable_owner: ["place"] });
-      const plan = planCatalogSchemaMigration(world, narrower);
-      applyCatalogSchemaPlan(world, narrower, plan);
-      expect(world.getProp("$tiers_block", "writable_owner")).toEqual(["place"]);
-    });
-
-    it("accepts a tier list that references a property from a same-manifest parent class", () => {
-      const world = createWorld({ catalogs: false });
-      // $base ships first (with the property) and $sub extends $base's tier
-      // list — both arrive in the same manifest, so the parent class is not
-      // yet in the world when the child's tiers are validated.
-      const manifest = {
-        name: "tiers-same-manifest",
-        version: "0.1.0",
-        spec_version: "v1",
-        license: "MIT",
-        classes: [
-          {
-            local_name: "$tier_base",
-            parent: "$root",
-            properties: [{ name: "foo", type: "str", default: "" }],
-            writable_owner: ["foo"]
-          },
-          {
-            local_name: "$tier_sub",
-            parent: "$tier_base",
-            properties: [{ name: "bar", type: "str", default: "" }],
-            writable_owner: ["foo", "bar"]
+            description: "Test class — tier lists declared as ordinary class properties.",
+            properties: merged
           }
         ]
       } as unknown as RuntimeCatalogManifest;
-      expect(() => installCatalogManifest(world, manifest, { tap: "@local", alias: "tiers-same-manifest" })).not.toThrow();
-      expect(world.getProp("$tier_sub", "writable_owner")).toEqual(["foo", "bar"]);
+    }
+
+    it("declares writable_owner / writable_self as ordinary class properties", () => {
+      const world = createWorld({ catalogs: false });
+      installCatalogManifest(world, tiersClass(), { tap: "@local", alias: "tiers-demo" });
+      expect(world.getProp("$tiers_block", "writable_owner")).toEqual(["place", "units"]);
+      expect(world.getProp("$tiers_block", "writable_self")).toEqual(["current", "history"]);
+      const ownerDef = world.object("$tiers_block").propertyDefs.get("writable_owner");
+      expect(ownerDef?.perms).toBe("r");
     });
 
-    it("rejects a tier list that references an undeclared property", () => {
+    it("propagates the tier lists to instances (and subclasses) via property def inheritance", () => {
       const world = createWorld({ catalogs: false });
-      const bad = writabilityManifest({}, { writable_owner: ["place", "missing_prop"] });
-      expect(() => installCatalogManifest(world, bad, { tap: "@local", alias: "tiers-demo" })).toThrow(/undeclared property "missing_prop"/);
+      installCatalogManifest(world, tiersClass(), { tap: "@local", alias: "tiers-demo" });
+      world.createObject({ id: "inst_tier_block_1", name: "inst_tier_block_1", parent: "$tiers_block", owner: "$wiz", location: null });
+      expect(world.getProp("inst_tier_block_1", "writable_owner")).toEqual(["place", "units"]);
+      expect(world.getProp("inst_tier_block_1", "writable_self")).toEqual(["current", "history"]);
+      world.createObject({ id: "$tiers_subblock", name: "$tiers_subblock", parent: "$tiers_block", owner: "$wiz", location: null });
+      world.createObject({ id: "inst_tier_subblock_1", name: "inst_tier_subblock_1", parent: "$tiers_subblock", owner: "$wiz", location: null });
+      expect(world.getProp("inst_tier_subblock_1", "writable_owner")).toEqual(["place", "units"]);
+      expect(world.getProp("inst_tier_subblock_1", "writable_self")).toEqual(["current", "history"]);
     });
 
-    it("rejects a tier list that contains a reserved property name", () => {
-      const world = createWorld({ catalogs: false });
-      const bad = writabilityManifest({}, { writable_owner: ["place", "name"] });
-      expect(() => installCatalogManifest(world, bad, { tap: "@local", alias: "tiers-demo" })).toThrow(/reserved property "name"/);
+    // Lint helper: catalog authors should keep tier defaults well-formed.
+    // Surfaces issues without requiring install (works on raw manifest data).
+    function lintTiers(
+      classDef: { local_name: string; parent?: string; properties?: { name: string; default?: unknown }[] },
+      ancestorPropNames: Set<string> = new Set()
+    ): string[] {
+      const issues: string[] = [];
+      const props = classDef.properties ?? [];
+      const declared = new Set([...props.map((p) => p.name), ...ancestorPropNames]);
+      const tierFor = (name: "writable_owner" | "writable_self"): string[] | null => {
+        const def = props.find((p) => p.name === name);
+        if (!def) return null;
+        const value = def.default;
+        if (!Array.isArray(value)) {
+          issues.push(`${classDef.local_name}.${name}: default must be a list<str>`);
+          return null;
+        }
+        if (!value.every((v) => typeof v === "string" && v.length > 0)) {
+          issues.push(`${classDef.local_name}.${name}: every entry must be a non-empty string`);
+          return null;
+        }
+        const seen = new Set<string>();
+        for (const item of value as string[]) {
+          if (seen.has(item)) issues.push(`${classDef.local_name}.${name}: duplicate "${item}"`);
+          seen.add(item);
+        }
+        return value as string[];
+      };
+      const reserved = new Set(["owner", "name", "description", "aliases", "flags", "parent", "location", "anchor", "home", "writable_owner", "writable_self"]);
+      const ownerList = tierFor("writable_owner");
+      const selfList = tierFor("writable_self");
+      for (const list of [ownerList, selfList]) {
+        if (!list) continue;
+        for (const name of list) {
+          if (reserved.has(name)) issues.push(`${classDef.local_name}: tier may not include reserved property "${name}"`);
+          if (!declared.has(name)) issues.push(`${classDef.local_name}: tier references undeclared property "${name}"`);
+        }
+      }
+      if (ownerList && selfList) {
+        const overlap = ownerList.filter((n) => selfList.includes(n));
+        for (const n of overlap) issues.push(`${classDef.local_name}: property "${n}" appears in both writable_owner and writable_self`);
+      }
+      return issues;
+    }
+
+    it("lint catches reserved-name / duplicate / overlap / undeclared / non-list tier defaults", () => {
+      const baseProps = [{ name: "foo" }, { name: "bar" }];
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo", "missing"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/undeclared property "missing"/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo", "name"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/reserved property "name"/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo", "foo"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/duplicate "foo"/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo"] }, { name: "writable_self", default: ["foo"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/both writable_owner and writable_self/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: "not a list" }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/must be a list<str>/)]));
+      // Same-manifest parent property satisfies the declared check.
+      expect(lintTiers(
+        { local_name: "$sub", properties: [{ name: "bar" }, { name: "writable_owner", default: ["foo", "bar"] }] },
+        new Set(["foo"])
+      )).toEqual([]);
+      // Well-formed.
+      expect(lintTiers({ local_name: "$ok", properties: [...baseProps, { name: "writable_owner", default: ["foo"] }, { name: "writable_self", default: ["bar"] }] }))
+        .toEqual([]);
     });
 
-    it("rejects a property that appears in both writable_owner and writable_self", () => {
-      const world = createWorld({ catalogs: false });
-      const bad = writabilityManifest({}, { writable_owner: ["place", "units"], writable_self: ["units", "current"] });
-      expect(() => installCatalogManifest(world, bad, { tap: "@local", alias: "tiers-demo" })).toThrow(/both writable_owner and writable_self/);
-    });
-
-    it("rejects a duplicate inside a single tier list", () => {
-      const world = createWorld({ catalogs: false });
-      const bad = writabilityManifest({}, { writable_owner: ["place", "place"] });
-      expect(() => installCatalogManifest(world, bad, { tap: "@local", alias: "tiers-demo" })).toThrow(/duplicate "place"/);
+    it("guards every bundled catalog: tier defaults are well-formed", () => {
+      // Catalog-wide guard. Each class with a writable_owner / writable_self
+      // property must have a well-formed default. Inherited names from
+      // same-catalog parents satisfy the "declared" check; cross-catalog
+      // parents (e.g. $weather_block extends $block) lint without the
+      // undeclared check since the parent isn't in the same manifest.
+      for (const catalogName of readdirSync(root).filter((entry) => existsSync(join(root, entry, "manifest.json")))) {
+        const manifest = readManifest(catalogName);
+        const classes = [...(manifest.classes ?? []), ...(manifest.features ?? [])] as Array<{ local_name: string; parent?: string; properties?: { name: string; default?: unknown }[] }>;
+        const declaredByName = new Map<string, Set<string>>();
+        for (const cls of classes) declaredByName.set(cls.local_name, new Set((cls.properties ?? []).map((p) => p.name)));
+        for (const cls of classes) {
+          const ancestorProps = new Set<string>();
+          let parent: string | undefined = cls.parent;
+          while (parent && declaredByName.has(parent)) {
+            for (const p of declaredByName.get(parent)!) ancestorProps.add(p);
+            parent = classes.find((c) => c.local_name === parent)?.parent;
+          }
+          const issues = lintTiers(cls, ancestorProps);
+          // Skip "undeclared" complaints when the parent chain leaves this
+          // catalog — the lint can't see across manifests.
+          const fullyLocal = !cls.parent || declaredByName.has(cls.parent);
+          const filtered = fullyLocal ? issues : issues.filter((m) => !/undeclared property/.test(m));
+          expect(filtered, `${catalogName}/${cls.local_name}`).toEqual([]);
+        }
+      }
     });
 
     it("$block base catalog enforces tier-gated set_property", async () => {
@@ -2463,7 +2501,7 @@ describe("local catalogs", () => {
       installLocalCatalogs(world, ["block"]);
       // Test subclass: place is owner-tier, current is self-tier (the
       // writable_self list extends the base $block list per authoring
-      // convention).
+      // convention — declared as ordinary property defaults).
       installCatalogManifest(world, {
         name: "test-block-sub",
         version: "0.1.0",
@@ -2474,10 +2512,10 @@ describe("local catalogs", () => {
           parent: "$block",
           properties: [
             { name: "place", type: "str", default: "" },
-            { name: "current", type: "map", default: {} }
-          ],
-          writable_owner: ["place"],
-          writable_self: ["last_pushed_at", "last_error", "current"]
+            { name: "current", type: "map", default: {} },
+            { name: "writable_owner", type: "list<str>", default: ["place"] },
+            { name: "writable_self", type: "list<str>", default: ["last_pushed_at", "last_error", "current"] }
+          ]
         }]
       } as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "test-block-sub" });
 
@@ -2599,6 +2637,7 @@ describe("local catalogs", () => {
       const blockId = "obj_test_disp_block";
       world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
       world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
 
       const requesterSess = world.auth("guest:disp-requester");
       const requester = requesterSess.actor;
@@ -2663,7 +2702,9 @@ describe("local catalogs", () => {
       const owner = ownerSess.actor;
       const blockId = "obj_test_disp_rate_block";
       world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
-      // Default 60s rate limit.
+      // Default 60s per-requester limit. Disable the block-wide cooldown so
+      // we observe the per-actor branch in isolation.
+      world.setProp(blockId, "block_cooldown_seconds", 0);
       const requesterSess = world.auth("guest:disp-rate-requester");
       const requester = requesterSess.actor;
       const first = await world.directCall("rate-1", requester, blockId, "order", ["aries"]);
@@ -2672,8 +2713,76 @@ describe("local catalogs", () => {
       expect(second.op).toBe("error");
       if (second.op === "error") {
         expect(second.error.code).toBe("E_RATE_LIMIT");
-        expect((second.error.value as { rate_limit_seconds?: number })?.rate_limit_seconds).toBe(60);
+        expect((second.error.value as { scope?: string; rate_limit_seconds?: number })?.scope).toBe("requester");
+        expect((second.error.value as { scope?: string; rate_limit_seconds?: number })?.rate_limit_seconds).toBe(60);
       }
+    });
+
+    it("$dispenser_block:order enforces block-wide cooldown across distinct actors (defends against guest minting)", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_block_cooldown_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:disp-cool-owner");
+      const blockId = "obj_test_disp_block_cooldown";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      // Default block_cooldown_seconds=5; first order primes last_order_at.
+      const a = world.auth("guest:cool-a").actor;
+      const b = world.auth("guest:cool-b").actor;
+      const first = await world.directCall("cool-1", a, blockId, "order", ["one"]);
+      expect(first.op).toBe("result");
+      // Different actor inside the cooldown window must be rejected.
+      const second = await world.directCall("cool-2", b, blockId, "order", ["two"]);
+      expect(second.op).toBe("error");
+      if (second.op === "error") {
+        expect(second.error.code).toBe("E_RATE_LIMIT");
+        expect((second.error.value as { scope?: string })?.scope).toBe("block");
+      }
+    });
+
+    it("$dispenser_block:order rejects oversized requests and full queues", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_caps_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:disp-caps-owner");
+      const blockId = "obj_test_disp_caps";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+      world.setProp(blockId, "max_request_chars", 16);
+      world.setProp(blockId, "max_pending_orders", 2);
+
+      const requester = world.auth("guest:caps-req").actor;
+      const oversized = await world.directCall("caps-too-big", requester, blockId, "order", ["x".repeat(17)]);
+      expect(oversized.op).toBe("error");
+      if (oversized.op === "error") expect(oversized.error.code).toBe("E_INVARG");
+      // Queue cap.
+      for (let i = 0; i < 2; i++) {
+        const r = await world.directCall(`caps-${i}`, requester, blockId, "order", [`o${i}`]);
+        expect(r.op).toBe("result");
+      }
+      const overflow = await world.directCall("caps-overflow", requester, blockId, "order", ["nope"]);
+      expect(overflow.op).toBe("error");
+      if (overflow.op === "error") expect(overflow.error.code).toBe("E_QUEUE_FULL");
+    });
+
+    it("$dispenser_block keeps mutating queue helpers off the direct-call surface", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const owner = world.auth("guest:disp-helper-owner").actor;
+      const requester = world.auth("guest:disp-helper-requester").actor;
+      const blockId = "obj_test_disp_helpers";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: null });
+
+      expect(world.verbInfo("$dispenser_block", "check_order_limits").direct_callable).toBe(false);
+      expect(world.verbInfo("$dispenser_block", "enqueue_order").direct_callable).toBe(false);
+
+      const direct = await world.directCall("helper-direct-denied", requester, blockId, "enqueue_order", ["bypass"]);
+      expect(direct.op).toBe("error");
+      if (direct.op === "error") expect(direct.error.code).toBe("E_DIRECT_DENIED");
+      expect(world.getProp(blockId, "pending_orders")).toEqual([]);
     });
 
     it("blocks-demo seeds the_weather in the chatroom and the_horoscope on the deck", () => {
@@ -2717,7 +2826,7 @@ describe("local catalogs", () => {
 
       // Owner can read system_prompt; tier lists inherit the dispenser config.
       expect(world.getProp(blockId, "system_prompt")).toBe("Speak in two short sentences.");
-      expect(world.getProp(blockId, "writable_owner")).toEqual(["system_prompt", "rate_limit_seconds"]);
+      expect(world.getProp(blockId, "writable_owner")).toEqual(["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"]);
 
       // Plug-as-block delivers; note arrives in requester inventory with back-references.
       const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Today the stars suggest sandwiches."]);
@@ -2747,20 +2856,5 @@ describe("local catalogs", () => {
       expect(world.getProp("$weather_block", "summary_props")).toEqual(["current"]);
     });
 
-    it("propagates the tier lists to instances (and subclasses) via property def inheritance", () => {
-      const world = createWorld({ catalogs: false });
-      installCatalogManifest(world, writabilityManifest(), { tap: "@local", alias: "tiers-demo" });
-      // Instance: a fresh object whose parent is the class. The tier props
-      // are not on the instance's own properties map, so getProp must walk
-      // up to the ancestor def's defaultValue.
-      world.createObject({ id: "inst_tier_block_1", name: "inst_tier_block_1", parent: "$tiers_block", owner: "$wiz", location: null });
-      expect(world.getProp("inst_tier_block_1", "writable_owner")).toEqual(["place", "units"]);
-      expect(world.getProp("inst_tier_block_1", "writable_self")).toEqual(["current", "history"]);
-      // Subclass that doesn't redeclare the tier lists also inherits.
-      world.createObject({ id: "$tiers_subblock", name: "$tiers_subblock", parent: "$tiers_block", owner: "$wiz", location: null });
-      world.createObject({ id: "inst_tier_subblock_1", name: "inst_tier_subblock_1", parent: "$tiers_subblock", owner: "$wiz", location: null });
-      expect(world.getProp("inst_tier_subblock_1", "writable_owner")).toEqual(["place", "units"]);
-      expect(world.getProp("inst_tier_subblock_1", "writable_self")).toEqual(["current", "history"]);
-    });
   });
 });
