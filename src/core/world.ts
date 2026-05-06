@@ -2014,6 +2014,7 @@ export class WooWorld {
     for (const objRef of objRefs) {
       const host = await this.remoteHostForObject(objRef, memo);
       if (!host) {
+        if (!this.objects.has(objRef)) continue;
         out[objRef] = this.localScopedObjectSummary(actor, objRef);
         continue;
       }
@@ -4667,7 +4668,14 @@ export class WooWorld {
     const homeValue = this.propOrNull(actor, "home");
     const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
     const fallback = this.guestInventoryFallback(actor, home);
-    for (const item of Array.from(this.object(actor).contents)) this.moveObject(item, this.inventoryEjectTarget(item, fallback));
+    const contents = this.object(actor).contents;
+    for (const item of Array.from(contents)) {
+      if (!this.objects.has(item)) {
+        contents.delete(item);
+        continue;
+      }
+      this.moveObject(item, this.inventoryEjectTarget(item, fallback));
+    }
     this.moveObject(actor, home);
     this.setProp(actor, "description", "");
     this.setProp(actor, "aliases", []);
@@ -5761,7 +5769,13 @@ export class WooWorld {
       const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
       const fallback = this.guestInventoryFallback(ctx.thisObj, home);
       const carried = await this.objectContents(ctx.thisObj, ctx.hostMemo);
-      for (const item of carried) await this.moveObjectChecked(item, this.inventoryEjectTarget(item, fallback));
+      for (const item of carried) {
+        if (!this.objects.has(item) && !await this.remoteHostForObject(item, ctx.hostMemo)) {
+          this.object(ctx.thisObj).contents.delete(item);
+          continue;
+        }
+        await this.moveObjectChecked(item, this.inventoryEjectTarget(item, fallback));
+      }
       await this.moveObjectChecked(ctx.thisObj, home);
       this.setProp(ctx.thisObj, "description", "");
       this.setProp(ctx.thisObj, "aliases", []);
@@ -6093,7 +6107,7 @@ export class WooWorld {
   }
 
   private async playerWho(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
-    const requested = valueToText(args[0]).trim();
+    const requested = valueToText(args[0] ?? null).trim();
     const players = requested
       ? this.playerNameTokens(requested).map((name) => this.matchPlayerForCommand(name))
       : this.connectedPlayers();
@@ -6756,15 +6770,32 @@ export class WooWorld {
     const prefix = await this.longestObjectPrefix(restTokens, ctx, location, actor);
     const prefixTokens = prefix ? restTokens.slice(0, prefix.length) : [];
     const prefixRestTokens = prefix ? restTokens.slice(prefix.length) : [];
+    const verb = verbToken.value.toLowerCase();
+    let dobj = dobjMatch?.status === "ok" ? dobjMatch.value : null;
+    let dobjText = dobjstr;
+    let dobjPrefix = prefix?.object ?? null;
+    let dobjPrefixText = tokenPhrase(prefixTokens);
+    let dobjPrefixRest = tokenPhrase(prefixRestTokens);
+    const prep = prepMatch?.prep ?? null;
+    const iobj = iobjMatch?.status === "ok" ? iobjMatch.value : null;
+    // Treat "look at <object>" as the same object command shape as
+    // "look <object>" while preserving the parsed preposition for diagnostics.
+    if ((verb === "look" || verb === "l" || verb === "examine" || verb === "ex") && prep === "at" && !dobj && !dobjPrefix && iobj) {
+      dobj = iobj;
+      dobjText = iobjstr;
+      dobjPrefix = iobj;
+      dobjPrefixText = iobjstr;
+      dobjPrefixRest = "";
+    }
     return {
-      verb: verbToken.value.toLowerCase(),
-      dobj: dobjMatch?.status === "ok" ? dobjMatch.value : null,
-      dobjstr,
-      dobj_prefix: prefix?.object ?? null,
-      dobj_prefix_str: tokenPhrase(prefixTokens),
-      dobj_prefix_rest: tokenPhrase(prefixRestTokens),
-      prep: prepMatch?.prep ?? null,
-      iobj: iobjMatch?.status === "ok" ? iobjMatch.value : null,
+      verb,
+      dobj,
+      dobjstr: dobjText,
+      dobj_prefix: dobjPrefix,
+      dobj_prefix_str: dobjPrefixText,
+      dobj_prefix_rest: dobjPrefixRest,
+      prep,
+      iobj,
       iobjstr,
       args: restTokens.map((token) => token.value),
       argstr,
