@@ -27,6 +27,12 @@ export type SerializedSession = {
   lastDetachAt?: number | null;
   tokenClass?: "guest" | "bearer" | "apikey";
   currentLocation?: ObjRef | null;
+  /** The apikey record id this session was minted from, when tokenClass is
+   * "apikey". Persisted so revokeApiKey can close routed and post-restart
+   * session copies; omitting it would leave session:<id> usable until
+   * normal expiry after a restart or on a host that received the session
+   * via ensureSessionForActor. */
+  apikeyId?: string;
 };
 
 export type SpaceSnapshotRecord = {

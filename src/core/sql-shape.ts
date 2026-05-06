@@ -140,7 +140,8 @@ export const SQL_SCHEMA_STATEMENTS = [
     expires_at INTEGER,
     last_detach_at INTEGER,
     token_class TEXT NOT NULL DEFAULT 'guest',
-    current_location TEXT
+    current_location TEXT,
+    apikey_id TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS world_meta (
     key TEXT PRIMARY KEY,
@@ -300,7 +301,8 @@ export function sessionFromSqlRow(row: SqlRow): SerializedSession {
     expiresAt: row.expires_at === null || row.expires_at === undefined ? undefined : Number(row.expires_at),
     lastDetachAt: row.last_detach_at === null || row.last_detach_at === undefined ? null : Number(row.last_detach_at),
     tokenClass: row.token_class as "guest" | "bearer" | "apikey" | undefined,
-    currentLocation: row.current_location === null || row.current_location === undefined ? null : String(row.current_location)
+    currentLocation: row.current_location === null || row.current_location === undefined ? null : String(row.current_location),
+    ...(row.apikey_id === null || row.apikey_id === undefined ? {} : { apikeyId: String(row.apikey_id) })
   };
 }
 

@@ -753,6 +753,68 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("revoke_api_key removes Directory routes for sessions minted from that key", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-apikey-revoke-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: undefined,
+      WOO: undefined
+    } as unknown as Env;
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, env);
+    (env as any).DIRECTORY = new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    });
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    (env as any).WOO = new FakeDurableObjectNamespace((name) => {
+      if (name !== "world") throw new Error(`unexpected Woo DO ${name}`);
+      return gateway;
+    });
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, any> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    }
+
+    try {
+      const auth = await post("/api/auth", { token: "wizard:cf-apikey-revoke-token" });
+      expect(auth.status).toBe(200);
+      const wizardSession = String(auth.body.session);
+
+      const created = await post("/api/objects/%24system/calls/create_api_key", { args: ["$wiz", "revoke-route"] }, wizardSession);
+      expect(created.status).toBe(200);
+      const key = created.body.result as { id: string; secret: string };
+
+      const apiAuth = await post("/api/auth", { token: `apikey:${key.id}:${key.secret}` });
+      expect(apiAuth.status).toBe(200);
+      const apiSession = String(apiAuth.body.session);
+
+      const before = await post("/api/objects/%24system/calls/list_api_keys", { args: [] }, apiSession);
+      expect(before.status).toBe(200);
+
+      const revoked = await post("/api/objects/%24system/calls/revoke_api_key", { args: [key.id] }, wizardSession);
+      expect(revoked.status).toBe(200);
+      expect(revoked.body.result).toBe(true);
+
+      const stale = await post("/api/objects/%24system/calls/list_api_keys", { args: [] }, apiSession);
+      expect(stale.status).toBe(401);
+      expect(stale.body.error).toMatchObject({ code: "E_NOSESSION" });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("publishes Worker-installed self-hosted tap objects before serving host seeds", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");

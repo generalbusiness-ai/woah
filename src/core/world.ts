@@ -117,6 +117,7 @@ export type CallContext = {
   observations: Observation[];
   observe(event: Observation): void;
   deferHostEffect?(effect: DeferredHostEffect): void;
+  onSessionsEnded?(sessions: Session[]): void | Promise<void>;
   hostMemo?: HostOperationMemo;
   /** Per-call set of `${obj}->${target}` markers used by movetoChecked to
    * prevent infinite recursion when an `obj:moveto` verb calls back into
@@ -260,6 +261,7 @@ export type DirectCallOptions = {
   forceReason?: string;
   sessionId?: string | null;
   deferHostEffect?: (effect: DeferredHostEffect) => void;
+  onSessionsEnded?: (sessions: Session[]) => void | Promise<void>;
 };
 
 type WooRepository = WorldRepository & Partial<ObjectRepository>;
@@ -1017,16 +1019,40 @@ export class WooWorld {
     const expected = String(r.hash ?? "");
     const actor = String(r.actor ?? "");
     if (!salt || !expected || !actor) throw wooError("E_NOSESSION", "apikey record is malformed");
+    // Soft-deleted records remain in the map (for audit + observability) but
+    // reject all further authentications.
+    if (r.revoked_at != null) throw wooError("E_NOSESSION", "apikey not found or revoked");
     if (!this.objects.has(actor)) throw wooError("E_NOSESSION", "apikey target actor no longer exists");
     const presented = hashSource(`${salt}:${secret}`);
     if (!constantTimeEqual(presented, expected)) throw wooError("E_NOSESSION", "apikey secret rejected");
-    return this.createSessionForActor(actor, "apikey");
+    // Record liveness so :look on a block can render "plug last seen Ns ago"
+    // without needing extra state. last_seen_at is per-key, not per-session;
+    // a key with N concurrent sessions still gets one timestamp.
+    this.touchApiKeyLastSeen(id);
+    return this.createSessionForActor(actor, "apikey", id);
   }
 
+  /** Wizard-only: mint an apikey bound to any $actor descendant. */
   createApiKey(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to create api keys", { actor });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
     if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    return this.createApiKeyRecord(actor, target, label, "create_api_key");
+  }
+
+  /** Owner-mint: the owner of `target` may mint an apikey bound to `target`.
+   * This is the path catalog code (e.g. `$block:mint_apikey`) uses so blocks
+   * can be configured by their creator without wizard escalation. */
+  createApiKeyForOwner(actor: ObjRef, target: ObjRef, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
+    if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
+    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!this.canBypassPerms(actor) && this.object(target).owner !== actor) {
+      throw wooError("E_PERM", "owner-mint requires the calling actor to own the target", { actor, target });
+    }
+    return this.createApiKeyRecord(actor, target, label, "create_api_key_for_owner");
+  }
+
+  private createApiKeyRecord(actor: ObjRef, target: ObjRef, label: string | null, auditAction: string): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number } {
     const id = randomHex(16);
     const secret = randomHex(32);
     const salt = randomHex(16);
@@ -1036,36 +1062,104 @@ export class WooWorld {
     const map = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, WooValue>) } : {};
     map[id] = { hash, salt, actor: target, label: label ?? null, created_at } as WooValue;
     this.setProp("$system", "api_keys", map as WooValue);
-    this.recordWizardAction(actor, "create_api_key", { actor: target, key_id: id, label: label ?? null });
+    this.recordWizardAction(actor, auditAction, { actor: target, key_id: id, label: label ?? null });
     return { id, secret, actor: target, label, created_at };
   }
 
-  revokeApiKey(actor: ObjRef, id: string): boolean {
-    if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to revoke api keys", { actor });
+  private touchApiKeyLastSeen(id: string): void {
     const raw = this.propOrNull("$system", "api_keys");
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-    const map = { ...(raw as Record<string, WooValue>) };
-    if (!(id in map)) return false;
-    delete map[id];
-    this.setProp("$system", "api_keys", map as WooValue);
-    this.recordWizardAction(actor, "revoke_api_key", { key_id: id });
-    return true;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const map = raw as Record<string, WooValue>;
+    const rec = map[id];
+    if (!rec || typeof rec !== "object" || Array.isArray(rec)) return;
+    const updated = { ...(rec as Record<string, WooValue>), last_seen_at: Date.now() };
+    this.setProp("$system", "api_keys", { ...map, [id]: updated as WooValue });
   }
 
-  listApiKeys(actor: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number }> {
+  /** Mark an apikey revoked and tear down any sessions minted from it.
+   * Keeps the record (with revoked_at) for audit. Authorized for wizards
+   * unconditionally and for the owner of the bound actor (so the same actor
+   * who could mint can also revoke). */
+  revokeApiKey(actor: ObjRef, id: string): boolean {
+    return this.revokeApiKeyWithClosedSessions(actor, id).revoked;
+  }
+
+  private revokeApiKeyWithClosedSessions(actor: ObjRef, id: string): { revoked: boolean; closedSessions: Session[] } {
+    const raw = this.propOrNull("$system", "api_keys");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { revoked: false, closedSessions: [] };
+    const map = raw as Record<string, WooValue>;
+    const rec = map[id];
+    if (!rec || typeof rec !== "object" || Array.isArray(rec)) return { revoked: false, closedSessions: [] };
+    const r = rec as Record<string, WooValue>;
+    const targetActor = String(r.actor ?? "");
+    const isWizard = this.canBypassPerms(actor);
+    const isOwner = targetActor && this.objects.has(targetActor) && this.object(targetActor).owner === actor;
+    if (!isWizard && !isOwner) {
+      throw wooError("E_PERM", "revoke requires wizard authority or ownership of the bound actor", { actor, key_id: id });
+    }
+    return this.revokeApiKeyRecord(actor, id, map, r, targetActor);
+  }
+
+  private revokeApiKeyRecord(actor: ObjRef, id: string, map: Record<string, WooValue>, record: Record<string, WooValue>, targetActor: ObjRef): { revoked: boolean; closedSessions: Session[] } {
+    if (record.revoked_at != null) return { revoked: false, closedSessions: [] }; // already revoked — caller can disambiguate via listApiKeys
+    const updated = { ...record, revoked_at: Date.now() };
+    this.setProp("$system", "api_keys", { ...map, [id]: updated as WooValue });
+    const closedSessions = this.closeSessionsForApiKey(id);
+    this.recordWizardAction(actor, "revoke_api_key", { key_id: id, actor: targetActor });
+    return { revoked: true, closedSessions };
+  }
+
+  /** Walk the in-memory session table and reap any whose apikeyId matches.
+   * Returns the sessions closed. Live transports (WS, MCP) discover
+   * via their session-resume path that the session no longer exists and
+   * disconnect on the next op. */
+  private closeSessionsForApiKey(id: string): Session[] {
+    const matches: Session[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.apikeyId === id) matches.push({ ...session, attachedSockets: new Set(session.attachedSockets) });
+    }
+    for (const session of matches) this.reapSession(session.id);
+    if (matches.length > 0) this.persist(true);
+    return matches;
+  }
+
+  /** Wizard-only: list every apikey record's metadata. */
+  listApiKeys(actor: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to list api keys", { actor });
+    return this.collectApiKeyMetadata();
+  }
+
+  /** Owner-scoped: list apikeys for actors the caller owns. Useful for
+   * `$block:list_apikeys` so a block's owner can audit "is my plug
+   * connected and which key did it use?" without wizard authority. */
+  listApiKeysForOwner(actor: ObjRef): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
+    if (this.canBypassPerms(actor)) return this.collectApiKeyMetadata();
+    return this.collectApiKeyMetadata().filter((entry) => {
+      if (!entry.actor || !this.objects.has(entry.actor)) return false;
+      return this.object(entry.actor).owner === actor;
+    });
+  }
+
+  private collectApiKeyMetadata(): Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> {
     const raw = this.propOrNull("$system", "api_keys");
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-    const out: Array<{ id: string; actor: ObjRef; label: string | null; created_at: number }> = [];
+    const out: Array<{ id: string; actor: ObjRef; label: string | null; created_at: number; last_seen_at: number | null; revoked_at: number | null }> = [];
     for (const [id, rec] of Object.entries(raw as Record<string, WooValue>)) {
       if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
       const r = rec as Record<string, WooValue>;
-      out.push({ id, actor: String(r.actor ?? ""), label: typeof r.label === "string" ? r.label : null, created_at: Number(r.created_at ?? 0) });
+      out.push({
+        id,
+        actor: String(r.actor ?? ""),
+        label: typeof r.label === "string" ? r.label : null,
+        created_at: Number(r.created_at ?? 0),
+        last_seen_at: r.last_seen_at == null ? null : Number(r.last_seen_at),
+        revoked_at: r.revoked_at == null ? null : Number(r.revoked_at)
+      });
     }
     return out;
   }
 
-  createSessionForActor(actor: ObjRef, tokenClass: Session["tokenClass"] = "bearer"): Session {
+  createSessionForActor(actor: ObjRef, tokenClass: Session["tokenClass"] = "bearer", apikeyId?: string): Session {
     this.reapExpiredSessions();
     this.object(actor);
     const id = `session-${this.sessionCounter++}`;
@@ -1080,7 +1174,8 @@ export class WooWorld {
       tokenClass,
       currentLocation: this.initialSessionLocation(actor),
       attachedSockets: new Set(),
-      lastInputAt: now
+      lastInputAt: now,
+      ...(apikeyId !== undefined ? { apikeyId } : {})
     };
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
@@ -1098,7 +1193,8 @@ export class WooWorld {
     actor: ObjRef,
     tokenClass: Session["tokenClass"] = "bearer",
     expiresAt?: number,
-    currentLocation?: ObjRef | null
+    currentLocation?: ObjRef | null,
+    apikeyId?: string
   ): Session {
     const existing = this.sessions.get(id);
     if (existing) {
@@ -1109,6 +1205,13 @@ export class WooWorld {
       }
       if (currentLocation && existing.currentLocation !== currentLocation) {
         existing.currentLocation = currentLocation;
+        changed = true;
+      }
+      // If the originating host knows the apikey id but the routed copy
+      // doesn't yet, learn it so future revokes can tear the session down
+      // here too.
+      if (apikeyId !== undefined && existing.apikeyId !== apikeyId) {
+        existing.apikeyId = apikeyId;
         changed = true;
       }
       if (changed) this.persistSession(existing);
@@ -1125,7 +1228,8 @@ export class WooWorld {
       tokenClass,
       currentLocation: currentLocation ?? this.initialSessionLocation(actor),
       attachedSockets: new Set(),
-      lastInputAt: now
+      lastInputAt: now,
+      ...(apikeyId !== undefined ? { apikeyId } : {})
     };
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
@@ -1498,6 +1602,7 @@ export class WooWorld {
         message,
         observations,
         hostMemo,
+        onSessionsEnded: options.onSessionsEnded,
         observe: (event) => {
           observations.push({ ...event, source: event.source ?? target });
         },
@@ -4029,7 +4134,8 @@ export class WooWorld {
         expiresAt: session.expiresAt,
         lastDetachAt: session.lastDetachAt,
         tokenClass: session.tokenClass,
-        currentLocation: session.currentLocation
+        currentLocation: session.currentLocation,
+        ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
       };
     }
 
@@ -4485,7 +4591,7 @@ export class WooWorld {
   }
 
     private hydrateSession(
-      session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; currentLocation?: ObjRef | null },
+      session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; currentLocation?: ObjRef | null; apikeyId?: string },
       now: number
     ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
@@ -4506,7 +4612,8 @@ export class WooWorld {
       // lastInputAt isn't persisted; on cold rehydrate, treat as just-active
       // rather than restoring some old timestamp from `started`. Otherwise
       // every freshly-rehydrated DO would show huge idle for everyone.
-      lastInputAt: now
+      lastInputAt: now,
+      ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
     };
   }
 
@@ -5686,13 +5793,24 @@ export class WooWorld {
       const result = this.createApiKey(ctx.actor, target, label);
       return result as unknown as WooValue;
     });
+    this.nativeHandlers.set("create_api_key_for_owner", (ctx, args) => {
+      const target = assertObj(args[0]);
+      const label = typeof args[1] === "string" ? args[1] : null;
+      const result = this.createApiKeyForOwner(ctx.actor, target, label);
+      return result as unknown as WooValue;
+    });
     this.nativeHandlers.set("revoke_api_key", (ctx, args) => {
       const id = String(args[0] ?? "");
       if (!id) throw wooError("E_INVARG", "revoke_api_key requires an id");
-      return this.revokeApiKey(ctx.actor, id);
+      const result = this.revokeApiKeyWithClosedSessions(ctx.actor, id);
+      if (result.closedSessions.length > 0) return Promise.resolve(ctx.onSessionsEnded?.(result.closedSessions)).then(() => result.revoked);
+      return result.revoked;
     });
     this.nativeHandlers.set("list_api_keys", (ctx) => {
       return this.listApiKeys(ctx.actor) as unknown as WooValue;
+    });
+    this.nativeHandlers.set("list_api_keys_for_owner", (ctx) => {
+      return this.listApiKeysForOwner(ctx.actor) as unknown as WooValue;
     });
     this.nativeHandlers.set("feature_can_be_attached_by", (ctx, args) => {
       const actor = assertObj(args[0] ?? ctx.actor);

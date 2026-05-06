@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHostScopedWorld } from "../src/core/bootstrap";
-import { installCatalogManifest, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
+import { applyCatalogSchemaPlan, installCatalogManifest, planCatalogSchemaMigration, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
 import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations, runHostScopedLocalCatalogLifecycle } from "../src/core/local-catalogs";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, VerbDef, WooValue } from "../src/core/types";
 
@@ -2389,5 +2389,543 @@ describe("local catalogs", () => {
         }
       }
     }
+  });
+
+  describe("writability tiers", () => {
+    // Tier lists are ordinary class properties: the substrate has no
+    // special knowledge of them. The catalog convention is that
+    // `writable_owner` and `writable_self` are list<str> property defaults
+    // that the per-class :is_writable_by_property(who, name) verb consults.
+    // Subclasses extend the lists by redeclaring the property with a
+    // wider default; the substrate's normal property-def chain handles
+    // inheritance.
+    function tiersClass(propertyOverrides: Array<{ name: string; default?: unknown; type?: string }> = []): RuntimeCatalogManifest {
+      const baseProps = [
+        { name: "place", type: "str", default: "", perms: "r" },
+        { name: "units", type: "str", default: "metric", perms: "r" },
+        { name: "current", type: "map", default: {}, perms: "r" },
+        { name: "history", type: "list", default: [], perms: "r" },
+        { name: "writable_owner", type: "list<str>", default: ["place", "units"], perms: "r" },
+        { name: "writable_self", type: "list<str>", default: ["current", "history"], perms: "r" }
+      ];
+      const merged = baseProps.map((p) => propertyOverrides.find((o) => o.name === p.name) ?? p);
+      for (const o of propertyOverrides) {
+        if (!baseProps.some((p) => p.name === o.name)) merged.push(o);
+      }
+      return {
+        name: "tiers-demo",
+        version: "0.1.0",
+        spec_version: "v1",
+        license: "MIT",
+        classes: [
+          {
+            local_name: "$tiers_block",
+            parent: "$root",
+            description: "Test class — tier lists declared as ordinary class properties.",
+            properties: merged
+          }
+        ]
+      } as unknown as RuntimeCatalogManifest;
+    }
+
+    it("declares writable_owner / writable_self as ordinary class properties", () => {
+      const world = createWorld({ catalogs: false });
+      installCatalogManifest(world, tiersClass(), { tap: "@local", alias: "tiers-demo" });
+      expect(world.getProp("$tiers_block", "writable_owner")).toEqual(["place", "units"]);
+      expect(world.getProp("$tiers_block", "writable_self")).toEqual(["current", "history"]);
+      const ownerDef = world.object("$tiers_block").propertyDefs.get("writable_owner");
+      expect(ownerDef?.perms).toBe("r");
+    });
+
+    it("propagates the tier lists to instances (and subclasses) via property def inheritance", () => {
+      const world = createWorld({ catalogs: false });
+      installCatalogManifest(world, tiersClass(), { tap: "@local", alias: "tiers-demo" });
+      world.createObject({ id: "inst_tier_block_1", name: "inst_tier_block_1", parent: "$tiers_block", owner: "$wiz", location: null });
+      expect(world.getProp("inst_tier_block_1", "writable_owner")).toEqual(["place", "units"]);
+      expect(world.getProp("inst_tier_block_1", "writable_self")).toEqual(["current", "history"]);
+      world.createObject({ id: "$tiers_subblock", name: "$tiers_subblock", parent: "$tiers_block", owner: "$wiz", location: null });
+      world.createObject({ id: "inst_tier_subblock_1", name: "inst_tier_subblock_1", parent: "$tiers_subblock", owner: "$wiz", location: null });
+      expect(world.getProp("inst_tier_subblock_1", "writable_owner")).toEqual(["place", "units"]);
+      expect(world.getProp("inst_tier_subblock_1", "writable_self")).toEqual(["current", "history"]);
+    });
+
+    // Lint helper: catalog authors should keep tier defaults well-formed.
+    // Surfaces issues without requiring install (works on raw manifest data).
+    function lintTiers(
+      classDef: { local_name: string; parent?: string; properties?: { name: string; default?: unknown }[] },
+      ancestorPropNames: Set<string> = new Set()
+    ): string[] {
+      const issues: string[] = [];
+      const props = classDef.properties ?? [];
+      const declared = new Set([...props.map((p) => p.name), ...ancestorPropNames]);
+      const tierFor = (name: "writable_owner" | "writable_self"): string[] | null => {
+        const def = props.find((p) => p.name === name);
+        if (!def) return null;
+        const value = def.default;
+        if (!Array.isArray(value)) {
+          issues.push(`${classDef.local_name}.${name}: default must be a list<str>`);
+          return null;
+        }
+        if (!value.every((v) => typeof v === "string" && v.length > 0)) {
+          issues.push(`${classDef.local_name}.${name}: every entry must be a non-empty string`);
+          return null;
+        }
+        const seen = new Set<string>();
+        for (const item of value as string[]) {
+          if (seen.has(item)) issues.push(`${classDef.local_name}.${name}: duplicate "${item}"`);
+          seen.add(item);
+        }
+        return value as string[];
+      };
+      const reserved = new Set(["owner", "name", "description", "aliases", "flags", "parent", "location", "anchor", "home", "writable_owner", "writable_self"]);
+      const ownerList = tierFor("writable_owner");
+      const selfList = tierFor("writable_self");
+      for (const list of [ownerList, selfList]) {
+        if (!list) continue;
+        for (const name of list) {
+          if (reserved.has(name)) issues.push(`${classDef.local_name}: tier may not include reserved property "${name}"`);
+          if (!declared.has(name)) issues.push(`${classDef.local_name}: tier references undeclared property "${name}"`);
+        }
+      }
+      if (ownerList && selfList) {
+        const overlap = ownerList.filter((n) => selfList.includes(n));
+        for (const n of overlap) issues.push(`${classDef.local_name}: property "${n}" appears in both writable_owner and writable_self`);
+      }
+      return issues;
+    }
+
+    it("lint catches reserved-name / duplicate / overlap / undeclared / non-list tier defaults", () => {
+      const baseProps = [{ name: "foo" }, { name: "bar" }];
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo", "missing"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/undeclared property "missing"/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo", "name"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/reserved property "name"/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo", "foo"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/duplicate "foo"/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: ["foo"] }, { name: "writable_self", default: ["foo"] }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/both writable_owner and writable_self/)]));
+      expect(lintTiers({ local_name: "$x", properties: [...baseProps, { name: "writable_owner", default: "not a list" }] }))
+        .toEqual(expect.arrayContaining([expect.stringMatching(/must be a list<str>/)]));
+      // Same-manifest parent property satisfies the declared check.
+      expect(lintTiers(
+        { local_name: "$sub", properties: [{ name: "bar" }, { name: "writable_owner", default: ["foo", "bar"] }] },
+        new Set(["foo"])
+      )).toEqual([]);
+      // Well-formed.
+      expect(lintTiers({ local_name: "$ok", properties: [...baseProps, { name: "writable_owner", default: ["foo"] }, { name: "writable_self", default: ["bar"] }] }))
+        .toEqual([]);
+    });
+
+    it("guards every bundled catalog: tier defaults are well-formed", () => {
+      // Catalog-wide guard. Each class with a writable_owner / writable_self
+      // property must have a well-formed default. Inherited names from
+      // same-catalog parents satisfy the "declared" check; cross-catalog
+      // parents (e.g. $weather_block extends $block) lint without the
+      // undeclared check since the parent isn't in the same manifest.
+      for (const catalogName of readdirSync(root).filter((entry) => existsSync(join(root, entry, "manifest.json")))) {
+        const manifest = readManifest(catalogName);
+        const classes = [...(manifest.classes ?? []), ...(manifest.features ?? [])] as Array<{ local_name: string; parent?: string; properties?: { name: string; default?: unknown }[] }>;
+        const declaredByName = new Map<string, Set<string>>();
+        for (const cls of classes) declaredByName.set(cls.local_name, new Set((cls.properties ?? []).map((p) => p.name)));
+        for (const cls of classes) {
+          const ancestorProps = new Set<string>();
+          let parent: string | undefined = cls.parent;
+          while (parent && declaredByName.has(parent)) {
+            for (const p of declaredByName.get(parent)!) ancestorProps.add(p);
+            parent = classes.find((c) => c.local_name === parent)?.parent;
+          }
+          const issues = lintTiers(cls, ancestorProps);
+          // Skip "undeclared" complaints when the parent chain leaves this
+          // catalog — the lint can't see across manifests.
+          const fullyLocal = !cls.parent || declaredByName.has(cls.parent);
+          const filtered = fullyLocal ? issues : issues.filter((m) => !/undeclared property/.test(m));
+          expect(filtered, `${catalogName}/${cls.local_name}`).toEqual([]);
+        }
+      }
+    });
+
+    it("$block base catalog enforces tier-gated set_property", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+      // Test subclass: place is owner-tier, current is self-tier (the
+      // writable_self list extends the base $block list per authoring
+      // convention — declared as ordinary property defaults).
+      installCatalogManifest(world, {
+        name: "test-block-sub",
+        version: "0.1.0",
+        spec_version: "v1",
+        license: "MIT",
+        classes: [{
+          local_name: "$test_block",
+          parent: "$block",
+          properties: [
+            { name: "place", type: "str", default: "" },
+            { name: "current", type: "map", default: {} },
+            { name: "writable_owner", type: "list<str>", default: ["place"] },
+            { name: "writable_self", type: "list<str>", default: ["last_pushed_at", "last_error", "current"] }
+          ]
+        }]
+      } as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "test-block-sub" });
+
+      // Place the block in a real $space so observe_to_space has a routable
+      // audience for block_data observations.
+      const roomId = "obj_test_block_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:block-owner");
+      const owner = ownerSess.actor;
+      const strangerSess = world.auth("guest:block-stranger");
+      const stranger = strangerSess.actor;
+      const blockId = "obj_test_block_alpha";
+      world.createObject({ id: blockId, name: blockId, parent: "$test_block", owner, location: roomId });
+
+      // Block actor needs an apikey-bound session of its own to act as itself.
+      const key = world.createApiKey("$wiz", blockId, "test-self");
+      const blockSess = world.auth(`apikey:${key.id}:${key.secret}`);
+      expect(blockSess.actor).toBe(blockId);
+
+      // 1. Owner writes writable_owner prop: succeeds.
+      const ownerWrite = await world.directCall("set-place", owner, blockId, "set_property", ["place", "Mountain View, CA"]);
+      if (ownerWrite.op === "error") throw new Error(`owner-writable-write failed: ${ownerWrite.error.code} ${ownerWrite.error.message}`);
+      expect(ownerWrite.op).toBe("result");
+      expect(world.getProp(blockId, "place")).toBe("Mountain View, CA");
+
+      // 2. Owner attempts writable_self prop: E_PERM.
+      const ownerOnSelf = await world.directCall("owner-on-self", owner, blockId, "set_property", ["current", { temp: 60 }]);
+      expect(ownerOnSelf.op).toBe("error");
+      if (ownerOnSelf.op === "error") expect(ownerOnSelf.error.code).toBe("E_PERM");
+
+      // 3. Block actor (plug) writes writable_self prop: succeeds.
+      const plugWrite = await world.directCall("plug-write", blockId, blockId, "set_property", ["current", { temp: 72, unit: "F" }]);
+      expect(plugWrite.op).toBe("result");
+      expect(world.getProp(blockId, "current")).toEqual({ temp: 72, unit: "F" });
+
+      // 4. Block actor attempts writable_owner prop: E_PERM.
+      const plugOnOwner = await world.directCall("plug-on-owner", blockId, blockId, "set_property", ["place", "elsewhere"]);
+      expect(plugOnOwner.op).toBe("error");
+      if (plugOnOwner.op === "error") expect(plugOnOwner.error.code).toBe("E_PERM");
+
+      // 5. Stranger fails on both tiers.
+      const strangerOwner = await world.directCall("stranger-owner", stranger, blockId, "set_property", ["place", "nope"]);
+      expect(strangerOwner.op).toBe("error");
+      if (strangerOwner.op === "error") expect(strangerOwner.error.code).toBe("E_PERM");
+      const strangerSelf = await world.directCall("stranger-self", stranger, blockId, "set_property", ["current", {}]);
+      expect(strangerSelf.op).toBe("error");
+      if (strangerSelf.op === "error") expect(strangerSelf.error.code).toBe("E_PERM");
+
+      // 6. Wizard bypasses both.
+      const wizOwner = await world.directCall("wiz-owner", "$wiz", blockId, "set_property", ["place", "Wizardville"]);
+      expect(wizOwner.op).toBe("result");
+      const wizSelf = await world.directCall("wiz-self", "$wiz", blockId, "set_property", ["current", { temp: 100 }]);
+      expect(wizSelf.op).toBe("result");
+
+      // 7. block_data observation routes to location(this).
+      expect(world.object(blockId).location).toBe(roomId);
+      const obsCheck = await world.directCall("plug-write-obs", blockId, blockId, "set_property", ["current", { temp: 73 }]);
+      expect(obsCheck.op).toBe("result");
+      if (obsCheck.op === "result") {
+        const blockObs = obsCheck.observations.find((o) => o.type === "block_data");
+        expect(blockObs).toMatchObject({ type: "block_data", block: blockId, name: "current" });
+      }
+    });
+
+    it("$block:get_data returns the live property value", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+      const blockId = "obj_test_block_get";
+      world.createObject({ id: blockId, name: blockId, parent: "$block", owner: "$wiz", location: "$nowhere" });
+      world.setProp(blockId, "last_pushed_at", 12345);
+      const result = await world.directCall("get-data", "$wiz", blockId, "get_data", ["last_pushed_at"]);
+      expect(result.op).toBe("result");
+      if (result.op === "result") expect(result.result).toBe(12345);
+    });
+
+    it("$block:moveto raises E_PERM for non-wizards and :acceptable returns false", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+      const ownerSess = world.auth("guest:block-anchor-owner");
+      const owner = ownerSess.actor;
+      const blockId = "obj_test_block_anchor";
+      world.createObject({ id: blockId, name: blockId, parent: "$block", owner, location: "$nowhere" });
+      const blocked = await world.directCall("anchor-move", owner, blockId, "moveto", ["$nowhere"]);
+      expect(blocked.op).toBe("error");
+      if (blocked.op === "error") expect(blocked.error.code).toBe("E_PERM");
+      const accept = await world.directCall("anchor-accept", owner, blockId, "acceptable", ["some_thing"]);
+      expect(accept.op).toBe("result");
+      if (accept.op === "result") expect(accept.result).toBe(false);
+    });
+
+    it("$block:mint_apikey lets the owner mint, and the resulting key authenticates as the block", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+      const ownerSess = world.auth("guest:block-mint-owner");
+      const owner = ownerSess.actor;
+      const blockId = "obj_test_block_mint";
+      world.createObject({ id: blockId, name: blockId, parent: "$block", owner, location: "$nowhere" });
+      // Owner mints.
+      const minted = world.directCall("mint-key", owner, blockId, "mint_apikey", ["primary"]);
+      // Note: directCall returns synchronously here because mint_apikey is a verb that calls a substrate native.
+      // The result shape mirrors $system:create_api_key_for_owner.
+      return minted.then((res) => {
+        expect(res.op).toBe("result");
+        if (res.op !== "result") return;
+        const key = res.result as { id: string; secret: string; actor: string };
+        expect(key.actor).toBe(blockId);
+        const sess = world.auth(`apikey:${key.id}:${key.secret}`);
+        expect(sess.actor).toBe(blockId);
+      });
+    });
+
+    it("$dispenser_block: order → next_pending → deliver flows end-to-end", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:disp-owner");
+      const owner = ownerSess.actor;
+      const blockId = "obj_test_disp_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const requesterSess = world.auth("guest:disp-requester");
+      const requester = requesterSess.actor;
+
+      // 1. Public :order returns a ticket synchronously, queues the entry,
+      //    and emits an order_placed observation.
+      const ordered = await world.directCall("disp-order", requester, blockId, "order", ["scorpio"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderResult = ordered.result as { order_id: string; queued: boolean };
+      expect(orderResult.queued).toBe(true);
+      expect(orderResult.order_id).toMatch(/^ord_\d+$/);
+      const orderPlaced = ordered.observations.find((o) => o.type === "order_placed");
+      expect(orderPlaced).toMatchObject({ type: "order_placed", block: blockId, requester, request: "scorpio" });
+      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(1);
+
+      // 2. Plug authenticates as the block actor and reads next_pending.
+      const key = world.createApiKey("$wiz", blockId, "test-plug");
+      const plugSess = world.auth(`apikey:${key.id}:${key.secret}`);
+      expect(plugSess.actor).toBe(blockId);
+      const next = await world.directCall("disp-next", blockId, blockId, "next_pending", []);
+      expect(next.op).toBe("result");
+      if (next.op !== "result") return;
+      expect(next.result).toMatchObject({ order_id: orderResult.order_id, requester, request: "scorpio" });
+
+      // 3. Plug delivers — note lands in requester's inventory.
+      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Today's horoscope: avoid llamas."]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const dRes = delivered.result as { delivered: boolean; note: string };
+      expect(dRes.delivered).toBe(true);
+      expect(world.object(dRes.note).location).toBe(requester);
+      expect(world.getProp(dRes.note, "produced_by")).toBe(blockId);
+      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
+
+      // 4. Idempotent re-deliver returns delivered:false.
+      const redeliver = await world.directCall("disp-redeliver", blockId, blockId, "deliver", [orderResult.order_id, "again"]);
+      expect(redeliver.op).toBe("result");
+      if (redeliver.op === "result") {
+        const r = redeliver.result as { delivered: boolean; reason: string };
+        expect(r.delivered).toBe(false);
+        expect(r.reason).toBe("unknown_or_already_delivered");
+      }
+
+      // 5. Stranger cannot deliver someone else's order.
+      const strangerSess = world.auth("guest:disp-stranger");
+      const order2 = await world.directCall("disp-order-2", requester, blockId, "order", ["leo"]);
+      expect(order2.op).toBe("result");
+      if (order2.op !== "result") return;
+      const strangerOrderId = (order2.result as { order_id: string }).order_id;
+      const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "haha"]);
+      expect(strangerDeliver.op).toBe("error");
+      if (strangerDeliver.op === "error") expect(strangerDeliver.error.code).toBe("E_PERM");
+    });
+
+    it("$dispenser_block keeps queue internals out of public get_data", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const owner = world.auth("guest:disp-private-owner").actor;
+      const requester = world.auth("guest:disp-private-requester").actor;
+      const stranger = world.auth("guest:disp-private-stranger").actor;
+      const blockId = "obj_test_disp_private";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: "$nowhere" });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const ordered = await world.directCall("private-order", requester, blockId, "order", ["private prompt"]);
+      expect(ordered.op).toBe("result");
+
+      const leaked = await world.directCall("private-leak", stranger, blockId, "get_data", ["pending_orders"]);
+      expect(leaked.op).toBe("error");
+      if (leaked.op === "error") expect(leaked.error.code).toBe("E_PERM");
+
+      const ownerRead = await world.directCall("private-owner-read", owner, blockId, "get_data", ["pending_orders"]);
+      expect(ownerRead.op).toBe("result");
+      if (ownerRead.op === "result") expect(ownerRead.result).toMatchObject([{ request: "private prompt", requester }]);
+    });
+
+    it("$dispenser_block:order rate-limits per requester", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_rate_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:disp-rate-owner");
+      const owner = ownerSess.actor;
+      const blockId = "obj_test_disp_rate_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
+      // Default 60s per-requester limit. Disable the block-wide cooldown so
+      // we observe the per-actor branch in isolation.
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+      const requesterSess = world.auth("guest:disp-rate-requester");
+      const requester = requesterSess.actor;
+      const first = await world.directCall("rate-1", requester, blockId, "order", ["aries"]);
+      expect(first.op).toBe("result");
+      const second = await world.directCall("rate-2", requester, blockId, "order", ["taurus"]);
+      expect(second.op).toBe("error");
+      if (second.op === "error") {
+        expect(second.error.code).toBe("E_RATE_LIMIT");
+        expect((second.error.value as { scope?: string; rate_limit_seconds?: number })?.scope).toBe("requester");
+        expect((second.error.value as { scope?: string; rate_limit_seconds?: number })?.rate_limit_seconds).toBe(60);
+      }
+    });
+
+    it("$dispenser_block:order enforces block-wide cooldown across distinct actors (defends against guest minting)", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_block_cooldown_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:disp-cool-owner");
+      const blockId = "obj_test_disp_block_cooldown";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      // Default block_cooldown_seconds=5; first order primes last_order_at.
+      const a = world.auth("guest:cool-a").actor;
+      const b = world.auth("guest:cool-b").actor;
+      const first = await world.directCall("cool-1", a, blockId, "order", ["one"]);
+      expect(first.op).toBe("result");
+      // Different actor inside the cooldown window must be rejected.
+      const second = await world.directCall("cool-2", b, blockId, "order", ["two"]);
+      expect(second.op).toBe("error");
+      if (second.op === "error") {
+        expect(second.error.code).toBe("E_RATE_LIMIT");
+        expect((second.error.value as { scope?: string })?.scope).toBe("block");
+      }
+    });
+
+    it("$dispenser_block:order rejects oversized requests and full queues", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_caps_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:disp-caps-owner");
+      const blockId = "obj_test_disp_caps";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+      world.setProp(blockId, "max_request_chars", 16);
+      world.setProp(blockId, "max_pending_orders", 2);
+
+      const requester = world.auth("guest:caps-req").actor;
+      const oversized = await world.directCall("caps-too-big", requester, blockId, "order", ["x".repeat(17)]);
+      expect(oversized.op).toBe("error");
+      if (oversized.op === "error") expect(oversized.error.code).toBe("E_INVARG");
+      // Queue cap.
+      for (let i = 0; i < 2; i++) {
+        const r = await world.directCall(`caps-${i}`, requester, blockId, "order", [`o${i}`]);
+        expect(r.op).toBe("result");
+      }
+      const overflow = await world.directCall("caps-overflow", requester, blockId, "order", ["nope"]);
+      expect(overflow.op).toBe("error");
+      if (overflow.op === "error") expect(overflow.error.code).toBe("E_QUEUE_FULL");
+    });
+
+    it("$dispenser_block keeps mutating queue helpers off the direct-call surface", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const owner = world.auth("guest:disp-helper-owner").actor;
+      const requester = world.auth("guest:disp-helper-requester").actor;
+      const blockId = "obj_test_disp_helpers";
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: null });
+
+      expect(world.verbInfo("$dispenser_block", "check_order_limits").direct_callable).toBe(false);
+      expect(world.verbInfo("$dispenser_block", "enqueue_order").direct_callable).toBe(false);
+
+      const direct = await world.directCall("helper-direct-denied", requester, blockId, "enqueue_order", ["bypass"]);
+      expect(direct.op).toBe("error");
+      if (direct.op === "error") expect(direct.error.code).toBe("E_DIRECT_DENIED");
+      expect(world.getProp(blockId, "pending_orders")).toEqual([]);
+    });
+
+    it("blocks-demo seeds the_weather in the chatroom and the_horoscope on the deck", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["blocks-demo"]);
+      // Weather panel: anchored in the chatroom, default config matches manifest seed.
+      expect(world.objects.has("the_weather")).toBe(true);
+      expect(world.object("the_weather").parent).toBe("$weather_block");
+      expect(world.object("the_weather").location).toBe("the_chatroom");
+      expect(world.object("the_weather").anchor).toBe("the_chatroom");
+      expect(world.getProp("the_weather", "place")).toBe("Mountain View, CA");
+      expect(world.getProp("the_weather", "units")).toBe("imperial");
+      expect(world.getProp("the_weather", "forecast_hours")).toBe(12);
+      // Horoscope machine: anchored on the deck, default rate limit + persona.
+      expect(world.objects.has("the_horoscope")).toBe(true);
+      expect(world.object("the_horoscope").parent).toBe("$horoscope_block");
+      expect(world.object("the_horoscope").location).toBe("the_deck");
+      expect(world.object("the_horoscope").anchor).toBe("the_deck");
+      expect(world.getProp("the_horoscope", "rate_limit_seconds")).toBe(60);
+      expect(world.getProp("the_horoscope", "system_prompt")).toMatch(/fortune-teller/i);
+    });
+
+    it("$horoscope_block inherits the dispenser surface end-to-end", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["horoscope"]);
+      const roomId = "obj_test_horo_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:horo-owner");
+      const owner = ownerSess.actor;
+      const blockId = "obj_test_horo_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "system_prompt", "Speak in two short sentences.");
+
+      const requesterSess = world.auth("guest:horo-requester");
+      const requester = requesterSess.actor;
+      const ordered = await world.directCall("horo-order", requester, blockId, "order", ["scorpio"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+
+      // Owner can read system_prompt; tier lists inherit the dispenser config.
+      expect(world.getProp(blockId, "system_prompt")).toBe("Speak in two short sentences.");
+      expect(world.getProp(blockId, "writable_owner")).toEqual(["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"]);
+
+      // Plug-as-block delivers; note arrives in requester inventory with back-references.
+      const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Today the stars suggest sandwiches."]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+      expect(world.object(noteId).location).toBe(requester);
+      expect(world.getProp(noteId, "produced_by")).toBe(blockId);
+      expect(world.getProp(noteId, "text")).toEqual(["Today the stars suggest sandwiches."]);
+    });
+
+    it("$weather_block installs cleanly and ships the configured tier lists", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["weather"]);
+      expect(world.getProp("$weather_block", "writable_owner")).toEqual(["place", "units", "forecast_hours"]);
+      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "forecast", "history"]);
+      // An instance inherits the tier lists.
+      const blockId = "obj_test_weather_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$weather_block", owner: "$wiz", location: "$nowhere" });
+      expect(world.getProp(blockId, "writable_owner")).toEqual(["place", "units", "forecast_hours"]);
+      expect(world.getProp(blockId, "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "forecast", "history"]);
+      // Default config matches the manifest.
+      expect(world.getProp(blockId, "place")).toBe("");
+      expect(world.getProp(blockId, "units")).toBe("metric");
+      expect(world.getProp(blockId, "forecast_hours")).toBe(12);
+      // summary_props defaults to ["current"] via the seed_hook on the class.
+      expect(world.getProp("$weather_block", "summary_props")).toEqual(["current"]);
+    });
+
   });
 });

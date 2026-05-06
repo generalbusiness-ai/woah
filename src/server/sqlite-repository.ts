@@ -421,16 +421,18 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   }
 
   saveSession(record: SerializedSession): void {
-    const hasAttachmentColumn = this.tableColumns("session").has("attachment");
-    const hasCurrentLocationColumn = this.tableColumns("session").has("current_location");
-    const stmt = this.db.prepare(
-      hasAttachmentColumn
-        ? `INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}, attachment) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""}, ?)`
-        : `INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""})`
-    );
-    const values = [record.id, record.actor, record.started, record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest"];
-    const withCurrent = hasCurrentLocationColumn ? [...values, record.currentLocation ?? null] : values;
-    stmt.run(...(hasAttachmentColumn ? [...withCurrent, "{}"] : withCurrent));
+    const cols = this.tableColumns("session");
+    const hasAttachmentColumn = cols.has("attachment");
+    const hasCurrentLocationColumn = cols.has("current_location");
+    const hasApikeyIdColumn = cols.has("apikey_id");
+    const columnList = ["id", "actor", "started", "expires_at", "last_detach_at", "token_class"];
+    const values: Array<string | number | null> = [record.id, record.actor, record.started, record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest"];
+    if (hasCurrentLocationColumn) { columnList.push("current_location"); values.push(record.currentLocation ?? null); }
+    if (hasApikeyIdColumn) { columnList.push("apikey_id"); values.push(record.apikeyId ?? null); }
+    if (hasAttachmentColumn) { columnList.push("attachment"); values.push("{}"); }
+    const placeholders = columnList.map(() => "?").join(", ");
+    const stmt = this.db.prepare(`INSERT OR REPLACE INTO session(${columnList.join(", ")}) VALUES (${placeholders})`);
+    stmt.run(...values);
   }
 
   deleteSession(session_id: string): void {
@@ -498,6 +500,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     this.ensureColumn("session", "last_detach_at", "INTEGER");
     this.ensureColumn("session", "token_class", "TEXT NOT NULL DEFAULT 'guest'");
     this.ensureColumn("session", "current_location", "TEXT");
+    this.ensureColumn("session", "apikey_id", "TEXT");
     this.ensureColumn("space_message", "observations", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureNullableSpaceMessageOutcome();
     this.ensureColumn("verb", "flags", "TEXT NOT NULL DEFAULT '{}'");

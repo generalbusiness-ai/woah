@@ -1,0 +1,20 @@
+{
+  "name": "woo-weather-plug",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "plug": "tsx bin/local.mjs",
+    "plug:once": "tsx bin/local.mjs --once",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260430.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "wrangler": "^3.95.0"
+  }
+}
