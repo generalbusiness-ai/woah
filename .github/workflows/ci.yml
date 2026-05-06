@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: typecheck + guards + tests + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run cf:migrations:check
+      - run: npm test
+      - run: npm run build
+
+  audit:
+    name: dependency audit (block on moderate+)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # `npm ci` is not strictly required for `npm audit`, but it primes the
+      # cache and gives audit the same lockfile view CI uses.
+      - run: npm ci
+      - name: npm audit --audit-level=moderate
+        run: npm audit --audit-level=moderate

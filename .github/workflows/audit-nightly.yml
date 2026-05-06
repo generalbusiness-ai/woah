@@ -1,0 +1,43 @@
+name: audit-nightly
+
+# Full advisory audit. Runs nightly and reports every severity into the job
+# summary, so moderate-and-above stay visible alongside the blocking gate in
+# ci.yml. This job does not block.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: full npm audit (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: npm audit (full report)
+        run: |
+          set +e
+          npm audit --json > audit.json
+          status=$?
+          {
+            echo "## npm audit"
+            if [ "$status" -eq 0 ]; then
+              echo
+              echo "No advisories."
+            else
+              echo
+              echo '```json'
+              jq '{ vulnerabilities: .metadata.vulnerabilities, advisories: [.vulnerabilities | to_entries[] | { name: .key, severity: .value.severity, via: ([.value.via[] | if type == "object" then .title else . end]), range: .value.range, fixAvailable: .value.fixAvailable } ] }' audit.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
