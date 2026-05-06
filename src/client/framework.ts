@@ -731,6 +731,10 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
         if (Number.isFinite(value)) fields[key] = value;
       }
       if (Object.keys(fields).length > 0) draft.patchCatalogState(pin, "pinboard_note", fields);
+      const board = String(obs.board ?? "");
+      // `pinboard_layout` is a sparse per-pin overlay, not a full layout map.
+      // Readers must merge it with the board's authoritative props.layout.
+      if (board && Object.keys(fields).length > 0) draft.patchCatalogState(board, "pinboard_layout", { [pin]: fields });
     }
   });
   registry.observation({
@@ -761,11 +765,15 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
       if (!note || typeof note !== "object" || Array.isArray(note)) return;
       const id = String((note as any).id ?? envelope.observation.pin ?? "");
       if (!id) return;
+      const board = String(envelope.observation.board ?? "");
       draft.patchObject(id, {
         name: typeof (note as any).name === "string" ? (note as any).name : undefined,
         owner: typeof (note as any).owner === "string" ? (note as any).owner : undefined
       });
       draft.patchCatalogState(id, "pinboard_note", pinboardNoteState(note));
+      // `pinboard_layout` entries are sparse overlays keyed by pin id; merge
+      // with props.layout before rendering.
+      if (board) draft.patchCatalogState(board, "pinboard_layout", { [id]: pinboardLayoutState(note) });
     }
   });
   registry.observation({
@@ -774,6 +782,20 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
     reduce: (draft, envelope) => {
       const id = String(envelope.observation.pin ?? envelope.observation.note ?? envelope.observation.id ?? "");
       if (id) draft.clearCatalogState(id, "pinboard_note");
+      const board = String(envelope.observation.board ?? "");
+      if (board && id) draft.patchCatalogState(board, "pinboard_layout", { [id]: null });
+    }
+  });
+  registry.observation({
+    types: ["pinboard_entered", "pinboard_left"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const board = String(envelope.observation.board ?? "");
+      const actor = String(envelope.observation.actor ?? "");
+      if (!board || !actor) return;
+      draft.patchCatalogState(board, "pinboard_presence", {
+        [actor]: envelope.observation.type === "pinboard_left" ? false : true
+      });
     }
   });
   registry.observation({
@@ -1031,6 +1053,14 @@ function stripUndefined<T extends Record<string, unknown>>(value: T): T {
 function pinboardNoteState(note: any): Record<string, unknown> {
   const fields: Record<string, unknown> = {};
   for (const key of ["x", "y", "z", "w", "h", "text", "color", "author", "owner", "writers"]) {
+    if (note?.[key] !== undefined) fields[key] = note[key];
+  }
+  return fields;
+}
+
+function pinboardLayoutState(note: any): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  for (const key of ["x", "y", "z", "w", "h"]) {
     if (note?.[key] !== undefined) fields[key] = note[key];
   }
   return fields;

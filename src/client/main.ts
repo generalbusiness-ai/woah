@@ -1245,44 +1245,63 @@ function projectPinboard(world: any, meta: any) {
 }
 
 function pinboardModel(): PinboardRenderModel | undefined {
-  // Transitional hybrid while the board renderer is migrating. In scoped mode
-  // projection owns note state; legacy `state.world.pinboard` remains only for
-  // missing metadata and non-migrated callers until the componentized board
-  // renderer removes this fallback entirely.
-  const legacy = state.world?.pinboard;
-  if (!scopedProjectionEnabled) return legacy;
+  if (!scopedProjectionEnabled) return state.world?.pinboard;
   const boardId = pinboardSpace();
-  if (!boardId) return legacy;
+  if (!boardId) return undefined;
   const projected = ui.observe(boardId);
-  if (!projected && legacy) return legacy;
-  const board = projected
-    ? {
-      id: boardId,
-      name: projected.name ?? legacy?.board?.name ?? boardId,
-      owner: projected.owner ?? legacy?.board?.owner,
-      parent: projected.parent ?? legacy?.board?.parent,
-      location: projected.location ?? legacy?.board?.location,
-      props: { ...(legacy?.board?.props ?? {}), ...(projected.props ?? {}) }
-    }
-    : legacy?.board;
-  if (!board) return undefined;
+  const board = {
+    id: boardId,
+    name: projected?.name ?? boardId,
+    owner: projected?.owner,
+    parent: projected?.parent,
+    location: projected?.location,
+    props: { ...(projected?.props ?? {}) },
+    catalogState: { ...(projected?.catalogState ?? {}) }
+  };
   const props = board.props ?? {};
-  const palette = pinboardPalette(props.palette ?? legacy?.palette);
+  const palette = pinboardPalette(props.palette);
   state.pinboardNewColor = normalizePinboardStickyColor(state.pinboardNewColor, palette);
   const layout = pinboardLayoutFromBoard(board);
-  const noteIds = pinboardProjectedNoteIds(boardId, layout, legacy?.notes);
+  const noteIds = pinboardProjectedNoteIds(boardId, layout);
   return {
     board,
-    notes: normalizePinboardNotes(noteIds.map((id) => pinboardProjectedNote(id, layout[id], legacy?.notes)).filter(Boolean), legacy?.notes),
-    present: Array.isArray(props.subscribers) ? props.subscribers.map(String) : Array.isArray(legacy?.present) ? legacy.present.map(String) : [],
+    notes: normalizePinboardNotes(noteIds.map((id) => pinboardProjectedNote(id, layout[id])).filter(Boolean)),
+    present: scopedPinboardPresentActors(boardId, props),
     palette,
-    viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : legacy?.viewport ?? { w: 960, h: 560 }
+    viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : { w: 960, h: 560 }
   };
+}
+
+function scopedPinboardPresentActors(boardId: string, props: Record<string, unknown>): string[] {
+  const present = new Set(Array.isArray(props.subscribers) ? props.subscribers.map(String) : []);
+  const presence = ui.observe(boardId)?.catalogState.pinboard_presence;
+  if (presence && typeof presence === "object" && !Array.isArray(presence)) {
+    for (const [actor, value] of Object.entries(presence)) {
+      if (value === false) present.delete(actor);
+      else if (value === true) present.add(actor);
+    }
+  }
+  if (present.size > 0) return [...present];
+  const room = pinboardOverlaySnapshot()?.room;
+  const fromRoom = idsFromRefsOrSummaries(Array.isArray(room?.present_actors) ? room.present_actors : []);
+  if (fromRoom.length > 0) return fromRoom;
+  // Last-resort local fallback: before the first overlay/presence frame lands,
+  // show the user in their own active pinboard rather than an empty presence
+  // map. This is not an authoritative subscriber list.
+  return state.actor && state.scopedProjection?.session?.current_location === boardId ? [state.actor] : [];
 }
 
 function pinboardLayoutFromBoard(board: any): Record<string, any> {
   const layout = board?.props?.layout;
-  return layout && typeof layout === "object" && !Array.isArray(layout) ? layout : {};
+  const base = layout && typeof layout === "object" && !Array.isArray(layout) ? layout : {};
+  const overlay = board?.catalogState?.pinboard_layout;
+  if (!overlay || typeof overlay !== "object" || Array.isArray(overlay)) return base;
+  const merged: Record<string, any> = { ...base };
+  for (const [id, value] of Object.entries(overlay)) {
+    if (value === null) delete merged[id];
+    else if (value && typeof value === "object" && !Array.isArray(value)) merged[id] = { ...(merged[id] ?? {}), ...value };
+  }
+  return merged;
 }
 
 function pinboardProjectedNoteIds(boardId: string, layout: Record<string, any>, legacyNotes: any[] = []): string[] {
@@ -1307,8 +1326,9 @@ function pinboardProjectedNote(id: string, layoutEntry: any, legacyNotes: any[] 
   const entry = layoutEntry && typeof layoutEntry === "object" && !Array.isArray(layoutEntry) ? layoutEntry : {};
   if (!projected && !previous && Object.keys(entry).length === 0) return undefined;
   // Priority is deliberate: observation-reduced catalogState is the current
-  // UI model; projection props carry static readable note fields; legacy is
-  // the compatibility cache; board layout fills placement defaults.
+  // UI model; projection props carry static readable note fields; the optional
+  // legacy cache is used only by `/api/state` mode; board layout fills
+  // placement defaults.
   return {
     id,
     name: projected?.name ?? previous?.name ?? id,
@@ -1475,6 +1495,23 @@ function taskspaceSpace() {
 }
 
 function pinboardSpace() {
+  if (scopedProjectionEnabled) {
+    // Scoped mode can render the bundled demo pinboard before the overlay
+    // snapshot arrives. Returning the bundled seed is a temporary route
+    // allowlist fallback, not a claim that every installed world has that id.
+    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+    if (route?.view === "pinboard" && route.objectId) return route.objectId;
+    if (route?.objectId === bundledToolSeeds.pinboard) return route.objectId;
+    const overlays = state.scopedProjection?.overlays ?? {};
+    for (const handle of Object.values(overlays)) {
+      const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
+      const surface = typeof (handle as any)?.surface === "string" ? (handle as any).surface : "";
+      if (subject && surface === "pinboard") return subject;
+    }
+    const current = state.scopedProjection?.session?.current_location;
+    if (typeof current === "string" && current === bundledToolSeeds.pinboard) return current;
+    return bundledToolSeeds.pinboard;
+  }
   return String(state.world?.pinboardMeta?.board ?? "");
 }
 
@@ -4245,17 +4282,17 @@ function setPinboardPresent(result: any) {
   const presentIds = idsFromRefsOrSummaries(present);
   const boardId = pinboardSpace();
   if (boardId) ui.applyCanonical([{ subject: boardId, props: { subscribers: presentIds } }]);
-  // Compatibility write for the legacy pinboard branch. The projection write
-  // above is the real scoped-model update; this side goes away with the
-  // remaining `state.world.pinboard` fallback.
+  const presentActors = new Set(presentIds);
+  for (const actor of Object.keys(state.pinboardViewports)) {
+    if (!presentActors.has(actor)) removePinboardViewport(actor);
+  }
+  if (scopedProjectionEnabled) return;
+  // Compatibility write for the legacy `/api/state` pinboard branch. The
+  // projection write above is the scoped-model update.
   if (!state.world?.pinboard) return;
   state.world.pinboard.present = presentIds;
   const board = state.world.pinboard.board;
   if (board?.props) board.props.subscribers = state.world.pinboard.present;
-  const presentActors = new Set(state.world.pinboard.present);
-  for (const actor of Object.keys(state.pinboardViewports)) {
-    if (!presentActors.has(actor)) removePinboardViewport(actor);
-  }
 }
 
 function pinboardCall(verb: string, args: any[] = [], options?: ProjectionCallOptions) {
@@ -4290,7 +4327,7 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
 }
 
 function applyPinboardNotesCanonical(board: string, result: any[]) {
-  const previous = pinboardModel()?.notes ?? state.world?.pinboard?.notes ?? [];
+  const previous = pinboardModel()?.notes ?? (!scopedProjectionEnabled ? state.world?.pinboard?.notes : []) ?? [];
   const notes = normalizePinboardNotes(result, previous);
   const layout: Record<string, any> = {};
   const patches: ProjectionPatch[] = [];
@@ -4315,7 +4352,7 @@ function applyPinboardNotesCanonical(board: string, result: any[]) {
   }
   patches.unshift({ subject: board, props: { layout } });
   ui.applyCanonical(patches);
-  if (state.world?.pinboard) state.world.pinboard.notes = notes;
+  if (!scopedProjectionEnabled && state.world?.pinboard) state.world.pinboard.notes = notes;
 }
 
 function pinboardNoteState(note: any): Record<string, unknown> {

@@ -95,6 +95,7 @@ describe("client UI framework projection", () => {
   it("clears pinboard catalog state when a pin leaves the board", () => {
     const ui = createWooClientFramework();
     ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: { note_1: { x: 10, y: 20 } } } },
       { id: "note_1", name: "Note", catalogState: { pinboard_note: { text: ["old"], x: 10, y: 20 } } }
     ]);
 
@@ -102,10 +103,76 @@ describe("client UI framework projection", () => {
       op: "applied",
       seq: 16,
       space: "the_pinboard",
-      observations: [{ type: "pin_removed", pin: "note_1" }]
+      observations: [{ type: "pin_removed", board: "the_pinboard", pin: "note_1" }]
     });
 
     expect(ui.observe("note_1")?.catalogState.pinboard_note).toBeUndefined();
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: null });
+  });
+
+  it("tracks added pinboard notes through board layout catalog state", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 17,
+      space: "the_pinboard",
+      observations: [{
+        type: "note_added",
+        board: "the_pinboard",
+        pin: "note_1",
+        note: { id: "note_1", name: "Note", text: ["hello"], x: 12, y: 24, w: 180, h: 110, z: 3 }
+      }]
+    });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hello"], x: 12, y: 24 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: { x: 12, y: 24, w: 180, h: 110, z: 3 } });
+  });
+
+  it("keeps pinboard layout overlays sparse across sequential partial updates", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: { note_1: { x: 10, y: 20, w: 180, h: 110, z: 1 } } } },
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { x: 10, y: 20, w: 180, h: 110 } } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 18,
+      space: "the_pinboard",
+      observations: [{ type: "pin_moved", board: "the_pinboard", pin: "note_1", x: 12, y: 24, z: 2 }]
+    });
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 19,
+      space: "the_pinboard",
+      observations: [{ type: "pin_resized", board: "the_pinboard", pin: "note_1", w: 200, h: 120 }]
+    });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 12, y: 24, w: 200, h: 120, z: 2 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: { w: 200, h: 120 } });
+  });
+
+  it("tracks pinboard presence as a catalog-state overlay", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { subscribers: ["guest_1"] } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 20,
+      space: "the_pinboard",
+      observations: [
+        { type: "pinboard_entered", board: "the_pinboard", actor: "guest_2" },
+        { type: "pinboard_left", board: "the_pinboard", actor: "guest_1" }
+      ]
+    });
+
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_presence).toEqual({ guest_2: true, guest_1: false });
   });
 
   it("applies live dubspace gesture previews without mutating canonical props", () => {

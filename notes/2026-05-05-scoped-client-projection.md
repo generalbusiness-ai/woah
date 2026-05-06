@@ -624,12 +624,17 @@ Status: initial overlay-snapshot bridge implemented.
 Open after this slice: the current renderers still consume a compatibility
 world assembled from scoped snapshots. Dubspace still uses compatibility
 metadata for object ids and layout assembly, but its control state no longer
-depends on the compatibility object map. Pinboard note rendering now reads note
-layout/text/color through the framework projection; overlay snapshots seed
-`catalogState.pinboard_note`, `list_notes` folds authoritative note records into
-canonical projection, and note text/color edits use the same optimistic layer as
-move/resize. Full Phase 4 still needs taskspace native framework reads and
-proper observation reducers for task creation/movement.
+depends on the compatibility object map. Pinboard rendering in scoped mode now
+gets board id/source from scoped route/overlay/session metadata and reads
+layout/text/color/presence through the framework projection; overlay snapshots
+seed `catalogState.pinboard_note`, `list_notes` folds authoritative note
+records into canonical projection, and note text/color edits use the same
+optimistic layer as move/resize. The board also has sparse
+`catalogState.pinboard_layout` and `catalogState.pinboard_presence` overlays
+for immediate add/move/remove/presence deltas; renderers merge those with
+`props.layout` and `props.subscribers` instead of reading them as full
+snapshots. Full Phase 4 still needs taskspace native framework reads and proper
+observation reducers for task creation/movement.
 Bundled demo object ids are used only as a transitional route allowlist; custom
 installed worlds need a runtime scoped-route feed before their object URLs can
 default to scoped mode. Chat, dubspace, and pinboard `leave`/`out` verbs now
@@ -638,8 +643,6 @@ return move-shaped results with `here_request`; the client-side
 collapsed into the ordinary move-result path.
 
 - Finish dubspace by moving object-id/frame assembly out of `state.world`.
-- Finish pinboard by removing the remaining compatibility-world id/source
-  fallbacks once the componentized board renderer lands.
 - Migrate taskspace to overlay snapshot plus observation reducers.
 - Migrate mini-chat/current-room UI to `here` and observation reducers.
 
