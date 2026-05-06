@@ -115,6 +115,8 @@ export type ErrorFrame = {
   error: ErrorValue;
 };
 
+export type CommandFrame = AppliedFrame | DirectResultFrame | ErrorFrame;
+
 export type TinyOp = [string, ...WooValue[]];
 
 export type TinyBytecode = {

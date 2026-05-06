@@ -175,6 +175,7 @@ const taskStatuses = ["open", "claimed", "in_progress", "blocked", "done"] as co
 const directThrottle = new Map<string, number>();
 const pendingDirect = new Map<string, (result: any) => void>();
 const pendingFrameErrors = new Map<string, (error: any) => void>();
+const pendingCommands = new Map<string, { space: string; text: string }>();
 let pinboardNotesRefreshPending = false;
 const pendingTaskSelections = new Set<string>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
@@ -273,12 +274,18 @@ function connect() {
       ui.ingestAppliedFrame(frame);
       applyScopedMoveResult(frame.result);
       const observations = frame.observations ?? [];
+      const frameErrors = appliedFrameErrorObservations({ observations });
       receiveAppliedFrameErrors(frame, observations);
       // Sequenced verb raises arrive as `$error` observations inside applied
       // frames, so keep the pending handler until those observations route.
       if (typeof frame.id === "string") {
-        if (appliedFrameErrorObservations(observations).length > 0) ui.failOptimisticCall(frame.id);
-        else ui.completeOptimisticCall(frame.id);
+        const commandContext = pendingCommands.get(frame.id);
+        if (frameErrors.length > 0) ui.failOptimisticCall(frame.id);
+        else {
+          ui.completeOptimisticCall(frame.id);
+          if (commandContext) renderChatCommandResult(frame.message, frame.result, commandContext.text);
+        }
+        pendingCommands.delete(frame.id);
         pendingFrameErrors.delete(frame.id);
       }
       const pinboardAnimations = capturePinboardAnimations(observations);
@@ -322,7 +329,14 @@ function connect() {
       if (typeof frame.id === "string") ui.completeOptimisticCall(frame.id);
       if (handler) {
         pendingDirect.delete(frame.id);
+        if (typeof frame.id === "string") pendingCommands.delete(frame.id);
         handler(frame.result);
+      } else if (typeof frame.id === "string") {
+        const commandContext = pendingCommands.get(frame.id);
+        if (commandContext) {
+          pendingCommands.delete(frame.id);
+          renderChatCommandResult(frame.command, frame.result, commandContext.text);
+        }
       }
     }
     if (frame.op === "task") {
@@ -349,6 +363,7 @@ function connect() {
       if (typeof frame.id === "string") {
         ui.failOptimisticCall(frame.id);
         pendingDirect.delete(frame.id);
+        pendingCommands.delete(frame.id);
         pendingFrameErrors.delete(frame.id);
         pendingTaskSelections.delete(frame.id);
       }
@@ -367,6 +382,7 @@ function connect() {
     if (state.socket !== socket) return;
     stopHeartbeat();
     pendingDirect.clear();
+    pendingCommands.clear();
     pendingFrameErrors.clear();
     pendingTaskSelections.clear();
     scheduleReconnect();
@@ -1408,6 +1424,21 @@ function direct(target: string, verb: string, args: unknown[] = [], onResult?: (
   if (onError) pendingFrameErrors.set(id, onError);
   if (!sendFrame({ op: "direct", id, target, verb, args })) {
     ui.failOptimisticCall(id);
+    pendingDirect.delete(id);
+    pendingFrameErrors.delete(id);
+  }
+  return id;
+}
+
+function command(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
+  const id = crypto.randomUUID();
+  ui.applyOptimisticCall(id, options);
+  pendingCommands.set(id, { space, text });
+  if (onResult) pendingDirect.set(id, onResult);
+  if (onError) pendingFrameErrors.set(id, onError);
+  if (!sendFrame({ op: "command", id, space, text })) {
+    ui.failOptimisticCall(id);
+    pendingCommands.delete(id);
     pendingDirect.delete(id);
     pendingFrameErrors.delete(id);
   }
@@ -2996,38 +3027,8 @@ function sendChatInput(space: string, text: string) {
   // Local-only echo so the feed reads as a transcript; never emitted server-side.
   pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
   ensureSpacePresence(space, () => {
-    direct(space, "command_plan", [text], (plan) => executeChatPlan(space, plan, text), receiveChatError);
+    command(space, text, undefined, receiveChatError);
   }, receiveChatError);
-}
-
-function executeChatPlan(currentSpace: string, plan: any, originalText: string) {
-  if (!plan || plan.ok !== true) return;
-  const route = String(plan.route ?? "");
-  const target = String(plan.target ?? "");
-  const verb = String(plan.verb ?? "");
-  const args = Array.isArray(plan.args) ? plan.args : [];
-  if (!target || !verb) return;
-  if (route === "sequenced") {
-    const space = String(plan.space ?? currentSpace);
-    const options = chatPlanProjectionOptions(plan);
-    if (space) callWithError(space, target, verb, args, receiveChatError, options);
-    if (options && state.tab === "dubspace") render();
-    return;
-  }
-  if (route === "direct") {
-    direct(target, verb, args, (result) => renderChatCommandResult(plan, result, originalText), receiveChatError);
-  }
-}
-
-function chatPlanProjectionOptions(plan: any): ProjectionCallOptions | undefined {
-  const target = String(plan?.target ?? "");
-  const verb = String(plan?.verb ?? "");
-  if (target === dubspaceSpace() && verb === "set_tempo") {
-    const bpm = clamp(Math.round(Number(plan?.args?.[0])), 60, 200);
-    const drum = state.world?.dubspaceMeta?.drum ?? "";
-    if (drum && Number.isFinite(bpm)) return dubspaceOptimisticProps(drum, { bpm }, `${drum}:bpm`);
-  }
-  return undefined;
 }
 
 function renderChatCommandResult(plan: any, result: any, originalText: string) {

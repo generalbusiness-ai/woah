@@ -39,6 +39,15 @@ WebSockets between client and player host. JSON frames. UTF-8. Values are encode
 //   args    — positional args
 { op: "direct", id: string, target: ObjRef, verb: string, args: Value[] }
 
+// Execute natural-language text against a command surface.
+// The server plans the command, then executes the resolved verb as direct or
+// sequenced according to the resolved verb metadata. Direct command results
+// return op:"result"; sequenced command results return op:"applied".
+//   id      — client-chosen correlation token; echoed in result/error/applied
+//   space   — active $space command surface
+//   text    — text exactly as typed by the actor
+{ op: "command", id: string, space: ObjRef, text: string }
+
 // Deliver input to the oldest task awaiting READ for this actor.
 // Space-owned continuations resume as an applied $resume frame.
 { op: "input", id?: string, value: Value }
@@ -80,9 +89,11 @@ Reserved for transient hosts (see [browser-host.md](browser-host.md)):
 
 // A direct call completed. Any observations emitted by that call are delivered
 // separately as op:"event" frames to the call's live audience.
-//   id      — matches the originating op:"direct"
+//   id      — matches the originating op:"direct" or direct op:"command"
 //   result  — verb return value
-{ op: "result", id: string, result: Value }
+//   command — optional resolved command descriptor for direct op:"command";
+//             clients may use it for UI reactions, not for dispatch.
+{ op: "result", id: string, result: Value, command?: Map }
 
 // A live observation from a direct (non-sequenced) verb call. Not stored
 // anywhere; not replayable; gone after delivery. See semantics/events.md §12.6.

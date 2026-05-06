@@ -42,7 +42,7 @@ import {
 } from "../core/protocol";
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
-import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
+import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SerializedWorld } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
@@ -1513,6 +1513,10 @@ export class PersistentObjectDO {
         }
         return result;
       },
+      command: async (frameId, session, space, text) => {
+        world.touchSessionInput(session.sessionId);
+        return await this.executeWsCommand(world, frameId, session, space, text);
+      },
       direct: async (frameId, session, target, verb, args) => {
         world.touchSessionInput(session.sessionId);
         const host = await this.resolveObjectHost(target, WORLD_HOST);
@@ -1656,6 +1660,36 @@ export class PersistentObjectDO {
       await world.applyDeferredHostEffects(result.deferred_host_effects);
       delete result.deferred_host_effects;
     }
+    return result;
+  }
+
+  private async executeWsCommand(
+    world: WooWorld,
+    frameId: string | undefined,
+    session: { sessionId: string; actor: ObjRef },
+    space: ObjRef,
+    text: string
+  ): Promise<CommandFrame> {
+    const planned = await world.planCommand(frameId, session.sessionId, space, text);
+    if (planned.op === "error") return planned;
+    const plan = commandPlanFromProtocolValue(planned.result);
+    if (!plan) return planned;
+
+    if (plan.route === "direct") {
+      const host = await this.resolveObjectHost(plan.target, WORLD_HOST);
+      const result = host === WORLD_HOST
+        ? await world.directCall(frameId, session.actor, plan.target, plan.verb, plan.args, { sessionId: session.sessionId })
+        : await this.forwardWsDirect(world, host, frameId, session, plan.target, plan.verb, plan.args);
+      return result.op === "result" ? { ...result, command: plan } as DirectResultFrame : result;
+    }
+
+    const commandSpace = plan.space ?? space;
+    const message: Message = { actor: session.actor, target: plan.target, verb: plan.verb, args: plan.args };
+    const host = await this.resolveObjectHost(commandSpace, WORLD_HOST);
+    const result = host === WORLD_HOST
+      ? await world.call(frameId, session.sessionId, commandSpace, message)
+      : await this.forwardWsCall(world, host, frameId, session, commandSpace, message);
+    if (result.op === "applied" && host !== WORLD_HOST) await this.registerRemoteObjectRoutes(host);
     return result;
   }
 
@@ -1887,6 +1921,21 @@ function uniqueRoutes(routes: Array<{ id: string; host: string; anchor: string |
     byId.set(route.id, route);
   }
   return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function commandPlanFromProtocolValue(value: WooValue): { route: "direct" | "sequenced"; space: ObjRef | null; target: ObjRef; verb: string; args: WooValue[] } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const map = value as Record<string, WooValue>;
+  if (map.ok !== true) return null;
+  if (map.route !== "direct" && map.route !== "sequenced") return null;
+  if (typeof map.target !== "string" || typeof map.verb !== "string") return null;
+  return {
+    route: map.route,
+    space: typeof map.space === "string" ? map.space : null,
+    target: map.target,
+    verb: map.verb,
+    args: Array.isArray(map.args) ? map.args : []
+  };
 }
 
 async function workerHashText(text: string): Promise<string> {

@@ -105,6 +105,53 @@ describe("scoped client projection", () => {
     expect(sent[0]).toMatchObject({ op: "session", actor: session.actor, session: session.id, resumed: false });
   });
 
+  it("routes websocket command frames through the host command executor", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:ws-command");
+    const sent: any[] = [];
+    const live: any[] = [];
+    await handleWsProtocolFrame("conn", {
+      op: "command",
+      id: "ws-command-1",
+      space: "the_chatroom",
+      text: "hello"
+    }, {
+      authenticate: () => session,
+      attach: () => undefined,
+      session: () => ({ sessionId: session.id, actor: session.actor }),
+      send: (_connection, frame) => sent.push(frame),
+      call: async () => { throw new Error("unexpected call"); },
+      command: async (frameId, wsSession, space, text) => {
+        expect(frameId).toBe("ws-command-1");
+        expect(wsSession).toMatchObject({ sessionId: session.id, actor: session.actor });
+        expect(space).toBe("the_chatroom");
+        expect(text).toBe("hello");
+        return {
+          op: "result",
+          id: frameId,
+          result: true,
+          observations: [{ type: "said", source: space, actor: session.actor, text }],
+          audience: space,
+          command: { route: "direct", target: space, verb: "say", args: [text] }
+        } as any;
+      },
+      direct: async () => { throw new Error("unexpected direct"); },
+      replay: async () => { throw new Error("unexpected replay"); },
+      deliverInput: async () => null,
+      broadcastApplied: async () => { throw new Error("unexpected applied"); },
+      broadcastTaskResult: async () => undefined,
+      broadcastLiveEvents: async (result) => { live.push(result); }
+    });
+
+    expect(sent[0]).toMatchObject({
+      op: "result",
+      id: "ws-command-1",
+      result: true,
+      command: { route: "direct", target: "the_chatroom", verb: "say", args: ["hello"] }
+    });
+    expect(live).toHaveLength(1);
+  });
+
   it("includes enriched movement results on sequenced applied frames", async () => {
     const world = createWorld();
     const session = world.auth("guest:scoped-sequenced-move");

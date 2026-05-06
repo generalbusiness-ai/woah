@@ -2,12 +2,14 @@
 
 Date: 2026-05-05
 
-Status: Phase 1 through the first compatibility slice of Phase 4 are partly
-implemented. Catalog installs preserve `arg_spec.command`, `$match` exposes
-native-backed `match_command_verb` and `plan_command`, `$conversational:
-command_plan` is a thin wrapper over the shared planner, and dubspace no longer
-ships its own `command_plan`. The browser still consumes plan descriptors; the
-later `:command(text)` client migration and huh-hook chain remain open.
+Status: Phase 1 through the first browser-facing command execution slice are
+partly implemented. Catalog installs preserve `arg_spec.command`, `$match`
+exposes native-backed `match_command_verb` and `plan_command`,
+`$conversational:command_plan` is a thin wrapper over the shared planner, and
+dubspace no longer ships its own `command_plan`. The WebSocket wire now accepts
+`op:"command"` so the server plans and executes direct/sequenced text commands;
+the browser no longer executes plan descriptors for chat input. The huh-hook
+chain and final removal of compatibility planner helpers remain open.
 
 ## Problem
 
@@ -420,15 +422,16 @@ changing the world's command language.
 
 ### Phase 6: client cleanup
 
-- Replace `command_plan` + `executeChatPlan` with `:command(text)`.
+- Replace `command_plan` + `executeChatPlan` with wire `op:"command"` or a
+  future `:command(text)` equivalent that can return direct or applied frames.
 - Remove route/space/target/verb/args plan interpretation from the browser.
 - Keep UI-only post-result reducers for tab changes and overlay focus.
 - Once no catalog/client reads the descriptor, remove the plan descriptor
   format.
 
-The next major moves after the current compatibility slice are Phase 2's
-inherited `:command(text)` entrypoint plus huh hooks, and Phase 6's browser
-migration away from interpreting plan descriptors.
+The next major move after the current compatibility slice is the huh hook chain
+plus retiring compatibility planner helpers once old surfaces no longer call
+`command_plan`.
 
 ## Conditions of satisfaction
 

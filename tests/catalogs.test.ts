@@ -1253,6 +1253,22 @@ describe("local catalogs", () => {
       });
     }
 
+    const dubspaceCommandSay = await world.command("command-dubspace-say", first.id, "the_dubspace", "hello from command op");
+    expect(dubspaceCommandSay.op).toBe("result");
+    if (dubspaceCommandSay.op === "result") {
+      expect(dubspaceCommandSay.result).toBe(true);
+      expect(dubspaceCommandSay.observations).toContainEqual(expect.objectContaining({ type: "said", actor: first.actor, text: "hello from command op" }));
+      expect((dubspaceCommandSay as any).command).toMatchObject({ route: "direct", target: "the_dubspace", verb: "say", args: ["hello from command op"] });
+    }
+
+    const dubspaceCommandBpm = await world.command("command-dubspace-bpm", first.id, "the_dubspace", "bpm 144");
+    expect(dubspaceCommandBpm.op).toBe("applied");
+    if (dubspaceCommandBpm.op === "applied") {
+      expect(dubspaceCommandBpm.message).toMatchObject({ target: "the_dubspace", verb: "set_tempo", args: ["144"] });
+      expect(dubspaceCommandBpm.observations).toContainEqual(expect.objectContaining({ type: "tempo_changed", target: "drum_1", bpm: 144 }));
+    }
+    expect(world.getProp("drum_1", "bpm")).toBe(144);
+
       expect(installVerb(world, "$chatroom", "tag", `verb :tag(text) rx {
     observe({ type: "tagged", source: this, actor: actor, text: text });
     return text;

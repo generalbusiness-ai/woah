@@ -96,6 +96,10 @@ type CommandPlan = {
   cmd: CommandMap;
 };
 
+type CommandOptions = {
+  deferHostEffect?: (effect: DeferredHostEffect) => void;
+};
+
 export type CallContext = {
   world: WooWorld;
   space: ObjRef;
@@ -1360,6 +1364,85 @@ export class WooWorld {
 
   async directCall(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<DirectResultFrame | ErrorFrame> {
     return await this.enqueueHostTask(() => this.directCallNow(frameId, actor, target, verbName, args, options));
+  }
+
+  async planCommand(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
+    return await this.enqueueHostTask(() => this.planCommandNow(frameId, sessionId, space, text));
+  }
+
+  async command(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    return await this.enqueueHostTask(() => this.commandNow(frameId, sessionId, space, text, options));
+  }
+
+  private async commandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    const planned = await this.planCommandNow(frameId, sessionId, space, text);
+    if (planned.op === "error") return planned;
+    const plan = commandPlanFromValue(planned.result);
+    if (!plan) return planned;
+    if (plan.route === "direct") {
+      const frame = await this.directCallNow(frameId, this.sessionActor(sessionId), plan.target, plan.verb, plan.args, { sessionId, deferHostEffect: options.deferHostEffect });
+      return frame.op === "result" ? { ...frame, command: plan } as DirectResultFrame : frame;
+    }
+    const commandSpace = plan.space ?? space;
+    return await this.callNow(frameId, sessionId, commandSpace, { actor: this.sessionActor(sessionId), target: plan.target, verb: plan.verb, args: plan.args });
+  }
+
+  private async planCommandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
+    const startedAt = Date.now();
+    try {
+      assertObj(space);
+      assertString(text);
+      const actor = this.sessionActor(sessionId);
+      const hostMemo = createHostOperationMemo();
+      if (!await this.isDescendantOfChecked(space, "$space", hostMemo)) throw wooError("E_TYPE", `${space} is not a space`, space);
+      await this.chatPresentAsync(space, actor);
+      this.authorizePresence(actor, space, sessionId);
+      const observations: Observation[] = [];
+      const ctx: CallContext = {
+        world: this,
+        space,
+        seq: -1,
+        session: sessionId,
+        actor,
+        player: actor,
+        caller: "#-1",
+        callerPerms: actor,
+        progr: actor,
+        thisObj: space,
+        verbName: "command",
+        definer: space,
+        message: { actor, target: space, verb: "command", args: [text] },
+        observations,
+        hostMemo,
+        observe: (event) => {
+          observations.push({ ...event, source: event.source ?? space });
+        }
+      };
+      const result = await this.planCommandForSpace(ctx, text, space) as WooValue;
+      const liveAudiences = await this.directLiveAudiences(space, observations);
+      this.recordMetric({ kind: "direct_call", target: space, verb: "command", audience: space, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
+      return {
+        op: "result",
+        id: frameId,
+        result,
+        observations,
+        audience: space,
+        audienceActors: liveAudiences.audienceActors,
+        observationAudiences: liveAudiences.observationAudiences,
+        audienceSessions: liveAudiences.audienceSessions,
+        observationSessionAudiences: liveAudiences.observationSessionAudiences
+      };
+    } catch (err) {
+      const error = normalizeError(err);
+      this.recordMetric({ kind: "direct_call", target: space, verb: "command", audience: space, observations: 0, ms: Date.now() - startedAt, status: "error" });
+      return { op: "error", id: frameId, error };
+    }
+  }
+
+  private sessionActor(sessionId: string): ObjRef {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.sessionAlive(sessionId)) throw wooError("E_NOSESSION", "session token is expired or unknown");
+    return session.actor;
   }
 
   private async directCallNow(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<DirectResultFrame | ErrorFrame> {
@@ -6644,6 +6727,23 @@ function commandMapFromValue(value: WooValue | undefined): CommandMap {
     args: Array.isArray(map.args) ? map.args.filter((item): item is string => typeof item === "string") : [],
     argstr: typeof map.argstr === "string" ? map.argstr : "",
     text: typeof map.text === "string" ? map.text : ""
+  };
+}
+
+function commandPlanFromValue(value: WooValue): CommandPlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const map = value as Record<string, WooValue>;
+  if (map.ok !== true) return null;
+  const route = map.route === "direct" || map.route === "sequenced" ? map.route : null;
+  if (!route || typeof map.target !== "string" || typeof map.verb !== "string") return null;
+  return {
+    ok: true,
+    route,
+    space: typeof map.space === "string" ? map.space : null,
+    target: map.target,
+    verb: map.verb,
+    args: Array.isArray(map.args) ? map.args : [],
+    cmd: commandMapFromValue(map.cmd)
   };
 }
 

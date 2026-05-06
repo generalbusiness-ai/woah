@@ -1,6 +1,7 @@
 import {
   wooError,
   type AppliedFrame,
+  type CommandFrame,
   type DirectResultFrame,
   type ErrorFrame,
   type ErrorValue,
@@ -395,6 +396,12 @@ export type WsProtocolHost<Connection> = {
   session(connection: Connection): WsProtocolSession | null;
   send(connection: Connection, frame: unknown): void;
   call(frameId: string | undefined, session: WsProtocolSession, space: ObjRef, message: Message): AppliedFrame | ErrorFrame | Promise<AppliedFrame | ErrorFrame>;
+  command?(
+    frameId: string | undefined,
+    session: WsProtocolSession,
+    space: ObjRef,
+    text: string
+  ): CommandFrame | Promise<CommandFrame>;
   direct(
     frameId: string | undefined,
     session: WsProtocolSession,
@@ -451,6 +458,25 @@ export async function handleWsProtocolFrame<Connection>(
       const result = await host.call(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, message);
       if (result.op === "applied") await host.broadcastApplied(result, connection);
       else host.send(connection, result);
+      return;
+    }
+
+    if (op === "command") {
+      if (!host.command) {
+        host.send(connection, { op: "error", id: frame.id, error: wooError("E_NOTSUPPORTED", "command op is not supported by this host") });
+        return;
+      }
+      const result = await host.command(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, String(frame.text ?? ""));
+      if (result.op === "applied") await host.broadcastApplied(result, connection);
+      else if (result.op === "result") {
+        const command = (result as DirectResultFrame & { command?: WooValue }).command;
+        host.send(connection, command === undefined
+          ? { op: "result", id: result.id, result: result.result }
+          : { op: "result", id: result.id, result: result.result, command });
+        await host.broadcastLiveEvents(result);
+      } else {
+        host.send(connection, result);
+      }
       return;
     }
 
