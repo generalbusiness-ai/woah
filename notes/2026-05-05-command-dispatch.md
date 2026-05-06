@@ -2,6 +2,13 @@
 
 Date: 2026-05-05
 
+Status: Phase 1 through the first compatibility slice of Phase 4 are partly
+implemented. Catalog installs preserve `arg_spec.command`, `$match` exposes
+native-backed `match_command_verb` and `plan_command`, `$conversational:
+command_plan` is a thin wrapper over the shared planner, and dubspace no longer
+ships its own `command_plan`. The browser still consumes plan descriptors; the
+later `:command(text)` client migration and huh-hook chain remain open.
+
 ## Problem
 
 `$chatroom:command_plan` has become a dense command compiler.
@@ -97,11 +104,13 @@ Proposed metadata extension:
 ```json
 {
   "name": "gi*ve ha*nd",
-  "command": {
-    "dobj": "this",
-    "prep": ["to", "at"],
-    "iobj": "any",
-    "args_from": ["iobjstr"]
+  "arg_spec": {
+    "command": {
+      "dobj": "this",
+      "prep": ["to", "at"],
+      "iobj": "any",
+      "args_from": ["iobjstr"]
+    }
   }
 }
 ```
@@ -416,6 +425,10 @@ changing the world's command language.
 - Keep UI-only post-result reducers for tab changes and overlay focus.
 - Once no catalog/client reads the descriptor, remove the plan descriptor
   format.
+
+The next major moves after the current compatibility slice are Phase 2's
+inherited `:command(text)` entrypoint plus huh hooks, and Phase 6's browser
+migration away from interpreting plan descriptors.
 
 ## Conditions of satisfaction
 

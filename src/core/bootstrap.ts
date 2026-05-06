@@ -387,11 +387,26 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$root", "describe", "describe", "verb :describe() rxd { ... }", { directCallable: true });
   native(world, "$root", "title", "default_title", "verb :title() rxd { return this.name; }", { directCallable: true });
   native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
-  sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, { directCallable: true, toolExposed: true });
+  sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["describe", "@describe", "@desc"],
+    argSpec: { args: ["desc"], command: { dobj: "object", prep: "as", iobj: "string", args_from: ["iobjstr"] } }
+  });
   sourceVerb(world, "$actor", "look_self", ACTOR_LOOK_SELF_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "look_self", PLAYER_LOOK_SELF_SOURCE, { directCallable: true });
-  sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, { directCallable: true, toolExposed: true, aliases: ["i@nventory", "inv"] });
-  sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, { directCallable: true, toolExposed: true, aliases: ["@home"] });
+  sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["i@nventory", "inv"],
+    argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } }
+  });
+  sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["@home"],
+    argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } }
+  });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });
   native(world, "$player", "tell", "player_tell", "verb :tell(text) rxd { ... }", { directCallable: true });

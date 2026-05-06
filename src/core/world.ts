@@ -79,6 +79,23 @@ type CommandVerbSummary = {
   arg_spec?: Record<string, WooValue>;
 };
 
+type CommandPattern = {
+  dobj?: WooValue;
+  prep?: WooValue;
+  iobj?: WooValue;
+  args_from?: WooValue;
+};
+
+type CommandPlan = {
+  ok: true;
+  route: "direct" | "sequenced";
+  space: ObjRef | null;
+  target: ObjRef;
+  verb: string;
+  args: WooValue[];
+  cmd: CommandMap;
+};
+
 export type CallContext = {
   world: WooWorld;
   space: ObjRef;
@@ -5631,6 +5648,17 @@ export class WooWorld {
         return this.objects.has("$failed_match") ? "$failed_match" : null;
       }
     });
+    this.nativeHandlers.set("match_command_verb", async (ctx, args) => {
+      const cmd = commandMapFromValue(args[0]);
+      const target = assertObj(args[1]);
+      if (!await this.canSeeCommandObject(ctx, target)) throw wooError("E_PERM", `${ctx.actor} cannot match command verbs on ${target}`, { actor: ctx.actor, target });
+      const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
+      return matched ? matched as unknown as WooValue : (this.objects.has("$failed_match") ? "$failed_match" : null);
+    });
+    this.nativeHandlers.set("plan_command", async (ctx, args) => {
+      const space = assertObj(args[1] ?? ctx.caller);
+      return await this.planCommandForSpace(ctx, assertString(args[0] ?? ""), space) as unknown as WooValue;
+    });
     this.nativeHandlers.set("parse_command", async (ctx, args) => {
       const actor = await this.publicCommandActor(ctx, args[1]);
       const location = await this.publicCommandLocation(ctx, actor, args[2]);
@@ -5879,7 +5907,274 @@ export class WooWorld {
       }
     }
     const resolved = this.tryResolveVerb(target, verb);
-    return resolved ? { name: resolved.verb.name, definer: resolved.definer, direct_callable: resolved.verb.direct_callable === true } : null;
+    return resolved ? { name: resolved.verb.name, definer: resolved.definer, direct_callable: resolved.verb.direct_callable === true, arg_spec: resolved.verb.arg_spec ?? {} } : null;
+  }
+
+  private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef): Promise<WooValue> {
+    const text = input.trim();
+    if (!text) return await this.commandHuhPlan(ctx, space, input, "empty command");
+    const actor = await this.publicCommandActor(ctx, undefined);
+    const location = await this.publicCommandLocation(ctx, actor, space);
+
+    const lowered = await this.lowerSpeechPrefixPlan(ctx, text, space, actor, location);
+    if (lowered) return lowered as unknown as WooValue;
+
+    const cmd = await this.parseCommandMap(text, ctx, location, actor);
+    if (cmd.verb === "drop" && !cmd.argstr) return await this.commandHuhPlan(ctx, space, text, "Drop what?");
+    const metadataPlan = await this.resolveCommandPlan(ctx, cmd, space, actor);
+    if (metadataPlan) return metadataPlan as unknown as WooValue;
+
+    const fallback = await this.fallbackCommandPlan(ctx, cmd, space, actor);
+    if (fallback) return fallback as unknown as WooValue;
+
+    if (!text.startsWith("/")) return await this.directCommandPlan(ctx, space, "say", [text], cmd);
+    return await this.commandHuhPlan(ctx, space, text, `I don't see ${cmd.argstr || text}.`);
+  }
+
+  private async lowerSpeechPrefixPlan(ctx: CallContext, text: string, space: ObjRef, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue | null> {
+    const lower = text.toLowerCase();
+    const parsed = new Map<string, Promise<CommandMap>>();
+    const parse = async (normalized: string) => {
+      const existing = parsed.get(normalized);
+      if (existing) return await existing;
+      const next = this.parseCommandMap(normalized, ctx, location, actor);
+      parsed.set(normalized, next);
+      return await next;
+    };
+    if (lower.startsWith("/me ")) {
+      const body = text.slice(4).trim();
+      return await this.directCommandPlan(ctx, space, "emote", [body], await parse(`emote ${body}`));
+    }
+    if (text.startsWith(":") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "emote", [body], await parse(`emote ${body}`));
+    }
+    if (text.startsWith("]") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "pose", [body], await parse(`pose ${body}`));
+    }
+    if (text.startsWith("|") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "quote", [body], await parse(`quote ${body}`));
+    }
+    if (text.startsWith("<") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "self", [body], await parse(`self ${body}`));
+    }
+    if (text.startsWith("\"") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "say", [body], await parse(`say ${body}`));
+    }
+    if (text.startsWith("`") && text.length > 1) {
+      return await this.directedSpeechPlan(ctx, space, "say_to", text.slice(1), text, actor, location);
+    }
+    if (lower.startsWith("/tell ")) {
+      return await this.directedSpeechPlan(ctx, space, "tell", text.slice(6), text, actor, location);
+    }
+    if (text.startsWith("[")) {
+      const close = text.indexOf("]");
+      if (close > 1) {
+        const style = text.slice(1, close).trim();
+        let body = text.slice(close + 1).trim();
+        if (body.startsWith(":")) body = body.slice(1).trim();
+        if (!style || !body) return await this.commandHuhPlan(ctx, space, text, "Styled speech needs a style and text.");
+        return await this.directCommandPlan(ctx, space, "say_as", [style, body], await parse(`say_as ${body}`));
+      }
+    }
+    return null;
+  }
+
+  private async directedSpeechPlan(ctx: CallContext, space: ObjRef, verbName: string, rest: string, original: string, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue> {
+    const normalized = `${verbName} ${rest.trim()}`;
+    const cmd = await this.parseCommandMap(normalized, ctx, location, actor);
+    const target = cmd.dobj_prefix;
+    const body = cmd.dobj_prefix_rest.trim();
+    if (!target || !body) return await this.commandHuhPlan(ctx, space, original, "Directed speech needs a recipient and text.");
+    return await this.directCommandPlan(ctx, space, verbName, [target, body], cmd);
+  }
+
+  private async resolveCommandPlan(ctx: CallContext, cmd: CommandMap, space: ObjRef, actor: ObjRef): Promise<CommandPlan | null> {
+    // parseCommandMap only returns object refs visible from the command scope.
+    // The public match_command_verb native still enforces command-object
+    // visibility because callers may pass arbitrary targets.
+    const targets = this.commandTargetOrder(cmd, space, actor);
+    for (const target of targets) {
+      const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
+      if (matched) return await this.commandPlanForResolved(ctx, space, matched.target, matched.verb, matched.args, cmd);
+    }
+    return null;
+  }
+
+  private commandTargetOrder(cmd: CommandMap, space: ObjRef, actor: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    const add = (id: ObjRef | null | undefined) => {
+      if (id && !out.includes(id)) out.push(id);
+    };
+    add(cmd.dobj_prefix);
+    add(cmd.dobj);
+    add(cmd.iobj);
+    add(space);
+    add(actor);
+    return out;
+  }
+
+  private async matchCommandVerbOnTarget(ctx: CallContext, cmd: CommandMap, target: ObjRef): Promise<{ target: ObjRef; verb: string; args: WooValue[]; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
+    const candidates = await this.commandVerbCandidates(ctx, target, cmd.verb);
+    for (const candidate of candidates) {
+      const pattern = commandPattern(candidate.arg_spec);
+      if (!pattern) continue;
+      if (!await this.commandPatternMatches(ctx, pattern, cmd, target)) continue;
+      return {
+        target,
+        verb: candidate.name,
+        args: this.commandArgsFrom(pattern, cmd),
+        direct_callable: candidate.direct_callable,
+        arg_spec: candidate.arg_spec ?? {}
+      };
+    }
+    return null;
+  }
+
+  private async commandVerbCandidates(ctx: CallContext, target: ObjRef, name: string): Promise<CommandVerbSummary[]> {
+    if (await this.remoteHostForObject(target, ctx.hostMemo)) {
+      const resolved = await this.tryResolveVerbForCommand(ctx, target, name);
+      return resolved ? [resolved] : [];
+    }
+    if (!this.objects.has(target)) return [];
+    const out: CommandVerbSummary[] = [];
+    const seen = new Set<string>();
+    const collectFrom = (start: ObjRef | null) => {
+      let current = start;
+      while (current) {
+        const obj = this.object(current);
+        for (const verb of obj.verbs) {
+          if (!verbNameMatches(verb, name)) continue;
+          const key = `${current}:${verb.slot ?? verb.name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ name: verb.name, definer: current, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} });
+        }
+        current = obj.parent;
+      }
+    };
+    collectFrom(target);
+    if (this.canCarryFeatures(target)) {
+      for (const feature of this.featureList(target)) collectFrom(feature);
+    }
+    return out;
+  }
+
+  private async commandPatternMatches(ctx: CallContext, pattern: CommandPattern, cmd: CommandMap, target: ObjRef): Promise<boolean> {
+    if (!this.commandPrepMatches(pattern.prep, cmd.prep)) return false;
+    if (!await this.commandSlotMatches(ctx, pattern.dobj ?? "any", "dobj", cmd, target)) return false;
+    if (!await this.commandSlotMatches(ctx, pattern.iobj ?? "any", "iobj", cmd, target)) return false;
+    return true;
+  }
+
+  private commandPrepMatches(pattern: WooValue | undefined, prep: string | null): boolean {
+    const value = pattern ?? "any";
+    if (value === "any") return true;
+    if (value === "none") return prep == null || prep === "";
+    if (typeof value === "string") return (prep ?? "") === value;
+    if (Array.isArray(value)) return value.some((item) => typeof item === "string" && item === (prep ?? ""));
+    return false;
+  }
+
+  private async commandSlotMatches(ctx: CallContext, pattern: WooValue, slot: "dobj" | "iobj", cmd: CommandMap, target: ObjRef): Promise<boolean> {
+    const text = slot === "dobj" ? cmd.dobjstr : cmd.iobjstr;
+    const obj = slot === "dobj" ? (cmd.dobj ?? cmd.dobj_prefix) : cmd.iobj;
+    if (pattern === "any") return true;
+    if (pattern === "none") return !text && !obj;
+    if (pattern === "string") return text.trim().length > 0;
+    if (pattern === "object") return Boolean(obj);
+    if (pattern === "player") return Boolean(obj && await this.isDescendantOfChecked(obj, "$player", ctx.hostMemo));
+    if (pattern === "this") return obj === target;
+    return false;
+  }
+
+  private commandArgsFrom(pattern: CommandPattern, cmd: CommandMap): WooValue[] {
+    const tokens = Array.isArray(pattern.args_from) ? pattern.args_from : [];
+    if (tokens.length === 0) return [];
+    return tokens.map((token) => this.commandArgFrom(String(token), cmd));
+  }
+
+  private commandArgFrom(token: string, cmd: CommandMap): WooValue {
+    if (token === "text") return cmd.text;
+    if (token === "verb") return cmd.verb;
+    if (token === "argstr") return cmd.argstr;
+    if (token === "prep") return cmd.prep ?? "";
+    if (token === "dobj") return cmd.dobj ?? "$failed_match";
+    if (token === "dobjstr") return cmd.dobjstr;
+    if (token === "dobj_prefix") return cmd.dobj_prefix ?? "$failed_match";
+    if (token === "dobj_prefix_rest") return cmd.dobj_prefix_rest;
+    if (token === "iobj") return cmd.iobj ?? "$failed_match";
+    if (token === "iobjstr") return cmd.iobjstr;
+    if (token === "cmd") return cmd as unknown as WooValue;
+    throw wooError("E_INVARG", `unsupported command args_from token: ${token}`, token);
+  }
+
+  // Transitional compatibility path for verbs/catalogs not yet annotated with
+  // arg_spec.command. Delete once bundled chat-shaped verbs all declare command
+  // metadata and source-only callers have a replacement.
+  private async fallbackCommandPlan(ctx: CallContext, cmd: CommandMap, space: ObjRef, actor: ObjRef): Promise<CommandPlan | null> {
+    const objectTarget = cmd.dobj_prefix ?? cmd.dobj;
+    if (objectTarget && objectTarget !== space) {
+      const matched = await this.tryResolveVerbForCommand(ctx, objectTarget, cmd.verb);
+      if (matched) {
+        const args: WooValue[] = cmd.dobj_prefix_rest ? [cmd.dobj_prefix_rest] : [];
+        return await this.commandPlanForResolved(ctx, space, objectTarget, matched.name, args, cmd);
+      }
+    }
+
+    if (cmd.argstr) {
+      const namedObject = await this.matchObjectForActorAsync(cmd.verb, ctx, space, actor);
+      if (namedObject.status === "ok" && namedObject.value !== space) {
+        const sayTo = await this.tryResolveVerbForCommand(ctx, namedObject.value, "on_say_to");
+        if (sayTo) return await this.commandPlanForResolved(ctx, space, namedObject.value, sayTo.name, [cmd.argstr], cmd);
+      }
+    }
+
+    const roomVerb = await this.tryResolveVerbForCommand(ctx, space, cmd.verb);
+    if (roomVerb) {
+      const args: WooValue[] = [];
+      if (cmd.argstr) {
+        const spec = roomVerb.arg_spec ?? {};
+        args.push(spec.resolve === "object" && cmd.dobj_prefix ? cmd.dobj_prefix : cmd.argstr);
+      }
+      return await this.commandPlanForResolved(ctx, space, space, roomVerb.name, args, cmd);
+    }
+
+    const actorVerb = await this.tryResolveVerbForCommand(ctx, actor, cmd.verb);
+    if (actorVerb) {
+      const args = cmd.argstr ? [cmd.argstr] : [];
+      return await this.commandPlanForResolved(ctx, space, actor, actorVerb.name, args, cmd);
+    }
+    return null;
+  }
+
+  private async directCommandPlan(ctx: CallContext, space: ObjRef, verb: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
+    return await this.commandPlanForResolved(ctx, space, space, verb, args, cmd);
+  }
+
+  private async commandPlanForResolved(ctx: CallContext, commandSpace: ObjRef, target: ObjRef, verbName: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
+    const resolved = await this.tryResolveVerbForCommand(ctx, target, verbName);
+    const directCallable = resolved?.direct_callable === true;
+    let route: "direct" | "sequenced" = directCallable ? "direct" : "sequenced";
+    let space: ObjRef | null = null;
+    if (route === "sequenced") {
+      space = await this.isDescendantOfChecked(target, "$space", ctx.hostMemo) ? target : commandSpace;
+      if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
+    }
+    return { ok: true, route, space, target, verb: resolved?.name ?? verbName, args, cmd };
+  }
+
+  private async commandHuhPlan(ctx: CallContext, space: ObjRef, text: string, reason: string): Promise<WooValue> {
+    try {
+      await this.dispatch(ctx, space, "huh", [text, reason]);
+    } catch {
+      ctx.observe({ type: "huh", source: space, actor: ctx.actor, text, reason, ts: Date.now() });
+    }
+    return { ok: false, route: "huh", target: space, verb: "huh", args: [text, reason], error: reason, text } as unknown as WooValue;
   }
 
   private async parseCommandMap(text: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor): Promise<CommandMap> {
@@ -5901,7 +6196,7 @@ export class WooWorld {
     const prefixTokens = prefix ? restTokens.slice(0, prefix.length) : [];
     const prefixRestTokens = prefix ? restTokens.slice(prefix.length) : [];
     return {
-      verb: verbToken.value,
+      verb: verbToken.value.toLowerCase(),
       dobj: dobjMatch?.status === "ok" ? dobjMatch.value : null,
       dobjstr,
       dobj_prefix: prefix?.object ?? null,
@@ -6277,6 +6572,7 @@ const PREPOSITIONS = [
   ["into"],
   ["on"],
   ["upon"],
+  ["as"],
   ["from"],
   ["over"],
   ["through"],
@@ -6306,6 +6602,7 @@ function verbAliasMatches(pattern: string, name: string): boolean {
   for (const segment of pattern.split("|")) {
     const trimmed = segment.trim();
     if (!trimmed) continue;
+    if (trimmed === name) return true;
     const star = trimmed.indexOf("*");
     if (star === trimmed.length - 1) {
       const literal = trimmed.slice(0, -1);
@@ -6318,9 +6615,36 @@ function verbAliasMatches(pattern: string, name: string): boolean {
       if (literal && literal.startsWith(name) && name.length >= Math.max(1, abbreviation)) return true;
       continue;
     }
-    if (trimmed === name) return true;
   }
   return false;
+}
+
+function verbNameMatches(verb: VerbDef, name: string): boolean {
+  return verb.name === name || verb.aliases.some((alias) => verbAliasMatches(alias, name));
+}
+
+function commandPattern(argSpec: Record<string, WooValue> | undefined): CommandPattern | null {
+  const raw = argSpec?.command;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return raw as CommandPattern;
+}
+
+function commandMapFromValue(value: WooValue | undefined): CommandMap {
+  const map = assertMap(value ?? {});
+  return {
+    verb: assertString(map.verb ?? ""),
+    dobj: typeof map.dobj === "string" ? map.dobj : null,
+    dobjstr: typeof map.dobjstr === "string" ? map.dobjstr : "",
+    dobj_prefix: typeof map.dobj_prefix === "string" ? map.dobj_prefix : null,
+    dobj_prefix_str: typeof map.dobj_prefix_str === "string" ? map.dobj_prefix_str : "",
+    dobj_prefix_rest: typeof map.dobj_prefix_rest === "string" ? map.dobj_prefix_rest : "",
+    prep: typeof map.prep === "string" ? map.prep : null,
+    iobj: typeof map.iobj === "string" ? map.iobj : null,
+    iobjstr: typeof map.iobjstr === "string" ? map.iobjstr : "",
+    args: Array.isArray(map.args) ? map.args.filter((item): item is string => typeof item === "string") : [],
+    argstr: typeof map.argstr === "string" ? map.argstr : "",
+    text: typeof map.text === "string" ? map.text : ""
+  };
 }
 
 function addUnique<T>(items: T[], item: T): T[] {

@@ -547,16 +547,9 @@ describe("local catalogs", () => {
     }
     expect(world.getProp("delay_1", "feedback")).toBe(0.44);
 
-    const filterPlan = await world.directCall("dubspace-filter-plan", actor, "the_dubspace", "command_plan", ["filter 500"]);
-    expect(filterPlan.op).toBe("result");
-    if (filterPlan.op === "result") {
-      expect(filterPlan.result).toMatchObject({ ok: true, route: "direct", target: "filter_1", verb: "on_say_to", args: ["500"] });
-    }
-    const directedFilterPlan = await world.directCall("dubspace-directed-filter-plan", actor, "the_dubspace", "command_plan", ["`filter 650"]);
-    expect(directedFilterPlan.op).toBe("result");
-    if (directedFilterPlan.op === "result") {
-      expect(directedFilterPlan.result).toMatchObject({ ok: true, route: "direct", target: "filter_1", verb: "on_say_to", args: ["650"] });
-    }
+    // In source-only mode native implementation hints are deliberately not
+    // trusted, so the shared native command planner is not available here.
+    // Direct woocode behavior still needs to work.
     const directedFiltered = await world.directCall("dubspace-directed-filter", actor, "filter_1", "on_say_to", ["650"]);
     expect(directedFiltered.op).toBe("result");
     if (directedFiltered.op === "result") {
@@ -571,31 +564,6 @@ describe("local catalogs", () => {
     }
     expect(world.getProp("filter_1", "cutoff")).toBe(500);
 
-    const bpmPlan = await world.directCall("dubspace-bpm-plan", actor, "the_dubspace", "command_plan", ["bpm 142"]);
-    expect(bpmPlan.op).toBe("result");
-    if (bpmPlan.op === "result") {
-      expect(bpmPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_dubspace", target: "the_dubspace", verb: "set_tempo", args: [142] });
-    }
-    const directedBpmPlan = await world.directCall("dubspace-directed-bpm-plan", actor, "the_dubspace", "command_plan", ["`bpm 143"]);
-    expect(directedBpmPlan.op).toBe("result");
-    if (directedBpmPlan.op === "result") {
-      expect(directedBpmPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_dubspace", target: "the_dubspace", verb: "set_tempo", args: [143] });
-    }
-    const zeroBpmPlan = await world.directCall("dubspace-zero-bpm-plan", actor, "the_dubspace", "command_plan", ["bpm 0"]);
-    expect(zeroBpmPlan.op).toBe("result");
-    if (zeroBpmPlan.op === "result") {
-      expect(zeroBpmPlan.result).toMatchObject({ ok: false, route: "huh", error: "BPM must be between 60 and 200." });
-    }
-    const directedZeroBpmPlan = await world.directCall("dubspace-directed-zero-bpm-plan", actor, "the_dubspace", "command_plan", ["`bpm 0"]);
-    expect(directedZeroBpmPlan.op).toBe("result");
-    if (directedZeroBpmPlan.op === "result") {
-      expect(directedZeroBpmPlan.result).toMatchObject({ ok: false, route: "huh", error: "BPM must be between 60 and 200." });
-    }
-    const badBpmPlan = await world.directCall("dubspace-bad-bpm-plan", actor, "the_dubspace", "command_plan", ["bpm abc"]);
-    expect(badBpmPlan.op).toBe("result");
-    if (badBpmPlan.op === "result") {
-      expect(badBpmPlan.result).toMatchObject({ ok: false, route: "huh", error: "BPM expects digits." });
-    }
     const bpmChanged = await callInDubspace(world, session.id, "bpm", { actor, target: "the_dubspace", verb: "set_tempo", args: [142] });
     expect(bpmChanged.op).toBe("applied");
     if (bpmChanged.op === "applied") {
@@ -621,12 +589,6 @@ describe("local catalogs", () => {
     expect(recalled.op).toBe("applied");
     if (recalled.op === "applied") expect(recalled.observations[0]).toMatchObject({ type: "scene_recalled", scene: "default_scene", controls: { delay_1: { feedback: 0.44 } } });
     expect(world.getProp("delay_1", "feedback")).toBe(0.44);
-
-    const outPlan = await world.directCall("dubspace-out-plan", actor, "the_dubspace", "command_plan", ["out"]);
-    expect(outPlan.op).toBe("result");
-    if (outPlan.op === "result") {
-      expect(outPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "out", args: [] });
-    }
 
     const left = await world.directCall("dubspace-out", actor, "the_dubspace", "out", []);
     expect(left.op).toBe("result");
@@ -1276,6 +1238,19 @@ describe("local catalogs", () => {
     expect(dubspaceChatPlan.op).toBe("result");
     if (dubspaceChatPlan.op === "result") {
       expect(dubspaceChatPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "say", args: ["hello dubspace"] });
+    }
+
+    const dubspaceBpmPlan = await world.directCall("plan-dubspace-bpm-direct", first.actor, "$match", "plan_command", ["bpm 142", "the_dubspace"]);
+    expect(dubspaceBpmPlan.op).toBe("result");
+    if (dubspaceBpmPlan.op === "result") {
+      expect(dubspaceBpmPlan.result).toMatchObject({
+        ok: true,
+        route: "sequenced",
+        space: "the_dubspace",
+        target: "the_dubspace",
+        verb: "set_tempo",
+        args: ["142"]
+      });
     }
 
       expect(installVerb(world, "$chatroom", "tag", `verb :tag(text) rx {
@@ -2191,7 +2166,7 @@ describe("local catalogs", () => {
 
     const repaired = world.ownVerbExact("$conversational", "command_plan");
     expect(repaired?.kind).toBe("bytecode");
-    expect(repaired?.source).toContain("parse_command");
+    expect(repaired?.source).toContain("plan_command");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-03-chat-command-plan-source-repair");
 
     const session = world.auth("guest:command-plan-repair");

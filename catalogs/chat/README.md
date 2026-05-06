@@ -1,6 +1,6 @@
 ---
 name: chat
-version: 0.2.3
+version: 0.2.4
 spec_version: v1
 license: MIT
 description: Foundational chat primitives — conversational/acoustic features, $match scaffolding, $room/$exit geography, $chatroom/portable/furniture base classes. No demo instances; install @local:demoworld for those.

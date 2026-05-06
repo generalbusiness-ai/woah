@@ -90,7 +90,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": [] }
           },
           "source": "verb :squawk() rxd { let here = location(this); if (this.gagged) { observe({ type: \"cockatoo_muffled\", source: this, room: here, actor: actor, ts: now() }); return \"*muffled noises*\"; } let phrases = this.phrases; if (length(phrases) == 0) { return \"\"; } let phrase = phrases[random(length(phrases)) + 1]; observe({ type: \"cockatoo_squawk\", source: this, room: here, actor: actor, text: phrase, ts: now() }); return phrase; }"
         },
@@ -101,7 +102,8 @@
           "arg_spec": {
             "args": [
               "phrase"
-            ]
+            ],
+            "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix_rest"] }
           },
           "source": "verb :teach(phrase) rx { if (typeof(phrase) != \"string\") { raise { code: \"E_TYPE\", message: \"teach requires a string phrase\", value: phrase }; } if (!phrase) { raise { code: \"E_INVARG\", message: \"teach requires a non-empty phrase\" }; } this.phrases = this.phrases + [phrase]; observe({ type: \"cockatoo_taught\", source: this, room: location(this), actor: actor, phrase: phrase, ts: now() }); return length(this.phrases); }"
         },

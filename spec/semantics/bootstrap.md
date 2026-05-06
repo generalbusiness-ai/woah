@@ -384,6 +384,8 @@ All direct-callable (rxd). See [match.md](match.md) for exact matching rules.
 | `:match_object(name, location?)` | str, obj? | Resolve visible objects; returns obj, `$failed_match`, or `$ambiguous_match`. |
 | `:match_verb(name, target)` | str, obj | Resolve a verb using the same lookup rule as runtime dispatch. |
 | `:parse_command(text, actor)` | str, obj | Parse free text into a structured command map for chat-shaped surfaces. |
+| `:match_command_verb(cmd, target)` | map, obj | Resolve a command-pattern verb using `arg_spec.command`; returns a plan fragment or `$failed_match`. |
+| `:plan_command(text, space)` | str, obj | Shared native-backed planner used by `$conversational:command_plan`. |
 
 ### B5.2 `$conversational` verbs
 
@@ -400,7 +402,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:who()` | — | Returns the present-actor list. |
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
-| `:command_plan(text)` | str | Parse free text into a concrete direct/sequenced/huh route. |
+| `:command_plan(text)` | str | Compatibility wrapper around `$match:plan_command(text, this)`, returning a concrete direct/sequenced/huh route. |
 | `:command(text)` | str | Compatibility wrapper that executes direct plans. Richer clients should call `:command_plan` and then execute the returned route. |
 | `:can_be_attached_by(actor)` | obj | Attachment policy. Bundled `$conversational` allows attachment by default; stricter feature objects override. |
 
