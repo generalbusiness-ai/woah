@@ -123,6 +123,14 @@ route a command as the calling actor should first call
 policy: parser conventions such as chat prefixes or room commands live in
 catalog source.
 
+`execute_command_plan(plan)` consumes a command plan produced by
+`$match:plan_command`. Direct plans execute through the normal dispatch path and
+return the target verb's result. Sequenced plans require a live session and run
+through the resolved command space, returning the applied/error frame. This
+builtin is for inherited command-surface verbs such as
+`$conversational:command(text)`; browser clients should normally use wire
+`op:"command"` instead of calling it indirectly.
+
 `has_flag(obj, name)` returns whether an object metadata flag is true. It is for
 ordinary behavior checks such as wizard bypasses; it is not a substitute for the
 permission system.

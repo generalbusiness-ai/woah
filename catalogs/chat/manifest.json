@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -851,7 +851,7 @@
               "text"
             ]
           },
-          "source": "verb :command(text) rxd { let plan = this:command_plan(text); if (!plan[\"ok\"] || plan[\"route\"] != \"direct\") { return plan; } set_task_perms(caller_perms()); return dispatch(plan[\"target\"], plan[\"verb\"], plan[\"args\"]); }"
+          "source": "verb :command(text) rxd { let plan = this:command_plan(text); if (!plan[\"ok\"]) { return plan; } return execute_command_plan(plan); }"
         }
       ]
     },

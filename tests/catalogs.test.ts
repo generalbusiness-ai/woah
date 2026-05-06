@@ -1269,6 +1269,24 @@ describe("local catalogs", () => {
     }
     expect(world.getProp("drum_1", "bpm")).toBe(144);
 
+    const dubspaceCommandVerbSay = await world.directCall("command-verb-dubspace-say", first.actor, "the_dubspace", "command", ["hello from command verb"]);
+    expect(dubspaceCommandVerbSay.op).toBe("result");
+    if (dubspaceCommandVerbSay.op === "result") {
+      expect(dubspaceCommandVerbSay.result).toBe(true);
+      expect(dubspaceCommandVerbSay.observations).toContainEqual(expect.objectContaining({ type: "said", actor: first.actor, text: "hello from command verb" }));
+    }
+
+    const dubspaceCommandVerbBpm = await world.directCall("command-verb-dubspace-bpm", first.actor, "the_dubspace", "command", ["bpm 146"]);
+    expect(dubspaceCommandVerbBpm.op).toBe("result");
+    if (dubspaceCommandVerbBpm.op === "result") {
+      expect(dubspaceCommandVerbBpm.result).toMatchObject({
+        op: "applied",
+        message: { target: "the_dubspace", verb: "set_tempo", args: ["146"] },
+        observations: [expect.objectContaining({ type: "tempo_changed", target: "drum_1", bpm: 146 })]
+      });
+    }
+    expect(world.getProp("drum_1", "bpm")).toBe(146);
+
       expect(installVerb(world, "$chatroom", "tag", `verb :tag(text) rx {
     observe({ type: "tagged", source: this, actor: actor, text: text });
     return text;
@@ -1365,6 +1383,44 @@ describe("local catalogs", () => {
       expect(middleStarPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_cockatoo", verb: "preen", args: [] });
     }
 
+    world.defineProperty(first.actor, { name: "huh_order", typeHint: "list<str>", defaultValue: [], owner: "$wiz", perms: "rw" });
+    const myHuh = installVerb(world, first.actor, "my_huh", `verb :my_huh(cmd) rxd {
+  this.huh_order = this.huh_order + ["my_huh"];
+  return null;
+}`, null);
+    expect(myHuh.ok).toBe(true);
+    const hereHuh = installVerb(world, "the_chatroom", "here_huh", `verb :here_huh(cmd) rxd {
+  actor.huh_order = actor.huh_order + ["here_huh"];
+  if (cmd["text"] == "/sparkle") {
+    return { ok: true, route: "direct", space: null, target: this, verb: "say", args: ["The room sparkles."], cmd: cmd };
+  }
+  return null;
+}`, null);
+    expect(hereHuh.ok).toBe(true);
+    const lastHuh = installVerb(world, first.actor, "last_huh", `verb :last_huh(cmd) rxd {
+  this.huh_order = this.huh_order + ["last_huh"];
+  if (cmd["text"] == "/last") {
+    return { ok: true, route: "direct", space: null, target: "the_chatroom", verb: "say", args: ["Last hook wins."], cmd: cmd };
+  }
+  return null;
+}`, null);
+    expect(lastHuh.ok).toBe(true);
+    const hereHuhPlan = await world.directCall("plan-here-huh-hook", first.actor, "the_chatroom", "command_plan", ["/sparkle"]);
+    expect(hereHuhPlan.op).toBe("result");
+    if (hereHuhPlan.op === "result") {
+      expect(hereHuhPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "say", args: ["The room sparkles."] });
+    }
+    expect(world.getProp(first.actor, "huh_order")).toEqual(["my_huh", "here_huh"]);
+    world.setProp(first.actor, "huh_order", []);
+
+    const lastHuhPlan = await world.directCall("plan-last-huh-hook", first.actor, "the_chatroom", "command_plan", ["/last"]);
+    expect(lastHuhPlan.op).toBe("result");
+    if (lastHuhPlan.op === "result") {
+      expect(lastHuhPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "say", args: ["Last hook wins."] });
+    }
+    expect(world.getProp(first.actor, "huh_order")).toEqual(["my_huh", "here_huh", "last_huh"]);
+    world.setProp(first.actor, "huh_order", []);
+
     const override = installVerb(world, "the_chatroom", "huh", `verb :huh(text, reason) rxd {
   observe({ type: "custom_huh", source: this, actor: actor, text: text, reason: reason, ts: now() });
   return false;
@@ -1376,6 +1432,7 @@ describe("local catalogs", () => {
       expect(huh.result).toMatchObject({ ok: false, route: "huh", target: "the_chatroom", verb: "huh" });
       expect(huh.observations).toMatchObject([{ type: "custom_huh", source: "the_chatroom", actor: first.actor, text: "/doesnotexist" }]);
     }
+    expect(world.getProp(first.actor, "huh_order")).toEqual(["my_huh", "here_huh", "last_huh"]);
   });
 
   it("supports a small multi-room chat world with stable carryable placement", async () => {

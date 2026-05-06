@@ -1387,6 +1387,17 @@ export class WooWorld {
     return await this.callNow(frameId, sessionId, commandSpace, { actor: this.sessionActor(sessionId), target: plan.target, verb: plan.verb, args: plan.args });
   }
 
+  async executeCommandPlan(ctx: CallContext, planValue: Record<string, WooValue>): Promise<WooValue> {
+    const plan = commandPlanFromValue(planValue as unknown as WooValue);
+    if (!plan) return planValue as unknown as WooValue;
+    if (plan.route === "direct") {
+      return await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, plan.target, plan.verb, plan.args);
+    }
+    if (!ctx.session) throw wooError("E_NOSESSION", "sequenced command requires a live session");
+    const commandSpace = plan.space ?? ctx.space;
+    return await this.callNow(undefined, ctx.session, commandSpace, { actor: ctx.actor, target: plan.target, verb: plan.verb, args: plan.args });
+  }
+
   private async planCommandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
     const startedAt = Date.now();
     try {
@@ -6022,6 +6033,8 @@ export class WooWorld {
     if (fallback) return fallback as unknown as WooValue;
 
     if (!text.startsWith("/")) return await this.directCommandPlan(ctx, space, "say", [text], cmd);
+    const hookPlan = await this.commandHuhHookPlan(ctx, space, actor, cmd);
+    if (hookPlan) return hookPlan;
     return await this.commandHuhPlan(ctx, space, text, `I don't see ${cmd.argstr || text}.`);
   }
 
@@ -6269,6 +6282,26 @@ export class WooWorld {
       ctx.observe({ type: "huh", source: space, actor: ctx.actor, text, reason, ts: Date.now() });
     }
     return { ok: false, route: "huh", target: space, verb: "huh", args: [text, reason], error: reason, text } as unknown as WooValue;
+  }
+
+  private async commandHuhHookPlan(ctx: CallContext, space: ObjRef, actor: ObjRef, cmd: CommandMap): Promise<WooValue | null> {
+    for (const [target, verb] of [[actor, "my_huh"], [space, "here_huh"], [actor, "last_huh"]] as Array<[ObjRef, string]>) {
+      let result: WooValue;
+      try {
+        // Huh hooks are part of command planning, so the planning task remains
+        // the caller; hooks that want delegated authority should dispatch
+        // explicitly just like ordinary woocode.
+        result = await this.dispatch(ctx, target, verb, [cmd as unknown as WooValue]);
+      } catch (err) {
+        // Only absence is ignored. A present hook that raises is a real planner
+        // failure so catalog bugs surface instead of silently degrading to huh.
+        if (normalizeError(err).code === "E_VERBNF") continue;
+        throw err;
+      }
+      if (result && typeof result === "object" && !Array.isArray(result) && "ok" in result) return result;
+      if (result === true) return { ok: false, route: "handled", target, verb, args: [cmd as unknown as WooValue], text: cmd.text } as unknown as WooValue;
+    }
+    return null;
   }
 
   private async parseCommandMap(text: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor): Promise<CommandMap> {

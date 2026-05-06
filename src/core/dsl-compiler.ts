@@ -136,7 +136,7 @@ const BUILTINS = new Set([
   "length", "keys", "values", "has", "typeof", "to_string", "tostr", "to_int", "toint", "to_float", "tofloat", "min", "max", "floor", "ceil", "round", "abs",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join",
   "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "random", "contents", "location", "task_perms", "caller_perms",
-  "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "collect_prop",
+  "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
   "builder_create_object", "builder_chparent", "builder_recycle", "builder_set_property", "builder_inspect", "builder_search",

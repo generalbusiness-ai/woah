@@ -157,6 +157,17 @@ Command metadata is per verb definition. Aliases share the same command pattern;
 
 `$match:plan_command(text, space)` uses this normative target order: direct object, indirect object, command space, actor. Within each target it uses the existing runtime verb lookup rule, including parent chains and features.
 
+When no command-pattern or compatibility verb matches a slash-prefixed command,
+the planner consults optional huh hooks in this order: `actor:my_huh(cmd)`,
+`space:here_huh(cmd)`, then `actor:last_huh(cmd)`. A missing hook is ignored. A
+hook that returns a map with an `ok` field supplies the returned plan; returning
+`true` marks the input handled without a follow-on route. The command-plan route
+vocabulary is closed for v1: `direct`, `sequenced`, `huh`, and `handled`.
+Hooks fire only for slash-prefixed misses; bare text without a command match is
+ordinary speech. If no hook handles the input, the planner returns the ordinary
+room `:huh` plan. Missing hooks (`E_VERBNF`) are ignored; any other hook error is
+surfaced as a planner failure so broken catalog hooks are visible.
+
 ---
 
 ## MA5. Preposition vocabulary
@@ -187,7 +198,9 @@ Custom worlds can extend this list by overriding `$match.prepositions` (a list p
 
 - **Sentence parsing.** `$match` parses one verb-shaped command per call. Multi-clause input (`get the book and read it`) is the caller's responsibility.
 - **Spell correction or fuzzy matching.** Prefix matching is the only forgiveness offered. Worlds that want Damerau-Levenshtein or phonetic matching layer it on top.
-- **Verb suggestion (`:huh`).** When `:match_verb` returns null, the caller can choose to call `room:huh(cmd)` (a convention, not a built-in). LambdaMOO's `:huh` lives on rooms; same here.
+- **Verb suggestion UX.** The bundled planner has the small `my_huh` /
+  `here_huh` / `last_huh` hook chain above, but richer suggestion or typo
+  correction is catalog policy.
 - **Cross-room search.** `:match_object` only walks `location.contents` and `actor.contents`, even when those containers are remote. A world that wants global search adds a verb that walks an index.
 - **Same-name overload authoring.** The bundled command planner filters verbs by command metadata, but the authoring UI still does not make same-name overload sets pleasant to manage. Prefer one command pattern per verb definition until the editor grows explicit support.
 

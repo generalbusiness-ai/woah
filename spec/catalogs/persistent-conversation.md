@@ -144,7 +144,7 @@ PC6 for the privacy reasoning on tell/say_to):
 | `:say_to(recipient, text)` | Same; recipient-directed speech. |
 | `:look`, `:who` | Read-only view, if supplied by the feature rather than the consumer. |
 | `:history(limit, before_seq)` | Read-only transcript query for persistent spaces. |
-| `:command_plan`, `:command` | Compatibility planning/direct-command surface. Browser text input uses wire `op:"command"` so the server can choose direct vs sequenced. |
+| `:command_plan`, `:command` | Compatibility planning/command surface. Browser text input uses wire `op:"command"` so the server can choose direct vs sequenced without a catalog round trip. |
 
 The durable utterance bodies should otherwise match `$conversational`:
 same observation shape, same permission gates, same return values.
@@ -427,8 +427,11 @@ space and raw text. The server consumes the plan and dispatches:
 - direct plans call the target verb directly and return `op:"result"`;
 - sequenced plans call `plan.space:call({...plan})` and return `op:"applied"`.
 
-The catalog-level `:command(text)` verb remains a compatibility wrapper for
-older direct callers; it is not the browser dispatch path for sequenced text.
+The catalog-level `:command(text)` verb remains a compatibility command surface
+for older direct callers. It consumes the same plan shape: direct plans execute
+inline and sequenced plans return the applied/error frame from the resolved
+command space. Browser clients still use wire `op:"command"` to avoid an extra
+catalog call.
 
 The SPA already implements this pattern for taskspace; persistent
 conversation relies on the same route-aware client behavior.

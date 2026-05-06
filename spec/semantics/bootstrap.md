@@ -403,7 +403,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
 | `:command_plan(text)` | str | Compatibility wrapper around `$match:plan_command(text, this)`, returning a concrete direct/sequenced/huh route. |
-| `:command(text)` | str | Compatibility wrapper that executes direct plans. Browser clients use wire `op:"command"` for the server-side direct/sequenced execution path; this verb remains for older direct callers. |
+| `:command(text)` | str | Compatibility command surface. It executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients use wire `op:"command"` for the same server-side direct/sequenced execution path. |
 | `:can_be_attached_by(actor)` | obj | Attachment policy. Bundled `$conversational` allows attachment by default; stricter feature objects override. |
 
 ### B5.3 `$room` / `$exit` verbs

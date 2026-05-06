@@ -580,6 +580,7 @@ const VALID_BUILTINS = new Set([
   "observe_to_space",
   "tell",
   "dispatch",
+  "execute_command_plan",
   "collect_prop",
   "current_location",
   "current_session",

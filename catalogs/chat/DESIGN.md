@@ -78,7 +78,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |
 | `:huh(text, reason?)` | str, str? | Emits a parse-failure observation. |
 | `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, args, cmd}`. |
-| `:command(text)` | str | Compatibility wrapper for direct plans; richer clients should call `:command_plan` and then execute the plan. |
+| `:command(text)` | str | Compatibility command surface. Executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients normally use wire `op:"command"` instead. |
 
 Most `$conversational` verbs are portable source, including the command planner. `$match` still uses trusted local native implementation hints for tokenizer/object-matcher primitives. Public tap installs ignore those hints and still compile the source fallback.
 

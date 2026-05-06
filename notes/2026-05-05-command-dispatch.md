@@ -8,8 +8,11 @@ exposes native-backed `match_command_verb` and `plan_command`,
 `$conversational:command_plan` is a thin wrapper over the shared planner, and
 dubspace no longer ships its own `command_plan`. The WebSocket wire now accepts
 `op:"command"` so the server plans and executes direct/sequenced text commands;
-the browser no longer executes plan descriptors for chat input. The huh-hook
-chain and final removal of compatibility planner helpers remain open.
+the browser no longer executes plan descriptors for chat input. The inherited
+catalog `:command(text)` surface executes the same direct/sequenced plans for
+older direct callers. The first huh-hook chain is present for slash-prefixed
+misses (`my_huh`, `here_huh`, `last_huh`); final removal of compatibility
+planner helpers remains open.
 
 ## Problem
 
