@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.7",
+  "version": "0.2.9",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -613,7 +613,8 @@
           "arg_spec": {
             "args": [
               "text"
-            ]
+            ],
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
           },
           "source": "verb :say(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say requires text\" }; } observe({ type: \"said\", actor: actor, text: text, ts: now() }); return true; }"
         },
@@ -802,7 +803,7 @@
               "reason?"
             ]
           },
-          "source": "verb :huh(text, reason) rxd { observe({ type: \"huh\", actor: actor, text: text, reason: reason, ts: now() }); return false; }"
+          "source": "verb :huh(text, reason) rxd { return actor:huh(text, reason, this); }"
         },
         {
           "name": "huh_plan",
@@ -814,7 +815,7 @@
               "reason"
             ]
           },
-          "source": "verb :huh_plan(text, reason) rxd { this:huh(text, reason); return { ok: false, route: \"huh\", target: this, verb: \"huh\", args: [text, reason], error: reason, text: text }; }"
+          "source": "verb :huh_plan(text, reason) rxd { actor:huh(text, reason, this); return { ok: false, route: \"huh\", space: this, target: actor, verb: \"huh\", args: [text, reason, this], error: reason, text: text }; }"
         },
         {
           "name": "directed_plan",

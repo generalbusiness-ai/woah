@@ -76,7 +76,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:who()` rxd | — | Returns the present-actor list and emits a private `who` observation to the caller. |
 | `:enter(actor?)` | obj? | Moves the calling session into the room; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
 | `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |
-| `:huh(text, reason?)` | str, str? | Emits a parse-failure observation. |
+| `:huh(text, reason?)` | str, str? | Compatibility wrapper that delegates parse-failure output to `actor:huh(text, reason, this)`. |
 | `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, args, cmd}`. |
 | `:command(text)` | str | Compatibility command surface. Executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients normally use wire `op:"command"` instead. |
 
@@ -168,7 +168,7 @@ declare_event $conversational "huh"     { source: obj, actor: obj, text: str, re
 | `told` | `{source, from, to, text}` | Delivered only to `to`. |
 | `entered` / `left` | room-originated presence payloads | Presence transitions. These follow the LambdaCore room pattern: the room tells its own occupants, and the moving actor is excluded from the room announcement. |
 | `looked` / `who` | private payloads with `to: actor` | Room-generated output for commands whose display text should not be client-derived. |
-| `huh` | `{source, actor, text, reason?}` | Unparseable input. |
+| `huh` | `{source, actor, text, reason?}` | Unparseable input. Routed privately to `actor`; the text is retained for local history/debugging but is not room speech. |
 
 Live observations flow over the wire as `op: "event"` frames ([wire.md §17.2](../../spec/protocol/wire.md#172-server--client)) or as SSE `event: event` entries; clients render them in the same chronological feed as applied frames but they are not part of `:replay` history.
 
@@ -271,7 +271,7 @@ A transient browser host that:
    - `told {from, text}` → `from.name tells you, "text"` (only delivered to recipient)
    - `entered/left` → render the room-supplied `text`.
    - `looked/who` → render the room-supplied `text`.
-   - `huh {text}` → `I don't understand "text".`
+   - `huh {text}` → `I don't understand that.`
 5. Sends free-text input as `target_room:command_plan(text)`, then executes the returned route. Direct plans use `op:"direct"`; sequenced plans use `$space:call`.
 
 Same client speaks against `$chatroom` and against `$taskspace` — the verb set is identical, the renderer doesn't care.
@@ -287,8 +287,11 @@ ordinary verb arguments using each verb's `arg_spec.command` metadata.
 The command policy is catalog-owned metadata plus small object verbs. Core
 provides the tokenizer, cross-host object/verb matching, command-pattern
 matching, and route selection; the chat catalog declares that `:foo` means
-emote, `/tell` means private speech, bare text means `:say`, and object commands
-such as `give lamp to Pat` dispatch on the carried object.
+emote, `/tell` means private speech, `say hello` and `"hello` mean public
+speech, and object commands such as `give lamp to Pat` dispatch on the carried
+object. Bare text without a command match is not implicit speech; it dispatches
+to the actor-owned `:huh` path and produces a private response matching
+LambdaMOO's `I don't understand that.` behavior.
 
 The parser is location-scoped rather than tied to where the actor object lives.
 If the actor is in a room hosted elsewhere, `here`, room contents, and actor

@@ -1471,7 +1471,8 @@ function pinboardModel(): PinboardRenderModel | undefined {
   const palette = pinboardPalette(props.palette);
   state.pinboardNewColor = normalizePinboardStickyColor(state.pinboardNewColor, palette);
   const layout = pinboardLayoutFromBoard(board);
-  const noteIds = pinboardProjectedNoteIds(boardId, layout);
+  const removed = pinboardLayoutTombstones(board);
+  const noteIds = pinboardProjectedNoteIds(boardId, layout, [], removed);
   return {
     board,
     notes: normalizePinboardNotes(noteIds.map((id) => pinboardProjectedNote(id, layout[id])).filter(Boolean)),
@@ -1513,17 +1514,29 @@ function pinboardLayoutFromBoard(board: any): Record<string, any> {
   return merged;
 }
 
-function pinboardProjectedNoteIds(boardId: string, layout: Record<string, any>, legacyNotes: any[] = []): string[] {
+function pinboardLayoutTombstones(board: any): Set<string> {
+  const overlay = board?.catalogState?.pinboard_layout;
+  const removed = new Set<string>();
+  if (!overlay || typeof overlay !== "object" || Array.isArray(overlay)) return removed;
+  for (const [id, value] of Object.entries(overlay)) {
+    if (value === null) removed.add(id);
+  }
+  return removed;
+}
+
+function pinboardProjectedNoteIds(boardId: string, layout: Record<string, any>, legacyNotes: any[] = [], removed = new Set<string>()): string[] {
   const ids = new Set<string>();
-  for (const id of Object.keys(layout)) ids.add(id);
+  for (const id of Object.keys(layout)) {
+    if (!removed.has(id)) ids.add(id);
+  }
   for (const note of Array.isArray(legacyNotes) ? legacyNotes : []) {
     const id = String(note?.id ?? "");
-    if (id) ids.add(id);
+    if (id && !removed.has(id)) ids.add(id);
   }
   const snapshot = pinboardOverlaySnapshot();
   for (const item of overlaySnapshotObjects(snapshot)) {
     const id = String(item?.id ?? "");
-    if (id && isPinboardNoteSummary(item, boardId, layout)) ids.add(id);
+    if (id && !removed.has(id) && isPinboardNoteSummary(item, boardId, layout)) ids.add(id);
   }
   return [...ids];
 }
@@ -4571,11 +4584,14 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
 function applyPinboardNotesCanonical(board: string, result: any[]) {
   const previous = pinboardModel()?.notes ?? (!scopedProjectionEnabled ? state.world?.pinboard?.notes : []) ?? [];
   const notes = normalizePinboardNotes(result, previous);
+  const nextIds = new Set<string>();
+  const previousIds = new Set((Array.isArray(previous) ? previous : []).map((note: any) => String(note?.id ?? "")).filter(Boolean));
   const layout: Record<string, any> = {};
-  const patches: ProjectionPatch[] = [];
+  const notePatches: ProjectionPatch[] = [];
   for (const note of notes) {
     const id = String(note?.id ?? "");
     if (!id) continue;
+    nextIds.add(id);
     layout[id] = {
       x: pinNoteNumber(note?.x, 48),
       y: pinNoteNumber(note?.y, 48),
@@ -4583,7 +4599,7 @@ function applyPinboardNotesCanonical(board: string, result: any[]) {
       h: pinNoteNumber(note?.h, 110),
       z: pinNoteNumber(note?.z, 1)
     };
-    patches.push({
+    notePatches.push({
       subject: id,
       fields: {
         name: typeof note?.name === "string" ? note.name : undefined,
@@ -4592,8 +4608,11 @@ function applyPinboardNotesCanonical(board: string, result: any[]) {
       catalogState: { pinboard_note: pinboardNoteState(note) }
     });
   }
-  patches.unshift({ subject: board, props: { layout } });
-  ui.applyCanonical(patches);
+  for (const id of previousIds) {
+    if (!nextIds.has(id)) notePatches.push({ subject: id, clearCatalogState: ["pinboard_note"] });
+  }
+  ui.applyCanonical([{ subject: board, props: { layout } }]);
+  ui.applyCanonical(notePatches, { mode: "replace" });
   if (!scopedProjectionEnabled && state.world?.pinboard) state.world.pinboard.notes = notes;
 }
 

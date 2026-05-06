@@ -13,7 +13,12 @@ peripheral vision, enabling both strong structures and nebulous boundaries.
 
 Objects, properties and verbs, permissions, a self-contained VM runtime.
 Interact with Websockets, MCP tools, and REST APIs.  Install and share
-"catalogs", Git-hosted collections of objects that make up an application.  
+"catalogs", Git-hosted collections of objects that make up an application.
+
+Catalog objects can include lightweight UI.
+
+In-world objects can be presentation and interaction surfaces over external
+data.
 
 ![woo](public/og-image.png)
 
@@ -39,9 +44,7 @@ with many of the LambdaMOO chat behaviors (and a cockatoo); "Dubspace", a
 realtime interactive audio playground; "Pinboard", a shared spatial text-note
 board; "Taskspace", a task-management workspace, and a very minimal IDE/inspector.
 
-The UI is demo/proof-of-concept, not "product".  There's no immediate plan to
-have objects declare their own UI, but eventually that will make sense if we
-can figure out a stable target.
+The UI is demo/proof-of-concept, not "product".
 
 ## Specification
 

@@ -171,10 +171,19 @@ consults optional huh hooks in this order: `actor:my_huh(cmd)`,
 hook that returns a map with an `ok` field supplies the returned plan; returning
 `true` marks the input handled without a follow-on route. The command-plan route
 vocabulary is closed for v1: `direct`, `sequenced`, `huh`, and `handled`.
-Hooks fire only for slash-prefixed misses; bare text without a command match is
-ordinary speech. If no hook handles the input, the planner returns the ordinary
-room `:huh` plan. Missing hooks (`E_VERBNF`) are ignored; any other hook error is
-surfaced as a planner failure so broken catalog hooks are visible.
+Hooks fire only for slash-prefixed misses. Bare text without a command match is
+also a miss, not implicit speech; it returns the actor-owned `:huh` plan with
+the LambdaMOO-style default message `I don't understand that.` Explicit speech
+uses command metadata such as `say hello` or one of the speech-prefix lowerings
+above, such as `"hello`. Missing hooks (`E_VERBNF`) are ignored; any other hook
+error is surfaced as a planner failure so broken catalog hooks are visible.
+
+The bundled default `:huh` is actor-owned: the planner dispatches
+`actor:huh(text, reason, space)`. This follows LambdaMOO's player-rooted
+default-miss shape while preserving Woo's explicit command surface; the space is
+passed as context, not as the owner of the private output. `$conversational:huh`
+is only a compatibility wrapper for older space-level callers and delegates back
+to the actor.
 
 ---
 

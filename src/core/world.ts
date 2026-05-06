@@ -6052,10 +6052,9 @@ export class WooWorld {
     const metadataPlan = await this.resolveCommandPlan(ctx, cmd, space, actor);
     if (metadataPlan) return metadataPlan as unknown as WooValue;
 
-    if (!text.startsWith("/")) return await this.directCommandPlan(ctx, space, "say", [text], cmd);
-    const hookPlan = await this.commandHuhHookPlan(ctx, space, actor, cmd);
+    const hookPlan = text.startsWith("/") ? await this.commandHuhHookPlan(ctx, space, actor, cmd) : null;
     if (hookPlan) return hookPlan;
-    return await this.commandHuhPlan(ctx, space, text, `I don't see ${cmd.argstr || text}.`);
+    return await this.commandHuhPlan(ctx, space, text, "I don't understand that.");
   }
 
   private async lowerSpeechPrefixPlan(ctx: CallContext, text: string, space: ObjRef, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue | null> {
@@ -6264,11 +6263,11 @@ export class WooWorld {
 
   private async commandHuhPlan(ctx: CallContext, space: ObjRef, text: string, reason: string): Promise<WooValue> {
     try {
-      await this.dispatch(ctx, space, "huh", [text, reason]);
+      await this.dispatch(ctx, ctx.actor, "huh", [text, reason, space]);
     } catch {
-      ctx.observe({ type: "huh", source: space, actor: ctx.actor, text, reason, ts: Date.now() });
+      ctx.observe({ type: "huh", source: space, actor: ctx.actor, text, reason, ts: Date.now(), _audience_override: [ctx.actor] });
     }
-    return { ok: false, route: "huh", target: space, verb: "huh", args: [text, reason], error: reason, text } as unknown as WooValue;
+    return { ok: false, route: "huh", space, target: ctx.actor, verb: "huh", args: [text, reason, space], error: reason, text } as unknown as WooValue;
   }
 
   private async commandHuhHookPlan(ctx: CallContext, space: ObjRef, actor: ObjRef, cmd: CommandMap): Promise<WooValue | null> {

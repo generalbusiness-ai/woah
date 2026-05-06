@@ -43,7 +43,7 @@ the target for runtime-created objects, but it is not active in v1.
 |---|---|---|---|---|---|---|---|
 | `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]` | `:return_guest(guest)` | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
 | `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement`, `help` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
-| `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
+| `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:huh(text,reason?,source?)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
 | `$player` | class | `$actor` | `$wiz` | — | Defines `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
 | `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc()` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
@@ -110,6 +110,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `:remove_feature(f)` | obj | Remove from `features`. |
 | `:has_feature(f)` rxd | obj | Predicate. |
 | `:look_self()` rxd | — | Actor-authored view. Returns the generic title/description plus `carrying`, and appends the current inventory sentence to `description`. This is woocode seeded on `$actor`, not a substrate special case. |
+| `:huh(text, reason?, source?)` rxd | str, str?, obj? | Actor-owned parse-miss output. Emits a private `huh` observation to `this` with `source` naming the command surface when available. Default reason is `I don't understand that.` |
 | `:wait(timeout_ms?, limit?)` rxd | int?, int? | MCP observation drain for the actor's session queue. Tool-exposed. |
 | `:focus(target)` rxd | obj | Add an object/space to `focus_list`. Tool-exposed. |
 | `:unfocus(target)` rxd | obj | Remove an object/space from `focus_list`. Tool-exposed. |
@@ -402,6 +403,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:who()` | — | Returns the present-actor list. |
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
+| `:huh(text, reason?)` | str, str? | Compatibility wrapper. Delegates to `actor:huh(text, reason, this)` so parse-miss output remains actor-owned while old space-level callers continue to work. |
 | `:command_plan(text)` | str | Compatibility wrapper around `$match:plan_command(text, this)`, returning a concrete direct/sequenced/huh route. |
 | `:command(text)` | str | Compatibility command surface. It executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients use wire `op:"command"` for the same server-side direct/sequenced execution path. |
 | `:can_be_attached_by(actor)` | obj | Attachment policy. Bundled `$conversational` allows attachment by default; stricter feature objects override. |
@@ -448,7 +450,7 @@ declare_event $conversational "entered" { source: obj, actor: obj, room: obj, or
 declare_event $conversational "left"    { source: obj, actor: obj, room: obj, destination?: obj, exit?: str, text: str };
 declare_event $conversational "looked"  { source: obj, actor: obj, to: obj, room: obj, target?: obj, text: str, look: map };
 declare_event $conversational "who"     { source: obj, actor: obj, to: obj, room: obj, present_actors: list<obj>, text: str };
-declare_event $conversational "huh"     { source: obj, actor: obj, text: str, suggestion?: str };
+declare_event $conversational "huh"     { source: obj, actor: obj, text: str, reason?: str };
 ```
 
 Schemas describe shape only ([events.md §13](events.md#13-schemas)); durability is set by the route of the verb that emits each observation.

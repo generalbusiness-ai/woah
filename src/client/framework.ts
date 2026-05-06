@@ -70,6 +70,7 @@ export type ClientProjectionDraft = {
   patchObjectProps(ref: string, props: Record<string, unknown>): void;
   patchCatalogState(ref: string, key: string, fields: Record<string, unknown>): void;
   clearCatalogState(ref: string, key: string): void;
+  clearAuthoritative(ref: string): void;
 };
 
 export type WooObservationHandler = {
@@ -224,6 +225,13 @@ type OptimisticCallRecord = {
   reconcile: ProjectionOptimisticReconcile;
 };
 
+export type ApplyCanonicalOptions = {
+  // `replace` is per field group: fields/props merge as usual, while each
+  // catalogState key present in the patch is cleared before its new fields are
+  // applied. CatalogState keys absent from the patch are left alone.
+  mode?: "merge" | "replace";
+};
+
 const LIVE_TTL_MS = 1_600;
 const OPTIMISTIC_TTL_MS = 5_000;
 
@@ -334,6 +342,7 @@ export class CatalogUiRegistry {
 export class ClientProjection {
   private canonical = new Map<string, ObjectProjection>();
   private scopedCanonical = new Map<string, Map<string, ObjectProjection>>();
+  private authoritativeCanonical = new Map<string, ProjectionPatch>();
   private scopeOrder: string[] = [];
   private sequenced = new Map<string, ProjectionPatch>();
   private live = new Map<string, ProjectionLayer>();
@@ -345,6 +354,7 @@ export class ClientProjection {
     const changed = new Set(this.canonical.keys());
     this.scopedCanonical.clear();
     this.scopeOrder = [];
+    this.authoritativeCanonical.clear();
     this.canonical.clear();
     for (const [id, obj] of Object.entries(world?.objects ?? {})) {
       this.canonical.set(id, normalizeObjectProjection(id, obj));
@@ -438,17 +448,27 @@ export class ClientProjection {
   // log. Fold those patches into canonical projection so they survive later
   // scoped-snapshot ingestion while still clearing overlapping live/optimistic
   // layers.
-  applyCanonical(patches: ProjectionPatch[]) {
+  applyCanonical(patches: ProjectionPatch[], options: ApplyCanonicalOptions = {}) {
     const changed = new Set<string>();
     for (const patch of patches) {
       const subject = String(patch.subject ?? "");
       if (!subject) continue;
-      this.patchCanonical(subject, patch);
+      const canonicalPatch = options.mode === "replace" ? replacementPatch(patch) : patch;
+      this.authoritativeCanonical.set(subject, options.mode === "replace" ? canonicalPatch : mergePatch(this.authoritativeCanonical.get(subject), patch));
+      this.patchCanonical(subject, canonicalPatch);
       clearPatchFieldsFromLayers(this.live, patch);
       clearPatchFieldsFromLayers(this.optimistic, patch);
       changed.add(subject);
     }
     this.notify(changed);
+  }
+
+  clearAuthoritative(subject: string, options: { notify?: boolean } = {}) {
+    const id = String(subject ?? "");
+    if (!id || !this.authoritativeCanonical.delete(id)) return false;
+    this.rebuildCanonicalObject(id);
+    if (options.notify !== false) this.notify(new Set([id]));
+    return true;
   }
 
   applyLive(id: string, patches: ProjectionPatch[], expiresMs = LIVE_TTL_MS): number {
@@ -541,6 +561,12 @@ export class ClientProjection {
       if (!scoped) continue;
       next = next ? mergeObjectProjection(next, scoped) : cloneObjectProjection(scoped);
     }
+    const authoritative = this.authoritativeCanonical.get(id);
+    if (authoritative) {
+      const patched = next ?? emptyObjectProjection(id);
+      applyPatch(patched, authoritative);
+      next = hasProjectionData(patched) ? patched : undefined;
+    }
     if (next) this.canonical.set(id, next);
     else this.canonical.delete(id);
   }
@@ -581,12 +607,14 @@ export class ObservationRegistry {
       handler.reduce(draft, envelope);
     }
     const patches = draft.consume();
-    if (patches.length === 0) return;
+    const authoritativeClears = draft.consumeAuthoritativeClears();
+    if (patches.length === 0 && authoritativeClears.length === 0) return;
     if (delivered.route === "live") {
       for (const patch of patches) {
         this.projection.applyLive(liveProjectionKey(type, patch.subject, livePatchDiscriminator(patch)), [patch]);
       }
     } else {
+      for (const subject of authoritativeClears) this.projection.clearAuthoritative(subject, { notify: patches.length === 0 });
       this.projection.applySequenced(patches);
     }
   }
@@ -696,8 +724,12 @@ export class WooClientFramework {
     this.projection.applyOptimisticCall(callId, options);
   }
 
-  applyCanonical(patches: ProjectionPatch[]) {
-    this.projection.applyCanonical(patches);
+  applyCanonical(patches: ProjectionPatch[], options?: ApplyCanonicalOptions) {
+    this.projection.applyCanonical(patches, options);
+  }
+
+  clearAuthoritative(subject: string) {
+    this.projection.clearAuthoritative(subject);
   }
 
   completeOptimisticCall(callId: string) {
@@ -781,7 +813,10 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
     route: "sequenced",
     reduce: (draft, envelope) => {
       const id = String(envelope.observation.pin ?? envelope.observation.note ?? envelope.observation.id ?? "");
-      if (id) draft.clearCatalogState(id, "pinboard_note");
+      if (id) {
+        draft.clearAuthoritative(id);
+        draft.clearCatalogState(id, "pinboard_note");
+      }
       const board = String(envelope.observation.board ?? "");
       if (board && id) draft.patchCatalogState(board, "pinboard_layout", { [id]: null });
     }
@@ -1007,6 +1042,7 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
 
 class ProjectionDraft implements ClientProjectionDraft {
   private patches = new Map<string, ProjectionPatch>();
+  private authoritativeClears = new Set<string>();
 
   patchObject(ref: string, fields: Record<string, unknown>) {
     const subject = String(ref ?? "");
@@ -1034,8 +1070,17 @@ class ProjectionDraft implements ClientProjectionDraft {
     this.merge(subject, { subject, clearCatalogState: [catalogKey] });
   }
 
+  clearAuthoritative(ref: string) {
+    const subject = String(ref ?? "");
+    if (subject) this.authoritativeClears.add(subject);
+  }
+
   consume(): ProjectionPatch[] {
     return [...this.patches.values()];
+  }
+
+  consumeAuthoritativeClears(): string[] {
+    return [...this.authoritativeClears];
   }
 
   private merge(subject: string, patch: ProjectionPatch) {
@@ -1124,6 +1169,23 @@ function mergePatch(left: ProjectionPatch | undefined, right: ProjectionPatch): 
     catalogState: mergeCatalogState(left?.catalogState, right.catalogState),
     clearCatalogState: mergeClearList(left?.clearCatalogState, right.clearCatalogState)
   };
+}
+
+function clonePatch(patch: ProjectionPatch): ProjectionPatch {
+  return {
+    subject: patch.subject,
+    fields: patch.fields ? { ...patch.fields } : undefined,
+    props: patch.props ? { ...patch.props } : undefined,
+    catalogState: patch.catalogState ? Object.fromEntries(Object.entries(patch.catalogState).map(([key, fields]) => [key, { ...fields }])) : undefined,
+    clearCatalogState: patch.clearCatalogState ? [...patch.clearCatalogState] : undefined
+  };
+}
+
+function replacementPatch(patch: ProjectionPatch): ProjectionPatch {
+  const cloned = clonePatch(patch);
+  const replacedCatalogKeys = Object.keys(cloned.catalogState ?? {});
+  cloned.clearCatalogState = mergeClearList(cloned.clearCatalogState, replacedCatalogKeys);
+  return cloned;
 }
 
 function mergeRecord(left?: Record<string, unknown>, right?: Record<string, unknown>): Record<string, unknown> | undefined {

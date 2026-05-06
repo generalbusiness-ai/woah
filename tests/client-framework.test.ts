@@ -259,6 +259,74 @@ describe("client UI framework projection", () => {
     expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
   });
 
+  it("keeps direct authoritative patches across later scoped snapshots", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin", catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["hydrated"], color: "green" } } }]);
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hydrated"], color: "green" });
+
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin", catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hydrated"], color: "green" });
+  });
+
+  it("clears authoritative patches so removed scoped objects do not ghost", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: { note_1: { x: 10, y: 20 } } } },
+      { id: "note_1", name: "Note", parent: "$pin", catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["hydrated"], color: "green" } } }]);
+
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hydrated"], color: "green" });
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 21,
+      space: "the_pinboard",
+      observations: [{ type: "pin_removed", board: "the_pinboard", pin: "note_1" }]
+    });
+
+    expect(ui.observe("note_1")).toBeUndefined();
+  });
+
+  it("can replace authoritative patches for full canonical refreshes", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin" }
+    ]);
+
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["old"], color: "yellow" } } }], { mode: "replace" });
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["new"] } } }], { mode: "replace" });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toEqual({ text: ["new"] });
+  });
+
+  it("clears authoritative patches on full world refresh", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:dubspace:the_dubspace", [
+      { id: "filter_1", name: "filter", props: { cutoff: 1000 } }
+    ]);
+    ui.applyCanonical([{ subject: "filter_1", props: { cutoff: 500 } }]);
+    expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
+
+    ui.ingestWorld({
+      objects: {
+        filter_1: { id: "filter_1", name: "filter", props: { cutoff: 1000 } }
+      }
+    });
+
+    expect(ui.observe("filter_1")?.props.cutoff).toBe(1000);
+  });
+
   it("keeps independent live fields on separate coalesced layers", () => {
     const ui = createWooClientFramework();
     ui.ingestWorld({

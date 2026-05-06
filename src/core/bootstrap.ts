@@ -43,6 +43,13 @@ const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   return { id: this, title: title, description: description, carrying: carried };
 }`;
 
+const ACTOR_HUH_SOURCE = `verb :huh(text, reason, source) rxd {
+  if (!reason) { reason = "I don't understand that."; }
+  if (source == null) { source = location(this); }
+  observe({ type: "huh", source: source, actor: this, text: text, reason: reason, ts: now(), _audience_override: [this] });
+  return false;
+}`;
+
 const PLAYER_INVENTORY_SOURCE = `verb :inventory() rxd {
   let items = [];
   let names = [];
@@ -395,6 +402,7 @@ function seedUniversal(world: WooWorld): void {
     argSpec: { args: ["desc"], command: { dobj: "object", prep: "as", iobj: "string", args_from: ["iobjstr"] } }
   });
   sourceVerb(world, "$actor", "look_self", ACTOR_LOOK_SELF_SOURCE, { directCallable: true });
+  sourceVerb(world, "$actor", "huh", ACTOR_HUH_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "look_self", PLAYER_LOOK_SELF_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, {
     directCallable: true,
