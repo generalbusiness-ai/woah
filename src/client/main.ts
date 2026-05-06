@@ -1219,6 +1219,14 @@ function installedCatalogSeed(world: any, catalogName: string, fallback: string)
   return values.find((id) => id === fallback) ?? values[0] ?? (fallback || undefined);
 }
 
+function activeInstalledCatalogSeed(catalogName: string, fallback: string): string {
+  const catalog = activeInstalledCatalog(catalogName);
+  if (!catalog) return fallback || "";
+  const seeds = catalog?.seeds && typeof catalog.seeds === "object" && !Array.isArray(catalog.seeds) ? catalog.seeds : {};
+  const values = Object.values(seeds).filter((item): item is string => typeof item === "string");
+  return values.find((id) => id === fallback) ?? values[0] ?? (fallback || "");
+}
+
 function catalogClass(catalog: any, localName: string): string | undefined {
   const value = catalog?.objects?.[localName];
   return typeof value === "string" ? value : undefined;
@@ -1839,7 +1847,7 @@ function pinboardSpace() {
     if (route?.view === "pinboard" && route.objectId) return route.objectId;
     if (state.routedSubjects.pinboard) return state.routedSubjects.pinboard;
     const scoped = scopedToolSubject("pinboard");
-    return scoped;
+    return scoped || activeInstalledCatalogSeed("pinboard", bundledToolSeeds.pinboard);
   }
   return String(state.world?.pinboardMeta?.board ?? "");
 }

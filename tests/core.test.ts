@@ -1204,6 +1204,7 @@ describe("woo core", () => {
     const takeLamp = await world.directCall("take-lamp-before-reap", actor, "the_chatroom", "take", ["lamp"]);
     expect(takeLamp.op).toBe("result");
     expect(world.object("the_lamp").location).toBe(actor);
+    world.object(actor).contents.add("missing_inventory_ref");
     world.setProp(actor, "description", "temporary guest description");
     world.setProp(actor, "aliases", ["temp"]);
     world.setProp(actor, "focus_list", ["the_dubspace"]);
@@ -1221,6 +1222,7 @@ describe("woo core", () => {
     expect(world.getProp(actor, "aliases")).toEqual([]);
     expect(world.getProp(actor, "focus_list")).toEqual([]);
     expect(world.object(actor).location).toBe("$nowhere");
+    expect(world.object(actor).contents.has("missing_inventory_ref")).toBe(false);
     expect(world.object("the_lamp").location).toBe("the_chatroom");
     expect(world.object("the_chatroom").contents.has("the_lamp")).toBe(true);
 

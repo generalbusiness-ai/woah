@@ -56,6 +56,7 @@ const LOCAL_CATALOG_CHAT_STALE_CLASS_VERBS_REPAIR_MIGRATION = "2026-05-02-chat-s
 const LOCAL_CATALOG_CHAT_LOOK_SKIP_PRESENCE_MIGRATION = "2026-05-02-chat-look-skip-presence";
 const LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION = "2026-05-03-chat-command-plan-source-repair";
 const LOCAL_CATALOG_CHAT_ACTOR_HUH_SOURCE_REPAIR_MIGRATION = "2026-05-06-chat-actor-huh-source-repair";
+const LOCAL_CATALOG_CHAT_LOOK_AT_COMMAND_REPAIR_MIGRATION = "2026-05-06-chat-look-at-command-repair";
 const LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION = "2026-05-03-chat-look-at-collect-prop-try";
 const LOCAL_CATALOG_TASKSPACE_LIST_TASKS_GUARD_MIGRATION = "2026-05-02-taskspace-list-tasks-guard";
 const LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION = "2026-05-03-taskspace-task-note-parent";
@@ -106,6 +107,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_LOOK_SKIP_PRESENCE_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_ACTOR_HUH_SOURCE_REPAIR_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_CHAT_LOOK_AT_COMMAND_REPAIR_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_TASKSPACE_LIST_TASKS_GUARD_MIGRATION, only: "taskspace" },
   { id: LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION, only: "taskspace" },
@@ -327,6 +329,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runChatLookSkipPresenceMigration(world, names);
   run(LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
   run(LOCAL_CATALOG_CHAT_ACTOR_HUH_SOURCE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_LOOK_AT_COMMAND_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
   run(LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION, { allowImplementationHints: true, only: "chat" });
   runTaskspaceListTasksGuardMigration(world, names);
   runTaskspaceTaskNoteParentMigration(world, names);

@@ -1406,6 +1406,19 @@ describe("local catalogs", () => {
       }
     }
 
+    const lookMugPlan = await world.directCall("plan-look-mug", first.actor, "the_chatroom", "command_plan", ["look mug"]);
+    expect(lookMugPlan.op).toBe("result");
+    if (lookMugPlan.op === "result") {
+      expect(lookMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+    }
+
+    const lookAtMugPlan = await world.directCall("plan-look-at-mug", first.actor, "the_chatroom", "command_plan", ["look at mug"]);
+    expect(lookAtMugPlan.op).toBe("result");
+    if (lookAtMugPlan.op === "result") {
+      expect(lookAtMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+      expect((lookAtMugPlan.result as Record<string, any>).cmd).toMatchObject({ prep: "at", iobj: "the_mug" });
+    }
+
     const lookMePlan = await world.directCall("plan-look-me", first.actor, "the_chatroom", "command_plan", ["look me"]);
     expect(lookMePlan.op).toBe("result");
     if (lookMePlan.op === "result") {
@@ -1896,6 +1909,14 @@ describe("local catalogs", () => {
       ]));
       expect(who.observations).toContainEqual(expect.objectContaining({ type: "who", actor: first.actor, present_actors: expect.arrayContaining([first.actor, second.actor]) }));
     }
+    const directWhoNoArgs = await world.directCall("lambda-who-no-args", first.actor, first.actor, "who_all", []);
+    expect(directWhoNoArgs.op).toBe("result");
+    if (directWhoNoArgs.op === "result") {
+      expect(directWhoNoArgs.result).toEqual(expect.arrayContaining([
+        expect.objectContaining({ player: first.actor }),
+        expect.objectContaining({ player: second.actor })
+      ]));
+    }
 
     const secondSession = world.sessions.get(second.id);
     if (secondSession) secondSession.lastInputAt = Date.now() - 1_000_000;
@@ -2357,7 +2378,11 @@ describe("local catalogs", () => {
   it("repairs stale native chat command planning on existing installs", async () => {
     const world = createWorld();
     const migrations = (world.getProp("$system", "applied_migrations") as string[])
-      .filter((id) => id !== "2026-05-03-chat-command-plan-source-repair" && id !== "2026-05-06-chat-actor-huh-source-repair");
+      .filter((id) => ![
+        "2026-05-03-chat-command-plan-source-repair",
+        "2026-05-06-chat-actor-huh-source-repair",
+        "2026-05-06-chat-look-at-command-repair"
+      ].includes(id));
     world.setProp("$system", "applied_migrations", migrations);
 
     const commandPlan = world.ownVerbExact("$conversational", "command_plan")!;
@@ -2380,6 +2405,8 @@ describe("local catalogs", () => {
     });
     world.addVerb("$conversational", { ...huh, source: "verb :huh(text, reason) rxd { observe({ type: \"huh\", actor: actor, text: text, reason: reason, ts: now() }); return false; }", version: huh.version + 1 });
     world.addVerb("$conversational", { ...huhPlan, source: "verb :huh_plan(text, reason) rxd { this:huh(text, reason); return { ok: false, route: \"huh\", target: this, verb: \"huh\", args: [text, reason], error: reason, text: text }; }", version: huhPlan.version + 1 });
+    const lookAt = world.ownVerbExact("$conversational", "look_at")!;
+    world.addVerb("$conversational", { ...lookAt, arg_spec: { args: ["target"] }, version: lookAt.version + 1 });
 
     installLocalCatalogs(world, ["chat"]);
 
@@ -2388,14 +2415,19 @@ describe("local catalogs", () => {
     expect(repaired?.source).toContain("plan_command");
     expect(world.ownVerbExact("$conversational", "huh")?.source).toContain("actor:huh");
     expect(world.ownVerbExact("$conversational", "huh_plan")?.source).toContain("target: actor");
+    expect(world.ownVerbExact("$conversational", "look_at")?.arg_spec.command).toMatchObject({ dobj: "object", args_from: ["dobj_prefix"] });
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-03-chat-command-plan-source-repair");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-06-chat-actor-huh-source-repair");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-06-chat-look-at-command-repair");
 
     const session = world.auth("guest:command-plan-repair");
     await world.directCall("enter-command-plan-repair", session.actor, "the_chatroom", "enter", []);
     const plan = await world.directCall("repaired-plan", session.actor, "the_chatroom", "command_plan", ["say hello after repair"]);
     expect(plan.op).toBe("result");
     if (plan.op === "result") expect(plan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "say", args: ["hello after repair"] });
+    const lookPlan = await world.directCall("repaired-look-plan", session.actor, "the_chatroom", "command_plan", ["look mug"]);
+    expect(lookPlan.op).toBe("result");
+    if (lookPlan.op === "result") expect(lookPlan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
   });
 
   it("surfaces :title failures during room look composition", async () => {
