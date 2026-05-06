@@ -26,7 +26,7 @@ This is the demo that retires the question "do feature objects pull their weight
 - Two or more actors connected to a shared room.
 - Free-text input bar; output is a chronological text feed.
 - Presence list visible.
-- MOO-like text input parsed by the room: speech forms (`"hi`, `:waves`, `/tell`, backtick directed speech), room commands (`look`, `who`), direction verbs (`se`, `east`, `out`), and object commands (`look cockatoo`, `enter tub`, `teach bird "hello"`).
+- MOO-like text input parsed by the room: explicit speech forms (`say hi`, `"hi`, `:waves`, `/tell`, backtick directed speech), room commands (`look`, `who`), direction verbs (`se`, `east`, `out`), and object commands (`look cockatoo`, `enter tub`, `teach bird "hello"`).
 - Enter/exit notifications when actors join or leave.
 - A "join taskspace as room" mode where the same chat client renders against `the_taskspace` instead of a standalone `$chatroom`. Same verbs, same observations.
 
@@ -44,7 +44,7 @@ The chat verbs use the **direct live interaction** pattern from [core.md §C13](
 | `:give` (on `$portable`) | direct | object location; private — no room broadcast |
 | `:enter` / `:leave` | direct | session current location and `$space.session_subscribers` |
 | `:command_plan` | direct parser | none; returns the concrete route/target/verb/args |
-| `:command` | direct dispatcher | compatibility wrapper for direct-only plans |
+| `:command` | direct dispatcher | compatibility wrapper; executes direct plans inline and sequenced plans through the resolved command space |
 
 Because the chat verbs route directly, every observation they emit is live-only by [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route): pushed to the room's session audience, never stored. A late-joining client sees no scrollback. This matches MOO's `notify()` semantics. Object commands that mutate state can still route through the room's sequenced log; for example `teach bird "hello"` plans as a `$space:call` against the cockatoo, so the mutation and observation are replay-visible.
 
@@ -272,7 +272,7 @@ A transient browser host that:
    - `entered/left` → render the room-supplied `text`.
    - `looked/who` → render the room-supplied `text`.
    - `huh {text}` → `I don't understand that.`
-5. Sends free-text input as `target_room:command_plan(text)`, then executes the returned route. Direct plans use `op:"direct"`; sequenced plans use `$space:call`.
+5. Sends free-text input as wire `op:"command"` with the active command space and raw text. The server plans and dispatches the command; direct plans return `op:"result"` and sequenced plans return `op:"applied"`. The catalog-level `:command_plan` / `:command` verbs remain for direct callers and compatibility.
 
 Same client speaks against `$chatroom` and against `$taskspace` — the verb set is identical, the renderer doesn't care.
 

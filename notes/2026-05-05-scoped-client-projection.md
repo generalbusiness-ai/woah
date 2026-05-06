@@ -635,10 +635,12 @@ layer as move/resize. The board also has sparse
 `catalogState.pinboard_layout` and `catalogState.pinboard_presence` overlays
 for immediate add/move/remove/presence deltas; renderers merge those with
 `props.layout` and `props.subscribers` instead of reading them as full
-snapshots. Taskspace now builds its tree/inspector from scoped overlay
-summaries and `ui.observe`, with task creation/move/status/claim/requirement/
-message/artifact observations reducing into sparse `taskspace_tree` and
-`taskspace_task` catalog-state overlays.
+snapshots. Pin removal clears authoritative note patches and records a
+tombstone for that board/pin pair so stale overlay snapshots cannot re-add a
+shadow copy after a delete/take. Taskspace now builds its tree/inspector from
+scoped overlay summaries and `ui.observe`, with task creation/move/status/
+claim/requirement/message/artifact observations reducing into sparse
+`taskspace_tree` and `taskspace_task` catalog-state overlays.
 Bundled demo object ids are used only as a transitional route allowlist; custom
 installed worlds need a runtime scoped-route feed before their object URLs can
 default to scoped mode. Chat, dubspace, and pinboard `leave`/`out` verbs now

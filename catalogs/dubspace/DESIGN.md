@@ -85,15 +85,21 @@ controls explicitly from the catalog rather than through core-native handlers.
 
 ## Command Surface
 
-The dubspace has a specialized `:command_plan` for control-room shortcuts such
-as `filter 500`, `bpm 144`, `out`, and `say ...`. It must still preserve the
-shared chat directed-speech syntax from `$conversational`: backtick speech such
-as `` `filter 500 `` lowers to `filter_1:on_say_to("500")`, matching the plain
-`filter 500` shortcut instead of echoing the line as room speech. `` `bpm 144 ``
-and `bpm 144` both lower to the sequenced `the_dubspace:set_tempo(144)` path so
-tempo changes remain replayable. BPM command shortcuts accept only integer
-values in the UI tempo range, 60 through 200; the lower-level `:set_tempo`
-verb remains tolerant and clamps direct callers.
+The dubspace inherits the shared `$conversational` command parser. Control-room
+shortcuts are declared as ordinary command metadata on the relevant verbs
+rather than as branches in a dubspace-specific `:command_plan`.
+
+`filter 500` resolves to the filter control's `:on_say_to("500")` command
+shape, so the same object verb handles plain control input and directed
+backtick input such as `` `filter 500 ``. `bpm 144` resolves to the sequenced
+`the_dubspace:set_tempo(144)` path so tempo changes remain replayable. `out`
+routes through the inherited room/exit command path. Explicit speech remains
+available through `say ...`, `"..."`, `/tell`, and the other chat speech forms;
+bare unmatched text is a private actor-owned `huh`, not implicit room speech.
+
+BPM command shortcuts accept only integer values in the UI tempo range, 60
+through 200; the lower-level `:set_tempo` verb remains tolerant and clamps
+direct callers.
 
 ## Observation Schemas
 

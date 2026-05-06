@@ -259,8 +259,13 @@ the standard envelope. Type-specific fields below:
 These should land in `manifest.json` as `schemas[].on === "$kanban_board"`
 entries when the implementation ships, mirroring `$pinboard`'s schema list.
 
-Pin-level events (`pin_recolored` and `$note` edit observations) propagate
-through `$pin`/`$note` regardless of which board the pin lives on.
+The non-kanban `$pinboard` schemas cover board presence and layout:
+`pinboard_entered`, `pinboard_left`, `pinboard_viewport`, `pin_added`,
+`pin_removed`, `pin_moved`, `pin_resized`, `note_added`, and
+`pinboard_activity`. Board/layout observations carry `board` so a scoped
+client can reduce them into the correct overlay without consulting global
+world state. Pin-level events (`pin_recolored` and `$note` edit observations)
+propagate through `$pin`/`$note` regardless of which board the pin lives on.
 
 ## Permissions story
 
@@ -409,16 +414,20 @@ this is a one-time local state repair.
 
 ## Frontend implications
 
-UI is hardcoded in the SPA, not part of the catalog.
+The current UI renderer still lives in the SPA, but scoped clients consume the
+catalog's observations and `list_notes`/snapshot shapes through the shared
+client projection rather than through a full-world `/api/state` model.
 
 - `list_notes` shape is unchanged on the wire (still
   `[{ id, text, color, x, y, w, h, z, author? }]` — minor field renames),
   so existing pinboard SPA can stay close.
 - `pin.color = null` displays white. Existing palette dropdown may send
   `"white"` for the white swatch; the verb stores it as `null`.
-- New observations: `pin_added`, `pin_removed`, `pin_moved`, `pin_resized`,
-  `pin_recolored`. The umbrella `pinboard_activity` is still emitted for
-  room-level summaries.
+- Board observations: `pinboard_entered`, `pinboard_left`,
+  `pinboard_viewport`, `pin_added`, `pin_removed`, `pin_moved`,
+  `pin_resized`, and `note_added`. The umbrella `pinboard_activity` is still
+  emitted for room-level summaries. Pin color/text changes arrive through
+  `pin_recolored` and the note catalog's `note_edited`.
 - Kanban frontend should not consume `layout`. It consumes `list_columns`
   and renders columns in array order and cards in `cards` order.
 - Kanban observations: `kanban_column_added`, `kanban_column_renamed`,

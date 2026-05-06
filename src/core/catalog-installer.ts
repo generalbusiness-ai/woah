@@ -1070,13 +1070,17 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         perms: parsedPerms.perms,
         direct_callable: parsedPerms.directCallable,
         skip_presence_check: existing.skip_presence_check || def.skip_presence_check === true,
-        tool_exposed: existing.tool_exposed || def.tool_exposed === true
+        tool_exposed: existing.tool_exposed || def.tool_exposed === true,
+        aliases: def.aliases ?? existing.aliases,
+        arg_spec: catalogVerbArgSpec(def, existing.arg_spec)
       };
       if (
         next.perms !== existing.perms ||
         next.direct_callable !== existing.direct_callable ||
         next.skip_presence_check !== existing.skip_presence_check ||
-        next.tool_exposed !== existing.tool_exposed
+        next.tool_exposed !== existing.tool_exposed ||
+        stableStringify(next.aliases ?? []) !== stableStringify(existing.aliases ?? []) ||
+        stableStringify(next.arg_spec ?? {}) !== stableStringify(existing.arg_spec ?? {})
       ) world.addVerb(obj, next);
       return;
     }

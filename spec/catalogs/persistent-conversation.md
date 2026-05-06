@@ -400,13 +400,15 @@ semantics for replayed frames. Out of scope for v1.
 
 The chat UI is a command UI to the current space. It is not a command
 UI to a sidecar chat object. If the current space is `the_pinboard`,
-then free text becomes `the_pinboard:say(...)`; object commands such
-as `drop note` resolve in the pinboard context and dispatch to the
-pinboard's own verbs.
+then explicit speech such as `say hi` or `"hi"` becomes
+`the_pinboard:say(...)`; object commands such as `drop note` resolve
+in the pinboard context and dispatch to the pinboard's own verbs.
 
-`$conversational:command_plan(text)` parses input ("hi" ->
-`:say("hi")`, "/me waves" -> `:emote("waves")`, etc.) and returns
-a plan. The planner MUST determine route from the target verb's
+`$conversational:command_plan(text)` parses explicit command input (`say hi`
+and `"hi"` -> `:say("hi")`, `/me waves` -> `:emote("waves")`, etc.) and
+returns a plan. Bare unmatched text is not implicit speech; it plans through
+the actor-owned `:huh` path and yields a private `I don't understand that.`
+response. The planner MUST determine route from the target verb's
 installed `direct_callable` metadata:
 
 - `$conversational:say` plans as `route: "direct"`.

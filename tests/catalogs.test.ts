@@ -284,6 +284,54 @@ describe("local catalogs", () => {
     ]);
   });
 
+  it("refreshes verb arg_spec and aliases on existing verbs without source repair", async () => {
+    const world = createWorld({ catalogs: false });
+    const source = "verb :poke() rxd {\n  return \"pong\";\n}";
+    world.createObject({ id: "$metadata_probe", name: "$metadata_probe", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(world, "$metadata_probe", "poke", source, null).ok).toBe(true);
+    const before = worldVerb(world, "$metadata_probe", "poke");
+    expect(before.aliases).toEqual([]);
+    expect(before.arg_spec.command).toBeUndefined();
+
+    const manifest: RuntimeCatalogManifest = {
+      name: "metadata-demo",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [
+        {
+          local_name: "$metadata_probe",
+          parent: "$thing",
+          verbs: [
+            {
+              name: "poke",
+              aliases: ["p*oke", "jab"],
+              source,
+              arg_spec: {
+                command: {
+                  dobj: "none",
+                  args_from: ["argstr"]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    };
+
+    installCatalogManifest(world, manifest, { tap: "@local", alias: "metadata-demo", adoptExisting: true });
+
+    const after = worldVerb(world, "$metadata_probe", "poke");
+    expect(after.source).toBe(source);
+    expect(after.version).toBe(before.version);
+    expect(after.aliases).toEqual(["p*oke", "jab"]);
+    expect(after.arg_spec).toEqual({
+      command: {
+        dobj: "none",
+        args_from: ["argstr"]
+      }
+    });
+  });
+
   it("gates major catalog updates behind explicit migration input", async () => {
     const world = createWorld({ catalogs: false });
     const v1: RuntimeCatalogManifest = {

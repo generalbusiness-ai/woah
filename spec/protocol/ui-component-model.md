@@ -1102,12 +1102,17 @@ type ClientProjectionDraft = {
   patchObject(ref: string, fields: Record<string, unknown>): void;
   setObject(ref: string, snapshot: ObjectSnapshot): void;
   removeObject(ref: string): void;
+  clearAuthoritative(ref: string): void;
   patchCatalogState(key: string, fields: Record<string, unknown>): void;
 };
 ```
 
 The draft is the only API a reducer may use to update projection state. Its
 operations are idempotent and write-only; the draft does not expose reads.
+`clearAuthoritative(ref)` removes server-confirmed direct-result patches for a
+subject that has been removed from the current scope, preventing stale
+authoritative entries from resurrecting objects after a scoped snapshot or
+sequenced removal.
 Reducers that need a prior value require the observation to carry it
 explicitly.
 
@@ -1196,7 +1201,13 @@ entry. The framework may fold those authoritative direct results into the
 canonical snapshot layer with an explicit canonical patch operation. That
 operation is not an optimistic or live-preview update: it is treated as
 server-confirmed state, persists across later scoped-snapshot ingestion, and
-clears overlapping live or optimistic fields.
+clears overlapping live or optimistic fields. The operation MAY be a merge or a
+per-key replacement. Replacement is scoped to the keys present in the patch: a
+replacement of `catalogState.pinboard_note` for one note replaces that note's
+authoritative entry without deleting unrelated catalog-state keys on the same
+subject. The framework MUST also provide a way to clear authoritative entries
+for recycled or removed subjects so a direct-result patch cannot resurrect an
+object that has left the current scope.
 
 Optimistic patches use this shape:
 

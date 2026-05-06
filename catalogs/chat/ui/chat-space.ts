@@ -232,7 +232,7 @@ export function renderChatLineHtml(line: ChatLine, actorLabel: ActorLabeler): st
   if (line.kind === "self_pointed") return `<div class="chat-line emote"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(actorLabel(line.actor))} &lt;- ${escapeHtml(line.text ?? "")}</span></div>`;
   if (line.kind === "told") return `<div class="chat-line told"><span class="chat-time">${escapeHtml(time)}</span><strong>${escapeHtml(actorLabel(line.from))} -> ${escapeHtml(actorLabel(line.to))}</strong><span>${escapeHtml(line.text ?? "")}</span></div>`;
   if (line.kind === "huh") {
-    const detail = typeof line.reason === "string" && line.reason ? line.reason : `I don't understand "${line.text ?? ""}".`;
+    const detail = typeof line.reason === "string" && line.reason ? line.reason : "I don't understand that.";
     return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(detail)}</span></div>`;
   }
   if (line.kind === "error") return `<div class="chat-line error"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "That didn't work.")}</span></div>`;
