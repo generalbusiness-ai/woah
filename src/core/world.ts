@@ -712,8 +712,7 @@ export class WooWorld {
       flags: {
         wizard: Boolean(obj.flags.wizard),
         programmer: Boolean(obj.flags.programmer),
-        fertile: Boolean(obj.flags.fertile),
-        recyclable: Boolean(obj.flags.recyclable)
+        fertile: Boolean(obj.flags.fertile)
       },
       modified: obj.modified,
       children_count: obj.children.size,
@@ -2234,8 +2233,7 @@ export class WooWorld {
     const id = this.createBuilderObject(parentRef, actor, anchor, {
       location,
       name: displayName ?? undefined,
-      fertile: optionBool(options, "fertile", false),
-      recyclable: optionBool(options, "recyclable", true)
+      fertile: optionBool(options, "fertile", false)
     });
     if (displayName !== null) this.setProp(id, "name", displayName);
     if (description !== null) this.setProp(id, "description", description);
@@ -2272,7 +2270,6 @@ export class WooWorld {
     }
     const obj = this.object(objRef);
     this.assertCanBuildOwnedObject(actor, objRef);
-    if (!this.isWizard(actor) && obj.flags.recyclable !== true) throw wooError("E_PERM", `${objRef} is not recyclable`, { actor, obj: objRef });
     if (this.inheritsFrom(objRef, "$actor")) throw wooError("E_PERM", "actors cannot be recycled through builder tools", { actor, obj: objRef });
     const impact = {
       id: objRef,
@@ -2752,8 +2749,7 @@ export class WooWorld {
       flags: {
         wizard: obj.flags.wizard === true,
         programmer: obj.flags.programmer === true,
-        fertile: obj.flags.fertile === true,
-        recyclable: obj.flags.recyclable === true
+        fertile: obj.flags.fertile === true
       },
       name: obj.name,
       description: this.propOrNullForActor(actor, objRef, "description"),
@@ -3161,7 +3157,6 @@ export class WooWorld {
     description?: string;
     aliases?: string[];
     fertile?: boolean;
-    recyclable?: boolean;
   } = {}): ObjRef {
     return this.withPersistenceDeferred(() => {
       this.object(parent);
@@ -3178,7 +3173,6 @@ export class WooWorld {
       } while (this.objects.has(id));
       const flags: WooObject["flags"] = {};
       if (typeof options.fertile === "boolean") flags.fertile = options.fertile;
-      if (typeof options.recyclable === "boolean") flags.recyclable = options.recyclable;
       this.createObject({
         id,
         parent,
@@ -3688,7 +3682,7 @@ export class WooWorld {
     this.persist();
   }
 
-  private createBuilderObject(parent: ObjRef, owner: ObjRef, anchor: ObjRef | null, options: { location: ObjRef | null; name?: string; fertile: boolean; recyclable: boolean }): ObjRef {
+  private createBuilderObject(parent: ObjRef, owner: ObjRef, anchor: ObjRef | null, options: { location: ObjRef | null; name?: string; fertile: boolean }): ObjRef {
     this.object(parent);
     this.object(owner);
     if (anchor) this.object(anchor);
@@ -3704,7 +3698,7 @@ export class WooWorld {
       anchor,
       location: options.location,
       name: options.name,
-      flags: { fertile: options.fertile, recyclable: options.recyclable }
+      flags: { fertile: options.fertile }
     });
     this.persistCounters();
     return id;
@@ -4853,10 +4847,10 @@ export class WooWorld {
    * Wizard-only flag mutation. Updates the target's authority/lifecycle bits
    * in place and records a wizard_action audit entry per changed flag.
    *
-   * Allowed flags: wizard, programmer, fertile, recyclable. Unknown keys are
-   * ignored. Boolean coerced; non-bool values raise E_TYPE. The target must
-   * exist; passing $system or $wiz revokes nothing the substrate would not
-   * already protect, but we still audit.
+   * Allowed flags: wizard, programmer, fertile. Unknown keys are ignored.
+   * Boolean coerced; non-bool values raise E_TYPE. The target must exist;
+   * passing $system or $wiz revokes nothing the substrate would not already
+   * protect, but we still audit.
    *
    * Required for the auth.md §A11 "mint a backup wizard" flow — the only
    * in-world surface that can grant wizard authority to a non-substrate
@@ -4865,7 +4859,7 @@ export class WooWorld {
   setObjectFlags(actor: ObjRef, target: ObjRef, flags: Record<string, unknown>): WooObject["flags"] {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to set object flags", { actor, target });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target object not found: ${target}`, target);
-    const allowed = new Set(["wizard", "programmer", "fertile", "recyclable"]);
+    const allowed = new Set(["wizard", "programmer", "fertile"]);
     const obj = this.object(target);
     const before: Record<string, boolean> = { ...obj.flags };
     const changes: Record<string, { from: boolean; to: boolean }> = {};

@@ -36,7 +36,7 @@ programmer capabilities.
 Builder class membership is delegable without granting programmer authority.
 The operation checks are class/parent/owner/quota checks: the actor must inherit
 from `$builder` (or be wizard), own the target where appropriate, use a fertile
-parent, respect recyclable targets, and satisfy deployment policy. A world can
+parent, and satisfy deployment policy. A world can
 reparent a helper actor, object factory, catalog instance, or trusted agent to
 `$builder` without letting that actor install code.
 
@@ -143,7 +143,7 @@ The catalog ships once these are in place:
 | `search(query, opts?)` | Bounded search across object names and property channels. No source. |
 | `create(parent, opts?)` | New ordinary object owned by the invoking actor. `opts: {name?, description?, location?, fertile?}`. No `owner` option. |
 | `chparent(id, parent, opts?)` | Re-parent within owner/fertile/cycle rules. Actor objects must stay under actor-derived parents. `opts.dry_run=true` checks only. |
-| `recycle(id, opts?)` | Destroy owned recyclable objects; `opts.dry_run=true` reports affected objects only. |
+| `recycle(id, opts?)` | Destroy owned objects (wizard-or-owner); `opts.dry_run=true` reports affected objects only. |
 | `set_property(id, name, value, opts?)` | Set ordinary data values; no executable source or permission metadata. |
 
 ### Programmer tools

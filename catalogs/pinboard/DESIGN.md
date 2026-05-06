@@ -403,7 +403,7 @@ Pinboard v0.2 depends on three platform primitives that now exist in v0:
 - `isa(obj, ancestor)` lets `:acceptable` filter by class without naming
   catalog internals in core.
 - `create(parent, options)` accepts an options map with `owner`, `name`,
-  `description`, `aliases`, `location`, `fertile`, and `recyclable`.
+  `description`, `aliases`, `location`, and `fertile`.
 
 ## Migration from v0.1
 

@@ -863,7 +863,6 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           aliases?: string[];
           location?: ObjRef | null;
           fertile?: boolean;
-          recyclable?: boolean;
         } = {};
         const createArg = builtinArgs[1];
         if (createArg === undefined || createArg === null) {
@@ -876,8 +875,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
             description: typeof map.description === "string" ? map.description : undefined,
             aliases: Array.isArray(map.aliases) ? map.aliases.filter((item): item is string => typeof item === "string") : undefined,
             location: map.location === undefined || map.location === null ? null : assertObj(map.location),
-            fertile: typeof map.fertile === "boolean" ? map.fertile : undefined,
-            recyclable: typeof map.recyclable === "boolean" ? map.recyclable : undefined
+            fertile: typeof map.fertile === "boolean" ? map.fertile : undefined
           };
         } else {
           owner = assertObj(createArg);

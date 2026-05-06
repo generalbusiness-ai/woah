@@ -228,15 +228,14 @@ export function parseSqlValue(value: unknown): WooValue {
 }
 
 export function flagsToSqlInt(flags: SerializedObject["flags"]): number {
-  return (flags.wizard ? 1 : 0) | (flags.programmer ? 2 : 0) | (flags.fertile ? 4 : 0) | (flags.recyclable ? 8 : 0);
+  return (flags.wizard ? 1 : 0) | (flags.programmer ? 2 : 0) | (flags.fertile ? 4 : 0);
 }
 
 export function flagsFromSqlInt(flags: number): SerializedObject["flags"] {
   return {
     wizard: Boolean(flags & 1),
     programmer: Boolean(flags & 2),
-    fertile: Boolean(flags & 4),
-    recyclable: Boolean(flags & 8)
+    fertile: Boolean(flags & 4)
   };
 }
 
