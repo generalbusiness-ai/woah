@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -261,7 +261,8 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :enter() rxd { moveto(actor, this); if (!(actor in this.operators)) { this.operators = this.operators + [actor]; } let text = actor.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: this, operators: this.operators, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
         },
@@ -286,7 +287,8 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :out() rxd { return this:leave(); }"
         },

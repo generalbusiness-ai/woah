@@ -763,7 +763,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         aliases: ["p*ing"],
         owner: "$wiz",
         perms: "rxd",
-        arg_spec: {},
+        arg_spec: {
+          command: { dobj: "this", prep: "any", iobj: "any", args_from: [] }
+        },
         source: "verb :ping() rxd { return \"pong\"; }",
         source_hash: "conf-remote-command-ping-seed",
         version: 1,
@@ -773,7 +775,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       });
       expect(installVerb(home, "conf_home_widget", "ping", `verb :ping() rxd {
   return "pong";
-}`, 1).ok).toBe(true);
+}`, 1, { argSpec: { command: { dobj: "this", prep: "any", iobj: "any", args_from: [] } } }).ok).toBe(true);
       roomHost.mirrorContents("conf_remote_room", actor, true);
       roomHost.mirrorContents("conf_remote_room", "conf_home_widget", true);
 

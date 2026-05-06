@@ -6029,9 +6029,6 @@ export class WooWorld {
     const metadataPlan = await this.resolveCommandPlan(ctx, cmd, space, actor);
     if (metadataPlan) return metadataPlan as unknown as WooValue;
 
-    const fallback = await this.fallbackCommandPlan(ctx, cmd, space, actor);
-    if (fallback) return fallback as unknown as WooValue;
-
     if (!text.startsWith("/")) return await this.directCommandPlan(ctx, space, "say", [text], cmd);
     const hookPlan = await this.commandHuhHookPlan(ctx, space, actor, cmd);
     if (hookPlan) return hookPlan;
@@ -6188,6 +6185,12 @@ export class WooWorld {
   }
 
   private async commandSlotMatches(ctx: CallContext, pattern: WooValue, slot: "dobj" | "iobj", cmd: CommandMap, target: ObjRef): Promise<boolean> {
+    if (Array.isArray(pattern)) {
+      for (const item of pattern) {
+        if (await this.commandSlotMatches(ctx, item, slot, cmd, target)) return true;
+      }
+      return false;
+    }
     const text = slot === "dobj" ? cmd.dobjstr : cmd.iobjstr;
     const obj = slot === "dobj" ? (cmd.dobj ?? cmd.dobj_prefix) : cmd.iobj;
     if (pattern === "any") return true;
@@ -6218,45 +6221,6 @@ export class WooWorld {
     if (token === "iobjstr") return cmd.iobjstr;
     if (token === "cmd") return cmd as unknown as WooValue;
     throw wooError("E_INVARG", `unsupported command args_from token: ${token}`, token);
-  }
-
-  // Transitional compatibility path for verbs/catalogs not yet annotated with
-  // arg_spec.command. Delete once bundled chat-shaped verbs all declare command
-  // metadata and source-only callers have a replacement.
-  private async fallbackCommandPlan(ctx: CallContext, cmd: CommandMap, space: ObjRef, actor: ObjRef): Promise<CommandPlan | null> {
-    const objectTarget = cmd.dobj_prefix ?? cmd.dobj;
-    if (objectTarget && objectTarget !== space) {
-      const matched = await this.tryResolveVerbForCommand(ctx, objectTarget, cmd.verb);
-      if (matched) {
-        const args: WooValue[] = cmd.dobj_prefix_rest ? [cmd.dobj_prefix_rest] : [];
-        return await this.commandPlanForResolved(ctx, space, objectTarget, matched.name, args, cmd);
-      }
-    }
-
-    if (cmd.argstr) {
-      const namedObject = await this.matchObjectForActorAsync(cmd.verb, ctx, space, actor);
-      if (namedObject.status === "ok" && namedObject.value !== space) {
-        const sayTo = await this.tryResolveVerbForCommand(ctx, namedObject.value, "on_say_to");
-        if (sayTo) return await this.commandPlanForResolved(ctx, space, namedObject.value, sayTo.name, [cmd.argstr], cmd);
-      }
-    }
-
-    const roomVerb = await this.tryResolveVerbForCommand(ctx, space, cmd.verb);
-    if (roomVerb) {
-      const args: WooValue[] = [];
-      if (cmd.argstr) {
-        const spec = roomVerb.arg_spec ?? {};
-        args.push(spec.resolve === "object" && cmd.dobj_prefix ? cmd.dobj_prefix : cmd.argstr);
-      }
-      return await this.commandPlanForResolved(ctx, space, space, roomVerb.name, args, cmd);
-    }
-
-    const actorVerb = await this.tryResolveVerbForCommand(ctx, actor, cmd.verb);
-    if (actorVerb) {
-      const args = cmd.argstr ? [cmd.argstr] : [];
-      return await this.commandPlanForResolved(ctx, space, actor, actorVerb.name, args, cmd);
-    }
-    return null;
   }
 
   private async directCommandPlan(ctx: CallContext, space: ObjRef, verb: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {

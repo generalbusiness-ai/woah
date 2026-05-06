@@ -3,16 +3,24 @@
 Date: 2026-05-05
 
 Status: Phase 1 through the first browser-facing command execution slice are
-partly implemented. Catalog installs preserve `arg_spec.command`, `$match`
-exposes native-backed `match_command_verb` and `plan_command`,
+implemented. Catalog installs preserve `arg_spec.command`, `$match` exposes
+native-backed `match_command_verb` and `plan_command`,
 `$conversational:command_plan` is a thin wrapper over the shared planner, and
 dubspace no longer ships its own `command_plan`. The WebSocket wire now accepts
 `op:"command"` so the server plans and executes direct/sequenced text commands;
 the browser no longer executes plan descriptors for chat input. The inherited
 catalog `:command(text)` surface executes the same direct/sequenced plans for
 older direct callers. The first huh-hook chain is present for slash-prefixed
-misses (`my_huh`, `here_huh`, `last_huh`); final removal of compatibility
-planner helpers remains open.
+misses (`my_huh`, `here_huh`, `last_huh`). The transitional
+`fallbackCommandPlan` helper has been removed; textual commands now need either
+speech-prefix lowering, command metadata, or an explicit huh hook.
+
+Upgrade note for third-party catalogs: any chat-shaped verb that previously
+worked only because the fallback planner found a room, actor, or nearby-object
+verb by name must now declare `arg_spec.command` metadata or install an explicit
+huh hook. First-party bundled catalogs were annotated in the same change, but
+there is no automatic migration that can infer third-party command patterns
+safely.
 
 ## Problem
 
@@ -432,9 +440,10 @@ changing the world's command language.
 - Once no catalog/client reads the descriptor, remove the plan descriptor
   format.
 
-The next major move after the current compatibility slice is the huh hook chain
-plus retiring compatibility planner helpers once old surfaces no longer call
-`command_plan`.
+The current implementation still returns plan descriptors for callers that
+explicitly invoke `command_plan`, but those descriptors now come from declared
+command metadata, speech-prefix lowering, or huh hooks rather than the removed
+fallback planner.
 
 ## Conditions of satisfaction
 

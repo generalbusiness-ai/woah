@@ -1,6 +1,6 @@
 {
   "name": "pinboard",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "spec_version": "v1",
   "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
@@ -134,7 +134,8 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :enter() rxd { let old = location(actor); moveto(actor, this); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: this, present: this.subscribers, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
         },
@@ -157,7 +158,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :out() rxd { return this:leave(); }"
         },
@@ -242,7 +244,8 @@
             "args": [
               "object"
             ],
-            "resolve": "object"
+            "resolve": "object",
+            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"] }
           },
           "source": "verb :drop(object) rx { let pin = object; if (typeof(object) == \"string\") { pin = $match:match_object(object, actor); } if (pin == $failed_match) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + object + \".\", value: object }; } if (pin == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + object + \" you mean.\", value: object }; } if (location(pin) != actor) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + object + \".\", value: pin }; } if (!isa(pin, $note)) { raise { code: \"E_INVARG\", message: \"only notes can be dropped on the pinboard\", value: pin }; } moveto(pin, this); return pin; }"
         },
@@ -258,7 +261,8 @@
             "args": [
               "pin"
             ],
-            "resolve": "object"
+            "resolve": "object",
+            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"] }
           },
           "source": "verb :take(pin) rx { if (location(pin) != this) { raise { code: \"E_INVARG\", message: \"that note is not on this board\", value: pin }; } if (pin.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the pin's author may take it; board owners use eject\", value: pin }; } moveto(pin, actor); return pin; }"
         },

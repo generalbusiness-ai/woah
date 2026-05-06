@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -270,7 +270,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :north() rxd { set_task_perms(caller_perms()); return this:go(\"north\"); }"
         },
@@ -283,7 +284,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :northeast() rxd { set_task_perms(caller_perms()); return this:go(\"northeast\"); }"
         },
@@ -296,7 +298,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :east() rxd { set_task_perms(caller_perms()); return this:go(\"east\"); }"
         },
@@ -309,7 +312,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :southeast() rxd { set_task_perms(caller_perms()); return this:go(\"southeast\"); }"
         },
@@ -322,7 +326,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :south() rxd { set_task_perms(caller_perms()); return this:go(\"south\"); }"
         },
@@ -335,7 +340,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :southwest() rxd { set_task_perms(caller_perms()); return this:go(\"southwest\"); }"
         },
@@ -348,7 +354,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :west() rxd { set_task_perms(caller_perms()); return this:go(\"west\"); }"
         },
@@ -361,7 +368,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :northwest() rxd { set_task_perms(caller_perms()); return this:go(\"northwest\"); }"
         },
@@ -374,7 +382,8 @@
           "direct_callable": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :out() rxd { set_task_perms(caller_perms()); return this:go(\"out\"); }"
         },
@@ -766,7 +775,8 @@
           "arg_spec": {
             "args": [
               "actor?"
-            ]
+            ],
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old != $nowhere) { try { observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } except err { } } moveto(actor, this); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
         },

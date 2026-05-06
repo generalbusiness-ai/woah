@@ -356,7 +356,9 @@ describe("CFObjectRepository production-shape coverage", () => {
         aliases: ["p*ing"],
         owner: "$wiz",
         perms: "rxd",
-        arg_spec: {},
+        arg_spec: {
+          command: { dobj: "this", prep: "any", iobj: "any", args_from: [] }
+        },
         source: "verb :ping() rxd { return \"pong\"; }",
         source_hash: "cf-remote-command-ping",
         version: 1,

@@ -149,16 +149,24 @@ Pattern values for `dobj` and `iobj` are:
 | `player` | The slot must resolve to a `$player` descendant. |
 | `string` | The slot source text must be present. |
 
+`dobj` and `iobj` may also be a list of these values; the slot matches if any
+listed value matches. Use this for deliberately small overloads such as
+`["none", "this"]`, not as a replacement for separate verbs with distinct
+behavior.
+
 `prep` is `none`, `any`, an exact normalized preposition string, or a list of exact normalized preposition strings.
 
 `args_from` is an ordered list drawn from: `text`, `verb`, `argstr`, `prep`, `dobj`, `dobjstr`, `dobj_prefix`, `dobj_prefix_rest`, `iobj`, `iobjstr`, and `cmd`. These become the actual verb arguments. The parsed command map is available as `cmd` only as an escape hatch.
 
 Command metadata is per verb definition. Aliases share the same command pattern; a different pattern requires a separate verb.
+Source-install authoring APIs MAY attach the same metadata out-of-band as
+`argSpec.command` while the source language lacks first-class `args_from`
+syntax. The stored verb definition is still the source of truth after install.
 
 `$match:plan_command(text, space)` uses this normative target order: direct object, indirect object, command space, actor. Within each target it uses the existing runtime verb lookup rule, including parent chains and features.
 
-When no command-pattern or compatibility verb matches a slash-prefixed command,
-the planner consults optional huh hooks in this order: `actor:my_huh(cmd)`,
+When no command-pattern verb matches a slash-prefixed command, the planner
+consults optional huh hooks in this order: `actor:my_huh(cmd)`,
 `space:here_huh(cmd)`, then `actor:last_huh(cmd)`. A missing hook is ignored. A
 hook that returns a map with an `ok` field supplies the returned plan; returning
 `true` marks the input handled without a follow-on route. The command-plan route

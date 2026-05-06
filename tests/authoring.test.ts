@@ -572,6 +572,19 @@ describe("authoring", () => {
     expect(pingAfter?.direct_callable).toBe(true);
   });
 
+  it("lets authoring callers attach command metadata when installing source", () => {
+    const { world } = authedWorld();
+    world.createObject({ id: "command_metadata_probe", name: "Command Metadata Probe", parent: "$thing", owner: "$wiz" });
+    const installed = installVerb(world, "command_metadata_probe", "ping", `verb :ping() rxd {
+  return "ok";
+}`, null, { argSpec: { command: { dobj: "this", prep: "any", iobj: "any", args_from: [] } } });
+    expect(installed.ok).toBe(true);
+    expect(world.ownVerbExact("command_metadata_probe", "ping")?.arg_spec).toMatchObject({
+      params: [],
+      command: { dobj: "this", prep: "any", iobj: "any", args_from: [] }
+    });
+  });
+
   it("uses structural map equality in T0 EQ", async () => {
     const { world, session, actor } = authedWorld();
     world.addVerb("delay_1", {
