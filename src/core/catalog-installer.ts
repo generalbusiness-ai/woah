@@ -1130,12 +1130,13 @@ function dropStaleOwnVerbs(world: WooWorld, objRef: ObjRef, manifestVerbNames: S
 
 function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, version: number, allowImplementationHints: boolean): VerbDef {
   const parsedPerms = normalizeVerbPerms(def.perms ?? "rx", def.direct_callable === true);
+  const argSpec = catalogVerbArgSpec(def);
   const base = {
     name: def.name,
     aliases: def.aliases ?? [],
     owner,
     perms: parsedPerms.perms,
-    arg_spec: def.arg_spec ?? {},
+    arg_spec: argSpec,
     source: def.source,
     source_hash: hashSource(def.source),
     version,
@@ -1172,7 +1173,7 @@ function compileCatalogVerb(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, ver
     aliases: def.aliases ?? [],
     owner,
     perms: parsedPerms.perms,
-    arg_spec: def.arg_spec ?? compiled.metadata?.arg_spec ?? {},
+    arg_spec: catalogVerbArgSpec(def, compiled.metadata?.arg_spec),
     source: def.source,
     source_hash: compiled.source_hash ?? hashSource(def.source),
     version,
@@ -1182,6 +1183,10 @@ function compileCatalogVerb(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, ver
     skip_presence_check: def.skip_presence_check === true,
     tool_exposed: def.tool_exposed === true
   };
+}
+
+function catalogVerbArgSpec(def: CatalogVerbDef, compiledArgSpec: Record<string, WooValue> = {}): Record<string, WooValue> {
+  return { ...(def.arg_spec ?? compiledArgSpec) };
 }
 
 function resolveObjectRef(

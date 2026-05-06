@@ -100,6 +100,14 @@ type PinboardMapModel = {
   spanY: number;
 };
 
+type PinboardRenderModel = {
+  board: any;
+  notes: any[];
+  present: string[];
+  palette: string[];
+  viewport: { w?: unknown; h?: unknown };
+};
+
 const state: AppState = {
   tab: "chat",
   audioOn: false,
@@ -175,6 +183,7 @@ const taskStatuses = ["open", "claimed", "in_progress", "blocked", "done"] as co
 const directThrottle = new Map<string, number>();
 const pendingDirect = new Map<string, (result: any) => void>();
 const pendingFrameErrors = new Map<string, (error: any) => void>();
+const pendingCommands = new Map<string, { space: string; text: string }>();
 let pinboardNotesRefreshPending = false;
 const pendingTaskSelections = new Set<string>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
@@ -273,21 +282,26 @@ function connect() {
       ui.ingestAppliedFrame(frame);
       applyScopedMoveResult(frame.result);
       const observations = frame.observations ?? [];
+      const frameErrors = appliedFrameErrorObservations({ observations });
       receiveAppliedFrameErrors(frame, observations);
       // Sequenced verb raises arrive as `$error` observations inside applied
       // frames, so keep the pending handler until those observations route.
       if (typeof frame.id === "string") {
-        if (appliedFrameErrorObservations(observations).length > 0) ui.failOptimisticCall(frame.id);
-        else ui.completeOptimisticCall(frame.id);
+        const commandContext = pendingCommands.get(frame.id);
+        if (frameErrors.length > 0) ui.failOptimisticCall(frame.id);
+        else {
+          ui.completeOptimisticCall(frame.id);
+          if (commandContext) renderChatCommandResult(chatCommandUiActionFromMessage(frame.message), frame.result, commandContext.text);
+        }
+        pendingCommands.delete(frame.id);
         pendingFrameErrors.delete(frame.id);
       }
       const pinboardAnimations = capturePinboardAnimations(observations);
       const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
       if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
-      // The server has confirmed any pin moves/resizes that show up here;
-      // first fold those values into the local note model, then clear the
-      // optimistic patch so the render below does not snap back to stale
-      // /api/state coordinates while the follow-up refresh catches up.
+      // Legacy /api/state mode still folds confirmed placement observations
+      // into its pinboard note array. Scoped mode gets the same fields through
+      // the framework reducer above.
       for (const observation of observations) {
         const type = String(observation?.type ?? "");
         if (type === "pin_moved" || type === "pin_resized" || type === "note_moved" || type === "note_resized") {
@@ -322,7 +336,14 @@ function connect() {
       if (typeof frame.id === "string") ui.completeOptimisticCall(frame.id);
       if (handler) {
         pendingDirect.delete(frame.id);
+        if (typeof frame.id === "string") pendingCommands.delete(frame.id);
         handler(frame.result);
+      } else if (typeof frame.id === "string") {
+        const commandContext = pendingCommands.get(frame.id);
+        if (commandContext) {
+          pendingCommands.delete(frame.id);
+          renderChatCommandResult(chatCommandUiActionFromPlan(frame.command), frame.result, commandContext.text);
+        }
       }
     }
     if (frame.op === "task") {
@@ -349,6 +370,7 @@ function connect() {
       if (typeof frame.id === "string") {
         ui.failOptimisticCall(frame.id);
         pendingDirect.delete(frame.id);
+        pendingCommands.delete(frame.id);
         pendingFrameErrors.delete(frame.id);
         pendingTaskSelections.delete(frame.id);
       }
@@ -367,6 +389,7 @@ function connect() {
     if (state.socket !== socket) return;
     stopHeartbeat();
     pendingDirect.clear();
+    pendingCommands.clear();
     pendingFrameErrors.clear();
     pendingTaskSelections.clear();
     scheduleReconnect();
@@ -528,7 +551,7 @@ function objectIdForTab(tab: AppState["tab"]): string {
   if (tab === "chat") return activeChatRoom();
   if (tab === "dubspace") return dubspaceSpace();
   if (tab === "pinboard") return pinboardSpace();
-  if (tab === "taskspace") return state.selectedTask && state.world?.taskspace?.tasks?.[state.selectedTask] ? state.selectedTask : taskspaceSpace();
+  if (tab === "taskspace") return state.selectedTask && taskspaceModel()?.tasks?.[state.selectedTask] ? state.selectedTask : taskspaceSpace();
   if (tab === "ide") return state.selectedObject || defaultSelectedObject();
   return "";
 }
@@ -570,7 +593,7 @@ function routeForObjectId(objectId: string): AppState["tab"] {
   if (objectId === activeChatRoom()) return "chat";
   if (objectId === dubspaceSpace()) return "dubspace";
   if (objectId === pinboardSpace()) return "pinboard";
-  if (state.world?.taskspace?.tasks?.[objectId]) return "taskspace";
+  if (taskspaceModel()?.tasks?.[objectId]) return "taskspace";
   if (state.world?.objects?.[objectId]) return "ide";
   return "chat";
 }
@@ -583,14 +606,16 @@ function applyLocationRoute(mode: "replace" | "push", route: RouteLocation | nul
   const ensureTabPresence = (tab: AppState["tab"]) => {
     if (tab === "dubspace") enterDubspace();
     if (tab === "pinboard") enterPinboard();
+    if (tab === "taskspace") enterTaskspace();
   };
   const viewTab = tabFromViewHint(route.view);
   if (viewTab) {
-    if (viewTab === "taskspace" && state.world?.taskspace?.tasks?.[route.objectId]) setSelectedTask(route.objectId, { apply: false });
+    const taskspace = taskspaceModel();
+    if (viewTab === "taskspace" && taskspace?.tasks?.[route.objectId]) setSelectedTask(route.objectId, { apply: false });
     if (viewTab === "ide" && state.world?.objects?.[route.objectId]) setSelectedObject(route.objectId, { apply: false });
-    if (viewTab === "taskspace" && !state.world?.taskspace?.tasks?.[route.objectId]) setSelectedTask(firstMatchingTask(
-      Array.isArray(state.world?.taskspace?.root_tasks) ? state.world.taskspace.root_tasks : [],
-      state.world?.taskspace?.tasks ?? {},
+    if (viewTab === "taskspace" && !taskspace?.tasks?.[route.objectId]) setSelectedTask(firstMatchingTask(
+      Array.isArray(taskspace?.root_tasks) ? taskspace.root_tasks : [],
+      taskspace?.tasks ?? {},
       activeTaskStatuses()
     ), { apply: false });
     setTab(viewTab, { mode, leaveCurrent: true }, () => {
@@ -600,7 +625,7 @@ function applyLocationRoute(mode: "replace" | "push", route: RouteLocation | nul
   }
 
   const inferredTab = routeForObjectId(route.objectId);
-  if (inferredTab === "taskspace" && state.world?.taskspace?.tasks?.[route.objectId]) {
+  if (inferredTab === "taskspace" && taskspaceModel()?.tasks?.[route.objectId]) {
     setSelectedTask(route.objectId, { apply: false });
     setTab(inferredTab, { mode, leaveCurrent: true }, () => {
       ensureTabPresence(inferredTab);
@@ -715,7 +740,7 @@ async function refresh() {
     syncUrlFromCurrentState("replace");
   }
   audio?.sync(effectiveDubspace(), state.clockOffset);
-  hydratePinboardNotesTextIfNeeded(state.world?.pinboard);
+  hydratePinboardNotesTextIfNeeded(pinboardModel());
   render();
 }
 
@@ -835,7 +860,7 @@ function applyScopedOverlaySnapshot(key: string, snapshot: any) {
     ? { ...(state.scopedProjection.overlays ?? {}), [key]: { subject, surface, restore: true } }
     : state.scopedProjection.overlays ?? {};
   state.scopedProjection = { ...state.scopedProjection, overlays, overlaySnapshots };
-  const objects = overlaySnapshotObjects(snapshot);
+  const objects = overlaySnapshotProjectionObjects(snapshot);
   ui.ingestSnapshot(`overlay:${key}`, objects);
   if (snapshot.cursor?.spaces) {
     for (const [space, record] of Object.entries(snapshot.cursor.spaces)) {
@@ -844,6 +869,9 @@ function applyScopedOverlaySnapshot(key: string, snapshot: any) {
     }
   }
   applyScopedProjectionModel();
+  if (surface === "pinboard") {
+    hydratePinboardNotesTextIfNeeded(pinboardModel());
+  }
 }
 
 function applyScopedProjectionSnapshot(me: any, catalogs: any) {
@@ -975,9 +1003,35 @@ function adaptScopedWorld(me: any, catalogs: any) {
 function overlaySnapshotObjects(snapshot: any): any[] {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return [];
   return [
-    ...arrayOfObjects(snapshot.objects),
-    ...roomSnapshotObjects(snapshot.room)
+    // Room snapshots intentionally carry thin contents; overlay objects carry
+    // the full subject neighborhood. Put thin records first so full overlay
+    // summaries win when the projection ingests duplicate ids.
+    ...roomSnapshotObjects(snapshot.room),
+    ...arrayOfObjects(snapshot.objects)
   ];
+}
+
+function overlaySnapshotProjectionObjects(snapshot: any): any[] {
+  const objects = overlaySnapshotObjects(snapshot);
+  if (snapshot?.surface !== "pinboard") return objects;
+  const subject = typeof snapshot?.subject === "string" ? snapshot.subject : "";
+  const board = objects.find((item) => String(item?.id ?? "") === subject);
+  const layout = pinboardLayoutFromBoard(board);
+  if (!subject || Object.keys(layout).length === 0) return objects;
+  return objects.map((item) => {
+    const id = String(item?.id ?? "");
+    if (!id || !isPinboardNoteSummary(item, subject, layout)) return item;
+    return {
+      ...item,
+      catalogState: {
+        ...(item.catalogState ?? {}),
+        pinboard_note: {
+          ...(item.catalogState?.pinboard_note ?? {}),
+          ...pinboardNoteStateFromSummary(item, layout[id])
+        }
+      }
+    };
+  });
 }
 
 function scopedSummaryToLegacyObject(summary: any) {
@@ -1154,8 +1208,44 @@ function dubspaceObjectIds(meta: any): string[] {
     .filter((id): id is string => typeof id === "string" && Boolean(id));
 }
 
-function projectedDubspace(meta: any = state.world?.dubspaceMeta ?? {}) {
+function projectedDubspace(meta: any = dubspaceMeta()) {
   return Object.fromEntries(dubspaceObjectIds(meta).map((id: string) => [id, projectedObjectView(id)]).filter(([, view]) => view));
+}
+
+function dubspaceMeta(): any {
+  if (!scopedProjectionEnabled) return state.world?.dubspaceMeta ?? {};
+  const space = dubspaceSpace();
+  const objects = overlaySnapshotObjects(dubspaceOverlaySnapshot());
+  const byClass = (localName: string) => {
+    const ids = objects
+      .filter((item) => isCatalogObjectSummary(item, "dubspace", localName) && (localName === "$dubspace" || item?.location === space))
+      .map((item) => String(item.id ?? ""))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+    const unique = [...new Set(ids)];
+    return unique.length > 0 ? unique : bundledSeedRefs(dubspaceManifest, localName);
+  };
+  return {
+    space: byClass("$dubspace")[0] ?? space,
+    slots: byClass("$loop_slot"),
+    channel: byClass("$channel")[0],
+    filter: byClass("$filter")[0],
+    delay: byClass("$delay")[0],
+    drum: byClass("$drum_loop")[0],
+    scene: byClass("$scene")[0]
+  };
+}
+
+function dubspaceOverlaySnapshot(): any {
+  const space = dubspaceSpace();
+  if (!space) return undefined;
+  return state.scopedProjection?.overlaySnapshots?.[`dubspace:${space}`];
+}
+
+function isCatalogObjectSummary(item: any, catalogName: string, localName: string): boolean {
+  const classRef = catalogClass(installedCatalog(state.world, catalogName), localName) ?? localName;
+  const ancestors = Array.isArray(item?.ancestors) ? item.ancestors.map(String) : [];
+  return item?.parent === classRef || item?.parent === localName || ancestors.includes(classRef) || ancestors.includes(localName);
 }
 
 function buildTaskspaceMeta(world: any) {
@@ -1173,6 +1263,171 @@ function projectTaskspace(world: any, meta: any) {
     root_tasks: Array.isArray(space?.props?.root_tasks) ? space.props.root_tasks : [],
     tasks: Object.fromEntries(taskIds.map((id) => [id, objectView(world, id)]).filter(([, view]) => view))
   };
+}
+
+function taskspaceModel(): any {
+  if (!scopedProjectionEnabled) return state.world?.taskspace;
+  const spaceId = taskspaceSpace();
+  if (!spaceId) return undefined;
+  const space = projectedObjectView(spaceId) ?? { id: spaceId, name: spaceId, props: {} };
+  const tree = scopedTaskspaceTree(spaceId);
+  const ids = new Set<string>();
+  for (const id of Array.isArray(space.props?.root_tasks) ? space.props.root_tasks : []) ids.add(String(id));
+  for (const id of Object.keys(tree.parents)) ids.add(id);
+  for (const item of overlaySnapshotObjects(taskspaceOverlaySnapshot())) {
+    const id = String(item?.id ?? "");
+    if (id && isTaskspaceTaskSummary(item)) ids.add(id);
+  }
+  if (state.selectedTask) ids.add(state.selectedTask);
+
+  const tasks: Record<string, any> = {};
+  for (const id of ids) {
+    const view = taskspaceProjectedTask(id);
+    if (view) tasks[id] = view;
+  }
+
+  const childIds = new Map<string, Set<string>>();
+  const roots = new Set<string>();
+  for (const [id, task] of Object.entries(tasks)) {
+    const parent = taskspaceTaskParent(id, task, tree.parents);
+    task.props.parent_task = parent;
+    if (parent && tasks[parent]) {
+      if (!childIds.has(parent)) childIds.set(parent, new Set());
+      childIds.get(parent)!.add(id);
+    } else {
+      roots.add(id);
+    }
+  }
+
+  for (const [id, task] of Object.entries(tasks)) {
+    const children = [...(childIds.get(id) ?? new Set<string>())];
+    task.props.subtasks = sortTaskChildren(children, id, tasks, tree.index);
+  }
+
+  return {
+    space,
+    root_tasks: sortTaskChildren([...roots], null, tasks, tree.index),
+    tasks
+  };
+}
+
+function scopedTaskspaceTree(spaceId: string): { parents: Record<string, string | null>; index: Record<string, number> } {
+  const raw = ui.observe(spaceId)?.catalogState.taskspace_tree;
+  const parents: Record<string, string | null> = {};
+  const index: Record<string, number> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { parents, index };
+  for (const [key, value] of Object.entries(raw)) {
+    if (key.startsWith("index:")) {
+      const task = key.slice("index:".length);
+      const numeric = Number(value);
+      if (task && Number.isFinite(numeric)) index[task] = numeric;
+    } else {
+      parents[key] = typeof value === "string" ? value : null;
+    }
+  }
+  return { parents, index };
+}
+
+function taskspaceTaskParent(id: string, task: any, parents: Record<string, string | null>): string | null {
+  if (Object.prototype.hasOwnProperty.call(parents, id)) return parents[id];
+  const parent = task?.props?.parent_task;
+  return typeof parent === "string" && parent ? parent : null;
+}
+
+function sortTaskChildren(ids: string[], parent: string | null, tasks: Record<string, any>, overlayIndex: Record<string, number>): string[] {
+  const baseOrder = parent
+    ? Array.isArray(tasks[parent]?.props?.subtasks) ? tasks[parent].props.subtasks.map(String) : []
+    : Array.isArray(projectedObjectView(taskspaceSpace())?.props?.root_tasks) ? projectedObjectView(taskspaceSpace())!.props.root_tasks.map(String) : [];
+  const baseIndex = new Map(baseOrder.map((id: string, index: number) => [id, index]));
+  return [...new Set(ids)].sort((a, b) => {
+    const ai = overlayIndex[a] ?? baseIndex.get(a) ?? Number.MAX_SAFE_INTEGER;
+    const bi = overlayIndex[b] ?? baseIndex.get(b) ?? Number.MAX_SAFE_INTEGER;
+    return ai - bi || String(tasks[a]?.props?.title ?? a).localeCompare(String(tasks[b]?.props?.title ?? b)) || a.localeCompare(b);
+  });
+}
+
+function taskspaceProjectedTask(id: string): any | undefined {
+  const projected = ui.observe(id);
+  const legacy = state.world?.taskspace?.tasks?.[id];
+  if (!projected && !legacy) return undefined;
+  const overlay = projected?.catalogState.taskspace_task ?? {};
+  const props = {
+    ...(legacy?.props ?? {}),
+    ...(projected?.props ?? {})
+  };
+  for (const key of ["title", "description", "parent_task", "status", "assignee", "space"]) {
+    if (Object.prototype.hasOwnProperty.call(overlay, key)) props[key] = (overlay as any)[key];
+  }
+  props.requirements = mergeTaskspaceRequirements(props.requirements, overlay);
+  props.messages = mergeTaskspaceMessages(props.messages, overlay);
+  props.artifacts = mergeTaskspaceArtifacts(props.artifacts, overlay);
+  return {
+    id,
+    name: projected?.name ?? legacy?.name ?? props.title ?? id,
+    owner: projected?.owner ?? legacy?.owner,
+    parent: projected?.parent ?? legacy?.parent,
+    location: projected?.location ?? legacy?.location,
+    props
+  };
+}
+
+function mergeTaskspaceRequirements(base: any, overlay: Record<string, unknown>): any[] {
+  const out = Array.isArray(base) ? base.map((item) => ({ ...(item && typeof item === "object" && !Array.isArray(item) ? item : {}) })) : [];
+  for (const [key, value] of Object.entries(overlay)) {
+    if (!key.startsWith("requirement:")) continue;
+    const index = Number(key.slice("requirement:".length));
+    if (!Number.isInteger(index) || index < 0 || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    out[index] = { ...(out[index] ?? {}), ...(value as Record<string, unknown>) };
+  }
+  for (const [key, value] of Object.entries(overlay)) {
+    if (!key.startsWith("requirement_checked:")) continue;
+    const index = Number(key.slice("requirement_checked:".length));
+    if (!Number.isInteger(index) || index < 0) continue;
+    out[index] = { ...(out[index] ?? {}), checked: value === true };
+  }
+  return out.filter((item) => item !== undefined);
+}
+
+function mergeTaskspaceMessages(base: any, overlay: Record<string, unknown>): any[] {
+  const out = Array.isArray(base) ? [...base] : [];
+  const seen = new Set(out.map((item: any) => `message:${String(item?.ts ?? "")}:${String(item?.body ?? "")}`));
+  for (const [key, value] of Object.entries(overlay)) {
+    if (!key.startsWith("message:") || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    const item = value as Record<string, unknown>;
+    const dedupe = `message:${String(item.ts ?? "")}:${String(item.body ?? "")}`;
+    if (!seen.has(dedupe)) {
+      seen.add(dedupe);
+      out.push(item);
+    }
+  }
+  return out.sort((a: any, b: any) => Number(a?.ts ?? 0) - Number(b?.ts ?? 0));
+}
+
+function mergeTaskspaceArtifacts(base: any, overlay: Record<string, unknown>): any[] {
+  const out = Array.isArray(base) ? [...base] : [];
+  const seen = new Set(out.map((item: any) => `${String(item?.kind ?? "")}:${String(item?.ref ?? "")}`));
+  for (const [key, value] of Object.entries(overlay)) {
+    if (!key.startsWith("artifact:") || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    const item = value as Record<string, unknown>;
+    const dedupe = `${String(item.kind ?? "")}:${String(item.ref ?? "")}`;
+    if (!seen.has(dedupe)) {
+      seen.add(dedupe);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function taskspaceOverlaySnapshot(): any {
+  const space = taskspaceSpace();
+  if (!space) return undefined;
+  return state.scopedProjection?.overlaySnapshots?.[`taskspace:${space}`];
+}
+
+function isTaskspaceTaskSummary(item: any): boolean {
+  const taskClass = catalogClass(installedCatalog(state.world, "taskspace"), "$task") ?? "$task";
+  const ancestors = Array.isArray(item?.ancestors) ? item.ancestors.map(String) : [];
+  return item?.parent === taskClass || item?.parent === "$task" || ancestors.includes(taskClass) || ancestors.includes("$task");
 }
 
 function buildPinboardMeta(world: any) {
@@ -1196,6 +1451,155 @@ function projectPinboard(world: any, meta: any) {
     palette,
     viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : { w: 960, h: 560 }
   };
+}
+
+function pinboardModel(): PinboardRenderModel | undefined {
+  if (!scopedProjectionEnabled) return state.world?.pinboard;
+  const boardId = pinboardSpace();
+  if (!boardId) return undefined;
+  const projected = ui.observe(boardId);
+  const board = {
+    id: boardId,
+    name: projected?.name ?? boardId,
+    owner: projected?.owner,
+    parent: projected?.parent,
+    location: projected?.location,
+    props: { ...(projected?.props ?? {}) },
+    catalogState: { ...(projected?.catalogState ?? {}) }
+  };
+  const props = board.props ?? {};
+  const palette = pinboardPalette(props.palette);
+  state.pinboardNewColor = normalizePinboardStickyColor(state.pinboardNewColor, palette);
+  const layout = pinboardLayoutFromBoard(board);
+  const removed = pinboardLayoutTombstones(board);
+  const noteIds = pinboardProjectedNoteIds(boardId, layout, [], removed);
+  return {
+    board,
+    notes: normalizePinboardNotes(noteIds.map((id) => pinboardProjectedNote(id, layout[id])).filter(Boolean)),
+    present: scopedPinboardPresentActors(boardId, props),
+    palette,
+    viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : { w: 960, h: 560 }
+  };
+}
+
+function scopedPinboardPresentActors(boardId: string, props: Record<string, unknown>): string[] {
+  const present = new Set(Array.isArray(props.subscribers) ? props.subscribers.map(String) : []);
+  const presence = ui.observe(boardId)?.catalogState.pinboard_presence;
+  if (presence && typeof presence === "object" && !Array.isArray(presence)) {
+    for (const [actor, value] of Object.entries(presence)) {
+      if (value === false) present.delete(actor);
+      else if (value === true) present.add(actor);
+    }
+  }
+  if (present.size > 0) return [...present];
+  const room = pinboardOverlaySnapshot()?.room;
+  const fromRoom = idsFromRefsOrSummaries(Array.isArray(room?.present_actors) ? room.present_actors : []);
+  if (fromRoom.length > 0) return fromRoom;
+  // Last-resort local fallback: before the first overlay/presence frame lands,
+  // show the user in their own active pinboard rather than an empty presence
+  // map. This is not an authoritative subscriber list.
+  return state.actor && state.scopedProjection?.session?.current_location === boardId ? [state.actor] : [];
+}
+
+function pinboardLayoutFromBoard(board: any): Record<string, any> {
+  const layout = board?.props?.layout;
+  const base = layout && typeof layout === "object" && !Array.isArray(layout) ? layout : {};
+  const overlay = board?.catalogState?.pinboard_layout;
+  if (!overlay || typeof overlay !== "object" || Array.isArray(overlay)) return base;
+  const merged: Record<string, any> = { ...base };
+  for (const [id, value] of Object.entries(overlay)) {
+    if (value === null) delete merged[id];
+    else if (value && typeof value === "object" && !Array.isArray(value)) merged[id] = { ...(merged[id] ?? {}), ...value };
+  }
+  return merged;
+}
+
+function pinboardLayoutTombstones(board: any): Set<string> {
+  const overlay = board?.catalogState?.pinboard_layout;
+  const removed = new Set<string>();
+  if (!overlay || typeof overlay !== "object" || Array.isArray(overlay)) return removed;
+  for (const [id, value] of Object.entries(overlay)) {
+    if (value === null) removed.add(id);
+  }
+  return removed;
+}
+
+function pinboardProjectedNoteIds(boardId: string, layout: Record<string, any>, legacyNotes: any[] = [], removed = new Set<string>()): string[] {
+  const ids = new Set<string>();
+  for (const id of Object.keys(layout)) {
+    if (!removed.has(id)) ids.add(id);
+  }
+  for (const note of Array.isArray(legacyNotes) ? legacyNotes : []) {
+    const id = String(note?.id ?? "");
+    if (id && !removed.has(id)) ids.add(id);
+  }
+  const snapshot = pinboardOverlaySnapshot();
+  for (const item of overlaySnapshotObjects(snapshot)) {
+    const id = String(item?.id ?? "");
+    if (id && !removed.has(id) && isPinboardNoteSummary(item, boardId, layout)) ids.add(id);
+  }
+  return [...ids];
+}
+
+function pinboardProjectedNote(id: string, layoutEntry: any, legacyNotes: any[] = []): any | undefined {
+  const projected = ui.observe(id);
+  const previous = Array.isArray(legacyNotes) ? legacyNotes.find((note) => String(note?.id ?? "") === id) : undefined;
+  const noteState = projected?.catalogState.pinboard_note ?? {};
+  const entry = layoutEntry && typeof layoutEntry === "object" && !Array.isArray(layoutEntry) ? layoutEntry : {};
+  if (!projected && !previous && Object.keys(entry).length === 0) return undefined;
+  // Priority is deliberate: observation-reduced catalogState is the current
+  // UI model; projection props carry static readable note fields; the optional
+  // legacy cache is used only by `/api/state` mode; board layout fills
+  // placement defaults.
+  return {
+    id,
+    name: projected?.name ?? previous?.name ?? id,
+    owner: projected?.owner ?? previous?.owner ?? previous?.author,
+    author: noteState.author ?? projected?.owner ?? previous?.author ?? previous?.owner,
+    writers: noteState.writers ?? projected?.props?.writers ?? previous?.writers,
+    text: noteState.text ?? projected?.props?.text ?? previous?.text,
+    color: noteState.color ?? projected?.props?.color ?? previous?.color,
+    x: noteState.x ?? entry.x ?? previous?.x,
+    y: noteState.y ?? entry.y ?? previous?.y,
+    w: noteState.w ?? entry.w ?? previous?.w,
+    h: noteState.h ?? entry.h ?? previous?.h,
+    z: noteState.z ?? entry.z ?? previous?.z,
+    created_at: noteState.created_at ?? previous?.created_at,
+    updated_at: noteState.updated_at ?? previous?.updated_at,
+    updated_by: noteState.updated_by ?? previous?.updated_by
+  };
+}
+
+function pinboardOverlaySnapshot(): any {
+  const board = pinboardSpace();
+  if (!board) return undefined;
+  return state.scopedProjection?.overlaySnapshots?.[`pinboard:${board}`];
+}
+
+function isPinboardNoteSummary(item: any, boardId: string, layout: Record<string, any>): boolean {
+  const id = String(item?.id ?? "");
+  if (!id) return false;
+  // Overlay snapshots do not yet carry catalog-specific `kind: "pin"`
+  // metadata, so the bridge recognizes pins by layout membership first, then
+  // by location plus class summary. Replace this with catalog-provided
+  // snapshot transforms when UCM component loading owns pinboard rendering.
+  if (Object.prototype.hasOwnProperty.call(layout, id)) return true;
+  if (item?.location === boardId && (item?.parent === "$pin" || item?.parent === "$note")) return true;
+  const ancestors = Array.isArray(item?.ancestors) ? item.ancestors.map(String) : [];
+  return item?.location === boardId && (ancestors.includes("$pin") || ancestors.includes("$note"));
+}
+
+function pinboardNoteStateFromSummary(item: any, layoutEntry: any): Record<string, unknown> {
+  const entry = layoutEntry && typeof layoutEntry === "object" && !Array.isArray(layoutEntry) ? layoutEntry : {};
+  const props = item?.props && typeof item.props === "object" && !Array.isArray(item.props) ? item.props : {};
+  const out: Record<string, unknown> = {};
+  for (const key of ["x", "y", "z", "w", "h"]) if (entry[key] !== undefined) out[key] = entry[key];
+  for (const key of ["text", "color", "writers"]) if (props[key] !== undefined && props[key] !== null) out[key] = props[key];
+  if (typeof item?.owner === "string") {
+    out.owner = item.owner;
+    out.author = item.owner;
+  }
+  return out;
 }
 
 function pinboardNotesFromContents(world: any, boardId: string | undefined, layoutValue: any) {
@@ -1301,18 +1705,67 @@ function projectChat(world: any, meta: any) {
 }
 
 function defaultSelectedObject() {
-  return state.world?.dubspaceMeta?.delay ?? Object.keys(state.world?.objects ?? {}).sort()[0] ?? "";
+  return dubspaceMeta().delay ?? Object.keys(state.world?.objects ?? {}).sort()[0] ?? "";
 }
 
 function dubspaceSpace() {
+  if (scopedProjectionEnabled) {
+    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+    if (route?.view === "dubspace" && route.objectId) return route.objectId;
+    if (route?.objectId === bundledToolSeeds.dubspace) return route.objectId;
+    const overlays = state.scopedProjection?.overlays ?? {};
+    for (const handle of Object.values(overlays)) {
+      const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
+      const surface = typeof (handle as any)?.surface === "string" ? (handle as any).surface : "";
+      if (subject && surface === "dubspace") return subject;
+    }
+    const current = state.scopedProjection?.session?.current_location;
+    if (typeof current === "string" && current === bundledToolSeeds.dubspace) return current;
+    return bundledToolSeeds.dubspace;
+  }
   return String(state.world?.dubspaceMeta?.space ?? "");
 }
 
 function taskspaceSpace() {
+  if (scopedProjectionEnabled) {
+    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+    if (route?.view === "taskspace" && route.objectId) {
+      const routedTask = taskspaceProjectedTask(route.objectId);
+      const routedSpace = routedTask?.props?.space;
+      return typeof routedSpace === "string" && routedSpace ? routedSpace : route.objectId;
+    }
+    if (route?.objectId === bundledToolSeeds.taskspace) return route.objectId;
+    const overlays = state.scopedProjection?.overlays ?? {};
+    for (const handle of Object.values(overlays)) {
+      const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
+      const surface = typeof (handle as any)?.surface === "string" ? (handle as any).surface : "";
+      if (subject && surface === "taskspace") return subject;
+    }
+    const current = state.scopedProjection?.session?.current_location;
+    if (typeof current === "string" && current === bundledToolSeeds.taskspace) return current;
+    return bundledToolSeeds.taskspace;
+  }
   return String(state.world?.taskspaceMeta?.space ?? "");
 }
 
 function pinboardSpace() {
+  if (scopedProjectionEnabled) {
+    // Scoped mode can render the bundled demo pinboard before the overlay
+    // snapshot arrives. Returning the bundled seed is a temporary route
+    // allowlist fallback, not a claim that every installed world has that id.
+    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+    if (route?.view === "pinboard" && route.objectId) return route.objectId;
+    if (route?.objectId === bundledToolSeeds.pinboard) return route.objectId;
+    const overlays = state.scopedProjection?.overlays ?? {};
+    for (const handle of Object.values(overlays)) {
+      const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
+      const surface = typeof (handle as any)?.surface === "string" ? (handle as any).surface : "";
+      if (subject && surface === "pinboard") return subject;
+    }
+    const current = state.scopedProjection?.session?.current_location;
+    if (typeof current === "string" && current === bundledToolSeeds.pinboard) return current;
+    return bundledToolSeeds.pinboard;
+  }
   return String(state.world?.pinboardMeta?.board ?? "");
 }
 
@@ -1408,6 +1861,21 @@ function direct(target: string, verb: string, args: unknown[] = [], onResult?: (
   if (onError) pendingFrameErrors.set(id, onError);
   if (!sendFrame({ op: "direct", id, target, verb, args })) {
     ui.failOptimisticCall(id);
+    pendingDirect.delete(id);
+    pendingFrameErrors.delete(id);
+  }
+  return id;
+}
+
+function command(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
+  const id = crypto.randomUUID();
+  ui.applyOptimisticCall(id, options);
+  pendingCommands.set(id, { space, text });
+  if (onResult) pendingDirect.set(id, onResult);
+  if (onError) pendingFrameErrors.set(id, onError);
+  if (!sendFrame({ op: "command", id, space, text })) {
+    ui.failOptimisticCall(id);
+    pendingCommands.delete(id);
     pendingDirect.delete(id);
     pendingFrameErrors.delete(id);
   }
@@ -1698,7 +2166,7 @@ function rememberTaskObservations(observations: any[], frameId?: string) {
 }
 
 function syncTaskSelection() {
-  const taskspace = state.world?.taskspace;
+  const taskspace = taskspaceModel();
   const tasks = taskspace?.tasks ?? {};
   const roots = Array.isArray(taskspace?.root_tasks) ? taskspace.root_tasks : [];
   const active = activeTaskStatuses();
@@ -1845,6 +2313,7 @@ function bindCommon() {
         if (!wasDifferent) return;
         if (next === "dubspace") enterDubspace();
         if (next === "pinboard") enterPinboard();
+        if (next === "taskspace") enterTaskspace();
       });
     });
   });
@@ -1884,7 +2353,7 @@ function installBundledCatalogUi() {
 
 function renderDubspace() {
   const dub = effectiveDubspace();
-  const meta = state.world?.dubspaceMeta ?? {};
+  const meta = dubspaceMeta();
   const space = meta.space ? dub[meta.space] : null;
   const spaceId = typeof meta.space === "string" ? meta.space : "";
   const operators = dubspaceOperators();
@@ -1975,7 +2444,7 @@ function dubspaceOperators(): string[] {
 
 function renderFilterStrip(filter: any) {
   const cutoff = filter.cutoff ?? 1000;
-  const target = state.world?.dubspaceMeta?.filter ?? "";
+  const target = dubspaceMeta().filter ?? "";
   return `
     <div class="filter-strip">
       <div class="loop-strip-head">
@@ -2089,7 +2558,7 @@ function bindDubspace() {
   document.querySelectorAll<HTMLElement>("[data-pitch-dial]").forEach((dial) => bindPitchDial(dial));
   document.querySelector<HTMLButtonElement>("[data-transport]")?.addEventListener("click", (event) => {
     const mode = (event.currentTarget as HTMLButtonElement).dataset.transport;
-    const drum = state.world?.dubspaceMeta?.drum ?? "";
+    const drum = dubspaceMeta().drum ?? "";
     const props = mode === "stop"
       ? { playing: false }
       : { playing: true, started_at: Date.now() + state.clockOffset };
@@ -2097,14 +2566,14 @@ function bindDubspace() {
   });
   document.querySelector<HTMLInputElement>("[data-tempo]")?.addEventListener("change", (event) => {
     const bpm = Number((event.currentTarget as HTMLInputElement).value);
-    const drum = state.world?.dubspaceMeta?.drum ?? "";
+    const drum = dubspaceMeta().drum ?? "";
     callDubspaceMutation("set_tempo", [bpm], dubspaceOptimisticProps(drum, { bpm }, `${drum}:bpm`));
   });
   document.querySelectorAll<HTMLButtonElement>("[data-step]").forEach((button) => {
     button.addEventListener("click", () => {
       const [voice, step] = button.dataset.step!.split(":");
       const enabled = button.dataset.enabled !== "true";
-      const drum = state.world?.dubspaceMeta?.drum ?? "";
+      const drum = dubspaceMeta().drum ?? "";
       const pattern = patternWithStep(projectedObjectView(drum)?.props?.pattern, voice, Number(step), enabled);
       callDubspaceMutation("set_drum_step", [voice, Number(step), enabled], dubspaceOptimisticProps(drum, { pattern }, `${drum}:pattern`));
     });
@@ -2115,7 +2584,7 @@ function bindDubspace() {
   });
   document.querySelector<HTMLButtonElement>("[data-recall-scene]")?.addEventListener("click", () => {
     const space = dubspaceSpace();
-    const scene = state.world?.dubspaceMeta?.scene;
+    const scene = dubspaceMeta().scene;
     if (space && scene) call(space, space, "recall_scene", [scene]);
   });
 }
@@ -2338,6 +2807,7 @@ function pinboardObservationNeedsNotesRefresh(type: string) {
 function applyPinboardPlacementObservation(observation: any): boolean {
   const type = String(observation?.type ?? "");
   if (type !== "pin_moved" && type !== "pin_resized" && type !== "note_moved" && type !== "note_resized") return false;
+  if (scopedProjectionEnabled) return false;
   const id = String(observation?.pin ?? observation?.id ?? "");
   const notes = state.world?.pinboard?.notes;
   if (!id || !Array.isArray(notes)) return false;
@@ -2996,44 +3466,29 @@ function sendChatInput(space: string, text: string) {
   // Local-only echo so the feed reads as a transcript; never emitted server-side.
   pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
   ensureSpacePresence(space, () => {
-    direct(space, "command_plan", [text], (plan) => executeChatPlan(space, plan, text), receiveChatError);
+    command(space, text, undefined, receiveChatError);
   }, receiveChatError);
 }
 
-function executeChatPlan(currentSpace: string, plan: any, originalText: string) {
-  if (!plan || plan.ok !== true) return;
-  const route = String(plan.route ?? "");
-  const target = String(plan.target ?? "");
-  const verb = String(plan.verb ?? "");
-  const args = Array.isArray(plan.args) ? plan.args : [];
-  if (!target || !verb) return;
-  if (route === "sequenced") {
-    const space = String(plan.space ?? currentSpace);
-    const options = chatPlanProjectionOptions(plan);
-    if (space) callWithError(space, target, verb, args, receiveChatError, options);
-    if (options && state.tab === "dubspace") render();
-    return;
-  }
-  if (route === "direct") {
-    direct(target, verb, args, (result) => renderChatCommandResult(plan, result, originalText), receiveChatError);
-  }
+type ChatCommandUiAction = { verb: string; target: string };
+
+function chatCommandUiActionFromMessage(message: any): ChatCommandUiAction {
+  return {
+    verb: String(message?.verb ?? ""),
+    target: String(message?.target ?? "")
+  };
 }
 
-function chatPlanProjectionOptions(plan: any): ProjectionCallOptions | undefined {
-  const target = String(plan?.target ?? "");
-  const verb = String(plan?.verb ?? "");
-  if (target === dubspaceSpace() && verb === "set_tempo") {
-    const bpm = clamp(Math.round(Number(plan?.args?.[0])), 60, 200);
-    const drum = state.world?.dubspaceMeta?.drum ?? "";
-    if (drum && Number.isFinite(bpm)) return dubspaceOptimisticProps(drum, { bpm }, `${drum}:bpm`);
-  }
-  return undefined;
+function chatCommandUiActionFromPlan(plan: any): ChatCommandUiAction {
+  return {
+    verb: String(plan?.verb ?? ""),
+    target: String(plan?.target ?? "")
+  };
 }
 
-function renderChatCommandResult(plan: any, result: any, originalText: string) {
+function renderChatCommandResult(action: ChatCommandUiAction, result: any, originalText: string) {
   applyScopedMoveResult(result);
-  const verb = String(plan?.verb ?? "");
-  const target = String(plan?.target ?? "");
+  const { verb, target } = action;
   if (verb === "enter" && target === dubspaceSpace()) {
     setDubspaceOperators(result);
     setTab("dubspace", { mode: "push", leaveCurrent: false });
@@ -3129,7 +3584,7 @@ function actorLabel(id: string | undefined) {
 }
 
 function renderPinboard() {
-  const pinboard = state.world?.pinboard;
+  const pinboard = pinboardModel();
   const board = pinboard?.board;
   const present = Array.isArray(pinboard?.present) ? pinboard.present : [];
   const inBoard = pinboardActorPresent();
@@ -3169,7 +3624,7 @@ function renderPinboard() {
       </div>
       <aside class="panel pinboard-presence">
         <h2>Presence</h2>
-        <div data-pinboard-map-shell>${renderPinboardMap(notes, present, width, height)}</div>
+        <div data-pinboard-map-shell>${renderPinboardMap(notes, present, width, height, pinboard.palette)}</div>
       </aside>
     </section>
   `;
@@ -3197,21 +3652,21 @@ function renderSpaceChatPanel(space: string) {
   return `<${tag} class="panel space-chat-panel" data-space-chat-panel data-space-chat-space="${escapeHtml(space)}" style="height:${height}px"></${tag}>`;
 }
 
-function renderPinboardMap(notes: any[], present: string[], width: number, height: number) {
+function renderPinboardMap(notes: any[], present: string[], width: number, height: number, palette: string[] = pinboardModel()?.palette ?? []) {
   const model = pinboardMapModel(notes, present, width, height);
   return `
     <div class="pinboard-map" data-pinboard-map data-min-x="${roundCss(model.minX)}" data-min-y="${roundCss(model.minY)}" data-span-x="${roundCss(model.spanX)}" data-span-y="${roundCss(model.spanY)}" aria-label="Pinboard overview">
-      ${renderPinboardMapNotes(notes, model)}
+      ${renderPinboardMapNotes(notes, model, palette)}
       ${renderPinboardMapViewports(present, model, width, height)}
       ${present.length === 0 ? `<p class="pinboard-map-empty">No one is here.</p>` : ""}
     </div>
   `;
 }
 
-function renderPinboardMapNotes(notes: any[], model: PinboardMapModel) {
+function renderPinboardMapNotes(notes: any[], model: PinboardMapModel, palette: string[]) {
   return notes.map((note: any) => {
     const id = String(note?.id ?? "");
-    const color = pinNoteColor(note, state.world?.pinboard?.palette);
+    const color = pinNoteColor(note, palette);
     return `<div class="pinboard-map-note pin-note-${escapeHtml(color)}" data-pinboard-map-note="${escapeHtml(id)}" style="${pinboardMapBoxStyle(pinNoteRecordBox(note), model)}"></div>`;
   }).join("");
 }
@@ -3350,6 +3805,18 @@ function pinboardPlacementOptimistic(id: string, patch: { x?: number; y?: number
   };
 }
 
+function pinboardNoteOptimistic(id: string, patch: Record<string, unknown>): ProjectionCallOptions | undefined {
+  if (!id || Object.keys(patch).length === 0) return undefined;
+  return {
+    optimistic: {
+      id: `pinboard:${id}:note`,
+      patches: [{ subject: id, catalogState: { pinboard_note: patch } }],
+      ttlMs: PINBOARD_OPTIMISTIC_TTL_MS,
+      reconcile: "drop_on_applied"
+    }
+  };
+}
+
 function applyProjectedPinPatch<T extends { x: number; y: number; w: number; h: number }>(id: string, base: T): T {
   ui.prune();
   const projected = ui.observe(id)?.catalogState.pinboard_note;
@@ -3411,7 +3878,8 @@ function pinNoteWritable(note: any, editable: boolean): boolean {
 function pinNoteAction(note: any, editable: boolean): { verb: "take" | "eject"; label: string; text: string } | null {
   if (!editable || !state.actor) return null;
   const owner = typeof note?.owner === "string" ? note.owner : typeof note?.author === "string" ? note.author : "";
-  const boardOwner = typeof state.world?.pinboard?.board?.owner === "string" ? state.world.pinboard.board.owner : "";
+  const board = pinboardModel()?.board;
+  const boardOwner = typeof board?.owner === "string" ? board.owner : "";
   if (owner === state.actor) return { verb: "take", label: "Take note", text: "x" };
   if (boardOwner === state.actor) return { verb: "eject", label: "Eject note", text: "x" };
   return null;
@@ -3437,7 +3905,7 @@ function normalizePinboardStickyColor(value: unknown, palette: any): string {
   return colors[0] ?? "white";
 }
 
-function rememberPinboardNewColor(value: unknown, palette: any = state.world?.pinboard?.palette) {
+function rememberPinboardNewColor(value: unknown, palette: any = pinboardModel()?.palette) {
   const color = normalizePinboardStickyColor(value, palette);
   state.pinboardNewColor = color;
   writeStorage(pinboardNewColorKey, color);
@@ -3476,7 +3944,7 @@ function bindPinboard() {
       const text = (textInput?.value ?? state.pinboardNewText).trim();
       if (!text) return;
       const placement = newPinNotePlacement();
-      const color = normalizePinboardStickyColor(colorInput?.value, state.world?.pinboard?.palette);
+      const color = normalizePinboardStickyColor(colorInput?.value, pinboardModel()?.palette);
       rememberPinboardNewColor(color);
       pinboardCall("add_note", [text, color, placement.x, placement.y, placement.w, placement.h]);
       state.pinboardNewText = "";
@@ -3497,14 +3965,15 @@ function bindPinboard() {
       const text = input.value;
       if (!id || text === input.dataset.original) return;
       input.dataset.original = text;
-      pinboardTargetCall(id, "set_text", [text.split(/\r?\n/)]);
+      const lines = text.split(/\r?\n/);
+      pinboardTargetCall(id, "set_text", [lines], pinboardNoteOptimistic(id, { text: lines }));
     });
   });
   document.querySelectorAll<HTMLSelectElement>("[data-pin-note-color]").forEach((select) => {
     select.addEventListener("change", () => {
       const id = select.dataset.pinNoteColor ?? "";
       rememberPinboardNewColor(select.value);
-      if (id) pinboardTargetCall(id, "set_color", [select.value]);
+      if (id) pinboardTargetCall(id, "set_color", [select.value], pinboardNoteOptimistic(id, { color: select.value === "white" ? null : select.value }));
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-pin-note-action]").forEach((button) => {
@@ -3535,7 +4004,7 @@ function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChat
   panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
   setCustomElementData(panel, {
     space,
-    spaceName: objectName(state.world, space),
+    spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
     lines,
     draft: spaceChatDraft(space),
     height: Math.round(spaceChatHeight(space))
@@ -3613,7 +4082,7 @@ function applySpaceChatHeight(panel: HTMLElement, height: number) {
 
 function bringPinNoteToTop(id: string) {
   if (!id) return;
-  const notes = Array.isArray(state.world?.pinboard?.notes) ? state.world.pinboard.notes : [];
+  const notes = pinboardModel()?.notes ?? [];
   let max = 0;
   for (const n of notes) {
     const z = pinNoteNumber(n?.z, 1);
@@ -3660,7 +4129,7 @@ function refreshPinboardMap() {
   const shell = document.querySelector<HTMLElement>("[data-pinboard-map-shell]");
   const data = pinboardMapData();
   if (!shell || !data) return;
-  shell.innerHTML = renderPinboardMap(data.notes, data.present, data.width, data.height);
+  shell.innerHTML = renderPinboardMap(data.notes, data.present, data.width, data.height, data.palette);
   bindPinboardMap();
 }
 
@@ -3697,15 +4166,16 @@ function updatePinboardMapViewports() {
   }
 }
 
-function pinboardMapData(): { notes: any[]; present: string[]; width: number; height: number } | undefined {
-  const pinboard = state.world?.pinboard;
+function pinboardMapData(): { notes: any[]; present: string[]; width: number; height: number; palette: string[] } | undefined {
+  const pinboard = pinboardModel();
   if (!pinboard) return undefined;
   const viewport = pinboard?.viewport ?? { w: 960, h: 560 };
   return {
     width: pinNoteNumber(viewport.w, 960),
     height: pinNoteNumber(viewport.h, 560),
     present: Array.isArray(pinboard?.present) ? pinboard.present : [],
-    notes: Array.isArray(pinboard?.notes) ? pinboard.notes : []
+    notes: Array.isArray(pinboard?.notes) ? pinboard.notes : [],
+    palette: pinboardPalette(pinboard?.palette)
   };
 }
 
@@ -3874,7 +4344,8 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  return Boolean(state.actor && board && state.world?.session?.current_location === board);
+  const currentLocation = scopedProjectionEnabled ? state.scopedProjection?.session?.current_location : state.world?.session?.current_location;
+  return Boolean(state.actor && board && currentLocation === board);
 }
 
 function panPinboardBy(dx: number, dy: number) {
@@ -4063,14 +4534,20 @@ function setPinboardPresent(result: any) {
       : Array.isArray(result?.present_actors)
         ? result.present_actors
         : [];
-  if (!state.world?.pinboard) return;
-  state.world.pinboard.present = idsFromRefsOrSummaries(present);
-  const board = state.world.pinboard.board;
-  if (board?.props) board.props.subscribers = state.world.pinboard.present;
-  const presentActors = new Set(state.world.pinboard.present);
+  const presentIds = idsFromRefsOrSummaries(present);
+  const boardId = pinboardSpace();
+  if (boardId) ui.applyCanonical([{ subject: boardId, props: { subscribers: presentIds } }]);
+  const presentActors = new Set(presentIds);
   for (const actor of Object.keys(state.pinboardViewports)) {
     if (!presentActors.has(actor)) removePinboardViewport(actor);
   }
+  if (scopedProjectionEnabled) return;
+  // Compatibility write for the legacy `/api/state` pinboard branch. The
+  // projection write above is the scoped-model update.
+  if (!state.world?.pinboard) return;
+  state.world.pinboard.present = presentIds;
+  const board = state.world.pinboard.board;
+  if (board?.props) board.props.subscribers = state.world.pinboard.present;
 }
 
 function pinboardCall(verb: string, args: any[] = [], options?: ProjectionCallOptions) {
@@ -4085,7 +4562,7 @@ function pinboardTargetCall(target: string, verb: string, args: any[] = [], opti
 
 function refreshPinboardNotes(options: { force?: boolean } = {}) {
   const board = pinboardSpace();
-  if (!board || !canSendDirect() || !state.world?.pinboard) return;
+  if (!board || !canSendDirect()) return;
   if (pinboardNotesRefreshPending && options.force !== true) return;
   pinboardNotesRefreshPending = true;
   window.setTimeout(() => {
@@ -4093,9 +4570,8 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
   }, 2500);
   direct(board, "list_notes", [], (result) => {
     pinboardNotesRefreshPending = false;
-    if (!Array.isArray(result) || !state.world?.pinboard) return;
-    state.world.pinboard.notes = normalizePinboardNotes(result, state.world.pinboard.notes);
-    ui.ingestWorld(state.world);
+    if (!Array.isArray(result)) return;
+    applyPinboardNotesCanonical(board, result);
     if (state.tab === "pinboard") render();
   }, () => {
     pinboardNotesRefreshPending = false;
@@ -4103,6 +4579,49 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
     // failure (cold remote DO, network blip) ate this list_notes call.
     pinboardTextHydrationRequested = false;
   });
+}
+
+function applyPinboardNotesCanonical(board: string, result: any[]) {
+  const previous = pinboardModel()?.notes ?? (!scopedProjectionEnabled ? state.world?.pinboard?.notes : []) ?? [];
+  const notes = normalizePinboardNotes(result, previous);
+  const nextIds = new Set<string>();
+  const previousIds = new Set((Array.isArray(previous) ? previous : []).map((note: any) => String(note?.id ?? "")).filter(Boolean));
+  const layout: Record<string, any> = {};
+  const notePatches: ProjectionPatch[] = [];
+  for (const note of notes) {
+    const id = String(note?.id ?? "");
+    if (!id) continue;
+    nextIds.add(id);
+    layout[id] = {
+      x: pinNoteNumber(note?.x, 48),
+      y: pinNoteNumber(note?.y, 48),
+      w: pinNoteNumber(note?.w, 180),
+      h: pinNoteNumber(note?.h, 110),
+      z: pinNoteNumber(note?.z, 1)
+    };
+    notePatches.push({
+      subject: id,
+      fields: {
+        name: typeof note?.name === "string" ? note.name : undefined,
+        owner: typeof note?.owner === "string" ? note.owner : typeof note?.author === "string" ? note.author : undefined
+      },
+      catalogState: { pinboard_note: pinboardNoteState(note) }
+    });
+  }
+  for (const id of previousIds) {
+    if (!nextIds.has(id)) notePatches.push({ subject: id, clearCatalogState: ["pinboard_note"] });
+  }
+  ui.applyCanonical([{ subject: board, props: { layout } }]);
+  ui.applyCanonical(notePatches, { mode: "replace" });
+  if (!scopedProjectionEnabled && state.world?.pinboard) state.world.pinboard.notes = notes;
+}
+
+function pinboardNoteState(note: any): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  for (const key of ["x", "y", "z", "w", "h", "text", "color", "author", "owner", "writers", "created_at", "updated_at", "updated_by"]) {
+    if (note?.[key] !== undefined) fields[key] = note[key];
+  }
+  return fields;
 }
 
 function pinNoteNumber(value: any, fallback: number) {
@@ -4116,7 +4635,7 @@ function pinboardPalette(palette: any): string[] {
 }
 
 function renderTaskspace() {
-  const taskspace = state.world?.taskspace;
+  const taskspace = taskspaceModel();
   const space = taskspaceSpace();
   const tasks = taskspace?.tasks ?? {};
   const roots = Array.isArray(taskspace?.root_tasks) ? taskspace.root_tasks : [];
@@ -4325,6 +4844,26 @@ function firstMatchingTask(ids: string[], tasks: any, active: Set<string>): stri
   return undefined;
 }
 
+function enterTaskspace() {
+  const space = taskspaceSpace();
+  if (!space || !canSendDirect() || actorPresentInSpace(space)) return;
+  direct(space, "enter", [], () => {
+    void ensureScopedOverlayForTab("taskspace").then(() => {
+      if (state.tab === "taskspace") render();
+    });
+    requestSpaceChatFocus(space);
+  }, receiveChatError);
+}
+
+function taskspaceCall(target: string, verb: string, args: unknown[] = [], onCall?: (id: string) => void) {
+  const space = taskspaceSpace();
+  if (!space || !target) return;
+  ensureSpacePresence(space, () => {
+    const id = call(space, target, verb, args);
+    onCall?.(id);
+  }, receiveChatError);
+}
+
 function bindTaskspace() {
   bindSpaceChatPanels();
   document.querySelectorAll<HTMLButtonElement>("[data-task-status]").forEach((button) => {
@@ -4341,7 +4880,7 @@ function bindTaskspace() {
     const title = titleInput?.value.trim() || "Untitled";
     const description = descriptionInput?.value.trim() || "";
     const space = taskspaceSpace();
-    if (space) pendingTaskSelections.add(call(space, space, "create_task", [title, description]));
+    if (space) taskspaceCall(space, "create_task", [title, description], (id) => pendingTaskSelections.add(id));
     if (titleInput) titleInput.value = "";
     if (descriptionInput) descriptionInput.value = "";
   });
@@ -4365,10 +4904,8 @@ function bindTaskspace() {
   document.querySelectorAll<HTMLButtonElement>("[data-task-action]").forEach((button) => {
     button.addEventListener("click", () => {
       const action = button.dataset.taskAction!;
-      const space = taskspaceSpace();
-      if (!space) return;
-      if (action === "claim" || action === "release") call(space, id, action, []);
-      if (action.startsWith("status:")) call(space, id, "set_status", [action.slice("status:".length)]);
+      if (action === "claim" || action === "release") taskspaceCall(id, action, []);
+      if (action.startsWith("status:")) taskspaceCall(id, "set_status", [action.slice("status:".length)]);
     });
   });
   document.querySelector<HTMLButtonElement>("[data-add-subtask]")?.addEventListener("click", () => {
@@ -4377,36 +4914,31 @@ function bindTaskspace() {
     const title = titleInput?.value.trim() || "Subtask";
     const description = descriptionInput?.value.trim() || "";
     state.taskExpanded[id] = true;
-    const space = taskspaceSpace();
-    if (space) pendingTaskSelections.add(call(space, id, "add_subtask", [title, description]));
+    taskspaceCall(id, "add_subtask", [title, description], (callId) => pendingTaskSelections.add(callId));
     if (titleInput) titleInput.value = "";
     if (descriptionInput) descriptionInput.value = "";
   });
   document.querySelector<HTMLButtonElement>("[data-add-requirement]")?.addEventListener("click", () => {
     const input = document.querySelector<HTMLInputElement>("[data-requirement]");
     const text = input?.value.trim() || "Requirement";
-    const space = taskspaceSpace();
-    if (space) call(space, id, "add_requirement", [text]);
+    taskspaceCall(id, "add_requirement", [text]);
     if (input) input.value = "";
   });
   document.querySelectorAll<HTMLInputElement>("[data-check-req]").forEach((input) => {
     input.addEventListener("change", () => {
-      const space = taskspaceSpace();
-      if (space) call(space, id, "check_requirement", [Number(input.dataset.checkReq), input.checked]);
+      taskspaceCall(id, "check_requirement", [Number(input.dataset.checkReq), input.checked]);
     });
   });
   document.querySelector<HTMLButtonElement>("[data-add-message]")?.addEventListener("click", () => {
     const input = document.querySelector<HTMLInputElement>("[data-message]");
     const body = input?.value.trim() || "Update";
-    const space = taskspaceSpace();
-    if (space) call(space, id, "add_message", [body]);
+    taskspaceCall(id, "add_message", [body]);
     if (input) input.value = "";
   });
   document.querySelector<HTMLButtonElement>("[data-add-artifact]")?.addEventListener("click", () => {
     const input = document.querySelector<HTMLInputElement>("[data-artifact]");
     const ref = input?.value.trim() || "https://example.com";
-    const space = taskspaceSpace();
-    if (space) call(space, id, "add_artifact", [{ kind: ref.startsWith("http") ? "url" : "external", ref }]);
+    taskspaceCall(id, "add_artifact", [{ kind: ref.startsWith("http") ? "url" : "external", ref }]);
     if (input) input.value = "";
   });
 }
@@ -4610,7 +5142,7 @@ class DubAudio {
     this.dubspace = dubspace;
     this.clockOffset = clockOffset;
     this.syncEffects(dubspace);
-    const slots = Array.isArray(state.world?.dubspaceMeta?.slots) ? state.world.dubspaceMeta.slots : [];
+    const slots = Array.isArray(dubspaceMeta().slots) ? dubspaceMeta().slots : [];
     for (const [index, id] of slots.entries()) {
       const props = dubspace[id]?.props ?? {};
       const freq = loopPitch(Number(props.freq ?? defaultLoopFreq(index + 1))).freq;
@@ -4638,7 +5170,7 @@ class DubAudio {
 
   private syncEffects(dubspace: any) {
     const now = this.context.currentTime;
-    const meta = state.world?.dubspaceMeta ?? {};
+    const meta = dubspaceMeta();
     const delay = dubspace[meta.delay]?.props ?? {};
     const filter = dubspace[meta.filter]?.props ?? {};
     const channel = dubspace[meta.channel]?.props ?? {};
@@ -4658,7 +5190,7 @@ class DubAudio {
 
   private tickSequencer() {
     if (this.context.state !== "running") return;
-    const drum = this.dubspace?.[state.world?.dubspaceMeta?.drum]?.props;
+    const drum = this.dubspace?.[dubspaceMeta().drum]?.props;
     if (!drum?.playing) {
       this.lastStep = -1;
       return;

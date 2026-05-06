@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { WooChatSpaceElement, WooSpaceChatPanelElement, type ChatSpaceData, type SpaceChatPanelData } from "../catalogs/chat/ui/chat-space";
+import { renderChatLineHtml, WooChatSpaceElement, WooSpaceChatPanelElement, type ChatSpaceData, type SpaceChatPanelData } from "../catalogs/chat/ui/chat-space";
 import type { WooContext } from "../src/client/framework";
 
 function context(): WooContext {
@@ -118,5 +118,18 @@ describe("chat catalog UI components", () => {
     element.querySelector<HTMLFormElement>("[data-space-chat-form]")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 
     expect(detail).toMatchObject({ text: "look", space: "the_pinboard" });
+  });
+
+  it("renders huh output as private system text without a room prefix", () => {
+    const html = renderChatLineHtml(
+      { kind: "huh", source: "the_dubspace", actor: "guest_1", text: "zzzz", reason: "I don't understand that.", ts: 1 },
+      (id) => id || "unknown"
+    );
+
+    const container = document.createElement("div");
+    container.innerHTML = html;
+    expect(container.textContent).toContain("I don't understand that.");
+    expect(container.textContent).not.toContain("the_dubspace");
+    expect(container.textContent).not.toContain("zzzz");
   });
 });

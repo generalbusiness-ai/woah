@@ -79,6 +79,27 @@ type CommandVerbSummary = {
   arg_spec?: Record<string, WooValue>;
 };
 
+type CommandPattern = {
+  dobj?: WooValue;
+  prep?: WooValue;
+  iobj?: WooValue;
+  args_from?: WooValue;
+};
+
+type CommandPlan = {
+  ok: true;
+  route: "direct" | "sequenced";
+  space: ObjRef | null;
+  target: ObjRef;
+  verb: string;
+  args: WooValue[];
+  cmd: CommandMap;
+};
+
+type CommandOptions = {
+  deferHostEffect?: (effect: DeferredHostEffect) => void;
+};
+
 export type CallContext = {
   world: WooWorld;
   space: ObjRef;
@@ -1439,6 +1460,96 @@ export class WooWorld {
     return await this.enqueueHostTask(() => this.directCallNow(frameId, actor, target, verbName, args, options));
   }
 
+  async planCommand(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
+    return await this.enqueueHostTask(() => this.planCommandNow(frameId, sessionId, space, text));
+  }
+
+  async command(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    return await this.enqueueHostTask(() => this.commandNow(frameId, sessionId, space, text, options));
+  }
+
+  private async commandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    const planned = await this.planCommandNow(frameId, sessionId, space, text);
+    if (planned.op === "error") return planned;
+    const plan = commandPlanFromValue(planned.result);
+    if (!plan) return planned;
+    if (plan.route === "direct") {
+      const frame = await this.directCallNow(frameId, this.sessionActor(sessionId), plan.target, plan.verb, plan.args, { sessionId, deferHostEffect: options.deferHostEffect });
+      return frame.op === "result" ? { ...frame, command: plan } as DirectResultFrame : frame;
+    }
+    const commandSpace = plan.space ?? space;
+    return await this.callNow(frameId, sessionId, commandSpace, { actor: this.sessionActor(sessionId), target: plan.target, verb: plan.verb, args: plan.args });
+  }
+
+  async executeCommandPlan(ctx: CallContext, planValue: Record<string, WooValue>): Promise<WooValue> {
+    const plan = commandPlanFromValue(planValue as unknown as WooValue);
+    if (!plan) return planValue as unknown as WooValue;
+    if (plan.route === "direct") {
+      return await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, plan.target, plan.verb, plan.args);
+    }
+    if (!ctx.session) throw wooError("E_NOSESSION", "sequenced command requires a live session");
+    const commandSpace = plan.space ?? ctx.space;
+    return await this.callNow(undefined, ctx.session, commandSpace, { actor: ctx.actor, target: plan.target, verb: plan.verb, args: plan.args });
+  }
+
+  private async planCommandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
+    const startedAt = Date.now();
+    try {
+      assertObj(space);
+      assertString(text);
+      const actor = this.sessionActor(sessionId);
+      const hostMemo = createHostOperationMemo();
+      if (!await this.isDescendantOfChecked(space, "$space", hostMemo)) throw wooError("E_TYPE", `${space} is not a space`, space);
+      await this.chatPresentAsync(space, actor);
+      this.authorizePresence(actor, space, sessionId);
+      const observations: Observation[] = [];
+      const ctx: CallContext = {
+        world: this,
+        space,
+        seq: -1,
+        session: sessionId,
+        actor,
+        player: actor,
+        caller: "#-1",
+        callerPerms: actor,
+        progr: actor,
+        thisObj: space,
+        verbName: "command",
+        definer: space,
+        message: { actor, target: space, verb: "command", args: [text] },
+        observations,
+        hostMemo,
+        observe: (event) => {
+          observations.push({ ...event, source: event.source ?? space });
+        }
+      };
+      const result = await this.planCommandForSpace(ctx, text, space) as WooValue;
+      const liveAudiences = await this.directLiveAudiences(space, observations);
+      this.recordMetric({ kind: "direct_call", target: space, verb: "command", audience: space, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
+      return {
+        op: "result",
+        id: frameId,
+        result,
+        observations,
+        audience: space,
+        audienceActors: liveAudiences.audienceActors,
+        observationAudiences: liveAudiences.observationAudiences,
+        audienceSessions: liveAudiences.audienceSessions,
+        observationSessionAudiences: liveAudiences.observationSessionAudiences
+      };
+    } catch (err) {
+      const error = normalizeError(err);
+      this.recordMetric({ kind: "direct_call", target: space, verb: "command", audience: space, observations: 0, ms: Date.now() - startedAt, status: "error" });
+      return { op: "error", id: frameId, error };
+    }
+  }
+
+  private sessionActor(sessionId: string): ObjRef {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.sessionAlive(sessionId)) throw wooError("E_NOSESSION", "session token is expired or unknown");
+    return session.actor;
+  }
+
   private async directCallNow(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<DirectResultFrame | ErrorFrame> {
     const startedAt = Date.now();
     try {
@@ -1453,23 +1564,23 @@ export class WooWorld {
         throw wooError("E_DIRECT_DENIED", `direct call denied for ${target}:${verbName}`, { target, verb: verbName });
       }
       if (forceDirect && !wizard) throw wooError("E_PERM", "only wizards may force direct calls", { actor, target, verb: verbName });
-        if (forceDirect) this.recordWizardAction(actor, "force_direct", { target, verb: verbName, reason: options.forceReason ?? null });
-        const audience = this.directAudience(target);
-        const hostMemo = createHostOperationMemo();
-        const sessionId = options.sessionId === undefined ? this.primarySessionForActor(actor)?.id ?? null : options.sessionId;
-        if (audience) await this.scrubStaleSubscribersForSpace(audience, actor, this.chatPresent(audience), hostMemo);
-        if (audience && verb.skip_presence_check !== true && !forceDirect) this.authorizePresence(actor, audience, sessionId);
-        const observations: Observation[] = [];
-        if (forceDirect) observations.push({ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target });
-        const message: Message = { actor, target, verb: verbName, args };
-        const deferredHostEffects: DeferredHostEffect[] = [];
+      if (forceDirect) this.recordWizardAction(actor, "force_direct", { target, verb: verbName, reason: options.forceReason ?? null });
+      const hostMemo = createHostOperationMemo();
+      const audience = await this.directAudience(target, hostMemo);
+      const sessionId = options.sessionId === undefined ? this.primarySessionForActor(actor)?.id ?? null : options.sessionId;
+      if (audience) await this.chatPresentAsync(audience, actor);
+      if (audience && verb.skip_presence_check !== true && !forceDirect) this.authorizePresence(actor, audience, sessionId);
+      const observations: Observation[] = [];
+      if (forceDirect) observations.push({ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target });
+      const message: Message = { actor, target, verb: verbName, args };
+      const deferredHostEffects: DeferredHostEffect[] = [];
       let result: WooValue = null;
       let mutated = false;
       const dispatchCtx: CallContext = {
-          world: this,
-          space: audience ?? "#-1",
-          seq: -1,
-          session: sessionId,
+        world: this,
+        space: audience ?? "#-1",
+        seq: -1,
+        session: sessionId,
         actor,
         player: actor,
         caller: "#-1",
@@ -1559,7 +1670,7 @@ export class WooWorld {
     if (currentHere !== here.id) return here;
     return {
       ...here,
-      present_actors: [...here.present_actors, await this.scopedObjectSummary(ctx.actor, ctx.actor, memo)]
+      present_actors: [...here.present_actors, this.thinScopedObjectSummary(await this.scopedObjectSummary(ctx.actor, ctx.actor, memo))]
     };
   }
 
@@ -1854,8 +1965,8 @@ export class WooWorld {
       features: roomSummary.features,
       description: roomSummary.description,
       exits,
-      present_actors: presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
-      contents: contentRefs.map((id) => contents[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
+      present_actors: presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item)),
+      contents: contentRefs.map((id) => contents[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item)),
       props: roomSummary.props
     };
   }
@@ -1990,7 +2101,10 @@ export class WooWorld {
   private localScopedObjectSummary(actor: ObjRef, objRef: ObjRef): ScopedObjectSummary {
     const obj = this.object(objRef);
     const props: Record<string, WooValue> = {};
-    for (const name of this.properties(objRef)) props[String(name)] = this.propOrNullForActor(actor, objRef, String(name));
+    for (const name of this.properties(objRef)) {
+      if (String(name) === "session_subscribers") continue;
+      props[String(name)] = this.propOrNullForActor(actor, objRef, String(name));
+    }
     const aliases = props.aliases;
     return {
       id: obj.id,
@@ -2004,6 +2118,11 @@ export class WooWorld {
       description: props.description ?? null,
       props
     };
+  }
+
+  private thinScopedObjectSummary(summary: ScopedObjectSummary): ScopedObjectSummary {
+    const { props: _props, catalogState: _catalogState, ...thin } = summary;
+    return thin;
   }
 
   private safeFeatureList(objRef: ObjRef): ObjRef[] {
@@ -2030,8 +2149,14 @@ export class WooWorld {
   private async exitSummariesForRoom(actor: ObjRef, room: ObjRef, memo: HostOperationMemo): Promise<RoomSnapshot["exits"]> {
     const raw = await this.propOrNullForActorAsync(actor, room, "exits", memo);
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-    const entries = Object.entries(raw as Record<string, WooValue>)
-      .filter((entry): entry is [string, ObjRef] => typeof entry[1] === "string")
+    const byExit = new Map<ObjRef, string>();
+    for (const [direction, exit] of Object.entries(raw as Record<string, WooValue>)) {
+      if (typeof exit !== "string") continue;
+      const existing = byExit.get(exit);
+      if (!existing || this.preferExitDirection(direction, existing)) byExit.set(exit, direction);
+    }
+    const entries = Array.from(byExit.entries())
+      .map(([exit, direction]): [string, ObjRef] => [direction, exit])
       .sort(([a], [b]) => a.localeCompare(b));
     return await Promise.all(entries.map(async ([direction, exit]) => {
       const summary = await this.scopedObjectSummary(actor, exit, memo);
@@ -2044,6 +2169,15 @@ export class WooWorld {
         dest: typeof dest === "string" ? dest : null
       };
     }));
+  }
+
+  private preferExitDirection(candidate: string, current: string): boolean {
+    const canonical = new Set(["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest", "out"]);
+    const candidateCanonical = canonical.has(candidate);
+    const currentCanonical = canonical.has(current);
+    if (candidateCanonical !== currentCanonical) return candidateCanonical;
+    if (candidate.length !== current.length) return candidate.length > current.length;
+    return candidate.localeCompare(current) < 0;
   }
 
   async builderCreateObject(actor: ObjRef, parentRef: ObjRef, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
@@ -4777,12 +4911,23 @@ export class WooWorld {
     return true;
   }
 
-  private directAudience(target: ObjRef): ObjRef | null {
+  private async directAudience(target: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null> {
     const obj = this.object(target);
-    if (this.inheritsFrom(target, "$space")) return target;
-    if (obj.anchor && this.inheritsFrom(obj.anchor, "$space")) return obj.anchor;
-    if (obj.location && this.inheritsFrom(obj.location, "$space")) return obj.location;
+    if (await this.isDescendantOfCheckedOrFalse(target, "$space", memo)) return target;
+    if (obj.anchor && await this.isDescendantOfCheckedOrFalse(obj.anchor, "$space", memo)) return obj.anchor;
+    if (obj.location && await this.isDescendantOfCheckedOrFalse(obj.location, "$space", memo)) return obj.location;
     return null;
+  }
+
+  private async isDescendantOfCheckedOrFalse(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
+    try {
+      return await this.isDescendantOfChecked(objRef, ancestorRef, memo);
+    } catch {
+      // Audience discovery is intentionally tolerant: a stale anchor, stale
+      // location mirror, or unreachable remote host means "no audience here",
+      // not "fail the direct call before the verb can run".
+      return false;
+    }
   }
 
   private liveAudienceActors(space: ObjRef): ObjRef[] | undefined {
@@ -5736,6 +5881,17 @@ export class WooWorld {
         return this.objects.has("$failed_match") ? "$failed_match" : null;
       }
     });
+    this.nativeHandlers.set("match_command_verb", async (ctx, args) => {
+      const cmd = commandMapFromValue(args[0]);
+      const target = assertObj(args[1]);
+      if (!await this.canSeeCommandObject(ctx, target)) throw wooError("E_PERM", `${ctx.actor} cannot match command verbs on ${target}`, { actor: ctx.actor, target });
+      const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
+      return matched ? matched as unknown as WooValue : (this.objects.has("$failed_match") ? "$failed_match" : null);
+    });
+    this.nativeHandlers.set("plan_command", async (ctx, args) => {
+      const space = assertObj(args[1] ?? ctx.caller);
+      return await this.planCommandForSpace(ctx, assertString(args[0] ?? ""), space) as unknown as WooValue;
+    });
     this.nativeHandlers.set("parse_command", async (ctx, args) => {
       const actor = await this.publicCommandActor(ctx, args[1]);
       const location = await this.publicCommandLocation(ctx, actor, args[2]);
@@ -5984,7 +6140,259 @@ export class WooWorld {
       }
     }
     const resolved = this.tryResolveVerb(target, verb);
-    return resolved ? { name: resolved.verb.name, definer: resolved.definer, direct_callable: resolved.verb.direct_callable === true } : null;
+    return resolved ? { name: resolved.verb.name, definer: resolved.definer, direct_callable: resolved.verb.direct_callable === true, arg_spec: resolved.verb.arg_spec ?? {} } : null;
+  }
+
+  private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef): Promise<WooValue> {
+    const text = input.trim();
+    if (!text) return await this.commandHuhPlan(ctx, space, input, "empty command");
+    const actor = await this.publicCommandActor(ctx, undefined);
+    const location = await this.publicCommandLocation(ctx, actor, space);
+
+    const lowered = await this.lowerSpeechPrefixPlan(ctx, text, space, actor, location);
+    if (lowered) return lowered as unknown as WooValue;
+
+    const cmd = await this.parseCommandMap(text, ctx, location, actor);
+    if (cmd.verb === "drop" && !cmd.argstr) return await this.commandHuhPlan(ctx, space, text, "Drop what?");
+    const metadataPlan = await this.resolveCommandPlan(ctx, cmd, space, actor);
+    if (metadataPlan) return metadataPlan as unknown as WooValue;
+
+    const hookPlan = text.startsWith("/") ? await this.commandHuhHookPlan(ctx, space, actor, cmd) : null;
+    if (hookPlan) return hookPlan;
+    return await this.commandHuhPlan(ctx, space, text, "I don't understand that.");
+  }
+
+  private async lowerSpeechPrefixPlan(ctx: CallContext, text: string, space: ObjRef, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue | null> {
+    const lower = text.toLowerCase();
+    const parsed = new Map<string, Promise<CommandMap>>();
+    const parse = async (normalized: string) => {
+      const existing = parsed.get(normalized);
+      if (existing) return await existing;
+      const next = this.parseCommandMap(normalized, ctx, location, actor);
+      parsed.set(normalized, next);
+      return await next;
+    };
+    if (lower.startsWith("/me ")) {
+      const body = text.slice(4).trim();
+      return await this.directCommandPlan(ctx, space, "emote", [body], await parse(`emote ${body}`));
+    }
+    if (text.startsWith(":") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "emote", [body], await parse(`emote ${body}`));
+    }
+    if (text.startsWith("]") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "pose", [body], await parse(`pose ${body}`));
+    }
+    if (text.startsWith("|") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "quote", [body], await parse(`quote ${body}`));
+    }
+    if (text.startsWith("<") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "self", [body], await parse(`self ${body}`));
+    }
+    if (text.startsWith("\"") && text.length > 1) {
+      const body = text.slice(1).trim();
+      return await this.directCommandPlan(ctx, space, "say", [body], await parse(`say ${body}`));
+    }
+    if (text.startsWith("`") && text.length > 1) {
+      return await this.directedSpeechPlan(ctx, space, "say_to", text.slice(1), text, actor, location);
+    }
+    if (lower.startsWith("/tell ")) {
+      return await this.directedSpeechPlan(ctx, space, "tell", text.slice(6), text, actor, location);
+    }
+    if (text.startsWith("[")) {
+      const close = text.indexOf("]");
+      if (close > 1) {
+        const style = text.slice(1, close).trim();
+        let body = text.slice(close + 1).trim();
+        if (body.startsWith(":")) body = body.slice(1).trim();
+        if (!style || !body) return await this.commandHuhPlan(ctx, space, text, "Styled speech needs a style and text.");
+        return await this.directCommandPlan(ctx, space, "say_as", [style, body], await parse(`say_as ${body}`));
+      }
+    }
+    return null;
+  }
+
+  private async directedSpeechPlan(ctx: CallContext, space: ObjRef, verbName: string, rest: string, original: string, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue> {
+    const normalized = `${verbName} ${rest.trim()}`;
+    const cmd = await this.parseCommandMap(normalized, ctx, location, actor);
+    const target = cmd.dobj_prefix;
+    const body = cmd.dobj_prefix_rest.trim();
+    if (!target || !body) return await this.commandHuhPlan(ctx, space, original, "Directed speech needs a recipient and text.");
+    return await this.directCommandPlan(ctx, space, verbName, [target, body], cmd);
+  }
+
+  private async resolveCommandPlan(ctx: CallContext, cmd: CommandMap, space: ObjRef, actor: ObjRef): Promise<CommandPlan | null> {
+    // parseCommandMap only returns object refs visible from the command scope.
+    // The public match_command_verb native still enforces command-object
+    // visibility because callers may pass arbitrary targets.
+    const targets = this.commandTargetOrder(cmd, space, actor);
+    for (const target of targets) {
+      const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
+      if (matched) return await this.commandPlanForResolved(ctx, space, matched.target, matched.verb, matched.args, cmd);
+    }
+    return null;
+  }
+
+  private commandTargetOrder(cmd: CommandMap, space: ObjRef, actor: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    const add = (id: ObjRef | null | undefined) => {
+      if (id && !out.includes(id)) out.push(id);
+    };
+    add(cmd.dobj_prefix);
+    add(cmd.dobj);
+    add(cmd.iobj);
+    add(space);
+    add(actor);
+    return out;
+  }
+
+  private async matchCommandVerbOnTarget(ctx: CallContext, cmd: CommandMap, target: ObjRef): Promise<{ target: ObjRef; verb: string; args: WooValue[]; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
+    const candidates = await this.commandVerbCandidates(ctx, target, cmd.verb);
+    for (const candidate of candidates) {
+      const pattern = commandPattern(candidate.arg_spec);
+      if (!pattern) continue;
+      if (!await this.commandPatternMatches(ctx, pattern, cmd, target)) continue;
+      return {
+        target,
+        verb: candidate.name,
+        args: this.commandArgsFrom(pattern, cmd),
+        direct_callable: candidate.direct_callable,
+        arg_spec: candidate.arg_spec ?? {}
+      };
+    }
+    return null;
+  }
+
+  private async commandVerbCandidates(ctx: CallContext, target: ObjRef, name: string): Promise<CommandVerbSummary[]> {
+    if (await this.remoteHostForObject(target, ctx.hostMemo)) {
+      const resolved = await this.tryResolveVerbForCommand(ctx, target, name);
+      return resolved ? [resolved] : [];
+    }
+    if (!this.objects.has(target)) return [];
+    const out: CommandVerbSummary[] = [];
+    const seen = new Set<string>();
+    const collectFrom = (start: ObjRef | null) => {
+      let current = start;
+      while (current) {
+        const obj = this.object(current);
+        for (const verb of obj.verbs) {
+          if (!verbNameMatches(verb, name)) continue;
+          const key = `${current}:${verb.slot ?? verb.name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ name: verb.name, definer: current, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} });
+        }
+        current = obj.parent;
+      }
+    };
+    collectFrom(target);
+    if (this.canCarryFeatures(target)) {
+      for (const feature of this.featureList(target)) collectFrom(feature);
+    }
+    return out;
+  }
+
+  private async commandPatternMatches(ctx: CallContext, pattern: CommandPattern, cmd: CommandMap, target: ObjRef): Promise<boolean> {
+    if (!this.commandPrepMatches(pattern.prep, cmd.prep)) return false;
+    if (!await this.commandSlotMatches(ctx, pattern.dobj ?? "any", "dobj", cmd, target)) return false;
+    if (!await this.commandSlotMatches(ctx, pattern.iobj ?? "any", "iobj", cmd, target)) return false;
+    return true;
+  }
+
+  private commandPrepMatches(pattern: WooValue | undefined, prep: string | null): boolean {
+    const value = pattern ?? "any";
+    if (value === "any") return true;
+    if (value === "none") return prep == null || prep === "";
+    if (typeof value === "string") return (prep ?? "") === value;
+    if (Array.isArray(value)) return value.some((item) => typeof item === "string" && item === (prep ?? ""));
+    return false;
+  }
+
+  private async commandSlotMatches(ctx: CallContext, pattern: WooValue, slot: "dobj" | "iobj", cmd: CommandMap, target: ObjRef): Promise<boolean> {
+    if (Array.isArray(pattern)) {
+      for (const item of pattern) {
+        if (await this.commandSlotMatches(ctx, item, slot, cmd, target)) return true;
+      }
+      return false;
+    }
+    const text = slot === "dobj" ? cmd.dobjstr : cmd.iobjstr;
+    const obj = slot === "dobj" ? (cmd.dobj ?? cmd.dobj_prefix) : cmd.iobj;
+    if (pattern === "any") return true;
+    if (pattern === "none") return !text && !obj;
+    if (pattern === "string") return text.trim().length > 0;
+    if (pattern === "object") return Boolean(obj);
+    if (pattern === "player") return Boolean(obj && await this.isDescendantOfChecked(obj, "$player", ctx.hostMemo));
+    if (pattern === "this") return obj === target;
+    return false;
+  }
+
+  private commandArgsFrom(pattern: CommandPattern, cmd: CommandMap): WooValue[] {
+    const tokens = Array.isArray(pattern.args_from) ? pattern.args_from : [];
+    if (tokens.length === 0) return [];
+    return tokens.map((token) => this.commandArgFrom(String(token), cmd));
+  }
+
+  private commandArgFrom(token: string, cmd: CommandMap): WooValue {
+    if (token === "text") return cmd.text;
+    if (token === "verb") return cmd.verb;
+    if (token === "argstr") return cmd.argstr;
+    if (token === "prep") return cmd.prep ?? "";
+    if (token === "dobj") return cmd.dobj ?? "$failed_match";
+    if (token === "dobjstr") return cmd.dobjstr;
+    if (token === "dobj_prefix") return cmd.dobj_prefix ?? "$failed_match";
+    if (token === "dobj_prefix_rest") return cmd.dobj_prefix_rest;
+    if (token === "iobj") return cmd.iobj ?? "$failed_match";
+    if (token === "iobjstr") return cmd.iobjstr;
+    if (token === "cmd") return cmd as unknown as WooValue;
+    throw wooError("E_INVARG", `unsupported command args_from token: ${token}`, token);
+  }
+
+  private async directCommandPlan(ctx: CallContext, space: ObjRef, verb: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
+    return await this.commandPlanForResolved(ctx, space, space, verb, args, cmd);
+  }
+
+  private async commandPlanForResolved(ctx: CallContext, commandSpace: ObjRef, target: ObjRef, verbName: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
+    const resolved = await this.tryResolveVerbForCommand(ctx, target, verbName);
+    const directCallable = resolved?.direct_callable === true;
+    let route: "direct" | "sequenced" = directCallable ? "direct" : "sequenced";
+    let space: ObjRef | null = null;
+    if (route === "sequenced") {
+      space = await this.isDescendantOfChecked(target, "$space", ctx.hostMemo) ? target : commandSpace;
+      if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
+    }
+    return { ok: true, route, space, target, verb: resolved?.name ?? verbName, args, cmd };
+  }
+
+  private async commandHuhPlan(ctx: CallContext, space: ObjRef, text: string, reason: string): Promise<WooValue> {
+    try {
+      await this.dispatch(ctx, ctx.actor, "huh", [text, reason, space]);
+    } catch {
+      ctx.observe({ type: "huh", source: space, actor: ctx.actor, text, reason, ts: Date.now(), _audience_override: [ctx.actor] });
+    }
+    return { ok: false, route: "huh", space, target: ctx.actor, verb: "huh", args: [text, reason, space], error: reason, text } as unknown as WooValue;
+  }
+
+  private async commandHuhHookPlan(ctx: CallContext, space: ObjRef, actor: ObjRef, cmd: CommandMap): Promise<WooValue | null> {
+    for (const [target, verb] of [[actor, "my_huh"], [space, "here_huh"], [actor, "last_huh"]] as Array<[ObjRef, string]>) {
+      let result: WooValue;
+      try {
+        // Huh hooks are part of command planning, so the planning task remains
+        // the caller; hooks that want delegated authority should dispatch
+        // explicitly just like ordinary woocode.
+        result = await this.dispatch(ctx, target, verb, [cmd as unknown as WooValue]);
+      } catch (err) {
+        // Only absence is ignored. A present hook that raises is a real planner
+        // failure so catalog bugs surface instead of silently degrading to huh.
+        if (normalizeError(err).code === "E_VERBNF") continue;
+        throw err;
+      }
+      if (result && typeof result === "object" && !Array.isArray(result) && "ok" in result) return result;
+      if (result === true) return { ok: false, route: "handled", target, verb, args: [cmd as unknown as WooValue], text: cmd.text } as unknown as WooValue;
+    }
+    return null;
   }
 
   private async parseCommandMap(text: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor): Promise<CommandMap> {
@@ -6006,7 +6414,7 @@ export class WooWorld {
     const prefixTokens = prefix ? restTokens.slice(0, prefix.length) : [];
     const prefixRestTokens = prefix ? restTokens.slice(prefix.length) : [];
     return {
-      verb: verbToken.value,
+      verb: verbToken.value.toLowerCase(),
       dobj: dobjMatch?.status === "ok" ? dobjMatch.value : null,
       dobjstr,
       dobj_prefix: prefix?.object ?? null,
@@ -6382,6 +6790,7 @@ const PREPOSITIONS = [
   ["into"],
   ["on"],
   ["upon"],
+  ["as"],
   ["from"],
   ["over"],
   ["through"],
@@ -6411,6 +6820,7 @@ function verbAliasMatches(pattern: string, name: string): boolean {
   for (const segment of pattern.split("|")) {
     const trimmed = segment.trim();
     if (!trimmed) continue;
+    if (trimmed === name) return true;
     const star = trimmed.indexOf("*");
     if (star === trimmed.length - 1) {
       const literal = trimmed.slice(0, -1);
@@ -6423,9 +6833,53 @@ function verbAliasMatches(pattern: string, name: string): boolean {
       if (literal && literal.startsWith(name) && name.length >= Math.max(1, abbreviation)) return true;
       continue;
     }
-    if (trimmed === name) return true;
   }
   return false;
+}
+
+function verbNameMatches(verb: VerbDef, name: string): boolean {
+  return verb.name === name || verb.aliases.some((alias) => verbAliasMatches(alias, name));
+}
+
+function commandPattern(argSpec: Record<string, WooValue> | undefined): CommandPattern | null {
+  const raw = argSpec?.command;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return raw as CommandPattern;
+}
+
+function commandMapFromValue(value: WooValue | undefined): CommandMap {
+  const map = assertMap(value ?? {});
+  return {
+    verb: assertString(map.verb ?? ""),
+    dobj: typeof map.dobj === "string" ? map.dobj : null,
+    dobjstr: typeof map.dobjstr === "string" ? map.dobjstr : "",
+    dobj_prefix: typeof map.dobj_prefix === "string" ? map.dobj_prefix : null,
+    dobj_prefix_str: typeof map.dobj_prefix_str === "string" ? map.dobj_prefix_str : "",
+    dobj_prefix_rest: typeof map.dobj_prefix_rest === "string" ? map.dobj_prefix_rest : "",
+    prep: typeof map.prep === "string" ? map.prep : null,
+    iobj: typeof map.iobj === "string" ? map.iobj : null,
+    iobjstr: typeof map.iobjstr === "string" ? map.iobjstr : "",
+    args: Array.isArray(map.args) ? map.args.filter((item): item is string => typeof item === "string") : [],
+    argstr: typeof map.argstr === "string" ? map.argstr : "",
+    text: typeof map.text === "string" ? map.text : ""
+  };
+}
+
+function commandPlanFromValue(value: WooValue): CommandPlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const map = value as Record<string, WooValue>;
+  if (map.ok !== true) return null;
+  const route = map.route === "direct" || map.route === "sequenced" ? map.route : null;
+  if (!route || typeof map.target !== "string" || typeof map.verb !== "string") return null;
+  return {
+    ok: true,
+    route,
+    space: typeof map.space === "string" ? map.space : null,
+    target: map.target,
+    verb: map.verb,
+    args: Array.isArray(map.args) ? map.args : [],
+    cmd: commandMapFromValue(map.cmd)
+  };
 }
 
 function addUnique<T>(items: T[], item: T): T[] {

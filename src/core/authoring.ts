@@ -7,6 +7,7 @@ import type { WooWorld } from "./world";
 
 type AuthoringOptions = {
   format?: "t0-source" | "woo-source" | "t0-json-bytecode";
+  argSpec?: Record<string, WooValue>;
 };
 
 type StackEffect = { requires: number; delta: number; exits?: boolean };
@@ -77,13 +78,15 @@ function installVerbWithOwner(world: WooWorld, obj: ObjRef, name: string, source
     compiled.metadata?.perms ?? current?.perms ?? "rx",
     compiled.metadata?.perms ? false : current?.direct_callable === true
   );
+  const compiledArgSpec = compiled.metadata?.arg_spec ?? {};
+  const argSpec = options.argSpec ? { ...compiledArgSpec, ...options.argSpec } : (compiled.metadata?.arg_spec ?? current?.arg_spec ?? {});
   world.addVerb(obj, {
     kind: "bytecode",
     name,
     aliases: current?.aliases ?? [],
     owner,
     perms: parsedPerms.perms,
-    arg_spec: compiled.metadata?.arg_spec ?? current?.arg_spec ?? {},
+    arg_spec: argSpec,
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: current?.skip_presence_check,
     tool_exposed: current?.tool_exposed,
@@ -580,6 +583,7 @@ const VALID_BUILTINS = new Set([
   "observe_to_space",
   "tell",
   "dispatch",
+  "execute_command_plan",
   "collect_prop",
   "current_location",
   "current_session",

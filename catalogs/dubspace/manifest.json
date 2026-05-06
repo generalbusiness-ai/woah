@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "0.2.5",
+  "version": "0.2.8",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -261,7 +261,8 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :enter() rxd { moveto(actor, this); if (!(actor in this.operators)) { this.operators = this.operators + [actor]; } let text = actor.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: this, operators: this.operators, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
         },
@@ -274,7 +275,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let next = []; for item in this.operators { if (item != actor) { next = next + [item]; } } this.operators = next; let text = actor.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return this.operators; }"
+          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let next = []; for item in this.operators { if (item != actor) { next = next + [item]; } } this.operators = next; let text = actor.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: dest, operators: this.operators, here_request: true, look_deferred: true }; }"
         },
         {
           "name": "out",
@@ -286,20 +287,10 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": []
+            "args": [],
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
           },
           "source": "verb :out() rxd { return this:leave(); }"
-        },
-        {
-          "name": "command_plan",
-          "perms": "rxd",
-          "direct_callable": true,
-          "arg_spec": {
-            "args": [
-              "input"
-            ]
-          },
-          "source": "verb :command_plan(input) rxd { let text = str_trim(input); let lower = str_lower(text); if (!text) { return this:huh_plan(input, \"empty command\"); } if (str_starts(text, \"`\") && length(text) > 1) { let directed = str_trim(str_slice(text, 2)); let directed_lower = str_lower(directed); if (str_starts(directed_lower, \"filter \")) { let directed_rest = str_trim(str_slice(directed, 8)); if (directed_rest) { return { ok: true, route: \"direct\", space: null, target: \"filter_1\", verb: \"on_say_to\", args: [directed_rest], cmd: { text: text, actor: actor } }; } } if (str_starts(directed_lower, \"bpm \") || str_starts(directed_lower, \"tempo \")) { let directed_bpm_raw = str_trim(str_slice(directed, 5)); if (str_starts(directed_lower, \"tempo \")) { directed_bpm_raw = str_trim(str_slice(directed, 7)); } if (directed_bpm_raw) { let directed_bpm = to_int(directed_bpm_raw); if (directed_bpm == 0 && directed_bpm_raw != \"0\") { return this:huh_plan(text, \"BPM expects digits.\"); } if (directed_bpm < 60 || directed_bpm > 200) { return this:huh_plan(text, \"BPM must be between 60 and 200.\"); } return { ok: true, route: \"sequenced\", space: this, target: this, verb: \"set_tempo\", args: [directed_bpm], cmd: { text: text, actor: actor } }; } } return this:directed_plan(directed, \"say_to\", text); } if (lower == \"out\" || lower == \"o\" || lower == \"leave\") { let verb_name = \"out\"; if (lower == \"leave\") { verb_name = \"leave\"; } return { ok: true, route: \"direct\", space: null, target: this, verb: verb_name, args: [], cmd: { text: text, actor: actor } }; } if (lower == \"look\" || lower == \"l\") { return { ok: true, route: \"direct\", space: null, target: this, verb: \"look\", args: [], cmd: { text: text, actor: actor } }; } if (str_starts(lower, \"filter \")) { let rest = str_trim(str_slice(text, 8)); if (rest) { return { ok: true, route: \"direct\", space: null, target: \"filter_1\", verb: \"on_say_to\", args: [rest], cmd: { text: text, actor: actor } }; } } if (str_starts(lower, \"bpm \") || str_starts(lower, \"tempo \")) { let bpm_raw = str_trim(str_slice(text, 5)); if (str_starts(lower, \"tempo \")) { bpm_raw = str_trim(str_slice(text, 7)); } if (bpm_raw) { let bpm_value = to_int(bpm_raw); if (bpm_value == 0 && bpm_raw != \"0\") { return this:huh_plan(text, \"BPM expects digits.\"); } if (bpm_value < 60 || bpm_value > 200) { return this:huh_plan(text, \"BPM must be between 60 and 200.\"); } return { ok: true, route: \"sequenced\", space: this, target: this, verb: \"set_tempo\", args: [bpm_value], cmd: { text: text, actor: actor } }; } } if (str_starts(text, \"/me \")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [str_trim(str_slice(text, 5))], cmd: { text: text, actor: actor } }; } if (str_starts(text, \":\") && length(text) > 1) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"emote\", args: [str_trim(str_slice(text, 2))], cmd: { text: text, actor: actor } }; } if (str_starts(lower, \"say \")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [str_trim(str_slice(text, 5))], cmd: { text: text, actor: actor } }; } if (!str_starts(text, \"/\")) { return { ok: true, route: \"direct\", space: null, target: this, verb: \"say\", args: [text], cmd: { text: text, actor: actor } }; } return this:huh_plan(text, \"I don't see \" + text + \".\"); }"
         },
         {
           "name": "set_control",
@@ -376,14 +367,19 @@
         },
         {
           "name": "set_tempo",
+          "aliases": [
+            "bpm",
+            "tempo"
+          ],
           "perms": "rx",
           "tool_exposed": true,
           "arg_spec": {
             "args": [
               "bpm"
-            ]
+            ],
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
           },
-          "source": "verb :set_tempo(raw_bpm) rx { if (typeof(raw_bpm) != \"number\") { raise { code: \"E_TYPE\", message: \"tempo must be numeric\", value: raw_bpm }; } let bpm = round(raw_bpm); if (bpm < 60) { bpm = 60; } if (bpm > 200) { bpm = 200; } \"drum_1\".bpm = bpm; observe({ type: \"tempo_changed\", target: \"drum_1\", bpm: bpm }); return bpm; }"
+          "source": "verb :set_tempo(raw_bpm) rx { let bpm = raw_bpm; if (typeof(raw_bpm) == \"string\") { let trimmed = str_trim(raw_bpm); bpm = to_int(trimmed); if (bpm == 0 && trimmed != \"0\") { raise { code: \"E_INVARG\", message: \"BPM expects digits.\", value: raw_bpm }; } } if (typeof(bpm) != \"number\") { raise { code: \"E_TYPE\", message: \"tempo must be numeric\", value: raw_bpm }; } bpm = round(bpm); if (bpm < 60) { bpm = 60; } if (bpm > 200) { bpm = 200; } \"drum_1\".bpm = bpm; observe({ type: \"tempo_changed\", target: \"drum_1\", bpm: bpm }); return bpm; }"
         },
         {
           "name": "start_transport",

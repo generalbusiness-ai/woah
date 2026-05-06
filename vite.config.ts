@@ -11,8 +11,9 @@ export default defineConfig({
     port: 5173
   },
   test: {
+    // The threads pool avoids Vitest fork/birpc RPC timeouts; no single-worker
+    // cap is needed now that per-test timeout is high enough for heavy files.
     pool: "threads",
-    testTimeout: 30_000,
-    maxWorkers: 1
+    testTimeout: 30_000
   }
 });

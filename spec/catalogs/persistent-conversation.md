@@ -135,7 +135,7 @@ surface:
 | `$conversational` | direct-callable; live-only | no durable transcript |
 | `$persistent_conversational` | sequenced through the current space's `:call` | `:history()` filters the current space's replay |
 
-**Verbs that stay direct** (private speech, view, and planning; see
+**Verbs that stay direct** (private speech, view, and compatibility planning; see
 PC6 for the privacy reasoning on tell/say_to):
 
 | Verb | Why stays direct |
@@ -144,7 +144,7 @@ PC6 for the privacy reasoning on tell/say_to):
 | `:say_to(recipient, text)` | Same; recipient-directed speech. |
 | `:look`, `:who` | Read-only view, if supplied by the feature rather than the consumer. |
 | `:history(limit, before_seq)` | Read-only transcript query for persistent spaces. |
-| `:command_plan`, `:command` | UI/planning surface. |
+| `:command_plan`, `:command` | Compatibility planning/command surface. Browser text input uses wire `op:"command"` so the server can choose direct vs sequenced without a catalog round trip. |
 
 The durable utterance bodies should otherwise match `$conversational`:
 same observation shape, same permission gates, same return values.
@@ -421,13 +421,17 @@ This route calculation belongs in the base planner, not in a
 `match_verb` for the catch-all path; recognized chat forms should
 use the same metadata check.
 
-`:command(text)` consumes the plan and dispatches. Today it dispatches
-`route: "direct"` plans inline and **returns** non-direct plans
-without executing. The cleaner contract is that rich clients consume
-the plan and dispatch it themselves:
+Browser clients send free text as wire `op:"command"` with the active command
+space and raw text. The server consumes the plan and dispatches:
 
-- direct plans call the target verb directly;
-- sequenced plans call `plan.space:call({...plan})`.
+- direct plans call the target verb directly and return `op:"result"`;
+- sequenced plans call `plan.space:call({...plan})` and return `op:"applied"`.
+
+The catalog-level `:command(text)` verb remains a compatibility command surface
+for older direct callers. It consumes the same plan shape: direct plans execute
+inline and sequenced plans return the applied/error frame from the resolved
+command space. Browser clients still use wire `op:"command"` to avoid an extra
+catalog call.
 
 The SPA already implements this pattern for taskspace; persistent
 conversation relies on the same route-aware client behavior.
@@ -503,8 +507,9 @@ This is a **breaking change for clients that hardcode direct `:say`
 POSTs.** After persistence is enabled, those POSTs raise
 `E_DIRECT_DENIED`. Operators MUST do one of:
 
-- Update every client to consume `:command_plan`'s plan and dispatch
-  through `:call` for sequenced plans.
+- Update every browser client to send wire `op:"command"` for text input, or
+  update non-browser clients to use an equivalent server-side command executor
+  rather than hardcoding direct `:say` calls.
 - Coordinate the feature/class change with a client deploy that
   handles the new route.
 

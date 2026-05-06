@@ -22,6 +22,8 @@ export type ProjectionPatch = {
   props?: Record<string, unknown>;
   // Catalog-derived projection state lives here, grouped by catalog key.
   catalogState?: Record<string, Record<string, unknown>>;
+  // Catalog-derived state groups to remove from the subject.
+  clearCatalogState?: string[];
 };
 
 export type ProjectionSnapshot = {
@@ -67,6 +69,8 @@ export type ClientProjectionDraft = {
   patchObject(ref: string, fields: Record<string, unknown>): void;
   patchObjectProps(ref: string, props: Record<string, unknown>): void;
   patchCatalogState(ref: string, key: string, fields: Record<string, unknown>): void;
+  clearCatalogState(ref: string, key: string): void;
+  clearAuthoritative(ref: string): void;
 };
 
 export type WooObservationHandler = {
@@ -221,6 +225,13 @@ type OptimisticCallRecord = {
   reconcile: ProjectionOptimisticReconcile;
 };
 
+export type ApplyCanonicalOptions = {
+  // `replace` is per field group: fields/props merge as usual, while each
+  // catalogState key present in the patch is cleared before its new fields are
+  // applied. CatalogState keys absent from the patch are left alone.
+  mode?: "merge" | "replace";
+};
+
 const LIVE_TTL_MS = 1_600;
 const OPTIMISTIC_TTL_MS = 5_000;
 
@@ -331,6 +342,7 @@ export class CatalogUiRegistry {
 export class ClientProjection {
   private canonical = new Map<string, ObjectProjection>();
   private scopedCanonical = new Map<string, Map<string, ObjectProjection>>();
+  private authoritativeCanonical = new Map<string, ProjectionPatch>();
   private scopeOrder: string[] = [];
   private sequenced = new Map<string, ProjectionPatch>();
   private live = new Map<string, ProjectionLayer>();
@@ -342,6 +354,7 @@ export class ClientProjection {
     const changed = new Set(this.canonical.keys());
     this.scopedCanonical.clear();
     this.scopeOrder = [];
+    this.authoritativeCanonical.clear();
     this.canonical.clear();
     for (const [id, obj] of Object.entries(world?.objects ?? {})) {
       this.canonical.set(id, normalizeObjectProjection(id, obj));
@@ -435,17 +448,27 @@ export class ClientProjection {
   // log. Fold those patches into canonical projection so they survive later
   // scoped-snapshot ingestion while still clearing overlapping live/optimistic
   // layers.
-  applyCanonical(patches: ProjectionPatch[]) {
+  applyCanonical(patches: ProjectionPatch[], options: ApplyCanonicalOptions = {}) {
     const changed = new Set<string>();
     for (const patch of patches) {
       const subject = String(patch.subject ?? "");
       if (!subject) continue;
-      this.patchCanonical(subject, patch);
+      const canonicalPatch = options.mode === "replace" ? replacementPatch(patch) : patch;
+      this.authoritativeCanonical.set(subject, options.mode === "replace" ? canonicalPatch : mergePatch(this.authoritativeCanonical.get(subject), patch));
+      this.patchCanonical(subject, canonicalPatch);
       clearPatchFieldsFromLayers(this.live, patch);
       clearPatchFieldsFromLayers(this.optimistic, patch);
       changed.add(subject);
     }
     this.notify(changed);
+  }
+
+  clearAuthoritative(subject: string, options: { notify?: boolean } = {}) {
+    const id = String(subject ?? "");
+    if (!id || !this.authoritativeCanonical.delete(id)) return false;
+    this.rebuildCanonicalObject(id);
+    if (options.notify !== false) this.notify(new Set([id]));
+    return true;
   }
 
   applyLive(id: string, patches: ProjectionPatch[], expiresMs = LIVE_TTL_MS): number {
@@ -538,6 +561,12 @@ export class ClientProjection {
       if (!scoped) continue;
       next = next ? mergeObjectProjection(next, scoped) : cloneObjectProjection(scoped);
     }
+    const authoritative = this.authoritativeCanonical.get(id);
+    if (authoritative) {
+      const patched = next ?? emptyObjectProjection(id);
+      applyPatch(patched, authoritative);
+      next = hasProjectionData(patched) ? patched : undefined;
+    }
     if (next) this.canonical.set(id, next);
     else this.canonical.delete(id);
   }
@@ -578,12 +607,14 @@ export class ObservationRegistry {
       handler.reduce(draft, envelope);
     }
     const patches = draft.consume();
-    if (patches.length === 0) return;
+    const authoritativeClears = draft.consumeAuthoritativeClears();
+    if (patches.length === 0 && authoritativeClears.length === 0) return;
     if (delivered.route === "live") {
       for (const patch of patches) {
         this.projection.applyLive(liveProjectionKey(type, patch.subject, livePatchDiscriminator(patch)), [patch]);
       }
     } else {
+      for (const subject of authoritativeClears) this.projection.clearAuthoritative(subject, { notify: patches.length === 0 });
       this.projection.applySequenced(patches);
     }
   }
@@ -693,8 +724,12 @@ export class WooClientFramework {
     this.projection.applyOptimisticCall(callId, options);
   }
 
-  applyCanonical(patches: ProjectionPatch[]) {
-    this.projection.applyCanonical(patches);
+  applyCanonical(patches: ProjectionPatch[], options?: ApplyCanonicalOptions) {
+    this.projection.applyCanonical(patches, options);
+  }
+
+  clearAuthoritative(subject: string) {
+    this.projection.clearAuthoritative(subject);
   }
 
   completeOptimisticCall(callId: string) {
@@ -728,6 +763,83 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
         if (Number.isFinite(value)) fields[key] = value;
       }
       if (Object.keys(fields).length > 0) draft.patchCatalogState(pin, "pinboard_note", fields);
+      const board = String(obs.board ?? "");
+      // `pinboard_layout` is a sparse per-pin overlay, not a full layout map.
+      // Readers must merge it with the board's authoritative props.layout.
+      if (board && Object.keys(fields).length > 0) draft.patchCatalogState(board, "pinboard_layout", { [pin]: fields });
+    }
+  });
+  registry.observation({
+    types: ["pin_recolored", "note_color_changed"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const pin = String(obs.pin ?? obs.note ?? obs.id ?? "");
+      if (!pin) return;
+      draft.patchCatalogState(pin, "pinboard_note", { color: obs.color });
+    }
+  });
+  registry.observation({
+    types: ["note_edited"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const note = String(obs.note ?? obs.pin ?? obs.id ?? "");
+      if (!note) return;
+      draft.patchCatalogState(note, "pinboard_note", { text: obs.text });
+    }
+  });
+  registry.observation({
+    types: ["note_added"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const note = envelope.observation.note;
+      if (!note || typeof note !== "object" || Array.isArray(note)) return;
+      const id = String((note as any).id ?? envelope.observation.pin ?? "");
+      if (!id) return;
+      const board = String(envelope.observation.board ?? "");
+      draft.patchObject(id, {
+        name: typeof (note as any).name === "string" ? (note as any).name : undefined,
+        owner: typeof (note as any).owner === "string" ? (note as any).owner : undefined
+      });
+      draft.patchCatalogState(id, "pinboard_note", pinboardNoteState(note));
+      // `pinboard_layout` entries are sparse overlays keyed by pin id; merge
+      // with props.layout before rendering.
+      if (board) draft.patchCatalogState(board, "pinboard_layout", { [id]: pinboardLayoutState(note) });
+    }
+  });
+  registry.observation({
+    types: ["pin_removed", "note_deleted"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const id = String(envelope.observation.pin ?? envelope.observation.note ?? envelope.observation.id ?? "");
+      if (id) {
+        draft.clearAuthoritative(id);
+        draft.clearCatalogState(id, "pinboard_note");
+      }
+      const board = String(envelope.observation.board ?? "");
+      if (board && id) draft.patchCatalogState(board, "pinboard_layout", { [id]: null });
+    }
+  });
+  registry.observation({
+    types: ["pinboard_entered", "pinboard_left"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const board = String(envelope.observation.board ?? "");
+      const actor = String(envelope.observation.actor ?? "");
+      if (!board || !actor) return;
+      draft.patchCatalogState(board, "pinboard_presence", {
+        [actor]: envelope.observation.type === "pinboard_left" ? false : true
+      });
+    }
+  });
+  registry.observation({
+    types: ["notes_cleared"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      for (const id of Array.isArray(envelope.observation.notes) ? envelope.observation.notes : []) {
+        if (typeof id === "string" && id) draft.clearCatalogState(id, "pinboard_note");
+      }
     }
   });
   registry.observation({
@@ -816,6 +928,106 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
     }
   });
   registry.observation({
+    types: ["task_created"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const task = String(obs.task ?? "");
+      if (!task) return;
+      const parent = typeof obs.parent === "string" ? obs.parent : null;
+      const space = String(obs.space ?? envelope.delivered.space ?? "");
+      const title = typeof obs.title === "string" ? obs.title : undefined;
+      draft.patchObject(task, { name: title });
+      draft.patchObjectProps(task, {
+        title,
+        parent_task: parent,
+        status: "open",
+        space: space || undefined
+      });
+      draft.patchCatalogState(task, "taskspace_task", {
+        title,
+        parent_task: parent,
+        status: "open",
+        space: space || undefined
+      });
+      if (space) draft.patchCatalogState(space, "taskspace_tree", { [task]: parent });
+    }
+  });
+  registry.observation({
+    types: ["subtask_added", "task_moved"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const task = String(obs.child ?? obs.task ?? "");
+      if (!task) return;
+      const parent = typeof obs.parent === "string"
+        ? obs.parent
+        : typeof obs.to_parent === "string"
+          ? obs.to_parent
+          : null;
+      const index = Number(obs.index);
+      const space = String(obs.space ?? envelope.delivered.space ?? "");
+      draft.patchObjectProps(task, { parent_task: parent });
+      draft.patchCatalogState(task, "taskspace_task", { parent_task: parent });
+      if (space) {
+        draft.patchCatalogState(space, "taskspace_tree", {
+          [task]: parent,
+          [`index:${task}`]: Number.isFinite(index) ? index : undefined
+        });
+      }
+    }
+  });
+  registry.observation({
+    types: ["task_claimed", "task_released", "status_changed"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const task = String(obs.task ?? "");
+      if (!task) return;
+      const props: Record<string, unknown> = {};
+      if (obs.type === "task_claimed") {
+        props.assignee = obs.actor;
+        props.status = "claimed";
+      } else if (obs.type === "task_released") {
+        props.assignee = null;
+        props.status = "open";
+      } else {
+        props.status = obs.to;
+      }
+      draft.patchObjectProps(task, props);
+      draft.patchCatalogState(task, "taskspace_task", props);
+    }
+  });
+  registry.observation({
+    types: ["requirement_added", "requirement_checked", "message_added", "artifact_attached"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const task = String(obs.task ?? "");
+      if (!task) return;
+      if (obs.type === "requirement_added") {
+        const index = Number(obs.index);
+        if (Number.isFinite(index)) {
+          draft.patchCatalogState(task, "taskspace_task", { [`requirement:${index}`]: { text: obs.text, checked: false } });
+        }
+      } else if (obs.type === "requirement_checked") {
+        const index = Number(obs.index);
+        if (Number.isFinite(index)) {
+          draft.patchCatalogState(task, "taskspace_task", { [`requirement_checked:${index}`]: obs.checked === true });
+        }
+      } else if (obs.type === "message_added") {
+        const ts = Number(obs.ts);
+        const key = Number.isFinite(ts) ? `message:${ts}` : `message:${envelope.delivered.seq ?? envelope.delivered.receivedAt}`;
+        draft.patchCatalogState(task, "taskspace_task", { [key]: { actor: obs.actor, body: obs.body, ts: Number.isFinite(ts) ? ts : undefined } });
+      } else {
+        const ref = obs.ref;
+        const addedAt = ref && typeof ref === "object" && !Array.isArray(ref) ? Number((ref as any).added_at) : NaN;
+        const key = Number.isFinite(addedAt) ? `artifact:${addedAt}` : `artifact:${envelope.delivered.seq ?? envelope.delivered.receivedAt}`;
+        draft.patchCatalogState(task, "taskspace_task", { [key]: ref });
+      }
+    }
+  });
+  registry.observation({
     types: ["gesture_progress"],
     route: "live",
     reduce: (draft, envelope) => {
@@ -830,6 +1042,7 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
 
 class ProjectionDraft implements ClientProjectionDraft {
   private patches = new Map<string, ProjectionPatch>();
+  private authoritativeClears = new Set<string>();
 
   patchObject(ref: string, fields: Record<string, unknown>) {
     const subject = String(ref ?? "");
@@ -850,8 +1063,24 @@ class ProjectionDraft implements ClientProjectionDraft {
     this.merge(subject, { subject, catalogState: { [catalogKey]: stripUndefined(fields) } });
   }
 
+  clearCatalogState(ref: string, key: string) {
+    const subject = String(ref ?? "");
+    const catalogKey = String(key ?? "");
+    if (!subject || !catalogKey) return;
+    this.merge(subject, { subject, clearCatalogState: [catalogKey] });
+  }
+
+  clearAuthoritative(ref: string) {
+    const subject = String(ref ?? "");
+    if (subject) this.authoritativeClears.add(subject);
+  }
+
   consume(): ProjectionPatch[] {
     return [...this.patches.values()];
+  }
+
+  consumeAuthoritativeClears(): string[] {
+    return [...this.authoritativeClears];
   }
 
   private merge(subject: string, patch: ProjectionPatch) {
@@ -924,6 +1153,7 @@ function applyPatch(target: ObjectProjection, patch: ProjectionPatch | undefined
   if (!patch) return;
   if (patch.fields) Object.assign(target, stripUndefined(patch.fields));
   if (patch.props) Object.assign(target.props, stripUndefined(patch.props));
+  for (const key of patch.clearCatalogState ?? []) delete target.catalogState[key];
   if (patch.catalogState) {
     for (const [key, fields] of Object.entries(patch.catalogState)) {
       target.catalogState[key] = { ...(target.catalogState[key] ?? {}), ...stripUndefined(fields) };
@@ -936,8 +1166,26 @@ function mergePatch(left: ProjectionPatch | undefined, right: ProjectionPatch): 
     subject: right.subject,
     fields: mergeRecord(left?.fields, right.fields),
     props: mergeRecord(left?.props, right.props),
-    catalogState: mergeCatalogState(left?.catalogState, right.catalogState)
+    catalogState: mergeCatalogState(left?.catalogState, right.catalogState),
+    clearCatalogState: mergeClearList(left?.clearCatalogState, right.clearCatalogState)
   };
+}
+
+function clonePatch(patch: ProjectionPatch): ProjectionPatch {
+  return {
+    subject: patch.subject,
+    fields: patch.fields ? { ...patch.fields } : undefined,
+    props: patch.props ? { ...patch.props } : undefined,
+    catalogState: patch.catalogState ? Object.fromEntries(Object.entries(patch.catalogState).map(([key, fields]) => [key, { ...fields }])) : undefined,
+    clearCatalogState: patch.clearCatalogState ? [...patch.clearCatalogState] : undefined
+  };
+}
+
+function replacementPatch(patch: ProjectionPatch): ProjectionPatch {
+  const cloned = clonePatch(patch);
+  const replacedCatalogKeys = Object.keys(cloned.catalogState ?? {});
+  cloned.clearCatalogState = mergeClearList(cloned.clearCatalogState, replacedCatalogKeys);
+  return cloned;
 }
 
 function mergeRecord(left?: Record<string, unknown>, right?: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -955,6 +1203,11 @@ function mergeCatalogState(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+function mergeClearList(left?: string[], right?: string[]): string[] | undefined {
+  const merged = [...new Set([...(left ?? []), ...(right ?? [])].map(String).filter(Boolean))];
+  return merged.length > 0 ? merged : undefined;
+}
+
 function stripUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }
@@ -962,6 +1215,14 @@ function stripUndefined<T extends Record<string, unknown>>(value: T): T {
 function pinboardNoteState(note: any): Record<string, unknown> {
   const fields: Record<string, unknown> = {};
   for (const key of ["x", "y", "z", "w", "h", "text", "color", "author", "owner", "writers"]) {
+    if (note?.[key] !== undefined) fields[key] = note[key];
+  }
+  return fields;
+}
+
+function pinboardLayoutState(note: any): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  for (const key of ["x", "y", "z", "w", "h"]) {
     if (note?.[key] !== undefined) fields[key] = note[key];
   }
   return fields;
@@ -1017,8 +1278,19 @@ function removePatchFields(current: ProjectionPatch, applied: ProjectionPatch): 
     subject: current.subject,
     fields,
     props,
-    catalogState: Object.keys(catalogState).length > 0 ? catalogState : undefined
+    catalogState: Object.keys(catalogState).length > 0 ? catalogState : undefined,
+    clearCatalogState: removeClearKeys(current.clearCatalogState, applied)
   };
+}
+
+function removeClearKeys(keys: string[] | undefined, applied: ProjectionPatch): string[] | undefined {
+  if (!keys || keys.length === 0) return undefined;
+  const appliedKeys = new Set([
+    ...Object.keys(applied.catalogState ?? {}),
+    ...(applied.clearCatalogState ?? [])
+  ]);
+  const next = keys.filter((key) => !appliedKeys.has(key));
+  return next.length > 0 ? next : undefined;
 }
 
 function removeKeys(record: Record<string, unknown> | undefined, keys: string[]): Record<string, unknown> | undefined {
@@ -1030,7 +1302,7 @@ function removeKeys(record: Record<string, unknown> | undefined, keys: string[])
 }
 
 function isEmptyPatch(patch: ProjectionPatch): boolean {
-  return !patch.fields && !patch.props && !patch.catalogState;
+  return !patch.fields && !patch.props && !patch.catalogState && !patch.clearCatalogState;
 }
 
 function subjectsInLayer(layer: ProjectionLayer | undefined): Set<string> {
@@ -1041,7 +1313,8 @@ function livePatchDiscriminator(patch: ProjectionPatch): string {
   const fields = Object.keys(patch.fields ?? {}).map((key) => `field.${key}`);
   const props = Object.keys(patch.props ?? {}).map((key) => `prop.${key}`);
   const catalog = Object.entries(patch.catalogState ?? {}).flatMap(([key, value]) => Object.keys(value).map((field) => `catalog.${key}.${field}`));
-  return [...fields, ...props, ...catalog].sort().join(",");
+  const clearCatalog = (patch.clearCatalogState ?? []).map((key) => `catalog.${key}`);
+  return [...fields, ...props, ...catalog, ...clearCatalog].sort().join(",");
 }
 
 function qualifyComponentId(alias: string, id: string): string {

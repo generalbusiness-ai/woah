@@ -216,11 +216,11 @@ class FakeHostBridge implements HostBridge {
     };
   }
 
-  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean } | null> {
+  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
     const world = this.worldFor(target);
     try {
       const { verb } = world.resolveVerb(target, verbName);
-      return { name: verb.name, direct_callable: verb.direct_callable === true };
+      return { name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
     } catch {
       return null;
     }
@@ -356,7 +356,9 @@ describe("CFObjectRepository production-shape coverage", () => {
         aliases: ["p*ing"],
         owner: "$wiz",
         perms: "rxd",
-        arg_spec: {},
+        arg_spec: {
+          command: { dobj: "this", prep: "any", iobj: "any", args_from: [] }
+        },
         source: "verb :ping() rxd { return \"pong\"; }",
         source_hash: "cf-remote-command-ping",
         version: 1,

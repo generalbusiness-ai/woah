@@ -4,6 +4,7 @@ import { installLocalCatalogs } from "./local-catalogs";
 import type { ObjectRepository, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
 import { hashSource } from "./source-hash";
 import type { ObjRef, TinyBytecode, WooValue } from "./types";
+import { valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
 
@@ -40,6 +41,13 @@ const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
     else { description = inventory; }
   }
   return { id: this, title: title, description: description, carrying: carried };
+}`;
+
+const ACTOR_HUH_SOURCE = `verb :huh(text, reason, source) rxd {
+  if (!reason) { reason = "I don't understand that."; }
+  if (source == null) { source = location(this); }
+  observe({ type: "huh", source: source, actor: this, text: text, reason: reason, ts: now(), _audience_override: [this] });
+  return false;
 }`;
 
 const PLAYER_INVENTORY_SOURCE = `verb :inventory() rxd {
@@ -387,16 +395,38 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$root", "describe", "describe", "verb :describe() rxd { ... }", { directCallable: true });
   native(world, "$root", "title", "default_title", "verb :title() rxd { return this.name; }", { directCallable: true });
   native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
-  sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, { directCallable: true, toolExposed: true });
+  sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["describe", "@describe", "@desc"],
+    argSpec: { args: ["desc"], command: { dobj: "object", prep: "as", iobj: "string", args_from: ["iobjstr"] } }
+  });
   sourceVerb(world, "$actor", "look_self", ACTOR_LOOK_SELF_SOURCE, { directCallable: true });
+  sourceVerb(world, "$actor", "huh", ACTOR_HUH_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "look_self", PLAYER_LOOK_SELF_SOURCE, { directCallable: true });
-  sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, { directCallable: true, toolExposed: true, aliases: ["i@nventory", "inv"] });
-  sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, { directCallable: true, toolExposed: true, aliases: ["@home"] });
+  sourceVerb(world, "$player", "inventory", PLAYER_INVENTORY_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["i@nventory", "inv"],
+    argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } }
+  });
+  sourceVerb(world, "$player", "home", PLAYER_HOME_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["@home"],
+    argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } }
+  });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });
   native(world, "$player", "tell", "player_tell", "verb :tell(text) rxd { ... }", { directCallable: true });
   native(world, "$player", "tell_lines", "player_tell_lines", "verb :tell_lines(lines) rxd { ... }", { directCallable: true });
-  native(world, "$player", "help", "player_help", "verb :help(topic?) rxd { return null; /* native: see player_help */ }", { directCallable: true, skipPresenceCheck: true, toolExposed: true, aliases: ["?", "info", "information", "@help"], argSpec: { args: ["topic?"] } });
+  native(world, "$player", "help", "player_help", "verb :help(topic?) rxd { return null; /* native: see player_help */ }", {
+    directCallable: true,
+    skipPresenceCheck: true,
+    toolExposed: true,
+    aliases: ["?", "info", "information", "@help"],
+    argSpec: { args: ["topic?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
+  });
   native(world, "$guest", "on_disfunc", "guest_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$system", "return_guest", "return_guest", "verb :return_guest(guest) r { ... }", { perms: "r" });
   native(world, "$system", "set_object_flags", "set_object_flags", "verb :set_object_flags(target, flags) rxd { /* native: wizard-only flag mutation. flags is a map; allowed keys: wizard, programmer, fertile, recyclable. Returns the resulting flags. Required for the auth.md A11 \"mint a backup wizard\" flow. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["target", "flags"] } });
@@ -574,7 +604,7 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     existing.skip_presence_check === next.skip_presence_check &&
     existing.tool_exposed === next.tool_exposed &&
     JSON.stringify(existing.aliases ?? []) === JSON.stringify(next.aliases ?? []) &&
-    JSON.stringify(existing.arg_spec ?? {}) === JSON.stringify(next.arg_spec ?? {})
+    valuesEqual((existing.arg_spec ?? {}) as WooValue, (next.arg_spec ?? {}) as WooValue)
   ) return;
   world.addVerb(obj, next);
 }
@@ -584,20 +614,23 @@ function native(world: WooWorld, obj: ObjRef, name: string, handler: string, sou
   if (existing) {
     const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existing.direct_callable || options.directCallable === true);
     const aliases = options.aliases ?? existing.aliases;
+    const argSpec = options.argSpec ?? existing.arg_spec;
     const next = {
       ...existing,
       perms: parsedPerms.perms,
       direct_callable: parsedPerms.directCallable,
       skip_presence_check: existing.skip_presence_check || options.skipPresenceCheck === true,
       tool_exposed: existing.tool_exposed || options.toolExposed === true,
-      aliases
+      aliases,
+      arg_spec: argSpec
     };
     if (
       next.perms !== existing.perms ||
       next.direct_callable !== existing.direct_callable ||
       next.skip_presence_check !== existing.skip_presence_check ||
       next.tool_exposed !== existing.tool_exposed ||
-      JSON.stringify(next.aliases ?? []) !== JSON.stringify(existing.aliases ?? [])
+      JSON.stringify(next.aliases ?? []) !== JSON.stringify(existing.aliases ?? []) ||
+      !valuesEqual((next.arg_spec ?? {}) as WooValue, (existing.arg_spec ?? {}) as WooValue)
     ) world.addVerb(obj, next);
     return;
   }

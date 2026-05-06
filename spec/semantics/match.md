@@ -9,7 +9,7 @@ status: implemented
 
 LambdaMOO's `parse_command` did three things at once: tokenize text, resolve direct/indirect objects, and dispatch a verb with parser globals (`dobj`, `iobj`, `prepstr`, `argstr`, etc.). woo's runtime does **none** of these — verb invocations are structured messages, not parsed text. This is correct for dubspace (UI controls) and taskspace (REST/agent calls), but a chat-shaped surface (rooms with conversational text) needs the equivalent.
 
-`$match` is a **bootstrap class**, not a runtime primitive. It scaffolds the text-to-action pipeline as ordinary verbs on a seed object, so chat surfaces don't each invent their own. The runtime privileges nothing here; everything below is implementable as user code.
+`$match` is a **bootstrap class**, not a runtime primitive. It scaffolds the text-to-action pipeline as ordinary verbs on a seed object, so chat surfaces don't each invent their own. Some bundled `$match` verbs are native-backed for cross-host object/verb lookup and command planning, but they remain ordinary verbs at the woocode boundary.
 
 This doc is the convention. An implementation that doesn't ship a chat surface may skip it entirely. An implementation that does ship one should use these verb names so the pattern is portable.
 
@@ -24,6 +24,8 @@ A seed object with these verbs. Lives with the chat classes and scaffolding ([bo
 | `:match_object(name, location?)` rxd | obj \| `$failed_match` \| `$ambiguous_match` | Resolve a string to an object visible from `location` (defaults to `actor.location`). |
 | `:match_verb(name, target)` rxd | verb \| null | Resolve a verb name (with alias patterns per [objects.md §9.1](objects.md#91-lookup)) on `target` using runtime lookup, including features where applicable. |
 | `:parse_command(text, actor, location?)` rxd | map | Full pipeline: tokenize, identify verb + dobj + iobj, return a structured `command` map. `location` defaults to `actor.location`. |
+| `:match_command_verb(cmd, target)` rxd | map \| `$failed_match` | Resolve a command-pattern verb on `target`, using the same ancestry/feature lookup as `:match_verb` but filtering by command metadata. |
+| `:plan_command(text, space)` rxd | map | Shared command planner used by `$conversational:command_plan`; returns `{ok, route, space?, target, verb, args, cmd}` or a huh plan. |
 
 Returned by `:match_object`:
 - A successful objref.
@@ -108,13 +110,80 @@ User code dispatches by:
 
 ```woo
 let cmd = $match:parse_command(text, actor);
-let v = $match:match_verb(cmd.verb, cmd.dobj);
-if (v != null) {
-  cmd.dobj:(cmd.verb)(cmd);  // dispatch with the parsed map as the arg
+let v = $match:match_command_verb(cmd, cmd.dobj);
+if (typeof(v) == "map") {
+  dispatch(v["target"], v["verb"], v["args"]);
 }
 ```
 
-The verb body sees the structured `cmd` as its argument; it does not get parser globals injected. This is the deliberate departure from MOO: parser state is data passed in, not implicit task globals. Verbs that want MOO-style ergonomics can destructure: `verb foo(cmd) { let dobj = cmd.dobj; ... }`.
+The verb body receives ordinary declared arguments, not parser globals. This is the deliberate departure from MOO: parser state is data used by the planner, not implicit task globals.
+
+---
+
+## MA4.1 Command verb metadata
+
+Catalog verbs may declare command-pattern metadata inside `arg_spec.command`:
+
+```json
+{
+  "arg_spec": {
+    "args": ["recipient"],
+    "command": {
+      "dobj": "this",
+      "prep": ["to", "at"],
+      "iobj": "string",
+      "args_from": ["iobjstr"]
+    }
+  }
+}
+```
+
+Pattern values for `dobj` and `iobj` are:
+
+| Value | Meaning |
+|---|---|
+| `none` | The slot must be empty. |
+| `this` | The slot must resolve to the command receiver. |
+| `any` | The slot may be empty or non-empty. |
+| `object` | The slot must resolve to an object. |
+| `player` | The slot must resolve to a `$player` descendant. |
+| `string` | The slot source text must be present. |
+
+`dobj` and `iobj` may also be a list of these values; the slot matches if any
+listed value matches. Use this for deliberately small overloads such as
+`["none", "this"]`, not as a replacement for separate verbs with distinct
+behavior.
+
+`prep` is `none`, `any`, an exact normalized preposition string, or a list of exact normalized preposition strings.
+
+`args_from` is an ordered list drawn from: `text`, `verb`, `argstr`, `prep`, `dobj`, `dobjstr`, `dobj_prefix`, `dobj_prefix_rest`, `iobj`, `iobjstr`, and `cmd`. These become the actual verb arguments. The parsed command map is available as `cmd` only as an escape hatch.
+
+Command metadata is per verb definition. Aliases share the same command pattern; a different pattern requires a separate verb.
+Source-install authoring APIs MAY attach the same metadata out-of-band as
+`argSpec.command` while the source language lacks first-class `args_from`
+syntax. The stored verb definition is still the source of truth after install.
+
+`$match:plan_command(text, space)` uses this normative target order: direct object, indirect object, command space, actor. Within each target it uses the existing runtime verb lookup rule, including parent chains and features.
+
+When no command-pattern verb matches a slash-prefixed command, the planner
+consults optional huh hooks in this order: `actor:my_huh(cmd)`,
+`space:here_huh(cmd)`, then `actor:last_huh(cmd)`. A missing hook is ignored. A
+hook that returns a map with an `ok` field supplies the returned plan; returning
+`true` marks the input handled without a follow-on route. The command-plan route
+vocabulary is closed for v1: `direct`, `sequenced`, `huh`, and `handled`.
+Hooks fire only for slash-prefixed misses. Bare text without a command match is
+also a miss, not implicit speech; it returns the actor-owned `:huh` plan with
+the LambdaMOO-style default message `I don't understand that.` Explicit speech
+uses command metadata such as `say hello` or one of the speech-prefix lowerings
+above, such as `"hello`. Missing hooks (`E_VERBNF`) are ignored; any other hook
+error is surfaced as a planner failure so broken catalog hooks are visible.
+
+The bundled default `:huh` is actor-owned: the planner dispatches
+`actor:huh(text, reason, space)`. This follows LambdaMOO's player-rooted
+default-miss shape while preserving Woo's explicit command surface; the space is
+passed as context, not as the owner of the private output. `$conversational:huh`
+is only a compatibility wrapper for older space-level callers and delegates back
+to the actor.
 
 ---
 
@@ -146,9 +215,11 @@ Custom worlds can extend this list by overriding `$match.prepositions` (a list p
 
 - **Sentence parsing.** `$match` parses one verb-shaped command per call. Multi-clause input (`get the book and read it`) is the caller's responsibility.
 - **Spell correction or fuzzy matching.** Prefix matching is the only forgiveness offered. Worlds that want Damerau-Levenshtein or phonetic matching layer it on top.
-- **Verb suggestion (`:huh`).** When `:match_verb` returns null, the caller can choose to call `room:huh(cmd)` (a convention, not a built-in). LambdaMOO's `:huh` lives on rooms; same here.
+- **Verb suggestion UX.** The bundled planner has the small `my_huh` /
+  `here_huh` / `last_huh` hook chain above, but richer suggestion or typo
+  correction is catalog policy.
 - **Cross-room search.** `:match_object` only walks `location.contents` and `actor.contents`, even when those containers are remote. A world that wants global search adds a verb that walks an index.
-- **Arg-pattern overload selection.** LambdaMOO's `do_command` chooses among same-named verb candidates by matching `(dobj kind, preposition, iobj kind)` against each verb's arg spec. Woo now stores ordered same-name verb slots, but the chat parser still resolves by verb name only and lowers to the first matching target verb's current argument shape. Full arg-pattern dispatch is deferred until the authoring surface exposes the grammar clearly and command planning consumes it.
+- **Same-name overload authoring.** The bundled command planner filters verbs by command metadata, but the authoring UI still does not make same-name overload sets pleasant to manage. Prefer one command pattern per verb definition until the editor grows explicit support.
 
 These deferrals keep `$match` small. The pattern is "scaffolding for the 80% case"; the 20% extends it.
 

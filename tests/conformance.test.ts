@@ -178,11 +178,11 @@ class LocalHostBridge implements HostBridge {
     };
   }
 
-  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean } | null> {
+  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
     const world = this.worldFor(target);
     try {
       const { verb } = world.resolveVerb(target, verbName);
-      return { name: verb.name, direct_callable: verb.direct_callable === true };
+      return { name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
     } catch {
       return null;
     }
@@ -749,13 +749,13 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       roomHost.setProp("conf_remote_room", "features", ["$conversational"]);
       roomHost.setProp("conf_remote_room", "aliases", ["remote room"]);
       if (!roomHost.objects.has(actor)) roomHost.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
-        roomHost.setActorPresence(actor, "conf_remote_room", true);
+      roomHost.setActorPresence(actor, "conf_remote_room", true);
 
-        home.object(actor).location = "conf_remote_room";
-        home.sessions.get(session.id)!.currentLocation = "conf_remote_room";
-        home.setActorPresence(actor, "conf_remote_room", true);
-        home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
-        home.object("conf_home_widget").location = "conf_remote_room";
+      home.object(actor).location = "conf_remote_room";
+      home.sessions.get(session.id)!.currentLocation = "conf_remote_room";
+      home.setActorPresence(actor, "conf_remote_room", true);
+      home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
+      home.object("conf_home_widget").location = "conf_remote_room";
       home.setProp("conf_home_widget", "aliases", ["widget"]);
       home.addVerb("conf_home_widget", {
         kind: "native",
@@ -763,39 +763,51 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         aliases: ["p*ing"],
         owner: "$wiz",
         perms: "rxd",
-        arg_spec: {},
+        arg_spec: {
+          command: { dobj: "this", prep: "any", iobj: "any", args_from: [] }
+        },
         source: "verb :ping() rxd { return \"pong\"; }",
-        source_hash: "conf-remote-command-ping",
+        source_hash: "conf-remote-command-ping-seed",
         version: 1,
         line_map: {},
         native: "describe",
         direct_callable: true
       });
+      expect(installVerb(home, "conf_home_widget", "ping", `verb :ping() rxd {
+  return "pong";
+}`, 1, { argSpec: { command: { dobj: "this", prep: "any", iobj: "any", args_from: [] } } }).ok).toBe(true);
       roomHost.mirrorContents("conf_remote_room", actor, true);
       roomHost.mirrorContents("conf_remote_room", "conf_home_widget", true);
 
       const parsedHere = await home.directCall("parse-remote-here", actor, "$match", "parse_command", ["look here", actor]);
-      expect(parsedHere.op).toBe("result");
+      expect(parsedHere.op, parsedHere.op === "error" ? JSON.stringify(parsedHere.error) : "").toBe("result");
       if (parsedHere.op === "result") {
         expect(parsedHere.result).toMatchObject({ dobj: "conf_remote_room", dobjstr: "here" });
       }
 
       const parsedWidget = await home.directCall("parse-remote-widget", actor, "$match", "parse_command", ["look widget", actor]);
-      expect(parsedWidget.op).toBe("result");
+      expect(parsedWidget.op, parsedWidget.op === "error" ? JSON.stringify(parsedWidget.error) : "").toBe("result");
       if (parsedWidget.op === "result") {
         expect(parsedWidget.result).toMatchObject({ dobj: "conf_home_widget", dobjstr: "widget" });
       }
 
       const remoteVerb = await roomHost.directCall("match-remote-verb", actor, "$match", "match_verb", ["p", "conf_home_widget"]);
-      expect(remoteVerb.op).toBe("result");
+      expect(remoteVerb.op, remoteVerb.op === "error" ? JSON.stringify(remoteVerb.error) : "").toBe("result");
       if (remoteVerb.op === "result") {
         expect(remoteVerb.result).toMatchObject({ name: "ping", direct_callable: true });
       }
 
       const plan = await roomHost.directCall("plan-cross-host-widget", actor, "conf_remote_room", "command_plan", ["ping widget"]);
-      expect(plan.op).toBe("result");
+      expect(plan.op, plan.op === "error" ? JSON.stringify(plan.error) : "").toBe("result");
       if (plan.op === "result") {
         expect(plan.result).toMatchObject({ ok: true, route: "direct", target: "conf_home_widget", verb: "ping", args: [] });
+      }
+
+      const command = await home.command("command-cross-host-widget", session.id, "conf_remote_room", "ping widget");
+      expect(command.op, command.op === "error" ? JSON.stringify(command.error) : "").toBe("result");
+      if (command.op === "result") {
+        expect(command.result).toBe("pong");
+        expect((command as any).command).toMatchObject({ route: "direct", target: "conf_home_widget", verb: "ping", args: [] });
       }
     } finally {
       roomHarness.cleanup();

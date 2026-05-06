@@ -190,6 +190,15 @@ export class LocalHostBridge implements HostBridge {
     return out;
   }
 
+  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
+    try {
+      const { verb } = this.worldFor(target).resolveVerb(target, verbName);
+      return { name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
+    } catch {
+      return null;
+    }
+  }
+
   async location(objRef: ObjRef): Promise<ObjRef | null> {
     return this.worldFor(objRef).object(objRef).location;
   }

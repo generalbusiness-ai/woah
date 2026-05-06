@@ -105,6 +105,84 @@ describe("scoped client projection", () => {
     expect(sent[0]).toMatchObject({ op: "session", actor: session.actor, session: session.id, resumed: false });
   });
 
+  it("routes websocket command frames through the host command executor", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:ws-command");
+    const sent: any[] = [];
+    const live: any[] = [];
+    await handleWsProtocolFrame("conn", {
+      op: "command",
+      id: "ws-command-1",
+      space: "the_chatroom",
+      text: "hello"
+    }, {
+      authenticate: () => session,
+      attach: () => undefined,
+      session: () => ({ sessionId: session.id, actor: session.actor }),
+      send: (_connection, frame) => sent.push(frame),
+      call: async () => { throw new Error("unexpected call"); },
+      command: async (frameId, wsSession, space, text) => {
+        expect(frameId).toBe("ws-command-1");
+        expect(wsSession).toMatchObject({ sessionId: session.id, actor: session.actor });
+        expect(space).toBe("the_chatroom");
+        expect(text).toBe("hello");
+        return {
+          op: "result",
+          id: frameId,
+          result: true,
+          observations: [{ type: "said", source: space, actor: session.actor, text }],
+          audience: space,
+          command: { route: "direct", target: space, verb: "say", args: [text] }
+        } as any;
+      },
+      direct: async () => { throw new Error("unexpected direct"); },
+      replay: async () => { throw new Error("unexpected replay"); },
+      deliverInput: async () => null,
+      broadcastApplied: async () => { throw new Error("unexpected applied"); },
+      broadcastTaskResult: async () => undefined,
+      broadcastLiveEvents: async (result) => { live.push(result); }
+    });
+
+    expect(sent[0]).toMatchObject({
+      op: "result",
+      id: "ws-command-1",
+      result: true,
+      command: { route: "direct", target: "the_chatroom", verb: "say", args: ["hello"] }
+    });
+    expect(live).toHaveLength(1);
+  });
+
+  it("returns websocket command errors from invalid command spaces", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:ws-command-bad-space");
+    const sent: any[] = [];
+    await handleWsProtocolFrame("conn", {
+      op: "command",
+      id: "ws-command-bad-space",
+      space: "the_lamp",
+      text: "hello"
+    }, {
+      authenticate: () => session,
+      attach: () => undefined,
+      session: () => ({ sessionId: session.id, actor: session.actor }),
+      send: (_connection, frame) => sent.push(frame),
+      call: async () => { throw new Error("unexpected call"); },
+      command: (frameId, wsSession, space, text) => world.command(frameId, wsSession.sessionId, space, text),
+      direct: async () => { throw new Error("unexpected direct"); },
+      replay: async () => { throw new Error("unexpected replay"); },
+      deliverInput: async () => null,
+      broadcastApplied: async () => { throw new Error("unexpected applied"); },
+      broadcastTaskResult: async () => undefined,
+      broadcastLiveEvents: async () => { throw new Error("unexpected live"); }
+    });
+
+    expect(sent[0]).toMatchObject({
+      op: "error",
+      id: "ws-command-bad-space",
+      error: { code: "E_TYPE" }
+    });
+  });
+
   it("includes enriched movement results on sequenced applied frames", async () => {
     const world = createWorld();
     const session = world.auth("guest:scoped-sequenced-move");
@@ -197,13 +275,42 @@ describe("scoped client projection", () => {
     });
     expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
     expect(body.here.exits.some((exit: { direction?: string }) => exit.direction === "south")).toBe(true);
+    expect(new Set(body.here.exits.map((exit: { id: string }) => exit.id)).size).toBe(body.here.exits.length);
     expect(body.here.props.secret_room_note).toBeNull();
+    expect(body.here.props.session_subscribers).toBeUndefined();
+    expect(body.here.present_actors.every((actor: { props?: unknown }) => actor.props === undefined)).toBe(true);
     expect(Array.isArray(body.inventory)).toBe(true);
+  });
+
+  it("keeps nested room snapshot summaries thin", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:scoped-thin-contents");
+    const entered = await world.directCall("scoped-thin-enter", session.actor, "the_deck", "enter", [], { sessionId: session.id });
+    expect(entered.op).toBe("result");
+
+    const body = await apiMe(world, session);
+    expect(body.here.id).toBe("the_deck");
+    expect(new Set(body.here.exits.map((exit: { id: string }) => exit.id)).size).toBe(body.here.exits.length);
+    expect(body.here.props.session_subscribers).toBeUndefined();
+    const pinboard = body.here.contents.find((item: { id?: string }) => item.id === "the_pinboard");
+    expect(pinboard).toBeDefined();
+    expect(pinboard.props).toBeUndefined();
   });
 
   it("serves scoped overlay snapshots without reading the full world state", async () => {
     const world = createWorld();
     const session = world.auth("guest:overlay-snapshot");
+    await world.directCall("overlay-pinboard-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
+    const added = await world.call("overlay-pinboard-note", session.id, "the_pinboard", {
+      actor: session.actor,
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["green note", "green", 12, 24, 160, 88]
+    });
+    expect(added.op).toBe("applied");
+    const pin = String((added as any).result?.id ?? "");
+    expect(pin).toBeTruthy();
+
     const result = await handleRestProtocolRequest(getWithQuery("/api/objects/the_pinboard/ui-snapshot", { surface: "pinboard" }), {
       world,
       requireSession: () => session,
@@ -226,6 +333,9 @@ describe("scoped client projection", () => {
     });
     expect(body.cursor.spaces.the_pinboard.next_seq).toEqual(expect.any(Number));
     expect(body.objects.some((object: { id?: string }) => object.id === "the_pinboard")).toBe(true);
+    const pinSummary = body.objects.find((object: { id?: string }) => object.id === pin);
+    expect(pinSummary?.props?.color).toBe("green");
+    expect(pinSummary?.props?.text).toBeNull();
   });
 
   it("adds here to direct move and enter results while preserving legacy fields", async () => {
@@ -264,6 +374,21 @@ describe("scoped client projection", () => {
       here_request: true,
       look_deferred: true,
       here: { id: "the_deck", name: "Deck" }
+    });
+  });
+
+  it("adds here to feature-space leave results", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:feature-leave-result");
+    await world.directCall("feature-leave-result-enter", session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    const left = await world.directCall("feature-leave-result-out", session.actor, "the_dubspace", "out", [], { sessionId: session.id });
+    expect(left.op).toBe("result");
+    if (left.op !== "result") return;
+    expect(left.result).toMatchObject({
+      room: "the_chatroom",
+      here_request: true,
+      look_deferred: true,
+      here: { id: "the_chatroom", name: "Living Room" }
     });
   });
 

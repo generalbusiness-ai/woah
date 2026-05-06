@@ -258,7 +258,7 @@ The concrete CF SQLite encoding lives in [persistence.md](persistence.md). The s
 |---|---|
 | `getProp(id, name, expected_version?)` | Property read with lazy version check ([persistence.md §15.3](persistence.md#153-lazy-version-check)). Returns `{value, version, perms}` or `E_PROPNF`/`E_PERM`. |
 | `describeObject(id, actor)` / `describeObjects(ids, actor)` | Bundled read of display `name`, actor-readable `description`, and actor-readable `aliases` for look/match projections. Batch form returns a map keyed by id and is preferred when multiple candidate ids are already known. |
-| `resolveVerb(id, descriptor)` | Read-only verb metadata lookup for command planning; descriptor is name or 1-based local slot. Returns slot, canonical name, and `direct_callable`, not executable code. |
+| `resolveVerb(id, descriptor)` | Read-only verb metadata lookup for command planning; descriptor is name or 1-based local slot. Returns slot, canonical name, `arg_spec` (including command metadata), and `direct_callable`, not executable code. |
 | `contents(id)` | Read a container's contents mirror for look/match projections. |
 | `getVerb(id, descriptor, expected_version?)` | Verb fetch for the cross-host bytecode cache. Returns `{slot, bytecode, version, owner, perms, definer}`. |
 | `getAncestorChain(id, expected_version?)` | Chain walk for cache population. |

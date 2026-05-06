@@ -117,7 +117,7 @@ const BUILTIN_NAMES = [
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
-  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "str_join", "collect_prop",
+  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
   "to_int", "to_float"
 ];
 
@@ -1003,6 +1003,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           callArgs,
           startAt
         );
+      }
+      case "execute_command_plan": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "execute_command_plan expects one plan");
+        return await frame.ctx.world.executeCommandPlan(frame.ctx, assertMap(builtinArgs[0]));
       }
       case "collect_prop": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "collect_prop expects list and property name");

@@ -2,6 +2,31 @@
 
 Date: 2026-05-05
 
+Status: Phase 1 through the first browser-facing command execution slice are
+implemented. Catalog installs preserve `arg_spec.command`, `$match` exposes
+native-backed `match_command_verb` and `plan_command`,
+`$conversational:command_plan` is a thin wrapper over the shared planner, and
+dubspace no longer ships its own `command_plan`. The WebSocket wire now accepts
+`op:"command"` so the server plans and executes direct/sequenced text commands;
+the browser no longer executes plan descriptors for chat input. The inherited
+catalog `:command(text)` surface executes the same direct/sequenced plans for
+older direct callers. The first huh-hook chain is present for slash-prefixed
+misses (`my_huh`, `here_huh`, `last_huh`). The transitional
+`fallbackCommandPlan` helper has been removed; textual commands now need either
+speech-prefix lowering, command metadata, or an explicit huh hook. Bare text
+without a command match is a private LambdaMOO-style huh response, not implicit
+room speech.
+
+Upgrade note for third-party catalogs: any chat-shaped verb that previously
+worked only because the fallback planner found a room, actor, or nearby-object
+verb by name must now declare `arg_spec.command` metadata or install an explicit
+huh hook. First-party bundled catalogs were annotated in the same change, but
+there is no automatic migration that can infer third-party command patterns
+safely. Custom `$conversational:huh` or per-space `:huh` overrides are no longer
+the planner's default parse-miss extension point; move personal/default miss
+behavior to `$actor`/`$player:huh`, and keep room-specific command recovery in
+`space:here_huh(cmd)`.
+
 ## Problem
 
 `$chatroom:command_plan` has become a dense command compiler.
@@ -66,6 +91,19 @@ direction verb and invokes the exit. Feature dispatch is handled by
 This is the hook shape woo should copy. Custom command behavior belongs in
 small hooks or object verbs, not in one global `command_plan` branch list.
 
+Woo now keeps the default attachment point close to LambdaMOO. The planner
+dispatches misses to `actor:huh(text, reason, space)`, with `space` passed as
+the active command surface. `$conversational:huh(text, reason)` remains as a
+compatibility wrapper that delegates to the actor. Room-specific customization
+belongs in `space:here_huh(cmd)`; personal output and generic miss reporting
+belong on the actor/player side.
+
+Woo also resolves feature-provided command verbs before the huh chain, because
+features participate in normal metadata-driven verb lookup. LambdaMOO reaches
+some feature behavior from `player:my_huh`. The observable policy is the same
+for v1: small feature/object verbs own command behavior, and the huh path is
+the final extension/reporting path.
+
 ### Command utilities own errors
 
 LambdaMOO centralizes match-failure wording in `$command_utils`, for example
@@ -73,8 +111,12 @@ LambdaMOO centralizes match-failure wording in `$command_utils`, for example
 verbs call those helpers instead of duplicating ambiguity/missing-object text.
 
 Woo's `huh_plan` and chat error rendering are a partial equivalent, but the
-messages are still often embedded in planner branches. That is another reason
-the planner grows.
+messages are still often embedded in planner branches. Ambiguous object names
+still surface as structured errors rather than friendly huh variants such as
+`I don't understand that ("note" is ambiguous)`. Syntax-explanation hooks such
+as LambdaMOO's `my_explain_syntax` / `here_explain_syntax` are also not part of
+this slice. Those are follow-on command-UX improvements, not reasons to
+reintroduce a branchy planner.
 
 ## What woo is missing
 
@@ -97,11 +139,13 @@ Proposed metadata extension:
 ```json
 {
   "name": "gi*ve ha*nd",
-  "command": {
-    "dobj": "this",
-    "prep": ["to", "at"],
-    "iobj": "any",
-    "args_from": ["iobjstr"]
+  "arg_spec": {
+    "command": {
+      "dobj": "this",
+      "prep": ["to", "at"],
+      "iobj": "any",
+      "args_from": ["iobjstr"]
+    }
   }
 }
 ```
@@ -411,11 +455,17 @@ changing the world's command language.
 
 ### Phase 6: client cleanup
 
-- Replace `command_plan` + `executeChatPlan` with `:command(text)`.
+- Replace `command_plan` + `executeChatPlan` with wire `op:"command"` or a
+  future `:command(text)` equivalent that can return direct or applied frames.
 - Remove route/space/target/verb/args plan interpretation from the browser.
 - Keep UI-only post-result reducers for tab changes and overlay focus.
 - Once no catalog/client reads the descriptor, remove the plan descriptor
   format.
+
+The current implementation still returns plan descriptors for callers that
+explicitly invoke `command_plan`, but those descriptors now come from declared
+command metadata, speech-prefix lowering, or huh hooks rather than the removed
+fallback planner.
 
 ## Conditions of satisfaction
 

@@ -39,6 +39,142 @@ describe("client UI framework projection", () => {
     expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 162, y: 171, z: 7 });
   });
 
+  it("reduces pinboard note edits and recolors into catalog state", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { text: ["old"], color: "yellow", x: 10, y: 20 } } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 14,
+      space: "the_pinboard",
+      observations: [
+        { type: "note_edited", note: "note_1", text: ["new", "text"] },
+        { type: "pin_recolored", pin: "note_1", color: "pink" }
+      ]
+    });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({
+      text: ["new", "text"],
+      color: "pink",
+      x: 10,
+      y: 20
+    });
+  });
+
+  it("keeps optimistic pinboard text edits across stale overlay snapshots until applied confirmation", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { text: ["old"], color: "yellow" } } }
+    ]);
+
+    ui.applyOptimisticCall("call-1", {
+      optimistic: {
+        id: "pinboard:note_1:note",
+        patches: [{ subject: "note_1", catalogState: { pinboard_note: { text: ["draft"] } } }]
+      }
+    });
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { text: ["old"], color: "yellow" } } }
+    ]);
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["draft"], color: "yellow" });
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 15,
+      space: "the_pinboard",
+      observations: [{ type: "note_edited", note: "note_1", text: ["draft"] }]
+    });
+    ui.completeOptimisticCall("call-1");
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["draft"], color: "yellow" });
+  });
+
+  it("clears pinboard catalog state when a pin leaves the board", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: { note_1: { x: 10, y: 20 } } } },
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { text: ["old"], x: 10, y: 20 } } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 16,
+      space: "the_pinboard",
+      observations: [{ type: "pin_removed", board: "the_pinboard", pin: "note_1" }]
+    });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toBeUndefined();
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: null });
+  });
+
+  it("tracks added pinboard notes through board layout catalog state", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 17,
+      space: "the_pinboard",
+      observations: [{
+        type: "note_added",
+        board: "the_pinboard",
+        pin: "note_1",
+        note: { id: "note_1", name: "Note", text: ["hello"], x: 12, y: 24, w: 180, h: 110, z: 3 }
+      }]
+    });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hello"], x: 12, y: 24 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: { x: 12, y: 24, w: 180, h: 110, z: 3 } });
+  });
+
+  it("keeps pinboard layout overlays sparse across sequential partial updates", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: { note_1: { x: 10, y: 20, w: 180, h: 110, z: 1 } } } },
+      { id: "note_1", name: "Note", catalogState: { pinboard_note: { x: 10, y: 20, w: 180, h: 110 } } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 18,
+      space: "the_pinboard",
+      observations: [{ type: "pin_moved", board: "the_pinboard", pin: "note_1", x: 12, y: 24, z: 2 }]
+    });
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 19,
+      space: "the_pinboard",
+      observations: [{ type: "pin_resized", board: "the_pinboard", pin: "note_1", w: 200, h: 120 }]
+    });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 12, y: 24, w: 200, h: 120, z: 2 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: { w: 200, h: 120 } });
+  });
+
+  it("tracks pinboard presence as a catalog-state overlay", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { subscribers: ["guest_1"] } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 20,
+      space: "the_pinboard",
+      observations: [
+        { type: "pinboard_entered", board: "the_pinboard", actor: "guest_2" },
+        { type: "pinboard_left", board: "the_pinboard", actor: "guest_1" }
+      ]
+    });
+
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_presence).toEqual({ guest_2: true, guest_1: false });
+  });
+
   it("applies live dubspace gesture previews without mutating canonical props", () => {
     const ui = createWooClientFramework();
     ui.ingestWorld({
@@ -123,6 +259,74 @@ describe("client UI framework projection", () => {
     expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
   });
 
+  it("keeps direct authoritative patches across later scoped snapshots", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin", catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["hydrated"], color: "green" } } }]);
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hydrated"], color: "green" });
+
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin", catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hydrated"], color: "green" });
+  });
+
+  it("clears authoritative patches so removed scoped objects do not ghost", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: { note_1: { x: 10, y: 20 } } } },
+      { id: "note_1", name: "Note", parent: "$pin", catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["hydrated"], color: "green" } } }]);
+
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: ["hydrated"], color: "green" });
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 21,
+      space: "the_pinboard",
+      observations: [{ type: "pin_removed", board: "the_pinboard", pin: "note_1" }]
+    });
+
+    expect(ui.observe("note_1")).toBeUndefined();
+  });
+
+  it("can replace authoritative patches for full canonical refreshes", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin" }
+    ]);
+
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["old"], color: "yellow" } } }], { mode: "replace" });
+    ui.applyCanonical([{ subject: "note_1", catalogState: { pinboard_note: { text: ["new"] } } }], { mode: "replace" });
+
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toEqual({ text: ["new"] });
+  });
+
+  it("clears authoritative patches on full world refresh", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:dubspace:the_dubspace", [
+      { id: "filter_1", name: "filter", props: { cutoff: 1000 } }
+    ]);
+    ui.applyCanonical([{ subject: "filter_1", props: { cutoff: 500 } }]);
+    expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
+
+    ui.ingestWorld({
+      objects: {
+        filter_1: { id: "filter_1", name: "filter", props: { cutoff: 1000 } }
+      }
+    });
+
+    expect(ui.observe("filter_1")?.props.cutoff).toBe(1000);
+  });
+
   it("keeps independent live fields on separate coalesced layers", () => {
     const ui = createWooClientFramework();
     ui.ingestWorld({
@@ -192,6 +396,40 @@ describe("client UI framework projection", () => {
     expect(ui.observe("slot_1")?.props.playing).toBe(false);
   });
 
+  it("reduces taskspace observations into task props and sparse tree/detail overlays", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:taskspace:the_taskspace", [
+      { id: "the_taskspace", name: "Tasks", parent: "$taskspace", props: { root_tasks: [] } }
+    ]);
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 21,
+      space: "the_taskspace",
+      observations: [
+        { type: "task_created", task: "task_1", parent: null, title: "Ship scoped tasks" },
+        { type: "task_claimed", task: "task_1", actor: "guest_1" },
+        { type: "status_changed", task: "task_1", from: "claimed", to: "in_progress" },
+        { type: "requirement_added", task: "task_1", index: 0, text: "renders without /api/state" },
+        { type: "requirement_checked", task: "task_1", index: 0, checked: true },
+        { type: "message_added", task: "task_1", actor: "guest_1", body: "wired", ts: 1234 }
+      ]
+    });
+
+    expect(ui.observe("task_1")?.props).toMatchObject({
+      title: "Ship scoped tasks",
+      parent_task: null,
+      assignee: "guest_1",
+      status: "in_progress"
+    });
+    expect(ui.observe("the_taskspace")?.catalogState.taskspace_tree).toMatchObject({ task_1: null });
+    expect(ui.observe("task_1")?.catalogState.taskspace_task).toMatchObject({
+      "requirement:0": { text: "renders without /api/state", checked: false },
+      "requirement_checked:0": true,
+      "message:1234": { actor: "guest_1", body: "wired", ts: 1234 }
+    });
+  });
+
   it("ingests scoped snapshots without clearing unrelated scopes", () => {
     const ui = createWooClientFramework();
     ui.ingestSnapshot("here", [
@@ -209,6 +447,17 @@ describe("client UI framework projection", () => {
     expect(ui.observe("actor_1")).toBeUndefined();
     expect(ui.observe("room_1")?.props.topic).toBe("new");
     expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ x: 10, y: 20 });
+  });
+
+  it("lets later full overlay summaries win over earlier thin duplicates", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "note_1", name: "Note", parent: "$pin", ancestors: ["$thing", "$note", "$pin"] },
+      { id: "note_1", name: "Note", parent: "$pin", ancestors: ["$thing", "$note", "$pin"], props: { color: "green" }, catalogState: { pinboard_note: { color: "green" } } }
+    ]);
+
+    expect(ui.observe("note_1")?.props.color).toBe("green");
+    expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ color: "green" });
   });
 
   it("notifies projection subscribers for snapshot, optimistic, and prune changes", () => {

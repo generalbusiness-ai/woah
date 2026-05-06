@@ -611,15 +611,27 @@ rather than updating display data.
 
 **Added properties**
 
-- `writable_owner`: `system_prompt` (subclasses extend).
+- `writable_owner`: `system_prompt`, `rate_limit_seconds` (subclasses extend).
+  - `rate_limit_seconds` is per-requester. `0` disables. Class manifest
+    sets a sensible default (horoscope: `60`). Owner can tune.
 - `writable_self` (plug-writable): `pending_orders` — a list of
   `{order_id, requester, request, ts}` records. Authoritative queue.
+- Internal (wizard-only writes; auto-managed by `:order` and `:deliver`):
+  `recent_orders` — a map `{<requester>: <last_accepted_ts>}`. Used by
+  the rate-limit check. Pruned on each `:order` call.
 
 **Added verbs**
 
-- `:order(request)` — public. Appends a record to `pending_orders` with a
-  fresh `order_id`. Returns `{order_id, queued: true}` synchronously —
-  no parking, no awaiting plug work. Emits sequenced
+- `:order(request)` — public. Rate-limit gate first: if
+  `rate_limit_seconds > 0` and `now() - recent_orders[caller] <
+  rate_limit_seconds * 1000`, raises `E_RATE` with a message like
+  "the machine isn't ready for another order yet (try in N seconds)" —
+  the chat panel renders this as a `$error` observation, no queue write,
+  no plug invocation. On accept: appends a record to `pending_orders`
+  with a fresh `order_id`, writes `recent_orders[caller] = now()`,
+  prunes `recent_orders` entries older than `rate_limit_seconds * 2`.
+  Returns `{order_id, queued: true}` synchronously — no parking, no
+  awaiting plug work. Emits sequenced
   `{type: "order_placed", order_id, requester, request, ts}` to the
   block's containing room (`observe_to_space(location(this), …)`).
   Optionally emits a directed `text` wakeup to `this` (the block actor)
@@ -659,10 +671,14 @@ already, and survive multiple orders. The block is a thin producer.
 `$horoscope_block` extends `$dispenser_block`. Lives on the deck.
 
 - The owner sets two things: `description` (what the machine looks like)
-  and `system_prompt` (what persona it speaks with).
-- You `:order("scorpio")` (or whatever). The verb returns immediately
-  with `{order_id, queued: true}`; your request is now in the block's
-  `pending_orders` queue.
+  and `system_prompt` (what persona it speaks with). Class manifest
+  defaults `rate_limit_seconds = 60` so any one actor can only order
+  once per minute; the owner can change it but probably won't.
+- You `:order("scorpio")` (or whatever). If you ordered within the last
+  minute, the verb raises `E_RATE` and the chat panel renders "the
+  machine isn't ready for another order yet." Otherwise the verb
+  returns immediately with `{order_id, queued: true}`; your request is
+  now in the block's `pending_orders` queue.
 - The plug Worker (woken by a directed `text` hint or its own cron poll)
   reads the next entry, runs `@cf/meta/llama-3.2-1b-instruct` on Workers
   AI with `system_prompt + request`, calls `:deliver(order_id, body)`.
@@ -922,15 +938,19 @@ What we will actually do, in order.
      pushes via WS, disconnects.
    - Demo: weather block in the living room, working end-to-end.
 5. **`$dispenser_block` base class.** Queue-and-deliver pattern (no
-   parked tasks): `:order` appends to `pending_orders` and returns a
-   ticket synchronously; `:deliver(order_id, body)` removes the entry
-   and creates a `$note` moved to the requester. Sequenced
-   `order_placed` / `delivered` observations routed to `location(this)`.
-   Optional directed `text` wakeup to plug sessions. `:cancel`,
-   `:next_pending`, `:status`. Order TTL.
+   parked tasks): `:order` rate-limit gate (per-requester
+   `rate_limit_seconds`, raises `E_RATE` when too soon), then appends to
+   `pending_orders` and returns a ticket synchronously;
+   `:deliver(order_id, body)` removes the entry and creates a `$note`
+   moved to the requester. Sequenced `order_placed` / `delivered`
+   observations routed to `location(this)`. Optional directed `text`
+   wakeup to plug sessions. `:cancel`, `:next_pending`, `:status`.
+   `recent_orders` map for rate-limit state, pruned on accept. Order
+   TTL.
 6. **`$horoscope_block` + Worker plug.**
-   - Catalog: class extending `$dispenser_block`. One owner-writable
-     `system_prompt`. Description via the base block.
+   - Catalog: class extending `$dispenser_block`. Owner-writable
+     `system_prompt`. Description via the base block. Manifest defaults
+     `rate_limit_seconds = 60`.
    - Plug: CF Worker. On wakeup (`text` hint or cron), reads
      `pending_orders` (or `:next_pending`), runs
      `@cf/meta/llama-3.2-1b-instruct` on Workers AI with

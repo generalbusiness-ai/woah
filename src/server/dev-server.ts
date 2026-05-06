@@ -194,6 +194,10 @@ wss.on("connection", (ws) => {
         world.touchSessionInput(session.sessionId);
         return world.call(frameId, session.sessionId, space, message);
       },
+      command: (frameId, session, space, text) => {
+        world.touchSessionInput(session.sessionId);
+        return world.command(frameId, session.sessionId, space, text);
+      },
       direct: (frameId, session, target, verb, args) => {
         world.touchSessionInput(session.sessionId);
         return world.directCall(frameId, session.actor, target, verb, args, { sessionId: session.sessionId });

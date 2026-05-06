@@ -588,6 +588,12 @@ client can replace the production UI end to end. During that bridge window,
 opening a non-chat tool surface intentionally falls back to the legacy
 `/api/state` model.
 
+Room snapshots intentionally keep full props only on the immediate `here`
+room. Nested `contents`, `present_actors`, and `exits` use thin summaries
+without `props`, and scoped props omit `session_subscribers` because session ids
+are transport internals rather than UI projection data. Exits are deduped by
+exit object id so alias-heavy exit maps do not inflate `here.exits`.
+
 ### Phase 4: migrate controls and overlays
 
 Status: initial overlay-snapshot bridge implemented.
@@ -616,22 +622,36 @@ Status: initial overlay-snapshot bridge implemented.
   taskspace, proving ordinary tool-tab navigation is now on scoped overlays.
 
 Open after this slice: the current renderers still consume a compatibility
-world assembled from scoped snapshots. Dubspace still uses compatibility
-metadata for object ids and layout assembly, but its control state no longer
-depends on the compatibility object map. Full Phase 4 still needs native
-framework reads for pinboard/taskspace renderers and proper observation
-reducers for task creation/movement and pin add/delete/text edits.
+world assembled from scoped snapshots, but the three tool surfaces now use the
+framework projection as their source of truth in scoped mode. Dubspace object
+ids come from scoped route/overlay/session metadata plus the overlay snapshot,
+and rendering/audio/control handlers read effective values through
+`ui.observe`. Pinboard rendering in scoped mode gets board id/source from
+scoped route/overlay/session metadata and reads layout/text/color/presence
+through the framework projection; overlay snapshots seed
+`catalogState.pinboard_note`, `list_notes` folds authoritative note records
+into canonical projection, and note text/color edits use the same optimistic
+layer as move/resize. The board also has sparse
+`catalogState.pinboard_layout` and `catalogState.pinboard_presence` overlays
+for immediate add/move/remove/presence deltas; renderers merge those with
+`props.layout` and `props.subscribers` instead of reading them as full
+snapshots. Taskspace now builds its tree/inspector from scoped overlay
+summaries and `ui.observe`, with task creation/move/status/claim/requirement/
+message/artifact observations reducing into sparse `taskspace_tree` and
+`taskspace_task` catalog-state overlays.
 Bundled demo object ids are used only as a transitional route allowlist; custom
 installed worlds need a runtime scoped-route feed before their object URLs can
-default to scoped mode. The `leave` path still has a small `markLeftChatRoom`
-helper parallel to `applyScopedMoveResult`; once leave verbs return a scoped
-snapshot or explicit `$nowhere` location, that should collapse into the same
-move-result path.
+default to scoped mode. Chat, dubspace, and pinboard `leave`/`out` verbs now
+return move-shaped results with `here_request`; the client-side
+`markLeftChatRoom` helper is still present as migration glue and can be
+collapsed into the ordinary move-result path.
 
-- Finish dubspace by moving object-id/frame assembly out of `state.world`.
-- Migrate pinboard rendering to generic projection state.
-- Migrate taskspace to overlay snapshot plus observation reducers.
-- Migrate mini-chat/current-room UI to `here` and observation reducers.
+- Mini-chat host data now names spaces through projected summaries rather than
+  ids when the overlay snapshot is present. The remaining cleanup is to have
+  frame declarations own each surface's chat target instead of hardcoded tab
+  helpers.
+- Replace the compatibility world with direct component/context mounting once
+  catalog components own pinboard, dubspace, and taskspace rendering.
 
 ### Phase 5: remove legacy production path
 
@@ -664,6 +684,10 @@ Framework/client tests:
   projection.
 - pinboard move/resize uses generic optimistic patches, not pinboard-only
   pending state.
+- pinboard text/color edits reduce through `catalogState.pinboard_note`, and
+  stale overlay snapshots do not overwrite optimistic note text.
+- taskspace create/move/status/claim/detail observations reduce through
+  `taskspace_tree` and `taskspace_task` overlays.
 - move result replaces `here` atomically and does not call `/api/state`.
 - reconnect calls `/api/me`, ingests scoped snapshots, and replays gaps.
 - `/api/me` + WS race: observations emitted after the snapshot cursor are
