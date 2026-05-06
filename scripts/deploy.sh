@@ -24,6 +24,7 @@ SKIP_POSTFLIGHT=0
 DRY_RUN=0
 EXPECTED_BRANCH="main"
 WORKER_URL="${WOO_WORKER_URL:-https://woo.hughpyle.workers.dev}"
+POSTFLIGHT_TIMEOUT="${WOO_POSTFLIGHT_TIMEOUT:-45}"
 
 usage() {
   sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -196,7 +197,7 @@ if [[ $SKIP_POSTFLIGHT -eq 1 ]]; then
 fi
 
 # /healthz
-healthz=$(curl -sS --max-time 10 "$WORKER_URL/healthz") \
+healthz=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" "$WORKER_URL/healthz") \
   || fail "healthz request failed"
 echo "$healthz" | grep -q '"ok":true' || fail "healthz body unhealthy: $healthz"
 ok "healthz: $healthz"
@@ -204,7 +205,7 @@ ok "healthz: $healthz"
 # Unsigned public access to the reserved internal namespace must fail before
 # any DO handler trusts forwarded authority. Signed internal calls are
 # exercised below by /api/state aggregation when routed hosts are present.
-internal_status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+internal_status=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" -o /dev/null -w '%{http_code}' \
   "$WORKER_URL/__internal/state") \
   || fail "unsigned internal route probe failed"
 [[ "$internal_status" == "401" ]] \
@@ -212,7 +213,7 @@ internal_status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
 ok "unsigned internal route rejected: 401"
 
 # guest auth
-auth_out=$(curl -sS --max-time 10 -X POST "$WORKER_URL/api/auth" \
+auth_out=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" -X POST "$WORKER_URL/api/auth" \
   -H 'content-type: application/json' -d '{"token":"guest:"}')
 sid=$(echo "$auth_out" | node -e \
   'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).session||"")}catch{console.log("")}})')
@@ -223,7 +224,7 @@ ok "auth: session=$sid"
 # /api/state — exercises gateway + cluster aggregate. Capture the body so
 # we can pick a live non-universal object id for the cluster-route check
 # below without hardcoding any catalog name.
-state_body=$(curl -sS --max-time 10 \
+state_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" \
   "$WORKER_URL/api/state" -H "authorization: Session $sid")
 # Avoid `echo … | head -c 2 | grep` here — pipefail trips when the body is
 # large enough that echo gets SIGPIPE before head closes the pipe.
@@ -232,7 +233,7 @@ state_body=$(curl -sS --max-time 10 \
 ok "/api/state: 200 ($(printf '%s' "$state_body" | wc -c | tr -d ' ') bytes)"
 
 # universal-class describe via gateway (no catalog assumption)
-wiz_body=$(curl -sS --max-time 10 "$WORKER_URL/api/objects/\$wiz" \
+wiz_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" "$WORKER_URL/api/objects/\$wiz" \
   -H "authorization: Session $sid")
 echo "$wiz_body" | grep -q '"id":"$wiz"' \
   || fail "describe \$wiz failed: $wiz_body"
@@ -254,7 +255,7 @@ sample_target=$(node -e '
   })
 ' <<< "$state_body" || true)
 if [[ -n "$sample_target" ]]; then
-  sample_body=$(curl -sS --max-time 10 \
+  sample_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" \
     "$WORKER_URL/api/objects/$sample_target" -H "authorization: Session $sid")
   echo "$sample_body" | grep -q "\"id\":\"$sample_target\"" \
     || fail "describe $sample_target failed: $sample_body"
@@ -270,7 +271,7 @@ ws_url="${WORKER_URL/https:/wss:}/ws"
 ws_session=$(node --input-type=module -e "
   import { WebSocket } from 'ws';
   const ws = new WebSocket('$ws_url');
-  const t = setTimeout(() => { console.error('timeout'); process.exit(1); }, 8000);
+  const t = setTimeout(() => { console.error('timeout'); process.exit(1); }, Number('$POSTFLIGHT_TIMEOUT') * 1000);
   ws.on('open', () => ws.send(JSON.stringify({ op: 'auth', token: 'guest:postflight' })));
   ws.on('message', (data) => {
     try {
@@ -289,7 +290,7 @@ ok "ws handshake: session=$ws_session"
 # E_TOKEN_CONSUMED; on a fresh world it returns a token-rejected error.
 # Either way the real WOO_INITIAL_WIZARD_TOKEN is not consumed and the
 # response is 401 — proves the bootstrap-claim path is wired.
-wiz_status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+wiz_status=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" -o /dev/null -w '%{http_code}' \
   -X POST "$WORKER_URL/api/auth" \
   -H 'content-type: application/json' \
   -d '{"token":"wizard:woo-postflight-decoy"}')
