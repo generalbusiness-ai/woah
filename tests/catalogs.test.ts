@@ -2911,7 +2911,7 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "pending_orders")).toEqual([]);
     });
 
-    it("blocks-demo seeds the_weather in the chatroom and the_horoscope on the deck", () => {
+    it("blocks-demo seeds visible weather and horoscope blocks with useful look output", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["blocks-demo"]);
       // Weather panel: anchored in the chatroom, default config matches manifest seed.
@@ -2922,6 +2922,26 @@ describe("local catalogs", () => {
       expect(world.getProp("the_weather", "place")).toBe("Mountain View, CA");
       expect(world.getProp("the_weather", "units")).toBe("imperial");
       expect(world.getProp("the_weather", "forecast_hours")).toBe(12);
+      world.setProp("the_weather", "current", { kind: "scalar", value: 72, unit: "°F", label: "current_temperature" });
+      world.setProp("the_weather", "last_pushed_at", 1778073000000);
+      const weatherLook = await world.directCall("blocks-weather-look", "$wiz", "the_weather", "look_self", []);
+      expect(weatherLook.op).toBe("result");
+      if (weatherLook.op === "result") {
+        expect(weatherLook.result).toMatchObject({
+          title: "Temperature in Mountain View, CA: 72°F",
+          last_updated: 1778073000000,
+          description: expect.stringContaining("Last updated: 1778073000000")
+        });
+      }
+      const roomLook = await world.directCall("blocks-room-look", "$wiz", "the_chatroom", "look", []);
+      expect(roomLook.op).toBe("result");
+      if (roomLook.op === "result") {
+        expect(roomLook.result).toMatchObject({
+          contents: expect.arrayContaining([
+            expect.objectContaining({ id: "the_weather", title: "Temperature in Mountain View, CA: 72°F" })
+          ])
+        });
+      }
       // Horoscope machine: anchored on the deck, default rate limit + persona.
       expect(world.objects.has("the_horoscope")).toBe(true);
       expect(world.object("the_horoscope").parent).toBe("$horoscope_block");
@@ -2929,6 +2949,20 @@ describe("local catalogs", () => {
       expect(world.object("the_horoscope").anchor).toBe("the_deck");
       expect(world.getProp("the_horoscope", "rate_limit_seconds")).toBe(60);
       expect(world.getProp("the_horoscope", "system_prompt")).toMatch(/fortune-teller/i);
+      const horoscopeLook = await world.directCall("blocks-horoscope-look", "$wiz", "the_horoscope", "look_self", []);
+      expect(horoscopeLook.op).toBe("result");
+      if (horoscopeLook.op === "result") {
+        expect(horoscopeLook.result).toMatchObject({
+          status: "disconnected",
+          connected: false,
+          usage: expect.stringContaining("order Horoscope machine <sign or topic>")
+        });
+      }
+      const orderPlan = await world.directCall("blocks-horoscope-order-plan", "$wiz", "the_deck", "command_plan", ["order horoscope scorpio"]);
+      expect(orderPlan.op).toBe("result");
+      if (orderPlan.op === "result") {
+        expect(orderPlan.result).toMatchObject({ ok: true, target: "the_horoscope", verb: "order", args: ["scorpio"] });
+      }
     });
 
     it("$horoscope_block inherits the dispenser surface end-to-end", async () => {

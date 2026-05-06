@@ -6008,6 +6008,7 @@ export class WooWorld {
 
   private isActorForLook(item: ObjRef, present: ObjRef[]): boolean {
     if (present.includes(item)) return true;
+    if (this.objects.has(item) && this.objects.has("$block") && this.inheritsFrom(item, "$block")) return false;
     return this.objects.has(item) && this.inheritsFrom(item, "$actor");
   }
 
@@ -6224,7 +6225,7 @@ export class WooWorld {
       id: item,
       name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
     })));
-    const obviousVerbs = this.examineObviousVerbs(target, name);
+    const obviousVerbs = this.obviousCommandSyntaxes(target, name);
     const ownerName = this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : "a recycled player";
     const lines = [
       `${obj.name} (${target}) is owned by ${ownerName} (${owner}).`,
@@ -6356,19 +6357,34 @@ export class WooWorld {
     return matches.length === 1 ? matches[0] : null;
   }
 
-  private examineObviousVerbs(target: ObjRef, objectName: string): string[] {
+  obviousCommandVerbs(target: ObjRef, options: { actor?: ObjRef; executableOnly?: boolean } = {}): VerbDef[] {
     const dullClasses = new Set<ObjRef>(["$root", "$room", "$player", "$prog", "$builder"]);
-    const out: string[] = [];
+    const out: VerbDef[] = [];
     const seen = new Set<string>();
     for (const definer of this.localAncestry(target)) {
       if (dullClasses.has(definer)) continue;
       for (const verb of this.object(definer).verbs) {
         if (!verb.perms.includes("r")) continue;
-        const syntax = this.formatCommandSyntax(verb, objectName);
-        if (!syntax || seen.has(syntax)) continue;
-        seen.add(syntax);
-        out.push(`  ${syntax}`);
+        if (options.executableOnly && options.actor && !this.canExecuteVerb(options.actor, verb)) continue;
+        const syntax = this.formatCommandSyntax(verb, target);
+        if (!syntax) continue;
+        const key = `${verb.name}:${syntax}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(verb);
       }
+    }
+    return out;
+  }
+
+  obviousCommandSyntaxes(target: ObjRef, objectName: string): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const verb of this.obviousCommandVerbs(target)) {
+      const syntax = this.formatCommandSyntax(verb, objectName);
+      if (!syntax || seen.has(syntax)) continue;
+      seen.add(syntax);
+      out.push(`  ${syntax}`);
     }
     return out;
   }

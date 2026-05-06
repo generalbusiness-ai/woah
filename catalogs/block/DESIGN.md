@@ -100,6 +100,14 @@ name in `this.summary_props`. Subclasses set `summary_props` to the small
 set of values that should always ride in the look output (e.g. for
 weather: `["current"]`).
 
+Although `$block` descends from `$actor` so plug credentials can bind
+directly to the block object, room look treats block instances as visible
+contents rather than as present players. A room-mounted block should read
+like an appliance in the room, not like another user standing there. MCP
+uses the same room-content view for non-self blocks: obvious command verbs
+such as `:look` are visible, but inherited `$actor` control verbs remain
+available only when the block is the authenticated actor's `self`.
+
 Detail-tier properties stay accessible via `:get_data(name)` —
 direct-callable; the UI mounts the block surface and fetches detail when
 needed.

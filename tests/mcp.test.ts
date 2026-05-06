@@ -133,7 +133,7 @@ describe("McpHost", () => {
     expect(text).toContain("`help`");
   });
 
-  it("does not expose other actors through contents, inventory, or focus", async () => {
+  it("exposes only obvious command verbs for other actors in room contents", async () => {
     const world = bootstrapWorld();
     const alice = world.auth("guest:mcp-privacy-alice");
     const bob = world.auth("guest:mcp-privacy-bob");
@@ -147,16 +147,53 @@ describe("McpHost", () => {
     expect(tools.some((t) => t.object === bob.actor)).toBe(false);
 
     // Same invariant inside an ordinary room: other present actors may be
-    // visible to :look, but their actor verbs are not part of Alice's tool set.
+    // visible to :look and can advertise obvious commands, but their actor
+    // maintenance verbs are not part of Alice's tool set.
     await world.directCall(undefined, alice.actor, "the_chatroom", "enter", []);
     await world.directCall(undefined, bob.actor, "the_chatroom", "enter", []);
+    const installed = installVerb(world, bob.actor, "wave", `verb :wave() rxd {
+  return "waved";
+}`, null);
+    expect(installed.ok).toBe(true);
+    const wave = world.ownVerb(bob.actor, "wave");
+    expect(wave).toBeDefined();
+    if (wave) {
+      wave.direct_callable = true;
+      wave.arg_spec = { ...wave.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+    }
     tools = await host.enumerateTools(alice.actor);
     expect(tools.some((t) => t.object === alice.actor && t.verb === "wait")).toBe(true);
-    expect(tools.some((t) => t.object === bob.actor)).toBe(false);
+    expect(tools.some((t) => t.object === bob.actor && t.verb === "wave")).toBe(true);
+    expect(tools.some((t) => t.object === bob.actor && ["wait", "focus", "unfocus", "focus_list"].includes(t.verb))).toBe(false);
 
     const focus = tools.find((t) => t.object === alice.actor && t.verb === "focus")!;
     await expect(host.invokeTool(alice.actor, alice.id, focus, [bob.actor])).rejects.toMatchObject({ code: "E_PERM" });
-    expect((await host.enumerateTools(alice.actor)).some((t) => t.object === bob.actor)).toBe(false);
+    expect((await host.enumerateTools(alice.actor)).some((t) => t.object === bob.actor && ["wait", "focus", "unfocus", "focus_list"].includes(t.verb))).toBe(false);
+  });
+
+  it("exposes block appliances even though they inherit from $actor", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-block-visible");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+
+    world.createObject({ id: "$block", name: "$block", parent: "$actor", owner: "$wiz" });
+    world.createObject({ id: "mcp_weather", name: "Weather", parent: "$block", owner: "$wiz", location: "the_chatroom" });
+    const installed = installVerb(world, "mcp_weather", "status", `verb :status() rxd {
+  return "72F";
+}`, null);
+    expect(installed.ok).toBe(true);
+    const verb = world.ownVerb("mcp_weather", "status");
+    expect(verb).toBeDefined();
+    if (verb) verb.arg_spec = { ...verb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+
+    await world.directCall(undefined, session.actor, "the_chatroom", "enter", []);
+    const reachable = host.reachable(session.actor);
+    expect(reachable).toEqual(expect.arrayContaining([expect.objectContaining({ id: "mcp_weather", origin: "contents" })]));
+    const tools = await host.enumerateTools(session.actor, { scope: "here" });
+    expect(tools.some((tool) => tool.object === "mcp_weather" && tool.verb === "status")).toBe(true);
+    expect(tools.some((tool) => tool.object === "mcp_weather" && ["wait", "focus", "unfocus", "focus_list"].includes(tool.verb))).toBe(false);
+    await expect(host.resolveReachableTool(session.actor, "mcp_weather", "focus")).resolves.toBeNull();
   });
 
   it("enumerates tools reachable from the actor with route classification", async () => {
@@ -249,7 +286,10 @@ describe("McpHost", () => {
     expect(installed.ok).toBe(true);
     const verb = world.ownVerb("schema_widget", "paint");
     expect(verb).toBeDefined();
-    if (verb) verb.tool_exposed = true;
+    if (verb) {
+      verb.tool_exposed = true;
+      verb.arg_spec = { ...verb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+    }
 
     const tool = (await host.enumerateTools(session.actor)).find((candidate) => candidate.object === "schema_widget" && candidate.verb === "paint");
     expect(tool).toBeDefined();
@@ -468,6 +508,33 @@ describe("McpHost", () => {
     const unfocus = (await host.enumerateTools(session.actor)).find((t) => t.object === session.actor && t.verb === "unfocus")!;
     await host.invokeTool(session.actor, session.id, unfocus, [taskRef]);
     expect((await host.enumerateTools(session.actor, { scope: "focus" })).some((t) => t.object === taskRef)).toBe(false);
+  });
+
+  it("focus upgrades visible room contents from obvious affordances to explicit tools", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-focused-room-content");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+    await world.directCall(undefined, session.actor, "the_chatroom", "enter", []);
+
+    world.createObject({ id: "focus_widget", name: "Focus Widget", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
+    const installed = installVerb(world, "focus_widget", "private_ping", `verb :private_ping() rxd {
+  return "pong";
+}`, null);
+    expect(installed.ok).toBe(true);
+    const verb = world.ownVerb("focus_widget", "private_ping");
+    expect(verb).toBeDefined();
+    if (verb) verb.tool_exposed = true;
+
+    expect((await host.enumerateTools(session.actor, { scope: "here" })).some((t) => t.object === "focus_widget" && t.verb === "private_ping")).toBe(false);
+
+    const focus = (await host.enumerateTools(session.actor)).find((t) => t.object === session.actor && t.verb === "focus")!;
+    await host.invokeTool(session.actor, session.id, focus, ["focus_widget"]);
+
+    expect((await host.enumerateTools(session.actor, { scope: "focus" })).some((t) => t.object === "focus_widget" && t.verb === "private_ping")).toBe(true);
+    expect((await host.enumerateTools(session.actor, { scope: "object", object: "focus_widget" })).some((t) => t.object === "focus_widget" && t.verb === "private_ping")).toBe(true);
+    expect((await host.enumerateTools(session.actor, { scope: "all" })).some((t) => t.object === "focus_widget" && t.verb === "private_ping")).toBe(true);
+    await expect(host.resolveReachableTool(session.actor, "focus_widget", "private_ping")).resolves.toMatchObject({ object: "focus_widget", verb: "private_ping" });
   });
 
   it("sends list_changed only to sessions for the actor whose tool list changed", async () => {
@@ -695,10 +762,14 @@ describe("McpGateway", () => {
     home.createObject({ id: "remote_gallery", name: "Remote Gallery", parent: "$space", owner: "$wiz" });
     home.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz" });
     home.addVerb("remote_widget", nativeToolVerb("ping", "remote_ping"));
+    const homePing = home.ownVerb("remote_widget", "ping");
+    if (homePing) homePing.arg_spec = { ...homePing.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
 
     remote.createObject({ id: "remote_gallery", name: "Remote Gallery", parent: "$space", owner: "$wiz" });
     remote.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz", location: "remote_gallery" });
     remote.addVerb("remote_widget", nativeToolVerb("ping", "remote_ping"));
+    const remotePing = remote.ownVerb("remote_widget", "ping");
+    if (remotePing) remotePing.arg_spec = { ...remotePing.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
     remote.registerNativeHandler("remote_ping", () => "pong");
 
     const gateway = new McpGateway(home);
@@ -775,6 +846,8 @@ describe("McpGateway", () => {
     remote.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz", location: "remote_room" });
     remote.setProp("remote_widget", "name", "Remote Widget");
     remote.addVerb("remote_widget", nativeToolVerb("ping", "remote_ping"));
+    const remotePing = remote.ownVerb("remote_widget", "ping");
+    if (remotePing) remotePing.arg_spec = { ...remotePing.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
     remote.registerNativeHandler("remote_ping", () => "pong");
 
     const session = home.auth("guest:mcp-remote-location");

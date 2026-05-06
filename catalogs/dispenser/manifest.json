@@ -51,7 +51,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["request"] },
+          "arg_spec": { "args": ["request"], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix_rest"] } },
           "source": "verb :order(request) rxd { this:check_order_limits(request); let entry = this:enqueue_order(request); let here = location(this); if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"order_placed\", source: this, block: this, order_id: entry[\"order_id\"], requester: actor, request: request, ts: entry[\"ts\"] }); } try { tell(this, \"order:\" + entry[\"order_id\"]); } except err { } return { order_id: entry[\"order_id\"], queued: true, ts: entry[\"ts\"] }; }"
         },
         {

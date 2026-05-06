@@ -228,7 +228,6 @@ export class McpHost {
     if (currentLocation) add(currentLocation, "location", false);
     if (currentLocation && this.world.objects.has(currentLocation) && this.descendsFrom(currentLocation, "$space")) {
       for (const id of this.world.object(currentLocation).contents) {
-        if (this.isOtherActor(actor, id)) continue;
         if (this.actorCanSee(actor, id)) add(id, "contents");
       }
     }
@@ -259,7 +258,7 @@ export class McpHost {
   }
 
   private isOtherActor(actor: ObjRef, target: ObjRef): boolean {
-    return target !== actor && this.isActorObject(target);
+    return target !== actor && this.isActorObject(target) && !this.isBlockObject(target);
   }
 
   private isActorObject(target: ObjRef): boolean {
@@ -270,6 +269,10 @@ export class McpHost {
       cursor = this.world.object(cursor).parent;
     }
     return false;
+  }
+
+  private isBlockObject(target: ObjRef): boolean {
+    return this.world.objects.has("$block") && this.descendsFrom(target, "$block");
   }
 
   async listTools(actor: ObjRef, options: McpToolListOptions = {}): Promise<McpToolListPage> {
@@ -307,9 +310,9 @@ export class McpHost {
     const seenObjectVerb = new Set<string>();
 
     for (const id of plan.selectedIds) {
-      if (this.isOtherActor(actor, id)) continue;
       if (!this.world.objects.has(id)) continue;
-      for (const verb of this.tooledVerbsFor(actor, id)) {
+      const verbs = plan.obviousOnlyIds.has(id) ? this.obviousVerbsFor(actor, id) : this.tooledVerbsFor(actor, id);
+      for (const verb of verbs) {
         const tool = this.assembleTool(id, {
           verb: verb.name,
           aliases: verb.aliases,
@@ -358,8 +361,9 @@ export class McpHost {
     actor: ObjRef,
     scope: McpToolScope,
     object: ObjRef | undefined
-  ): Promise<{ selectedIds: Set<ObjRef>; remoteIds: ObjRef[]; remoteExpandedIds: ObjRef[] }> {
+  ): Promise<{ selectedIds: Set<ObjRef>; obviousOnlyIds: Set<ObjRef>; remoteIds: ObjRef[]; remoteExpandedIds: ObjRef[] }> {
     const selectedIds = new Set<ObjRef>();
+    const obviousOnlyIds = new Set<ObjRef>();
     const remoteCandidates = new Set<ObjRef>();
     const remoteExpandCandidates = new Set<ObjRef>();
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
@@ -367,22 +371,26 @@ export class McpHost {
     const currentLocation = actorObj?.location ?? activeLocations[0] ?? null;
     const focus = this.focusListOf(actor);
     const reachable = this.reachable(actor);
-    const reachableIds = new Set(reachable.map((entry) => entry.id));
+    const reachableOrigins = new Map(reachable.map((entry) => [entry.id, entry.origin]));
+    const reachableIds = new Set(reachableOrigins.keys());
 
-    const add = (id: ObjRef | null | undefined, remoteCandidate = true): void => {
+    const add = (id: ObjRef | null | undefined, remoteCandidate = true, projection: "tools" | "obvious" = "tools"): void => {
       if (!id) return;
       selectedIds.add(id);
+      if (projection === "obvious") obviousOnlyIds.add(id);
+      else obviousOnlyIds.delete(id);
       if (remoteCandidate) remoteCandidates.add(id);
     };
     const addIfReachable = (id: ObjRef | null | undefined): void => {
       if (!id) return;
-      if (id === actor || id === currentLocation || reachableIds.has(id) || activeLocations.includes(id) || focus.includes(id)) add(id);
+      if (id === actor || id === currentLocation || reachableIds.has(id) || activeLocations.includes(id) || focus.includes(id)) {
+        add(id, true, reachableOrigins.get(id) === "contents" && !focus.includes(id) ? "obvious" : "tools");
+      }
     };
     const addContents = (space: ObjRef | null | undefined): void => {
       if (!space || !this.world.objects.has(space) || !this.descendsFrom(space, "$space")) return;
       for (const child of this.world.object(space).contents) {
-        if (this.isOtherActor(actor, child)) continue;
-        if (this.actorCanSee(actor, child)) add(child, false);
+        if (this.actorCanSee(actor, child)) add(child, false, "obvious");
       }
     };
     const expandRemoteContents = (space: ObjRef | null | undefined): void => {
@@ -416,7 +424,7 @@ export class McpHost {
         break;
       }
       case "all":
-        for (const { id } of reachable) add(id);
+        for (const { id, origin } of reachable) add(id, true, origin === "contents" ? "obvious" : "tools");
         for (const id of activeLocations) {
           add(id);
         }
@@ -439,7 +447,7 @@ export class McpHost {
     }
     const expanded = new Set(remoteExpandedIds);
     const remoteIds = remoteIdsRaw.filter((id) => !expanded.has(id));
-    return { selectedIds, remoteIds, remoteExpandedIds };
+    return { selectedIds, obviousOnlyIds, remoteIds, remoteExpandedIds };
   }
 
   // Computes tool descriptors for the given ids — the remote-side counterpart
@@ -450,11 +458,11 @@ export class McpHost {
   enumerateLocalToolDescriptors(actor: ObjRef, ids: ObjRef[]): RemoteToolDescriptor[] {
     const out: RemoteToolDescriptor[] = [];
     const seen = new Set<string>();
-    const emit = (id: ObjRef): void => {
-      if (this.isOtherActor(actor, id)) return;
+    const emit = (id: ObjRef, projection: "tools" | "obvious" = "tools"): void => {
       if (!this.world.objects.has(id)) return;
       if (!this.actorCanSee(actor, id)) return;
-      for (const verb of this.tooledVerbsFor(actor, id)) {
+      const verbs = projection === "obvious" ? this.obviousVerbsFor(actor, id) : this.tooledVerbsFor(actor, id);
+      for (const verb of verbs) {
         const key = `${id}${OBJECT_VERB_SEP}${verb.name}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -473,7 +481,7 @@ export class McpHost {
       if (!this.world.objects.has(id)) continue;
       emit(id);
       if (this.descendsFrom(id, "$space")) {
-        for (const child of this.world.object(id).contents) emit(child);
+        for (const child of this.world.object(id).contents) emit(child, "obvious");
       }
     }
     return out;
@@ -556,7 +564,7 @@ export class McpHost {
       return descriptor ? this.assembleTool(descriptor.object, descriptor, new Set()) : null;
     }
     if (locallyReachable) {
-      const verb = this.tooledVerbsFor(actor, object).find((candidate) => candidate.name === verbName);
+      const verb = (this.usesObviousProjection(actor, object) ? this.obviousVerbsFor(actor, object) : this.tooledVerbsFor(actor, object)).find((candidate) => candidate.name === verbName);
       if (!verb) return null;
       return this.assembleTool(object, {
         verb: verb.name,
@@ -585,6 +593,7 @@ export class McpHost {
         for (const verb of obj.verbs) {
           if (seen.has(verb.name)) continue;
           seen.add(verb.name);
+          if (this.isSuppressedInheritedActorTool(actor, id, cursor)) continue;
           if (verb.tool_exposed !== true) continue;
           if (!this.world.canExecuteVerb(actor, verb)) continue;
           out.push(verb as unknown as typeof out[number]);
@@ -596,6 +605,20 @@ export class McpHost {
     const features = this.featureListOf(id);
     for (const feature of features) collect(feature);
     return out;
+  }
+
+  private obviousVerbsFor(actor: ObjRef, id: ObjRef): Array<{ name: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct_callable?: boolean; perms: string; tool_exposed?: boolean; source?: string }> {
+    return this.world.obviousCommandVerbs(id, { actor, executableOnly: true }) as unknown as Array<{ name: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct_callable?: boolean; perms: string; tool_exposed?: boolean; source?: string }>;
+  }
+
+  private usesObviousProjection(actor: ObjRef, target: ObjRef): boolean {
+    const focus = this.focusListOf(actor);
+    if (focus.includes(target)) return false;
+    return this.reachable(actor).some((entry) => entry.id === target && entry.origin === "contents");
+  }
+
+  private isSuppressedInheritedActorTool(actor: ObjRef, target: ObjRef, definingObject: ObjRef): boolean {
+    return target !== actor && this.isBlockObject(target) && definingObject === "$actor";
   }
 
   private featureListOf(id: ObjRef): ObjRef[] {
