@@ -1137,6 +1137,30 @@ describe("local catalogs", () => {
     }
   });
 
+  it("records clean host schema plans without applying seed repairs", { timeout: 15000 }, () => {
+    const gateway = createWorld();
+    const scoped = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_hot_tub");
+    expect(scoped).not.toBeNull();
+    const host = createWorldFromSerialized(scoped!, { persist: false });
+    const writes: string[] = [];
+    const setProp = host.setProp.bind(host);
+    host.setProp = ((objRef, name, value) => {
+      writes.push(`${objRef}.${name}`);
+      return setProp(objRef, name, value);
+    }) as typeof host.setProp;
+    const metrics: any[] = [];
+    host.setMetricsHook((event) => metrics.push(event));
+
+    runHostScopedLocalCatalogLifecycle(host, "the_hot_tub");
+
+    expect(writes.filter((target) => target !== "$system.catalog_migration_records")).toEqual([]);
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "host_schema_sync", host: "the_hot_tub", planned: 0 }));
+    const records = (host.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>)
+      .filter((record) => record.scope === "host" && record.host === "the_hot_tub");
+    expect(records.length).toBeGreaterThan(0);
+    expect(records.every((record) => Array.isArray(record.steps) && record.steps.every((step: any) => step.status === "skipped"))).toBe(true);
+  });
+
   it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", { timeout: 15000 }, () => {
     const gateway = createWorld();
     const listNotes = worldVerb(gateway, "$pinboard", "list_notes");

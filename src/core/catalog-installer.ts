@@ -953,18 +953,38 @@ function reconcileSeedObject(
   const parent = resolveObjectRef(world, hook.class, localObjects, localSeeds, existing);
   const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
   const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;
+  const changedObjects = new Set<ObjRef>();
+  const markChanged = (objRef: ObjRef | null | undefined): void => {
+    if (objRef && world.objects.has(objRef)) changedObjects.add(objRef);
+  };
   if (obj.parent !== parent) {
-    if (obj.parent && world.objects.has(obj.parent)) world.object(obj.parent).children.delete(id);
+    const oldParent = obj.parent;
+    if (oldParent && world.objects.has(oldParent)) world.object(oldParent).children.delete(id);
     obj.parent = parent;
     world.object(parent).children.add(id);
+    markChanged(oldParent);
+    markChanged(parent);
+    markChanged(id);
   }
-  if (obj.owner !== actor) obj.owner = actor;
-  obj.anchor = anchor;
+  if (obj.owner !== actor) {
+    obj.owner = actor;
+    markChanged(id);
+  }
+  if (obj.anchor !== anchor) {
+    obj.anchor = anchor;
+    markChanged(id);
+  }
   if (hook.name) {
-    obj.name = hook.name;
-    world.setProp(id, "name", hook.name);
+    if (obj.name !== hook.name) {
+      obj.name = hook.name;
+      markChanged(id);
+    }
+    if (world.propOrNull(id, "name") !== hook.name) world.setProp(id, "name", hook.name);
   }
-  if (hook.description) world.setProp(id, "description", catalogDescription(hook.description, hook.name ?? id, manifest.name));
+  if (hook.description) {
+    const description = catalogDescription(hook.description, hook.name ?? id, manifest.name);
+    if (world.propOrNull(id, "description") !== description) world.setProp(id, "description", description);
+  }
   // Seed-hook properties are *initial* values — they bootstrap a fresh seed.
   // The unconditional set_if_missing path at the repair call site (line 510)
   // already handles "manifest added a new property; existing seed lacks it".
@@ -977,14 +997,21 @@ function reconcileSeedObject(
   }
   const strandedInNowhere = rehomeNowhereSeedObjects && obj.location === "$nowhere" && location !== null && location !== "$nowhere";
   if (obj.location !== location && (!obj.location || !world.objects.has(obj.location) || strandedInNowhere)) {
-    if (obj.location && world.objects.has(obj.location)) world.object(obj.location).contents.delete(id);
+    const oldLocation = obj.location;
+    if (oldLocation && world.objects.has(oldLocation)) world.object(oldLocation).contents.delete(id);
     obj.location = location;
     if (location && world.objects.has(location)) world.object(location).contents.add(id);
+    markChanged(oldLocation);
+    markChanged(location);
+    markChanged(id);
   } else if (obj.location && world.objects.has(obj.location)) {
-    world.object(obj.location).contents.add(id);
+    const container = world.object(obj.location);
+    if (!container.contents.has(id)) {
+      container.contents.add(id);
+      markChanged(obj.location);
+    }
   }
-  obj.modified = Date.now();
-  world.persist();
+  for (const objRef of changedObjects) world.markObjectChanged(objRef);
 }
 
 function populateSeedExitAliasMaps(world: WooWorld, manifest: CatalogManifest, localSeeds: Map<string, ObjRef>): void {

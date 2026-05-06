@@ -800,8 +800,8 @@ function runLocalCatalogSchemaPlan(
     host
   });
   const preIssues = verifyCatalogSchemaPlan(world, manifest, plan);
-  if (catalogMigrationRecordCompleted(world, plan.id, scope, host) && preIssues.length === 0) {
-    return {
+  if (preIssues.length === 0) {
+    const result: CatalogSchemaPlanApplyResult = {
       status: "completed",
       plan_id: plan.id,
       catalog: plan.catalog,
@@ -814,6 +814,13 @@ function runLocalCatalogSchemaPlan(
       steps: plan.steps.map((step) => ({ id: step.id, kind: step.kind, target: stepTarget(step), status: "skipped" })),
       issues: []
     };
+    if (catalogMigrationRecordCompleted(world, plan.id, scope, host)) {
+      return result;
+    }
+    if (scope === "host") {
+      recordCatalogMigrationResult(world, result, preIssues);
+      return result;
+    }
   }
   const result = applyCatalogSchemaPlan(world, manifest, plan, {
     actor: "$wiz",
