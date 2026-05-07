@@ -72,7 +72,7 @@ Properties inherited from `$portable`:
 | `set_text(str)` | Replace text. Enforces a 65536-char cap. Permission: `:is_writable_by(actor)`. |
 | `write(line)` / `w@rite` | LambdaMOO-style append-line. Inserts a newline before the line if the text is non-empty. Enforces the same 65536-char cap as `:set_text`. Permission: `:is_writable_by(actor)`. |
 | `erase` / `er@ase` | LambdaMOO-style clear. Sets the text to `""`. Permission: `:is_writable_by(actor)`. |
-| `add_writer(who)` / `rm_writer(who)` | Manage `.writers`. Owner or wizard only. |
+| `add_writer(who)` / `rm_writer(who)` | Manage `.writers`. Owner or wizard only. Mutating calls emit `note_writers_changed` so UIs can update edit affordances without rehydration. |
 | `is_readable_by(actor)` | Default `true`. Override in subclasses to restrict. |
 | `is_writable_by(actor)` | Owner, members of `.writers`, or wizard. |
 | `look` / `look_self` | Inherited from `$root` for `look`; `:look_self` returns `{id, title, description, text_length, location}` (text length comes from `:text_summary` so subclasses that gate read can hide it). The text body is *not* in the look surface — it's read via `:read`. |

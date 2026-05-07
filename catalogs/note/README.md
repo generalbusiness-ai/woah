@@ -60,6 +60,10 @@ Identity (`.name`) and cosmetic (`.description`) are inherited from
 :look / :look_self      standard look surface (title, description, text_length, location)
 ```
 
+Writer-list changes emit `note_writers_changed` with the current
+`writers` list so pinboard/card UIs can update edit controls from
+observations.
+
 `:title` is inherited from `$root` and just returns `this.name`. There
 is no first-line-is-title heuristic.
 

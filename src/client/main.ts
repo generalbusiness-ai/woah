@@ -1446,7 +1446,7 @@ function sortTaskChildren(ids: string[], parent: string | null, tasks: Record<st
   return [...new Set(ids)].sort((a, b) => {
     const ai = overlayIndex[a] ?? baseIndex.get(a) ?? Number.MAX_SAFE_INTEGER;
     const bi = overlayIndex[b] ?? baseIndex.get(b) ?? Number.MAX_SAFE_INTEGER;
-    return ai - bi || String(tasks[a]?.props?.title ?? a).localeCompare(String(tasks[b]?.props?.title ?? b)) || a.localeCompare(b);
+    return ai - bi || String(tasks[a]?.name ?? tasks[a]?.props?.name ?? a).localeCompare(String(tasks[b]?.name ?? tasks[b]?.props?.name ?? b)) || a.localeCompare(b);
   });
 }
 

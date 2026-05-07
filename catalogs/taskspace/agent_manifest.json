@@ -9,7 +9,7 @@
         "properties": {
           "space": { "type": "string" },
           "name": { "type": "string" },
-          "body": { "type": "string" }
+          "text": { "type": "string" }
         },
         "required": ["space", "name"]
       }
@@ -42,4 +42,3 @@
     }
   ]
 }
-

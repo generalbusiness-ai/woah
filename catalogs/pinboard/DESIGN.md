@@ -330,7 +330,7 @@ create $pin
         :acceptable(pin)         → isa $note? yes
         moveto via core
         board:enterfunc(pin)     → allocate layout, fire pin_added
-   ↓ pin:set_text(["Buy groceries"])
+   ↓ pin:set_text("Buy groceries")
    ↓ pin:set_color("yellow")
    ⋮
    board:move_pin(pin, 200, 150)  update layout, fire pin_moved
@@ -350,7 +350,7 @@ Kanban lifecycle:
 ```
 kanban:add_card("doing", "Write the spec")
         create $pin (the new card)
-        card:set_text(["Write the spec"])
+        card:set_text("Write the spec")
         kanban:post_card(card, "doing")
             moveto card → kanban
             kanban:enterfunc(card) → place in column 0 (default), emit kanban_card_added

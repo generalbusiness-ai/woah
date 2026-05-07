@@ -737,16 +737,12 @@ function runTaskspaceTaskNoteParentMigration(world: WooWorld, names: readonly st
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION);
 }
 
-function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string[]): void {
-  // v0.1 of $note declared `text: list<str>`. v0.2 retypes the same property
-  // to `text: str` (markdown). Existing $note descendants on upgraded worlds
-  // therefore carry a list value where the new code expects a string. Walk
-  // every descendant and join the list with \n. Idempotent: skip when the
-  // value is already a string. Run before reconcileClassVerbs so the new
-  // verb code never observes a stale list.
-  if (!names.includes("note")) return;
-  if (!localCatalogInstalled(world, "note")) return;
-  if (migrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION)) return;
+// v0.1 of $note declared `text: list<str>`. v0.2 retypes the same property
+// to `text: str` (markdown). Walk every $note descendant on whichever host
+// holds it and join any list value with \n. Idempotent: skip when the value
+// is already a string. Safe to call from both gateway and host slices —
+// each only sees the objects it owns.
+function migrateNoteTextStringShapeData(world: WooWorld): void {
   if (!world.objects.has("$note")) return;
   for (const id of world.objects.keys()) {
     if (!world.isDescendantOf(id, "$note")) continue;
@@ -765,20 +761,27 @@ function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string
       world.setProp(id, "text", "");
     }
   }
+}
+
+function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string[]): void {
+  // Gateway path. Runs the data walk so any $note descendants the gateway
+  // owns get converted, then marks the gateway-scope ledger entry. Host
+  // slices run their own walk via runHostScopedDataMigrations.
+  if (!names.includes("note")) return;
+  if (!localCatalogInstalled(world, "note")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION)) return;
+  if (!world.objects.has("$note")) return;
+  migrateNoteTextStringShapeData(world);
   markMigrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION);
 }
 
-function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[]): void {
-  // v0.2 of taskspace declared `title` and `description` as own properties on
-  // $task, shadowing the inherited $root.name and $root.description. v0.3
-  // drops both shadow defs in favor of the inherited slots and the $note
-  // `text` body. Walk every $task instance, copy `title` → object.name and
-  // `description` → `text`, then run the schema plan + reconcileClassVerbs to
-  // strip the obsolete property defs from the class object. Idempotent: the
-  // copies are skipped when already done.
-  if (!names.includes("taskspace")) return;
-  if (!localCatalogInstalled(world, "taskspace")) return;
-  if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION)) return;
+// v0.2 of taskspace declared `title` and `description` as own properties on
+// $task, shadowing the inherited $root.name and $root.description. v0.3
+// drops both shadow defs. For each $task instance: copy title → name,
+// description → text, then strip the obsolete own values. Runs anywhere
+// the data lives. Idempotent: each copy gates on a non-empty source value
+// and a missing destination; deletes only when own value is still present.
+function migrateTaskspaceNoteShapeData(world: WooWorld): void {
   if (!world.objects.has("$task")) return;
   for (const id of world.objects.keys()) {
     if (!world.isDescendantOf(id, "$task")) continue;
@@ -786,7 +789,11 @@ function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[
     const obj = world.object(id);
     const own = obj.properties;
     const title = own.get("title");
-    if (typeof title === "string" && title && !obj.name) {
+    if (typeof title === "string" && title) {
+      // v0.2 always set `task.title` via :create_task and never set the
+      // inherited `obj.name`, which therefore defaults to the object id.
+      // Always overwrite name with the explicit title — it's the
+      // user-supplied label, the id-shaped default never was.
       obj.name = title;
       world.setProp(id, "name", title);
     }
@@ -794,13 +801,21 @@ function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[
     if (typeof description === "string" && description && !own.has("text")) {
       world.setProp(id, "text", description);
     }
-    // Strip the obsolete own values so the new inherited shape isn't shadowed.
-    // After the schema plan below removes the property defs from $task, any
-    // remaining own values would still satisfy `obj.properties.has("title")`
-    // and confuse readers. Idempotent: delete only when present.
     if (own.has("title")) world.deleteProp(id, "title");
     if (own.has("description")) world.deleteProp(id, "description");
   }
+}
+
+function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[]): void {
+  // Gateway path. Walks $task instances on the gateway, then runs the
+  // schema plan + reconcileClassVerbs to strip the obsolete property defs
+  // from the $task class object. Host slices run their own data walk via
+  // runHostScopedDataMigrations; class-def reconciliation is gateway-only.
+  if (!names.includes("taskspace")) return;
+  if (!localCatalogInstalled(world, "taskspace")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION)) return;
+  if (!world.objects.has("$task")) return;
+  migrateTaskspaceNoteShapeData(world);
   const result = runLocalCatalogSchemaPlan(world, "taskspace", LOCAL_CATALOGS.get("taskspace")!, "gateway", "world", {
     allowImplementationHints: true,
     reconcileClassVerbs: true
@@ -1136,6 +1151,16 @@ export function runHostScopedDataMigrations(world: WooWorld, host = "host"): voi
   if (world.objects.has("$pin") && world.objects.has("$pinboard")) {
     runPinboardNotesToPinsDataPlan(world, LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION, "host", host);
   }
+  // $note descendants (dispensed notes, pins, tasks) often live on
+  // self-hosted slices. Walk text: list<str> → str here so the host's
+  // own copies get converted; gateway runs the same walk for objects it
+  // owns. Both paths gate on value shape and skip when there's nothing
+  // to do.
+  migrateNoteTextStringShapeData(world);
+  // $task instances on a host slice need title→name, description→text,
+  // and obsolete-property strip. Class-def reconciliation stays
+  // gateway-only (runs in runTaskspaceNoteShapeMigration).
+  migrateTaskspaceNoteShapeData(world);
 }
 
 function runPinboardNotesToPinsMigration(world: WooWorld, names: readonly string[], id: string): void {

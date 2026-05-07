@@ -515,11 +515,16 @@ describe("local catalogs", () => {
       actor: session.actor,
       target: "the_taskspace",
       verb: "create_task",
-      args: ["Source task", ""]
+      args: ["Source task", "Source body"]
     });
     expect(created.op).toBe("applied");
     const task = created.op === "applied" ? String(created.observations[0].task) : "";
     expect(world.object(task).name).toBe("Source task");
+    expect(world.getProp(task, "text")).toBe("Source body");
+    await expect(world.scopedObjectSummary(session.actor, task)).resolves.toMatchObject({
+      id: task,
+      props: { text: "Source body" }
+    });
     expect(world.isDescendantOf(task, "$note")).toBe(true);
 
     await callInTaskspace(world, session.id, "requirement", {
@@ -985,6 +990,13 @@ describe("local catalogs", () => {
     expect(observationsError(denied)).toBe("E_PERM");
     const added = await call("note-add-writer", owner, owner.actor, "add_writer", [collaborator.actor]);
     expect(observationsError(added)).toBeNull();
+    expect(added.op === "applied" ? added.observations : []).toContainEqual(expect.objectContaining({
+      type: "note_writers_changed",
+      note: noteId,
+      writers: [collaborator.actor],
+      added: collaborator.actor,
+      removed: null
+    }));
     expect(world.getProp(noteId, "writers")).toEqual([collaborator.actor]);
     // Idempotent: re-adding is a no-op (and still returns the writers list).
     const added2 = await call("note-add-writer-2", owner, owner.actor, "add_writer", [collaborator.actor]);
@@ -997,7 +1009,14 @@ describe("local catalogs", () => {
     const strangerWrite = await call("note-stranger-write", stranger, stranger.actor, "write", ["nope"]);
     expect(observationsError(strangerWrite)).toBe("E_PERM");
     // rm_writer removes the writer; the collaborator can no longer write.
-    await call("note-rm-writer", owner, owner.actor, "rm_writer", [collaborator.actor]);
+    const removed = await call("note-rm-writer", owner, owner.actor, "rm_writer", [collaborator.actor]);
+    expect(removed.op === "applied" ? removed.observations : []).toContainEqual(expect.objectContaining({
+      type: "note_writers_changed",
+      note: noteId,
+      writers: [],
+      added: null,
+      removed: collaborator.actor
+    }));
     expect(world.getProp(noteId, "writers")).toEqual([]);
     const collabBlocked = await call("note-collab-blocked", collaborator, collaborator.actor, "write", ["x"]);
     expect(observationsError(collabBlocked)).toBe("E_PERM");

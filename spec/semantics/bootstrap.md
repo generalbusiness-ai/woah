@@ -353,16 +353,17 @@ hints until the VM can express them directly.
 
 ### B4.3 `$taskspace` verbs
 
-`:create_task(title, description)` returning the new task ref. Body is ordinary
+`:create_task(name, text)` returning the new task ref. Body is ordinary
 catalog source: `create($task, actor)`, set task properties, append to
-`root_tasks`, and emit `task_created`. Taskspace uses the generic `create`
-builtin; no task-specific native runtime handler is required.
+`root_tasks`, and emit `task_created` with `name` and `text`. Taskspace uses
+the generic `create` builtin; no task-specific native runtime handler is
+required.
 
 ### B4.4 `$task` verbs
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:add_subtask(title, description)` | str, str | Creates a child task. Emits `subtask_added`. |
+| `:add_subtask(name, text)` | str, str | Creates a child task. Emits `task_created` and `subtask_added`. |
 | `:move(parent, index)` | obj \| null, int | Re-parent or reorder; emits `task_moved`. |
 | `:claim()` | — | Sets `assignee = actor`, status `claimed`. Emits `task_claimed`. |
 | `:release()` | — | Clears assignee, status `open` unless already `done`. Emits `task_released`. |

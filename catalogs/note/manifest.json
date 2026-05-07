@@ -78,14 +78,14 @@
           "perms": "rx",
           "tool_exposed": true,
           "arg_spec": { "args": ["who"] },
-          "source": "verb :add_writer(who) rx { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the note owner or a wizard can add writers\", value: this }; } if (!who) { raise { code: \"E_INVARG\", message: \"add_writer requires an object\", value: who }; } if (who in this.writers) { return this.writers; } this.writers = this.writers + [who]; return this.writers; }"
+          "source": "verb :add_writer(who) rx { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the note owner or a wizard can add writers\", value: this }; } if (!who) { raise { code: \"E_INVARG\", message: \"add_writer requires an object\", value: who }; } if (who in this.writers) { return this.writers; } this.writers = this.writers + [who]; observe({ type: \"note_writers_changed\", actor: actor, note: this, writers: this.writers, added: who, removed: null, ts: now() }); return this.writers; }"
         },
         {
           "name": "rm_writer",
           "perms": "rx",
           "tool_exposed": true,
           "arg_spec": { "args": ["who"] },
-          "source": "verb :rm_writer(who) rx { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the note owner or a wizard can remove writers\", value: this }; } let next = []; for w in this.writers { if (w != who) { next = next + [w]; } } this.writers = next; return this.writers; }"
+          "source": "verb :rm_writer(who) rx { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the note owner or a wizard can remove writers\", value: this }; } let before = length(this.writers); let next = []; for w in this.writers { if (w != who) { next = next + [w]; } } if (length(next) == before) { return this.writers; } this.writers = next; observe({ type: \"note_writers_changed\", actor: actor, note: this, writers: this.writers, added: null, removed: who, ts: now() }); return this.writers; }"
         },
         {
           "name": "is_readable_by",
@@ -109,7 +109,8 @@
   "features": [],
   "schemas": [
     { "on": "$note", "type": "note_read", "shape": { "actor": "obj", "note": "obj", "text": "str" } },
-    { "on": "$note", "type": "note_edited", "shape": { "actor": "obj", "note": "obj", "text": "str" } }
+    { "on": "$note", "type": "note_edited", "shape": { "actor": "obj", "note": "obj", "text": "str" } },
+    { "on": "$note", "type": "note_writers_changed", "shape": { "actor": "obj", "note": "obj", "writers": "list<obj>", "added": "obj|null", "removed": "obj|null", "ts": "int" } }
   ],
   "seed_hooks": []
 }

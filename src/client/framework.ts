@@ -840,6 +840,19 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
     }
   });
   registry.observation({
+    types: ["note_writers_changed"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const note = String(obs.note ?? obs.pin ?? obs.id ?? "");
+      if (!note) return;
+      const writers = Array.isArray(obs.writers) ? obs.writers.filter((item) => typeof item === "string") : [];
+      draft.patchCatalogState(note, "pinboard_note", { writers });
+      draft.patchCatalogState(note, "taskspace_task", { writers });
+      draft.patchObjectProps(note, { writers });
+    }
+  });
+  registry.observation({
     types: ["note_added"],
     route: "sequenced",
     reduce: (draft, envelope) => {
@@ -1024,14 +1037,17 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
       // gap recovery so a mid-upgrade replay still projects cleanly.
       const name = typeof obs.name === "string" ? obs.name : typeof obs.title === "string" ? obs.title : undefined;
       draft.patchObject(task, { name });
+      const text = typeof obs.text === "string" ? obs.text : undefined;
       draft.patchObjectProps(task, {
         name,
+        text,
         parent_task: parent,
         status: "open",
         space: space || undefined
       });
       draft.patchCatalogState(task, "taskspace_task", {
         name,
+        text,
         parent_task: parent,
         status: "open",
         space: space || undefined
