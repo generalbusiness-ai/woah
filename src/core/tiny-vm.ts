@@ -118,7 +118,11 @@ const BUILTIN_NAMES = [
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
-  "to_int", "to_float"
+  "to_int", "to_float",
+  // New entries MUST be appended; spec/semantics/builtins.md §19 fixes numeric
+  // indices, and persisted bytecode encodes builtins by index. Mid-list inserts
+  // would shift every later index and misdispatch already-stored verbs.
+  "str_split"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -838,6 +842,13 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const list = assertList(builtinArgs[0]);
         const separator = assertString(builtinArgs[1] ?? "");
         return list.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(separator);
+      }
+      case "str_split": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "str_split expects text and separator");
+        const text = assertString(builtinArgs[0] ?? "");
+        const separator = assertString(builtinArgs[1] ?? "");
+        if (separator === "") return Array.from(text);
+        return text.split(separator);
       }
       case "min":
         return Math.min(...builtinArgs.map((value) => numeric(value, "min argument")));

@@ -3959,7 +3959,7 @@ function bindPinboardComponentEvents(element: WooElement) {
     const id = String(detail.id ?? "");
     const text = String(detail.text ?? "");
     if (!id || text === String(detail.original ?? "")) return;
-    pinboardTargetCall(id, "set_text", [text.split(/\r?\n/)], pinboardNoteOptimistic(id, { text: text.split(/\r?\n/) }));
+    pinboardTargetCall(id, "set_text", [text], pinboardNoteOptimistic(id, { text }));
   });
   element.addEventListener("woo-pinboard-note-color", (event) => {
     const detail = (event as CustomEvent<{ id?: unknown; color?: unknown }>).detail ?? {};

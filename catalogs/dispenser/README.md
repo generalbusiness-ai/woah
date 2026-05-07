@@ -1,6 +1,6 @@
 ---
 name: dispenser
-version: 0.1.1
+version: 0.1.2
 spec_version: v1
 license: MIT
 description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests.

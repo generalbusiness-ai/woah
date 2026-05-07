@@ -8,7 +8,7 @@ behavior (pinboard pins, recipe notes, voting notes, decision logs).
 
 | Class | Parent | Description |
 |---|---|---|
-| `$note` | `$portable` | Movable text artifact. Text is a list of strings, one per line; writability gated by owner, the writers list, or wizard. |
+| `$note` | `$portable` | Movable text artifact. Text is a single string body; embedded `\n` separates lines for line-oriented verbs. Writability gated by owner, the writers list, or wizard. |
 
 ## Goal
 
@@ -22,7 +22,7 @@ observations, and editor handoff all work without copy.
 
 ```
 $note < $portable < $thing
-  .text     list<str>   perms ""   — one string per line; private (verb-only access)
+  .text     str         perms ""   — single string body, embedded \n separates lines; private (verb-only access)
   .writers  list<obj>   perms "r"  — additional writers besides .owner
 ```
 
@@ -44,16 +44,25 @@ Properties inherited from `$portable`:
 | `text` | Permission-checking getter for `.text`. Public API for callers that don't run as wizards. |
 | `text_summary(limit)` | Permission-checking bounded display summary. Base implementation returns line count, first-line preview, and truncation flag. Subclasses that transform text for readers should override this alongside `:text()`. See "Implementation note" below for what bounds the work. |
 | `read` / `r@ead` | Call `:text()`, emit a `note_read` observation, return the text. |
-| `set_text(lines)` | Replace text. Permission: `:is_writable_by(actor)`. |
-| `write(line)` | Append a line. Permission: `:is_writable_by(actor)`. |
-| `erase` / `er@ase` | Clear text. Permission: `:is_writable_by(actor)`. |
-| `delete(line)` / `del@ete` / `rem@ove` | Remove one 1-based line. Permission: `:is_writable_by(actor)`. |
+| `set_text(body)` | Replace text. Argument is the full body string. Permission: `:is_writable_by(actor)`. |
+| `write(line)` | Append a line; inserts a leading `\n` when the body is non-empty. Returns the new line count. Permission: `:is_writable_by(actor)`. |
+| `erase` / `er@ase` | Clear text (set to empty string). Permission: `:is_writable_by(actor)`. |
+| `delete(line)` / `del@ete` / `rem@ove` | Remove one 1-based line. The body is split on `\n`, the indexed line is removed, and the remainder is rejoined. Permission: `:is_writable_by(actor)`. |
 | `is_readable_by(actor)` | Default `true`. Override in subclasses to restrict. |
 | `is_writable_by(actor)` | Owner, members of `.writers`, or wizard. |
 | `look` / `look_self` | Standard space/thing look surface. Returns preview title, line count, and current location. |
 | `title` | Object name plus a bounded preview of the first readable text line when present, so multiple notes in one room can be distinguished and matched without expanding long note bodies into inventory or room summaries. |
 
-## What is intentionally absent in v0.1
+## v1.0 shape change
+
+`v1.0.0` retyped `.text` from `list<str>` (one entry per line) to `str` (a
+single body with embedded newlines). Bundled deployments upgrade through
+`migration-v0-to-v1.json`, which uses the `transform_property` step with
+`{ "op": "join", "separator": "\n" }` to coerce existing list values to
+strings. The migration is idempotent — already-string values pass through
+unchanged.
+
+## What is intentionally absent
 
 - **Encryption** (`:encrypt`/`:decrypt`). LambdaCore has it; we'll add when
   there's a use case.
@@ -76,15 +85,16 @@ it gives notes those guarantees for free and reuses the existing
 ### Implementation note: what bounds `:text_summary`
 
 `:text_summary` is pure DSL — it gates on `:is_readable_by(actor)`, clamps the
-incoming `limit` to `0..512`, reads `this.text`, and slices the first line.
+incoming `limit` to `0..512`, reads `this.text`, splits it on `\n` to count
+lines and grab the first line, and slices that first line down to the limit.
 There is no substrate fast-path.
 
 There is currently no per-property hard cap on note text storage. The
-`.text` list is materialized onto the verb's VM stack when read, which makes
+`.text` string is materialized onto the verb's VM stack when read, which makes
 the actual bound the per-frame VM `max_memory` budget (default 4 MB; see
 `tiny-vm.ts:DEFAULT_MEMORY`) plus the per-frame tick budget. For typical notes
 this is many orders of magnitude of headroom; for adversarial or accidentally
-huge bodies (`note.text = [body]` direct writes from producer catalogs such as
+huge bodies (`note.text = body` direct writes from producer catalogs such as
 `$dispenser_block`), the verb relies on those VM-frame budgets to terminate
 cleanly. A future change should add either a substrate-level property
 storage cap or a `$note`-level hard limit in `:set_text` plus a producer-side

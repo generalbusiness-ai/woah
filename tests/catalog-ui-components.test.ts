@@ -74,7 +74,7 @@ describe("bundled catalog UI components", () => {
       boardId: "the_pinboard",
       boardName: "Pinboard",
       boardOwner: "guest_1",
-      notes: [{ id: "note_1", text: ["hello"], x: 10, y: 20, w: 180, h: 110, author: "guest_1", color: "pink" }],
+      notes: [{ id: "note_1", text: "hello", x: 10, y: 20, w: 180, h: 110, author: "guest_1", color: "pink" }],
       present: ["guest_1"],
       palette: ["yellow", "pink", "white"],
       viewport: { w: 960, h: 560 },
