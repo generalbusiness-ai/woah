@@ -109,7 +109,7 @@ const MAX_RUNTIME_LOCALS = 1_024;
 const MAX_RUNTIME_STACK = 4_096;
 const BUILTIN_NAMES = [
   "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
-  "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "random", "contents", "location", "task_perms",
+  "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "random", "contents", "location", "task_perms",
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
@@ -914,6 +914,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");
         return frame.ctx.world.isDescendantOfChecked(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), frame.ctx.hostMemo);
+      }
+      case "is_recycled": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_recycled expects one object");
+        return frame.ctx.world.isRecycled(assertObj(builtinArgs[0]));
       }
       case "random": {
         const n = numeric(builtinArgs[0], "random argument");

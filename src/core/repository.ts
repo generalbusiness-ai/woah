@@ -67,6 +67,10 @@ export type SerializedWorld = {
   logs: [ObjRef, SpaceLogEntry[]][];
   snapshots: SpaceSnapshotRecord[];
   parkedTasks: ParkedTaskRecord[];
+  /** Tombstoned ULIDs (recycled). Per spec/semantics/recycle.md §RC3.9 and
+   * spec/reference/persistence.md §14.2.1. Optional in legacy dumps; absent
+   * means "no recycles recorded yet for this world". */
+  tombstones?: ObjRef[];
 };
 
 export interface WorldRepository {

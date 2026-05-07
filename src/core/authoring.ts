@@ -573,6 +573,7 @@ const VALID_BUILTINS = new Set([
   "chparent",
   "has_flag",
   "isa",
+  "is_recycled",
   "random",
   "contents",
   "location",

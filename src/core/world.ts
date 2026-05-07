@@ -273,6 +273,7 @@ type BehaviorSavepoint = {
   sessions: Map<string, Session>;
   snapshots: SpaceSnapshotRecord[];
   parkedTasks: Map<string, ParkedTaskRecord>;
+  tombstones: Set<ObjRef>;
   objectCounter: number;
   parkedTaskCounter: number;
   sessionCounter: number;
@@ -347,6 +348,9 @@ export class WooWorld {
   private dirtyTasks = new Set<string>();
   private deletedTasks = new Set<string>();
   private dirtyCounters = false;
+  // Tombstoned ULIDs from `recycle()`. Distinct from `objects` having no row,
+  // which can also mean "never existed". Per spec/semantics/recycle.md §RC3.9.
+  tombstones = new Set<ObjRef>();
   // Invalidation token for externally visible state. It is bumped on every
   // path that could change `state(actor)` (object/property/session/task/counter
   // writes, deletes, accepted log rows). It may over-invalidate after rollback;
@@ -491,6 +495,15 @@ export class WooWorld {
     const obj = this.objects.get(id);
     if (!obj) throw wooError("E_OBJNF", `object not found: ${id}`, id);
     return obj;
+  }
+
+  /**
+   * True if `id` was recycled. Distinct from "never existed": a never-existed
+   * id returns false. Per spec/semantics/recycle.md §RC5 and the
+   * `is_recycled()` builtin contract.
+   */
+  isRecycled(id: ObjRef): boolean {
+    return this.tombstones.has(id);
   }
 
   defineProperty(obj: ObjRef, def: Omit<PropertyDef, "version"> & { version?: number }): PropertyDef {
@@ -3733,6 +3746,7 @@ export class WooWorld {
       this.persistObject(location);
     }
     this.objects.delete(objRef);
+    this.tombstones.add(objRef);
     this.deletePersistedObject(objRef);
     if (this.presenceIndexBuilt) this.invalidatePresenceIndex();
     this.persist();
@@ -3915,7 +3929,8 @@ export class WooWorld {
       sessions: Array.from(this.sessions.values()).map((session) => this.serializeSession(session)),
       logs: Array.from(this.logs.entries()).map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
-      parkedTasks: Array.from(this.parkedTasks.values()).map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord)
+      parkedTasks: Array.from(this.parkedTasks.values()).map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
+      tombstones: Array.from(this.tombstones).sort()
     };
   }
 
@@ -3938,7 +3953,8 @@ export class WooWorld {
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
       parkedTasks: Array.from(this.parkedTasks.values())
         .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
-        .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord)
+        .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
+      tombstones: Array.from(this.tombstones).sort()
     };
   }
 
@@ -3949,6 +3965,7 @@ export class WooWorld {
       this.logs.clear();
       this.snapshots = [];
       this.parkedTasks.clear();
+      this.tombstones = new Set(serialized.tombstones ?? []);
       this.presenceIndexBuilt = false;
       this.subscribersIndex.clear();
       this.actorPresenceIndex.clear();
@@ -5632,6 +5649,7 @@ export class WooWorld {
       sessions: new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)])),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
       parkedTasks: new Map(Array.from(this.parkedTasks.entries()).map(([id, task]) => [id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord])),
+      tombstones: new Set(this.tombstones),
       objectCounter: this.objectCounter,
       parkedTaskCounter: this.parkedTaskCounter,
       sessionCounter: this.sessionCounter,
@@ -5645,6 +5663,7 @@ export class WooWorld {
     this.sessions = new Map(Array.from(savepoint.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)]));
     this.snapshots = cloneValue(savepoint.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[];
     this.parkedTasks = new Map(Array.from(savepoint.parkedTasks.entries()).map(([id, task]) => [id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord]));
+    this.tombstones = new Set(savepoint.tombstones);
     this.objectCounter = savepoint.objectCounter;
     this.parkedTaskCounter = savepoint.parkedTaskCounter;
     this.sessionCounter = savepoint.sessionCounter;
