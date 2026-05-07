@@ -636,7 +636,7 @@ A catalog publishing a major-version bump (e.g., `dubspace-v1.x.x` → `dubspace
       "kind": "transform_property",
       "class": "$delay",
       "name": "feedback",
-      "transform": "verb(old) { return clamp(old, 0.0, 1.0); }"
+      "transform": { "op": "join", "separator": "\n" }
     },
     {
       "kind": "drop_verb",
@@ -659,10 +659,14 @@ The v1 migration vocabulary is intentionally minimal. Runtime status is listed p
 - `drop_verb` — implemented for verbs defined directly on the named class; callers fail with `E_VERBNF`.
 - `change_parent` — implemented through the normal authored `chparent` path.
 - `rename_class` — deferred; changing corename/object identity safely requires object-reference migration.
-- `transform_property` — deferred; needs typed transform compilation and metering discipline.
+- `transform_property` — implemented for the v1 declarative-op vocabulary listed below; rewrites locally-set values across a class and its descendants. Inline-verb transforms (verb-source bodies, typed signatures) remain deferred.
 - `custom` — deferred; needs a stable migration-verb execution contract.
 
-Anything more complex requires a custom migration verb, declared as `kind: "custom"` with a `verb` body in DSL source. Custom steps run with the install actor's authority, like any other catalog code.
+The v1 `transform` ops (passed as a JSON object on the step):
+
+- `{ "op": "join", "separator"?: "\n" }` — accepts `list<str>` and emits a string. Separator defaults to `"\n"`. String inputs pass through unchanged so reruns no-op (idempotent per §CT14.4).
+
+Inputs that don't match the op's accepted types raise `E_INVARG`. Anything more complex than the listed ops requires a custom migration verb, declared as `kind: "custom"` with a `verb` body in DSL source. Custom steps run with the install actor's authority, like any other catalog code.
 
 ### CT14.3 Execution
 
@@ -692,7 +696,7 @@ This practice composes with the deployment lifecycle: catalog updates are *not* 
 
 - **Rollback to prior version.** Major downgrades are not in v1. A failed migration can be repaired forward but cannot reliably undo earlier migration steps. Backups are the recovery path; backups, snapshots, and the export tooling are spec'd separately ([backups.md](../operations/backups.md)).
 - **Cross-catalog migrations.** A migration that requires another catalog to be at a specific version is hard to express in v1's `depends` model. Defer.
-- **Schema-typed property migrations.** Without typed verb signatures (§CT11 closing note), the `transform_property` step takes the old value as untyped data. Typed migrations land when typed signatures do.
+- **Schema-typed property migrations.** Without typed verb signatures (§CT11 closing note), the `transform_property` step takes the old value as untyped data. The v1 op vocabulary is a small declarative set (§CT14.2). Inline verb-source transforms and typed migrations land when typed signatures do.
 - **Rolling migrations on live worlds.** v1 migrations are operator-coordinated and may pause normal traffic while running. Online schema migration is post-v1.
 - **Auto-generated migrations from manifest diffs.** Tooling for "compute the migration steps between v1.0 and v2.0 manifests" is useful but secondary; publishers write migrations by hand for now.
 

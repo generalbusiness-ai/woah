@@ -805,14 +805,14 @@ describe("CFObjectRepository production-shape coverage", () => {
       const editNote = await post(`/api/objects/${encodeURIComponent(pin)}/calls/set_text`, {
         id: "cf-pinboard-edit-smoke",
         space: "the_pinboard",
-        args: [["CF smoke edited"]]
+        args: ["CF smoke edited"]
       }, session);
       expect(editNote.status).toBe(200);
-      expect(editNote.body.observations).toContainEqual(expect.objectContaining({ type: "note_edited", note: pin, text: ["CF smoke edited"] }));
+      expect(editNote.body.observations).toContainEqual(expect.objectContaining({ type: "note_edited", note: pin, text: "CF smoke edited" }));
 
       const listed = await post("/api/objects/the_pinboard/calls/list_notes", { args: [] }, session);
       expect(listed.status).toBe(200);
-      expect(listed.body.result).toContainEqual(expect.objectContaining({ id: pin, text: ["CF smoke edited"], color: "blue", x: 80, y: 96 }));
+      expect(listed.body.result).toContainEqual(expect.objectContaining({ id: pin, text: "CF smoke edited", color: "blue", x: 80, y: 96 }));
     } finally {
       logSpy.mockRestore();
       directoryState.close();

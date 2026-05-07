@@ -566,6 +566,7 @@ const VALID_BUILTINS = new Set([
   "str_slice",
   "str_char",
   "str_join",
+  "str_split",
   "now",
   "create",
   "move",

@@ -92,8 +92,11 @@ export type CatalogMigrationStep =
   | { kind: "drop_verb"; class: string; verb: string }
   | { kind: "change_parent"; class: string; parent: string }
   | { kind: "rename_class"; from: string; to: string }
-  | { kind: "transform_property"; class: string; name: string; transform: string }
+  | { kind: "transform_property"; class: string; name: string; transform: CatalogMigrationTransform }
   | { kind: "custom"; verb: string };
+
+export type CatalogMigrationTransform =
+  | { op: "join"; separator?: string };
 
 export type CatalogMigrationManifest = {
   from_version: string;
@@ -1382,10 +1385,45 @@ function applyMigrationStep(
     }
     case "rename_class":
       throw wooError("E_NOT_IMPLEMENTED", "catalog rename_class migrations are deferred", step as unknown as WooValue);
-    case "transform_property":
-      throw wooError("E_NOT_IMPLEMENTED", "catalog transform_property migrations are deferred", step as unknown as WooValue);
+    case "transform_property": {
+      const classRef = resolveObjectRef(world, step.class, localObjects, localSeeds, installed);
+      for (const objRef of classAndDescendants(world, classRef)) transformPropertyLocal(world, objRef, step.name, step.transform);
+      return;
+    }
     case "custom":
       throw wooError("E_NOT_IMPLEMENTED", "catalog custom migrations are deferred", step as unknown as WooValue);
+  }
+}
+
+function transformPropertyLocal(world: WooWorld, objRef: ObjRef, name: string, transform: CatalogMigrationTransform): void {
+  const obj = world.object(objRef);
+  if (!obj.properties.has(name)) return;
+  const oldValue = obj.properties.get(name) as WooValue;
+  const newValue = applyMigrationTransform(oldValue, transform);
+  if (newValue === oldValue) return;
+  world.setProp(objRef, name, newValue);
+}
+
+function applyMigrationTransform(value: WooValue, transform: CatalogMigrationTransform): WooValue {
+  const op = (transform as { op?: unknown }).op;
+  switch (op) {
+    case "join": {
+      if (typeof value === "string") return value;
+      if (!Array.isArray(value)) {
+        throw wooError("E_INVARG", "transform op 'join' requires a list value", value);
+      }
+      const separator = typeof transform.separator === "string" ? transform.separator : "\n";
+      const parts: string[] = [];
+      for (const entry of value) {
+        if (typeof entry !== "string") {
+          throw wooError("E_INVARG", "transform op 'join' requires list entries to be strings", entry as WooValue);
+        }
+        parts.push(entry);
+      }
+      return parts.join(separator);
+    }
+    default:
+      throw wooError("E_CATALOG", `unknown transform_property op: ${typeof op === "string" ? op : String(op)}`, transform as unknown as WooValue);
   }
 }
 

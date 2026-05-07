@@ -1,6 +1,6 @@
 {
   "name": "note",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "Generic note: a portable text-bearing thing. Notes are first-class movable objects so they can travel between rooms, actor inventories, bulletin boards, and other containers without losing identity. Subclass for richer behaviors (pinboard pins, recipe notes, voting notes, decision logs); the base shape is text plus readers/writers permissions.",
   "license": "MIT",
@@ -9,9 +9,9 @@
     {
       "local_name": "$note",
       "parent": "$portable",
-      "description": "A movable text artifact. The text is a list of strings, one per line. Default is publicly readable; writability is gated by owner, the writers list, or wizard. Encryption and mailme bridges are deferred to v0.2.",
+      "description": "A movable text artifact. The text is a single string body; embedded newlines (\\n) separate lines for line-oriented verbs like :write and :delete. Default is publicly readable; writability is gated by owner, the writers list, or wizard. Encryption and mailme bridges are deferred to v0.3.",
       "properties": [
-        { "name": "text", "type": "list<str>", "default": [], "perms": "" },
+        { "name": "text", "type": "str", "default": "", "perms": "" },
         { "name": "writers", "type": "list<obj>", "default": [], "perms": "r" }
       ],
       "verbs": [
@@ -47,7 +47,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": ["limit"] },
-          "source": "verb :text_summary(limit) rxd { if (!this:is_readable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot read note\", value: this }; } let cap = limit; if (typeof(cap) != \"number\") { cap = 96; } if (cap < 0) { cap = 0; } if (cap > 512) { cap = 512; } let lines = this.text; let count = length(lines); let preview = \"\"; if (count > 0 && typeof(lines[1]) == \"string\") { preview = lines[1]; } let truncated = false; if (length(preview) > cap) { if (cap > 3) { preview = str_slice(preview, 1, cap - 3) + \"...\"; } else { preview = str_slice(preview, 1, cap); } truncated = true; } return { \"lines\": count, \"preview\": preview, \"truncated\": truncated }; }"
+          "source": "verb :text_summary(limit) rxd { if (!this:is_readable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot read note\", value: this }; } let cap = limit; if (typeof(cap) != \"number\") { cap = 96; } if (cap < 0) { cap = 0; } if (cap > 512) { cap = 512; } let body = this.text; if (typeof(body) != \"string\") { body = \"\"; } let lines = []; if (body) { lines = str_split(body, \"\\n\"); } let count = length(lines); let preview = \"\"; if (count > 0) { preview = lines[1]; } let truncated = false; if (length(preview) > cap) { if (cap > 3) { preview = str_slice(preview, 1, cap - 3) + \"...\"; } else { preview = str_slice(preview, 1, cap); } truncated = true; } return { \"lines\": count, \"preview\": preview, \"truncated\": truncated }; }"
         },
         {
           "name": "text",
@@ -72,8 +72,8 @@
           "name": "set_text",
           "perms": "rx",
           "tool_exposed": true,
-          "arg_spec": { "args": ["lines"] },
-          "source": "verb :set_text(lines) rx { if (typeof(lines) != \"list\") { raise { code: \"E_INVARG\", message: \"set_text requires a list of strings\", value: lines }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot write note\", value: this }; } this.text = lines; observe({ type: \"note_edited\", actor: actor, note: this, text: lines, ts: now() }); return true; }"
+          "arg_spec": { "args": ["body"] },
+          "source": "verb :set_text(body) rx { if (typeof(body) != \"string\") { raise { code: \"E_INVARG\", message: \"set_text requires a string\", value: body }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot write note\", value: this }; } this.text = body; observe({ type: \"note_edited\", actor: actor, note: this, text: body, ts: now() }); return true; }"
         },
         {
           "name": "write",
@@ -81,7 +81,7 @@
           "perms": "rx",
           "tool_exposed": true,
           "arg_spec": { "args": ["line"] },
-          "source": "verb :write(line) rx { if (typeof(line) != \"string\") { raise { code: \"E_INVARG\", message: \"write requires a string\", value: line }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot write note\", value: this }; } this.text = this.text + [line]; observe({ type: \"note_edited\", actor: actor, note: this, text: this.text, ts: now() }); return length(this.text); }"
+          "source": "verb :write(line) rx { if (typeof(line) != \"string\") { raise { code: \"E_INVARG\", message: \"write requires a string\", value: line }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot write note\", value: this }; } let body = this.text; if (typeof(body) != \"string\") { body = \"\"; } let next = body; if (next == \"\") { next = line; } else { next = body + \"\\n\" + line; } this.text = next; observe({ type: \"note_edited\", actor: actor, note: this, text: next, ts: now() }); return length(str_split(next, \"\\n\")); }"
         },
         {
           "name": "erase",
@@ -89,7 +89,7 @@
           "perms": "rx",
           "tool_exposed": true,
           "arg_spec": { "args": [] },
-          "source": "verb :erase() rx { if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot erase note\", value: this }; } this.text = []; observe({ type: \"note_edited\", actor: actor, note: this, text: [], ts: now() }); return true; }"
+          "source": "verb :erase() rx { if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot erase note\", value: this }; } this.text = \"\"; observe({ type: \"note_edited\", actor: actor, note: this, text: \"\", ts: now() }); return true; }"
         },
         {
           "name": "delete",
@@ -97,7 +97,7 @@
           "perms": "rx",
           "tool_exposed": true,
           "arg_spec": { "args": ["line"] },
-          "source": "verb :delete(line) rx { if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot edit note\", value: this }; } let lines = this.text; let n = length(lines); if (typeof(line) != \"number\" || line < 1 || line > n) { raise { code: \"E_RANGE\", message: \"line out of range\", value: line }; } let next = []; let i = 1; for entry in lines { if (i != line) { next = next + [entry]; } i = i + 1; } this.text = next; observe({ type: \"note_edited\", actor: actor, note: this, text: next, ts: now() }); return true; }"
+          "source": "verb :delete(line) rx { if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot edit note\", value: this }; } let body = this.text; if (typeof(body) != \"string\") { body = \"\"; } let lines = []; if (body) { lines = str_split(body, \"\\n\"); } let n = length(lines); if (typeof(line) != \"number\" || line < 1 || line > n) { raise { code: \"E_RANGE\", message: \"line out of range\", value: line }; } let kept = []; let i = 1; for entry in lines { if (i != line) { kept = kept + [entry]; } i = i + 1; } let next = str_join(kept, \"\\n\"); this.text = next; observe({ type: \"note_edited\", actor: actor, note: this, text: next, ts: now() }); return true; }"
         },
         {
           "name": "is_readable_by",
@@ -113,7 +113,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :match_names() rxd { let out = []; if (!this:is_readable_by(actor)) { return out; } let lines = this.text; for line in lines { if (typeof(line) == \"string\") { let trimmed = str_trim(line); if (trimmed) { out = out + [trimmed]; } } } return out; }"
+          "source": "verb :match_names() rxd { let out = []; if (!this:is_readable_by(actor)) { return out; } let body = this.text; if (typeof(body) != \"string\") { return out; } let lines = []; if (body) { lines = str_split(body, \"\\n\"); } for line in lines { if (typeof(line) == \"string\") { let trimmed = str_trim(line); if (trimmed) { out = out + [trimmed]; } } } return out; }"
         },
         {
           "name": "is_writable_by",
@@ -128,8 +128,8 @@
   ],
   "features": [],
   "schemas": [
-    { "on": "$note", "type": "note_read", "shape": { "actor": "obj", "note": "obj", "text": "list<str>" } },
-    { "on": "$note", "type": "note_edited", "shape": { "actor": "obj", "note": "obj", "text": "list<str>" } }
+    { "on": "$note", "type": "note_read", "shape": { "actor": "obj", "note": "obj", "text": "str" } },
+    { "on": "$note", "type": "note_edited", "shape": { "actor": "obj", "note": "obj", "text": "str" } }
   ],
   "seed_hooks": []
 }

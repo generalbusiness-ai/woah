@@ -1,6 +1,6 @@
 ---
 name: note
-version: 0.1.0
+version: 1.0.0
 spec_version: v1
 license: MIT
 description: Generic note class — portable text-bearing things, modeled after LambdaMOO's $note. Subclass for richer per-note behavior.
@@ -24,7 +24,7 @@ See [DESIGN.md](DESIGN.md) for the app design and behavior contract.
 
 `$note < $portable < $thing`
 
-Properties: `.text` (list of strings), `.writers` (list of additional
+Properties: `.text` (string body — embedded `\n` separates lines for line-oriented verbs), `.writers` (list of additional
 writer objects beyond the owner).
 
 ## Verbs
@@ -33,7 +33,7 @@ writer objects beyond the owner).
 :text                   permission-checking getter for the text content
 :text_summary(limit)    bounded display summary for title/look surfaces
 :read                   show the text and emit a note_read observation
-:set_text(lines)        replace the entire text (writers only)
+:set_text(body)         replace the entire text (writers only)
 :write(line)            append one line (writers only)
 :delete(line)           remove one line (writers only); alias :remove
 :erase                  clear the text (writers only)
@@ -61,7 +61,7 @@ Or in code:
 
 ```moo
 let note = create($note);
-note:set_text(["1. Boil water.", "2. Add tea."]);
+note:set_text("1. Boil water.\n2. Add tea.");
 note:read();
 ```
 

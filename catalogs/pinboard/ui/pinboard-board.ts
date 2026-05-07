@@ -268,7 +268,6 @@ function pinNoteColor(note: PinboardNote, palette: unknown): string {
 }
 
 function pinNoteText(value: unknown): string {
-  if (Array.isArray(value)) return value.map((line) => typeof line === "string" ? line : String(line ?? "")).join("\n");
   return typeof value === "string" ? value : "";
 }
 
