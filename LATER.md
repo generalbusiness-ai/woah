@@ -10,7 +10,8 @@ The sections below distinguish three flavors of pending item:
 
 ## random stuff to do
 
-- get the elves to build santa's workshop
+- structured review process
+- get the elves to build santa's workshop (using the kanban)
 - chat transparency isn't really working
 - better enter/leave messages; and for dubspace/pinboard/etc
 - djspace
@@ -18,11 +19,9 @@ The sections below distinguish three flavors of pending item:
 - make the couch a transparent room; "sit", "up"/off/out
 - LM couch shows your location as LR, right?
 - dm (outside of a room), chats and channels
-- are lists-of-text ok? that's a mooism that we don't really need and might cause problems later
 - flesh out the help, make it the default platform-docs
     - help is markdown notes
 - guest "it is awake and looks alert"
-- kanban
 - subscriptions (to anything) (grouped??)
 - help policy in DSL — first-light help is native-backed with explicit source stubs. Move `$player:help`, help search-path policy, directive rendering, and miss recording into woocode once the DSL has actor-ancestry and actor-aware verb-source primitives; then drop the native help handlers.
 - ~~multiple rooms, and furniture and exits~~ — first chat slice landed with Living Room, Deck, Hot Tub, exits, fixed furniture, and portables.
