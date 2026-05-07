@@ -729,6 +729,113 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
+  it("scrubs session_subscribers rows whose session is in this DO's table and expired", async () => {
+    // Regression: rows in `<space>.session_subscribers` whose session has
+    // expired on this DO sit there forever once the actor-level scrub no
+    // longer reaches them — `removeSessionPresence` is only called when
+    // `reapSession` runs on this DO, and that loop is racy on cold-start
+    // hosts. The session-level sibling scrub now drops any expired-in-table
+    // row alongside the actor-level pass, recomputing the `subscribers`
+    // mirror from the survivors.
+    //
+    // Scope is intentionally narrow: rows whose session is unknown to this
+    // DO are left alone, since they may legitimately belong to a different
+    // DO that hasn't synced the session here. The data pollution observed
+    // in production (`session-N` counter rows whose sessions had been
+    // reaped everywhere) is dealt with by broadcastLiveEvent's actor-keyed
+    // fallback in src/worker/persistent-object-do.ts; only DO replacement
+    // or an explicit wizard sweep clears those rows from disk.
+    const harness = make();
+    try {
+      const world = harness.world;
+      const live = world.auth("guest:conf-session-scrub-live");
+      world.createObject({ id: "conf_session_scrub_room", name: "Session Scrub Room", parent: "$chatroom", owner: "$wiz" });
+      world.setProp("conf_session_scrub_room", "features", ["$conversational"]);
+      const expiredAuth = world.auth("guest:conf-session-scrub-expired");
+      const expired = world.sessions.get(expiredAuth.id);
+      if (!expired) throw new Error("expected expired session in table");
+      expired.expiresAt = Date.now() - 60_000;
+      expired.lastDetachAt = Date.now() - 60_000;
+      // Pre-populate: live row, expired-in-table row, malformed row,
+      // `legacy:` placeholder, and an unknown-session row representing a
+      // hypothetical cross-host bridge subscriber. The unknown row must
+      // survive — see scope note above.
+      world.setProp("conf_session_scrub_room", "session_subscribers", [
+        { session: live.id, actor: live.actor },
+        { session: expired.id, actor: expiredAuth.actor },
+        { session: "", actor: "guest_blank" },
+        { session: `legacy:${live.actor}`, actor: live.actor },
+        { session: "session-cross-host", actor: "guest_remote" }
+      ]);
+      world.setProp("conf_session_scrub_room", "subscribers", [
+        live.actor,
+        expiredAuth.actor,
+        "guest_blank",
+        "guest_remote"
+      ]);
+      world.setActorPresence(live.actor, "conf_session_scrub_room", true);
+      world.object(live.actor).location = "conf_session_scrub_room";
+      world.sessions.get(live.id)!.currentLocation = "conf_session_scrub_room";
+
+      // First call paid the per-space throttle and runs both scrubs.
+      const looked = await world.directCall("conf-session-scrub-look", live.actor, "conf_session_scrub_room", "look", []);
+      expect(looked.op, looked.op === "error" ? JSON.stringify(looked.error) : "").toBe("result");
+
+      const remainingRows = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string; actor: string }>;
+      expect(remainingRows.map((row) => row.session).sort()).toEqual([
+        live.id,
+        `legacy:${live.actor}`,
+        "session-cross-host"
+      ].sort());
+      // Both scrubs collaborated to recompute `subscribers`. The actor pass
+      // dropped guest_blank — note that the drop happens in
+      // updateSpaceSubscriberLocal's parse step (the malformed empty-session
+      // row is filtered when the session pass rebuilds `subscribers` from
+      // surviving session_subscribers rows), not via the actor pass's
+      // present=false call. The session pass dropped expiredAuth.actor.
+      // guest_remote stays because its row is still in session_subscribers.
+      expect((world.getProp("conf_session_scrub_room", "subscribers") as ObjRef[]).sort()).toEqual([
+        live.actor,
+        "guest_remote"
+      ].sort());
+
+      // Re-running look within the SUBSCRIBER_SCRUB_FLOOR_MS window must NOT
+      // re-trigger the scrub. Plant a row that the scrub would otherwise
+      // remove and verify the throttle holds it in place. The throttle is
+      // the only thing keeping write amplification bounded for chatty rooms.
+      const survivors = world.getProp("conf_session_scrub_room", "session_subscribers") as WooValue;
+      const replant = (survivors as Array<Record<string, WooValue>>).concat([{ session: expired.id, actor: expiredAuth.actor }]);
+      world.setProp("conf_session_scrub_room", "session_subscribers", replant as unknown as WooValue);
+      const lookedAgain = await world.directCall("conf-session-scrub-look-throttled", live.actor, "conf_session_scrub_room", "look", []);
+      expect(lookedAgain.op).toBe("result");
+      const stillThere = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
+      expect(stillThere.map((row) => row.session)).toContain(expired.id);
+
+      // Sanity: when reapSession runs through removeSessionPresence first,
+      // there's nothing left for the new scrub to do. The session and its
+      // row both go away through the existing path; this pins that the
+      // sibling scrub stays a safety net rather than the primary cleanup.
+      world.setProp("conf_session_scrub_room", "session_subscribers", survivors);
+      const reapedActor = "guest_reaped" as ObjRef;
+      const reapedSession = "session-conf-reaped";
+      world.createObject({ id: reapedActor, name: reapedActor, parent: "$guest", owner: "$wiz" });
+      world.ensureSessionForActor(reapedSession, reapedActor, "guest", Date.now() + 60_000);
+      world.setSpaceSubscriber("conf_session_scrub_room", reapedActor, true, reapedSession);
+      const beforeReap = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
+      expect(beforeReap.map((row) => row.session)).toContain(reapedSession);
+      const reapedRecord = world.sessions.get(reapedSession);
+      if (reapedRecord) {
+        reapedRecord.expiresAt = Date.now() - 60_000;
+        reapedRecord.lastDetachAt = Date.now() - 60_000;
+      }
+      world.reapExpiredSessions();
+      const afterReap = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
+      expect(afterReap.map((row) => row.session)).not.toContain(reapedSession);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   it("resolves commands against a remote current room and cross-host room contents", async () => {
     const homeHarness = make();
     const roomHarness = make();

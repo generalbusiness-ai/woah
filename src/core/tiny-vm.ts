@@ -118,8 +118,7 @@ const BUILTIN_NAMES = [
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
-  "to_int", "to_float",
-  "note_text_summary"
+  "to_int", "to_float"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -840,13 +839,6 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const separator = assertString(builtinArgs[1] ?? "");
         return list.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(separator);
       }
-      case "note_text_summary": {
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "note_text_summary expects note and optional preview limit");
-        const limit = builtinArgs.length >= 2 && builtinArgs[1] !== null
-          ? numeric(builtinArgs[1], "note_text_summary limit")
-          : 96;
-        return await frame.ctx.world.noteTextSummary(frame.ctx, assertObj(builtinArgs[0]), limit);
-      }
       case "min":
         return Math.min(...builtinArgs.map((value) => numeric(value, "min argument")));
       case "max":
@@ -1012,15 +1004,22 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return null;
       }
       case "dispatch": {
-        if (builtinArgs.length < 2 || builtinArgs.length > 4) throw wooError("E_INVARG", "dispatch expects target, verb, optional args, and optional start_at");
+        if (builtinArgs.length < 2 || builtinArgs.length > 5) throw wooError("E_INVARG", "dispatch expects target, verb, optional args, optional start_at, optional max_chars");
         const callArgs = builtinArgs.length >= 3 && builtinArgs[2] !== null ? assertList(builtinArgs[2]) : [];
         const startAt = builtinArgs.length >= 4 && builtinArgs[3] !== null ? assertObj(builtinArgs[3]) : undefined;
+        let maxChars: number | undefined;
+        if (builtinArgs.length >= 5 && builtinArgs[4] !== null) {
+          const raw = numeric(builtinArgs[4], "dispatch max_chars");
+          if (!Number.isFinite(raw) || raw < 0) throw wooError("E_INVARG", "dispatch max_chars must be a non-negative finite number", builtinArgs[4]);
+          maxChars = Math.floor(raw);
+        }
         return await frame.ctx.world.dispatch(
           { ...frame.ctx, caller: frame.ctx.thisObj, callerPerms: frame.ctx.progr },
           assertObj(builtinArgs[0]),
           assertString(builtinArgs[1]),
           callArgs,
-          startAt
+          startAt,
+          maxChars
         );
       }
       case "execute_command_plan": {

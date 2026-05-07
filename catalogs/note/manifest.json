@@ -29,7 +29,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": ["limit"] },
-          "source": "verb :text_summary(limit) rxd { return note_text_summary(this, limit); }"
+          "source": "verb :text_summary(limit) rxd { if (!this:is_readable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot read note\", value: this }; } let cap = limit; if (typeof(cap) != \"number\") { cap = 96; } if (cap < 0) { cap = 0; } if (cap > 512) { cap = 512; } let lines = this.text; let count = length(lines); let preview = \"\"; if (count > 0 && typeof(lines[1]) == \"string\") { preview = lines[1]; } let truncated = false; if (length(preview) > cap) { if (cap > 3) { preview = str_slice(preview, 1, cap - 3) + \"...\"; } else { preview = str_slice(preview, 1, cap); } truncated = true; } return { \"lines\": count, \"preview\": preview, \"truncated\": truncated }; }"
         },
         {
           "name": "text",

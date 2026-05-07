@@ -2104,7 +2104,11 @@ export class PersistentObjectDO {
     }
     if (audienceSessions) {
       for (const sessionId of audienceSessions) sendAll(this.socketsBySession.get(sessionId));
-      return delivered;
+      // If every session lookup missed (typical when the space's
+      // session_subscribers row contains stale/expired session IDs that no
+      // longer have a live WebSocket on this DO), fall through to actor-keyed
+      // delivery so live participants still receive room-wide events.
+      if (delivered > 0) return delivered;
     }
     const actorsIter: Iterable<ObjRef> | null = audienceActors
       ? audienceActors

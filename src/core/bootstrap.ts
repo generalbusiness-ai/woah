@@ -57,7 +57,7 @@ const PLAYER_INVENTORY_SOURCE = `verb :inventory() rxd {
   let names = [];
   for item in contents(this) {
     let item_title = "";
-    try { item_title = item:title(); } except err { item_title = ""; }
+    try { item_title = dispatch(item, "title", [], null, 1024); } except err { item_title = ""; }
     if (!item_title) { item_title = to_string(item); }
     items = items + [{ id: item, title: item_title }];
     names = names + [item_title];

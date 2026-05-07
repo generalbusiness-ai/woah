@@ -135,7 +135,6 @@ const FRAME_GLOBALS = new Map<string, string>([
 const BUILTINS = new Set([
   "length", "keys", "values", "has", "typeof", "to_string", "tostr", "to_int", "toint", "to_float", "tofloat", "min", "max", "floor", "ceil", "round", "abs",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join",
-  "note_text_summary",
   "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms", "caller_perms",
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",

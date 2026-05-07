@@ -1343,4 +1343,94 @@ describe("CFObjectRepository production-shape coverage", () => {
       gatewayState.close();
     }
   });
+
+  it("falls back to actor-keyed delivery when audience_sessions has only stale session ids", async () => {
+    // Regression: production accumulated dozens of stale entries in
+    // `<space>.session_subscribers` (old `session-N` ids from the counter
+    // generator, kept alive by absent-logout client reuse). The audience
+    // computation legitimately filled `audience_sessions` from the index, but
+    // every id resolved to a missing socket on the live gateway, so room-wide
+    // events (`said`, `entered`, `left`) reached zero clients even though
+    // `audience_actors` had live participants reachable through
+    // `socketsByActor`. broadcastLiveEvent must fall through to the actor map
+    // when none of the session ids deliver, so a polluted index does not
+    // black-hole the broadcast.
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    let gateway: PersistentObjectDO;
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-broadcast-fallback-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        if (name !== "world") throw new Error(`unexpected Woo DO ${name}`);
+        return gateway;
+      })
+    } as unknown as Env;
+    gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    try {
+      // Force world boot so internals (socketsByActor / socketsBySession) are
+      // initialized before we reach into them. /healthz is the cheapest path.
+      await gateway.fetch(new Request("https://woo.test/healthz"));
+
+      type SentFrame = string;
+      class FakeWebSocket { readyState = 1; readonly sent: SentFrame[] = []; send(data: string): void { this.sent.push(data); } }
+
+      const liveActorWs = new FakeWebSocket();
+      const internals = gateway as unknown as {
+        socketsByActor: Map<ObjRef, Set<unknown>>;
+        socketsBySession: Map<string, Set<unknown>>;
+        broadcastLiveEvent: (
+          world: WooWorld,
+          frame: { op: "event"; observation: Record<string, unknown> },
+          audience: ObjRef,
+          audienceActors?: ObjRef[],
+          audienceSessions?: string[],
+          originator?: unknown
+        ) => number;
+        getWorld: (host?: string) => Promise<WooWorld>;
+      };
+      // Live participant has a socket on this DO, mapped only by actor.
+      // No entry in socketsBySession for any of the stale ids the room's
+      // session_subscribers would yield, mirroring the production state.
+      internals.socketsByActor.set("guest_live_actor" as ObjRef, new Set([liveActorWs]));
+      const world = await internals.getWorld("world");
+
+      const observation = { type: "said", actor: "guest_live_actor", text: "hello", source: "the_chatroom", ts: Date.now() };
+      const delivered = internals.broadcastLiveEvent(
+        world,
+        { op: "event", observation },
+        "the_chatroom" as ObjRef,
+        ["guest_live_actor" as ObjRef],
+        ["session-stale-1", "session-stale-2", "session-stale-3"]
+      );
+
+      expect(delivered).toBe(1);
+      expect(liveActorWs.sent).toHaveLength(1);
+      expect(JSON.parse(liveActorWs.sent[0])).toEqual({ op: "event", observation });
+
+      // Sanity check the positive case still works: when the session map
+      // already covers the live participant, fallback isn't needed and the
+      // session lookup delivers on its own (no double-send).
+      liveActorWs.sent.length = 0;
+      internals.socketsBySession.set("session-live", new Set([liveActorWs]));
+      const deliveredViaSession = internals.broadcastLiveEvent(
+        world,
+        { op: "event", observation },
+        "the_chatroom" as ObjRef,
+        ["guest_live_actor" as ObjRef],
+        ["session-live", "session-stale-1"]
+      );
+      expect(deliveredViaSession).toBe(1);
+      expect(liveActorWs.sent).toHaveLength(1);
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
 });

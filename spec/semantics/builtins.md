@@ -108,22 +108,6 @@ that session's current location. This keeps command parsing and room verbs scope
 to the tab/tool session that issued the call. It is a behavior-readable core
 field, not a property lookup.
 
-`note_text_summary(note, limit?)` returns `{lines, preview, truncated}` for the
-base note display path without materializing an unbounded note body in the Tiny
-VM. `limit` defaults to 96 and is clamped to `0..512` characters. The builtin
-first requires `note` to be a local `$note` descendant and raises `E_TYPE`
-otherwise. It then calls `note:is_readable_by(actor)` and raises `E_PERM` if it
-does not return true. The reference implementation then reads the note object's raw
-`.text` property locally, treats non-list text as empty, reports the list length
-as `lines`, and derives `preview` from the first string element only. If the
-preview exceeds the clamped limit, it is truncated and `truncated` is true; when
-there is room for an ellipsis, the returned preview ends with `...`.
-
-This builtin is intentionally narrow and catalog-supporting, not the public note
-text contract. Catalog callers should use the overridable `$note:text_summary`
-verb so subclasses that decrypt, redact, or derive text can keep title and look
-semantics aligned with their full `:text()` behavior.
-
 `current_session()` returns the current session id or `null` for host/bootstrap
 tasks. `current_location()` returns the current session's location or `null`.
 `session_location(id)` returns that live session's location or `null`.
@@ -132,12 +116,25 @@ tasks. `current_location()` returns the current session's location or `null`.
 sessions of an actor; for non-actors it returns the object's ordinary location
 as a singleton list, or `[]` when there is none.
 
-`dispatch(obj, verb, args?, start_at?)` invokes the normal verb-dispatch path
-from source code, using the current task permissions. Catalog code that wants to
-route a command as the calling actor should first call
+`dispatch(obj, verb, args?, start_at?, max_chars?)` invokes the normal
+verb-dispatch path from source code, using the current task permissions. Catalog
+code that wants to route a command as the calling actor should first call
 `set_task_perms(caller_perms())`. `dispatch` is a mechanism, not a command
 policy: parser conventions such as chat prefixes or room commands live in
 catalog source.
+
+When `max_chars` is supplied as a non-negative integer, the substrate enforces a
+size bound on the verb's return value: if the return is a string whose
+`length` exceeds `max_chars`, dispatch raises `E_TOOBIG` instead of returning
+the value, with `value = {verb, size, max}`. Non-string returns pass through
+unchanged. The bound is intentionally a hard cap rather than a silent truncation
+so callers must decide what to substitute when the verb's natural answer would
+not fit; pair it with a `try ... except err in (E_TOOBIG)` fallback when
+calling potentially-unbounded catalog affordances such as `:title()` or
+`:match_names()` from substrate paths that must not materialize unbounded text.
+The bound is checked after the verb returns; v1 does not propagate the cap to
+remote hosts, so cross-host calls may transmit the full value before the local
+side enforces the limit.
 
 `execute_command_plan(plan)` consumes a command plan produced by
 `$match:plan_command`. Direct plans execute through the normal dispatch path and
@@ -245,6 +242,7 @@ override uses these to surface `is sleeping` / `awake and looks alert` /
 | `E_CONFLICT` | State conflict (e.g., already claimed by another actor). |
 | `E_PRECONDITION` | Required condition was not met. |
 | `E_QUOTA` | Resource quota exceeded. |
+| `E_TOOBIG` | Caller-imposed `max_chars` size bound exceeded by a verb return value. |
 | `E_FLOAT` | Floating-point exception. |
 | `E_TICKS` | Tick limit exceeded. |
 | `E_MEM` | Memory limit exceeded. |

@@ -2079,41 +2079,49 @@ export class WooWorld {
     return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt));
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {
+    let result: WooValue;
     if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      return await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
-    }
-    if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
-    this.callDepth += 1;
-    try {
-      // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
-      // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
-      // as "no parent override" and fall back to the standard resolveVerb walk.
-      const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
-      this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-      const runCtx: CallContext = {
-        ...ctx,
-        thisObj: target,
-        verbName,
-        definer,
-        callerPerms: ctx.progr,
-        progr: verb.owner,
-        player: ctx.player ?? ctx.actor,
-        caller: ctx.caller ?? "#-1"
-      };
-      if (verb.kind === "native") {
-        // Native handlers are an implementation detail behind ordinary verb
-        // dispatch. The dispatch path above has already enforced verb execute
-        // permissions and set progr/definer/caller frame fields.
-        const handler = this.nativeHandlers.get(verb.native);
-        if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
-        return await handler(runCtx, args);
+      result = await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
+    } else {
+      if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
+      this.callDepth += 1;
+      try {
+        // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
+        // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
+        // as "no parent override" and fall back to the standard resolveVerb walk.
+        const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
+        this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
+        const runCtx: CallContext = {
+          ...ctx,
+          thisObj: target,
+          verbName,
+          definer,
+          callerPerms: ctx.progr,
+          progr: verb.owner,
+          player: ctx.player ?? ctx.actor,
+          caller: ctx.caller ?? "#-1"
+        };
+        if (verb.kind === "native") {
+          // Native handlers are an implementation detail behind ordinary verb
+          // dispatch. The dispatch path above has already enforced verb execute
+          // permissions and set progr/definer/caller frame fields.
+          const handler = this.nativeHandlers.get(verb.native);
+          if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
+          result = await handler(runCtx, args);
+        } else {
+          result = await runTinyVm(runCtx, verb.bytecode, args);
+        }
+      } finally {
+        this.callDepth -= 1;
       }
-      return await runTinyVm(runCtx, verb.bytecode, args);
-    } finally {
-      this.callDepth -= 1;
     }
+    if (typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 0
+        && typeof result === "string" && result.length > maxChars) {
+      throw wooError("E_TOOBIG", `dispatch result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: result.length, max: maxChars });
+    }
+    return result;
   }
 
   state(actor?: ObjRef): WorldSnapshot {
@@ -6629,32 +6637,117 @@ export class WooWorld {
 
   private async scrubStaleSubscribersForSpace(space: ObjRef, progr: ObjRef, subscribers: ObjRef[], memo?: HostOperationMemo): Promise<ObjRef[]> {
     void progr;
-    if (!this.objects.has(space) || subscribers.length === 0) return subscribers;
+    if (!this.objects.has(space)) return subscribers;
     const now = Date.now();
     const last = this.lastSubscriberScrubAt.get(space) ?? 0;
     if (now - last < SUBSCRIBER_SCRUB_FLOOR_MS) return subscribers;
     this.lastSubscriberScrubAt.set(space, now);
-    const kept: ObjRef[] = [];
-    const stale: ObjRef[] = [];
-    await Promise.all(subscribers.map(async (actor) => {
-      const remote = await this.remoteHostForObject(actor, memo);
-      const localLocations = this.allLocationsForActor(actor);
-      let remoteLocations: ObjRef[] = [];
-      if (remote) {
-        try {
-          remoteLocations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
-        } catch (err) {
-          if (isReadAvailabilityError(err)) return;
-          throw err;
+    let survivingActors = subscribers;
+    if (subscribers.length > 0) {
+      const kept: ObjRef[] = [];
+      const stale: ObjRef[] = [];
+      await Promise.all(subscribers.map(async (actor) => {
+        const remote = await this.remoteHostForObject(actor, memo);
+        const localLocations = this.allLocationsForActor(actor);
+        let remoteLocations: ObjRef[] = [];
+        if (remote) {
+          try {
+            remoteLocations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
+          } catch (err) {
+            if (isReadAvailabilityError(err)) return;
+            throw err;
+          }
         }
+        const locations = remote ? Array.from(new Set([...localLocations, ...remoteLocations])) : localLocations;
+        if (locations.includes(space)) kept.push(actor);
+        else stale.push(actor);
+      }));
+      for (const actor of stale) this.updateSpaceSubscriberLocal(space, actor, false);
+      const keptSet = new Set(kept);
+      survivingActors = subscribers.filter((actor) => keptSet.has(actor));
+    }
+    // Sibling scrub: drop session_subscribers rows whose session has been
+    // reaped on this DO but whose row was never cleaned up because
+    // `removeSessionPresence` walks only the local object map and has no
+    // way to learn that a different DO recently expired a session it shares.
+    // Runs even for empty `subscribers` because session_subscribers can
+    // accumulate independently and an emptied room is exactly when stale
+    // session rows pile up. The returned `survivingActors` reflects the
+    // actor scrub only; the persisted `subscribers` property may be
+    // further trimmed by the session pass — by design, the two views
+    // converge under the property-change hook in setPropLocal which
+    // reinvalidates the presence index.
+    this.scrubExpiredSessionSubscribersForSpace(space);
+    return survivingActors;
+  }
+
+  /**
+   * Drop entries in `<space>.session_subscribers` whose session is present
+   * in this DO's session table AND already expired. Recomputes the
+   * actor-level `subscribers` mirror from the surviving rows so both views
+   * stay consistent.
+   *
+   * Intentionally narrow: rows whose session is missing from `this.sessions`
+   * may legitimately belong to a different DO that hasn't synced the session
+   * here yet, so dropping them would race cross-host setup. The actor-level
+   * scrub already handles dropping subscribers whose remote-host
+   * actorSessionLocations no longer reports this space; the broadcast layer
+   * (broadcastLiveEvent) handles the data-pollution case where rows remain
+   * but don't resolve to live sockets. TODO(cross-host-session-gc): have the
+   * gateway's session-end signal propagate to peer DOs (or have the
+   * Directory participate) so cross-host pollution can be cleaned at source
+   * instead of bandaged at broadcast time.
+   *
+   * `legacy:<actor>` placeholder entries are kept regardless: they are
+   * synthesized by `updateSpaceSubscriberLocal` for bridge-era hosts that
+   * have no per-session attribution.
+   *
+   * Throttling is the wrapper's job (`scrubStaleSubscribersForSpace` gates
+   * both passes under a single per-space window). This helper is unguarded
+   * by design — keep it that way and add a guard here if a second caller
+   * appears.
+   */
+  private scrubExpiredSessionSubscribersForSpace(space: ObjRef): void {
+    if (!this.objects.has(space)) return;
+    const raw = this.propOrNull(space, "session_subscribers");
+    if (!Array.isArray(raw) || raw.length === 0) return;
+    const now = Date.now();
+    let changed = false;
+    const out: WooValue[] = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        changed = true;
+        continue;
       }
-      const locations = remote ? Array.from(new Set([...localLocations, ...remoteLocations])) : localLocations;
-      if (locations.includes(space)) kept.push(actor);
-      else stale.push(actor);
-    }));
-    for (const actor of stale) this.updateSpaceSubscriberLocal(space, actor, false);
-    const keptSet = new Set(kept);
-    return subscribers.filter((actor) => keptSet.has(actor));
+      const map = entry as Record<string, WooValue>;
+      const sessionId = typeof map.session === "string" ? map.session : "";
+      const actor: ObjRef | "" = typeof map.actor === "string" ? map.actor : "";
+      if (!sessionId || !actor) {
+        changed = true;
+        continue;
+      }
+      if (sessionId.startsWith("legacy:")) {
+        out.push(entry);
+        continue;
+      }
+      const session = this.sessions.get(sessionId);
+      if (session && this.sessionExpired(session, now)) {
+        changed = true;
+        continue;
+      }
+      out.push(entry);
+    }
+    if (!changed) return;
+    const nextActors = Array.from(new Set(out
+      .map((entry) => (entry as Record<string, WooValue>).actor)
+      .filter((actor): actor is ObjRef => typeof actor === "string")
+    )).sort();
+    // setProp invalidates the presence index via setPropLocal's
+    // subscribers/session_subscribers hook; no explicit invalidation needed.
+    this.withPersistenceDeferred(() => {
+      this.setProp(space, "session_subscribers", out as unknown as WooValue);
+      this.setProp(space, "subscribers", nextActors as unknown as WooValue);
+    });
   }
 
   private async defaultLookSelf(ctx: CallContext): Promise<WooValue> {
@@ -7164,53 +7257,19 @@ export class WooWorld {
     }
     if (!this.objects.has(item)) return item;
     try {
-      const value = await this.dispatch({ ...ctx, caller: room, progr: ctx.actor }, item, "title", []);
+      // 1024 chars is a generous upper bound for inventory/look titles
+      // (typical `name + ": " + 96-char preview` runs under 200) while still
+      // preventing a misbehaving or hostile :title() verb from materializing
+      // megabytes of text into room/inventory composition. On overflow,
+      // fall back to the bare object name like a missing :title() does.
+      const value = await this.dispatch({ ...ctx, caller: room, progr: ctx.actor }, item, "title", [], undefined, 1024);
       if (typeof value !== "string") throw wooError("E_TYPE", `${item}:title() must return a string`, value);
       return value;
     } catch (err) {
       const error = normalizeError(err);
-      if (error.code !== "E_VERBNF") throw err;
+      if (error.code !== "E_VERBNF" && error.code !== "E_TOOBIG") throw err;
       return this.objects.has(item) ? this.object(item).name : item;
     }
-  }
-
-  async noteTextSummary(ctx: CallContext, note: ObjRef, rawLimit: number): Promise<Record<string, WooValue>> {
-    // TODO(note-catalog): this substrate helper knows about $note's raw .text
-    // property and :is_readable_by verb. It exists to keep note display
-    // summaries bounded without materializing full note bodies in the Tiny VM;
-    // the catalog-facing contract should remain the overridable
-    // $note:text_summary(limit) verb.
-    if (!this.objects.has(note) || !this.inheritsFrom(note, "$note")) {
-      throw wooError("E_TYPE", `note_text_summary target must be a $note descendant: ${note}`, note);
-    }
-    const readable = await this.dispatch(
-      { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
-      note,
-      "is_readable_by",
-      [ctx.actor]
-    );
-    if (readable !== true) throw wooError("E_PERM", "cannot read note", note);
-
-    const limit = Math.max(0, Math.min(512, Math.floor(rawLimit)));
-    // v0.2 of $note stores .text as a single markdown string (capped at 65536
-    // chars by :set_text/:write). Tolerate the v0.1 list-of-strings shape too
-    // so summary calls during a partial upgrade replay still succeed.
-    const raw = this.object(note).properties.get("text");
-    const text = typeof raw === "string"
-      ? raw
-      : Array.isArray(raw)
-        ? raw.filter((line): line is string => typeof line === "string").join("\n")
-        : "";
-    const newlineIdx = text.indexOf("\n");
-    const first = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
-    let preview = first;
-    let truncated = false;
-    if (preview.length > limit) {
-      preview = limit > 3 ? `${preview.slice(0, limit - 3)}...` : preview.slice(0, limit);
-      truncated = true;
-    }
-    const lines = text.length === 0 ? 0 : text.split(/\r?\n/).length;
-    return { lines, length: text.length, preview, truncated };
   }
 
   // Cross-host-aware display name. The local stub of a remote object
@@ -7679,12 +7738,9 @@ export class WooWorld {
       names.push(`${color} note`, `the ${color} note`, `${color} ${objectName}`, `the ${color} ${objectName}`);
     }
     const text = await this.dispatch({ ...ctx, caller: ctx.thisObj, progr: ctx.actor }, id, "text", []).catch(() => null);
-    if (typeof text === "string") {
-      // Note text is capped at 65536 chars by :set_text/:write, so a per-note
-      // line scan stays bounded; no further trimming needed for matching.
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed) names.push(trimmed);
+    if (Array.isArray(text)) {
+      for (const line of text) {
+        if (typeof line === "string" && line.trim()) names.push(line.trim());
       }
     }
   }

@@ -519,7 +519,7 @@ describe("local catalogs", () => {
     });
     expect(created.op).toBe("applied");
     const task = created.op === "applied" ? String(created.observations[0].task) : "";
-    expect(world.object(task).name).toBe("Source task");
+    expect(world.getProp(task, "title")).toBe("Source task");
     expect(world.isDescendantOf(task, "$note")).toBe(true);
 
     await callInTaskspace(world, session.id, "requirement", {
@@ -704,7 +704,7 @@ describe("local catalogs", () => {
     expect(world.object(pin).owner).toBe(session.actor);
     expect(world.object(pin).location).toBe("the_pinboard");
     expect(world.object("the_pinboard").contents.has(pin)).toBe(true);
-    expect(world.getProp(pin, "text")).toBe("Bring the towel to the hot tub");
+    expect(world.getProp(pin, "text")).toEqual(["Bring the towel to the hot tub"]);
     expect(world.getProp(pin, "color")).toBe("blue");
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     expect(world.getProp("the_pinboard", "layout")).toMatchObject({ [pin]: { x: 12, y: 24, w: 160, h: 88 } });
@@ -712,7 +712,7 @@ describe("local catalogs", () => {
     const listed = await world.directCall("pinboard-list", session.actor, "the_pinboard", "list_notes", []);
     expect(listed.op).toBe("result");
     if (listed.op === "result") {
-      expect(listed.result).toEqual([expect.objectContaining({ id: pin, text: "Bring the towel to the hot tub", color: "blue", owner: session.actor })]);
+      expect(listed.result).toEqual([expect.objectContaining({ id: pin, text: ["Bring the towel to the hot tub"], color: "blue", owner: session.actor })]);
     }
 
     await world.call("pinboard-take", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "take", args: [pin] });
@@ -733,9 +733,9 @@ describe("local catalogs", () => {
     if (deniedEject.op === "applied") expect(deniedEject.observations.find((obs) => obs.type === "$error")?.code).toBe("E_PERM");
 
     await world.call("pinboard-move", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "move_pin", args: [pin, 80, 96] });
-    await world.call("pinboard-edit", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_text", args: ["Towel is ready"] });
+    await world.call("pinboard-edit", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_text", args: [["Towel is ready"]] });
     await world.call("pinboard-color", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_color", args: ["green"] });
-    expect(world.getProp(pin, "text")).toBe("Towel is ready");
+    expect(world.getProp(pin, "text")).toEqual(["Towel is ready"]);
     expect(world.getProp(pin, "color")).toBe("green");
     const clearedColor = await world.call("pinboard-color-white", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_color", args: ["white"] });
     expect(clearedColor.op).toBe("applied");
@@ -863,8 +863,8 @@ describe("local catalogs", () => {
     expect(pins).toHaveLength(2);
     expect(world.object(pins[0]).owner).toBe(session.actor);
     expect(world.object(pins[1]).owner).toBe(world.object("the_pinboard").owner);
-    expect(world.getProp(pins[0], "text")).toBe("Alpha\nBeta");
-    expect(world.getProp(pins[1], "text")).toBe("Missing author");
+    expect(world.getProp(pins[0], "text")).toEqual(["Alpha", "Beta"]);
+    expect(world.getProp(pins[1], "text")).toEqual(["Missing author"]);
     expect(world.getProp(pins[0], "color")).toBe("pink");
     expect(world.getProp(pins[1], "color")).toBeNull();
     expect(world.getProp("the_pinboard", "layout")).toMatchObject({
@@ -877,7 +877,7 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-notes-to-pins");
   });
 
-  it("lets room commands distinguish and inspect notes by body content, color, and name", async () => {
+  it("lets room commands distinguish and inspect duplicate sticky notes by preview title", async () => {
     const world = createWorld();
     const session = world.auth("guest:sticky-room-notes");
     await world.directCall("enter-hot-tub-sticky", session.actor, "the_hot_tub", "enter", []);
@@ -886,30 +886,42 @@ describe("local catalogs", () => {
     world.createObject({ id: "sticky_beta", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
     world.createObject({ id: "sticky_blue", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
     world.createObject({ id: "sticky_secret", name: "private note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
-    world.setProp("sticky_alpha", "text", "another one");
-    world.setProp("sticky_beta", "text", "this is it");
-    world.setProp("sticky_blue", "text", "hello");
+    world.setProp("sticky_alpha", "name", "sticky note");
+    world.setProp("sticky_beta", "name", "sticky note");
+    world.setProp("sticky_blue", "name", "sticky note");
+    world.setProp("sticky_alpha", "text", ["another one"]);
+    world.setProp("sticky_beta", "text", ["this is it"]);
+    world.setProp("sticky_blue", "text", ["hello"]);
     world.setProp("sticky_blue", "color", "blue");
-    world.setProp("sticky_secret", "text", "nuclear codes");
+    world.setProp("sticky_secret", "text", ["nuclear codes"]);
     expect(installVerb(world, "sticky_secret", "is_readable_by", `verb :is_readable_by(actor_obj) rxd {
   return actor_obj == this.owner;
 }`, null).ok).toBe(true);
 
-    // Three pins share the name "sticky note", so a bare name lookup is ambiguous.
+    const look = await world.directCall("look-sticky-alpha", session.actor, "the_hot_tub", "command_plan", ["look sticky note: another one"]);
+    expect(look.op).toBe("result");
+    if (look.op === "result") {
+      expect(look.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "look_at", args: ["sticky_alpha"] });
+    }
+
+    const noteLook = await world.directCall("look-at-sticky-alpha", session.actor, "the_hot_tub", "look_at", ["sticky_alpha"]);
+    expect(noteLook.op).toBe("result");
+    if (noteLook.op === "result") {
+      expect(noteLook.result).toMatchObject({ id: "sticky_alpha", title: "sticky note: another one", location: "the_hot_tub" });
+    }
+
     const ambiguous = await world.directCall("take-sticky-ambiguous", session.actor, "the_hot_tub", "take", ["note"]);
     expect(ambiguous.op).toBe("error");
     if (ambiguous.op === "error") expect(ambiguous.error.code).toBe("E_AMBIGUOUS");
 
-    // The matcher reads each readable note's body line-by-line as match candidates,
-    // so a noun phrase from the body still resolves uniquely.
-    const takeByContainedBody = await world.directCall("take-sticky-alpha", session.actor, "the_hot_tub", "take", ["another"]);
-    expect(takeByContainedBody.op).toBe("result");
+    const takeByContainedPreview = await world.directCall("take-sticky-alpha", session.actor, "the_hot_tub", "take", ["another"]);
+    expect(takeByContainedPreview.op).toBe("result");
     expect(world.object("sticky_alpha").location).toBe(session.actor);
     await world.directCall("drop-sticky-alpha", session.actor, "the_hot_tub", "drop", ["another"]);
     expect(world.object("sticky_alpha").location).toBe("the_hot_tub");
 
-    const takeByBody = await world.directCall("take-sticky-blue-text", session.actor, "the_hot_tub", "take", ["hello"]);
-    expect(takeByBody.op).toBe("result");
+    const takeByText = await world.directCall("take-sticky-blue-text", session.actor, "the_hot_tub", "take", ["hello"]);
+    expect(takeByText.op).toBe("result");
     expect(world.object("sticky_blue").location).toBe(session.actor);
     await world.directCall("drop-sticky-blue", session.actor, "the_hot_tub", "drop", ["the blue note"]);
     expect(world.object("sticky_blue").location).toBe("the_hot_tub");
@@ -919,6 +931,11 @@ describe("local catalogs", () => {
     expect(world.object("sticky_blue").location).toBe(session.actor);
     await world.directCall("drop-sticky-blue-again", session.actor, "the_hot_tub", "drop", ["blue note"]);
     expect(world.object("sticky_blue").location).toBe("the_hot_tub");
+
+    const take = await world.directCall("take-sticky-beta", session.actor, "the_hot_tub", "take", ["sticky note: this is it"]);
+    expect(take.op).toBe("result");
+    expect(world.object("sticky_beta").location).toBe(session.actor);
+    expect(world.object("the_hot_tub").contents.has("sticky_beta")).toBe(false);
 
     const outsider = world.auth("guest:sticky-room-note-outsider");
     await world.directCall("enter-hot-tub-sticky-outsider", outsider.actor, "the_hot_tub", "enter", []);
@@ -936,89 +953,6 @@ describe("local catalogs", () => {
       const err = privateTextTake.observations.find((obs) => obs.type === "$error");
       expect(err?.code).toBe("E_INVARG");
     }
-  });
-
-  it("$note exposes LambdaMOO write/erase facades, an add_writer/rm_writer pair, and bounds text at 65536 chars", async () => {
-    const world = createWorld();
-    const owner = world.auth("guest:note-write-owner");
-    const collaborator = world.auth("guest:note-write-collab");
-    const stranger = world.auth("guest:note-write-stranger");
-    const noteId = "obj_test_note_write";
-    world.createObject({ id: noteId, parent: "$note", owner: owner.actor, location: "the_deck" });
-    await world.directCall("note-write-enter-owner", owner.actor, "the_deck", "enter", []);
-    await world.directCall("note-write-enter-collab", collaborator.actor, "the_deck", "enter", []);
-    await world.directCall("note-write-enter-stranger", stranger.actor, "the_deck", "enter", []);
-    const call = (id: string, sess: { id: string }, actor: string, verb: string, args: WooValue[]) =>
-      world.call(id, sess.id, "the_deck", { actor, target: noteId, verb, args });
-    const observationsError = (frame: { op: "applied"; observations: { type?: string; code?: string }[] } | unknown): string | null => {
-      if (typeof frame !== "object" || frame === null) return null;
-      const f = frame as { op?: string; observations?: { type?: string; code?: string }[] };
-      if (f.op !== "applied") return null;
-      return f.observations?.find((obs) => obs?.type === "$error")?.code ?? null;
-    };
-
-    // :write appends a line; :erase clears; :set_text replaces.
-    const written = await call("note-write-1", owner, owner.actor, "write", ["alpha"]);
-    expect(written.op).toBe("applied");
-    expect(observationsError(written)).toBeNull();
-    expect(world.getProp(noteId, "text")).toBe("alpha");
-    await call("note-write-2", owner, owner.actor, "write", ["beta"]);
-    expect(world.getProp(noteId, "text")).toBe("alpha\nbeta");
-    await call("note-erase", owner, owner.actor, "erase", []);
-    expect(world.getProp(noteId, "text")).toBe("");
-    await call("note-set", owner, owner.actor, "set_text", ["just-one-line"]);
-    expect(world.getProp(noteId, "text")).toBe("just-one-line");
-
-    // The 65536-char cap rejects oversize text on both :set_text and :write.
-    const huge = "x".repeat(70_000);
-    const oversize = await call("note-set-huge", owner, owner.actor, "set_text", [huge]);
-    expect(observationsError(oversize)).toBe("E_INVARG");
-    expect(world.getProp(noteId, "text")).toBe("just-one-line");
-    await call("note-fill", owner, owner.actor, "set_text", ["x".repeat(60_000)]);
-    const overflowAppend = await call("note-write-overflow", owner, owner.actor, "write", ["y".repeat(10_000)]);
-    expect(observationsError(overflowAppend)).toBe("E_INVARG");
-    expect(world.getProp(noteId, "text")).toBe("x".repeat(60_000));
-
-    // Writers list management is owner-or-wizard gated.
-    expect(world.getProp(noteId, "writers")).toEqual([]);
-    const denied = await call("note-add-writer-denied", stranger, stranger.actor, "add_writer", [collaborator.actor]);
-    expect(observationsError(denied)).toBe("E_PERM");
-    const added = await call("note-add-writer", owner, owner.actor, "add_writer", [collaborator.actor]);
-    expect(observationsError(added)).toBeNull();
-    expect(world.getProp(noteId, "writers")).toEqual([collaborator.actor]);
-    // Idempotent: re-adding is a no-op (and still returns the writers list).
-    const added2 = await call("note-add-writer-2", owner, owner.actor, "add_writer", [collaborator.actor]);
-    expect(observationsError(added2)).toBeNull();
-    expect(world.getProp(noteId, "writers")).toEqual([collaborator.actor]);
-    // The collaborator can now write through :is_writable_by.
-    await call("note-collab-write", collaborator, collaborator.actor, "write", ["from-collab"]);
-    expect(world.getProp(noteId, "text")).toBe("x".repeat(60_000) + "\nfrom-collab");
-    // Strangers still cannot.
-    const strangerWrite = await call("note-stranger-write", stranger, stranger.actor, "write", ["nope"]);
-    expect(observationsError(strangerWrite)).toBe("E_PERM");
-    // rm_writer removes the writer; the collaborator can no longer write.
-    await call("note-rm-writer", owner, owner.actor, "rm_writer", [collaborator.actor]);
-    expect(world.getProp(noteId, "writers")).toEqual([]);
-    const collabBlocked = await call("note-collab-blocked", collaborator, collaborator.actor, "write", ["x"]);
-    expect(observationsError(collabBlocked)).toBe("E_PERM");
-  });
-
-  it("$note v0.2 boot migration converts list<str> text values to a joined string", () => {
-    const world = createWorld();
-    // Pretend an upgraded world with a $note-descended pin carrying v0.1 shape
-    // text and the new migration tag missing.
-    const migrations = (world.getProp("$system", "applied_migrations") as string[]).filter(
-      (id) => id !== "2026-05-06-note-text-string-shape"
-    );
-    world.setProp("$system", "applied_migrations", migrations);
-    const noteId = "obj_test_v01_note";
-    world.createObject({ id: noteId, parent: "$pin", owner: "$wiz", location: "the_pinboard" });
-    world.setProp(noteId, "text", ["line one", "line two", "line three"] as unknown as WooValue);
-
-    installLocalCatalogs(world, ["pinboard"]);
-
-    expect(world.getProp(noteId, "text")).toBe("line one\nline two\nline three");
-    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-06-note-text-string-shape");
   });
 
   it("repairs stale pinboard v0.1 source and leftover note records", () => {
@@ -1042,7 +976,7 @@ describe("local catalogs", () => {
     expect(world.ownVerbExact("$pinboard", "list_notes")?.source).toContain("contents(this)");
     const pins = Array.from(world.object("the_pinboard").contents).filter((id) => world.isDescendantOf(id, "$pin"));
     expect(pins).toHaveLength(1);
-    expect(world.getProp(pins[0], "text")).toBe("hello");
+    expect(world.getProp(pins[0], "text")).toEqual(["hello"]);
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-v02-repair");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-v02-data-repair");
@@ -1157,7 +1091,7 @@ describe("local catalogs", () => {
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     const pins = Array.from(world.object("the_pinboard").contents).filter((id) => world.isDescendantOf(id, "$pin"));
     expect(pins).toHaveLength(1);
-    expect(world.getProp(pins[0], "text")).toBe("real legacy");
+    expect(world.getProp(pins[0], "text")).toEqual(["real legacy"]);
     expect(world.getProp(pins[0], "color")).toBe("blue");
     const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
     expect(records).toContainEqual(expect.objectContaining({
@@ -2937,25 +2871,23 @@ describe("local catalogs", () => {
       if (next.op !== "result") return;
       expect(next.result).toMatchObject({ order_id: orderResult.order_id, requester, request: "scorpio" });
 
-      // 3. Plug delivers — note lands in requester's inventory with name + body.
-      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "Today's horoscope: avoid llamas."]);
+      // 3. Plug delivers — note lands in requester's inventory.
+      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Today's horoscope: avoid llamas."]);
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const dRes = delivered.result as { delivered: boolean; note: string; text: string };
       expect(dRes.delivered).toBe(true);
-      expect(dRes.text).toContain("delivers a note to your inventory");
+      expect(dRes.text).toContain("hands you a note");
       expect(world.object(dRes.note).location).toBe(requester);
-      expect(world.object(dRes.note).name).toBe("Horoscope: Scorpio");
-      expect(world.getProp(dRes.note, "text")).toBe("Today's horoscope: avoid llamas.");
       expect(world.getProp(dRes.note, "produced_by")).toBe(blockId);
       expect(delivered.observations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("delivers a note to your inventory") }),
-        expect.objectContaining({ type: "delivered", block: blockId, requester, note: dRes.note, text: expect.stringContaining("delivers a note to your inventory") })
+        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("hands you a note") }),
+        expect.objectContaining({ type: "delivered", block: blockId, requester, note: dRes.note, text: expect.stringContaining("hands you a note") })
       ]));
       expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
 
       // 4. Idempotent re-deliver returns delivered:false.
-      const redeliver = await world.directCall("disp-redeliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "again"]);
+      const redeliver = await world.directCall("disp-redeliver", blockId, blockId, "deliver", [orderResult.order_id, "again"]);
       expect(redeliver.op).toBe("result");
       if (redeliver.op === "result") {
         const r = redeliver.result as { delivered: boolean; reason: string };
@@ -2969,7 +2901,7 @@ describe("local catalogs", () => {
       expect(order2.op).toBe("result");
       if (order2.op !== "result") return;
       const strangerOrderId = (order2.result as { order_id: string }).order_id;
-      const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "Horoscope: Leo", "haha"]);
+      const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "haha"]);
       expect(strangerDeliver.op).toBe("error");
       if (strangerDeliver.op === "error") expect(strangerDeliver.error.code).toBe("E_PERM");
     });
@@ -3200,21 +3132,20 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "writable_owner")).toEqual(["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"]);
 
       // Plug-as-block delivers; note arrives in requester inventory with back-references.
-      const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Scorpio", "Today the stars suggest sandwiches."]);
+      const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Today the stars suggest sandwiches."]);
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
-      expect(delivered.result).toMatchObject({ text: expect.stringContaining("delivers a note to your inventory") });
+      expect(delivered.result).toMatchObject({ text: expect.stringContaining("hands you a note") });
       expect(world.object(noteId).location).toBe(requester);
-      expect(world.object(noteId).name).toBe("Horoscope: Scorpio");
       expect(world.getProp(noteId, "produced_by")).toBe(blockId);
-      expect(world.getProp(noteId, "text")).toBe("Today the stars suggest sandwiches.");
+      expect(world.getProp(noteId, "text")).toEqual(["Today the stars suggest sandwiches."]);
       expect(delivered.observations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("delivers a note to your inventory") })
+        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("hands you a note") })
       ]));
     });
 
-    it("$dispensed_note rejects oversize text at the producer rather than rendering an unbounded inventory line", async () => {
+    it("$dispensed_note keeps inventory display bounded for long single-line bodies", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["horoscope"]);
       const roomId = "obj_test_horo_long_room";
@@ -3229,76 +3160,160 @@ describe("local catalogs", () => {
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
-      // v0.2 caps $note.text at 65536 chars in :set_text. The dispenser
-      // routes text through that verb, so an oversize body fails at the
-      // producer instead of leaking into the requester's inventory.
-      const huge = "Gemini ".repeat(180_000);
-      const delivered = await world.directCall("horo-long-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Gemini", huge]);
-      expect(delivered.op).toBe("error");
-      if (delivered.op === "error") expect(delivered.error.code).toBe("E_INVARG");
-      // No note minted; inventory stays clean.
+      const body = "Gemini ".repeat(180_000);
+      const delivered = await world.directCall("horo-long-deliver", blockId, blockId, "deliver", [orderId, body]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+      expect(world.getProp(noteId, "text")).toEqual([body]);
+
       const inventory = await world.directCall("horo-long-inventory", requester, requester, "inventory", []);
       expect(inventory.op).toBe("result");
       if (inventory.op !== "result") return;
       const result = inventory.result as { items: Array<{ id: string; title: string }>; text: string };
-      expect(result.items).toEqual([]);
+      expect(result.items).toEqual([
+        expect.objectContaining({ id: noteId, title: expect.stringMatching(/^obj_obj_test_horo_long_room_\d+: Gemini /) })
+      ]);
+      expect(result.items[0].title.length).toBeLessThanOrEqual(140);
+      expect(result.text.length).toBeLessThanOrEqual(170);
+      expect(inventory.observations[0]).toMatchObject({
+        type: "text",
+        target: requester,
+        text: result.text
+      });
     });
 
-    it("$note text_summary is overridable, and look_self honours the override", async () => {
+    it("$note title and look use the overridable bounded text summary", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["note"]);
       const requester = world.auth("guest:redacted-note-reader").actor;
       const noteClass = "obj_test_redacted_note_class";
       world.createObject({ id: noteClass, name: "$redacted_note", parent: "$note", owner: "$wiz", location: null });
       expect(installVerb(world, noteClass, "text_summary", `verb :text_summary(limit) rxd {
-        return { lines: 7, length: 0, preview: "REDACTED", truncated: true };
+        return { lines: 7, preview: "REDACTED", truncated: true };
       }`, null).ok).toBe(true);
 
       const noteId = "obj_test_redacted_note";
+      const body = "secret ".repeat(20_000);
       world.createObject({ id: noteId, name: "Private note", parent: noteClass, owner: "$wiz", location: requester });
-      world.setProp(noteId, "text", "secret ".repeat(20_000));
+      world.setProp(noteId, "text", [body]);
 
-      // The override wins for any direct caller of :text_summary.
-      const summary = await world.directCall("redacted-note-summary", requester, noteId, "text_summary", [96]);
-      expect(summary.op).toBe("result");
-      if (summary.op === "result") {
-        expect(summary.result).toMatchObject({ lines: 7, preview: "REDACTED", truncated: true });
-      }
+      const inventory = await world.directCall("redacted-note-inventory", requester, requester, "inventory", []);
+      expect(inventory.op).toBe("result");
+      if (inventory.op !== "result") return;
+      const inventoryResult = inventory.result as { items: Array<{ id: string; title: string }>; text: string };
+      expect(inventoryResult.items).toEqual([
+        expect.objectContaining({ id: noteId, title: "obj_test_redacted_note: REDACTED" })
+      ]);
+      expect(inventoryResult.text).toContain("obj_test_redacted_note: REDACTED");
+      expect(inventoryResult.text).not.toContain("secret");
 
-      // look_self routes through :text_summary for text_length, so a redacted
-      // override surfaces 0 instead of the raw secret length.
       const looked = await world.directCall("redacted-note-look", requester, noteId, "look_self", []);
       expect(looked.op).toBe("result");
-      if (looked.op === "result") {
-        expect(looked.result).toMatchObject({
-          id: noteId,
-          title: "Private note",
-          text_length: 0
-        });
-      }
+      if (looked.op !== "result") return;
+      expect(looked.result).toMatchObject({
+        id: noteId,
+        title: "obj_test_redacted_note: REDACTED",
+        lines: 7
+      });
     });
 
-    it("note_text_summary rejects non-note objects before reading raw private text", async () => {
+    it("dispatch with max_chars raises E_TOOBIG on oversize string returns and passes through within bound", async () => {
       const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["note"]);
-      const requester = world.auth("guest:note-summary-probe").actor;
-      const nonNoteId = "obj_test_not_a_note_with_text";
-      world.createObject({ id: nonNoteId, name: "Not a note", parent: "$thing", owner: "$wiz", location: requester });
-      world.defineProperty(nonNoteId, { name: "text", defaultValue: "", owner: "$wiz", perms: "", typeHint: "str" });
-      world.setProp(nonNoteId, "text", "private text that must not leak");
-      expect(installVerb(world, nonNoteId, "is_readable_by", `verb :is_readable_by(actor_obj) rxd {
-        return true;
+      const actor = world.auth("guest:bounded-dispatch").actor;
+      const target = "obj_test_bounded_dispatch_target";
+      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
+      expect(installVerb(world, target, "long_string", `verb :long_string() rxd {
+        let s = "";
+        let i = 0;
+        while (i < 200) { s = s + "abcdefghij"; i = i + 1; }
+        return s;
       }`, null).ok).toBe(true);
-      expect(installVerb(world, requester, "probe_note_summary", `verb :probe_note_summary(obj) rxd {
-        return note_text_summary(obj, 512);
+      expect(installVerb(world, target, "short_string", `verb :short_string() rxd { return "ok"; }`, null).ok).toBe(true);
+      expect(installVerb(world, target, "structured", `verb :structured() rxd { return { kind: "map", n: 1 }; }`, null).ok).toBe(true);
+
+      expect(installVerb(world, actor, "probe_oversize", `verb :probe_oversize() rxd {
+        return dispatch(this:get_target(), "long_string", [], null, 96);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_within", `verb :probe_within() rxd {
+        return dispatch(this:get_target(), "short_string", [], null, 96);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_nonstring", `verb :probe_nonstring() rxd {
+        return dispatch(this:get_target(), "structured", [], null, 8);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
+
+      const oversize = await world.directCall("bounded-dispatch-oversize", actor, actor, "probe_oversize", []);
+      expect(oversize.op).toBe("error");
+      if (oversize.op === "error") expect(oversize.error.code).toBe("E_TOOBIG");
+
+      const within = await world.directCall("bounded-dispatch-within", actor, actor, "probe_within", []);
+      expect(within.op).toBe("result");
+      if (within.op === "result") expect(within.result).toBe("ok");
+
+      const nonstring = await world.directCall("bounded-dispatch-nonstring", actor, actor, "probe_nonstring", []);
+      expect(nonstring.op).toBe("result");
+      if (nonstring.op === "result") expect(nonstring.result).toEqual({ kind: "map", n: 1 });
+    });
+
+    it("dispatch max_chars edge cases: zero, negative, and target-in-error", async () => {
+      const world = createWorld({ catalogs: false });
+      const actor = world.auth("guest:bounded-dispatch-edges").actor;
+      const target = "obj_test_bounded_dispatch_edges_target";
+      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
+      expect(installVerb(world, target, "empty", `verb :empty() rxd { return ""; }`, null).ok).toBe(true);
+      expect(installVerb(world, target, "one", `verb :one() rxd { return "x"; }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_zero_empty", `verb :probe_zero_empty() rxd {
+        return dispatch(this:get_target(), "empty", [], null, 0);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_zero_nonempty", `verb :probe_zero_nonempty() rxd {
+        return dispatch(this:get_target(), "one", [], null, 0);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_negative", `verb :probe_negative() rxd {
+        return dispatch(this:get_target(), "empty", [], null, -1);
       }`, null).ok).toBe(true);
 
-      const result = await world.directCall("note-summary-nonnote", requester, requester, "probe_note_summary", [nonNoteId]);
-      expect(result.op).toBe("error");
-      if (result.op === "error") {
-        expect(result.error.code).toBe("E_TYPE");
-        expect(result.error.message).toContain("$note descendant");
+      const zeroEmpty = await world.directCall("bounded-edge-zero-empty", actor, actor, "probe_zero_empty", []);
+      expect(zeroEmpty.op).toBe("result");
+      if (zeroEmpty.op === "result") expect(zeroEmpty.result).toBe("");
+
+      const zeroNonempty = await world.directCall("bounded-edge-zero-nonempty", actor, actor, "probe_zero_nonempty", []);
+      expect(zeroNonempty.op).toBe("error");
+      if (zeroNonempty.op === "error") {
+        expect(zeroNonempty.error.code).toBe("E_TOOBIG");
+        expect(zeroNonempty.error.value).toMatchObject({ target, verb: "one", size: 1, max: 0 });
       }
+
+      const negative = await world.directCall("bounded-edge-negative", actor, actor, "probe_negative", []);
+      expect(negative.op).toBe("error");
+      if (negative.op === "error") expect(negative.error.code).toBe("E_INVARG");
+    });
+
+    it("inventory bounds :title() returns and falls back when the verb exceeds max_chars", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat"]);
+      const actor = world.auth("guest:title-overflow").actor;
+      const itemId = "obj_test_title_overflow_item";
+      world.createObject({ id: itemId, name: "thing-with-name", parent: "$thing", owner: "$wiz", location: actor });
+      // A :title() verb that returns ~2KB — beyond the 1024-char titleForLook cap.
+      expect(installVerb(world, itemId, "title", `verb :title() rxd {
+        let s = "";
+        let i = 0;
+        while (i < 200) { s = s + "abcdefghij"; i = i + 1; }
+        return s;
+      }`, null).ok).toBe(true);
+
+      const inv = await world.directCall("title-overflow-inventory", actor, actor, "inventory", []);
+      expect(inv.op).toBe("result");
+      if (inv.op !== "result") return;
+      const result = inv.result as { items: Array<{ id: string; title: string }> };
+      const entry = result.items.find((c) => c.id === itemId);
+      expect(entry).toBeDefined();
+      // The 2KB :title() return must not flow into composition. The inventory
+      // verb's fallback for an erroring :title() is `to_string(item)`, the id.
+      expect(entry?.title.length).toBeLessThan(200);
+      expect(entry?.title).not.toContain("abcdefghij");
     });
 
     it("$weather_block installs cleanly and ships the configured tier lists", async () => {
