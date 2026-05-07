@@ -704,6 +704,54 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(deckLook.body.result).toMatchObject({
         contents: expect.arrayContaining([expect.objectContaining({ id: "the_horoscope" })])
       });
+
+      const gateway = wooObjects.get("world") as any;
+      expect(gateway).toBeTruthy();
+      const gatewayWorld = await gateway.getWorld("world") as WooWorld;
+      const horoscopeRoute = gatewayWorld.objectRoutes().find((route) => route.id === "the_horoscope");
+      expect(horoscopeRoute).toMatchObject({ host: "the_deck" });
+      gateway.routeCache.set("the_horoscope", "world");
+      gateway.publishedRoutes.set("the_horoscope", "world");
+      const repairedHost = await gateway.resolveObjectHost("the_horoscope" as ObjRef, "world");
+      expect(repairedHost).toBe("the_deck");
+      expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
+      expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
+      gateway.routeCache.set("the_horoscope", "world");
+      gateway.publishedRoutes.set("the_horoscope", "world");
+      const bridgeHost = await (gatewayWorld as any).hostBridge.hostForObject("the_horoscope" as ObjRef);
+      expect(bridgeHost).toBe("the_deck");
+      expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
+      expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
+      const originalRegisterRoutes = gateway.registerRoutes.bind(gateway);
+      gateway.routeCache.delete("the_horoscope");
+      gateway.publishedRoutes.delete("the_horoscope");
+      gateway.registerRoutes = async () => false;
+      try {
+        const localHost = await gateway.resolveObjectHost("the_horoscope" as ObjRef, "world");
+        expect(localHost).toBe("the_deck");
+        expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
+        expect(gateway.publishedRoutes.has("the_horoscope")).toBe(false);
+      } finally {
+        gateway.registerRoutes = originalRegisterRoutes;
+      }
+
+      const order = await post("/api/objects/the_horoscope/calls/order", { args: ["gemini"] }, session);
+      expect(order.status).toBe(200);
+      const orderId = String((order.body.result as { order_id: string }).order_id);
+      const wizardAuth = await post("/api/auth", { token: "wizard:cf-smoke-token" });
+      expect(wizardAuth.status).toBe(200);
+      const wizardSession = String(wizardAuth.body.session);
+      const deliver = await post("/api/objects/the_horoscope/calls/deliver", { args: [orderId, "The stars prefer bounded route tables."] }, wizardSession);
+      expect(deliver.status).toBe(200);
+      const deliveredNote = String((deliver.body.result as { note: string }).note);
+      const lookDeliveredNote = await post("/api/objects/the_deck/calls/look_at", {
+        id: "cf-look-delivered-note",
+        space: "the_deck",
+        args: [deliveredNote]
+      }, session);
+      expect(lookDeliveredNote.status).toBe(200);
+      expect(lookDeliveredNote.body.result).toMatchObject({ id: deliveredNote });
+
       const deckState = await worker.fetch(new Request("https://woo.test/api/me", {
         headers: { authorization: `Session ${session}` }
       }), env, {});

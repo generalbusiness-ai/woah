@@ -474,7 +474,10 @@ export class PersistentObjectDO {
   }
 
   private async registerObjectRoutes(world: WooWorld): Promise<void> {
-    if (this.routesRegistered) return;
+    if (this.routesRegistered) {
+      await this.registerIncrementalObjectRoutes(world);
+      return;
+    }
     const ok = await this.registerRoutes(world.objectRoutes());
     if (ok) this.routesRegistered = true;
   }
@@ -482,6 +485,45 @@ export class PersistentObjectDO {
   private async registerIncrementalObjectRoutes(world: WooWorld): Promise<void> {
     const routes = world.objectRoutes().filter((route) => this.publishedRoutes.get(route.id) !== route.host);
     await this.registerRoutes(routes);
+  }
+
+  private localObjectRoute(world: WooWorld | null | undefined, id: ObjRef): { id: ObjRef; host: string; anchor: ObjRef | null } | null {
+    return world?.objectRoutes().find((route) => route.id === id) ?? null;
+  }
+
+  private async adoptLocalObjectRoute(route: { id: ObjRef; host: string; anchor: ObjRef | null }): Promise<string> {
+    if (this.publishedRoutes.get(route.id) !== route.host) {
+      const ok = await this.registerRoutes([route]);
+      if (!ok) this.routeCache.set(route.id, route.host);
+    } else {
+      this.routeCache.set(route.id, route.host);
+    }
+    return route.host;
+  }
+
+  private async resolveObjectHostForWorld(world: WooWorld | null | undefined, id: ObjRef, fallbackHost: string): Promise<string> {
+    const localRoute = this.localObjectRoute(world, id);
+    const cached = this.routeCache.get(id);
+    if (cached) {
+      if (localRoute && localRoute.host !== cached) return await this.adoptLocalObjectRoute(localRoute);
+      return cached;
+    }
+    if (localRoute) return await this.adoptLocalObjectRoute(localRoute);
+    try {
+      const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/resolve-object`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ id, fallback_host: fallbackHost })
+      }));
+      const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
+      const body = await response.json() as Record<string, unknown>;
+      const host = typeof body.host === "string" ? body.host : fallbackHost;
+      this.routeCache.set(id, host);
+      return host;
+    } catch {
+      return fallbackHost;
+    }
   }
 
   private async registerRoutes(routes: Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>): Promise<boolean> {
@@ -509,15 +551,7 @@ export class PersistentObjectDO {
 
   private installHostBridge(world: WooWorld, localHost: string): void {
     const hostForObjectUncached = async (id: ObjRef): Promise<string | null> => {
-      const cached = this.routeCache.get(id);
-      if (cached) return cached;
-      const route = world.objectRoutes().find((item) => item.id === id);
-      if (route) {
-        this.routeCache.set(id, route.host);
-        return route.host;
-      }
-      if (localHost === WORLD_HOST && world.objects.has(id)) return localHost;
-      const resolved = await this.resolveObjectHost(id, "");
+      const resolved = await this.resolveObjectHostForWorld(world, id, "");
       return resolved || null;
     };
     const hostForObject = async (id: ObjRef, memo?: HostOperationMemo): Promise<string | null> => {
@@ -1781,23 +1815,7 @@ export class PersistentObjectDO {
   }
 
   private async resolveObjectHost(id: ObjRef, fallbackHost: string): Promise<string> {
-    const cached = this.routeCache.get(id);
-    if (cached) return cached;
-    try {
-      const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
-      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/resolve-object`, {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ id, fallback_host: fallbackHost })
-      }));
-      const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
-      const body = await response.json() as Record<string, unknown>;
-      const host = typeof body.host === "string" ? body.host : fallbackHost;
-      this.routeCache.set(id, host);
-      return host;
-    } catch {
-      return fallbackHost;
-    }
+    return await this.resolveObjectHostForWorld(this.world, id, fallbackHost);
   }
 
   private async forwardWsCall(
