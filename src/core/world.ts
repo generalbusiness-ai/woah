@@ -6593,17 +6593,26 @@ export class WooWorld {
     this.lastSubscriberScrubAt.set(space, now);
     let survivingActors = subscribers;
     if (subscribers.length > 0) {
-      const remoteActors: ObjRef[] = [];
+      const remoteActorsSet = new Set<ObjRef>();
       for (const actor of subscribers) {
-        if (await this.remoteHostForObject(actor, memo)) remoteActors.push(actor);
+        if (await this.remoteHostForObject(actor, memo)) remoteActorsSet.add(actor);
       }
-      const remoteLocationsByActor = await this.fetchRemoteSessionLocations(remoteActors, memo);
+      const remoteLocationsByActor = await this.fetchRemoteSessionLocations(
+        Array.from(remoteActorsSet),
+        memo
+      );
       const kept: ObjRef[] = [];
       const stale: ObjRef[] = [];
       for (const actor of subscribers) {
+        // A remote actor whose home host failed to answer (read-availability
+        // error) is left in `subscribers` and excluded from this read's
+        // survivingActors view, mirroring the per-actor path's behavior
+        // under the same error class. Without this guard a transient remote
+        // blip would mark the actor stale and persist a subscriber-row drop.
+        if (remoteActorsSet.has(actor) && !remoteLocationsByActor.has(actor)) continue;
         const localLocations = this.allLocationsForActor(actor);
-        const remoteLocations = remoteLocationsByActor.get(actor);
-        const locations = remoteLocations
+        const remoteLocations = remoteLocationsByActor.get(actor) ?? [];
+        const locations = remoteActorsSet.has(actor)
           ? Array.from(new Set([...localLocations, ...remoteLocations]))
           : localLocations;
         if (locations.includes(space)) kept.push(actor);
