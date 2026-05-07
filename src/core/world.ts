@@ -3177,6 +3177,15 @@ export class WooWorld {
       if (anchor) this.object(anchor);
       const progr = options.progr ?? owner;
       this.assertCanCreateObject(progr, parent, owner);
+      // Self-hosted instances cannot be anchored. Per
+      // spec/semantics/objects.md §4.1, combining `instances_self_host = true`
+      // with a non-null anchor would route the instance to its own DO (rule 1)
+      // while declaring it a member of another cluster, breaking
+      // co-residency. The recycle anchored-descendants check (recycle.md
+      // §RC3 pre-flight A3) relies on this.
+      if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
+        throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
+      }
       const location = options.location ?? null;
       if (location) this.object(location);
       const scope = runtimeObjectScope(anchor ?? parent);
@@ -3699,6 +3708,11 @@ export class WooWorld {
     this.object(parent);
     this.object(owner);
     if (anchor) this.object(anchor);
+    // Mirror the createRuntimeObject self-host/anchor rejection. See
+    // spec/semantics/objects.md §4.1.
+    if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
+      throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
+    }
     const scope = runtimeObjectScope(anchor ?? parent);
     let id: ObjRef;
     do {
