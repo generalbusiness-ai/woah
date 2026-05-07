@@ -25,15 +25,21 @@ deliberate woo changes are flagged inline:
   null location sentinel. Woo's universal seed `$nowhere` is a real object that
   can carry recycled-content semantics (see `bootstrap.md §B2.15`).
 
-**Implementation status (2026-05-06).** The current runtime implements only the
-parent/location bookkeeping (RC3 steps 5, 6) and storage row deletion (RC3 step
-8), with a hard refusal of non-empty objects in the builder wrapper (§RC3a).
-The `:recycle` dispatch (§RC4), parked-task kill (RC3 step 2), child grafting
-(RC3 step 3), contents displacement (RC3 step 4), verb-cache invalidation
-(RC3 step 7), ULID tombstoning (RC3 step 9), `$system.recycle_tick_budget`, and
-`wiz:force_recycle` (§RC6.1) are not yet implemented. The current code also
-gates `recycle()` on a non-LambdaMOO `obj.flags.recyclable` flag; this spec
-removes that gate (§RC2), and the implementation pass will drop the flag.
+**Implementation status (2026-05-07).** The host-local path is implemented:
+pre-flight A1–A4 checks, `:recycle` dispatch (§RC4), parked-task kill (RC3
+step 2), child grafting (RC3 step 3), contents displacement to `$nowhere`
+(RC3 step 4), parent/location chain bookkeeping (steps 5, 6), lazy
+verb/ancestor cache invalidation on dispatch-time tombstone hits (step 7),
+storage-row deletion (step 8), ULID tombstoning persisted across hosts
+(step 9), the builder safety wrapper (§RC3a), and `wiz:force_recycle`
+(§RC6.1). The non-LambdaMOO `obj.flags.recyclable` gate has been removed.
+Status remains `partial` because `$system.recycle_tick_budget` and the
+cross-host steps in §RC3.1 / §RC10 (cluster co-location enforcement when
+the cluster spans hosts, fire-after-commit Directory reconciliation, and
+remote tombstone gossip) are deferred to the post-v1 multi-host pass. The
+in-host bridge wired in v1 returns `false` for unreachable peers, so a
+stale ref to an object on an offline host currently dereferences as live
+until that host is reachable again.
 
 ---
 

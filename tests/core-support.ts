@@ -216,6 +216,14 @@ export class LocalHostBridge implements HostBridge {
     return this.worldFor(objRef).object(objRef).location;
   }
 
+  async isRecycled(objRef: ObjRef): Promise<boolean> {
+    try {
+      return this.worldFor(objRef).isRecycled(objRef);
+    } catch {
+      return false;
+    }
+  }
+
   async isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
     const key = `isa:${objRef}:${ancestorRef}`;
     const read = async () => {

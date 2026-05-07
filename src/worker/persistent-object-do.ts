@@ -793,6 +793,28 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `isa:${objRef}:${ancestorRef}`, read);
         return await read();
       },
+      isRecycled: async (objRef, memo) => {
+        // Per spec/semantics/recycle.md §RC5 and
+        // spec/reference/persistence.md §14.2.1, tombstones live on the
+        // owning host. When `objRef` lives elsewhere, ask that host's
+        // local tombstone table; otherwise consult the local set.
+        const read = async (): Promise<boolean> => {
+          const host = await hostForObject(objRef, memo);
+          if (!host || host === localHost) return world.isRecycled(objRef);
+          try {
+            const response = await this.forwardInternalReadChecked<{ result: boolean }>(
+              host,
+              "/__internal/remote-is-recycled",
+              { obj: objRef }
+            );
+            return response.result === true;
+          } catch {
+            return false;
+          }
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `is-recycled:${objRef}`, read);
+        return await read();
+      },
       location: async (objRef, memo) => {
         const read = async (): Promise<ObjRef | null> => {
           const host = await hostForObject(objRef, memo);
@@ -1407,6 +1429,11 @@ export class PersistentObjectDO {
         const obj = String(body.obj ?? "") as ObjRef;
         const ancestor = String(body.ancestor ?? "") as ObjRef;
         return jsonResponse({ result: world.isDescendantOf(obj, ancestor) });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/remote-is-recycled") {
+        const obj = String(body.obj ?? "") as ObjRef;
+        return jsonResponse({ result: world.isRecycled(obj) });
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-location") {

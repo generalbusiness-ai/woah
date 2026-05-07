@@ -925,7 +925,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       }
       case "is_recycled": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_recycled expects one object");
-        return frame.ctx.world.isRecycled(assertObj(builtinArgs[0]));
+        return await frame.ctx.world.isRecycledChecked(assertObj(builtinArgs[0]), frame.ctx.hostMemo);
       }
       case "directory_reconcile_corenames": {
         // Wizard-only janitor that walks $system's own properties and

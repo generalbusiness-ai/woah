@@ -144,6 +144,12 @@ export type HostBridge = {
   resolveVerb?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary | null>;
   commandVerbCandidates?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary[]>;
   isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
+  /** Probe the owning host's tombstone table. Optional — hosts that don't
+   * yet expose a tombstone probe return false (matching the previous
+   * local-only behavior). Per spec/semantics/recycle.md §RC5 and
+   * spec/reference/persistence.md §14.2.1: each tombstone lives on the
+   * owning host, so cross-host stale-ref answers must come from there. */
+  isRecycled?(objRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
   dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
   moveObject(objRef: ObjRef, targetRef: ObjRef, options?: { suppressMirrorHost?: string | null }): Promise<MoveObjectResult>;
@@ -405,6 +411,7 @@ export class WooWorld {
     this.deletedSessions.clear();
     this.dirtyTasks.clear();
     this.deletedTasks.clear();
+    this.dirtyTombstones.clear();
     this.dirtyCounters = false;
     this.persistenceDirty = false;
   }
@@ -532,12 +539,38 @@ export class WooWorld {
   }
 
   /**
-   * True if `id` was recycled. Distinct from "never existed": a never-existed
-   * id returns false. Per spec/semantics/recycle.md §RC5 and the
-   * `is_recycled()` builtin contract.
+   * Synchronous local tombstone lookup. Use isRecycledChecked for the
+   * host-transparent version. Returns true for ULIDs tombstoned on this
+   * host; for ULIDs owned by a remote host, this returns the local view
+   * only (which may be false even if the remote has tombstoned the id).
    */
   isRecycled(id: ObjRef): boolean {
     return this.tombstones.has(id);
+  }
+
+  /**
+   * Host-transparent tombstone probe. Per spec/semantics/recycle.md §RC5
+   * and spec/reference/persistence.md §14.2.1, tombstones live on the
+   * owning host. For an id owned by another host, ask the bridge; for a
+   * local id, consult the local set.
+   *
+   * Returns false (rather than raising) for a never-existed id: the
+   * is_recycled() builtin distinguishes "recycled" from "never existed",
+   * so callers expect false in the never-existed case.
+   */
+  async isRecycledChecked(id: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
+    if (this.tombstones.has(id)) return true;
+    const remoteHost = await this.remoteHostForObject(id, memo);
+    if (remoteHost && this.hostBridge?.isRecycled) {
+      try {
+        return await this.hostBridge.isRecycled(id, memo);
+      } catch {
+        // Best-effort: if the remote host is unreachable, fall back to
+        // the local answer (false). The caller can re-probe.
+        return false;
+      }
+    }
+    return false;
   }
 
   /**
