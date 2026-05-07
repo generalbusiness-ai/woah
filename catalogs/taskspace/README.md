@@ -1,9 +1,9 @@
 ---
 name: taskspace
-version: 0.2.0
+version: 0.3.0
 spec_version: v1
 license: MIT
-description: Hierarchical task coordination demo.
+description: Hierarchical task coordination demo. Tasks are $note descendants — name is the listing identity, text is the markdown description.
 depends:
   - @local:chat
   - @local:note

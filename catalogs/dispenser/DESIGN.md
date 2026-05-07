@@ -13,9 +13,13 @@ A `$dispenser_block` decouples the request from the work:
    to a directed `text` wakeup hint emitted by `:order` (best-effort).
    It calls `:next_pending()` to read the oldest record.
 3. The plug processes the request *outside woo* (LLM, API call,
-   compute) and calls `:deliver(order_id, body)`. The verb removes the
-   entry, creates a `$dispensed_note` with the body, and moves it to
-   the requester's inventory.
+   compute) and calls `:deliver(order_id, name, text)`. The plug
+   supplies the `name` (the inventory listing label, e.g.
+   `"Horoscope: Capricorn"`) and the `text` (markdown content). The
+   verb removes the entry, creates a `$dispensed_note` owned by the
+   block with that name, calls `:set_text(text)` to write the markdown
+   payload (subject to the 65536-char cap on `$note.text`), and moves the
+   note to the requester's inventory.
 4. The requester sees the note arrive — that's the visible delivery.
    The requester also receives a direct text observation; the room sees a
    sequenced `delivered` observation for bystanders.
@@ -34,11 +38,34 @@ is delivered as an artifact rather than a return value.
 
 ## Idempotency
 
-`:deliver(order_id, ...)` is keyed on `order_id`. If the plug retries
-after a partial failure (network error after the deliver landed), the
-second call returns
+`:deliver(order_id, name, text)` is keyed on `order_id`. If the plug
+retries after a partial failure (network error after the deliver
+landed), the second call returns
 `{order_id, delivered: false, reason: "unknown_or_already_delivered"}`
 rather than producing a duplicate note.
+
+## Why the plug supplies `name`
+
+LambdaMOO's `$note` keeps three slots — `name` (listing identity),
+`description` (cosmetic look-at flavour), and `text` (the readable
+content) — and they never mix. v0.1 of this catalog dispensed notes
+whose `name` was unset and whose body was injected as a single `text`
+list-line, so the inherited title heuristic concatenated
+`name + ": " + text[1]` and the entire horoscope rendered into the
+inventory listing.
+
+v0.2 hands name responsibility to the producer. The plug knows the
+request, the order, and the text, so it knows how to label the
+artifact: `"Horoscope: Capricorn"`, `"Recipe of the day: Earl Grey"`,
+or whatever fits the dispenser kind. The block stores the name on the
+note's identity slot and calls `:set_text(text)` for the markdown
+content. Inventory shows the name; `read note` shows the text. Same as
+LambdaMOO.
+
+A subclass that prefers to compute the name from request+text in-world
+(rather than at the plug) can expose a `:default_note_name(request,
+text)` hook and have the plug consult it before calling `:deliver`,
+but the contract on the block stays the same: name is required.
 
 ## Admission limits
 

@@ -7058,9 +7058,12 @@ export class WooWorld {
       names.push(`${color} note`, `the ${color} note`, `${color} ${objectName}`, `the ${color} ${objectName}`);
     }
     const text = await this.dispatch({ ...ctx, caller: ctx.thisObj, progr: ctx.actor }, id, "text", []).catch(() => null);
-    if (Array.isArray(text)) {
-      for (const line of text) {
-        if (typeof line === "string" && line.trim()) names.push(line.trim());
+    if (typeof text === "string") {
+      // Note text is capped at 65536 chars by :set_text/:write, so a per-note
+      // line scan stays bounded; no further trimming needed for matching.
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed) names.push(trimmed);
       }
     }
   }

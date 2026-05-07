@@ -1459,7 +1459,7 @@ function taskspaceProjectedTask(id: string): any | undefined {
     ...(legacy?.props ?? {}),
     ...(projected?.props ?? {})
   };
-  for (const key of ["title", "description", "parent_task", "status", "assignee", "space"]) {
+  for (const key of ["text", "parent_task", "status", "assignee", "space"]) {
     if (Object.prototype.hasOwnProperty.call(overlay, key)) props[key] = (overlay as any)[key];
   }
   props.requirements = mergeTaskspaceRequirements(props.requirements, overlay);
@@ -1467,7 +1467,7 @@ function taskspaceProjectedTask(id: string): any | undefined {
   props.artifacts = mergeTaskspaceArtifacts(props.artifacts, overlay);
   return {
     id,
-    name: projected?.name ?? legacy?.name ?? props.title ?? id,
+    name: projected?.name ?? legacy?.name ?? id,
     owner: projected?.owner ?? legacy?.owner,
     parent: projected?.parent ?? legacy?.parent,
     location: projected?.location ?? legacy?.location,
@@ -3836,7 +3836,6 @@ function pinboardPlacementPatch(id: string, patch: { x?: number; y?: number; z?:
 }
 
 function pinNoteText(value: any): string {
-  if (Array.isArray(value)) return value.map((line) => typeof line === "string" ? line : String(line ?? "")).join("\n");
   return typeof value === "string" ? value : "";
 }
 
@@ -3926,7 +3925,7 @@ function bindPinboardComponentEvents(element: WooElement) {
     const id = String(detail.id ?? "");
     const text = String(detail.text ?? "");
     if (!id || text === String(detail.original ?? "")) return;
-    pinboardTargetCall(id, "set_text", [text.split(/\r?\n/)], pinboardNoteOptimistic(id, { text: text.split(/\r?\n/) }));
+    pinboardTargetCall(id, "set_text", [text], pinboardNoteOptimistic(id, { text }));
   });
   element.addEventListener("woo-pinboard-note-color", (event) => {
     const detail = (event as CustomEvent<{ id?: unknown; color?: unknown }>).detail ?? {};
@@ -4687,11 +4686,11 @@ function bindTaskspaceComponentEvents(element: WooElement) {
     render();
   });
   element.addEventListener("woo-taskspace-create", (event) => {
-    const detail = (event as CustomEvent<{ title?: unknown; description?: unknown }>).detail ?? {};
-    const title = String(detail.title ?? "").trim() || "Untitled";
-    const description = String(detail.description ?? "").trim();
+    const detail = (event as CustomEvent<{ name?: unknown; text?: unknown }>).detail ?? {};
+    const name = String(detail.name ?? "").trim() || "Untitled";
+    const text = String(detail.text ?? "").trim();
     const space = taskspaceSpace();
-    if (space) taskspaceCall(space, "create_task", [title, description], (id) => pendingTaskSelections.add(id));
+    if (space) taskspaceCall(space, "create_task", [name, text], (id) => pendingTaskSelections.add(id));
   });
   element.addEventListener("woo-taskspace-toggle", (event) => {
     const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
@@ -4716,11 +4715,11 @@ function bindTaskspaceComponentEvents(element: WooElement) {
   element.addEventListener("woo-taskspace-add-subtask", (event) => {
     const id = state.selectedTask;
     if (!id) return;
-    const detail = (event as CustomEvent<{ title?: unknown; description?: unknown }>).detail ?? {};
-    const title = String(detail.title ?? "").trim() || "Subtask";
-    const description = String(detail.description ?? "").trim();
+    const detail = (event as CustomEvent<{ name?: unknown; text?: unknown }>).detail ?? {};
+    const name = String(detail.name ?? "").trim() || "Subtask";
+    const text = String(detail.text ?? "").trim();
     state.taskExpanded[id] = true;
-    taskspaceCall(id, "add_subtask", [title, description], (callId) => pendingTaskSelections.add(callId));
+    taskspaceCall(id, "add_subtask", [name, text], (callId) => pendingTaskSelections.add(callId));
   });
   element.addEventListener("woo-taskspace-add-requirement", (event) => {
     const id = state.selectedTask;

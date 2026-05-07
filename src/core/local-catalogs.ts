@@ -67,6 +67,11 @@ const LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION = "2026-05-04-chat-transp
 const LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION = "2026-05-04-drop-presence-in-property";
 const LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION = "2026-05-04-chat-room-exits-restore";
 const LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION = "2026-05-04-chat-room-leave-filter";
+const LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION = "2026-05-06-note-text-string-shape";
+const LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-note-stale-class-verbs";
+const LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-pinboard-stale-class-verbs";
+const LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-dispenser-stale-class-verbs";
+const LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION = "2026-05-06-taskspace-note-shape";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -117,7 +122,12 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION },
   { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION },
-  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" }
+  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, only: "pinboard" },
+  { id: LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, only: "dispenser" },
+  { id: LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION, only: "taskspace" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -340,6 +350,11 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runDropPresenceInPropertyMigration(world);
   runChatRoomExitsRestoreMigration(world);
   runChatRoomLeaveFilterMigration(world, names);
+  runNoteTextStringShapeMigration(world, names);
+  run(LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
+  run(LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
+  run(LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
+  runTaskspaceNoteShapeMigration(world, names);
   return covered;
 }
 
@@ -720,6 +735,78 @@ function runTaskspaceTaskNoteParentMigration(world: WooWorld, names: readonly st
     if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION);
+}
+
+function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string[]): void {
+  // v0.1 of $note declared `text: list<str>`. v0.2 retypes the same property
+  // to `text: str` (markdown). Existing $note descendants on upgraded worlds
+  // therefore carry a list value where the new code expects a string. Walk
+  // every descendant and join the list with \n. Idempotent: skip when the
+  // value is already a string. Run before reconcileClassVerbs so the new
+  // verb code never observes a stale list.
+  if (!names.includes("note")) return;
+  if (!localCatalogInstalled(world, "note")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION)) return;
+  if (!world.objects.has("$note")) return;
+  for (const id of world.objects.keys()) {
+    if (!world.isDescendantOf(id, "$note")) continue;
+    const own = world.object(id).properties;
+    if (!own.has("text")) continue;
+    const value = own.get("text");
+    if (typeof value === "string") continue;
+    if (Array.isArray(value)) {
+      const joined = value
+        .map((line) => (typeof line === "string" ? line : String(line ?? "")))
+        .join("\n");
+      world.setProp(id, "text", joined);
+      continue;
+    }
+    if (value === null || value === undefined) {
+      world.setProp(id, "text", "");
+    }
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION);
+}
+
+function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[]): void {
+  // v0.2 of taskspace declared `title` and `description` as own properties on
+  // $task, shadowing the inherited $root.name and $root.description. v0.3
+  // drops both shadow defs in favor of the inherited slots and the $note
+  // `text` body. Walk every $task instance, copy `title` → object.name and
+  // `description` → `text`, then run the schema plan + reconcileClassVerbs to
+  // strip the obsolete property defs from the class object. Idempotent: the
+  // copies are skipped when already done.
+  if (!names.includes("taskspace")) return;
+  if (!localCatalogInstalled(world, "taskspace")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION)) return;
+  if (!world.objects.has("$task")) return;
+  for (const id of world.objects.keys()) {
+    if (!world.isDescendantOf(id, "$task")) continue;
+    if (id === "$task") continue;
+    const obj = world.object(id);
+    const own = obj.properties;
+    const title = own.get("title");
+    if (typeof title === "string" && title && !obj.name) {
+      obj.name = title;
+      world.setProp(id, "name", title);
+    }
+    const description = own.get("description");
+    if (typeof description === "string" && description && !own.has("text")) {
+      world.setProp(id, "text", description);
+    }
+    // Strip the obsolete own values so the new inherited shape isn't shadowed.
+    // After the schema plan below removes the property defs from $task, any
+    // remaining own values would still satisfy `obj.properties.has("title")`
+    // and confuse readers. Idempotent: delete only when present.
+    if (own.has("title")) world.deleteProp(id, "title");
+    if (own.has("description")) world.deleteProp(id, "description");
+  }
+  const result = runLocalCatalogSchemaPlan(world, "taskspace", LOCAL_CATALOGS.get("taskspace")!, "gateway", "world", {
+    allowImplementationHints: true,
+    reconcileClassVerbs: true
+  });
+  if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
+  markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION);
 }
 
 function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>): void {
@@ -1129,9 +1216,9 @@ function migratePinboardNoteRecords(world: WooWorld): void {
         progr: "$wiz",
         location: board,
         name: "sticky note",
-        description: text ? `A sticky note. It says: ${text}` : "A sticky note."
+        description: "A sticky note."
       });
-      world.setProp(pin, "text", lines);
+      world.setProp(pin, "text", text);
       world.setProp(pin, "color", typeof record.color === "string" ? record.color : null);
       const z = numberValue(record.z, nextZ);
       layout = {
@@ -1169,12 +1256,13 @@ function countPinboardLegacyNoteRecords(world: WooWorld): number {
 
 function hasEquivalentMigratedPin(world: WooWorld, board: ObjRef, record: Record<string, WooValue>): boolean {
   const layout = mapValue(world.propOrNull(board, "layout"));
-  const expectedText = noteTextLines(record.text);
+  const expectedLines = noteTextLines(record.text);
+  const expectedText = expectedLines.length > 0 ? expectedLines.join("\n") : "";
   const expectedColor = typeof record.color === "string" ? record.color : null;
   for (const id of world.object(board).contents) {
     if (!world.objects.has(id) || !world.isDescendantOf(id, "$pin")) continue;
     const text = world.propOrNull(id, "text");
-    if (!Array.isArray(text) || JSON.stringify(text) !== JSON.stringify(expectedText)) continue;
+    if (typeof text !== "string" || text !== expectedText) continue;
     if (world.propOrNull(id, "color") !== expectedColor) continue;
     const entry = layout[id];
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;

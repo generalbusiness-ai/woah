@@ -1,8 +1,8 @@
 {
   "name": "horoscope",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "spec_version": "v1",
-  "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory carrying the generated text.",
+  "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory with name `Horoscope: Scorpio` and the generated text as its markdown body.",
   "license": "MIT",
   "depends": ["@local:dispenser"],
   "classes": [
@@ -10,7 +10,7 @@
       "local_name": "$horoscope_block",
       "parent": "$dispenser_block",
       "flags": { "fertile": true },
-      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, and calls :deliver to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
+      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, derives a note name from the request (e.g. `Horoscope: Scorpio`), and calls :deliver(order_id, name, text) to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
       "properties": [],
       "verbs": [
         {

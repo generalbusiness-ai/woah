@@ -98,7 +98,7 @@ describe("runLoggedHoroscopeTick", () => {
       block: "the_horoscope_block",
       order_id: "ord_1",
       requester: "guest_5",
-      body_chars: "destiny calls.".length
+      text_chars: "destiny calls.".length
     });
     expect(lines[2]).toMatchObject({
       event: "order_delivered",

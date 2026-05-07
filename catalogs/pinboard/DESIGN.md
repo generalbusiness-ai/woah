@@ -71,7 +71,7 @@ because it shares those verbs, not because of cross-tree inheritance.
 
 | Property | On | Purpose |
 | --- | --- | --- |
-| `text` | `$note` (inherited) | The actual content. List of strings. |
+| `text` | `$note` (inherited) | The actual content. Markdown string. |
 | `writers` | `$note` (inherited) | Who else can edit besides owner. |
 | `color` | `$pin` | `null` or a string. Frontend renders white when null. |
 | `contents` | `$pinboard` (built-in) | Pins currently on the board, plus actors who have entered it. Note-listing and layout verbs filter to `$note` descendants. |
@@ -131,8 +131,9 @@ observation per card add.
 
 ### Pin (`$pin`)
 
-Inherits everything from `$note` (`read`, `write`, `set_text`, `erase`,
-`is_readable_by`, `is_writable_by`, `look`). Adds:
+Inherits everything from `$note` (`read`, `set_text`, `write`, `erase`,
+`add_writer`, `rm_writer`, `is_readable_by`, `is_writable_by`, `look`).
+Adds:
 
 - `set_color(color)` — write `.color`. `null` clears (frontend renders white);
   `"white"` is normalized to `null`.
@@ -229,7 +230,7 @@ Kanban invariants:
         {
           id:       ObjRef,         // pin / note objref
           name:     str,            // card.name (presentation only)
-          text:     [str],          // empty list if actor cannot read
+          text:     str,            // markdown body; empty string if actor cannot read
           color:    str | null,     // null on non-$pin cards
           owner:    ObjRef,
           writers:  [ObjRef]

@@ -71,7 +71,7 @@ describe("bundled catalog UI components", () => {
       boardId: "the_pinboard",
       boardName: "Pinboard",
       boardOwner: "guest_1",
-      notes: [{ id: "note_1", text: ["hello"], x: 10, y: 20, w: 180, h: 110, author: "guest_1", color: "pink" }],
+      notes: [{ id: "note_1", text: "hello", x: 10, y: 20, w: 180, h: 110, author: "guest_1", color: "pink" }],
       present: ["guest_1"],
       palette: ["yellow", "pink", "white"],
       viewport: { w: 960, h: 560 },
@@ -138,7 +138,7 @@ describe("bundled catalog UI components", () => {
     element.data = {
       space: "the_taskspace",
       tasks: {
-        task_1: { id: "task_1", props: { title: "Plan", status: "open", assignee: "guest_1", requirements: [] } }
+        task_1: { id: "task_1", name: "Plan", props: { status: "open", assignee: "guest_1", requirements: [] } }
       },
       rootTasks: ["task_1"],
       selectedTask: "task_1",
@@ -151,6 +151,6 @@ describe("bundled catalog UI components", () => {
     element.addEventListener("woo-taskspace-create", (event: Event) => { detail = (event as CustomEvent).detail; });
     element.querySelector<HTMLInputElement>("[data-new-title]")!.value = "New root";
     element.querySelector<HTMLButtonElement>("[data-create-task]")!.click();
-    expect(detail).toMatchObject({ title: "New root" });
+    expect(detail).toMatchObject({ name: "New root" });
   });
 });

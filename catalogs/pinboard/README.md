@@ -1,9 +1,9 @@
 ---
 name: pinboard
-version: 0.3.5
+version: 0.4.0
 spec_version: v1
 license: MIT
-description: Spatial bulletin board demo built from first-class $pin < $note objects.
+description: Spatial bulletin board demo built from first-class $pin < $note objects. Pins use the v0.2 $note shape (name + description + text, where text is a single markdown string); the board owns layout independent of note content.
 depends:
   - @local:chat
   - @local:note

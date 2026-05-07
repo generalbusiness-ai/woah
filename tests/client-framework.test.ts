@@ -457,7 +457,7 @@ describe("client UI framework projection", () => {
       seq: 21,
       space: "the_taskspace",
       observations: [
-        { type: "task_created", task: "task_1", parent: null, title: "Ship scoped tasks" },
+        { type: "task_created", task: "task_1", parent: null, name: "Ship scoped tasks" },
         { type: "task_claimed", task: "task_1", actor: "guest_1" },
         { type: "status_changed", task: "task_1", from: "claimed", to: "in_progress" },
         { type: "requirement_added", task: "task_1", index: 0, text: "renders without /api/state" },
@@ -467,11 +467,12 @@ describe("client UI framework projection", () => {
     });
 
     expect(ui.observe("task_1")?.props).toMatchObject({
-      title: "Ship scoped tasks",
+      name: "Ship scoped tasks",
       parent_task: null,
       assignee: "guest_1",
       status: "in_progress"
     });
+    expect(ui.observe("task_1")?.name).toBe("Ship scoped tasks");
     expect(ui.observe("the_taskspace")?.catalogState.taskspace_tree).toMatchObject({ task_1: null });
     expect(ui.observe("task_1")?.catalogState.taskspace_task).toMatchObject({
       "requirement:0": { text: "renders without /api/state", checked: false },

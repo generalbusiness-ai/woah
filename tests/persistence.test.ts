@@ -198,7 +198,8 @@ describe("sqlite persistence", () => {
       secondRepo.saves = 0;
 
       expect(secondCluster.object(task).parent).toBe("$task");
-      expect(secondCluster.getProp(task, "title")).toBe("Cluster persisted");
+      expect(secondCluster.object(task).name).toBe("Cluster persisted");
+      expect(secondCluster.getProp(task, "text")).toBe("written after host seed");
       expect(secondCluster.getProp("the_taskspace", "root_tasks")).toContain(task);
       expect(secondCluster.replay("the_taskspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["create_task"]);
 
