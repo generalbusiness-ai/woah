@@ -24,11 +24,8 @@ binding = "AI"
 #   wrangler secret put WOO_APIKEY
 #   wrangler deploy
 [vars]
-# Deployment-specific values can be set as Worker variables or secrets.
-# The repo bootstrap script writes WOO_BASE_URL and BLOCK_ID with
-# `wrangler secret put` so this template stays reusable.
-#
-# WOO_BASE_URL = "https://woo.example.com"
-# BLOCK_ID = "the_horoscope_block"
-# MAX_TOKENS = "350"
-# MAX_ORDERS_PER_TICK = "10"
+# Public routing/config values. Secrets still go through `wrangler secret put`.
+WOO_BASE_URL = "https://woo.hughpyle.workers.dev"
+BLOCK_ID = "the_horoscope"
+MAX_TOKENS = "350"
+MAX_ORDERS_PER_TICK = "10"

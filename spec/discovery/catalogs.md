@@ -276,7 +276,15 @@ content-addressed schema plan as covered by that seed; a host with stored state
 executes scoped plan steps, verifies postconditions, and appends a host-specific
 record to `$system.catalog_migration_records`. They do not run opaque manifest
 repair over partial slices. Host-local data migrations use the same ledger and
-run against state the host actually owns.
+run against state the host actually owns. If a fresh gateway host seed was
+available, the host re-applies it after the host-scoped lifecycle so copied
+support classes and verbs converge to the gateway's repaired definitions.
+
+Live object hosts can also be refreshed from the gateway's current host seed by
+a wizard operation. That path copies gateway support objects into the running
+host and persists only if the seed merge changed state. It does not re-run the
+host-scoped manifest repair pass, so an operator-applied gateway repair is not
+rewritten by the bundled manifest while the host is live.
 
 Dependency repair may encounter a partial earlier bootstrap where catalog
 objects already exist but `$catalog_registry` has no matching installed record.
@@ -333,6 +341,7 @@ Repair/update remains an explicit sequenced operation through
     {
       "local_name": "$loop_slot",
       "parent": "hughpyle/woo-libs:root-pack:$control",
+      "flags": {"fertile": true},
       "properties": [{"name": "loop_id", "default": null, "perms": "rw"}, ...],
       "verbs": [{"name": "play", "source": "verb $loop_slot:play() {...}", "perms": "rxd", ...}, ...]
     },
@@ -362,6 +371,12 @@ Catalog `perms` use the same authoring shorthand as source: `rxd` means install
 with normalized `perms: "rx"` and `direct_callable: true`. Catalogs may also set
 `direct_callable` explicitly; the explicit metadata field is the authoritative
 stored form after install.
+
+Class and feature objects may declare lifecycle `flags` for ordinary
+authoring/template behavior. `fertile: true` means instances may be created
+under the catalog class by actors who do not own the class object; deployed
+instances created from seed hooks remain ordinary non-fertile objects unless
+their own creation path sets flags separately.
 
 Seed hooks are intentionally small. `create_instance` creates a named instance
 from a catalog or dependency class, `attach_feature` appends a feature object to

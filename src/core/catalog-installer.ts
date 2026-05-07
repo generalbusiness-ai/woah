@@ -22,6 +22,10 @@ type CatalogObjectDef = {
   local_name: string;
   parent: string;
   description?: string;
+  flags?: {
+    fertile?: boolean;
+    recyclable?: boolean;
+  };
   properties?: CatalogPropertyDef[];
   verbs?: CatalogVerbDef[];
 };
@@ -293,6 +297,20 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
           actual: actualParent
         });
       }
+      for (const [flag, expected] of Object.entries(def.flags ?? {})) {
+        if (typeof expected !== "boolean") continue;
+        const actual = (world.object(def.local_name).flags as Record<string, boolean | undefined>)[flag] === true;
+        if (actual !== expected) {
+          issues.push({
+            severity: "warning",
+            kind: "flag_drift",
+            object: def.local_name,
+            message: `${def.local_name}.${flag} flag differs from manifest`,
+            expected,
+            actual
+          });
+        }
+      }
     } catch (err) {
       issues.push(catalogStatusErrorIssue("unresolved_parent", def.local_name, err));
     }
@@ -472,7 +490,7 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
   for (const def of objectDefs) {
     const id = def.local_name;
     const parent = resolveObjectRef(world, def.parent, localObjects, localSeeds, existing);
-    world.createObject({ id, name: id, parent, owner: actor });
+    world.createObject({ id, name: id, parent, owner: actor, flags: def.flags });
     setDescriptionIfEmpty(world, id, catalogDescription(def.description, id, manifest.name));
     for (const property of def.properties ?? []) installProperty(world, id, property, actor);
     for (const verb of def.verbs ?? []) installVerbDef(world, id, verb, actor, allowImplementationHints, false);
@@ -832,9 +850,21 @@ function applyCatalogSchemaPlanStep(
   switch (step.kind) {
     case "ensure_object": {
       const parent = resolveObjectRef(world, step.def.parent, context.localObjects, context.localSeeds, context.existing);
-      if (!world.objects.has(step.object)) world.createObject({ id: step.object, name: step.object, parent, owner: context.actor });
+      if (!world.objects.has(step.object)) world.createObject({ id: step.object, name: step.object, parent, owner: context.actor, flags: step.def.flags });
       else if (world.object(step.object).parent !== parent && !world.isDescendantOf(parent, step.object)) {
         world.chparentAuthoredObject(context.actor, step.object, parent);
+      }
+      if (world.objects.has(step.object)) {
+        let flagsChanged = false;
+        const target = world.object(step.object);
+        for (const [flag, expected] of Object.entries(step.def.flags ?? {})) {
+          if (typeof expected !== "boolean") continue;
+          const actual = (target.flags as Record<string, boolean | undefined>)[flag] === true;
+          if (actual === expected) continue;
+          (target.flags as Record<string, boolean>)[flag] = expected;
+          flagsChanged = true;
+        }
+        if (flagsChanged) world.markObjectChanged(step.object);
       }
       setDescriptionIfEmpty(world, step.object, catalogDescription(step.def.description, step.object, manifest.name));
       return;
@@ -953,18 +983,38 @@ function reconcileSeedObject(
   const parent = resolveObjectRef(world, hook.class, localObjects, localSeeds, existing);
   const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
   const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;
+  const changedObjects = new Set<ObjRef>();
+  const markChanged = (objRef: ObjRef | null | undefined): void => {
+    if (objRef && world.objects.has(objRef)) changedObjects.add(objRef);
+  };
   if (obj.parent !== parent) {
-    if (obj.parent && world.objects.has(obj.parent)) world.object(obj.parent).children.delete(id);
+    const oldParent = obj.parent;
+    if (oldParent && world.objects.has(oldParent)) world.object(oldParent).children.delete(id);
     obj.parent = parent;
     world.object(parent).children.add(id);
+    markChanged(oldParent);
+    markChanged(parent);
+    markChanged(id);
   }
-  if (obj.owner !== actor) obj.owner = actor;
-  obj.anchor = anchor;
+  if (obj.owner !== actor) {
+    obj.owner = actor;
+    markChanged(id);
+  }
+  if (obj.anchor !== anchor) {
+    obj.anchor = anchor;
+    markChanged(id);
+  }
   if (hook.name) {
-    obj.name = hook.name;
-    world.setProp(id, "name", hook.name);
+    if (obj.name !== hook.name) {
+      obj.name = hook.name;
+      markChanged(id);
+    }
+    if (world.propOrNull(id, "name") !== hook.name) world.setProp(id, "name", hook.name);
   }
-  if (hook.description) world.setProp(id, "description", catalogDescription(hook.description, hook.name ?? id, manifest.name));
+  if (hook.description) {
+    const description = catalogDescription(hook.description, hook.name ?? id, manifest.name);
+    if (world.propOrNull(id, "description") !== description) world.setProp(id, "description", description);
+  }
   // Seed-hook properties are *initial* values — they bootstrap a fresh seed.
   // The unconditional set_if_missing path at the repair call site (line 510)
   // already handles "manifest added a new property; existing seed lacks it".
@@ -977,14 +1027,21 @@ function reconcileSeedObject(
   }
   const strandedInNowhere = rehomeNowhereSeedObjects && obj.location === "$nowhere" && location !== null && location !== "$nowhere";
   if (obj.location !== location && (!obj.location || !world.objects.has(obj.location) || strandedInNowhere)) {
-    if (obj.location && world.objects.has(obj.location)) world.object(obj.location).contents.delete(id);
+    const oldLocation = obj.location;
+    if (oldLocation && world.objects.has(oldLocation)) world.object(oldLocation).contents.delete(id);
     obj.location = location;
     if (location && world.objects.has(location)) world.object(location).contents.add(id);
+    markChanged(oldLocation);
+    markChanged(location);
+    markChanged(id);
   } else if (obj.location && world.objects.has(obj.location)) {
-    world.object(obj.location).contents.add(id);
+    const container = world.object(obj.location);
+    if (!container.contents.has(id)) {
+      container.contents.add(id);
+      markChanged(obj.location);
+    }
   }
-  obj.modified = Date.now();
-  world.persist();
+  for (const objRef of changedObjects) world.markObjectChanged(objRef);
 }
 
 function populateSeedExitAliasMaps(world: WooWorld, manifest: CatalogManifest, localSeeds: Map<string, ObjRef>): void {
@@ -1093,9 +1150,9 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
       JSON.stringify(existing.aliases ?? []) !== JSON.stringify(repaired.aliases ?? []) ||
       existing.perms !== repaired.perms ||
       JSON.stringify(existing.arg_spec ?? {}) !== JSON.stringify(repaired.arg_spec ?? {}) ||
-      existing.direct_callable !== repaired.direct_callable ||
-      existing.skip_presence_check !== repaired.skip_presence_check ||
-      existing.tool_exposed !== repaired.tool_exposed ||
+      (existing.direct_callable === true) !== (repaired.direct_callable === true) ||
+      (existing.skip_presence_check === true) !== (repaired.skip_presence_check === true) ||
+      (existing.tool_exposed === true) !== (repaired.tool_exposed === true) ||
       (repaired.kind !== "native" && Object.keys(existing.line_map ?? {}).length === 0);
     if (changed) world.addVerb(obj, repaired);
     return;
@@ -1632,9 +1689,9 @@ function catalogVerbDrift(actual: VerbDef, expected: VerbDef): string[] {
   if (stableStringify(actual.aliases ?? []) !== stableStringify(expected.aliases ?? [])) drift.push("aliases");
   if (actual.perms !== expected.perms) drift.push("perms");
   if (stableStringify(actual.arg_spec ?? {}) !== stableStringify(expected.arg_spec ?? {})) drift.push("arg_spec");
-  if (actual.direct_callable !== expected.direct_callable) drift.push("direct_callable");
-  if (actual.skip_presence_check !== expected.skip_presence_check) drift.push("skip_presence_check");
-  if (actual.tool_exposed !== expected.tool_exposed) drift.push("tool_exposed");
+  if ((actual.direct_callable === true) !== (expected.direct_callable === true)) drift.push("direct_callable");
+  if ((actual.skip_presence_check === true) !== (expected.skip_presence_check === true)) drift.push("skip_presence_check");
+  if ((actual.tool_exposed === true) !== (expected.tool_exposed === true)) drift.push("tool_exposed");
   if (expected.kind !== "native" && Object.keys(actual.line_map ?? {}).length === 0) drift.push("line_map");
   return drift;
 }

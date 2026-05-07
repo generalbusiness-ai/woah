@@ -10,22 +10,19 @@ compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 [triggers]
 crons = ["0 * * * *"]
 
-# Required environment variables (set via `wrangler secret put` for secrets):
-#   WOO_BASE_URL          - e.g. https://woo.example.com
+# Required environment variables:
+#   WOO_BASE_URL          - public var, e.g. https://woo.example.com
 #   WOO_APIKEY            - secret. apikey:<id>:<secret> minted via :mint_apikey
 #   TOMORROW_IO_API_KEY   - secret. https://app.tomorrow.io/development/keys
-#   BLOCK_ID              - canonical block id, e.g. the_weather_block
-#   FORECAST_HOURS        - optional, defaults to 24
+#   BLOCK_ID              - public var, e.g. the_weather
+#   FORECAST_HOURS        - optional public fallback; block.forecast_hours wins when valid
 #
 # Provisioning:
 #   wrangler secret put WOO_APIKEY
 #   wrangler secret put TOMORROW_IO_API_KEY
 #   wrangler deploy
 [vars]
-# Deployment-specific values can be set as Worker variables or secrets.
-# The repo bootstrap script writes WOO_BASE_URL and BLOCK_ID with
-# `wrangler secret put` so this template stays reusable.
-#
-# WOO_BASE_URL = "https://woo.example.com"
-# BLOCK_ID = "the_weather_block"
-# FORECAST_HOURS = "12"
+# Public routing/config values. Secrets still go through `wrangler secret put`.
+WOO_BASE_URL = "https://woo.hughpyle.workers.dev"
+BLOCK_ID = "the_weather"
+FORECAST_HOURS = "12"

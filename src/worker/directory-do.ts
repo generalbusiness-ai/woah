@@ -1,4 +1,4 @@
-import { wooError, type ObjRef, type Session } from "../core/types";
+import { wooError, type MetricEvent, type ObjRef, type Session } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 
 type ObjectRoute = {
@@ -28,6 +28,7 @@ const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
 export class DirectoryDO {
   private state: DurableObjectState;
   private env: InternalAuthEnv;
+  private schemaEnsured = false;
 
   constructor(state: DurableObjectState, env: InternalAuthEnv) {
     this.state = state;
@@ -35,7 +36,17 @@ export class DirectoryDO {
   }
 
   async fetch(request: Request): Promise<Response> {
-    this.ensureSchema();
+    if (!this.schemaEnsured) {
+      const schemaStartedAt = Date.now();
+      try {
+        this.ensureSchema();
+        this.schemaEnsured = true;
+        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 3 });
+      } catch (err) {
+        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 3, error: metricErrorCode(err) });
+        throw err;
+      }
+    }
     const url = new URL(request.url);
     try {
       await verifyInternalRequest(this.env, request);
@@ -54,16 +65,24 @@ export class DirectoryDO {
       if (request.method === "POST" && url.pathname === "/register-objects") {
         const body = await readJson(request);
         const routes = Array.isArray(body.routes) ? body.routes : [];
-        this.state.storage.transactionSync(() => {
-          for (const route of routes) {
-            if (!route || typeof route !== "object") continue;
-            const record = route as Record<string, unknown>;
-            const id = typeof record.id === "string" ? record.id : "";
-            const host = typeof record.host === "string" ? record.host : "";
-            if (!id || !host) continue;
-            this.registerObject(id, host, typeof record.anchor === "string" ? record.anchor : null);
-          }
-        });
+        const startedAt = Date.now();
+        try {
+          let writes = 0;
+          this.state.storage.transactionSync(() => {
+            for (const route of routes) {
+              if (!route || typeof route !== "object") continue;
+              const record = route as Record<string, unknown>;
+              const id = typeof record.id === "string" ? record.id : "";
+              const host = typeof record.host === "string" ? record.host : "";
+              if (!id || !host) continue;
+              if (this.registerObject(id, host, typeof record.anchor === "string" ? record.anchor : null)) writes += 1;
+            }
+          });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "ok", routes: routes.length, writes });
+        } catch (err) {
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "error", routes: routes.length, error: metricErrorCode(err) });
+          throw err;
+        }
         return json({ ok: true });
       }
 
@@ -129,7 +148,11 @@ export class DirectoryDO {
     this.ensureColumn("session_route", "apikey_id", "TEXT");
   }
 
-  private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): void {
+  private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): boolean {
+    const existing = firstRow(this.state.storage.sql.exec("SELECT host, anchor FROM object_route WHERE id = ?", id));
+    if (existing && String(existing.host) === host && (existing.anchor === null ? null : String(existing.anchor)) === anchor) {
+      return false;
+    }
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO object_route(id, host, anchor, updated_at) VALUES (?, ?, ?, ?)",
       id,
@@ -137,6 +160,7 @@ export class DirectoryDO {
       anchor,
       Date.now()
     );
+    return true;
   }
 
   private resolveObject(id: string, fallbackHost: string): ObjectRoute {
@@ -208,6 +232,10 @@ export class DirectoryDO {
   private countRows(table: string): number {
     return Number(firstValue(this.state.storage.sql.exec(`SELECT COUNT(*) AS count FROM ${table}`)) ?? 0);
   }
+
+  private emitMetric(event: MetricEvent): void {
+    console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: "directory" }));
+  }
 }
 
 function firstRow(cursor: SqlStorageCursor<Record<string, SqlStorageValue>>): Record<string, unknown> | null {
@@ -226,6 +254,11 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json; charset=utf-8" }
   });
+}
+
+function metricErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
+  return err instanceof Error ? err.name : "E_INTERNAL";
 }
 
 async function readJson(request: Request): Promise<Record<string, unknown>> {

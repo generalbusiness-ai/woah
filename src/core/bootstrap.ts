@@ -3,7 +3,7 @@ import { setPropBytecode, setValueBytecode } from "./fixtures";
 import { installLocalCatalogs } from "./local-catalogs";
 import type { ObjectRepository, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
 import { hashSource } from "./source-hash";
-import type { ObjRef, TinyBytecode, WooValue } from "./types";
+import type { MetricEvent, ObjRef, TinyBytecode, WooValue } from "./types";
 import { valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
@@ -11,6 +11,8 @@ import { WooWorld } from "./world";
 type BootstrapOptions = {
   catalogs?: readonly string[] | false;
 };
+
+const bootSnapshotCache = new Map<string, SerializedWorld>();
 
 const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   let title = this:title();
@@ -196,13 +198,26 @@ const PLAYER_WAYS_SOURCE = `verb :ways(room_name) rxd {
   return { room: room, exits: exits, text: text };
 }`;
 
-export function createWorld(options: { repository?: WorldRepository & Partial<ObjectRepository>; catalogs?: readonly string[] | false } = {}): WooWorld {
+export function createWorld(options: { repository?: WorldRepository & Partial<ObjectRepository>; catalogs?: readonly string[] | false; metricsHook?: (event: MetricEvent) => void } = {}): WooWorld {
+  if (!options.repository) {
+    const world = new WooWorld();
+    if (options.metricsHook) world.setMetricsHook(options.metricsHook);
+    world.importWorld(cloneSerializedWorld(cachedBootSnapshot(options.catalogs)));
+    world.enableIncrementalPersistence();
+    return world;
+  }
+
   const world = new WooWorld(options.repository);
+  if (options.metricsHook) world.setMetricsHook(options.metricsHook);
   const stored = options.repository?.load();
   if (stored) {
     world.importWorld(stored);
     world.withPersistencePaused(() => bootstrap(world, { catalogs: options.catalogs }));
-    world.persist();
+    if (world.hasPendingPersistence()) {
+      world.persist();
+    } else {
+      world.discardPendingPersistence();
+    }
   } else {
     world.withPersistencePaused(() => bootstrap(world, { catalogs: options.catalogs }));
     world.persist();
@@ -211,11 +226,29 @@ export function createWorld(options: { repository?: WorldRepository & Partial<Ob
   return world;
 }
 
+function cachedBootSnapshot(catalogs: readonly string[] | false | undefined): SerializedWorld {
+  const key = bootSnapshotKey(catalogs);
+  const existing = bootSnapshotCache.get(key);
+  if (existing) return existing;
+  const world = new WooWorld();
+  world.withPersistencePaused(() => bootstrap(world, { catalogs }));
+  const snapshot = world.exportWorld();
+  bootSnapshotCache.set(key, snapshot);
+  return snapshot;
+}
+
+function bootSnapshotKey(catalogs: readonly string[] | false | undefined): string {
+  if (catalogs === undefined) return "default";
+  if (catalogs === false) return "false";
+  return JSON.stringify([...catalogs]);
+}
+
 export function createWorldFromSerialized(
   serialized: SerializedWorld,
-  options: { repository?: WorldRepository & Partial<ObjectRepository>; persist?: boolean } = {}
+  options: { repository?: WorldRepository & Partial<ObjectRepository>; persist?: boolean; metricsHook?: (event: MetricEvent) => void } = {}
 ): WooWorld {
   const world = new WooWorld(options.repository);
+  if (options.metricsHook) world.setMetricsHook(options.metricsHook);
   world.importWorld(serialized);
   if (options.persist !== false) world.persist();
   world.enableIncrementalPersistence();
@@ -233,10 +266,20 @@ export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRe
   return scoped.objects.length > 0 ? scoped : null;
 }
 
+export type HostScopedSeedMergeResult = {
+  world: SerializedWorld;
+  changed: boolean;
+};
+
 export function mergeHostScopedSeed(stored: SerializedWorld, seed: SerializedWorld): SerializedWorld {
+  return mergeHostScopedSeedWithStatus(stored, seed).world;
+}
+
+export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: SerializedWorld): HostScopedSeedMergeResult {
   const merged = cloneSerializedWorld(stored);
   const objects = new Map(merged.objects.map((obj) => [obj.id, obj]));
   const seedIds = new Set(seed.objects.map((obj) => obj.id));
+  let changed = false;
 
   for (const seedObj of seed.objects) {
     const current = objects.get(seedObj.id);
@@ -244,27 +287,47 @@ export function mergeHostScopedSeed(stored: SerializedWorld, seed: SerializedWor
       const next = cloneSerializedObject(seedObj);
       merged.objects.push(next);
       objects.set(next.id, next);
+      changed = true;
       continue;
     }
-    mergeSeedObject(current, seedObj);
+    changed = mergeSeedObject(current, seedObj) || changed;
   }
 
-  reconcileSeedContainment(objects, seedIds);
-  merged.objectCounter = Math.max(merged.objectCounter ?? 1, seed.objectCounter ?? 1);
-  merged.parkedTaskCounter = Math.max(merged.parkedTaskCounter ?? 1, seed.parkedTaskCounter ?? 1);
-  merged.sessionCounter = Math.max(merged.sessionCounter ?? 1, seed.sessionCounter ?? 1);
+  changed = reconcileSeedContainment(objects, seedIds) || changed;
+  const objectCounter = Math.max(merged.objectCounter ?? 1, seed.objectCounter ?? 1);
+  if (merged.objectCounter !== objectCounter) {
+    merged.objectCounter = objectCounter;
+    changed = true;
+  }
+  const parkedTaskCounter = Math.max(merged.parkedTaskCounter ?? 1, seed.parkedTaskCounter ?? 1);
+  if (merged.parkedTaskCounter !== parkedTaskCounter) {
+    merged.parkedTaskCounter = parkedTaskCounter;
+    changed = true;
+  }
+  const sessionCounter = Math.max(merged.sessionCounter ?? 1, seed.sessionCounter ?? 1);
+  if (merged.sessionCounter !== sessionCounter) {
+    merged.sessionCounter = sessionCounter;
+    changed = true;
+  }
   for (const [space, entries] of seed.logs) {
-    if (!merged.logs.some(([existing]) => existing === space)) merged.logs.push([space, cloneSerialized(entries)]);
+    if (!merged.logs.some(([existing]) => existing === space)) {
+      merged.logs.push([space, cloneSerialized(entries)]);
+      changed = true;
+    }
   }
   for (const snapshot of seed.snapshots) {
     if (!merged.snapshots.some((existing) => existing.space_id === snapshot.space_id && existing.seq === snapshot.seq)) {
       merged.snapshots.push(cloneSerialized(snapshot));
+      changed = true;
     }
   }
   for (const task of seed.parkedTasks) {
-    if (!merged.parkedTasks.some((existing) => existing.id === task.id)) merged.parkedTasks.push(cloneSerialized(task));
+    if (!merged.parkedTasks.some((existing) => existing.id === task.id)) {
+      merged.parkedTasks.push(cloneSerialized(task));
+      changed = true;
+    }
   }
-  return merged;
+  return { world: merged, changed };
 }
 
 export function bootstrap(world: WooWorld, options: BootstrapOptions = {}): WooWorld {
@@ -288,67 +351,140 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "installed_catalogs"
 ]);
 
-function mergeSeedObject(current: SerializedObject, seed: SerializedObject): void {
-  current.name = seed.name;
-  current.parent = seed.parent;
-  current.owner = seed.owner;
-  if (!current.location) current.location = seed.location;
-  current.anchor = seed.anchor;
-  current.flags = cloneSerialized(seed.flags);
-  current.modified = Math.max(current.modified ?? 0, seed.modified ?? 0);
-  current.propertyDefs = cloneSerialized(seed.propertyDefs);
-  current.verbs = cloneSerialized(seed.verbs);
-  current.eventSchemas = cloneSerialized(seed.eventSchemas);
-  current.children = mergeUnique(current.children, seed.children);
+function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boolean {
+  let changed = false;
+  if (current.name !== seed.name) {
+    current.name = seed.name;
+    changed = true;
+  }
+  if (current.parent !== seed.parent) {
+    current.parent = seed.parent;
+    changed = true;
+  }
+  if (current.owner !== seed.owner) {
+    current.owner = seed.owner;
+    changed = true;
+  }
+  if (!current.location && current.location !== seed.location) {
+    current.location = seed.location;
+    changed = true;
+  }
+  if (current.anchor !== seed.anchor) {
+    current.anchor = seed.anchor;
+    changed = true;
+  }
+  if (!valuesEqual(current.flags as WooValue, seed.flags as WooValue)) {
+    current.flags = cloneSerialized(seed.flags);
+    changed = true;
+  }
+  const modified = Math.max(current.modified ?? 0, seed.modified ?? 0);
+  if (current.modified !== modified) {
+    current.modified = modified;
+    changed = true;
+  }
+  if (!valuesEqual(current.propertyDefs as unknown as WooValue, seed.propertyDefs as unknown as WooValue)) {
+    current.propertyDefs = cloneSerialized(seed.propertyDefs);
+    changed = true;
+  }
+  if (!valuesEqual(current.verbs as unknown as WooValue, seed.verbs as unknown as WooValue)) {
+    current.verbs = cloneSerialized(seed.verbs);
+    changed = true;
+  }
+  if (!valuesEqual(current.eventSchemas as unknown as WooValue, seed.eventSchemas as unknown as WooValue)) {
+    current.eventSchemas = cloneSerialized(seed.eventSchemas);
+    changed = true;
+  }
+  const children = mergeUnique(current.children, seed.children);
+  if (!arraysEqual(current.children, children)) {
+    current.children = children;
+    changed = true;
+  }
 
   const properties = new Map(current.properties);
   const versions = new Map(current.propertyVersions);
   const seedVersions = new Map(seed.propertyVersions);
   for (const [name, value] of seed.properties) {
     if (name === "features" && properties.has(name) && Array.isArray(properties.get(name)) && Array.isArray(value)) {
-      properties.set(name, mergeUnique(properties.get(name) as string[], value.map(String)));
+      const merged = mergeUnique(properties.get(name) as string[], value.map(String));
+      if (!valuesEqual(properties.get(name) as WooValue, merged as WooValue)) {
+        properties.set(name, merged);
+        changed = true;
+      }
       continue;
     }
     if (name === "features_version" && properties.has(name)) {
       const currentVersion = Number(properties.get(name) ?? 0);
       const seedVersion = Number(value ?? 0);
-      properties.set(name, Math.max(Number.isFinite(currentVersion) ? currentVersion : 0, Number.isFinite(seedVersion) ? seedVersion : 0));
+      const nextVersion = Math.max(Number.isFinite(currentVersion) ? currentVersion : 0, Number.isFinite(seedVersion) ? seedVersion : 0);
+      if (properties.get(name) !== nextVersion) {
+        properties.set(name, nextVersion);
+        changed = true;
+      }
       continue;
     }
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && properties.has(name)) continue;
     if (properties.has(name) && Number(versions.get(name) ?? 0) >= Number(seedVersions.get(name) ?? 0)) continue;
-    properties.set(name, cloneSerialized(value));
+    if (!valuesEqual(properties.get(name) as WooValue, value as WooValue)) {
+      properties.set(name, cloneSerialized(value));
+      changed = true;
+    }
   }
   for (const [name, version] of seed.propertyVersions) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && versions.has(name)) continue;
-    if (!versions.has(name) || version > Number(versions.get(name) ?? 0)) versions.set(name, version);
+    if (!versions.has(name) || version > Number(versions.get(name) ?? 0)) {
+      versions.set(name, version);
+      changed = true;
+    }
   }
-  current.properties = Array.from(properties.entries());
-  current.propertyVersions = Array.from(versions.entries());
+  if (changed) {
+    current.properties = Array.from(properties.entries());
+    current.propertyVersions = Array.from(versions.entries());
+  }
+  return changed;
 }
 
-function reconcileSeedContainment(objects: Map<ObjRef, SerializedObject>, seedIds: Set<ObjRef>): void {
+function reconcileSeedContainment(objects: Map<ObjRef, SerializedObject>, seedIds: Set<ObjRef>): boolean {
+  let changed = false;
   for (const container of objects.values()) {
-    container.contents = container.contents.filter((id) => !seedIds.has(id) || objects.get(id)?.location === container.id);
+    const contents = container.contents.filter((id) => !seedIds.has(id) || objects.get(id)?.location === container.id);
+    if (!arraysEqual(container.contents, contents)) {
+      container.contents = contents;
+      changed = true;
+    }
   }
   for (const obj of objects.values()) {
     if (!seedIds.has(obj.id) || !obj.location) continue;
     const container = objects.get(obj.location);
-    if (container && !container.contents.includes(obj.id)) container.contents.push(obj.id);
+    if (container && !container.contents.includes(obj.id)) {
+      container.contents.push(obj.id);
+      changed = true;
+    }
   }
 
   for (const parent of objects.values()) {
-    parent.children = parent.children.filter((id) => !seedIds.has(id) || objects.get(id)?.parent === parent.id);
+    const children = parent.children.filter((id) => !seedIds.has(id) || objects.get(id)?.parent === parent.id);
+    if (!arraysEqual(parent.children, children)) {
+      parent.children = children;
+      changed = true;
+    }
   }
   for (const obj of objects.values()) {
     if (!seedIds.has(obj.id) || !obj.parent) continue;
     const parent = objects.get(obj.parent);
-    if (parent && !parent.children.includes(obj.id)) parent.children.push(obj.id);
+    if (parent && !parent.children.includes(obj.id)) {
+      parent.children.push(obj.id);
+      changed = true;
+    }
   }
+  return changed;
 }
 
 function mergeUnique<T>(left: readonly T[], right: readonly T[]): T[] {
   return Array.from(new Set([...left, ...right]));
+}
+
+function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function cloneSerializedWorld(value: SerializedWorld): SerializedWorld {
@@ -373,7 +509,10 @@ function seedUniversal(world: WooWorld): void {
   world.createObject({ id: "$sequenced_log", name: "$sequenced_log", parent: "$root", owner: "$wiz" });
   world.createObject({ id: "$space", name: "$space", parent: "$sequenced_log", owner: "$wiz" });
   world.createObject({ id: "$thing", name: "$thing", parent: "$root", owner: "$wiz" });
-  world.object("$thing").flags.fertile = true;
+  if (world.object("$thing").flags.fertile !== true) {
+    world.object("$thing").flags.fertile = true;
+    world.markObjectChanged("$thing");
+  }
   world.createObject({ id: "$catalog", name: "$catalog", parent: "$thing", owner: "$wiz" });
   world.createObject({ id: "$catalog_registry", name: "$catalog_registry", parent: "$space", owner: "$wiz" });
   world.createObject({ id: "$nowhere", name: "$nowhere", parent: "$thing", owner: "$wiz" });
@@ -546,7 +685,7 @@ function seedGuests(world: WooWorld): void {
     // display-name lookups (which read the property) get "Guest 1" instead
     // of the default empty string. Catalog seed_hooks already do this via
     // setNameIfMissing; bootstrap had to do it explicitly.
-    world.setProp(id, "name", displayName);
+    if (world.propOrNull(id, "name") !== displayName) world.setProp(id, "name", displayName);
     seedProp(world, id, "home", "$nowhere");
     removeSeedProperty(world, id, "attached_sockets");
   }
@@ -562,7 +701,10 @@ function seedGuests(world: WooWorld): void {
     const propValue = world.propOrNull(id, "name");
     const target = fieldName && fieldName !== id ? fieldName : `Guest ${match[1]}`;
     if (propValue !== target) world.setProp(id, "name", target);
-    if (!fieldName || fieldName === id) obj.name = target;
+    if (!fieldName || fieldName === id) {
+      obj.name = target;
+      world.markObjectChanged(id);
+    }
   }
 }
 
@@ -596,30 +738,38 @@ function seedProp(world: WooWorld, obj: ObjRef, name: string, value: WooValue): 
 
 function removeSeedProperty(world: WooWorld, obj: ObjRef, name: string): void {
   const target = world.object(obj);
-  target.propertyDefs.delete(name);
-  target.properties.delete(name);
-  target.propertyVersions.delete(name);
+  const removedDef = target.propertyDefs.delete(name);
+  const removedValue = target.properties.delete(name);
+  const removedVersion = target.propertyVersions.delete(name);
+  const changed = removedDef || removedValue || removedVersion;
+  if (changed) world.markObjectChanged(obj);
 }
 
 function reparentSeed(world: WooWorld, obj: ObjRef, parent: ObjRef): void {
   const target = world.object(obj);
   if (target.parent === parent) return;
-  if (target.parent && world.objects.has(target.parent)) world.object(target.parent).children.delete(obj);
+  const oldParent = target.parent;
+  if (oldParent && world.objects.has(oldParent)) world.object(oldParent).children.delete(obj);
   target.parent = parent;
   world.object(parent).children.add(obj);
+  world.markObjectChanged(obj);
+  if (oldParent && world.objects.has(oldParent)) world.markObjectChanged(oldParent);
+  world.markObjectChanged(parent);
 }
 
 function bytecode(world: WooWorld, obj: ObjRef, name: string, bytecodeValue: TinyBytecode, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; perms?: string } = {}): void {
   const existing = world.ownVerbExact(obj, name);
   if (existing) {
-    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existing.direct_callable || options.directCallable === true);
+    const existingDirectCallable = existing.direct_callable === true;
+    const existingSkipPresenceCheck = existing.skip_presence_check === true;
+    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existingDirectCallable || options.directCallable === true);
     const next = {
       ...existing,
       perms: parsedPerms.perms,
       direct_callable: parsedPerms.directCallable,
-      skip_presence_check: existing.skip_presence_check || options.skipPresenceCheck === true
+      skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true
     };
-    if (next.perms !== existing.perms || next.direct_callable !== existing.direct_callable || next.skip_presence_check !== existing.skip_presence_check) world.addVerb(obj, next);
+    if (next.perms !== existing.perms || next.direct_callable !== existingDirectCallable || next.skip_presence_check !== existingSkipPresenceCheck) world.addVerb(obj, next);
     return;
   }
   const parsedPerms = normalizeVerbPerms(options.perms ?? "rx", options.directCallable === true);
@@ -646,6 +796,9 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     throw new Error(`bootstrap source verb failed to compile: ${obj}:${name}`);
   }
   const existing = world.ownVerbExact(obj, name);
+  const existingDirectCallable = existing?.direct_callable === true;
+  const existingSkipPresenceCheck = existing?.skip_presence_check === true;
+  const existingToolExposed = existing?.tool_exposed === true;
   const parsedPerms = normalizeVerbPerms(options.perms ?? compiled.metadata?.perms ?? existing?.perms ?? "rx", options.directCallable === true);
   const next = {
     kind: "bytecode" as const,
@@ -660,17 +813,17 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     bytecode: { ...compiled.bytecode, version: (existing?.version ?? 0) + 1 },
     line_map: compiled.line_map ?? {},
     direct_callable: parsedPerms.directCallable,
-    skip_presence_check: existing?.skip_presence_check || options.skipPresenceCheck === true,
-    tool_exposed: existing?.tool_exposed || options.toolExposed === true
+    skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true,
+    tool_exposed: existingToolExposed || options.toolExposed === true
   };
   if (
     existing &&
     existing.kind === next.kind &&
     existing.source_hash === next.source_hash &&
     existing.perms === next.perms &&
-    existing.direct_callable === next.direct_callable &&
-    existing.skip_presence_check === next.skip_presence_check &&
-    existing.tool_exposed === next.tool_exposed &&
+    existingDirectCallable === next.direct_callable &&
+    existingSkipPresenceCheck === next.skip_presence_check &&
+    existingToolExposed === next.tool_exposed &&
     JSON.stringify(existing.aliases ?? []) === JSON.stringify(next.aliases ?? []) &&
     valuesEqual((existing.arg_spec ?? {}) as WooValue, (next.arg_spec ?? {}) as WooValue)
   ) return;
@@ -680,23 +833,26 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
 function native(world: WooWorld, obj: ObjRef, name: string, handler: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {
   const existing = world.ownVerbExact(obj, name);
   if (existing) {
-    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existing.direct_callable || options.directCallable === true);
+    const existingDirectCallable = existing.direct_callable === true;
+    const existingSkipPresenceCheck = existing.skip_presence_check === true;
+    const existingToolExposed = existing.tool_exposed === true;
+    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existingDirectCallable || options.directCallable === true);
     const aliases = options.aliases ?? existing.aliases;
     const argSpec = options.argSpec ?? existing.arg_spec;
     const next = {
       ...existing,
       perms: parsedPerms.perms,
       direct_callable: parsedPerms.directCallable,
-      skip_presence_check: existing.skip_presence_check || options.skipPresenceCheck === true,
-      tool_exposed: existing.tool_exposed || options.toolExposed === true,
+      skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true,
+      tool_exposed: existingToolExposed || options.toolExposed === true,
       aliases,
       arg_spec: argSpec
     };
     if (
       next.perms !== existing.perms ||
-      next.direct_callable !== existing.direct_callable ||
-      next.skip_presence_check !== existing.skip_presence_check ||
-      next.tool_exposed !== existing.tool_exposed ||
+      next.direct_callable !== existingDirectCallable ||
+      next.skip_presence_check !== existingSkipPresenceCheck ||
+      next.tool_exposed !== existingToolExposed ||
       JSON.stringify(next.aliases ?? []) !== JSON.stringify(existing.aliases ?? []) ||
       !valuesEqual((next.arg_spec ?? {}) as WooValue, (existing.arg_spec ?? {}) as WooValue)
     ) world.addVerb(obj, next);

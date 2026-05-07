@@ -182,6 +182,54 @@ woo-chat-space {
   margin-right: auto;
 }
 
+.chat-room-title {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  margin-right: auto;
+}
+
+.chat-room-title h1 {
+  margin-right: 0;
+}
+
+.weather-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  min-height: 1.45rem;
+  padding: 0.12rem 0.42rem;
+  border: 1px solid #cbd7c5;
+  border-radius: 999px;
+  background: #f8fbf5;
+  color: #243024;
+  font-size: 0.82rem;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.weather-badge-icon {
+  color: #b87400;
+  font-size: 0.92rem;
+}
+
+.weather-badge-condition {
+  display: none;
+}
+
+.weather-badge.pending,
+.weather-badge.error {
+  min-width: 1.45rem;
+  justify-content: center;
+}
+
+.weather-badge.error {
+  border-color: #d2aaa4;
+  background: #fff6f4;
+  color: #8b2d24;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));

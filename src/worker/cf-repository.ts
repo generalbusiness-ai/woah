@@ -50,7 +50,7 @@ import {
   verbFlagsJson,
   verbFromSqlRow as verbFromRow
 } from "../core/sql-shape";
-import { wooError, type ErrorValue, type Message, type ObjRef, type Observation, type SpaceLogEntry, type WooValue } from "../core/types";
+import { wooError, type ErrorValue, type Message, type MetricEvent, type ObjRef, type Observation, type SpaceLogEntry, type WooValue } from "../core/types";
 
 type Row = Record<string, unknown>;
 
@@ -58,9 +58,29 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   private sql: SqlStorage;
   private transactionDepth = 0;
 
-  constructor(private state: DurableObjectState) {
+  constructor(private state: DurableObjectState, private metricsHook?: (event: MetricEvent) => void) {
     this.sql = state.storage.sql;
-    this.migrate();
+    const startedAt = Date.now();
+    try {
+      this.migrate();
+      this.emitMetric({
+        kind: "startup_storage",
+        phase: "cf_repository_migrate",
+        ms: Date.now() - startedAt,
+        status: "ok",
+        statements: SQL_SCHEMA_STATEMENTS.length
+      });
+    } catch (err) {
+      this.emitMetric({
+        kind: "startup_storage",
+        phase: "cf_repository_migrate",
+        ms: Date.now() - startedAt,
+        status: "error",
+        statements: SQL_SCHEMA_STATEMENTS.length,
+        error: errorCode(err)
+      });
+      throw err;
+    }
   }
 
   // ---- WorldRepository compatibility (so WooWorld's constructor can accept us) ----
@@ -78,74 +98,97 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   // CF backend has to flush the bootstrap state through this method.
 
   load(): SerializedWorld | null {
-    const objectRows = this.all("SELECT * FROM object ORDER BY id");
-    if (objectRows.length === 0) return null;
+    const startedAt = Date.now();
+    try {
+      const objectRows = this.all("SELECT * FROM object ORDER BY id");
+      if (objectRows.length === 0) {
+        this.emitMetric({ kind: "startup_storage", phase: "cf_repository_load", ms: Date.now() - startedAt, status: "ok", stored: false, objects: 0 });
+        return null;
+      }
 
-    const propertyDefs = groupBy(this.all("SELECT * FROM property_def ORDER BY object_id, name"), "object_id");
-    const propertyValues = groupBy(this.all("SELECT * FROM property_value ORDER BY object_id, name"), "object_id");
-    const propertyVersions = groupBy(this.all("SELECT * FROM property_version ORDER BY object_id, name"), "object_id");
-    const verbs = groupBy(this.all("SELECT * FROM verb ORDER BY object_id, slot"), "object_id");
-    const children = groupBy(this.all("SELECT * FROM child ORDER BY object_id, child_ref"), "object_id");
-    const contents = groupBy(this.all("SELECT * FROM content ORDER BY object_id, content_ref"), "object_id");
-    const eventSchemas = groupBy(this.all("SELECT * FROM event_schema ORDER BY object_id, type"), "object_id");
+      const propertyDefs = groupBy(this.all("SELECT * FROM property_def ORDER BY object_id, name"), "object_id");
+      const propertyValues = groupBy(this.all("SELECT * FROM property_value ORDER BY object_id, name"), "object_id");
+      const propertyVersions = groupBy(this.all("SELECT * FROM property_version ORDER BY object_id, name"), "object_id");
+      const verbs = groupBy(this.all("SELECT * FROM verb ORDER BY object_id, slot"), "object_id");
+      const children = groupBy(this.all("SELECT * FROM child ORDER BY object_id, child_ref"), "object_id");
+      const contents = groupBy(this.all("SELECT * FROM content ORDER BY object_id, content_ref"), "object_id");
+      const eventSchemas = groupBy(this.all("SELECT * FROM event_schema ORDER BY object_id, type"), "object_id");
 
-    const objects: SerializedObject[] = objectRows.map((row) => ({
-      id: String(row.id),
-      name: String(row.name),
-      parent: row.parent === null ? null : String(row.parent),
-      owner: String(row.owner),
-      location: row.location === null ? null : String(row.location),
-      anchor: row.anchor === null ? null : String(row.anchor),
-      flags: flagsFromInt(Number(row.flags)),
-      created: Number(row.created),
-      modified: Number(row.modified),
-      propertyDefs: (propertyDefs.get(String(row.id)) ?? []).map((def) => ({
-        name: String(def.name),
-        defaultValue: parseValue(String(def.default_val)),
-        typeHint: def.type_hint == null ? undefined : String(def.type_hint),
-        owner: String(def.owner),
-        perms: String(def.perms),
-        version: Number(def.version)
-      })),
-      properties: (propertyValues.get(String(row.id)) ?? []).map(
-        (value) => [String(value.name), parseValue(String(value.value))] as [string, WooValue]
-      ),
-      propertyVersions: (propertyVersions.get(String(row.id)) ?? []).map(
-        (version) => [String(version.name), Number(version.version)] as [string, number]
-      ),
-      verbs: (verbs.get(String(row.id)) ?? []).map(verbFromRow),
-      children: (children.get(String(row.id)) ?? []).map((child) => String(child.child_ref)),
-      contents: (contents.get(String(row.id)) ?? []).map((content) => String(content.content_ref)),
-      eventSchemas: (eventSchemas.get(String(row.id)) ?? []).map(
-        (schema) => [String(schema.type), parseValue(String(schema.schema)) as Record<string, WooValue>] as [string, Record<string, WooValue>]
-      )
-    }));
+      const objects: SerializedObject[] = objectRows.map((row) => ({
+        id: String(row.id),
+        name: String(row.name),
+        parent: row.parent === null ? null : String(row.parent),
+        owner: String(row.owner),
+        location: row.location === null ? null : String(row.location),
+        anchor: row.anchor === null ? null : String(row.anchor),
+        flags: flagsFromInt(Number(row.flags)),
+        created: Number(row.created),
+        modified: Number(row.modified),
+        propertyDefs: (propertyDefs.get(String(row.id)) ?? []).map((def) => ({
+          name: String(def.name),
+          defaultValue: parseValue(String(def.default_val)),
+          typeHint: def.type_hint == null ? undefined : String(def.type_hint),
+          owner: String(def.owner),
+          perms: String(def.perms),
+          version: Number(def.version)
+        })),
+        properties: (propertyValues.get(String(row.id)) ?? []).map(
+          (value) => [String(value.name), parseValue(String(value.value))] as [string, WooValue]
+        ),
+        propertyVersions: (propertyVersions.get(String(row.id)) ?? []).map(
+          (version) => [String(version.name), Number(version.version)] as [string, number]
+        ),
+        verbs: (verbs.get(String(row.id)) ?? []).map(verbFromRow),
+        children: (children.get(String(row.id)) ?? []).map((child) => String(child.child_ref)),
+        contents: (contents.get(String(row.id)) ?? []).map((content) => String(content.content_ref)),
+        eventSchemas: (eventSchemas.get(String(row.id)) ?? []).map(
+          (schema) => [String(schema.type), parseValue(String(schema.schema)) as Record<string, WooValue>] as [string, Record<string, WooValue>]
+        )
+      }));
 
-    const sessions = this.all("SELECT * FROM session ORDER BY id").map(sessionFromRow);
+      const sessions = this.all("SELECT * FROM session ORDER BY id").map(sessionFromRow);
 
-    const logRows = this.all("SELECT * FROM space_message ORDER BY space_id, seq");
-    const logs = Array.from(groupBy(logRows, "space_id").entries()).map(([space, entries]) => [
-      space,
-      entries.map(logEntryFromRow) as SpaceLogEntry[]
-    ]) as [ObjRef, SpaceLogEntry[]][];
+      const logRows = this.all("SELECT * FROM space_message ORDER BY space_id, seq");
+      const logs = Array.from(groupBy(logRows, "space_id").entries()).map(([space, entries]) => [
+        space,
+        entries.map(logEntryFromRow) as SpaceLogEntry[]
+      ]) as [ObjRef, SpaceLogEntry[]][];
 
-    const snapshots = this.all("SELECT * FROM space_snapshot ORDER BY space_id, seq").map(snapshotFromRow);
-    const parkedTasks = this.all("SELECT * FROM task ORDER BY id").map(taskFromRow);
-    const tombstones = this.all("SELECT id FROM tombstone ORDER BY id").map((row) => String(row.id));
-    const meta = Object.fromEntries(this.all("SELECT key, value FROM world_meta").map((row) => [String(row.key), String(row.value ?? "")]));
+      const snapshots = this.all("SELECT * FROM space_snapshot ORDER BY space_id, seq").map(snapshotFromRow);
+      const parkedTasks = this.all("SELECT * FROM task ORDER BY id").map(taskFromRow);
+      const tombstones = this.all("SELECT id FROM tombstone ORDER BY id").map((row) => String(row.id));
+      const meta = Object.fromEntries(this.all("SELECT key, value FROM world_meta").map((row) => [String(row.key), String(row.value ?? "")]));
 
-    return {
-      version: 1,
-      objectCounter: Number(meta.objectCounter ?? meta.taskCounter ?? 1),
-      parkedTaskCounter: Number(meta.parkedTaskCounter ?? 1),
-      sessionCounter: Number(meta.sessionCounter ?? 1),
-      objects,
-      sessions,
-      logs,
-      snapshots,
-      parkedTasks,
-      tombstones
-    };
+      const world: SerializedWorld = {
+        version: 1,
+        objectCounter: Number(meta.objectCounter ?? meta.taskCounter ?? 1),
+        parkedTaskCounter: Number(meta.parkedTaskCounter ?? 1),
+        sessionCounter: Number(meta.sessionCounter ?? 1),
+        objects,
+        sessions,
+        logs,
+        snapshots,
+        parkedTasks,
+        tombstones
+      };
+      this.emitMetric({
+        kind: "startup_storage",
+        phase: "cf_repository_load",
+        ms: Date.now() - startedAt,
+        status: "ok",
+        stored: true,
+        objects: objects.length,
+        properties: serializedPropertyCount(objects),
+        sessions: sessions.length,
+        logs: logRows.length,
+        snapshots: snapshots.length,
+        tasks: parkedTasks.length
+      });
+      return world;
+    } catch (err) {
+      this.emitMetric({ kind: "startup_storage", phase: "cf_repository_load", ms: Date.now() - startedAt, status: "error", error: errorCode(err) });
+      throw err;
+    }
   }
 
   save(world: SerializedWorld): void {
@@ -156,39 +199,57 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
     // tables and re-inserting via the per-object methods, all in one
     // transaction. After this, enableIncrementalPersistence() takes over and
     // subsequent writes go through per-object methods directly.
-    this.transaction(() => {
-      // Drop everything; we're about to replace it.
-      for (const table of SQL_DELETE_TABLES) {
-        this.sql.exec(`DELETE FROM ${table}`);
-      }
-
-      this.saveMeta("version", String(world.version));
-      this.saveMeta("objectCounter", String(world.objectCounter));
-      this.saveMeta("parkedTaskCounter", String(world.parkedTaskCounter));
-      this.saveMeta("sessionCounter", String(world.sessionCounter));
-
-      for (const obj of world.objects) this.saveObject(obj);
-      for (const session of world.sessions) this.saveSession(session);
-
-      for (const [, entries] of world.logs) {
-        for (const entry of entries) {
-          this.sql.exec(
-            "INSERT INTO space_message(space_id, seq, ts, actor, message, observations, applied_ok, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            entry.space, entry.seq, entry.ts, entry.actor,
-            stringifyValue(entry.message as unknown as WooValue),
-            stringifyValue((entry.observations ?? []) as unknown as WooValue),
-            entry.applied_ok ? 1 : 0,
-            entry.error ? stringifyValue(entry.error as unknown as WooValue) : null
-          );
+    const startedAt = Date.now();
+    try {
+      this.transaction(() => {
+        // Drop everything; we're about to replace it.
+        for (const table of SQL_DELETE_TABLES) {
+          this.sql.exec(`DELETE FROM ${table}`);
         }
-      }
 
-      for (const snapshot of world.snapshots) this.saveSpaceSnapshot(snapshot);
-      for (const task of world.parkedTasks) this.saveTask(task);
+        this.saveMeta("version", String(world.version));
+        this.saveMeta("objectCounter", String(world.objectCounter));
+        this.saveMeta("parkedTaskCounter", String(world.parkedTaskCounter));
+        this.saveMeta("sessionCounter", String(world.sessionCounter));
 
-      const now = Date.now();
-      for (const id of world.tombstones ?? []) this.saveTombstone(id, now, null);
-    });
+        for (const obj of world.objects) this.saveObject(obj);
+        for (const session of world.sessions) this.saveSession(session);
+
+        for (const [, entries] of world.logs) {
+          for (const entry of entries) {
+            this.sql.exec(
+              "INSERT INTO space_message(space_id, seq, ts, actor, message, observations, applied_ok, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              entry.space, entry.seq, entry.ts, entry.actor,
+              stringifyValue(entry.message as unknown as WooValue),
+              stringifyValue((entry.observations ?? []) as unknown as WooValue),
+              entry.applied_ok ? 1 : 0,
+              entry.error ? stringifyValue(entry.error as unknown as WooValue) : null
+            );
+          }
+        }
+
+        for (const snapshot of world.snapshots) this.saveSpaceSnapshot(snapshot);
+        for (const task of world.parkedTasks) this.saveTask(task);
+
+        const now = Date.now();
+        for (const id of world.tombstones ?? []) this.saveTombstone(id, now, null);
+      });
+      this.emitMetric({
+        kind: "startup_storage",
+        phase: "cf_repository_save",
+        ms: Date.now() - startedAt,
+        status: "ok",
+        objects: world.objects.length,
+        properties: serializedPropertyCount(world.objects),
+        sessions: world.sessions.length,
+        logs: world.logs.reduce((sum, [, entries]) => sum + entries.length, 0),
+        snapshots: world.snapshots.length,
+        tasks: world.parkedTasks.length
+      });
+    } catch (err) {
+      this.emitMetric({ kind: "startup_storage", phase: "cf_repository_save", ms: Date.now() - startedAt, status: "error", error: errorCode(err) });
+      throw err;
+    }
   }
 
   latestSpaceSnapshot(space: ObjRef): SpaceSnapshotRecord | null {
@@ -685,4 +746,19 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
     if (this.tableColumns("verb").has("slot")) return;
     for (const stmt of SQL_VERB_ORDER_REBUILD_STATEMENTS) this.sql.exec(stmt);
   }
+
+  private emitMetric(event: MetricEvent): void {
+    const hook = this.metricsHook;
+    if (!hook) return;
+    try { hook(event); } catch { /* metrics must never throw */ }
+  }
+}
+
+function serializedPropertyCount(objects: SerializedObject[]): number {
+  return objects.reduce((sum, obj) => sum + obj.propertyDefs.length + obj.properties.length + obj.propertyVersions.length, 0);
+}
+
+function errorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
+  return err instanceof Error ? err.name : "E_INTERNAL";
 }

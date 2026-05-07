@@ -282,7 +282,7 @@ ws_session=$(node --input-type=module -e "
   });
   ws.on('error', (err) => { clearTimeout(t); console.error('socket: ' + err.message); process.exit(1); });
 " 2>&1) || fail "ws handshake failed: $ws_session"
-[[ "$ws_session" =~ ^session- ]] || fail "ws handshake unexpected reply: $ws_session"
+[[ "$ws_session" =~ ^session-[0-9a-f]{32}$ ]] || fail "ws handshake unexpected reply: $ws_session"
 POSTFLIGHT_SESSIONS+=("$ws_session")
 ok "ws handshake: session=$ws_session"
 

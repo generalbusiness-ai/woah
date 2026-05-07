@@ -31,7 +31,7 @@
 // - Private GitHub tap auth/cache policy — public GitHub taps are wired;
 //   private repos and content-hash caching are deferred.
 
-import { createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHostScopedWorld } from "../core/bootstrap";
+import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
@@ -61,6 +61,7 @@ export interface Env {
   WOO_INITIAL_WIZARD_TOKEN?: string;
   WOO_INTERNAL_SECRET?: string;
   WOO_AUTO_INSTALL_CATALOGS?: string;
+  WOO_HOST_READ_TIMEOUT_MS?: string;
 }
 
 const WORLD_HOST = "world";
@@ -71,6 +72,7 @@ const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
 const HOST_STATE_CACHE_LIMIT = 32;
 const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
+const HOST_READ_RPC_TIMEOUT_MS = 2500;
 
 export class PersistentObjectDO {
   private state: DurableObjectState;
@@ -105,7 +107,7 @@ export class PersistentObjectDO {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
-    this.repo = new CFObjectRepository(state);
+    this.repo = new CFObjectRepository(state, (event) => this.emitMetric(event, this.durableHostKey()));
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -139,7 +141,7 @@ export class PersistentObjectDO {
       const world = await this.getWorld(hostKey);
 
       if (internalRequest) {
-        return await this.handleInternal(request, world, pathname);
+        return await this.handleInternal(request, world, pathname, hostKey);
       }
 
       // WebSocket upgrade — accept via hibernation API. The connection survives
@@ -166,6 +168,14 @@ export class PersistentObjectDO {
       if (gatewayHost && pathname === "/mcp") {
         const gateway = this.getMcpGateway(world);
         return await gateway.handle(request);
+      }
+
+      if (gatewayHost && request.method === "POST" && pathname === "/api/admin/refresh-host-seeds") {
+        const session = this.requireRestSession(world, request);
+        if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
+        const body = await readJsonBody(request);
+        const hosts = Array.isArray(body.hosts) ? body.hosts.filter((item): item is string => typeof item === "string") : undefined;
+        return jsonResponse(await this.refreshRemoteHostSeeds(world, { hosts }));
       }
 
       const protocol = await handleRestProtocolRequest(workerRestRequest(request, pathname), {
@@ -294,9 +304,10 @@ export class PersistentObjectDO {
         return;
       }
       coldInitStart = Date.now();
+      const metricsHook = (event: MetricEvent) => this.emitMetric(event, hostKey);
       const world = hostKey === WORLD_HOST
-        ? createWorld({ repository: this.repo, catalogs: parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS) })
-        : await this.createHostScopedWorld(hostKey as ObjRef);
+        ? createWorld({ repository: this.repo, catalogs: parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS), metricsHook })
+        : await this.createHostScopedWorld(hostKey as ObjRef, metricsHook);
       this.installHostBridge(world, hostKey);
       // Rehydrate live WebSocket attachments. After DO wake-from-hibernation,
       // state.getWebSockets() returns sockets whose serializeAttachment
@@ -325,7 +336,7 @@ export class PersistentObjectDO {
     return world;
   }
 
-  private async createHostScopedWorld(hostKey: ObjRef): Promise<WooWorld> {
+  private async createHostScopedWorld(hostKey: ObjRef, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
     const stored = this.repo.load();
     let scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
     if (stored && !scoped) {
@@ -344,13 +355,26 @@ export class PersistentObjectDO {
       if (!scoped) throw err;
       console.warn("woo.cluster_seed_refresh_failed", { host: hostKey, error: normalizeError(err) });
     }
-    if (scoped && freshSeed) scoped = mergeHostScopedSeed(scoped, freshSeed);
+    let seedMergeChanged = false;
+    if (scoped && freshSeed) {
+      const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed);
+      scoped = merged.world;
+      seedMergeChanged = merged.changed;
+    }
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
-    const world = createWorldFromSerialized(scoped, { repository: this.repo });
+    const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook, persist: stored === null });
     // Run local catalog schema/data migration plans on this host's actual
     // slice. The gateway cannot convert state it does not own.
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
+    if (freshSeed) {
+      const seeded = mergeHostScopedSeedWithStatus(world.exportWorld(), freshSeed);
+      if (seeded.changed) {
+        world.importWorld(seeded.world);
+        seedMergeChanged = true;
+      }
+    }
+    if (seedMergeChanged) world.persistFullSnapshot();
     this.scrubStaleSubscribersOnce(world);
     return world;
   }
@@ -375,23 +399,85 @@ export class PersistentObjectDO {
   }
 
   private async fetchHostSeed(hostKey: ObjRef): Promise<SerializedWorld> {
+    const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
-    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/host-seed`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "x-woo-host-key": WORLD_HOST
-      },
-      body: JSON.stringify({ host: hostKey })
-    }));
-    const response = await this.env.WOO.get(id).fetch(request);
-    const body = await response.json();
-    if (!response.ok) throw wooError("E_STORAGE", `failed to load host seed for ${hostKey}`, body as WooValue);
-    return body as SerializedWorld;
+    try {
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/host-seed`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "x-woo-host-key": WORLD_HOST
+        },
+        body: JSON.stringify({ host: hostKey })
+      }));
+      const response = await this.env.WOO.get(id).fetch(request);
+      const body = await response.json();
+      if (!response.ok) {
+        throw wooError("E_STORAGE", `failed to load host seed for ${hostKey}`, body as WooValue);
+      }
+      this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "ok", objects: Array.isArray((body as { objects?: unknown }).objects) ? ((body as { objects: unknown[] }).objects.length) : undefined }, hostKey);
+      return body as SerializedWorld;
+    } catch (err) {
+      this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) }, hostKey);
+      throw err;
+    }
+  }
+
+  private async refreshRemoteHostSeeds(world: WooWorld, options: { hosts?: string[] } = {}): Promise<Record<string, unknown>> {
+    await this.registerObjectRoutes(world);
+    const requested = options.hosts && options.hosts.length > 0 ? new Set(options.hosts) : null;
+    const routeHosts = new Set(world.objectRoutes().map((route) => route.host).filter((host) => host && host !== WORLD_HOST));
+    const hosts = Array.from(new Set(
+      Array.from(routeHosts).filter((host) => !requested || requested.has(host))
+    )).sort();
+    const refreshed: Array<Record<string, unknown>> = [];
+    const skipped: Array<Record<string, unknown>> = [];
+    const errors: Array<Record<string, unknown>> = [];
+    if (requested) {
+      for (const host of Array.from(requested).sort()) {
+        if (host !== WORLD_HOST && !routeHosts.has(host)) skipped.push({ host, reason: "unmatched_host" });
+      }
+    }
+    for (const host of hosts) {
+      const seed = world.exportHostScopedWorld(host as ObjRef);
+      if (seed.objects.length === 0) {
+        skipped.push({ host, reason: "empty_seed" });
+        continue;
+      }
+      try {
+        const result = await this.forwardInternalChecked<Record<string, unknown>>(
+          host,
+          "/__internal/apply-host-seed",
+          { host, seed },
+          { timeoutMs: 15_000 }
+        );
+        refreshed.push(result);
+      } catch (err) {
+        errors.push({ host, error: normalizeError(err) });
+      }
+    }
+    return { ok: errors.length === 0, hosts: hosts.length, refreshed, skipped, errors };
+  }
+
+  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SerializedWorld): Record<string, unknown> {
+    const scopedSeed = nonEmptyHostScopedWorld(seed, hostKey);
+    if (!scopedSeed) throw wooError("E_OBJNF", `host seed does not contain ${hostKey}`, hostKey);
+    const current = world.exportWorld();
+    const merged = mergeHostScopedSeedWithStatus(current, scopedSeed);
+    if (merged.changed) {
+      world.importWorld(merged.world);
+      world.persistFullSnapshot();
+      this.hostStateCache.clear();
+      this.crossHostPropCache.clear();
+    }
+    return { ok: true, host: hostKey, changed: merged.changed, objects: world.objects.size };
   }
 
   private async registerObjectRoutes(world: WooWorld): Promise<void> {
-    if (this.routesRegistered) return;
+    if (this.routesRegistered) {
+      await this.registerIncrementalObjectRoutes(world);
+      return;
+    }
     const ok = await this.registerRoutes(world.objectRoutes());
     if (ok) this.routesRegistered = true;
   }
@@ -399,6 +485,45 @@ export class PersistentObjectDO {
   private async registerIncrementalObjectRoutes(world: WooWorld): Promise<void> {
     const routes = world.objectRoutes().filter((route) => this.publishedRoutes.get(route.id) !== route.host);
     await this.registerRoutes(routes);
+  }
+
+  private localObjectRoute(world: WooWorld | null | undefined, id: ObjRef): { id: ObjRef; host: string; anchor: ObjRef | null } | null {
+    return world?.objectRoutes().find((route) => route.id === id) ?? null;
+  }
+
+  private async adoptLocalObjectRoute(route: { id: ObjRef; host: string; anchor: ObjRef | null }): Promise<string> {
+    if (this.publishedRoutes.get(route.id) !== route.host) {
+      const ok = await this.registerRoutes([route]);
+      if (!ok) this.routeCache.set(route.id, route.host);
+    } else {
+      this.routeCache.set(route.id, route.host);
+    }
+    return route.host;
+  }
+
+  private async resolveObjectHostForWorld(world: WooWorld | null | undefined, id: ObjRef, fallbackHost: string): Promise<string> {
+    const localRoute = this.localObjectRoute(world, id);
+    const cached = this.routeCache.get(id);
+    if (cached) {
+      if (localRoute && localRoute.host !== cached) return await this.adoptLocalObjectRoute(localRoute);
+      return cached;
+    }
+    if (localRoute) return await this.adoptLocalObjectRoute(localRoute);
+    try {
+      const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/resolve-object`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ id, fallback_host: fallbackHost })
+      }));
+      const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
+      const body = await response.json() as Record<string, unknown>;
+      const host = typeof body.host === "string" ? body.host : fallbackHost;
+      this.routeCache.set(id, host);
+      return host;
+    } catch {
+      return fallbackHost;
+    }
   }
 
   private async registerRoutes(routes: Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>): Promise<boolean> {
@@ -426,15 +551,7 @@ export class PersistentObjectDO {
 
   private installHostBridge(world: WooWorld, localHost: string): void {
     const hostForObjectUncached = async (id: ObjRef): Promise<string | null> => {
-      const cached = this.routeCache.get(id);
-      if (cached) return cached;
-      const route = world.objectRoutes().find((item) => item.id === id);
-      if (route) {
-        this.routeCache.set(id, route.host);
-        return route.host;
-      }
-      if (localHost === WORLD_HOST && world.objects.has(id)) return localHost;
-      const resolved = await this.resolveObjectHost(id, "");
+      const resolved = await this.resolveObjectHostForWorld(world, id, "");
       return resolved || null;
     };
     const hostForObject = async (id: ObjRef, memo?: HostOperationMemo): Promise<string | null> => {
@@ -454,7 +571,7 @@ export class PersistentObjectDO {
             const cached = this.crossHostPropCache.get(cacheKey);
             if (cached && cached.expiresAt > Date.now()) return cached.value as WooValue;
           }
-          const response = await this.forwardInternalChecked<{ value: WooValue }>(host, "/__internal/remote-get-prop", { progr, obj: objRef, name });
+          const response = await this.forwardInternalReadChecked<{ value: WooValue }>(host, "/__internal/remote-get-prop", { progr, obj: objRef, name });
           if (cacheKey !== null) {
             if (this.crossHostPropCache.size >= PersistentObjectDO.CROSS_HOST_PROP_CACHE_MAX) {
               const firstKey = this.crossHostPropCache.keys().next().value;
@@ -467,11 +584,21 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `prop:${progr}:${objRef}:${name}`, read);
         return await read();
       },
+      setPropChecked: async (progr, objRef, name, value, memo) => {
+        const host = await hostForObject(objRef, memo);
+        if (!host || host === localHost) {
+          await world.setPropChecked(progr, objRef, name, value, memo);
+          return;
+        }
+        memo?.reads.delete(`prop:${progr}:${objRef}:${name}`);
+        this.crossHostPropCache.delete(`${host}|${objRef}|${name}`);
+        await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/remote-set-prop", { progr, obj: objRef, name, value });
+      },
       objectSummary: async (readActor, objRef, memo) => {
         const read = async (): Promise<ScopedObjectSummary> => {
           const host = await hostForObject(objRef, memo);
           if (!host || host === localHost) return await world.scopedObjectSummary(readActor, objRef, memo);
-          return await this.forwardInternalChecked<ScopedObjectSummary>(
+          return await this.forwardInternalReadChecked<ScopedObjectSummary>(
             host,
             "/__internal/object-summary",
             { read_actor: readActor, obj: objRef }
@@ -502,16 +629,25 @@ export class PersistentObjectDO {
           missingByHost.set(host, list);
         }
         await Promise.all(Array.from(missingByHost, async ([host, ids]) => {
-          const response = await this.forwardInternalChecked<{ objects: Record<ObjRef, ScopedObjectSummary> }>(
-            host,
-            "/__internal/object-summaries",
-            { read_actor: readActor, ids }
-          );
-          for (const id of ids) {
-            const summary = response.objects?.[id];
-            if (!summary) continue;
-            out[id] = summary;
-            if (memo) memo.reads.set(`summary:${readActor}:${id}`, Promise.resolve(summary));
+          try {
+            const response = await this.forwardInternalReadChecked<{ objects: Record<ObjRef, ScopedObjectSummary> }>(
+              host,
+              "/__internal/object-summaries",
+              { read_actor: readActor, ids }
+            );
+            if (!response.objects || typeof response.objects !== "object" || Array.isArray(response.objects)) {
+              throw wooError("E_INTERNAL", "remote object-summaries response missing objects", { host });
+            }
+            for (const id of ids) {
+              const summary = response.objects?.[id];
+              if (!summary) continue;
+              out[id] = summary;
+              if (memo) memo.reads.set(`summary:${readActor}:${id}`, Promise.resolve(summary));
+            }
+          } catch (err) {
+            if (!isReadAvailabilityError(err)) throw err;
+            // Scoped summaries are projection hints. A cold or slow remote host
+            // must not hold this host's single-threaded queue.
           }
         }));
         return out;
@@ -520,7 +656,7 @@ export class PersistentObjectDO {
         const read = async (): Promise<RoomSnapshot> => {
           const host = await hostForObject(room, memo);
           if (!host || host === localHost) return await world.roomSnapshotForActor(readActor, room, sessionId ?? null, memo);
-          return await this.forwardInternalChecked<RoomSnapshot>(
+          return await this.forwardInternalReadChecked<RoomSnapshot>(
             host,
             "/__internal/room-snapshot",
             { read_actor: readActor, room, session_id: sessionId ?? null }
@@ -533,7 +669,7 @@ export class PersistentObjectDO {
         const read = async (): Promise<OverlaySnapshot> => {
           const host = await hostForObject(subject, memo);
           if (!host || host === localHost) return await world.overlaySnapshotForActor(readActor, subject, surface, sessionId ?? null, memo);
-          return await this.forwardInternalChecked<OverlaySnapshot>(
+          return await this.forwardInternalReadChecked<OverlaySnapshot>(
             host,
             "/__internal/overlay-snapshot",
             { read_actor: readActor, subject, surface, session_id: sessionId ?? null }
@@ -554,7 +690,7 @@ export class PersistentObjectDO {
               obvious_verbs: world.obviousCommandSyntaxes(objRef, world.object(objRef).name || objRef)
             };
           }
-          return await this.forwardInternalChecked<HostObjectSummary>(
+          return await this.forwardInternalReadChecked<HostObjectSummary>(
             host,
             "/__internal/remote-describe",
             { name_actor: nameActor, read_actor: readActor, obj: objRef }
@@ -591,16 +727,24 @@ export class PersistentObjectDO {
           missingByHost.set(host, list);
         }
         await Promise.all(Array.from(missingByHost, async ([host, ids]) => {
-          const response = await this.forwardInternalChecked<{ objects: Record<ObjRef, HostObjectSummary> }>(
-            host,
-            "/__internal/remote-describe-many",
-            { name_actor: nameActor, read_actor: readActor, ids }
-          );
-          for (const id of ids) {
-            const summary = response.objects?.[id];
-            if (!summary) continue;
-            out[id] = summary;
-            if (memo) memo.reads.set(`describe:${nameActor}:${readActor}:${id}`, Promise.resolve(summary));
+          try {
+            const response = await this.forwardInternalReadChecked<{ objects: Record<ObjRef, HostObjectSummary> }>(
+              host,
+              "/__internal/remote-describe-many",
+              { name_actor: nameActor, read_actor: readActor, ids }
+            );
+            if (!response.objects || typeof response.objects !== "object" || Array.isArray(response.objects)) {
+              throw wooError("E_INTERNAL", "remote describe-many response missing objects", { host });
+            }
+            for (const id of ids) {
+              const summary = response.objects?.[id];
+              if (!summary) continue;
+              out[id] = summary;
+              if (memo) memo.reads.set(`describe:${nameActor}:${readActor}:${id}`, Promise.resolve(summary));
+            }
+          } catch (err) {
+            if (!isReadAvailabilityError(err)) throw err;
+            // Object matching/rendering can fall back to ids for a slow host.
           }
         }));
         return out;
@@ -612,7 +756,7 @@ export class PersistentObjectDO {
             const { verb } = world.resolveVerb(target, verbName);
             return { name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
           }
-          return await this.forwardInternalChecked<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>(
+          return await this.forwardInternalReadChecked<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>(
             host,
             "/__internal/remote-resolve-verb",
             { target, verb: verbName }
@@ -621,11 +765,25 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `verb:${target}:${verbName}`, read);
         return await read();
       },
+      commandVerbCandidates: async (target, verbName, memo) => {
+        const read = async () => {
+          const host = await hostForObject(target, memo);
+          if (!host || host === localHost) return world.commandVerbCandidateSummaries(target, verbName);
+          const response = await this.forwardInternalReadChecked<{ candidates?: Array<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }> }>(
+            host,
+            "/__internal/remote-command-verb-candidates",
+            { target, verb: verbName }
+          );
+          return Array.isArray(response.candidates) ? response.candidates : [];
+        };
+        if (memo) return await memoizeHostOperation(memo.reads, `command-verbs:${target}:${verbName}`, read);
+        return await read();
+      },
       isDescendantOf: async (objRef, ancestorRef, memo) => {
         const read = async (): Promise<boolean> => {
           const host = await hostForObject(objRef, memo);
           if (!host || host === localHost) return world.isDescendantOf(objRef, ancestorRef);
-          const response = await this.forwardInternalChecked<{ result: boolean }>(
+          const response = await this.forwardInternalReadChecked<{ result: boolean }>(
             host,
             "/__internal/remote-is-descendant",
             { obj: objRef, ancestor: ancestorRef }
@@ -639,7 +797,7 @@ export class PersistentObjectDO {
         const read = async (): Promise<ObjRef | null> => {
           const host = await hostForObject(objRef, memo);
           if (!host || host === localHost) return world.object(objRef).location;
-          const response = await this.forwardInternalChecked<{ location: ObjRef | null }>(host, "/__internal/remote-location", { obj: objRef });
+          const response = await this.forwardInternalReadChecked<{ location: ObjRef | null }>(host, "/__internal/remote-location", { obj: objRef });
           return response.location;
         };
         if (memo) return await memoizeHostOperation(memo.reads, `location:${objRef}`, read);
@@ -743,7 +901,7 @@ export class PersistentObjectDO {
         const read = async (): Promise<string[]> => {
           const host = await hostForObject(space, memo);
           if (!host || host === localHost) return world.presenceSessionIdsIn(space, actors);
-          const response = await this.forwardInternalChecked<{ sessions: string[] }>(
+          const response = await this.forwardInternalReadChecked<{ sessions: string[] }>(
             host,
             "/__internal/space-audience-sessions",
             { space, actors: actors ?? null }
@@ -757,7 +915,7 @@ export class PersistentObjectDO {
         const read = async (): Promise<ObjRef[]> => {
           const host = await hostForObject(actor, memo);
           if (!host || host === localHost) return world.allLocationsForActor(actor);
-          const response = await this.forwardInternalChecked<{ locations: ObjRef[] }>(
+          const response = await this.forwardInternalReadChecked<{ locations: ObjRef[] }>(
             host,
             "/__internal/actor-session-locations",
             { actor }
@@ -771,7 +929,7 @@ export class PersistentObjectDO {
         const read = async (): Promise<ObjRef[]> => {
           const host = await hostForObject(objRef, memo);
           if (!host || host === localHost) return world.contentsOf(objRef);
-          const response = await this.forwardInternalChecked<{ contents: ObjRef[] }>(host, "/__internal/contents", { obj: objRef });
+          const response = await this.forwardInternalReadChecked<{ contents: ObjRef[] }>(host, "/__internal/contents", { obj: objRef });
           return response.contents;
         };
         if (memo) return await memoizeHostOperation(memo.reads, `contents:${objRef}`, read);
@@ -791,7 +949,7 @@ export class PersistentObjectDO {
         const responses = await Promise.all(
           Array.from(byHost, async ([host, hostIds]) => {
             try {
-              const response = await this.forwardInternalChecked<{ tools: RemoteToolDescriptor[] }>(host, "/__internal/enumerate-tools", { actor, ids: hostIds });
+              const response = await this.forwardInternalReadChecked<{ tools: RemoteToolDescriptor[] }>(host, "/__internal/enumerate-tools", { actor, ids: hostIds });
               const tools = response.tools ?? [];
               // Returned descriptors include runtime-minted objects (tasks
               // created on the cluster) that the directory may not know about
@@ -1026,7 +1184,7 @@ export class PersistentObjectDO {
     return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
   }
 
-  private async handleInternal(request: Request, world: WooWorld, pathname: string): Promise<Response> {
+  private async handleInternal(request: Request, world: WooWorld, pathname: string, hostKey: string): Promise<Response> {
     try {
       if (request.method === "GET" && pathname === "/__internal/state") {
         const actor = request.headers.get("x-woo-internal-actor");
@@ -1042,6 +1200,15 @@ export class PersistentObjectDO {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
         return jsonResponse(world.exportHostScopedWorld(host));
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/apply-host-seed") {
+        if (hostKey === WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "host seed apply is only available on object hosts");
+        const host = String(body.host ?? "") as ObjRef;
+        if (!host) throw wooError("E_INVARG", "apply-host-seed requires host");
+        if (host !== hostKey) throw wooError("E_INVARG", `host mismatch: ${host} != ${hostKey}`);
+        if (!isSerializedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires serialized seed");
+        return jsonResponse(this.applyHostSeed(world, host, body.seed));
       }
 
       if (request.method === "POST" && pathname === "/__internal/broadcast-applied") {
@@ -1155,6 +1322,14 @@ export class PersistentObjectDO {
         return jsonResponse({ value: await world.getPropChecked(progr, obj, name) });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/remote-set-prop") {
+        const progr = String(body.progr ?? "") as ObjRef;
+        const obj = String(body.obj ?? "") as ObjRef;
+        const name = String(body.name ?? "");
+        await world.setPropChecked(progr, obj, name, body.value as WooValue);
+        return jsonResponse({ ok: true });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/object-summary") {
         const readActor = String(body.read_actor ?? "") as ObjRef;
         const obj = String(body.obj ?? "") as ObjRef;
@@ -1220,6 +1395,12 @@ export class PersistentObjectDO {
         const verbName = String(body.verb ?? "");
         const { verb } = world.resolveVerb(target, verbName);
         return jsonResponse({ name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/remote-command-verb-candidates") {
+        const target = String(body.target ?? "") as ObjRef;
+        const verbName = String(body.verb ?? "");
+        return jsonResponse({ candidates: world.commandVerbCandidateSummaries(target, verbName) });
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-is-descendant") {
@@ -1568,7 +1749,7 @@ export class PersistentObjectDO {
       },
       broadcastApplied: (frameValue, originator) => this.handleAppliedFrame(world, frameValue, originator),
       broadcastTaskResult: (result) => this.broadcastTaskResult(world, result),
-      broadcastLiveEvents: (result) => this.broadcastLiveEvents(world, result)
+      broadcastLiveEvents: (result, originator) => this.broadcastLiveEvents(world, result, null, originator)
     });
   }
 
@@ -1634,23 +1815,7 @@ export class PersistentObjectDO {
   }
 
   private async resolveObjectHost(id: ObjRef, fallbackHost: string): Promise<string> {
-    const cached = this.routeCache.get(id);
-    if (cached) return cached;
-    try {
-      const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
-      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/resolve-object`, {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ id, fallback_host: fallbackHost })
-      }));
-      const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
-      const body = await response.json() as Record<string, unknown>;
-      const host = typeof body.host === "string" ? body.host : fallbackHost;
-      this.routeCache.set(id, host);
-      return host;
-    } catch {
-      return fallbackHost;
-    }
+    return await this.resolveObjectHostForWorld(this.world, id, fallbackHost);
   }
 
   private async forwardWsCall(
@@ -1728,7 +1893,12 @@ export class PersistentObjectDO {
     return this.forwardInternal(host, "/__internal/replay", body);
   }
 
-  private async forwardInternal<T>(host: string, path: string, body: Record<string, unknown>): Promise<T> {
+  private hostReadRpcTimeoutMs(): number {
+    const configured = Number(this.env.WOO_HOST_READ_TIMEOUT_MS);
+    return Number.isFinite(configured) && configured > 0 ? configured : HOST_READ_RPC_TIMEOUT_MS;
+  }
+
+  private async forwardInternal<T>(host: string, path: string, body: Record<string, unknown>, options: { timeoutMs?: number } = {}): Promise<T> {
     const id = this.env.WOO.idFromName(host);
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
       method: "POST",
@@ -1739,18 +1909,56 @@ export class PersistentObjectDO {
       body: JSON.stringify(body)
     }));
     const startedAt = Date.now();
-    const response = await this.env.WOO.get(id).fetch(request);
-    const parsed = await response.json() as T;
-    this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok" });
-    return parsed;
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const fetchResult = (async () => {
+      const response = await this.env.WOO.get(id).fetch(request);
+      return await response.json() as T;
+    })();
+    const timeoutMs = options.timeoutMs;
+    try {
+      if (!timeoutMs || timeoutMs <= 0) {
+        const parsed = await fetchResult;
+        this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok" });
+        return parsed;
+      }
+      return await new Promise<T>((resolve, reject) => {
+        timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "timeout" });
+          reject(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs }));
+        }, timeoutMs);
+        fetchResult.then((parsed) => {
+          if (settled) return;
+          settled = true;
+          if (timeout !== undefined) clearTimeout(timeout);
+          this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok" });
+          resolve(parsed);
+        }, (err) => {
+          if (settled) return;
+          settled = true;
+          if (timeout !== undefined) clearTimeout(timeout);
+          const error = normalizeError(err);
+          this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "error", error: error.code });
+          reject(err);
+        });
+      });
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   }
 
-  private async forwardInternalChecked<T>(host: string, path: string, body: Record<string, unknown>): Promise<T> {
-    const parsed = await this.forwardInternal<T | { error?: unknown }>(host, path, body);
+  private async forwardInternalChecked<T>(host: string, path: string, body: Record<string, unknown>, options: { timeoutMs?: number } = {}): Promise<T> {
+    const parsed = await this.forwardInternal<T | { error?: unknown }>(host, path, body, options);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "error" in parsed && (parsed as { error?: unknown }).error) {
       throw normalizeError((parsed as { error: unknown }).error);
     }
     return parsed as T;
+  }
+
+  private async forwardInternalReadChecked<T>(host: string, path: string, body: Record<string, unknown>): Promise<T> {
+    return await this.forwardInternalChecked<T>(host, path, body, { timeoutMs: this.hostReadRpcTimeoutMs() });
   }
 
   private forwardBody(
@@ -1831,45 +2039,47 @@ export class PersistentObjectDO {
     }
   }
 
-  private broadcastLiveEvents(world: WooWorld, result: DirectResultFrame, originMcpSessionId?: string | null): void {
+  private broadcastLiveEvents(world: WooWorld, result: DirectResultFrame, originMcpSessionId?: string | null, originator?: WebSocket): void {
     if (!result.audience) return;
-      const startedAt = Date.now();
-      let audienceSize = 0;
-      result.observations.forEach((observation, index) => {
-        const frame: LiveEventFrame = { op: "event", observation };
-        audienceSize += this.broadcastLiveEvent(
-          world,
-          frame,
-          result.audience!,
-          result.observationAudiences?.[index] ?? result.audienceActors,
-          result.observationSessionAudiences?.[index] ?? result.audienceSessions
-        );
-      });
+    const startedAt = Date.now();
+    let audienceSize = 0;
+    result.observations.forEach((observation, index) => {
+      const frame: LiveEventFrame = { op: "event", observation };
+      audienceSize += this.broadcastLiveEvent(
+        world,
+        frame,
+        result.audience!,
+        result.observationAudiences?.[index] ?? result.audienceActors,
+        result.observationSessionAudiences?.[index] ?? result.audienceSessions,
+        originator
+      );
+    });
     this.mcpGateway?.routeLiveEvents(result, originMcpSessionId ?? null);
     world.recordMetric({ kind: "broadcast", audience_size: audienceSize, obs_count: result.observations.length, ms: Date.now() - startedAt });
   }
 
-    private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[]): number {
+  private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[], originator?: WebSocket): number {
     const data = JSON.stringify(frame);
     const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
     let delivered = 0;
     const sendAll = (sockets: Set<WebSocket> | undefined): void => {
       if (!sockets) return;
       for (const ws of sockets) {
+        if (ws === originator) continue;
         delivered += 1;
         try { ws.send(data); } catch { /* gone */ }
       }
     };
-      if (directedTo || directedFrom) {
-        if (directedTo) sendAll(this.socketsByActor.get(directedTo));
-        if (directedFrom && directedFrom !== directedTo) sendAll(this.socketsByActor.get(directedFrom));
-        return delivered;
-      }
-      if (audienceSessions) {
-        for (const sessionId of audienceSessions) sendAll(this.socketsBySession.get(sessionId));
-        return delivered;
-      }
-      const actorsIter: Iterable<ObjRef> | null = audienceActors
+    if (directedTo || directedFrom) {
+      if (directedTo) sendAll(this.socketsByActor.get(directedTo));
+      if (directedFrom && directedFrom !== directedTo) sendAll(this.socketsByActor.get(directedFrom));
+      return delivered;
+    }
+    if (audienceSessions) {
+      for (const sessionId of audienceSessions) sendAll(this.socketsBySession.get(sessionId));
+      return delivered;
+    }
+    const actorsIter: Iterable<ObjRef> | null = audienceActors
       ? audienceActors
       : world.presenceActorsIn(audience);
     if (!actorsIter) return delivered;
@@ -1937,6 +2147,16 @@ function readMap(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+function isSerializedWorld(value: unknown): value is SerializedWorld {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<Record<keyof SerializedWorld, unknown>>;
+  return Array.isArray(candidate.objects) &&
+    Array.isArray(candidate.sessions) &&
+    Array.isArray(candidate.logs) &&
+    Array.isArray(candidate.snapshots) &&
+    Array.isArray(candidate.parkedTasks);
+}
+
 function uniqueRoutes(routes: Array<{ id: string; host: string; anchor: string | null }>): Array<{ id: string; host: string; anchor: string | null }> {
   const byId = new Map<string, { id: string; host: string; anchor: string | null }>();
   for (const route of routes) {
@@ -1961,6 +2181,11 @@ function commandPlanFromProtocolValue(value: WooValue): { route: "direct" | "seq
   };
 }
 
+function isReadAvailabilityError(err: unknown): boolean {
+  const error = normalizeError(err);
+  return error.code === "E_TIMEOUT" || error.code === "E_OBJNF";
+}
+
 async function workerHashText(text: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -1968,4 +2193,9 @@ async function workerHashText(text: string): Promise<string> {
 
 function logCatalogTapEvent(event: CatalogTapLogEvent): void {
   console.log("woo.catalog", JSON.stringify({ ...event, ts: Date.now() }));
+}
+
+function metricErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
+  return err instanceof Error ? err.name : "E_INTERNAL";
 }

@@ -108,6 +108,22 @@ that session's current location. This keeps command parsing and room verbs scope
 to the tab/tool session that issued the call. It is a behavior-readable core
 field, not a property lookup.
 
+`note_text_summary(note, limit?)` returns `{lines, preview, truncated}` for the
+base note display path without materializing an unbounded note body in the Tiny
+VM. `limit` defaults to 96 and is clamped to `0..512` characters. The builtin
+first requires `note` to be a local `$note` descendant and raises `E_TYPE`
+otherwise. It then calls `note:is_readable_by(actor)` and raises `E_PERM` if it
+does not return true. The reference implementation then reads the note object's raw
+`.text` property locally, treats non-list text as empty, reports the list length
+as `lines`, and derives `preview` from the first string element only. If the
+preview exceeds the clamped limit, it is truncated and `truncated` is true; when
+there is room for an ellipsis, the returned preview ends with `...`.
+
+This builtin is intentionally narrow and catalog-supporting, not the public note
+text contract. Catalog callers should use the overridable `$note:text_summary`
+verb so subclasses that decrypt, redact, or derive text can keep title and look
+semantics aligned with their full `:text()` behavior.
+
 `current_session()` returns the current session id or `null` for host/bootstrap
 tasks. `current_location()` returns the current session's location or `null`.
 `session_location(id)` returns that live session's location or `null`.
@@ -235,7 +251,7 @@ override uses these to surface `is sleeping` / `awake and looks alert` /
 | `E_INTRPT` | Task killed. |
 | `E_GONE` | Transient ref no longer valid (host disconnected). |
 | `E_TIMEOUT` | Deadline exceeded (task wall-time budget, cross-host RPC). |
-| `E_CROSS_HOST_WRITE` | Behavior attempted a property-definition or property-value write on an object outside the current host's atomic rollback scope. |
+| `E_CROSS_HOST_WRITE` | Behavior attempted a property definition, property metadata edit, lifecycle change, or authoring write on an object outside the current host's atomic rollback scope. Ordinary property-value assignment routes to the object's host. |
 | `E_HOST_CYCLE` | Awaited host RPC would re-enter a host already in the current request's wait-for chain. |
 | `E_NOSESSION` | Session token is expired or unknown. |
 | `E_VERSION` | Bytecode version mismatch (cache stale). |

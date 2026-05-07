@@ -1,6 +1,6 @@
 {
   "name": "horoscope",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "spec_version": "v1",
   "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory carrying the generated text.",
   "license": "MIT",
@@ -9,9 +9,45 @@
     {
       "local_name": "$horoscope_block",
       "parent": "$dispenser_block",
+      "flags": { "fertile": true },
       "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, and calls :deliver to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
       "properties": [],
       "verbs": [
+        {
+          "name": "assert_configurable",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :assert_configurable() rxd { if (actor == this.owner || has_flag(actor, \"wizard\")) { return true; } raise { code: \"E_PERM\", message: \"only the block owner or wizard can configure horoscope\", value: { actor: actor, block: this } }; }"
+        },
+        {
+          "name": "set_system_prompt",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": { "args": ["prompt"] },
+          "source": "verb :set_system_prompt(prompt) rx { this:assert_configurable(); if (typeof(prompt) != \"string\" || !str_trim(prompt)) { raise { code: \"E_INVARG\", message: \"set_system_prompt requires a non-empty prompt\", value: prompt }; } return this:set_property(\"system_prompt\", str_trim(prompt)); }"
+        },
+        {
+          "name": "set_rate_limits",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": { "args": ["requester_seconds", "block_seconds"] },
+          "source": "verb :set_rate_limits(requester_seconds, block_seconds) rx { this:assert_configurable(); let requester = requester_seconds; if (typeof(requester) == \"string\") { requester = to_int(str_trim(requester)); } let block = block_seconds; if (typeof(block) == \"string\") { block = to_int(str_trim(block)); } if (typeof(requester) != \"number\" || requester < 0) { raise { code: \"E_INVARG\", message: \"requester_seconds must be a non-negative number\", value: requester_seconds }; } if (typeof(block) != \"number\" || block < 0) { raise { code: \"E_INVARG\", message: \"block_seconds must be a non-negative number\", value: block_seconds }; } return this:set_properties({ rate_limit_seconds: round(requester), block_cooldown_seconds: round(block) }); }"
+        },
+        {
+          "name": "set_queue_limits",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": { "args": ["max_pending_orders", "max_request_chars"] },
+          "source": "verb :set_queue_limits(max_pending_orders, max_request_chars) rx { this:assert_configurable(); let pending = max_pending_orders; if (typeof(pending) == \"string\") { pending = to_int(str_trim(pending)); } let chars = max_request_chars; if (typeof(chars) == \"string\") { chars = to_int(str_trim(chars)); } if (typeof(pending) != \"number\" || pending < 0) { raise { code: \"E_INVARG\", message: \"max_pending_orders must be a non-negative number\", value: max_pending_orders }; } if (typeof(chars) != \"number\" || chars < 0) { raise { code: \"E_INVARG\", message: \"max_request_chars must be a non-negative number\", value: max_request_chars }; } return this:set_properties({ max_pending_orders: round(pending), max_request_chars: round(chars) }); }"
+        },
         {
           "name": "title",
           "perms": "rxd",
@@ -26,7 +62,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will arrive as a note in your inventory when the plug drains the queue.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
         }
       ]
     }

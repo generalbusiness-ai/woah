@@ -3,14 +3,16 @@ import chatManifest from "../../catalogs/chat/manifest.json";
 import dubspaceManifest from "../../catalogs/dubspace/manifest.json";
 import pinboardManifest from "../../catalogs/pinboard/manifest.json";
 import taskspaceManifest from "../../catalogs/taskspace/manifest.json";
+import weatherManifest from "../../catalogs/weather/manifest.json";
 import * as chatUiModule from "../../catalogs/chat/ui/chat-space";
 import * as dubspaceUiModule from "../../catalogs/dubspace/ui/dubspace-workspace";
 import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
 import * as taskspaceUiModule from "../../catalogs/taskspace/ui/taskspace-workspace";
+import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
-import type { ChatLine, ChatSpaceData, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
+import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
 import type { TaskspaceData } from "../../catalogs/taskspace/ui/taskspace-workspace";
@@ -2415,7 +2417,8 @@ function installBundledCatalogUi() {
     { alias: "chat", manifest: chatManifest, objects: { "$space": "$space", "$chatroom": "$chatroom" }, modules: { "chat-ui": chatUiModule } },
     { alias: "dubspace", manifest: dubspaceManifest, objects: { "$dubspace": "$dubspace" }, modules: { "dubspace-ui": dubspaceUiModule } },
     { alias: "pinboard", manifest: pinboardManifest, objects: { "$pinboard": "$pinboard" }, modules: { "pinboard-ui": pinboardUiModule } },
-    { alias: "taskspace", manifest: taskspaceManifest, objects: { "$taskspace": "$taskspace" }, modules: { "taskspace-ui": taskspaceUiModule } }
+    { alias: "taskspace", manifest: taskspaceManifest, objects: { "$taskspace": "$taskspace" }, modules: { "taskspace-ui": taskspaceUiModule } },
+    { alias: "weather", manifest: weatherManifest, objects: { "$weather_block": "$weather_block" }, modules: { "weather-ui": weatherUiModule } }
   ] as const;
   for (const item of bundled) {
     const uiManifest = (item.manifest as any).ui;
@@ -3307,12 +3310,52 @@ function mountChatComponent() {
   setCustomElementData(element, {
     roomName: String(room?.name ?? "Room"),
     roomDescription: String(room?.props?.description ?? ""),
+    titleBadges: roomTitleBadges(subject),
     lines,
     present,
     draft: state.chatDraft,
     inRoom,
     canSend: canSendDirect()
   }, () => scrollChatFeedToEnd(element.querySelector<HTMLElement>(".chat-feed") ?? ".chat-feed"));
+}
+
+function roomTitleBadges(room: string): ChatTitleBadge[] {
+  const badges: ChatTitleBadge[] = [];
+  const components = ui.catalogUi.componentsForSurface("title-badge");
+  if (!room || components.length === 0) return badges;
+  for (const item of currentRoomContents(room)) {
+    const subject = String(item?.id ?? "");
+    if (!subject) continue;
+    const component = components.find((candidate) => {
+      const constraint = candidate.declaration.subject;
+      return typeof constraint === "string" && clientClassDistance(subject, constraint) !== false;
+    });
+    if (!component) continue;
+    const projected = ui.observe(subject) ?? item;
+    badges.push({
+      id: `${component.qualifiedId}:${subject}`,
+      tag: component.declaration.tag,
+      subject,
+      data: projected
+    });
+  }
+  return badges;
+}
+
+function currentRoomContents(room: string): any[] {
+  if (!room) return [];
+  if (scopedProjectionEnabled && String(state.scopedProjection?.here?.id ?? "") === room) {
+    return arrayOfObjects(state.scopedProjection?.here?.contents)
+      .map((item) => {
+        const id = String(item?.id ?? "");
+        return id ? ui.observe(id) ?? item : null;
+      })
+      .filter((item): item is any => Boolean(item));
+  }
+  const contentIds = Array.isArray(state.world?.objects?.[room]?.contents) ? state.world.objects[room].contents : [];
+  return contentIds
+    .map((id: unknown) => projectedObjectView(String(id)))
+    .filter((item: any): item is any => Boolean(item));
 }
 
 function chatFrameComponentTag(): string | null {

@@ -1,6 +1,6 @@
 ---
 name: horoscope
-version: 0.1.0
+version: 0.1.1
 spec_version: v1
 license: MIT
 description: Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM.
@@ -18,6 +18,8 @@ A `$horoscope_block` is a `$dispenser_block` subclass — the demo
 artifact-producing block. You `:order` a request (e.g. `"scorpio"`) and
 a `$dispensed_note` lands in your inventory carrying a generated
 horoscope.
+`$horoscope_block` is a fertile template: behavior and owner tools live
+on the class, while deployed horoscope machines are ordinary instances.
 
 The plug Worker lives at [`plug/`](plug/). It runs on a short cron
 trigger, reads `pending_orders` via the apikey-bound REST surface,
@@ -36,6 +38,20 @@ See [DESIGN.md](DESIGN.md) for design notes.
 | `last_pushed_at` | self | Plug heartbeat timestamp. `0` means the machine presents as disconnected. |
 | `last_error` | self | Last plug drain error, if any. |
 
+## Owner Tools
+
+`$horoscope_block` exposes narrow configuration verbs on each instance:
+
+| Verb | Notes |
+|---|---|
+| `set_system_prompt(prompt)` | Sets the LLM persona/instructions. |
+| `set_rate_limits(requester_seconds, block_seconds)` | Sets per-requester and block-wide cooldowns. Use `0` to disable either. |
+| `set_queue_limits(max_pending_orders, max_request_chars)` | Sets queue length and request-size caps. Use `0` for unbounded. |
+
+Only the block owner or a wizard can use these verbs. The generic
+`$block:set_property` / `:set_properties` surface remains hidden from MCP
+tools; plug sessions still use it for queue bookkeeping.
+
 ## Look Surface
 
 `:look_self()` reports `connected` / `disconnected`, queue count, and a
@@ -46,14 +62,15 @@ order horoscope scorpio
 order horoscope "the launch review"
 ```
 
-The command returns a ticket immediately; the generated note appears when
-the plug next drains the queue.
+The command returns a ticket immediately and tells the requester the order
+was accepted. The generated note appears when the plug next drains the
+queue; delivery also sends the requester a text notification.
 
 ## Provisioning
 
 ```text
 @create_instance $horoscope_block as the_deck_horoscope location: the_deck
-:set_property("system_prompt", "You are a wry, slightly weary fortune-teller. Reply with two short sentences for the asker's sign or topic.")
+:set_system_prompt("You are a wry, slightly weary fortune-teller. Reply with two short sentences for the asker's sign or topic.")
 :set_property("description", "A horoscope vending machine on the deck. It hums faintly.")
 :mint_apikey("horoscope-cf-worker-prod")
 # paste secret into wrangler secret put WOO_APIKEY

@@ -94,6 +94,18 @@ export type WeatherTickResult = {
   fetched_at: number;
 };
 
+export class WeatherConfigError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status: number,
+    public readonly value?: unknown
+  ) {
+    super(message);
+    this.name = "WeatherConfigError";
+  }
+}
+
 export async function runWeatherTick(
   env: WeatherPlugEnv,
   deps: { fetchImpl?: typeof fetch } = {}
@@ -105,11 +117,9 @@ export async function runWeatherTick(
   const placeValue = await client.getProperty(env.BLOCK_ID, "place");
   const place = typeof placeValue === "string" && placeValue.trim() ? placeValue : null;
   if (!place) {
-    await client.directCall(env.BLOCK_ID, "set_property", [
-      "last_error",
-      "owner has not configured `place` on this block"
-    ]);
-    throw new WooError("E_NO_PLACE", "owner has not configured `place` on this block", 400);
+    const message = "owner has not configured `place`; set it to a town name or zip code";
+    await writeConfigError(client, env.BLOCK_ID, "E_NO_PLACE", message, { place: placeValue });
+    throw new WeatherConfigError("E_NO_PLACE", message, 400, { place: placeValue });
   }
 
   // Owner-set knobs ride writable_owner on the block. The plug honors them
@@ -118,6 +128,13 @@ export async function runWeatherTick(
   // the $block contract.
   const unitsRaw = await client.getProperty(env.BLOCK_ID, "units");
   const units: TomorrowUnits = unitsRaw === "imperial" ? "imperial" : "metric";
+  const timezoneRaw = await getOptionalProperty(client, env.BLOCK_ID, "timezone");
+  const timezone = normalizeTimezone(timezoneRaw);
+  if (!timezone) {
+    const message = "owner has not configured a valid timezone; use an IANA timezone such as America/Los_Angeles";
+    await writeConfigError(client, env.BLOCK_ID, "E_BAD_TIMEZONE", message, { place, timezone: timezoneRaw });
+    throw new WeatherConfigError("E_BAD_TIMEZONE", message, 400, { place, timezone: timezoneRaw });
+  }
   const forecastHoursRaw = await client.getProperty(env.BLOCK_ID, "forecast_hours");
   const forecastHours = pickForecastHours(forecastHoursRaw, env.FORECAST_HOURS);
   const tomorrowPlace = normalizeTomorrowLocation(place);
@@ -132,16 +149,28 @@ export async function runWeatherTick(
       fetchImpl
     });
   } catch (err) {
-    await client.directCall(env.BLOCK_ID, "set_property", ["last_error", formatLastError(err)]);
+    const message = formatLastError(err, place);
+    if (isConfigSourceError(err)) {
+      await writeConfigError(client, env.BLOCK_ID, errorConfigCode(err), message, { place, timezone });
+    } else {
+      await client.directCall(env.BLOCK_ID, "set_property", ["last_error", message]);
+    }
     throw err;
   }
 
   await client.directCall(env.BLOCK_ID, "set_properties", [
     {
-      current: snapshot.current,
+      current: withLocalObservationTime(snapshot.current, timezone),
       forecast: snapshot.forecast,
       last_pushed_at: snapshot.fetched_at,
-      last_error: null
+      last_error: null,
+      config_state: {
+        status: "confirmed",
+        message: "weather plug confirmed location and timezone",
+        place,
+        timezone,
+        confirmed_at: snapshot.fetched_at
+      }
     }
   ]);
 
@@ -149,9 +178,60 @@ export async function runWeatherTick(
 }
 
 export function normalizeTomorrowLocation(place: string): string {
-  const trimmed = place.trim();
-  if (/^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(trimmed)) return trimmed;
-  return trimmed.replace(/,\s*/g, " ");
+  return place.trim();
+}
+
+async function getOptionalProperty(client: WooClient, blockId: string, name: string): Promise<unknown> {
+  try {
+    return await client.getProperty(blockId, name);
+  } catch (err) {
+    if (err instanceof WooError && (err.code === "E_PROPNF" || err.status === 404)) return null;
+    throw err;
+  }
+}
+
+export function normalizeTimezone(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const timezone = value.trim();
+  if (!timezone) return null;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date(0));
+    return timezone;
+  } catch {
+    return null;
+  }
+}
+
+export function withLocalObservationTime(current: WeatherSnapshot["current"], timezone: string | null): WeatherSnapshot["current"] {
+  return {
+    ...current,
+    observed_at_text: formatObservedAt(current.observed_at, timezone),
+    observed_timezone: timezone ?? "UTC"
+  };
+}
+
+export function formatObservedAt(observedAt: string, timezone: string | null): string {
+  const at = Date.parse(observedAt);
+  if (!Number.isFinite(at)) return observedAt || "an unknown time";
+  if (!timezone) return formatUtcMinute(at);
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZoneName: "short"
+    }).format(new Date(at));
+  } catch {
+    return formatUtcMinute(at);
+  }
+}
+
+function formatUtcMinute(at: number): string {
+  const iso = new Date(at).toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
 }
 
 function pickForecastHours(blockValue: unknown, envValue: string | undefined): number | undefined {
@@ -185,6 +265,9 @@ function errorBreadcrumb(err: unknown): ErrorBreadcrumb {
       : `tomorrow:${err.status}`;
     return { category, status: err.status, message: err.message };
   }
+  if (err instanceof WeatherConfigError) {
+    return { category: `weather_config:${err.code}`, code: err.code, status: err.status, message: err.message };
+  }
   if (err instanceof WooError) {
     return { category: `woo:${err.code}`, code: err.code, status: err.status, message: err.message };
   }
@@ -192,18 +275,46 @@ function errorBreadcrumb(err: unknown): ErrorBreadcrumb {
   return { category: "unknown", message };
 }
 
-function formatLastError(err: unknown): string {
+function formatLastError(err: unknown, place?: string): string {
   if (err instanceof TomorrowIoError) {
     if (err.isRateLimit) {
       const wait = err.retryAfter ? ` (retry after ${err.retryAfter}s)` : "";
-      return `tomorrow.io rate-limited${wait} — free plan caps 25/hour, 500/day`;
+      return `tomorrow.io rate-limited${wait} - free plan caps 25/hour, 500/day`;
     }
     if (err.isAuth) {
-      return "tomorrow.io rejected the API key — check TOMORROW_IO_API_KEY";
+      return "tomorrow.io rejected the API key - check TOMORROW_IO_API_KEY";
+    }
+    if (err.status === 400 || err.status === 404) {
+      const configured = place?.trim() ? ` "${place.trim()}"` : "";
+      return `tomorrow.io could not fetch weather for${configured} - set place to a town name or zip code it recognizes`;
     }
     return err.message;
   }
   return err instanceof Error ? err.message : String(err);
+}
+
+async function writeConfigError(client: WooClient, blockId: string, code: string, message: string, value: Record<string, unknown>): Promise<void> {
+  await client.directCall(blockId, "set_properties", [
+    {
+      last_error: message,
+      config_state: {
+        status: "error",
+        code,
+        message,
+        ...value,
+        checked_at: Date.now()
+      }
+    }
+  ]);
+}
+
+function isConfigSourceError(err: unknown): boolean {
+  return err instanceof TomorrowIoError && (err.status === 400 || err.status === 404);
+}
+
+function errorConfigCode(err: unknown): string {
+  if (err instanceof TomorrowIoError && err.status === 404) return "E_UNKNOWN_PLACE";
+  return "E_BAD_PLACE";
 }
 
 // Gate the manual fetch trigger on a shared secret. Constant-time-ish
@@ -238,6 +349,12 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 function errorResponse(err: unknown): Response {
   if (err instanceof WooError) {
+    return Response.json(
+      { ok: false, code: err.code, message: err.message, value: err.value },
+      { status: err.status >= 400 && err.status < 600 ? err.status : 500 }
+    );
+  }
+  if (err instanceof WeatherConfigError) {
     return Response.json(
       { ok: false, code: err.code, message: err.message, value: err.value },
       { status: err.status >= 400 && err.status < 600 ? err.status : 500 }

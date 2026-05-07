@@ -32,7 +32,9 @@ WebSockets between client and player host. JSON frames. UTF-8. Values are encode
 
 // Make a direct call, not through a space.
 // Allowed only for verbs annotated direct_callable:true; see core.md §C12.2.
-// Live observations emitted by the verb are delivered as op:"event" frames.
+// Live observations emitted by the verb are returned on the caller result
+// frame and may also be delivered as op:"event" frames to other live audience
+// members.
 //   id      — client-chosen correlation token; echoed in result/error
 //   target  — object receiving the verb
 //   verb    — verb name
@@ -93,13 +95,16 @@ Reserved for transient hosts (see [browser-host.md](browser-host.md)):
 //   result        — verb return value; present only for the originating client
 { op: "applied", id?: string, space: ObjRef, seq: int, message: Map, observations: Map[], result?: Value }
 
-// A direct call completed. Any observations emitted by that call are delivered
-// separately as op:"event" frames to the call's live audience.
-//   id      — matches the originating op:"direct" or direct op:"command"
-//   result  — verb return value
-//   command — optional resolved command descriptor for direct op:"command";
-//             clients may use it for UI reactions, not for dispatch.
-{ op: "result", id: string, result: Value, command?: Map }
+// A direct call completed. Observations are included for the originating
+// caller so command output does not depend on best-effort live fan-out. The
+// originating connection is not sent a duplicate op:"event" echo for the same
+// observations; other live audience members may receive op:"event" frames.
+//   id            — matches the originating op:"direct" or direct op:"command"
+//   result        — verb return value
+//   observations  — list of observation maps emitted during the direct call
+//   command       — optional resolved command descriptor for direct op:"command";
+//                   clients may use it for UI reactions, not for dispatch.
+{ op: "result", id: string, result: Value, observations: Map[], command?: Map }
 
 // A live observation from a direct (non-sequenced) verb call. Not stored
 // anywhere; not replayable; gone after delivery. See semantics/events.md §12.6.

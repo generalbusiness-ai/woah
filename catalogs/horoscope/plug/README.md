@@ -17,8 +17,8 @@ Cron-triggered every minute. Each tick:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
      `system_prompt + request`.
-   - POSTs `:deliver(order_id, body)` — the block creates a `$note` and
-     moves it to the orderer's inventory.
+   - POSTs `:deliver(order_id, body)` — the block creates a `$note`, moves
+     it to the orderer's inventory, and tells the orderer it arrived.
 
 Errors during AI generation leave the order on the queue and are reported in
 the tick's response body. The block's TTL handles abandoned orders. `:deliver`
@@ -42,8 +42,9 @@ client.
 npm install
 ```
 
-Configure the block on the woo side first (owner sets `description` and
-`system_prompt`, then mints an apikey via `:mint_apikey`). Take the secret and:
+Configure the block on the woo side first (owner sets `description` and calls
+`:set_system_prompt`, then mints an apikey via `:mint_apikey`). Take the
+secret and:
 
 ```bash
 wrangler secret put WOO_APIKEY            # apikey:<id>:<secret>
@@ -65,7 +66,9 @@ horoscope block. `E_NOSESSION` means the token is malformed, unknown,
 secret-mismatched, or revoked. Use the full `apikey:<id>:<secret>`
 token; `apikey:<secret>` is not the documented token form.
 
-Edit `wrangler.toml` to set `[vars] WOO_BASE_URL` and `[vars] BLOCK_ID`.
+`wrangler.toml` carries public `[vars]` for `WOO_BASE_URL`, `BLOCK_ID`,
+`MAX_TOKENS`, and `MAX_ORDERS_PER_TICK`; secrets still go through
+`wrangler secret put`.
 
 ```bash
 wrangler deploy

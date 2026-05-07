@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
@@ -25,8 +26,9 @@ const PLUGS = {
 function usage() {
   return `Usage: npm run plugs:bootstrap -- [options]
 
-Mints fresh woo apikeys bound to the demo weather/horoscope blocks, stores them
-as Wrangler secrets, and optionally deploys/triggers the plug Workers.
+Mints fresh woo apikeys bound to the demo weather/horoscope blocks, updates
+public Wrangler vars, stores secrets, and optionally deploys/triggers the plug
+Workers.
 
 Environment:
   WOO_BASE_URL             Woo REST base URL.
@@ -176,7 +178,8 @@ async function main() {
   if (opts.dryRun) {
     for (const plug of plugs) {
       console.log(`[dry-run] ${plug}: would mint key for ${blockFor(opts, plug)} label=${JSON.stringify(labelFor(opts, plug))}`);
-      console.log(`[dry-run] ${plug}: would store WOO_BASE_URL, BLOCK_ID, WOO_APIKEY, and TRIGGER_SECRET in ${PLUGS[plug].dir}`);
+      console.log(`[dry-run] ${plug}: would set WOO_BASE_URL and BLOCK_ID in ${PLUGS[plug].dir}/wrangler.toml`);
+      console.log(`[dry-run] ${plug}: would store WOO_APIKEY and TRIGGER_SECRET as Wrangler secrets`);
       if (plug === "weather") console.log(`[dry-run] ${plug}: would store TOMORROW_IO_API_KEY`);
       if (opts.deploy) console.log(`[dry-run] ${plug}: would run wrangler deploy`);
       if (opts.trigger) console.log(`[dry-run] ${plug}: would trigger if ${PLUGS[plug].triggerUrlEnv} is set`);
@@ -208,8 +211,7 @@ async function main() {
   for (const item of minted) {
     const plug = PLUGS[item.plug];
     const cwd = path.join(ROOT, plug.dir);
-    await putSecret(cwd, "WOO_BASE_URL", opts.wooBaseUrl);
-    await putSecret(cwd, "BLOCK_ID", item.block);
+    await setWranglerVars(cwd, { WOO_BASE_URL: opts.wooBaseUrl, BLOCK_ID: item.block });
     await putSecret(cwd, "WOO_APIKEY", item.token);
     await putSecret(cwd, "TRIGGER_SECRET", item.triggerSecret);
     if (item.plug === "weather") {
@@ -291,6 +293,23 @@ async function putSecret(cwd, name, value) {
     input: `${value}\n`,
     redact: value
   });
+}
+
+async function setWranglerVars(cwd, vars) {
+  const file = path.join(cwd, "wrangler.toml");
+  let text = await readFile(file, "utf8");
+  for (const [name, value] of Object.entries(vars)) {
+    const line = `${name} = ${JSON.stringify(value)}`;
+    const re = new RegExp(`^#?\\s*${escapeRegExp(name)}\\s*=.*$`, "m");
+    if (re.test(text)) text = text.replace(re, line);
+    else text = text.replace(/(\[vars\]\n)/, `$1${line}\n`);
+  }
+  await writeFile(file, text);
+  console.log(`${path.relative(ROOT, file)}: set ${Object.keys(vars).join(", ")}`);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function triggerPlug(url, secret, plug) {

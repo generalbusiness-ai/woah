@@ -16,7 +16,8 @@ keywords:
 Bundles the two demo block instances:
 
 - **`the_weather`** — a `$weather_block` anchored in `the_chatroom`, the
-  default place is `Mountain View, CA`, units imperial, 12h forecast.
+  default place is `Mountain View CA`, timezone `America/Los_Angeles`,
+  units imperial, 12h forecast.
 - **`the_horoscope`** — a `$horoscope_block` anchored on `the_deck`, with
   a wry-fortune-teller `system_prompt` and the default 60s rate limit.
 

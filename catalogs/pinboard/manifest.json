@@ -64,7 +64,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { let summary = \"A sticky note.\"; let lines = this:text(); if (length(lines) > 0 && lines[1]) { summary = summary + \" It says: \" + lines[1]; } return { id: this, title: this:title(), description: summary, lines: length(lines), location: location(this) }; }"
+          "source": "verb :look_self() rxd { let text_summary = this:text_summary(96); let summary = \"A sticky note.\"; let preview = text_summary[\"preview\"]; if (preview) { summary = summary + \" It says: \" + preview; } return { id: this, title: this:title(), description: summary, lines: text_summary[\"lines\"], location: location(this) }; }"
         },
         {
           "name": "set_color",

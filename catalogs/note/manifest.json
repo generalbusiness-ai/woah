@@ -21,7 +21,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :title() rxd { let base = this.name; if (!base) { base = to_string(this); } let lines = this:text(); if (length(lines) > 0 && lines[1]) { return base + \": \" + lines[1]; } return base; }"
+          "source": "verb :title() rxd { let base = this.name; if (!base) { base = to_string(this); } let summary = this:text_summary(96); let preview = summary[\"preview\"]; if (preview) { return base + \": \" + preview; } return base; }"
         },
         {
           "name": "look",
@@ -39,7 +39,15 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let lines = length(this:text()); return { id: this, title: this:title(), description: this.description, lines: lines, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let summary = this:text_summary(96); return { id: this, title: this:title(), description: this.description, lines: summary[\"lines\"], location: location(this) }; }"
+        },
+        {
+          "name": "text_summary",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["limit"] },
+          "source": "verb :text_summary(limit) rxd { return note_text_summary(this, limit); }"
         },
         {
           "name": "text",

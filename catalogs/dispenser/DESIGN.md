@@ -6,8 +6,8 @@ A `$dispenser_block` decouples the request from the work:
 
 1. Requester calls `:order(request)` — the verb appends a record to
    `pending_orders`, mints an `order_id`, and returns synchronously
-   with `{order_id, queued: true, ts}`. The verb does NOT wait for the
-   plug.
+   with `{order_id, queued: true, text, ts}`. It also tells the requester
+   that the order was accepted. The verb does NOT wait for the plug.
 2. The plug (a CF Worker, or any apikey-bound WS/REST client) drains
    the queue at its own cadence — either on a cron tick or in response
    to a directed `text` wakeup hint emitted by `:order` (best-effort).
@@ -17,7 +17,8 @@ A `$dispenser_block` decouples the request from the work:
    entry, creates a `$dispensed_note` with the body, and moves it to
    the requester's inventory.
 4. The requester sees the note arrive — that's the visible delivery.
-   The room sees a sequenced `delivered` observation for bystanders.
+   The requester also receives a direct text observation; the room sees a
+   sequenced `delivered` observation for bystanders.
 
 ## Why a queue and not parked tasks
 
@@ -65,8 +66,8 @@ verb is invoked through `$space:call` (the normal command path) and
 live when invoked via direct call. In v0.1 the room-level command path
 makes `:order` and `:cancel` sequenced; `:deliver` is plug-driven via
 direct call, so the `delivered` observation is live. The note arrival
-in the requester's inventory is durable regardless — bystander chatter
-about delivery is the only thing that may not survive a reconnect.
+in the requester's inventory is durable regardless; direct requester text
+is a live notification and may not survive a reconnect.
 
 ## TTL on pending orders (deferred)
 
@@ -82,9 +83,10 @@ keep the queue small.
 - The plug process — that's an external CF Worker, deployed
   independently.
 - TTL / retry / dead-letter shapes (deferred).
-- A "subscribe to delivery" affordance — the requester sees the note
-  arrive in their inventory; room bystanders see the sequenced
-  observation. No additional notification API in v0.1.
+- A persistent "subscribe to delivery" affordance — the requester gets a
+  live text notification and sees the note in inventory; room bystanders
+  see the sequenced observation. No additional durable notification API in
+  v0.1.
 
 See [`notes/2026-05-05-block-and-plug.md`](../../notes/2026-05-05-block-and-plug.md)
 for the full pattern.

@@ -12,9 +12,17 @@ export type ChatLine = {
   ts?: number;
 };
 
+export type ChatTitleBadge = {
+  id: string;
+  tag: string;
+  subject: string;
+  data?: unknown;
+};
+
 export type ChatSpaceData = {
   roomName: string;
   roomDescription: string;
+  titleBadges: ChatTitleBadge[];
   lines: ChatLine[];
   present: string[];
   draft: string;
@@ -38,6 +46,7 @@ export class WooChatSpaceElement extends HTMLElement {
   private model: ChatSpaceData = {
     roomName: "Room",
     roomDescription: "",
+    titleBadges: [],
     lines: [],
     present: [],
     draft: "",
@@ -46,7 +55,7 @@ export class WooChatSpaceElement extends HTMLElement {
   };
 
   set data(value: ChatSpaceData) {
-    this.model = value;
+    this.model = { ...value, titleBadges: value.titleBadges ?? [] };
     this.render();
   }
 
@@ -70,7 +79,7 @@ export class WooChatSpaceElement extends HTMLElement {
     if (!this.model.inRoom) {
       this.innerHTML = `
         <section class="toolbar">
-          <h1>${escapeHtml(room)}</h1>
+          ${this.renderRoomTitle(room)}
           <button data-chat-enter ${this.model.canSend ? "" : "disabled"}>Enter</button>
         </section>
         <section class="chat-layout solo">
@@ -79,12 +88,13 @@ export class WooChatSpaceElement extends HTMLElement {
           </div>
         </section>
       `;
+      this.mountTitleBadges();
       this.bind();
       return;
     }
     this.innerHTML = `
       <section class="toolbar">
-        <h1>${escapeHtml(room)}</h1>
+        ${this.renderRoomTitle(room)}
         <button data-chat-leave>Leave</button>
         <button data-chat-look>Look</button>
       </section>
@@ -106,7 +116,27 @@ export class WooChatSpaceElement extends HTMLElement {
         </aside>
       </section>
     `;
+    this.mountTitleBadges();
     this.bind();
+  }
+
+  private renderRoomTitle(room: string): string {
+    const badges = this.model.titleBadges.map((badge) => `<${badge.tag} data-chat-title-badge="${escapeHtml(badge.id)}"></${badge.tag}>`).join("");
+    return `<div class="chat-room-title"><h1>${escapeHtml(room)}</h1>${badges}</div>`;
+  }
+
+  private mountTitleBadges(): void {
+    for (const badge of this.model.titleBadges) {
+      const element = this.querySelector<HTMLElement & { subject?: string; woo?: WooContext; data?: unknown }>(`[data-chat-title-badge="${cssAttrValue(badge.id)}"]`);
+      if (!element) continue;
+      element.subject = badge.subject;
+      element.woo = this.woo;
+      const assign = () => {
+        element.data = badge.data;
+      };
+      if (customElements.get(element.localName)) assign();
+      else void customElements.whenDefined(element.localName).then(assign);
+    }
   }
 
   private bind() {
@@ -136,6 +166,10 @@ export class WooChatSpaceElement extends HTMLElement {
     if (!id) return "unknown";
     return String(this.woo?.observe(id)?.name ?? id);
   }
+}
+
+function cssAttrValue(value: string): string {
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
 }
 
 export class WooSpaceChatPanelElement extends HTMLElement {

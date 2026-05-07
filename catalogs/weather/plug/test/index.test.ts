@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeTomorrowLocation, runWeatherTick, type WeatherPlugEnv } from "../src/index";
+import { formatObservedAt, normalizeTimezone, normalizeTomorrowLocation, runWeatherTick, type WeatherPlugEnv } from "../src/index";
 
 type Call = { url: string; method: string; body?: unknown };
 type Reply = { status: number; body: unknown; headers?: Record<string, string> };
@@ -37,7 +37,7 @@ const env: WeatherPlugEnv = {
 };
 
 describe("runWeatherTick", () => {
-  it("auths, reads place/units/forecast_hours, fetches tomorrow.io, pushes set_properties", async () => {
+  it("auths, reads place/units/timezone/forecast_hours, fetches tomorrow.io, pushes set_properties", async () => {
     const { fetchImpl, calls } = makeFetch([
       // 1: auth
       () => ({
@@ -48,19 +48,21 @@ describe("runWeatherTick", () => {
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       // 3: get units
       () => ({ status: 200, body: { value: "imperial" } }),
-      // 4: get forecast_hours
+      // 4: get timezone
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
+      // 5: get forecast_hours
       () => ({ status: 200, body: { value: 3 } }),
-      // 5: realtime
+      // 6: realtime
       () => ({
         status: 200,
         body: {
           data: {
             time: "2026-05-05T18:00:00Z",
-            values: { temperature: 72.4 }
+            values: { temperature: 72.4, weatherCode: 1000 }
           }
         }
       }),
-      // 6: forecast (3 hours)
+      // 7: forecast (3 hours)
       () => ({
         status: 200,
         body: {
@@ -73,7 +75,7 @@ describe("runWeatherTick", () => {
           }
         }
       }),
-      // 7: set_properties on the block
+      // 8: set_properties on the block
       () => ({ status: 200, body: { result: { ok: true }, observations: [] } })
     ]);
 
@@ -86,22 +88,37 @@ describe("runWeatherTick", () => {
     expect(calls[0].url).toBe("https://woo.example/api/auth");
     expect(calls[1].url).toBe("https://woo.example/api/objects/the_weather_block/properties/place");
     expect(calls[2].url).toBe("https://woo.example/api/objects/the_weather_block/properties/units");
-    expect(calls[3].url).toBe("https://woo.example/api/objects/the_weather_block/properties/forecast_hours");
-    expect(calls[4].url).toContain("api.tomorrow.io/v4/weather/realtime");
-    expect(calls[4].url).toContain("units=imperial");
-    expect(new URL(calls[4].url).searchParams.get("location")).toBe("Mountain View CA");
-    expect(calls[5].url).toContain("api.tomorrow.io/v4/weather/forecast");
+    expect(calls[3].url).toBe("https://woo.example/api/objects/the_weather_block/properties/timezone");
+    expect(calls[4].url).toBe("https://woo.example/api/objects/the_weather_block/properties/forecast_hours");
+    expect(calls[5].url).toContain("api.tomorrow.io/v4/weather/realtime");
     expect(calls[5].url).toContain("units=imperial");
-    expect(new URL(calls[5].url).searchParams.get("location")).toBe("Mountain View CA");
+    expect(new URL(calls[5].url).searchParams.get("location")).toBe("Mountain View, CA");
+    expect(calls[6].url).toContain("api.tomorrow.io/v4/weather/forecast");
+    expect(calls[6].url).toContain("units=imperial");
+    expect(new URL(calls[6].url).searchParams.get("location")).toBe("Mountain View, CA");
 
-    const setProps = calls[6];
+    const setProps = calls[7];
     expect(setProps.url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_properties");
     expect(setProps.method).toBe("POST");
     const body = setProps.body as { args: [Record<string, unknown>] };
     const props = body.args[0];
     expect(props.last_error).toBeNull();
     expect(props.last_pushed_at).toEqual(expect.any(Number));
-    expect(props.current).toMatchObject({ kind: "scalar", value: 72.4, unit: "°F" });
+    expect(props.config_state).toMatchObject({
+      status: "confirmed",
+      place: "Mountain View, CA",
+      timezone: "America/Los_Angeles",
+      confirmed_at: expect.any(Number)
+    });
+    expect(props.current).toMatchObject({
+      kind: "scalar",
+      value: 72.4,
+      unit: "°F",
+      weather_code: 1000,
+      observed_at: "2026-05-05T18:00:00Z",
+      observed_at_text: "May 5, 2026, 11:00 AM PDT",
+      observed_timezone: "America/Los_Angeles"
+    });
     expect(props.forecast).toMatchObject({
       kind: "series",
       series: [{ name: "temperature", unit: "°F", points: expect.any(Array) }]
@@ -116,15 +133,16 @@ describe("runWeatherTick", () => {
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess_w", expires_at: null, token_class: "apikey" } }),
       () => ({ status: 200, body: { value: "Berlin" } }),
       () => ({ status: 200, body: { value: "metric" } }),
+      () => ({ status: 200, body: { value: "Europe/Berlin" } }),
       () => ({ status: 200, body: { value: 1 } }),
       () => ({ status: 200, body: { data: { time: "2026-05-05T18:00:00Z", values: { temperature: 22.4 } } } }),
       () => ({ status: 200, body: { timelines: { hourly: [{ time: "2026-05-05T19:00:00Z", values: { temperature: 23, precipitationProbability: 0, weatherCode: 1000 } }] } } }),
       () => ({ status: 200, body: { result: {}, observations: [] } })
     ]);
     await runWeatherTick(env, { fetchImpl });
-    expect(calls[4].url).toContain("units=metric");
-    const props = (calls[6].body as { args: [Record<string, any>] }).args[0];
-    expect(props.current).toMatchObject({ kind: "scalar", unit: "°C" });
+    expect(calls[5].url).toContain("units=metric");
+    const props = (calls[7].body as { args: [Record<string, any>] }).args[0];
+    expect(props.current).toMatchObject({ kind: "scalar", unit: "°C", observed_at_text: "May 5, 2026, 8:00 PM GMT+2" });
     expect(props.forecast.series[0]).toMatchObject({ unit: "°C" });
   });
 
@@ -139,8 +157,35 @@ describe("runWeatherTick", () => {
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toMatchObject({ code: "E_NO_PLACE" });
-    expect(calls[2].url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_property");
-    expect((calls[2].body as { args: unknown[] }).args[0]).toBe("last_error");
+    expect(calls[2].url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_properties");
+    const props = (calls[2].body as { args: [Record<string, any>] }).args[0];
+    expect(props.last_error).toMatch(/owner has not configured `place`/);
+    expect(props.config_state).toMatchObject({ status: "error", code: "E_NO_PLACE" });
+  });
+
+  it("writes a config error when timezone is not usable", async () => {
+    const { fetchImpl, calls } = makeFetch([
+      () => ({
+        status: 200,
+        body: { actor: "the_weather_block", session: "sess_w", expires_at: null, token_class: "apikey" }
+      }),
+      () => ({ status: 200, body: { value: "Mountain View, CA" } }),
+      () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "not/a-zone" } }),
+      () => ({ status: 200, body: { result: null, observations: [] } })
+    ]);
+
+    await expect(runWeatherTick(env, { fetchImpl })).rejects.toMatchObject({ code: "E_BAD_TIMEZONE" });
+    expect(calls).toHaveLength(5);
+    expect(calls[4].url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_properties");
+    const props = (calls[4].body as { args: [Record<string, any>] }).args[0];
+    expect(props.last_error).toMatch(/valid timezone/);
+    expect(props.config_state).toMatchObject({
+      status: "error",
+      code: "E_BAD_TIMEZONE",
+      place: "Mountain View, CA",
+      timezone: "not/a-zone"
+    });
   });
 
   it("writes a clean auth-rejected last_error when tomorrow.io returns 401", async () => {
@@ -151,13 +196,14 @@ describe("runWeatherTick", () => {
       }),
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
       () => ({ status: 200, body: { value: 3 } }),
       () => ({ status: 401, body: { error: "invalid api key" } }),
       () => ({ status: 200, body: { result: null, observations: [] } })
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toThrow();
-    const errCall = calls[5];
+    const errCall = calls[6];
     expect(errCall.url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_property");
     const args = (errCall.body as { args: unknown[] }).args;
     expect(args[0]).toBe("last_error");
@@ -173,6 +219,7 @@ describe("runWeatherTick", () => {
       }),
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
       () => ({ status: 200, body: { value: 3 } }),
       ({ url }) => {
         if (url.includes("api.tomorrow.io")) {
@@ -188,7 +235,7 @@ describe("runWeatherTick", () => {
     ]);
 
     await expect(runWeatherTick(env, { fetchImpl })).rejects.toThrow();
-    const errCall = calls[5];
+    const errCall = calls[6];
     expect(errCall.url).toBe("https://woo.example/api/objects/the_weather_block/calls/set_property");
     const args = (errCall.body as { args: unknown[] }).args;
     expect(args[0]).toBe("last_error");
@@ -196,11 +243,47 @@ describe("runWeatherTick", () => {
     expect(args[1]).toMatch(/retry after 120s/);
     expect(args[1]).toMatch(/25\/hour/);
   });
+
+  it("writes a helpful last_error when tomorrow.io does not recognize the configured place", async () => {
+    const { fetchImpl, calls } = makeFetch([
+      () => ({
+        status: 200,
+        body: { actor: "the_weather_block", session: "sess_w", expires_at: null, token_class: "apikey" }
+      }),
+      () => ({ status: 200, body: { value: "Atlantis" } }),
+      () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
+      () => ({ status: 200, body: { value: 3 } }),
+      () => ({ status: 400, body: { message: "location not found" } }),
+      () => ({ status: 200, body: { result: null, observations: [] } })
+    ]);
+
+    await expect(runWeatherTick(env, { fetchImpl })).rejects.toThrow();
+    expect(new URL(calls[5].url).searchParams.get("location")).toBe("Atlantis");
+    const props = (calls[6].body as { args: [Record<string, any>] }).args[0];
+    expect(props.last_error).toBe('tomorrow.io could not fetch weather for "Atlantis" - set place to a town name or zip code it recognizes');
+    expect(props.config_state).toMatchObject({
+      status: "error",
+      code: "E_BAD_PLACE",
+      place: "Atlantis",
+      timezone: "America/Los_Angeles"
+    });
+  });
 });
 
 describe("normalizeTomorrowLocation", () => {
-  it("keeps lat/lon coordinates intact but removes commas from named places", () => {
-    expect(normalizeTomorrowLocation("37.3861,-122.0839")).toBe("37.3861,-122.0839");
-    expect(normalizeTomorrowLocation("Mountain View, CA")).toBe("Mountain View CA");
+  it("uses the owner-configured location text verbatim apart from surrounding whitespace", () => {
+    expect(normalizeTomorrowLocation(" Mountain View, CA ")).toBe("Mountain View, CA");
+    expect(normalizeTomorrowLocation("94043")).toBe("94043");
+  });
+});
+
+describe("weather observation time formatting", () => {
+  it("formats observed time in the configured location timezone", () => {
+    expect(normalizeTimezone("America/Los_Angeles")).toBe("America/Los_Angeles");
+    expect(formatObservedAt("2026-05-05T18:00:00Z", "America/Los_Angeles")).toBe("May 5, 2026, 11:00 AM PDT");
+    expect(formatObservedAt("2026-05-05T18:00:00Z", null)).toBe("2026-05-05 18:00 UTC");
+    expect(normalizeTimezone("Pacific")).toBeNull();
+    expect(normalizeTimezone("not/a-zone")).toBeNull();
   });
 });

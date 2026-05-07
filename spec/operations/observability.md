@@ -61,6 +61,7 @@ Each persistent host emits standard metrics:
 - `memory_peak_bytes` (histogram)
 - `storage_bytes_used` (gauge)
 - `storage_flush_slices` (histogram/counter by slice kind: objects, properties, sessions, tasks, counters)
+- `startup_storage` events for cold-init repository migration/load/save work, host-seed fetches, and Directory route registration. These are emitted before `WooWorld` finishes initialization, so startup write amplification is visible even when the ordinary world metrics hook is not installed yet.
 - `parked_tasks` (gauge)
 - `inbound_rate_drops` (counter)
 - `outbound_overflow_drops` (counter)

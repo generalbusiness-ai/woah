@@ -5,6 +5,7 @@ import chatManifest from "../catalogs/chat/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import taskspaceManifest from "../catalogs/taskspace/manifest.json";
+import weatherManifest from "../catalogs/weather/manifest.json";
 import { CatalogUiRegistry, type WooContext } from "../src/client/framework";
 
 function defineOnce(tag: string, ctor: CustomElementConstructor): void {
@@ -31,10 +32,32 @@ describe("bundled catalog UI components", () => {
     expect(registry.installCatalogUi({ alias: "dubspace", catalog: "dubspace", objects: { "$dubspace": "$dubspace" }, ui: (dubspaceManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "pinboard", catalog: "pinboard", objects: { "$pinboard": "$pinboard" }, ui: (pinboardManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "taskspace", catalog: "taskspace", objects: { "$taskspace": "$taskspace" }, ui: (taskspaceManifest as any).ui })).toEqual([]);
+    expect(registry.installCatalogUi({ alias: "weather", catalog: "weather", objects: { "$weather_block": "$weather_block" }, ui: (weatherManifest as any).ui })).toEqual([]);
 
     expect(registry.resolveFrame("the_dubspace", undefined, (_subject, classRef) => classRef === "$dubspace" ? 1 : false)?.frame.id).toBe("dubspace.workspace");
     expect(registry.resolveFrame("the_pinboard", undefined, (_subject, classRef) => classRef === "$pinboard" ? 1 : false)?.frame.id).toBe("pinboard.board");
     expect(registry.resolveFrame("the_taskspace", undefined, (_subject, classRef) => classRef === "$taskspace" ? 1 : false)?.frame.id).toBe("taskspace.workspace");
+    expect(registry.componentsForSurface("title-badge").map((component) => component.declaration.tag)).toContain("woo-weather-badge");
+  });
+
+  it("renders the weather title badge from current block data", async () => {
+    const { WooWeatherBadgeElement } = await import("../catalogs/weather/ui/weather-badge");
+    defineOnce("woo-weather-badge", WooWeatherBadgeElement);
+    const element = document.createElement("woo-weather-badge") as HTMLElement & { data?: any };
+    document.body.appendChild(element);
+
+    element.data = {
+      id: "the_weather",
+      name: "Weather",
+      props: {
+        place: "Mountain View CA",
+        config_state: { status: "confirmed" },
+        current: { kind: "scalar", value: 72.4, unit: "°F", weather_code: 1000 }
+      }
+    };
+
+    expect(element.querySelector(".weather-badge-temp")?.textContent).toBe("72°F");
+    expect(element.querySelector(".weather-badge-condition")?.textContent).toBe("sunny");
   });
 
   it("renders pinboard notes and emits create events", async () => {

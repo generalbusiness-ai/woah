@@ -193,8 +193,8 @@ describe("sqlite persistence", () => {
       const stored = secondRepo.load();
       expect(stored).not.toBeNull();
       const secondSeed = scopeSerializedWorldToHost(stored ?? gatewaySeed, "the_taskspace");
-      const secondCluster = createWorldFromSerialized(secondSeed, { repository: secondRepo });
-      expect(secondRepo.saves).toBeGreaterThan(0);
+      const secondCluster = createWorldFromSerialized(secondSeed, { repository: secondRepo, persist: false });
+      expect(secondRepo.saves).toBe(0);
       secondRepo.saves = 0;
 
       expect(secondCluster.object(task).parent).toBe("$task");
@@ -242,12 +242,44 @@ describe("sqlite persistence", () => {
 
       const secondRepo = new CountingLocalSQLiteRepository(path);
       const secondWorld = createWorld({ repository: secondRepo });
+      expect(secondRepo.saves).toBe(0);
       expect(secondWorld.getProp("delay_1", "wet")).toBe(0.73);
       expect(secondWorld.replay("the_dubspace", 1, 10)).toHaveLength(1);
       expect(secondWorld.latestSnapshot("the_dubspace")?.seq).toBe(1);
       const resumed = secondWorld.auth(`session:${session.id}`);
       expect(resumed.actor).toBe(session.actor);
       secondRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists bootstrap repairs for stale stored worlds", async () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new CountingLocalSQLiteRepository(path);
+      createWorld({ repository: seedRepo });
+      const damaged = seedRepo.load();
+      expect(damaged).not.toBeNull();
+      const system = damaged!.objects.find((obj) => obj.id === "$system");
+      expect(system).toBeTruthy();
+      system!.properties = system!.properties.filter(([name]) => name !== "description");
+      system!.propertyVersions = system!.propertyVersions.filter(([name]) => name !== "description");
+      seedRepo.save(damaged!);
+      seedRepo.close();
+
+      const repairRepo = new CountingLocalSQLiteRepository(path);
+      repairRepo.saves = 0;
+      const repaired = createWorld({ repository: repairRepo });
+      expect(repaired.getProp("$system", "description")).toContain("Bootstrap object");
+      expect(repairRepo.saves).toBe(1);
+      repairRepo.close();
+
+      const restartRepo = new CountingLocalSQLiteRepository(path);
+      const restarted = createWorld({ repository: restartRepo });
+      expect(restarted.getProp("$system", "description")).toContain("Bootstrap object");
+      expect(restartRepo.saves).toBe(0);
+      restartRepo.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

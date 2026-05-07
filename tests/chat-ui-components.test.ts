@@ -45,6 +45,7 @@ describe("chat catalog UI components", () => {
     element.data = {
       roomName: "Living Room",
       roomDescription: "A room.",
+      titleBadges: [],
       lines: [{ kind: "said", actor: "guest_2", text: "hello <there>", ts: 1 }],
       present: ["guest_2"],
       draft: "wave",
@@ -67,6 +68,38 @@ describe("chat catalog UI components", () => {
 
     expect(detail).toMatchObject({ text: "send this" });
     expect(detail?.input).toBe(input);
+  });
+
+  it("mounts title badge components next to the room name", () => {
+    class TestTitleBadgeElement extends HTMLElement {
+      set data(value: any) {
+        this.textContent = String(value?.props?.current?.value ?? "");
+      }
+    }
+    if (!customElements.get("woo-test-title-badge")) customElements.define("woo-test-title-badge", TestTitleBadgeElement);
+    const element = document.createElement("woo-chat-space") as WooChatSpaceElement & { data: ChatSpaceData };
+    element.woo = context();
+    document.body.append(element);
+
+    element.data = {
+      roomName: "Living Room",
+      roomDescription: "A room.",
+      titleBadges: [{
+        id: "weather:weather.badge:the_weather",
+        tag: "woo-test-title-badge",
+        subject: "the_weather",
+        data: { id: "the_weather", props: { current: { value: 72 } } }
+      }],
+      lines: [],
+      present: [],
+      draft: "",
+      inRoom: true,
+      canSend: true
+    };
+
+    const title = element.querySelector(".chat-room-title");
+    expect(title?.querySelector("h1")?.textContent).toBe("Living Room");
+    expect(title?.querySelector("woo-test-title-badge")?.textContent).toBe("72");
   });
 
   it("renders WooSpaceChatPanelElement data and emits submit events", () => {

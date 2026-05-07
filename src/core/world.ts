@@ -134,6 +134,7 @@ export type HostBridge = {
   localHost: string;
   hostForObject(id: ObjRef, memo?: HostOperationMemo): string | null | Promise<string | null>;
   getPropChecked(progr: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue>;
+  setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue, memo?: HostOperationMemo): Promise<void>;
   objectSummary(readActor: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<ScopedObjectSummary>;
   objectSummaries(readActor: ObjRef, objRefs: ObjRef[], memo?: HostOperationMemo): Promise<Record<ObjRef, ScopedObjectSummary>>;
   roomSnapshot(readActor: ObjRef, room: ObjRef, sessionId?: string | null, memo?: HostOperationMemo): Promise<RoomSnapshot>;
@@ -141,6 +142,7 @@ export type HostBridge = {
   describeObject?(nameActor: ObjRef, readActor: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<HostObjectSummary>;
   describeObjects?(nameActor: ObjRef, readActor: ObjRef, objRefs: ObjRef[], memo?: HostOperationMemo): Promise<Record<ObjRef, HostObjectSummary>>;
   resolveVerb?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary | null>;
+  commandVerbCandidates?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary[]>;
   isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
   dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
@@ -168,8 +170,8 @@ export type HostObjectSummary = {
 
 export type HostOperationMemo = {
   routes: Map<ObjRef, Promise<string | null>>;
-  // Read promises are scoped to one execution frame. They intentionally behave
-  // like a frame snapshot, not a coherence mechanism after remote mutation.
+  // Read promises are scoped to one execution frame. Remote write bridges must
+  // invalidate the matching key so read-after-write observes the new value.
   reads: Map<string, Promise<unknown>>;
 };
 
@@ -393,6 +395,29 @@ export class WooWorld {
     for (const id of this.objectRepository.loadTombstones()) {
       this.tombstones.add(id);
     }
+  }
+
+  discardPendingPersistence(): void {
+    this.dirtyObjects.clear();
+    this.deletedObjects.clear();
+    this.dirtyProperties.clear();
+    this.dirtySessions.clear();
+    this.deletedSessions.clear();
+    this.dirtyTasks.clear();
+    this.deletedTasks.clear();
+    this.dirtyCounters = false;
+    this.persistenceDirty = false;
+  }
+
+  hasPendingPersistence(): boolean {
+    return this.persistenceDirty || this.hasDirtyPersistence();
+  }
+
+  markObjectChanged(objRef: ObjRef): void {
+    const obj = this.object(objRef);
+    obj.modified = Date.now();
+    this.persistObject(objRef);
+    this.persist();
   }
 
   setHostBridge(bridge: HostBridge | null): void {
@@ -879,9 +904,11 @@ export class WooWorld {
     return await Promise.all(objRefs.map((objRef) => this.getPropChecked(progr, objRef, name, memo)));
   }
 
-  async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue): Promise<void> {
-    if (await this.remoteHostForObject(objRef)) {
-      throw wooError("E_CROSS_HOST_WRITE", `cross-host writes are not atomic: ${objRef}.${name}`, { progr, obj: objRef, property: name, value });
+  async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue, memo?: HostOperationMemo): Promise<void> {
+    if (await this.remoteHostForObject(objRef, memo)) {
+      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      await this.hostBridge.setPropChecked(progr, objRef, name, value, memo);
+      return;
     }
     try {
       if (!this.canWriteProperty(progr, objRef, name)) {
@@ -1278,8 +1305,7 @@ export class WooWorld {
   createSessionForActor(actor: ObjRef, tokenClass: Session["tokenClass"] = "bearer", apikeyId?: string): Session {
     this.reapExpiredSessions();
     this.object(actor);
-    const id = `session-${this.sessionCounter++}`;
-    this.persistCounters();
+    const id = this.generateSessionId();
     const now = Date.now();
     const session: Session = {
       id,
@@ -1302,6 +1328,14 @@ export class WooWorld {
       // first-touch and was a top-3 ambient writer.
     });
     return session;
+  }
+
+  private generateSessionId(): string {
+    for (let attempts = 0; attempts < 8; attempts += 1) {
+      const id = `session-${randomHex(16)}`;
+      if (!this.sessions.has(id)) return id;
+    }
+    throw wooError("E_INTERNAL", "could not mint a unique session id");
   }
 
   ensureSessionForActor(
@@ -2070,7 +2104,12 @@ export class WooWorld {
   async meSnapshot(session: Session): Promise<MeSnapshot> {
     const memo = createHostOperationMemo();
     const currentLocation = this.currentLocationForSession(session.id);
-    const hereLocation = currentLocation ? await this.primaryRoomForLocation(currentLocation, memo) : null;
+    const hereLocation = currentLocation
+      ? await this.primaryRoomForLocation(currentLocation, memo).catch((err) => {
+        if (isReadAvailabilityError(err)) return null;
+        throw err;
+      })
+      : null;
     const inventoryRefs = await this.objectContents(session.actor, memo);
     const inventory = await this.scopedObjectSummaries(session.actor, inventoryRefs, memo);
     const overlays = currentLocation && hereLocation && currentLocation !== hereLocation
@@ -2081,6 +2120,12 @@ export class WooWorld {
       hereLocation,
       ...Object.values(overlays ?? {}).map((overlay) => overlay.subject)
     ].filter((item): item is ObjRef => typeof item === "string");
+    const here = hereLocation
+      ? await this.roomSnapshotForActor(session.actor, hereLocation, session.id, memo).catch((err) => {
+        if (isReadAvailabilityError(err)) return null;
+        throw err;
+      })
+      : null;
     return {
       server_time: Date.now(),
       cursor: await this.projectionCursor(cursorSpaces, memo),
@@ -2091,7 +2136,7 @@ export class WooWorld {
         current_location: currentLocation,
         all_locations: this.allLocationsForActor(session.actor)
       },
-      here: hereLocation ? await this.roomSnapshotForActor(session.actor, hereLocation, session.id, memo) : null,
+      here,
       inventory: inventoryRefs.map((id) => inventory[id]).filter((item): item is ScopedObjectSummary => item !== undefined),
       overlays
     };
@@ -2165,7 +2210,11 @@ export class WooWorld {
     if (remoteByHost.size === 0) return out;
     if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge object summaries unavailable");
     await Promise.all(Array.from(remoteByHost.values()).map(async (ids) => {
-      Object.assign(out, await this.hostBridge!.objectSummaries(actor, ids, memo));
+      try {
+        Object.assign(out, await this.hostBridge!.objectSummaries(actor, ids, memo));
+      } catch (err) {
+        if (!isReadAvailabilityError(err)) throw err;
+      }
     }));
     return out;
   }
@@ -2194,7 +2243,8 @@ export class WooWorld {
         return await this.hostBridge.getPropChecked("$wiz", space, "next_seq", memo);
       }
       return this.getProp(space, "next_seq");
-    } catch {
+    } catch (err) {
+      if (!isOptionalProjectionReadError(err)) throw err;
       return null;
     }
   }
@@ -2310,8 +2360,14 @@ export class WooWorld {
     const entries = Array.from(byExit.entries())
       .map(([exit, direction]): [string, ObjRef] => [direction, exit])
       .sort(([a], [b]) => a.localeCompare(b));
-    return await Promise.all(entries.map(async ([direction, exit]) => {
-      const summary = await this.scopedObjectSummary(actor, exit, memo);
+    const exits = await Promise.all(entries.map(async ([direction, exit]) => {
+      let summary: ScopedObjectSummary;
+      try {
+        summary = await this.scopedObjectSummary(actor, exit, memo);
+      } catch (err) {
+        if (isReadAvailabilityError(err)) return null;
+        throw err;
+      }
       const dest = await this.propOrNullForActorAsync(actor, exit, "dest", memo);
       return {
         id: exit,
@@ -2321,6 +2377,7 @@ export class WooWorld {
         dest: typeof dest === "string" ? dest : null
       };
     }));
+    return exits.filter((item): item is NonNullable<typeof item> => item !== null);
   }
 
   private preferExitDirection(candidate: string, current: string): boolean {
@@ -4754,6 +4811,15 @@ export class WooWorld {
     this.persistenceDirty = false;
   }
 
+  persistFullSnapshot(): void {
+    if (!this.repository) return;
+    // Use sparingly for whole-world replacement paths such as importing a
+    // repaired host seed; incremental persistence has no dirty-row record for
+    // objects replaced through importWorld().
+    this.repository.save(this.exportWorld());
+    this.discardPendingPersistence();
+  }
+
   private activeObjectRepository(): ObjectRepository | null {
     return this.incrementalPersistenceEnabled ? this.objectRepository : null;
   }
@@ -5502,7 +5568,8 @@ export class WooWorld {
   private async isDescendantOfCheckedOrFalse(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
     try {
       return await this.isDescendantOfChecked(objRef, ancestorRef, memo);
-    } catch {
+    } catch (err) {
+      if (!isReadAvailabilityError(err)) throw err;
       // Audience discovery is intentionally tolerant: a stale anchor, stale
       // location mirror, or unreachable remote host means "no audience here",
       // not "fail the direct call before the verb can run".
@@ -6242,7 +6309,10 @@ export class WooWorld {
         ? value as ObjRef
         : actor === ctx.actor && ctx.session
           ? this.currentLocationForSession(ctx.session)
-          : await this.objectLocationChecked(actor, ctx.hostMemo).catch(() => null);
+          : await this.objectLocationChecked(actor, ctx.hostMemo).catch((err) => {
+            if (isOptionalProjectionReadError(err)) return null;
+            throw err;
+          });
     await this.assertPublicCommandLocation(ctx, actor, location);
     return location;
   }
@@ -6256,7 +6326,10 @@ export class WooWorld {
 
       const actorLocation = actor === ctx.actor && ctx.session
         ? this.currentLocationForSession(ctx.session)
-        : await this.objectLocationChecked(actor, ctx.hostMemo).catch(() => null);
+        : await this.objectLocationChecked(actor, ctx.hostMemo).catch((err) => {
+          if (isOptionalProjectionReadError(err)) return null;
+          throw err;
+        });
     if (actorLocation === location) return;
     try {
       if (this.hasPresence(actor, location)) return;
@@ -6279,11 +6352,17 @@ export class WooWorld {
     add(actor);
     if (location) {
       add(location);
-      for (const id of await this.objectContents(location, ctx.hostMemo).catch(() => [])) add(id);
-      const present = await this.propOrNullForActorAsync(actor, location, "subscribers", ctx.hostMemo).catch(() => null);
+      for (const id of await this.objectContents(location, ctx.hostMemo).catch((err) => {
+        if (isReadAvailabilityError(err)) return [];
+        throw err;
+      })) add(id);
+      const present = await this.propOrNullForActorAsync(actor, location, "subscribers", ctx.hostMemo);
       if (Array.isArray(present)) for (const id of present) add(id);
     }
-    for (const id of await this.objectContents(actor, ctx.hostMemo).catch(() => [])) add(id);
+    for (const id of await this.objectContents(actor, ctx.hostMemo).catch((err) => {
+      if (isReadAvailabilityError(err)) return [];
+      throw err;
+    })) add(id);
     return candidates;
   }
 
@@ -6293,9 +6372,12 @@ export class WooWorld {
     if ((await this.commandVisibleCandidates(ctx, ctx.actor, location)).includes(target)) return true;
     const caller = ctx.caller;
     if (typeof caller === "string" && caller.length > 0 && this.objects.has(caller) && this.inheritsFrom(caller, "$space")) {
-      const callerContents = await this.objectContents(caller, ctx.hostMemo).catch((): ObjRef[] => []);
+      const callerContents = await this.objectContents(caller, ctx.hostMemo).catch((err): ObjRef[] => {
+        if (isReadAvailabilityError(err)) return [];
+        throw err;
+      });
       if (callerContents.includes(target)) return true;
-      const targetLocation = await this.propOrNullForActorAsync(ctx.actor, target, "location", ctx.hostMemo).catch(() => null);
+      const targetLocation = await this.propOrNullForActorAsync(ctx.actor, target, "location", ctx.hostMemo);
       if (targetLocation === caller) return true;
     }
     return false;
@@ -6470,7 +6552,9 @@ export class WooWorld {
         }
         const { definer, verb } = this.resolveVerb(target, name);
         return { name: verb.name, definer, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
-      } catch {
+      } catch (err) {
+        const error = normalizeError(err);
+        if (error.code !== "E_VERBNF" && !isReadAvailabilityError(error)) throw err;
         return this.objects.has("$failed_match") ? "$failed_match" : null;
       }
     });
@@ -6522,7 +6606,15 @@ export class WooWorld {
     await Promise.all(subscribers.map(async (actor) => {
       const remote = await this.remoteHostForObject(actor, memo);
       const localLocations = this.allLocationsForActor(actor);
-      const remoteLocations = remote ? await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [] : [];
+      let remoteLocations: ObjRef[] = [];
+      if (remote) {
+        try {
+          remoteLocations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
+        } catch (err) {
+          if (isReadAvailabilityError(err)) return;
+          throw err;
+        }
+      }
       const locations = remote ? Array.from(new Set([...localLocations, ...remoteLocations])) : localLocations;
       if (locations.includes(space)) kept.push(actor);
       else stale.push(actor);
@@ -6592,7 +6684,8 @@ export class WooWorld {
   private async propOrNullForActorAsync(actor: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
     try {
       return await this.getPropChecked(actor, objRef, name, memo);
-    } catch {
+    } catch (err) {
+      if (!isOptionalProjectionReadError(err)) throw err;
       return null;
     }
   }
@@ -6618,7 +6711,8 @@ export class WooWorld {
     if (!this.hostBridge?.describeObject) return null;
     try {
       return await this.hostBridge.describeObject(ctx.progr, ctx.actor, item, ctx.hostMemo);
-    } catch {
+    } catch (err) {
+      if (!isReadAvailabilityError(err)) throw err;
       return null;
     }
   }
@@ -6642,7 +6736,8 @@ export class WooWorld {
           if (summary) summaries.set(id, summary);
         }
         return { summaries, remoteCount: remoteIds.length, batchCount: remoteHosts.size };
-      } catch {
+      } catch (err) {
+        if (!isReadAvailabilityError(err)) throw err;
         summaries.clear();
       }
     }
@@ -6881,7 +6976,10 @@ export class WooWorld {
   }
 
   private async playerExamineRemote(ctx: CallContext, target: ObjRef, matchedName: string): Promise<WooValue> {
-    const summary = await this.hostBridge?.describeObject?.(ctx.progr, ctx.actor, target, ctx.hostMemo).catch(() => null) ?? null;
+    const summary = await this.hostBridge?.describeObject?.(ctx.progr, ctx.actor, target, ctx.hostMemo).catch((err) => {
+      if (isReadAvailabilityError(err)) return null;
+      throw err;
+    }) ?? null;
     const name = typeof summary?.name === "string" && summary.name.length > 0 ? summary.name : target;
     const owner = typeof summary?.owner === "string" ? summary.owner : null;
     const aliases = Array.isArray(summary?.aliases) ? summary.aliases.filter((item): item is string => typeof item === "string") : [];
@@ -6889,7 +6987,10 @@ export class WooWorld {
     const obviousVerbs = Array.isArray(summary?.obvious_verbs)
       ? summary.obvious_verbs.filter((item): item is string => typeof item === "string")
       : [];
-    const contents = await this.objectContents(target, ctx.hostMemo).catch(() => [] as ObjRef[]);
+    const contents = await this.objectContents(target, ctx.hostMemo).catch((err) => {
+      if (isReadAvailabilityError(err)) return [] as ObjRef[];
+      throw err;
+    });
     const contentRows = await Promise.all(contents.map(async (item) => ({
       id: item,
       name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
@@ -7022,7 +7123,8 @@ export class WooWorld {
       try {
         const name = await this.getPropChecked(ctx.progr, item, "name", ctx.hostMemo);
         if (typeof name === "string" && name.length > 0) return name;
-      } catch {
+      } catch (err) {
+        if (!isOptionalProjectionReadError(err)) throw err;
         // E_PROPNF / E_PERM — fall through to id.
       }
       return item;
@@ -7039,6 +7141,36 @@ export class WooWorld {
     }
   }
 
+  async noteTextSummary(ctx: CallContext, note: ObjRef, rawLimit: number): Promise<Record<string, WooValue>> {
+    // TODO(note-catalog): this substrate helper knows about $note's raw .text
+    // property and :is_readable_by verb. It exists to keep note display
+    // summaries bounded without materializing full note bodies in the Tiny VM;
+    // the catalog-facing contract should remain the overridable
+    // $note:text_summary(limit) verb.
+    if (!this.objects.has(note) || !this.inheritsFrom(note, "$note")) {
+      throw wooError("E_TYPE", `note_text_summary target must be a $note descendant: ${note}`, note);
+    }
+    const readable = await this.dispatch(
+      { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
+      note,
+      "is_readable_by",
+      [ctx.actor]
+    );
+    if (readable !== true) throw wooError("E_PERM", "cannot read note", note);
+
+    const limit = Math.max(0, Math.min(512, Math.floor(rawLimit)));
+    const raw = this.object(note).properties.get("text");
+    const lines = Array.isArray(raw) ? raw : [];
+    const first = typeof lines[0] === "string" ? lines[0] : "";
+    let preview = first;
+    let truncated = false;
+    if (preview.length > limit) {
+      preview = limit > 3 ? `${preview.slice(0, limit - 3)}...` : preview.slice(0, limit);
+      truncated = true;
+    }
+    return { lines: lines.length, preview, truncated };
+  }
+
   // Cross-host-aware display name. The local stub of a remote object
   // (created by ensureInternalActor on cross-host /__internal/remote-dispatch)
   // carries `name = id` rather than the authoritative display name, so we
@@ -7049,7 +7181,8 @@ export class WooWorld {
       try {
         const name = await this.getPropChecked(progr, objRef, "name", memo);
         if (typeof name === "string" && name.length > 0) return name;
-      } catch {
+      } catch (err) {
+        if (!isOptionalProjectionReadError(err)) throw err;
         // E_PROPNF / E_PERM — fall through to id.
       }
       return objRef;
@@ -7071,7 +7204,9 @@ export class WooWorld {
       if (!this.hostBridge?.resolveVerb) return null;
       try {
         return await this.hostBridge.resolveVerb(target, verb, ctx.hostMemo);
-      } catch {
+      } catch (err) {
+        const error = normalizeError(err);
+        if (error.code !== "E_VERBNF" && !isReadAvailabilityError(error)) throw err;
         return null;
       }
     }
@@ -7204,9 +7339,21 @@ export class WooWorld {
 
   private async commandVerbCandidates(ctx: CallContext, target: ObjRef, name: string): Promise<CommandVerbSummary[]> {
     if (await this.remoteHostForObject(target, ctx.hostMemo)) {
+      if (this.hostBridge?.commandVerbCandidates) {
+        try {
+          return await this.hostBridge.commandVerbCandidates(target, name, ctx.hostMemo);
+        } catch (err) {
+          if (!isReadAvailabilityError(err)) throw err;
+          return [];
+        }
+      }
       const resolved = await this.tryResolveVerbForCommand(ctx, target, name);
       return resolved ? [resolved] : [];
     }
+    return this.commandVerbCandidateSummaries(target, name);
+  }
+
+  commandVerbCandidateSummaries(target: ObjRef, name: string): CommandVerbSummary[] {
     if (!this.objects.has(target)) return [];
     const out: CommandVerbSummary[] = [];
     const seen = new Set<string>();
@@ -7455,13 +7602,15 @@ export class WooWorld {
         try {
           const remoteName = await this.getPropChecked(ctx.progr, id, "name", ctx.hostMemo);
           if (typeof remoteName === "string") names.push(remoteName);
-        } catch {
+        } catch (err) {
+          if (!isOptionalProjectionReadError(err)) throw err;
           // Remote object id remains matchable even when display metadata is absent.
         }
         try {
           const remoteAliases = await this.getPropChecked(ctx.progr, id, "aliases", ctx.hostMemo);
           if (Array.isArray(remoteAliases)) aliases.push(...remoteAliases.map((item) => String(item)));
-        } catch {
+        } catch (err) {
+          if (!isOptionalProjectionReadError(err)) throw err;
           // Aliases are optional for matching.
         }
       }
@@ -7690,6 +7839,16 @@ export function normalizeError(err: unknown): ErrorValue {
   if (err instanceof SyntaxError) return wooError("E_INVARG", err.message);
   if (err instanceof Error) return wooError("E_INTERNAL", err.message);
   return wooError("E_INTERNAL", "unknown error", String(err));
+}
+
+function isReadAvailabilityError(err: unknown): boolean {
+  const error = normalizeError(err);
+  return error.code === "E_TIMEOUT" || error.code === "E_OBJNF";
+}
+
+function isOptionalProjectionReadError(err: unknown): boolean {
+  const error = normalizeError(err);
+  return error.code === "E_PROPNF" || error.code === "E_PERM" || isReadAvailabilityError(error);
 }
 
 function tokenizeCommand(text: string): ParsedToken[] {

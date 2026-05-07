@@ -146,7 +146,7 @@ Logical `&&` and `||` are compiled to short-circuit jumps; no dedicated opcode.
 | Op | Operands | Stack effect | Yield | Description |
 |---|---|---|---|---|
 | `GET_PROP` | — | obj name → val | **Y** | Walk prop-def chain; read value from owning object's storage. RPC if obj is remote. |
-| `SET_PROP` | — | obj name val → | N | Write value on `obj`'s own storage; check perms. If `obj` is remote, raise `E_CROSS_HOST_WRITE`; use `CALL_VERB` for cross-host mutation. |
+| `SET_PROP` | — | obj name val → | **Y** | Write value on `obj`'s own storage; check perms. RPC if obj is remote. |
 | `HAS_PROP` | — | obj name → bool | **Y** | Check if prop exists (defined anywhere in chain). |
 | `DEFINE_PROP` | — | obj name default perms → | N | Introduce a new prop slot on `obj`. Visible to descendants. If `obj` is remote, raise `E_CROSS_HOST_WRITE`. |
 | `UNDEFINE_PROP` | — | obj name → | N | Remove a prop definition from `obj`. If `obj` is remote, raise `E_CROSS_HOST_WRITE`. |
@@ -234,7 +234,7 @@ Op weights (defaults; tunable per-world):
 | `STR_INTERP`, `MAP_KEYS`, `LIST_SLICE` | 5 |
 | `GET_PROP` / `SET_PROP` local | 5 |
 | `GET_PROP` remote (RPC) | 100 |
-| `SET_PROP` remote rejection | 100 |
+| `SET_PROP` remote (RPC) | 100 |
 | `CALL_VERB` local | 10 |
 | `CALL_VERB` remote (host RPC) | 500 |
 | `EMIT` to local target | 10 per recipient |

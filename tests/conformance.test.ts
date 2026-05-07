@@ -155,6 +155,10 @@ class LocalHostBridge implements HostBridge {
     return await this.worldFor(objRef).getPropChecked(progr, objRef, name);
   }
 
+  async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue): Promise<void> {
+    await this.worldFor(objRef).setPropChecked(progr, objRef, name, value);
+  }
+
   async objectSummary(readActor: ObjRef, objRef: ObjRef): Promise<ScopedObjectSummary> {
     return await this.worldFor(objRef).scopedObjectSummary(readActor, objRef);
   }
@@ -403,7 +407,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
-  it("bridges remote property reads and CALL_VERB while rejecting remote SET_PROP", async () => {
+  it("bridges remote property reads, writes, and CALL_VERB", async () => {
     const homeHarness = make();
     const remoteHarness = make();
     try {
@@ -479,10 +483,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
           ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["PUSH_LIT", 2], ["SET_PROP"], ["PUSH_LIT", 3], ["RETURN"]]
         })
       );
-      const failed = await callInDubspace(home, session.id, "conf-cross-host-write", message(session.actor, "conf_local_writer", "write_remote", []));
-      expect(failed.op).toBe("applied");
-      if (failed.op === "applied") expect(failed.observations[0]).toMatchObject({ type: "$error", code: "E_CROSS_HOST_WRITE" });
-      expect(remote.getProp("conf_remote_box", "value")).toBe("from remote");
+      const written = await home.directCall("conf-cross-host-write", session.actor, "conf_local_writer", "write_remote", []);
+      expect(written.op).toBe("result");
+      expect(remote.getProp("conf_remote_box", "value")).toBe("changed");
     } finally {
       remoteHarness.cleanup();
       homeHarness.cleanup();

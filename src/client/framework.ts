@@ -76,6 +76,7 @@ export type ClientProjectionDraft = {
 export type WooObservationHandler = {
   types: string[];
   route?: WooObservationRoute | "both";
+  liveProjection?: "preview" | "canonical";
   reduce: (draft: ClientProjectionDraft, envelope: ObservationEnvelope) => void;
 };
 
@@ -261,6 +262,12 @@ export class CatalogUiRegistry {
   component(id: string, declaringAlias?: string): RegisteredComponent | undefined {
     const resolved = this.resolveComponentId(id, declaringAlias);
     return resolved ? this.components.get(resolved) : undefined;
+  }
+
+  componentsForSurface(surface: string): RegisteredComponent[] {
+    const wanted = String(surface ?? "");
+    if (!wanted) return [];
+    return [...this.components.values()].filter((component) => component.declaration.surface === wanted);
   }
 
   resolveComponentId(id: string, declaringAlias?: string): string | undefined {
@@ -599,8 +606,34 @@ export class ObservationRegistry {
   deliver(observation: Record<string, unknown>, delivered: DeliveredObservation) {
     const type = String(observation?.type ?? "");
     if (!type) return;
-    const draft = new ProjectionDraft();
     const envelope = { observation, delivered };
+    if (delivered.route === "live") {
+      const livePatches: ProjectionPatch[] = [];
+      const canonicalPatches: ProjectionPatch[] = [];
+      const canonicalClears: string[] = [];
+      for (const handler of this.handlers) {
+        if (!handler.types.includes(type)) continue;
+        if (handler.route && handler.route !== "both" && handler.route !== delivered.route) continue;
+        const draft = new ProjectionDraft();
+        handler.reduce(draft, envelope);
+        const patches = draft.consume();
+        const clears = draft.consumeAuthoritativeClears();
+        if (handler.liveProjection === "canonical") {
+          canonicalPatches.push(...patches);
+          canonicalClears.push(...clears);
+        } else {
+          livePatches.push(...patches);
+        }
+      }
+      for (const subject of canonicalClears) this.projection.clearAuthoritative(subject, { notify: canonicalPatches.length === 0 && livePatches.length === 0 });
+      if (canonicalPatches.length > 0) this.projection.applyCanonical(canonicalPatches);
+      for (const patch of livePatches) {
+        this.projection.applyLive(liveProjectionKey(type, patch.subject, livePatchDiscriminator(patch)), [patch]);
+      }
+      return;
+    }
+
+    const draft = new ProjectionDraft();
     for (const handler of this.handlers) {
       if (!handler.types.includes(type)) continue;
       if (handler.route && handler.route !== "both" && handler.route !== delivered.route) continue;
@@ -609,14 +642,8 @@ export class ObservationRegistry {
     const patches = draft.consume();
     const authoritativeClears = draft.consumeAuthoritativeClears();
     if (patches.length === 0 && authoritativeClears.length === 0) return;
-    if (delivered.route === "live") {
-      for (const patch of patches) {
-        this.projection.applyLive(liveProjectionKey(type, patch.subject, livePatchDiscriminator(patch)), [patch]);
-      }
-    } else {
-      for (const subject of authoritativeClears) this.projection.clearAuthoritative(subject, { notify: patches.length === 0 });
-      this.projection.applySequenced(patches);
-    }
+    for (const subject of authoritativeClears) this.projection.clearAuthoritative(subject, { notify: patches.length === 0 });
+    this.projection.applySequenced(patches);
   }
 }
 
@@ -856,6 +883,39 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
       for (const id of Array.isArray(envelope.observation.notes) ? envelope.observation.notes : []) {
         if (typeof id === "string" && id) draft.clearCatalogState(id, "pinboard_note");
       }
+    }
+  });
+  registry.observation({
+    types: ["property_changed"],
+    route: "both",
+    liveProjection: "canonical",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const target = String(obs.target ?? obs.object ?? obs.source ?? "");
+      const name = String(obs.name ?? "");
+      if (!target || !name) return;
+      draft.patchObjectProps(target, { [name]: obs.value });
+    }
+  });
+  registry.observation({
+    types: ["value_changed"],
+    route: "both",
+    liveProjection: "canonical",
+    reduce: (draft, envelope) => {
+      const target = String(envelope.observation.target ?? envelope.observation.object ?? envelope.observation.source ?? "");
+      if (target) draft.patchObjectProps(target, { value: envelope.observation.value });
+    }
+  });
+  registry.observation({
+    types: ["block_data"],
+    route: "both",
+    liveProjection: "canonical",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const block = String(obs.block ?? obs.target ?? obs.source ?? "");
+      const name = String(obs.name ?? "");
+      if (!block || !name) return;
+      draft.patchObjectProps(block, { [name]: obs.value });
     }
   });
   registry.observation({

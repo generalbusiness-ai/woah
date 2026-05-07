@@ -160,7 +160,7 @@ describe("woo core", () => {
     expect(passErr).toMatchObject({ code: "E_PERM" });
   });
 
-  it("routes VM reads and CALL_VERB through a host bridge but rejects cross-host writes", async () => {
+  it("routes VM reads, writes, and CALL_VERB through a host bridge", async () => {
     const { world: home, session, actor } = authedWorld();
     const remote = createWorld({ catalogs: false });
     const worlds = new Map<string, WooWorld>([
@@ -243,10 +243,10 @@ describe("woo core", () => {
       )
     );
 
-    const failedWrite = await callInDubspace(home, session.id, "cross-host-write", message(actor, "local_writer", "write_remote", []));
-    expect(failedWrite.op).toBe("applied");
-    if (failedWrite.op === "applied") expect(failedWrite.observations[0]).toMatchObject({ type: "$error", code: "E_CROSS_HOST_WRITE" });
-    expect(remote.getProp("remote_box", "value")).toBe("remote");
+    const written = await callInDubspace(home, session.id, "cross-host-write", message(actor, "local_writer", "write_remote", []));
+    expect(written.op).toBe("applied");
+    if (written.op === "applied") expect(written.observations).toHaveLength(0);
+    expect(remote.getProp("remote_box", "value")).toBe("changed");
   });
 
   it("memoizes repeated remote reads within one host operation", async () => {
@@ -564,6 +564,44 @@ describe("woo core", () => {
     expect(failedInfo.op).toBe("applied");
     if (failedInfo.op === "applied") expect(failedInfo.observations[0]).toMatchObject({ type: "$error", code: "E_PERM" });
     expect(world.propertyInfo("private_box", "secret").perms).toBe("r");
+  });
+
+  it("routes VM property assignment to a remote object host", async () => {
+    const home = createWorld();
+    const remote = createWorld();
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["remote", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      ["delay_1", "home"],
+      ["remote_box", "remote"]
+    ]);
+    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    remote.createObject({ id: "remote_box", name: "Remote Box", parent: "$thing", owner: "$wiz" });
+    remote.defineProperty("remote_box", {
+      name: "secret",
+      defaultValue: "before",
+      owner: "$wiz",
+      perms: "r",
+      typeHint: "str"
+    });
+    home.addVerb(
+      "delay_1",
+      bytecodeVerb("write_remote_box", {
+        literals: ["remote_box", "secret", "after", true],
+        num_locals: 0,
+        max_stack: 3,
+        version: 1,
+        ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["PUSH_LIT", 2], ["SET_PROP"], ["PUSH_LIT", 3], ["RETURN"]]
+      })
+    );
+
+    const result = await home.directCall("remote-prop-write", "$wiz", "delay_1", "write_remote_box", []);
+
+    expect(result.op).toBe("result");
+    expect(remote.getProp("remote_box", "secret")).toBe("after");
   });
 
   it("treats owner as a read-only core field projection", () => {

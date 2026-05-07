@@ -27,10 +27,11 @@ $note < $portable < $thing
 ```
 
 `.text` is `perms ""` deliberately. Direct property reads are denied;
-the public API is the `:text()` verb, which gates via `:is_readable_by`.
+the public API for full note bodies is the `:text()` verb, which gates via
+`:is_readable_by`. Bounded display surfaces use `:text_summary(limit)`.
 This keeps the property model open for `$encrypted_note < $note` and
-similar privacy-respecting subclasses without changing callers — they
-already go through the verb.
+similar privacy-respecting subclasses without changing callers — they use
+overridable note verbs rather than reading `.text` directly.
 
 Properties inherited from `$portable`:
 - `.portable = true` — eligible for `:take`/`:drop` between rooms and
@@ -41,6 +42,7 @@ Properties inherited from `$portable`:
 | Verb | Purpose |
 | --- | --- |
 | `text` | Permission-checking getter for `.text`. Public API for callers that don't run as wizards. |
+| `text_summary(limit)` | Permission-checking bounded display summary. Base implementation returns line count, first-line preview, and truncation flag without expanding unbounded note bodies. Subclasses that transform text for readers should override this alongside `:text()`. |
 | `read` / `r@ead` | Call `:text()`, emit a `note_read` observation, return the text. |
 | `set_text(lines)` | Replace text. Permission: `:is_writable_by(actor)`. |
 | `write(line)` | Append a line. Permission: `:is_writable_by(actor)`. |
@@ -49,7 +51,7 @@ Properties inherited from `$portable`:
 | `is_readable_by(actor)` | Default `true`. Override in subclasses to restrict. |
 | `is_writable_by(actor)` | Owner, members of `.writers`, or wizard. |
 | `look` / `look_self` | Standard space/thing look surface. Returns preview title, line count, and current location. |
-| `title` | Object name plus the first readable text line when present, so multiple notes in one room can be distinguished and matched. |
+| `title` | Object name plus a bounded preview of the first readable text line when present, so multiple notes in one room can be distinguished and matched without expanding long note bodies into inventory or room summaries. |
 
 ## What is intentionally absent in v0.1
 

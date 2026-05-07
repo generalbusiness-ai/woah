@@ -6,6 +6,9 @@ The smallest viable demo of the `$dispenser_block` pattern: an
 LLM-driven vending machine. It exists to validate the queue → plug →
 delivery loop end-to-end with a real generative model and a real CF
 Worker, without any horoscope-specific machinery in the substrate.
+The class object is a fertile template: behavior and owner tools live on
+`$horoscope_block`, while deployed machines are ordinary non-fertile
+instances.
 
 ## Why this catalog is tiny
 
@@ -15,13 +18,16 @@ Everything about the dispenser pattern lives in `$dispenser_block`:
 - the persistent `pending_orders` queue
 - the per-requester rate limit
 - the `$dispensed_note` output type with back-references
+- requester text on accepted orders and delivered notes
 
 `$horoscope_block` only declares "this is the persona-driven LLM
 variant" — its only configuration is `system_prompt` (inherited) and
-`description` (intrinsic). No `tone` property. No `house_style`. No
-follow-up URL. The plug picks the prompt-and-request shape, the queue
-lives on the block, and the note in your hand is how you know it's
-done.
+the inherited dispenser limit knobs. Owners and wizards use narrow
+configuration verbs (`set_system_prompt`, `set_rate_limits`,
+`set_queue_limits`) rather than the raw generic `$block:set_property`
+surface. No `tone` property. No `house_style`. No follow-up URL. The
+plug picks the prompt-and-request shape, the queue lives on the block,
+and the note in your hand is how you know it's done.
 
 ## Plug
 

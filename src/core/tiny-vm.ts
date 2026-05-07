@@ -118,7 +118,8 @@ const BUILTIN_NAMES = [
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
-  "to_int", "to_float"
+  "to_int", "to_float",
+  "note_text_summary"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -460,7 +461,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           const value = pop();
           const name = assertString(pop());
           const obj = assertObj(pop());
-          await current.ctx.world.setPropChecked(current.ctx.progr, obj, name, value);
+          await current.ctx.world.setPropChecked(current.ctx.progr, obj, name, value, current.ctx.hostMemo);
           break;
         }
         case "HAS_PROP": {
@@ -838,6 +839,13 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const list = assertList(builtinArgs[0]);
         const separator = assertString(builtinArgs[1] ?? "");
         return list.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(separator);
+      }
+      case "note_text_summary": {
+        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "note_text_summary expects note and optional preview limit");
+        const limit = builtinArgs.length >= 2 && builtinArgs[1] !== null
+          ? numeric(builtinArgs[1], "note_text_summary limit")
+          : 96;
+        return await frame.ctx.world.noteTextSummary(frame.ctx, assertObj(builtinArgs[0]), limit);
       }
       case "min":
         return Math.min(...builtinArgs.map((value) => numeric(value, "min argument")));

@@ -15,7 +15,7 @@ The full identity surface here targets Cloudflare mode (see [SPEC.md §1.1](../.
 
 ## A1. Beyond guest
 
-Guest-baseline identity ([identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline)) supports `guest:<random>` and `session:<id>` tokens. That's enough for a demo where every actor is anonymous and short-lived. It's not enough for:
+Guest-baseline identity ([identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline)) supports `guest:<random>` and `session:<id>` tokens. The `<id>` is an opaque, unguessable session id with at least 128 bits of entropy. That's enough for a demo where every actor is anonymous and short-lived. It's not enough for:
 
 - A developer who wants to log in as themselves across sessions, days, devices.
 - A team where each member's actions are attributable.

@@ -23,9 +23,10 @@ There are exactly three host classes. The VM bytecode and semantics are identica
 
 ### 3.1 Async host RPC
 
-Execution is task-oriented. A **task** is an activation stack owned by one host at a time. The two operations that cross host boundaries are:
+Execution is task-oriented. A **task** is an activation stack owned by one host at a time. The ordinary operations that cross host boundaries are:
 
-- **Property reads on a remote object** (`OP_GET_PROP`): the task yields, an RPC fetches the value, the task resumes with the result on its operand stack. The task does *not* migrate. Raw remote property writes are rejected with `E_CROSS_HOST_WRITE`; cross-host mutation is expressed as verb dispatch so the receiving host owns its own permission checks, transaction boundary, and audit trail.
+- **Property reads on a remote object** (`OP_GET_PROP`): the task yields, an RPC fetches the value, the task resumes with the result on its operand stack. The task does *not* migrate.
+- **Property-value writes on a remote object** (`OP_SET_PROP`): the task yields, an RPC asks the owning host to check permissions and write the value, and the task resumes when that write succeeds or fails. The caller's local rollback scope does not include the remote write after it lands.
 - **Verb dispatch onto a remote object** (`OP_CALL_VERB`): the caller awaits a routed dispatch RPC. The origin host keeps the caller's continuation; the receiver runs the callee frame under the caller's authority and returns `{result, observations}`. The origin resumes its own frame at the call site.
 
 The opcode shape is symmetric across all three host classes. A verb call from a persistent host onto a transient-hosted object goes through the player's persistent host over the existing client connection; from the program's perspective it is the same `CALL_VERB` yield point.
@@ -204,7 +205,9 @@ ordinary language primitives:
 - local `CALL_VERB` composes activation frames on the same host;
 - remote `CALL_VERB` is an awaited `dispatch` RPC and may raise
   `E_HOST_CYCLE` if it would re-enter the wait chain;
-- raw remote property writes remain `E_CROSS_HOST_WRITE`;
+- remote property-value writes are awaited host RPCs to the owning object host;
+- property definition, property metadata, and lifecycle writes remain
+  `E_CROSS_HOST_WRITE` when they would cross hosts;
 - long-running cross-host coordination is expressed as messages, parked tasks,
   or sequenced calls, not as callbacks inside an open behavior turn.
 

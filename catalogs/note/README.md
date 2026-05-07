@@ -31,6 +31,7 @@ writer objects beyond the owner).
 
 ```
 :text                   permission-checking getter for the text content
+:text_summary(limit)    bounded display summary for title/look surfaces
 :read                   show the text and emit a note_read observation
 :set_text(lines)        replace the entire text (writers only)
 :write(line)            append one line (writers only)
@@ -39,12 +40,13 @@ writer objects beyond the owner).
 :is_readable_by(actor)  default true; override in subclasses to restrict
 :is_writable_by(actor)  owner, .writers entries, or wizard
 :look / :look_self      standard look surface (preview title, line count, location)
-:title                  name plus first readable text line when present
+:title                  name plus a bounded preview of the first readable text line when present
 ```
 
-`.text` is private (`perms: ""`); always go through `:text()` from
-non-wizard callers. This keeps `$encrypted_note` and other
-privacy-respecting subclasses possible without changing callers.
+`.text` is private (`perms: ""`); always go through `:text()` for full
+body reads and `:text_summary(limit)` for bounded display summaries. This
+keeps `$encrypted_note` and other privacy-respecting subclasses possible
+without changing callers.
 
 ## Use it
 

@@ -245,6 +245,56 @@ describe("client UI framework projection", () => {
     expect(ui.observe("filter_1")?.props.cutoff).toBe(500);
   });
 
+  it("reduces generic property change observations into object props", () => {
+    const ui = createWooClientFramework();
+    ui.ingestWorld({
+      objects: {
+        the_chatroom: { id: "the_chatroom", name: "Living Room", props: { mood: "quiet", value: "old" } }
+      }
+    });
+
+    ui.ingestAppliedFrame({
+      op: "applied",
+      seq: 22,
+      space: "the_chatroom",
+      observations: [
+        { type: "property_changed", source: "the_chatroom", name: "mood", value: "busy" },
+        { type: "value_changed", source: "the_chatroom", value: "new" }
+      ]
+    });
+
+    expect(ui.observe("the_chatroom")?.props).toMatchObject({ mood: "busy", value: "new" });
+  });
+
+  it("keeps live generic property change observations after live-layer pruning", () => {
+    const ui = createWooClientFramework();
+    ui.ingestWorld({
+      objects: {
+        the_chatroom: { id: "the_chatroom", name: "Living Room", props: { mood: "quiet", value: "old" } }
+      }
+    });
+
+    ui.ingestLiveObservation({ type: "property_changed", source: "the_chatroom", name: "mood", value: "busy" });
+    ui.ingestLiveObservation({ type: "value_changed", source: "the_chatroom", value: "new" });
+    ui.prune(Date.now() + 2_000);
+
+    expect(ui.observe("the_chatroom")?.props).toMatchObject({ mood: "busy", value: "new" });
+  });
+
+  it("keeps live block_data observations after live-layer pruning", () => {
+    const ui = createWooClientFramework();
+    ui.ingestWorld({
+      objects: {
+        the_weather: { id: "the_weather", name: "Weather", props: { current: null } }
+      }
+    });
+
+    ui.ingestLiveObservation({ type: "block_data", block: "the_weather", name: "current", value: { temp: 73, unit: "F" } });
+    ui.prune(Date.now() + 2_000);
+
+    expect(ui.observe("the_weather")?.props.current).toEqual({ temp: 73, unit: "F" });
+  });
+
   it("can fold direct authoritative patches into canonical projection", () => {
     const ui = createWooClientFramework();
     ui.ingestSnapshot("overlay:dubspace:the_dubspace", [

@@ -1,6 +1,6 @@
 ---
 name: weather
-version: 0.1.0
+version: 0.1.2
 spec_version: v1
 license: MIT
 description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes current, forecast, and history.
@@ -18,6 +18,9 @@ fetched by an external plug Worker. The plug authenticates as the block's
 actor via an apikey credential, calls a hosted weather API on a schedule,
 and pushes the result into the block's `writable_self` properties; the
 block's owner configures *where* and *how* via `writable_owner` props.
+The class object `$weather_block` is fertile: builders can create new
+weather panel instances under it, and each instance inherits the
+owner/wizard configuration verbs.
 
 See [DESIGN.md](DESIGN.md) for the mapping to canonical block kinds and
 the plug's lifecycle.
@@ -28,33 +31,62 @@ the plug's lifecycle.
 
 | Name | Default | Notes |
 |---|---|---|
-| `place` | `""` | Location string the plug passes to the upstream API (e.g. `"Mountain View, CA"`). |
+| `place` | `""` | Town name or zip code. The plug passes this to the upstream API, and the block displays this same value. |
+| `timezone` | `""` | IANA timezone, e.g. `America/Los_Angeles`; the plug uses it to write local observation time text. |
 | `units` | `"metric"` | `"metric"` or `"imperial"`. |
 | `forecast_hours` | `12` | How many hours of forecast the plug should fetch. |
+| `config_state` | `{status: "unconfigured"}` | Plug confirmation state for the current location/timezone. |
+
+## Owner Tools
+
+`$weather_block` exposes narrow configuration verbs on each instance:
+
+| Verb | Notes |
+|---|---|
+| `set_location(place, timezone)` | Sets `place` and `timezone` together, clears stale errors, and marks `config_state.status` as `pending` until the plug confirms them. |
+| `set_units(units)` | Accepts `metric` or `imperial`. |
+| `set_forecast_hours(hours)` | Stores a rounded value from 1 to 168. |
+
+Only the block owner or a wizard can use these verbs. The generic
+`$block:set_property` / `:set_properties` surface remains hidden from MCP
+tools; plug sessions still use it for data writes. Semantic validation
+stays in the plug: timezone values must be real IANA timezone names, and
+invalid values are rejected when the plug runs.
 
 ### Plug-writable (data)
 
 | Name | Kind | Notes |
 |---|---|---|
-| `current` | `scalar` | Headline current temperature with unit and label. |
+| `current` | `scalar` | Headline current temperature with unit, label, observed time text, and source `weather_code`. |
 | `forecast` | `series` | Hourly forecast with temperature points and hourly detail rows. |
 | `history` | `series` | Recent observed values as a series. |
 | `last_pushed_at` | int | Inherited from `$block`; epoch ms of last plug push. |
 | `last_error` | str/null | Inherited from `$block`; most recent fetch failure. |
+| `config_state` | map | `pending`, `confirmed`, or config-specific `error` state for the owner-set location/timezone. |
 
 ## Look Surface
 
-`:title()` and `:look_self()` render the current scalar reading directly,
-for example `Temperature in Mountain View, CA: 72°F`, and include
-`last_updated` / `last_pushed_at` so room look and object look both show
-freshness instead of a raw JSON block.
+`:title()` renders the current scalar reading directly, for example
+`Temperature in Mountain View CA: 72°F`. `:look_self()` renders a sentence:
+`The weather panel shows that the temperature in Mountain View CA was 72°F
+at May 6, 2026, 9:01 AM PDT.` The plug formats this from the observation
+timestamp and the block's `timezone`; `:look_self()` does not show the raw
+`last_pushed_at` epoch.
+
+## UI
+
+The catalog declares `weather.badge`, a compact `title-badge` component for
+room title bars. The bundled web client mounts it next to the current room name
+when a room contains a `$weather_block`; the demo Living Room is the intended
+initial placement. The badge reads projected block data and falls back
+silently if the UI module is unavailable.
 
 ## Provisioning
 
 ```text
 @create_instance $weather_block as the_living_room_weather location: the_living_room
-:set_property("place", "Mountain View, CA")
-:set_property("units", "imperial")
+:set_location("Mountain View CA", "America/Los_Angeles")
+:set_units("imperial")
 :mint_apikey("weather-cf-worker-prod")
 # paste the resulting secret into wrangler secret put WOO_APIKEY
 # wrangler deploy from catalogs/weather/plug

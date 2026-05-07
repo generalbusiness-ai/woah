@@ -189,7 +189,7 @@ CREATE TABLE space_snapshot (
 -- Credential metadata only — connection state is in-memory, not persisted, per
 -- semantics/identity.md §I2.
 CREATE TABLE session (
-  id             TEXT PRIMARY KEY,         -- session_id (random 128-bit)
+  id             TEXT PRIMARY KEY,         -- session_id (unguessable random, at least 128 bits)
   actor          TEXT NOT NULL,            -- objref of bound actor
     started        INTEGER NOT NULL,
     expires_at     INTEGER NOT NULL,

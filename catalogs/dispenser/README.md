@@ -1,6 +1,6 @@
 ---
 name: dispenser
-version: 0.1.0
+version: 0.1.1
 spec_version: v1
 license: MIT
 description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests.
@@ -47,8 +47,8 @@ sequencing details.
 
 | Verb | Caller | Notes |
 |---|---|---|
-| `:order(request)` | public | Checks request size, queue cap, block cooldown, and requester rate limit; appends to `pending_orders`, returns `{order_id, queued, ts}`, emits `order_placed` (sequenced when invoked through space-call). |
-| `:deliver(order_id, body)` | block actor (plug) or wizard | Idempotent. Removes the entry, creates a `$dispensed_note`, moves it to the requester. Emits `delivered`. |
+| `:order(request)` | public | Checks request size, queue cap, block cooldown, and requester rate limit; appends to `pending_orders`, tells the requester it was accepted, returns `{order_id, queued, text, ts}`, emits `order_placed` (sequenced when invoked through space-call). |
+| `:deliver(order_id, body)` | block actor (plug) or wizard | Idempotent. Removes the entry, creates a `$dispensed_note`, moves it to the requester, and tells them the note arrived. Emits `delivered`. |
 | `:cancel(order_id)` | requester / owner / wizard | Removes the entry, emits `canceled`. |
 | `:next_pending()` | block actor (plug) or wizard | Returns the oldest queued entry, or `null`. |
 | `:status(order_id)` | public | Returns `{state: "queued", ts}` or `{state: "unknown"}`. |
@@ -58,7 +58,8 @@ sequencing details.
 A `$note` subclass with `produced_by` (the producing block) and
 `produced_at` (epoch ms) back-references. The note arrives in the
 requester's inventory; the room sees a sequenced `delivered`
-observation describing the event for bystanders.
+observation describing the event for bystanders. The requester also gets
+a direct text observation when the note lands.
 
 ## Subclassing
 

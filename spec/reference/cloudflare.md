@@ -45,9 +45,19 @@ The runtime stores the resolved id-to-host map in **Directory** ([§R2](#r2-sing
 
 **Operation-scoped memoization.** Within one verb execution, the origin host may memoize id-to-host resolutions and read-only cross-DO fetches (`getProp`, `location`, `contents`, bundled object description, verb metadata) by promise. The memo dies with the execution frame; it is not a TTL cache and must not be reused by later calls. Reads inside one execution are therefore a frame-scoped snapshot: if the same frame mutates remote state through dispatch and then repeats a memoized read, the earlier read may be returned. This removes duplicate fetches inside one `:look`, movement, command parse, or agent tool resolution without serving stale world state across operations.
 
+**Read RPC timeouts.** Read-only cross-DO RPCs used for projections, room snapshots, object summaries, command matching, and tool discovery are bounded. A slow or cold remote host must not hold the caller host's single-threaded queue long enough to starve unrelated commands.
+
+Timeout fallback is operation-classed:
+
+- **Semantic reads** (`getProp`, `location`, `contents`, verb metadata, ancestry) fail with `E_TIMEOUT` when the caller needs the value to decide behavior, permission, routing, or a mutation. Callers must not guess.
+- **Presentation reads** may degrade only for expected read-availability failures (`E_TIMEOUT`, stale/missing remote object refs such as `E_OBJNF`) and optional-field misses. The fallback is omission or id-only display: omit timed-out remote room members/exits/tools, omit missing summaries, or show the object id as a title. Permission and programming errors remain visible unless the API is explicitly an optional filtered read.
+- **Command matching** may use local candidates and id-only remote candidates when metadata is unavailable. If the remote object's verb metadata is unavailable, the planner treats that object as not matching and produces the ordinary `huh` plan; it does not invent a verb route.
+- **Room snapshots** keep the local room shell and omit timed-out remote members/exits. If the room owner itself is remote and unavailable, the snapshot may degrade to absent (`here: null` in `/api/me`) only for expected read-availability errors; permission, type, and internal errors must propagate.
+- **Mutating RPCs** are not silently timed out by this read budget because a late owner write would create ambiguous state.
+
 **Bundled object descriptions.** Read-heavy projections such as room `:look` and `$match` object resolution should use bundled cross-host describe RPCs where available, returning the common display fields (`name`, `description`, `aliases`). When a caller already has several candidate objects on the same host, it should use the batch form (`describeObjects`) so one room look or command parse pays one RPC per host rather than one RPC per item. `name` is the object's display name; property fields use the same per-property read filtering the separate `getProp` calls would apply. This is an optimization, not a new authority surface: callers must still pass the actor/progr identities used for the equivalent reads, and a host may return `null` for fields the actor cannot read.
 
-**Remote command planning reads.** A room-hosted command planner may need to inspect a visible object's verb metadata when that object is hosted elsewhere. The host RPC returns only the slot, canonical verb name, aliases/arg spec needed for planning, and `direct_callable` flag; actual execution still routes through ordinary direct or sequenced dispatch and re-checks permissions on the object host.
+**Remote command planning reads.** A room-hosted command planner may need to inspect a visible object's verb metadata when that object is hosted elsewhere. Command planning must ask the owning host for all verb candidates whose canonical name or aliases match the command token, not just the first runtime-resolved verb: command aliases intentionally overlap, such as `look` and `look_at`, and the planner filters candidates by `arg_spec.command`. The host RPC returns only the slot, canonical verb name, aliases/arg spec needed for planning, and `direct_callable` flag; actual execution still routes through ordinary direct or sequenced dispatch and re-checks permissions on the object host.
 
 ### R1.7 Contents-mirror invariants
 
@@ -240,7 +250,12 @@ The caller receives an applied frame only after the final commit succeeds. If co
 
 Cross-anchor-cluster mutations (cross-DO RPCs from inside the verb body) are **not** in the rollback scope, per [space.md §S3.4](../semantics/space.md#s3-failure-rules-normative). Verb authors avoid them in sequenced flows; if they must, they accept the torn-state risk.
 
-The VM does not perform raw remote property writes (`SET_PROP`, property definition, or property metadata edits) from inside a running behavior. Those raise `E_CROSS_HOST_WRITE`. Cross-host mutation, when unavoidable, is expressed as `CALL_VERB` to the remote object so the receiving host performs its own permission checks, sequencing discipline, and audit trail.
+The VM routes ordinary remote property-value writes (`SET_PROP`) to the
+owning host, which performs the same permission checks and durable write it
+would perform for a local assignment. Property definition, property metadata
+edits, and lifecycle operations still raise `E_CROSS_HOST_WRITE` when they
+would cross hosts; those operations are authoring/lifecycle changes rather than
+ordinary object state writes.
 
 ---
 
@@ -258,7 +273,8 @@ The concrete CF SQLite encoding lives in [persistence.md](persistence.md). The s
 |---|---|
 | `getProp(id, name, expected_version?)` | Property read with lazy version check ([persistence.md §15.3](persistence.md#153-lazy-version-check)). Returns `{value, version, perms}` or `E_PROPNF`/`E_PERM`. |
 | `describeObject(id, actor)` / `describeObjects(ids, actor)` | Bundled read of display `name`, actor-readable `description`, and actor-readable `aliases` for look/match projections. Batch form returns a map keyed by id and is preferred when multiple candidate ids are already known. |
-| `resolveVerb(id, descriptor)` | Read-only verb metadata lookup for command planning; descriptor is name or 1-based local slot. Returns slot, canonical name, `arg_spec` (including command metadata), and `direct_callable`, not executable code. |
+| `resolveVerb(id, descriptor)` | Read-only single-verb metadata lookup; descriptor is name or 1-based local slot. Returns slot, canonical name, `arg_spec`, and `direct_callable`, not executable code. Runtime dispatch uses this single resolution shape. |
+| `commandVerbCandidates(id, name)` | Read-only command-planning metadata lookup. Returns every local ancestry/feature verb whose canonical name or aliases match `name`, preserving local planner order, with `arg_spec` (including command metadata) and `direct_callable`. Command planning filters this list by `arg_spec.command`; execution still uses ordinary dispatch. |
 | `contents(id)` | Read a container's contents mirror for look/match projections. |
 | `getVerb(id, descriptor, expected_version?)` | Verb fetch for the cross-host bytecode cache. Returns `{slot, bytecode, version, owner, perms, definer}`. |
 | `getAncestorChain(id, expected_version?)` | Chain walk for cache population. |
@@ -412,17 +428,29 @@ The seed graph from [bootstrap.md](../semantics/bootstrap.md) materializes the f
    - Sets `bootstrapped = true`.
 4. Boot is idempotent; concurrent first-requests serialize on `$system`'s single-threaded execution.
 
-Each object-owning DO also runs a host-scoped local catalog lifecycle after it
-loads or refreshes its host slice. Support objects and seed verbs arrive from
-the gateway's fresh host seed and merge through `mergeHostScopedSeed`. A
-brand-new host records the host-scoped content-addressed catalog schema plan as
-covered by that seed; a host with stored state applies the plan in host scope,
-verifies postconditions, and records the result in
-`$system.catalog_migration_records`.
+Each object-owning DO also runs a host-scoped local catalog lifecycle when it
+cold-loads its host slice. Support objects and seed verbs arrive from the
+gateway's fresh host seed and merge through `mergeHostScopedSeed`. A brand-new
+host records the host-scoped content-addressed catalog schema plan as covered by
+that seed; a host with stored state applies the plan in host scope, verifies
+postconditions, and records the result in `$system.catalog_migration_records`.
+When a fresh gateway seed was available, the host applies that seed again after
+the host-scoped lifecycle so gateway support-object repairs remain authoritative
+over the host's copied class and verb rows.
 Host-local data migrations use the same record path and run against state that
 the host actually owns. The gateway's `$system.applied_migrations` ledger may be
 copied into a host seed, but it does not prove the host's local instance data was
 converted.
+
+A wizard may ask the gateway to refresh live object hosts with
+`POST /api/admin/refresh-host-seeds`. The gateway exports each requested
+host-scoped seed and sends it to the owning DO. The receiving host merges that
+seed into its live world and persists only when the merge changed state. This
+live refresh treats the gateway seed as authoritative and does not run manifest
+repair on the partial host slice; host-local lifecycle repair remains a
+cold-load responsibility. When a wizard supplies an explicit `hosts` list, names
+that do not match any routed object host are reported as skipped with
+`reason = "unmatched_host"`.
 
 ### R9.2 Boot identity
 
@@ -460,8 +488,11 @@ Required event types (cardinality budget per DO):
 | `session` | event_kind ('bind'\|'detach'\|'reap'), token_class | — | actor_id |
 | `wizard_action` | action ('force_direct'\|'force_recycle'\|'impersonate') | — | actor_id |
 | `error` | code, surface ('rest'\|'wire'\|'rpc') | — | request_id |
+| `startup_storage` | phase, status, error_code? | latency_ms, object_count, route_count, statement_count | do_id |
 
 Cost: one AE write per call is fine at v1 traffic levels; budget revisits at scale.
+
+Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch, Directory schema setup, and Directory object-route registration.
 
 ### R10.2 Structured logs
 

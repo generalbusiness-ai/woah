@@ -15,10 +15,11 @@ Objects, properties and verbs, permissions, a self-contained VM runtime.
 Interact with Websockets, MCP tools, and REST APIs.  Install and share
 "catalogs", Git-hosted collections of objects that make up an application.
 
-Catalog objects can include lightweight UI.
+Catalog objects can include lightweight UI components.  The frame is not
+yet settled, but the components themselves can be functional surfaces.
 
-In-world objects can be presentation and interaction surfaces over external
-data.
+In-world objects can be presentation and interaction surfaces ("block")
+over external data that connects through a "plug".
 
 ![woo](public/og-image.png)
 
@@ -53,7 +54,8 @@ Start with [spec/README.md](spec/README.md).
 ## Implementation Plan
 
 Runtime code lives under [src/](src/), with focused tests under [tests/](tests/).
-Historical implementation notes are in [notes/](notes/).
+Implementation notes and discussion documents are in [notes/](notes/).
+The normative specs are documented in [spec/](spec/).
 
 Near-term goals: functional IDE for programmers; user onboarding flows;
 fork/suspend VM operations.

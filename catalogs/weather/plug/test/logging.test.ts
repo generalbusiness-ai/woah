@@ -53,6 +53,7 @@ describe("runLoggedWeatherTick", () => {
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
       () => ({ status: 200, body: { value: 1 } }),
       () => ({ status: 200, body: { data: { time: "t", values: { temperature: 70 } } } }),
       () => ({ status: 200, body: { timelines: { hourly: [{ time: "t1", values: { temperature: 71 } }] } } }),
@@ -94,7 +95,7 @@ describe("runLoggedWeatherTick", () => {
     });
   });
 
-  it("emits tick_error with category=woo:E_NO_PLACE when the owner hasn't set place", async () => {
+  it("emits tick_error with category=weather_config:E_NO_PLACE when the owner hasn't set place", async () => {
     const { fetchImpl } = makeFetch([
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
       () => ({ status: 200, body: { value: "" } }),
@@ -104,7 +105,7 @@ describe("runLoggedWeatherTick", () => {
     await expect(runLoggedWeatherTick(env, "fetch", { fetchImpl })).rejects.toMatchObject({ code: "E_NO_PLACE" });
     const errLine = lines.find((l) => l.event === "tick_error");
     expect(errLine).toMatchObject({
-      category: "woo:E_NO_PLACE",
+      category: "weather_config:E_NO_PLACE",
       code: "E_NO_PLACE",
       trigger: "fetch"
     });
@@ -115,6 +116,7 @@ describe("runLoggedWeatherTick", () => {
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
       () => ({ status: 200, body: { value: 1 } }),
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 429, body: { code: 429001, message: "rate limit" }, headers: { "Retry-After": "60" } }
@@ -135,6 +137,7 @@ describe("runLoggedWeatherTick", () => {
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
+      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
       () => ({ status: 200, body: { value: 1 } }),
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 401, body: { error: "bad key" } }

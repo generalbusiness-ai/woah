@@ -45,6 +45,10 @@ class RemoteToolBridge implements HostBridge {
     return await this.worldFor(objRef).getPropChecked(progr, objRef, name);
   }
 
+  async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue): Promise<void> {
+    await this.worldFor(objRef).setPropChecked(progr, objRef, name, value);
+  }
+
   async location(objRef: ObjRef): Promise<ObjRef | null> {
     return this.worldFor(objRef).object(objRef).location;
   }
