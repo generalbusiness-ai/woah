@@ -2079,41 +2079,49 @@ export class WooWorld {
     return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt));
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {
+    let result: WooValue;
     if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      return await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
-    }
-    if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
-    this.callDepth += 1;
-    try {
-      // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
-      // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
-      // as "no parent override" and fall back to the standard resolveVerb walk.
-      const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
-      this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-      const runCtx: CallContext = {
-        ...ctx,
-        thisObj: target,
-        verbName,
-        definer,
-        callerPerms: ctx.progr,
-        progr: verb.owner,
-        player: ctx.player ?? ctx.actor,
-        caller: ctx.caller ?? "#-1"
-      };
-      if (verb.kind === "native") {
-        // Native handlers are an implementation detail behind ordinary verb
-        // dispatch. The dispatch path above has already enforced verb execute
-        // permissions and set progr/definer/caller frame fields.
-        const handler = this.nativeHandlers.get(verb.native);
-        if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
-        return await handler(runCtx, args);
+      result = await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
+    } else {
+      if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
+      this.callDepth += 1;
+      try {
+        // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
+        // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
+        // as "no parent override" and fall back to the standard resolveVerb walk.
+        const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
+        this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
+        const runCtx: CallContext = {
+          ...ctx,
+          thisObj: target,
+          verbName,
+          definer,
+          callerPerms: ctx.progr,
+          progr: verb.owner,
+          player: ctx.player ?? ctx.actor,
+          caller: ctx.caller ?? "#-1"
+        };
+        if (verb.kind === "native") {
+          // Native handlers are an implementation detail behind ordinary verb
+          // dispatch. The dispatch path above has already enforced verb execute
+          // permissions and set progr/definer/caller frame fields.
+          const handler = this.nativeHandlers.get(verb.native);
+          if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
+          result = await handler(runCtx, args);
+        } else {
+          result = await runTinyVm(runCtx, verb.bytecode, args);
+        }
+      } finally {
+        this.callDepth -= 1;
       }
-      return await runTinyVm(runCtx, verb.bytecode, args);
-    } finally {
-      this.callDepth -= 1;
     }
+    if (typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 0
+        && typeof result === "string" && result.length > maxChars) {
+      throw wooError("E_TOOBIG", `dispatch result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: result.length, max: maxChars });
+    }
+    return result;
   }
 
   state(actor?: ObjRef): WorldSnapshot {
@@ -7164,44 +7172,19 @@ export class WooWorld {
     }
     if (!this.objects.has(item)) return item;
     try {
-      const value = await this.dispatch({ ...ctx, caller: room, progr: ctx.actor }, item, "title", []);
+      // 1024 chars is a generous upper bound for inventory/look titles
+      // (typical `name + ": " + 96-char preview` runs under 200) while still
+      // preventing a misbehaving or hostile :title() verb from materializing
+      // megabytes of text into room/inventory composition. On overflow,
+      // fall back to the bare object name like a missing :title() does.
+      const value = await this.dispatch({ ...ctx, caller: room, progr: ctx.actor }, item, "title", [], undefined, 1024);
       if (typeof value !== "string") throw wooError("E_TYPE", `${item}:title() must return a string`, value);
       return value;
     } catch (err) {
       const error = normalizeError(err);
-      if (error.code !== "E_VERBNF") throw err;
+      if (error.code !== "E_VERBNF" && error.code !== "E_TOOBIG") throw err;
       return this.objects.has(item) ? this.object(item).name : item;
     }
-  }
-
-  async noteTextSummary(ctx: CallContext, note: ObjRef, rawLimit: number): Promise<Record<string, WooValue>> {
-    // TODO(note-catalog): this substrate helper knows about $note's raw .text
-    // property and :is_readable_by verb. It exists to keep note display
-    // summaries bounded without materializing full note bodies in the Tiny VM;
-    // the catalog-facing contract should remain the overridable
-    // $note:text_summary(limit) verb.
-    if (!this.objects.has(note) || !this.inheritsFrom(note, "$note")) {
-      throw wooError("E_TYPE", `note_text_summary target must be a $note descendant: ${note}`, note);
-    }
-    const readable = await this.dispatch(
-      { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
-      note,
-      "is_readable_by",
-      [ctx.actor]
-    );
-    if (readable !== true) throw wooError("E_PERM", "cannot read note", note);
-
-    const limit = Math.max(0, Math.min(512, Math.floor(rawLimit)));
-    const raw = this.object(note).properties.get("text");
-    const lines = Array.isArray(raw) ? raw : [];
-    const first = typeof lines[0] === "string" ? lines[0] : "";
-    let preview = first;
-    let truncated = false;
-    if (preview.length > limit) {
-      preview = limit > 3 ? `${preview.slice(0, limit - 3)}...` : preview.slice(0, limit);
-      truncated = true;
-    }
-    return { lines: lines.length, preview, truncated };
   }
 
   // Cross-host-aware display name. The local stub of a remote object

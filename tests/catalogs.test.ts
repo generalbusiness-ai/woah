@@ -3218,27 +3218,102 @@ describe("local catalogs", () => {
       });
     });
 
-    it("note_text_summary rejects non-note objects before reading raw private text", async () => {
+    it("dispatch with max_chars raises E_TOOBIG on oversize string returns and passes through within bound", async () => {
       const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["note"]);
-      const requester = world.auth("guest:note-summary-probe").actor;
-      const nonNoteId = "obj_test_not_a_note_with_text";
-      world.createObject({ id: nonNoteId, name: "Not a note", parent: "$thing", owner: "$wiz", location: requester });
-      world.defineProperty(nonNoteId, { name: "text", defaultValue: [], owner: "$wiz", perms: "", typeHint: "list<str>" });
-      world.setProp(nonNoteId, "text", ["private text that must not leak"]);
-      expect(installVerb(world, nonNoteId, "is_readable_by", `verb :is_readable_by(actor_obj) rxd {
-        return true;
+      const actor = world.auth("guest:bounded-dispatch").actor;
+      const target = "obj_test_bounded_dispatch_target";
+      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
+      expect(installVerb(world, target, "long_string", `verb :long_string() rxd {
+        let s = "";
+        let i = 0;
+        while (i < 200) { s = s + "abcdefghij"; i = i + 1; }
+        return s;
       }`, null).ok).toBe(true);
-      expect(installVerb(world, requester, "probe_note_summary", `verb :probe_note_summary(obj) rxd {
-        return note_text_summary(obj, 512);
+      expect(installVerb(world, target, "short_string", `verb :short_string() rxd { return "ok"; }`, null).ok).toBe(true);
+      expect(installVerb(world, target, "structured", `verb :structured() rxd { return { kind: "map", n: 1 }; }`, null).ok).toBe(true);
+
+      expect(installVerb(world, actor, "probe_oversize", `verb :probe_oversize() rxd {
+        return dispatch(this:get_target(), "long_string", [], null, 96);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_within", `verb :probe_within() rxd {
+        return dispatch(this:get_target(), "short_string", [], null, 96);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_nonstring", `verb :probe_nonstring() rxd {
+        return dispatch(this:get_target(), "structured", [], null, 8);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
+
+      const oversize = await world.directCall("bounded-dispatch-oversize", actor, actor, "probe_oversize", []);
+      expect(oversize.op).toBe("error");
+      if (oversize.op === "error") expect(oversize.error.code).toBe("E_TOOBIG");
+
+      const within = await world.directCall("bounded-dispatch-within", actor, actor, "probe_within", []);
+      expect(within.op).toBe("result");
+      if (within.op === "result") expect(within.result).toBe("ok");
+
+      const nonstring = await world.directCall("bounded-dispatch-nonstring", actor, actor, "probe_nonstring", []);
+      expect(nonstring.op).toBe("result");
+      if (nonstring.op === "result") expect(nonstring.result).toEqual({ kind: "map", n: 1 });
+    });
+
+    it("dispatch max_chars edge cases: zero, negative, and target-in-error", async () => {
+      const world = createWorld({ catalogs: false });
+      const actor = world.auth("guest:bounded-dispatch-edges").actor;
+      const target = "obj_test_bounded_dispatch_edges_target";
+      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
+      expect(installVerb(world, target, "empty", `verb :empty() rxd { return ""; }`, null).ok).toBe(true);
+      expect(installVerb(world, target, "one", `verb :one() rxd { return "x"; }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_zero_empty", `verb :probe_zero_empty() rxd {
+        return dispatch(this:get_target(), "empty", [], null, 0);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_zero_nonempty", `verb :probe_zero_nonempty() rxd {
+        return dispatch(this:get_target(), "one", [], null, 0);
+      }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_negative", `verb :probe_negative() rxd {
+        return dispatch(this:get_target(), "empty", [], null, -1);
       }`, null).ok).toBe(true);
 
-      const result = await world.directCall("note-summary-nonnote", requester, requester, "probe_note_summary", [nonNoteId]);
-      expect(result.op).toBe("error");
-      if (result.op === "error") {
-        expect(result.error.code).toBe("E_TYPE");
-        expect(result.error.message).toContain("$note descendant");
+      const zeroEmpty = await world.directCall("bounded-edge-zero-empty", actor, actor, "probe_zero_empty", []);
+      expect(zeroEmpty.op).toBe("result");
+      if (zeroEmpty.op === "result") expect(zeroEmpty.result).toBe("");
+
+      const zeroNonempty = await world.directCall("bounded-edge-zero-nonempty", actor, actor, "probe_zero_nonempty", []);
+      expect(zeroNonempty.op).toBe("error");
+      if (zeroNonempty.op === "error") {
+        expect(zeroNonempty.error.code).toBe("E_TOOBIG");
+        expect(zeroNonempty.error.value).toMatchObject({ target, verb: "one", size: 1, max: 0 });
       }
+
+      const negative = await world.directCall("bounded-edge-negative", actor, actor, "probe_negative", []);
+      expect(negative.op).toBe("error");
+      if (negative.op === "error") expect(negative.error.code).toBe("E_INVARG");
+    });
+
+    it("inventory bounds :title() returns and falls back when the verb exceeds max_chars", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat"]);
+      const actor = world.auth("guest:title-overflow").actor;
+      const itemId = "obj_test_title_overflow_item";
+      world.createObject({ id: itemId, name: "thing-with-name", parent: "$thing", owner: "$wiz", location: actor });
+      // A :title() verb that returns ~2KB — beyond the 1024-char titleForLook cap.
+      expect(installVerb(world, itemId, "title", `verb :title() rxd {
+        let s = "";
+        let i = 0;
+        while (i < 200) { s = s + "abcdefghij"; i = i + 1; }
+        return s;
+      }`, null).ok).toBe(true);
+
+      const inv = await world.directCall("title-overflow-inventory", actor, actor, "inventory", []);
+      expect(inv.op).toBe("result");
+      if (inv.op !== "result") return;
+      const result = inv.result as { items: Array<{ id: string; title: string }> };
+      const entry = result.items.find((c) => c.id === itemId);
+      expect(entry).toBeDefined();
+      // The 2KB :title() return must not flow into composition. The inventory
+      // verb's fallback for an erroring :title() is `to_string(item)`, the id.
+      expect(entry?.title.length).toBeLessThan(200);
+      expect(entry?.title).not.toContain("abcdefghij");
     });
 
     it("$weather_block installs cleanly and ships the configured tier lists", async () => {

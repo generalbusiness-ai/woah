@@ -42,7 +42,7 @@ Properties inherited from `$portable`:
 | Verb | Purpose |
 | --- | --- |
 | `text` | Permission-checking getter for `.text`. Public API for callers that don't run as wizards. |
-| `text_summary(limit)` | Permission-checking bounded display summary. Base implementation returns line count, first-line preview, and truncation flag without expanding unbounded note bodies. Subclasses that transform text for readers should override this alongside `:text()`. |
+| `text_summary(limit)` | Permission-checking bounded display summary. Base implementation returns line count, first-line preview, and truncation flag. Subclasses that transform text for readers should override this alongside `:text()`. See "Implementation note" below for what bounds the work. |
 | `read` / `r@ead` | Call `:text()`, emit a `note_read` observation, return the text. |
 | `set_text(lines)` | Replace text. Permission: `:is_writable_by(actor)`. |
 | `write(line)` | Append a line. Permission: `:is_writable_by(actor)`. |
@@ -72,6 +72,35 @@ in room`, `put note in chest`, `post note on board` to all work uniformly.
 `$portable` already encodes the cross-host-safe-move semantics. Inheriting
 it gives notes those guarantees for free and reuses the existing
 `room_take`/`room_drop` natives.
+
+### Implementation note: what bounds `:text_summary`
+
+`:text_summary` is pure DSL — it gates on `:is_readable_by(actor)`, clamps the
+incoming `limit` to `0..512`, reads `this.text`, and slices the first line.
+There is no substrate fast-path.
+
+There is currently no per-property hard cap on note text storage. The
+`.text` list is materialized onto the verb's VM stack when read, which makes
+the actual bound the per-frame VM `max_memory` budget (default 4 MB; see
+`tiny-vm.ts:DEFAULT_MEMORY`) plus the per-frame tick budget. For typical notes
+this is many orders of magnitude of headroom; for adversarial or accidentally
+huge bodies (`note.text = [body]` direct writes from producer catalogs such as
+`$dispenser_block`), the verb relies on those VM-frame budgets to terminate
+cleanly. A future change should add either a substrate-level property
+storage cap or a `$note`-level hard limit in `:set_text` plus a producer-side
+guard; the design doc previously claimed a 65536-char cap that did not exist
+in the implementation.
+
+Substrate consumers that fan out across many notes (room/inventory titles,
+match-name expansion) should pass a `max_chars` hint to `dispatch(...)` to
+bound the per-call cost regardless of any future storage cap; see
+[spec/semantics/builtins.md](../../spec/semantics/builtins.md).
+
+Subclasses that change the `.text` storage shape, or want to derive the
+preview from a transformed source (decryption, redaction, summarization),
+must override `:text_summary` directly — overriding only `:text()` is not
+enough, because the base summary reads `this.text` rather than dispatching
+`:text()`.
 
 ### Why `is_readable_by`/`is_writable_by` are verbs, not properties
 
