@@ -2278,12 +2278,50 @@ export class WooWorld {
     this.assertBuilderActor(actor, surfaceClass);
     const options = progOptions(opts);
     const dryRun = optionBool(options, "dry_run", false);
+    const force = optionBool(options, "force", false);
+
+    // Pre-flight A1 (authority): wizard or owner. assertCanBuildOwnedObject
+    // covers both. We resolve `obj` first because the helpers want it.
+    const obj = this.object(objRef);
+    this.assertCanBuildOwnedObject(actor, objRef);
+
+    // Pre-flight A2 (reserved). The §RC6 forbidden list. Live actors are
+    // approximated by blocking all $actor descendants at the wrapper layer
+    // (session-binding tracking is not yet implemented; widening the check
+    // is safer than narrowing).
+    this.assertNotReservedForRecycle(objRef);
+    if (this.inheritsFrom(objRef, "$actor")) throw wooError("E_PERM", "actors cannot be recycled through builder tools", { actor, obj: objRef });
+
+    // Pre-flight A3 (anchored descendants).
+    const anchored = this.findAnchoredDescendants(objRef);
+    if (anchored.length > 0) throw wooError("E_NACC", `${objRef} has anchored descendants`, { obj: objRef, descendants: anchored as WooValue });
+
+    // Pre-flight A4 (cluster collocation): obj's parent, location, children,
+    // and contents must share obj's host (or be the well-known $nowhere
+    // sink). For single-host worlds these are local; for hostBridge-enabled
+    // worlds we ask remoteHostForObject. The existing objRef-side check
+    // catches the most common failure (recycling an object that lives on
+    // another host).
     if (await this.remoteHostForObject(objRef)) {
       throw wooError("E_CROSS_HOST_WRITE", `cross-host recycle is not atomic: ${objRef}`, { actor, obj: objRef });
     }
-    const obj = this.object(objRef);
-    this.assertCanBuildOwnedObject(actor, objRef);
-    if (this.inheritsFrom(objRef, "$actor")) throw wooError("E_PERM", "actors cannot be recycled through builder tools", { actor, obj: objRef });
+    if (obj.parent && obj.parent !== "$nowhere" && await this.remoteHostForObject(obj.parent)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via parent: ${objRef} -> ${obj.parent}`, { actor, obj: objRef, parent: obj.parent });
+    }
+    if (obj.location && obj.location !== "$nowhere" && await this.remoteHostForObject(obj.location)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via location: ${objRef} -> ${obj.location}`, { actor, obj: objRef, location: obj.location });
+    }
+    for (const child of obj.children) {
+      if (child !== "$nowhere" && await this.remoteHostForObject(child)) {
+        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via child: ${objRef} -> ${child}`, { actor, obj: objRef, child });
+      }
+    }
+    for (const content of obj.contents) {
+      if (content !== "$nowhere" && await this.remoteHostForObject(content)) {
+        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via content: ${objRef} -> ${content}`, { actor, obj: objRef, content });
+      }
+    }
+
     const impact = {
       id: objRef,
       parent: obj.parent,
@@ -2295,11 +2333,64 @@ export class WooWorld {
       own_verbs: obj.verbs.length,
       own_properties: obj.propertyDefs.size
     };
-    if (obj.children.size > 0 || obj.contents.size > 0) throw wooError("E_RECMOVE", `${objRef} still has children or contents`, impact as WooValue);
+
+    // Builder-surface safety check (§RC3a): refuse non-empty objects unless
+    // `force: true`. The engine apply phase always grafts/displaces; this
+    // safety check exists only at the authoring surface.
+    if (!force && (obj.children.size > 0 || obj.contents.size > 0)) {
+      throw wooError("E_RECMOVE", `${objRef} still has children or contents (pass force: true to recycle anyway)`, impact as WooValue);
+    }
     const result = { ok: true, dry_run: dryRun, id: objRef, impact: impact as WooValue };
     if (dryRun) return result;
     this.recycleObjectLocal(objRef);
     return result;
+  }
+
+  /**
+   * Reserved-object guard for recycle (§RC6 forbidden list, except live
+   * actors which are handled separately at the wrapper). Raises E_INVARG
+   * if the target is on the list.
+   */
+  private assertNotReservedForRecycle(objRef: ObjRef): void {
+    const reserved = new Set([
+      "$system",
+      "$nowhere",
+      "$root",
+      "$actor",
+      "$player",
+      "$wiz",
+      "$sequenced_log",
+      "$space",
+      "$thing"
+    ]);
+    if (reserved.has(objRef)) {
+      throw wooError("E_INVARG", `cannot recycle reserved object: ${objRef}`, objRef);
+    }
+  }
+
+  /**
+   * Pre-flight A3: find any local objects whose `anchor` chain transitively
+   * resolves to `obj`. Per spec/semantics/recycle.md §RC3 pre-flight A3,
+   * the check is bounded to obj's own host because anchor co-residency
+   * (objects.md §4.1) places transitively-anchored objects on the anchor
+   * root's host.
+   */
+  private findAnchoredDescendants(obj: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    for (const [id, candidate] of this.objects) {
+      if (id === obj) continue;
+      let cursor: ObjRef | null = candidate.anchor;
+      const seen = new Set<ObjRef>();
+      while (cursor && !seen.has(cursor)) {
+        if (cursor === obj) {
+          out.push(id);
+          break;
+        }
+        seen.add(cursor);
+        cursor = this.objects.has(cursor) ? this.object(cursor).anchor : null;
+      }
+    }
+    return out.sort();
   }
 
   async builderSetProperty(actor: ObjRef, objRef: ObjRef, name: string, value: WooValue, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
@@ -3751,6 +3842,33 @@ export class WooWorld {
     this.scrubEditorSessionsForObject(objRef);
     const parent = obj.parent;
     const location = obj.location;
+
+    // Step 3: graft children up. Each child's parent becomes obj.parent, so
+    // the inheritance chain stays connected. Snapshot the set first because
+    // chparentLocal mutates obj.children. obj.parent is non-null here
+    // because $system is forbidden by §RC6.
+    const childrenSnapshot = Array.from(obj.children);
+    if (parent) {
+      for (const child of childrenSnapshot) {
+        if (!this.objects.has(child)) continue;
+        this.chparentLocal(child, parent);
+      }
+    }
+
+    // Step 4: displace contents to $nowhere. $nowhere.contents is not
+    // maintained (per spec/semantics/bootstrap.md §B2.15 sink semantics), so
+    // we set only the local `c.location` and skip the back-reference write.
+    const contentsSnapshot = Array.from(obj.contents);
+    for (const content of contentsSnapshot) {
+      if (!this.objects.has(content)) continue;
+      const contentObj = this.object(content);
+      contentObj.location = "$nowhere";
+      contentObj.modified = Date.now();
+      this.persistObject(content);
+    }
+    obj.contents.clear();
+
+    // Step 5/6: parent-side and container-side bookkeeping.
     if (parent && this.objects.has(parent)) {
       this.object(parent).children.delete(objRef);
       this.persistObject(parent);
@@ -3759,6 +3877,7 @@ export class WooWorld {
       this.object(location).contents.delete(objRef);
       this.persistObject(location);
     }
+    // Steps 8/9: storage delete and tombstone insert.
     this.objects.delete(objRef);
     this.tombstones.add(objRef);
     this.deletePersistedObject(objRef);
