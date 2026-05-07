@@ -1,8 +1,8 @@
 {
   "name": "pinboard",
-  "version": "0.4.0",
+  "version": "0.3.6",
   "spec_version": "v1",
-  "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins inherit the v0.2 $note shape (name + description + text, where text is a single markdown string); board-level layout is independent of note content. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
+  "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
   "depends": [
     "@local:chat",
@@ -46,7 +46,7 @@
     {
       "local_name": "$pin",
       "parent": "$note",
-      "description": "Pinboard note. Adds an optional .color (default null, displayed white when null). Otherwise inherits all $note semantics: text (markdown string), read/set_text/write/erase, is_readable_by, is_writable_by, look. Pins are first-class movable: take one off a board, drop it in a room, post it on a different board, recycle it. The pin remembers its color across moves.",
+      "description": "Pinboard note. Adds an optional .color (default null, displayed white when null). Otherwise inherits all $note semantics: text, read/write/erase, is_readable_by, is_writable_by, look. Pins are first-class movable: take one off a board, drop it in a room, post it on a different board, recycle it. The pin remembers its color across moves.",
       "properties": [
         {
           "name": "color",
@@ -56,6 +56,16 @@
         }
       ],
       "verbs": [
+        {
+          "name": "look_self",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :look_self() rxd { let text_summary = this:text_summary(96); let summary = \"A sticky note.\"; let preview = text_summary[\"preview\"]; if (preview) { summary = summary + \" It says: \" + preview; } return { id: this, title: this:title(), description: summary, lines: text_summary[\"lines\"], location: location(this) }; }"
+        },
         {
           "name": "set_color",
           "perms": "rx",
@@ -348,7 +358,7 @@
               "h?"
             ]
           },
-          "source": "verb :add_note(text, color, x, y, w, h) rx { if (typeof(text) != \"string\" || !text) { raise { code: \"E_INVARG\", message: \"add_note requires text\" }; } let pin = create($pin, { owner: actor, name: \"sticky note\", description: \"A sticky note.\" }); moveto(pin, this); pin:set_text(text); if (typeof(color) == \"string\" && color != \"white\" && color in this.palette) { pin:set_color(color); } let key = to_string(pin); let layout = this.layout; let entry = layout[key]; if (typeof(x) == \"number\") { entry[\"x\"] = floor(x); } if (typeof(y) == \"number\") { entry[\"y\"] = floor(y); } if (typeof(w) == \"number\") { entry[\"w\"] = max(100, min(360, floor(w))); } if (typeof(h) == \"number\") { entry[\"h\"] = max(72, min(260, floor(h))); } layout[key] = entry; this.layout = layout; let note_record = { id: pin, name: pin.name, text: text, color: pin.color, owner: pin.owner, x: entry[\"x\"], y: entry[\"y\"], w: entry[\"w\"], h: entry[\"h\"], z: entry[\"z\"] }; observe({ type: \"note_added\", actor: actor, board: this, pin: pin, note: note_record, ts: now() }); return note_record; }"
+          "source": "verb :add_note(text, color, x, y, w, h) rx { if (typeof(text) != \"string\" || !text) { raise { code: \"E_INVARG\", message: \"add_note requires text\" }; } let pin = create($pin, { owner: actor, name: \"sticky note\", description: \"A sticky note. It says: \" + text }); moveto(pin, this); pin:set_text(text); if (typeof(color) == \"string\" && color != \"white\" && color in this.palette) { pin:set_color(color); } let key = to_string(pin); let layout = this.layout; let entry = layout[key]; if (typeof(x) == \"number\") { entry[\"x\"] = floor(x); } if (typeof(y) == \"number\") { entry[\"y\"] = floor(y); } if (typeof(w) == \"number\") { entry[\"w\"] = max(100, min(360, floor(w))); } if (typeof(h) == \"number\") { entry[\"h\"] = max(72, min(260, floor(h))); } layout[key] = entry; this.layout = layout; let note_record = { id: pin, name: pin.name, text: text, color: pin.color, owner: pin.owner, x: entry[\"x\"], y: entry[\"y\"], w: entry[\"w\"], h: entry[\"h\"], z: entry[\"z\"] }; observe({ type: \"note_added\", actor: actor, board: this, pin: pin, note: note_record, ts: now() }); return note_record; }"
         }
       ]
     }

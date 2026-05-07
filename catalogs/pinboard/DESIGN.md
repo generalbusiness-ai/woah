@@ -71,7 +71,7 @@ because it shares those verbs, not because of cross-tree inheritance.
 
 | Property | On | Purpose |
 | --- | --- | --- |
-| `text` | `$note` (inherited) | The actual content. Markdown string. |
+| `text` | `$note` (inherited) | The actual content. Single string body; embedded `\n` separates lines. |
 | `writers` | `$note` (inherited) | Who else can edit besides owner. |
 | `color` | `$pin` | `null` or a string. Frontend renders white when null. |
 | `contents` | `$pinboard` (built-in) | Pins currently on the board, plus actors who have entered it. Note-listing and layout verbs filter to `$note` descendants. |
@@ -131,9 +131,8 @@ observation per card add.
 
 ### Pin (`$pin`)
 
-Inherits everything from `$note` (`read`, `set_text`, `write`, `erase`,
-`add_writer`, `rm_writer`, `is_readable_by`, `is_writable_by`, `look`).
-Adds:
+Inherits everything from `$note` (`read`, `write`, `set_text`, `erase`,
+`is_readable_by`, `is_writable_by`, `look`). Adds:
 
 - `set_color(color)` — write `.color`. `null` clears (frontend renders white);
   `"white"` is normalized to `null`.
@@ -230,7 +229,7 @@ Kanban invariants:
         {
           id:       ObjRef,         // pin / note objref
           name:     str,            // card.name (presentation only)
-          text:     str,            // markdown body; empty string if actor cannot read
+          text:     [str],          // empty list if actor cannot read
           color:    str | null,     // null on non-$pin cards
           owner:    ObjRef,
           writers:  [ObjRef]
@@ -330,7 +329,7 @@ create $pin
         :acceptable(pin)         → isa $note? yes
         moveto via core
         board:enterfunc(pin)     → allocate layout, fire pin_added
-   ↓ pin:set_text(["Buy groceries"])
+   ↓ pin:set_text("Buy groceries")
    ↓ pin:set_color("yellow")
    ⋮
    board:move_pin(pin, 200, 150)  update layout, fire pin_moved
@@ -350,7 +349,7 @@ Kanban lifecycle:
 ```
 kanban:add_card("doing", "Write the spec")
         create $pin (the new card)
-        card:set_text(["Write the spec"])
+        card:set_text("Write the spec")
         kanban:post_card(card, "doing")
             moveto card → kanban
             kanban:enterfunc(card) → place in column 0 (default), emit kanban_card_added
@@ -459,8 +458,8 @@ client projection rather than through a full-world `/api/state` model.
 
 ## Open questions
 
-- Multi-line pin text. v0.1's single-line model becomes a list-of-strings
-  via `$note.text`. Frontend needs to render multi-line.
+- Multi-line pin text. `$note.text` is a single string body with embedded
+  `\n` separating lines (since note v1.0). Frontend renders multi-line.
 - Should `move_pin` and `resize_pin` require board-presence (`enter`)?
   v0.1 didn't. Probably fine.
 - Auto-recycle on `:eject` instead of moving to actor inventory? The

@@ -13,7 +13,7 @@ Sketch of the v1 builtin function set (registered with stable indices for the `B
 
 ## 19. Builtins (sketch — not exhaustive)
 
-Builtins are functions, not verbs. They are registered with stable indices for the `BUILTIN` opcode. The list will grow; v1 minimum:
+Builtins are functions, not verbs. They are registered with stable indices for the `BUILTIN` opcode. The list will grow; v1 minimum below. **New builtins MUST be appended** to the registry — never inserted mid-list — so persisted bytecode that encodes a builtin by numeric index keeps dispatching to the same function.
 
 ### 19.1 Core
 
@@ -25,13 +25,18 @@ Builtins are functions, not verbs. They are registered with stable indices for t
 ### 19.2 String
 
 `str_slice(s, from, to?)` / `strsub(s, from, to)`, `str_index(s, sub)` / `index(s, sub)`, `rindex`, `match(s, pattern)`, `pcre`,  
-`str_lower(s)` / `tolower`, `toupper`, `str_trim(s)` / `trim`, `str_starts(s, prefix)`, `str_char(codepoint)`, `split(s, sep)`, `str_join(list, sep)` / `join(list, sep)`,
+`str_lower(s)` / `tolower`, `toupper`, `str_trim(s)` / `trim`, `str_starts(s, prefix)`, `str_char(codepoint)`, `str_split(s, sep)`, `str_join(list, sep)` / `join(list, sep)`,
 `encode_json(v)`, `decode_json(s)`.
 
 `str_join(list, sep)` joins the list with a string separator. String elements
 are used directly; non-string elements are converted with the runtime's ordinary
 JSON-style value rendering. Callers that need a particular presentation should
 convert values explicitly before joining.
+
+`str_split(s, sep)` returns a list of strings produced by splitting `s` on each
+occurrence of `sep`. An empty `sep` returns the per-character list. The empty
+string splits to `[""]`. `str_split(str_join(parts, sep), sep)` round-trips when
+no element of `parts` contains `sep`.
 
 ### 19.3 List / map
 

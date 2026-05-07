@@ -414,6 +414,136 @@ describe("local catalogs", () => {
     if (state.op === "result") expect(state.result).toMatchObject({ status: "completed", to_version: "2.0.0" });
   });
 
+  it("applies the on-disk note v0→v1 migration file to legacy list-shape text values", () => {
+    const world = createWorld({ catalogs: false });
+    installCatalogManifest(world, readManifest("help") as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "help" });
+    installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "chat" });
+
+    const v0Note: RuntimeCatalogManifest = {
+      name: "note",
+      version: "0.1.0",
+      spec_version: "v1",
+      license: "MIT",
+      depends: ["@local:chat"],
+      classes: [{
+        local_name: "$note",
+        parent: "$portable",
+        properties: [
+          { name: "text", type: "list<str>", default: [], perms: "" },
+          { name: "writers", type: "list<obj>", default: [], perms: "r" }
+        ]
+      }],
+      seed_hooks: [
+        { kind: "create_instance", class: "$note", as: "obj_test_note_legacy_filled", properties: { text: ["alpha", "beta", "gamma"] } },
+        { kind: "create_instance", class: "$note", as: "obj_test_note_legacy_empty", properties: { text: [] } }
+      ]
+    } as unknown as RuntimeCatalogManifest;
+    installCatalogManifest(world, v0Note, { tap: "@local", alias: "note" });
+    expect(world.getProp("obj_test_note_legacy_filled", "text")).toEqual(["alpha", "beta", "gamma"]);
+
+    const v1Note = readManifest("note") as unknown as RuntimeCatalogManifest;
+    const migration = JSON.parse(readFileSync(join(root, "note", "migration-v0-to-v1.json"), "utf8"));
+    const record = updateCatalogManifest(world, v1Note, { tap: "@local", alias: "note", acceptMajor: true, migration });
+    expect(record.migration_state).toMatchObject({
+      status: "completed",
+      from_version: "0.1.0",
+      to_version: "1.0.0",
+      completed_steps: ["1:transform_property:$note.text"]
+    });
+    expect(world.getProp("obj_test_note_legacy_filled", "text")).toBe("alpha\nbeta\ngamma");
+    expect(world.getProp("obj_test_note_legacy_empty", "text")).toBe("");
+  });
+
+  it("transforms a property value via the 'join' op and is idempotent", () => {
+    const world = createWorld({ catalogs: false });
+    const v1: RuntimeCatalogManifest = {
+      name: "join-demo",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [{ local_name: "$joining", parent: "$thing", properties: [{ name: "body", type: "list<str>", default: [] }] }],
+      seed_hooks: [
+        { kind: "create_instance", class: "$joining", as: "joined_1", properties: { body: ["alpha", "beta", "gamma"] } },
+        { kind: "create_instance", class: "$joining", as: "joined_default", properties: {} }
+      ]
+    };
+    const v2: RuntimeCatalogManifest = {
+      ...v1,
+      version: "2.0.0",
+      classes: [{ local_name: "$joining", parent: "$thing", properties: [{ name: "body", type: "str", default: "" }] }],
+      seed_hooks: v1.seed_hooks
+    };
+
+    installCatalogManifest(world, v1, { tap: "@local", alias: "join-demo" });
+    expect(world.getProp("joined_1", "body")).toEqual(["alpha", "beta", "gamma"]);
+
+    const record = updateCatalogManifest(world, v2, {
+      tap: "@local",
+      alias: "join-demo",
+      acceptMajor: true,
+      migration: {
+        from_version: "1.x.x",
+        to_version: "2.0.0",
+        spec_version: "v1",
+        steps: [{ kind: "transform_property", class: "$joining", name: "body", transform: { op: "join", separator: "\n" } }]
+      }
+    });
+
+    expect(record.migration_state).toMatchObject({ status: "completed", completed_steps: ["1:transform_property:$joining.body"] });
+    expect(world.getProp("joined_1", "body")).toBe("alpha\nbeta\ngamma");
+    expect(world.getProp("joined_default", "body")).toBe("");
+
+    const replay = updateCatalogManifest(world, v2, {
+      tap: "@local",
+      alias: "join-demo",
+      acceptMajor: true,
+      migration: {
+        from_version: "2.0.0",
+        to_version: "2.0.0",
+        spec_version: "v1",
+        steps: [{ kind: "transform_property", class: "$joining", name: "body", transform: { op: "join" } }]
+      }
+    });
+    expect(replay.migration_state).toMatchObject({ status: "completed" });
+    expect(world.getProp("joined_1", "body")).toBe("alpha\nbeta\ngamma");
+  });
+
+  it("fails migration_state and rolls back when transform_property op is unknown", () => {
+    const world = createWorld({ catalogs: false });
+    const v1: RuntimeCatalogManifest = {
+      name: "unknown-op-demo",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [{ local_name: "$opaque", parent: "$thing", properties: [{ name: "body", type: "list<str>", default: [] }] }],
+      seed_hooks: [{ kind: "create_instance", class: "$opaque", as: "opaque_1", properties: { body: ["alpha", "beta"] } }]
+    };
+    const v2: RuntimeCatalogManifest = {
+      ...v1,
+      version: "2.0.0",
+      classes: [{ local_name: "$opaque", parent: "$thing", properties: [{ name: "body", type: "str", default: "" }] }],
+      seed_hooks: v1.seed_hooks
+    };
+
+    installCatalogManifest(world, v1, { tap: "@local", alias: "unknown-op-demo" });
+    const record = updateCatalogManifest(world, v2, {
+      tap: "@local",
+      alias: "unknown-op-demo",
+      acceptMajor: true,
+      migration: {
+        from_version: "1.x.x",
+        to_version: "2.0.0",
+        spec_version: "v1",
+        steps: [{ kind: "transform_property", class: "$opaque", name: "body", transform: { op: "jion" as "join" } }]
+      }
+    });
+    expect(record.migration_state).toMatchObject({
+      status: "failed",
+      failed_step: "1:transform_property:$opaque.body",
+      error: { code: "E_CATALOG", message: expect.stringContaining("unknown transform_property op: jion") }
+    });
+    // Savepoint rolled back: the original list value is intact.
+    expect(world.getProp("opaque_1", "body")).toEqual(["alpha", "beta"]);
+  });
+
   it("installs chat from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
     installHelpDependency(world);
@@ -704,7 +834,7 @@ describe("local catalogs", () => {
     expect(world.object(pin).owner).toBe(session.actor);
     expect(world.object(pin).location).toBe("the_pinboard");
     expect(world.object("the_pinboard").contents.has(pin)).toBe(true);
-    expect(world.getProp(pin, "text")).toEqual(["Bring the towel to the hot tub"]);
+    expect(world.getProp(pin, "text")).toBe("Bring the towel to the hot tub");
     expect(world.getProp(pin, "color")).toBe("blue");
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     expect(world.getProp("the_pinboard", "layout")).toMatchObject({ [pin]: { x: 12, y: 24, w: 160, h: 88 } });
@@ -712,7 +842,7 @@ describe("local catalogs", () => {
     const listed = await world.directCall("pinboard-list", session.actor, "the_pinboard", "list_notes", []);
     expect(listed.op).toBe("result");
     if (listed.op === "result") {
-      expect(listed.result).toEqual([expect.objectContaining({ id: pin, text: ["Bring the towel to the hot tub"], color: "blue", owner: session.actor })]);
+      expect(listed.result).toEqual([expect.objectContaining({ id: pin, text: "Bring the towel to the hot tub", color: "blue", owner: session.actor })]);
     }
 
     await world.call("pinboard-take", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "take", args: [pin] });
@@ -733,9 +863,9 @@ describe("local catalogs", () => {
     if (deniedEject.op === "applied") expect(deniedEject.observations.find((obs) => obs.type === "$error")?.code).toBe("E_PERM");
 
     await world.call("pinboard-move", session.id, "the_pinboard", { actor: session.actor, target: "the_pinboard", verb: "move_pin", args: [pin, 80, 96] });
-    await world.call("pinboard-edit", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_text", args: [["Towel is ready"]] });
+    await world.call("pinboard-edit", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_text", args: ["Towel is ready"] });
     await world.call("pinboard-color", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_color", args: ["green"] });
-    expect(world.getProp(pin, "text")).toEqual(["Towel is ready"]);
+    expect(world.getProp(pin, "text")).toBe("Towel is ready");
     expect(world.getProp(pin, "color")).toBe("green");
     const clearedColor = await world.call("pinboard-color-white", session.id, "the_pinboard", { actor: session.actor, target: pin, verb: "set_color", args: ["white"] });
     expect(clearedColor.op).toBe("applied");
@@ -845,6 +975,84 @@ describe("local catalogs", () => {
     expect(world.hasPresence(stranded.actor, "the_pinboard")).toBe(false);
   });
 
+  it("migrates legacy list-shape $note.text values during host-scoped data migrations", () => {
+    const world = createWorld();
+    const owner = world.auth("guest:host-note-text-migration").actor;
+    world.createObject({ id: "obj_test_host_legacy_note", name: "host note", parent: "$pin", owner, location: "the_pinboard" });
+    const note = world.object("obj_test_host_legacy_note");
+    note.properties.set("text", ["one", "two", "three"]);
+    note.propertyVersions.set("text", (note.propertyVersions.get("text") ?? 0) + 1);
+
+    runHostScopedDataMigrations(world, "the_pinboard");
+
+    expect(world.getProp("obj_test_host_legacy_note", "text")).toBe("one\ntwo\nthree");
+    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(records).toContainEqual(expect.objectContaining({
+      plan_id: "local-catalog-data:note:2026-05-07-note-text-list-to-str",
+      scope: "host",
+      host: "the_pinboard",
+      status: "completed",
+      pre_legacy_records: 1,
+      post_legacy_records: 0
+    }));
+  });
+
+  it("re-runs the host-scoped note text migration when the gateway-applied ledger id rides into the host slice", () => {
+    // applied_migrations is in DYNAMIC_HOST_SEED_PROPERTIES (bootstrap.ts), so a
+    // host slice can carry the gateway's ledger id while still owning legacy
+    // values. Per-(scope, host) records key each scope independently and re-verify
+    // the legacy count, so the host run still does its work.
+    const world = createWorld();
+    const owner = world.auth("guest:host-ledger-collision").actor;
+    world.createObject({ id: "obj_test_host_collision_note", name: "collision note", parent: "$pin", owner, location: "the_pinboard" });
+    const note = world.object("obj_test_host_collision_note");
+    note.properties.set("text", ["one", "two"]);
+    note.propertyVersions.set("text", (note.propertyVersions.get("text") ?? 0) + 1);
+    // Simulate the gateway's applied_migrations id surviving the seed-merge into the host.
+    const migrations = world.getProp("$system", "applied_migrations") as string[];
+    if (!migrations.includes("2026-05-07-note-text-list-to-str")) migrations.push("2026-05-07-note-text-list-to-str");
+    world.setProp("$system", "applied_migrations", migrations);
+
+    runHostScopedDataMigrations(world, "the_pinboard");
+
+    expect(world.getProp("obj_test_host_collision_note", "text")).toBe("one\ntwo");
+    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(records).toContainEqual(expect.objectContaining({
+      plan_id: "local-catalog-data:note:2026-05-07-note-text-list-to-str",
+      scope: "host",
+      host: "the_pinboard",
+      status: "completed"
+    }));
+  });
+
+  it("migrates legacy list-shape $note.text values during boot", () => {
+    const world = createWorld();
+    const owner = world.auth("guest:note-text-migration").actor;
+    // Two notes carrying the legacy list-shape values an old world could persist.
+    world.createObject({ id: "obj_test_legacy_note_a", name: "legacy note a", parent: "$note", owner, location: owner });
+    world.createObject({ id: "obj_test_legacy_note_b", name: "legacy note b", parent: "$note", owner, location: owner });
+    // Bypass the v1 string type by writing directly into the property maps.
+    const noteA = world.object("obj_test_legacy_note_a");
+    noteA.properties.set("text", ["alpha", "beta", "gamma"]);
+    noteA.propertyVersions.set("text", (noteA.propertyVersions.get("text") ?? 0) + 1);
+    const noteB = world.object("obj_test_legacy_note_b");
+    noteB.properties.set("text", []);
+    noteB.propertyVersions.set("text", (noteB.propertyVersions.get("text") ?? 0) + 1);
+
+    installLocalCatalogs(world, ["note"]);
+
+    expect(world.getProp("obj_test_legacy_note_a", "text")).toBe("alpha\nbeta\ngamma");
+    expect(world.getProp("obj_test_legacy_note_b", "text")).toBe("");
+    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
+    expect(records).toContainEqual(expect.objectContaining({
+      plan_id: "local-catalog-data:note:2026-05-07-note-text-list-to-str",
+      scope: "gateway",
+      host: "world",
+      status: "completed",
+      post_legacy_records: 0
+    }));
+  });
+
   it("migrates v0.1 pinboard note records into pin objects", () => {
     const world = createWorld();
     const session = world.auth("guest:pinboard-migration");
@@ -863,8 +1071,8 @@ describe("local catalogs", () => {
     expect(pins).toHaveLength(2);
     expect(world.object(pins[0]).owner).toBe(session.actor);
     expect(world.object(pins[1]).owner).toBe(world.object("the_pinboard").owner);
-    expect(world.getProp(pins[0], "text")).toEqual(["Alpha", "Beta"]);
-    expect(world.getProp(pins[1], "text")).toEqual(["Missing author"]);
+    expect(world.getProp(pins[0], "text")).toBe("Alpha\nBeta");
+    expect(world.getProp(pins[1], "text")).toBe("Missing author");
     expect(world.getProp(pins[0], "color")).toBe("pink");
     expect(world.getProp(pins[1], "color")).toBeNull();
     expect(world.getProp("the_pinboard", "layout")).toMatchObject({
@@ -889,11 +1097,11 @@ describe("local catalogs", () => {
     world.setProp("sticky_alpha", "name", "sticky note");
     world.setProp("sticky_beta", "name", "sticky note");
     world.setProp("sticky_blue", "name", "sticky note");
-    world.setProp("sticky_alpha", "text", ["another one"]);
-    world.setProp("sticky_beta", "text", ["this is it"]);
-    world.setProp("sticky_blue", "text", ["hello"]);
+    world.setProp("sticky_alpha", "text", "another one");
+    world.setProp("sticky_beta", "text", "this is it");
+    world.setProp("sticky_blue", "text", "hello");
     world.setProp("sticky_blue", "color", "blue");
-    world.setProp("sticky_secret", "text", ["nuclear codes"]);
+    world.setProp("sticky_secret", "text", "nuclear codes");
     expect(installVerb(world, "sticky_secret", "is_readable_by", `verb :is_readable_by(actor_obj) rxd {
   return actor_obj == this.owner;
 }`, null).ok).toBe(true);
@@ -976,7 +1184,7 @@ describe("local catalogs", () => {
     expect(world.ownVerbExact("$pinboard", "list_notes")?.source).toContain("contents(this)");
     const pins = Array.from(world.object("the_pinboard").contents).filter((id) => world.isDescendantOf(id, "$pin"));
     expect(pins).toHaveLength(1);
-    expect(world.getProp(pins[0], "text")).toEqual(["hello"]);
+    expect(world.getProp(pins[0], "text")).toBe("hello");
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-v02-repair");
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-v02-data-repair");
@@ -1091,7 +1299,7 @@ describe("local catalogs", () => {
     expect(world.propOrNull("the_pinboard", "notes")).toBeNull();
     const pins = Array.from(world.object("the_pinboard").contents).filter((id) => world.isDescendantOf(id, "$pin"));
     expect(pins).toHaveLength(1);
-    expect(world.getProp(pins[0], "text")).toEqual(["real legacy"]);
+    expect(world.getProp(pins[0], "text")).toBe("real legacy");
     expect(world.getProp(pins[0], "color")).toBe("blue");
     const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
     expect(records).toContainEqual(expect.objectContaining({
@@ -3139,7 +3347,7 @@ describe("local catalogs", () => {
       expect(delivered.result).toMatchObject({ text: expect.stringContaining("hands you a note") });
       expect(world.object(noteId).location).toBe(requester);
       expect(world.getProp(noteId, "produced_by")).toBe(blockId);
-      expect(world.getProp(noteId, "text")).toEqual(["Today the stars suggest sandwiches."]);
+      expect(world.getProp(noteId, "text")).toBe("Today the stars suggest sandwiches.");
       expect(delivered.observations).toEqual(expect.arrayContaining([
         expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("hands you a note") })
       ]));
@@ -3166,7 +3374,7 @@ describe("local catalogs", () => {
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
-      expect(world.getProp(noteId, "text")).toEqual([body]);
+      expect(world.getProp(noteId, "text")).toBe(body);
 
       const inventory = await world.directCall("horo-long-inventory", requester, requester, "inventory", []);
       expect(inventory.op).toBe("result");
@@ -3310,7 +3518,7 @@ describe("local catalogs", () => {
       const noteId = "obj_test_redacted_note";
       const body = "secret ".repeat(20_000);
       world.createObject({ id: noteId, name: "Private note", parent: noteClass, owner: "$wiz", location: requester });
-      world.setProp(noteId, "text", [body]);
+      world.setProp(noteId, "text", body);
 
       const inventory = await world.directCall("redacted-note-inventory", requester, requester, "inventory", []);
       expect(inventory.op).toBe("result");
@@ -3330,6 +3538,36 @@ describe("local catalogs", () => {
         title: "obj_test_redacted_note: REDACTED",
         lines: 7
       });
+    });
+
+    it("$note holds multiline text as a single string and exposes line semantics through verbs", async () => {
+      const world = createWorld();
+      const session = world.auth("guest:multiline-note");
+      const owner = session.actor;
+      await world.directCall("multiline-enter", owner, "the_chatroom", "enter", []);
+      const noteId = "obj_test_multiline_note";
+      world.createObject({ id: noteId, name: "Recipe", parent: "$note", owner, location: owner });
+      world.setProp(noteId, "text", "first line\nsecond line\nthird line");
+
+      const text = await world.directCall("multiline-text", owner, noteId, "text", []);
+      expect(text.op).toBe("result");
+      if (text.op === "result") expect(text.result).toBe("first line\nsecond line\nthird line");
+
+      const summary = await world.directCall("multiline-summary", owner, noteId, "text_summary", [96]);
+      expect(summary.op).toBe("result");
+      if (summary.op === "result") expect(summary.result).toMatchObject({ lines: 3, preview: "first line", truncated: false });
+
+      const written = await world.call("multiline-write", session.id, "the_chatroom", { actor: owner, target: noteId, verb: "write", args: ["fourth line"] });
+      expect(written.op).toBe("applied");
+      expect(world.getProp(noteId, "text")).toBe("first line\nsecond line\nthird line\nfourth line");
+
+      const deleted = await world.call("multiline-delete", session.id, "the_chatroom", { actor: owner, target: noteId, verb: "delete", args: [2] });
+      expect(deleted.op).toBe("applied");
+      expect(world.getProp(noteId, "text")).toBe("first line\nthird line\nfourth line");
+
+      const erased = await world.call("multiline-erase", session.id, "the_chatroom", { actor: owner, target: noteId, verb: "erase", args: [] });
+      expect(erased.op).toBe("applied");
+      expect(world.getProp(noteId, "text")).toBe("");
     });
 
     it("dispatch with max_chars raises E_TOOBIG on oversize string returns and passes through within bound", async () => {
