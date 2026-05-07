@@ -158,6 +158,12 @@ export type HostBridge = {
   setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void>;
   spaceAudienceSessions?(space: ObjRef, actors?: ObjRef[], memo?: HostOperationMemo): Promise<string[]>;
   actorSessionLocations?(actor: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]>;
+  // Batched form of actorSessionLocations: one RPC per host instead of one
+  // per actor. Used by `scrubStaleSubscribersForSpace`, which on a busy room
+  // would otherwise issue N parallel calls (a chat room with 11 subscribers
+  // wedged the worker's subrequest budget in production). Hosts that don't
+  // implement this fall back to the single-actor path.
+  actorSessionLocationsBatch?(actors: ObjRef[], memo?: HostOperationMemo): Promise<Map<ObjRef, ObjRef[]>>;
   contents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]>;
   // Cross-host MCP reachability (spec/protocol/mcp.md §M3). Asks the host
   // owning each id for tool descriptors covering that id's tool-exposed verbs
@@ -6654,24 +6660,22 @@ export class WooWorld {
     this.lastSubscriberScrubAt.set(space, now);
     let survivingActors = subscribers;
     if (subscribers.length > 0) {
+      const remoteActors: ObjRef[] = [];
+      for (const actor of subscribers) {
+        if (await this.remoteHostForObject(actor, memo)) remoteActors.push(actor);
+      }
+      const remoteLocationsByActor = await this.fetchRemoteSessionLocations(remoteActors, memo);
       const kept: ObjRef[] = [];
       const stale: ObjRef[] = [];
-      await Promise.all(subscribers.map(async (actor) => {
-        const remote = await this.remoteHostForObject(actor, memo);
+      for (const actor of subscribers) {
         const localLocations = this.allLocationsForActor(actor);
-        let remoteLocations: ObjRef[] = [];
-        if (remote) {
-          try {
-            remoteLocations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
-          } catch (err) {
-            if (isReadAvailabilityError(err)) return;
-            throw err;
-          }
-        }
-        const locations = remote ? Array.from(new Set([...localLocations, ...remoteLocations])) : localLocations;
+        const remoteLocations = remoteLocationsByActor.get(actor);
+        const locations = remoteLocations
+          ? Array.from(new Set([...localLocations, ...remoteLocations]))
+          : localLocations;
         if (locations.includes(space)) kept.push(actor);
         else stale.push(actor);
-      }));
+      }
       for (const actor of stale) this.updateSpaceSubscriberLocal(space, actor, false);
       const keptSet = new Set(kept);
       survivingActors = subscribers.filter((actor) => keptSet.has(actor));
@@ -6689,6 +6693,40 @@ export class WooWorld {
     // reinvalidates the presence index.
     this.scrubExpiredSessionSubscribersForSpace(space);
     return survivingActors;
+  }
+
+  /**
+   * Resolve `currentLocation` for each actor whose home host is not this DO,
+   * preferring a batched cross-host call so a room with N remote subscribers
+   * costs one RPC per host instead of N. Falls back to per-actor lookup for
+   * bridges that don't implement the batch method (older deployments and
+   * in-memory test bridges). Read-availability errors are swallowed so a
+   * cold or slow remote host doesn't hold the local single-threaded queue —
+   * actors whose locations are unknown stay in `subscribers` until the next
+   * scrub window. */
+  private async fetchRemoteSessionLocations(
+    remoteActors: ObjRef[],
+    memo?: HostOperationMemo
+  ): Promise<Map<ObjRef, ObjRef[]>> {
+    const out = new Map<ObjRef, ObjRef[]>();
+    if (remoteActors.length === 0 || !this.hostBridge) return out;
+    if (this.hostBridge.actorSessionLocationsBatch) {
+      try {
+        return await this.hostBridge.actorSessionLocationsBatch(remoteActors, memo);
+      } catch (err) {
+        if (!isReadAvailabilityError(err)) throw err;
+        return out;
+      }
+    }
+    await Promise.all(remoteActors.map(async (actor) => {
+      try {
+        const locations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
+        out.set(actor, locations);
+      } catch (err) {
+        if (!isReadAvailabilityError(err)) throw err;
+      }
+    }));
+    return out;
   }
 
   /**

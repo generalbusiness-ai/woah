@@ -140,6 +140,8 @@ function bytecodeVerb(name: string, bytecode: TinyBytecode): VerbDef {
 
 class LocalHostBridge implements HostBridge {
   readonly contentsCalls = new Map<ObjRef, number>();
+  actorSessionLocationsCalls = 0;
+  actorSessionLocationsBatchCalls: Array<ObjRef[]> = [];
 
   constructor(
     readonly localHost: string,
@@ -239,7 +241,15 @@ class LocalHostBridge implements HostBridge {
   }
 
   async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    this.actorSessionLocationsCalls += 1;
     return this.worldFor(actor).allLocationsForActor(actor);
+  }
+
+  async actorSessionLocationsBatch(actors: ObjRef[]): Promise<Map<ObjRef, ObjRef[]>> {
+    this.actorSessionLocationsBatchCalls.push([...actors]);
+    const out = new Map<ObjRef, ObjRef[]>();
+    for (const actor of actors) out.set(actor, this.worldFor(actor).allLocationsForActor(actor));
+    return out;
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -677,6 +687,57 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     } finally {
       roomBHarness.cleanup();
       roomAHarness.cleanup();
+      homeHarness.cleanup();
+    }
+  });
+
+  it("issues a single batched cross-host call for scrub instead of one per remote subscriber", async () => {
+    const homeHarness = make();
+    const roomHarness = make();
+    try {
+      const home = homeHarness.world;
+      const roomHost = roomHarness.world;
+      // Three remote-hosted subscribers all on the same `home` host. Without
+      // batching, the room's per-look scrub would fire one cross-host RPC per
+      // actor — N+1 against the home DO and a real subrequest-budget hazard
+      // when N grows.
+      const live1 = home.auth("guest:conf-batch-1").actor;
+      const live2 = home.auth("guest:conf-batch-2").actor;
+      const live3 = home.auth("guest:conf-batch-3").actor;
+      const worlds = new Map<string, WooWorld>([
+        ["home", home],
+        ["room", roomHost]
+      ]);
+      const routes = new Map<ObjRef, string>([
+        [live1, "home"],
+        [live2, "home"],
+        [live3, "home"],
+        ["conf_batch_room", "room"]
+      ]);
+      const homeBridge = new LocalHostBridge("home", worlds, routes);
+      const roomBridge = new LocalHostBridge("room", worlds, routes);
+      home.setHostBridge(homeBridge);
+      roomHost.setHostBridge(roomBridge);
+
+      roomHost.createObject({ id: "conf_batch_room", name: "Batch Room", parent: "$chatroom", owner: "$wiz" });
+      roomHost.setProp("conf_batch_room", "subscribers", [live1, live2, live3]);
+      roomHost.setProp("conf_batch_room", "features", ["$conversational"]);
+      for (const actor of [live1, live2, live3]) {
+        home.setActorPresence(actor, "conf_batch_room", true);
+        home.object(actor).location = "conf_batch_room";
+      }
+
+      const who = await roomHost.directCall("batch-who", live1, "conf_batch_room", "who", []);
+      expect(who.op).toBe("result");
+      if (who.op === "result") {
+        expect(who.result).toEqual([live1, live2, live3]);
+      }
+      // One batch call, all three actors in it; zero per-actor calls.
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
+      expect(new Set(roomBridge.actorSessionLocationsBatchCalls[0])).toEqual(new Set([live1, live2, live3]));
+      expect(roomBridge.actorSessionLocationsCalls).toBe(0);
+    } finally {
+      roomHarness.cleanup();
       homeHarness.cleanup();
     }
   });

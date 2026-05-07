@@ -947,6 +947,53 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `actor-locations:${actor}`, read);
         return await read();
       },
+      actorSessionLocationsBatch: async (actors, memo) => {
+        const out = new Map<ObjRef, ObjRef[]>();
+        const missingByHost = new Map<string, ObjRef[]>();
+        for (const actor of actors) {
+          const key = `actor-locations:${actor}`;
+          const cached = memo?.reads.get(key) as Promise<ObjRef[]> | undefined;
+          if (cached) {
+            out.set(actor, await cached);
+            continue;
+          }
+          const host = await hostForObject(actor, memo);
+          if (!host || host === localHost) {
+            const locations = world.allLocationsForActor(actor);
+            out.set(actor, locations);
+            if (memo) memo.reads.set(key, Promise.resolve(locations));
+            continue;
+          }
+          const list = missingByHost.get(host) ?? [];
+          list.push(actor);
+          missingByHost.set(host, list);
+        }
+        await Promise.all(Array.from(missingByHost, async ([host, ids]) => {
+          try {
+            const response = await this.forwardInternalReadChecked<{ locations: Record<ObjRef, ObjRef[]> }>(
+              host,
+              "/__internal/actor-session-locations-batch",
+              { actors: ids }
+            );
+            const map = response.locations && typeof response.locations === "object" && !Array.isArray(response.locations)
+              ? response.locations
+              : {};
+            for (const actor of ids) {
+              const raw = map[actor];
+              const locations = Array.isArray(raw)
+                ? raw.filter((item): item is ObjRef => typeof item === "string")
+                : [];
+              out.set(actor, locations);
+              if (memo) memo.reads.set(`actor-locations:${actor}`, Promise.resolve(locations));
+            }
+          } catch (err) {
+            if (!isReadAvailabilityError(err)) throw err;
+            // Leave these actors absent from `out`; the caller treats unknown
+            // remote-location data as "skip scrub for this actor this window".
+          }
+        }));
+        return out;
+      },
       contents: async (objRef, memo) => {
         const read = async (): Promise<ObjRef[]> => {
           const host = await hostForObject(objRef, memo);
@@ -1559,6 +1606,15 @@ export class PersistentObjectDO {
 
       if (request.method === "POST" && pathname === "/__internal/actor-session-locations") {
         return jsonResponse({ locations: world.allLocationsForActor(String(body.actor ?? "") as ObjRef) });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/actor-session-locations-batch") {
+        const actors = Array.isArray(body.actors)
+          ? (body.actors as unknown[]).filter((item): item is ObjRef => typeof item === "string")
+          : [];
+        const out: Record<ObjRef, ObjRef[]> = {};
+        for (const actor of actors) out[actor] = world.allLocationsForActor(actor);
+        return jsonResponse({ locations: out });
       }
 
       if (request.method === "POST" && pathname === "/__internal/contents") {
