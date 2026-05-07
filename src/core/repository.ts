@@ -67,6 +67,10 @@ export type SerializedWorld = {
   logs: [ObjRef, SpaceLogEntry[]][];
   snapshots: SpaceSnapshotRecord[];
   parkedTasks: ParkedTaskRecord[];
+  /** Tombstoned ULIDs (recycled). Per spec/semantics/recycle.md §RC3.9 and
+   * spec/reference/persistence.md §14.2.1. Optional in legacy dumps; absent
+   * means "no recycles recorded yet for this world". */
+  tombstones?: ObjRef[];
 };
 
 export interface WorldRepository {
@@ -314,6 +318,18 @@ export interface ObjectRepository {
    */
   earliestResumeAt(): number | null;
 
+  // ----- Tombstones (per spec/reference/persistence.md §14.2.1) -----
+
+  /**
+   * Persist a recycled-ULID tombstone. Idempotent: re-saving the same id is
+   * a no-op. The row is immutable once written; recycle inserts in the same
+   * transaction as deleteObject.
+   */
+  saveTombstone(id: ObjRef, recycledAt: number, reason?: string | null): void;
+
+  /** Enumerate every tombstone on this host. Used at boot to rebuild the in-memory set. */
+  loadTombstones(): ObjRef[];
+
   // ----- Host-scoped counters -----
 
   /**
@@ -334,12 +350,15 @@ export interface ObjectRepository {
 
 type PendingSpaceLogEntry = Omit<SpaceLogEntry, "applied_ok"> & { applied_ok: boolean | null };
 
+type Tombstone = { id: ObjRef; recycled_at: number; reason: string | null };
+
 type InMemoryObjectRepositoryState = {
   objects: Map<ObjRef, SerializedObject>;
   sessions: Map<string, SerializedSession>;
   logs: Map<ObjRef, PendingSpaceLogEntry[]>;
   snapshots: SpaceSnapshotRecord[];
   tasks: Map<string, ParkedTaskRecord>;
+  tombstones: Map<ObjRef, Tombstone>;
   counters: Map<string, number>;
   meta: Map<string, string>;
 };
@@ -350,6 +369,7 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
   private logs = new Map<ObjRef, PendingSpaceLogEntry[]>();
   private snapshots: SpaceSnapshotRecord[] = [];
   private tasks = new Map<string, ParkedTaskRecord>();
+  private tombstones = new Map<ObjRef, Tombstone>();
   private counters = new Map<string, number>();
   private meta = new Map<string, string>();
   private transactionDepth = 0;
@@ -365,7 +385,8 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
       sessions: Array.from(this.sessions.values()).map((session) => cloneRepoValue(session)),
       logs: Array.from(this.logs.entries()).map(([space, entries]) => [space, entries.map(finalizeLogEntry)]),
       snapshots: this.snapshots.map((snapshot) => cloneRepoValue(snapshot)),
-      parkedTasks: Array.from(this.tasks.values()).map((task) => cloneRepoValue(task))
+      parkedTasks: Array.from(this.tasks.values()).map((task) => cloneRepoValue(task)),
+      tombstones: Array.from(this.tombstones.keys()).sort()
     };
   }
 
@@ -376,6 +397,7 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
       this.logs.clear();
       this.snapshots = [];
       this.tasks.clear();
+      this.tombstones.clear();
       this.counters.clear();
       this.meta.clear();
       this.meta.set("version", String(world.version));
@@ -389,6 +411,10 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
       }
       this.snapshots = world.snapshots.map((snapshot) => cloneRepoValue(snapshot));
       for (const task of world.parkedTasks) this.tasks.set(task.id, cloneRepoValue(task));
+      const now = Date.now();
+      for (const id of world.tombstones ?? []) {
+        if (!this.tombstones.has(id)) this.tombstones.set(id, { id, recycled_at: now, reason: null });
+      }
     });
   }
 
@@ -647,6 +673,15 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
     return times.length === 0 ? null : Math.min(...times);
   }
 
+  saveTombstone(id: ObjRef, recycledAt: number, reason?: string | null): void {
+    if (this.tombstones.has(id)) return; // immutable per spec
+    this.tombstones.set(id, { id, recycled_at: recycledAt, reason: reason ?? null });
+  }
+
+  loadTombstones(): ObjRef[] {
+    return Array.from(this.tombstones.keys()).sort();
+  }
+
   nextCounter(name: string): number {
     const next = this.counters.get(name) ?? 1;
     this.counters.set(name, next + 1);
@@ -674,6 +709,7 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
       logs: new Map(Array.from(this.logs.entries()).map(([space, entries]) => [space, entries.map((entry) => cloneRepoValue(entry as unknown as WooValue) as unknown as PendingSpaceLogEntry)])),
       snapshots: this.snapshots.map((snapshot) => cloneRepoValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
       tasks: new Map(Array.from(this.tasks.entries()).map(([id, task]) => [id, cloneRepoValue(task as unknown as WooValue) as unknown as ParkedTaskRecord])),
+      tombstones: new Map(this.tombstones),
       counters: new Map(this.counters),
       meta: new Map(this.meta)
     };
@@ -685,6 +721,7 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
     this.logs = new Map(Array.from(state.logs.entries()).map(([space, entries]) => [space, entries.map((entry) => cloneRepoValue(entry as unknown as WooValue) as unknown as PendingSpaceLogEntry)]));
     this.snapshots = state.snapshots.map((snapshot) => cloneRepoValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord);
     this.tasks = new Map(Array.from(state.tasks.entries()).map(([id, task]) => [id, cloneRepoValue(task as unknown as WooValue) as unknown as ParkedTaskRecord]));
+    this.tombstones = new Map(state.tombstones);
     this.counters = new Map(state.counters);
     this.meta = new Map(state.meta);
   }

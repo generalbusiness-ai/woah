@@ -234,6 +234,18 @@ the default `home` for seeded players and guests, and the fallback destination
 for disconnect cleanup and recycle-like flows when no more specific home is
 available.
 
+**Sink semantics.** `$nowhere.contents` is **not maintained**. `$nowhere` is
+the documented exception to the bidirectional containment invariant in
+[objects.md §4.3](objects.md#43-containment-and-cross-host-invariants): when an
+object's `location` is set to `$nowhere`, only the object's own `location`
+field is written; no RPC is sent to update `$nowhere.contents`. Reads of
+`$nowhere.contents` return an empty list. This avoids a global write hotspot
+(every disconnect, recycle-fallback, and reset would otherwise contend on
+`$nowhere.contents`) and removes a cross-cluster write from the recycle apply
+phase ([recycle.md §RC3](recycle.md#rc3-bookkeeping)). Code that needs to
+enumerate "where did everyone go" must query each candidate's `location`
+directly rather than relying on `$nowhere.contents`.
+
 ---
 
 ## B3. Local catalog: Dubspace classes

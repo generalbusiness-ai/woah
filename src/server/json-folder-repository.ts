@@ -16,6 +16,7 @@ type JsonFolderManifest = {
   snapshots: Array<{ space: ObjRef; file: string }>;
   sessions_file: string | null;
   tasks_file: string | null;
+  tombstones?: ObjRef[];
 };
 
 export type JsonFolderDumpOptions = {
@@ -47,7 +48,8 @@ export class JsonFolderWorldRepository implements WorldRepository {
       sessions: manifest.sessions_file ? readJson(join(this.folder, manifest.sessions_file)) : [],
       logs: manifest.logs.map((item) => [item.space, readJson(join(this.folder, item.file))]),
       snapshots: manifest.snapshots.flatMap((item) => readJson<SpaceSnapshotRecord[]>(join(this.folder, item.file))),
-      parkedTasks: manifest.tasks_file ? readJson(join(this.folder, manifest.tasks_file)) : []
+      parkedTasks: manifest.tasks_file ? readJson(join(this.folder, manifest.tasks_file)) : [],
+      tombstones: manifest.tombstones ?? []
     };
   }
 
@@ -97,7 +99,8 @@ export function dumpSerializedWorldToJsonFolder(world: SerializedWorld, folder: 
     logs: [],
     snapshots: [],
     sessions_file: includeSessions ? "sessions.json" : null,
-    tasks_file: includeTasks ? "tasks.json" : null
+    tasks_file: includeTasks ? "tasks.json" : null,
+    tombstones: world.tombstones ?? []
   };
 
   for (const obj of objects.sort((a, b) => a.id.localeCompare(b.id))) {

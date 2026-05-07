@@ -10,6 +10,7 @@ export type SqlRow = Record<string, unknown>;
 
 export const SQL_DELETE_TABLES = [
   "world_meta",
+  "tombstone",
   "task",
   "space_snapshot",
   "space_message",
@@ -146,6 +147,15 @@ export const SQL_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS world_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+  )`,
+  // Recycled ULIDs. Per-host (each anchor cluster owns its own table).
+  // Survives backup/restore. Per spec/reference/persistence.md §14.2.1.
+  // Rows are immutable once written; recycle inserts in the same SQLite
+  // transaction as the storage-row deletes.
+  `CREATE TABLE IF NOT EXISTS tombstone (
+    id TEXT PRIMARY KEY,
+    recycled_at INTEGER NOT NULL,
+    reason TEXT
   )`
 ] as const;
 
@@ -228,15 +238,14 @@ export function parseSqlValue(value: unknown): WooValue {
 }
 
 export function flagsToSqlInt(flags: SerializedObject["flags"]): number {
-  return (flags.wizard ? 1 : 0) | (flags.programmer ? 2 : 0) | (flags.fertile ? 4 : 0) | (flags.recyclable ? 8 : 0);
+  return (flags.wizard ? 1 : 0) | (flags.programmer ? 2 : 0) | (flags.fertile ? 4 : 0);
 }
 
 export function flagsFromSqlInt(flags: number): SerializedObject["flags"] {
   return {
     wizard: Boolean(flags & 1),
     programmer: Boolean(flags & 2),
-    fertile: Boolean(flags & 4),
-    recyclable: Boolean(flags & 8)
+    fertile: Boolean(flags & 4)
   };
 }
 

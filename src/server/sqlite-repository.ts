@@ -102,6 +102,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
     const snapshots = (this.db.prepare("SELECT * FROM space_snapshot ORDER BY space_id, seq").all() as Row[]).map(snapshotFromRow);
     const parkedTasks = (this.db.prepare("SELECT * FROM task ORDER BY id").all() as Row[]).map(taskFromRow);
+    const tombstones = (this.db.prepare("SELECT id FROM tombstone ORDER BY id").all() as Row[]).map((row) => String(row.id));
     const meta = Object.fromEntries((this.db.prepare("SELECT key, value FROM world_meta").all() as Row[]).map((row) => [row.key, row.value]));
 
     return {
@@ -113,7 +114,8 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       sessions,
       logs,
       snapshots,
-      parkedTasks
+      parkedTasks,
+      tombstones
     };
   }
 
@@ -176,6 +178,10 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       for (const task of world.parkedTasks) {
         insertTask.run(task.id, task.parked_on, task.state, task.resume_at, task.awaiting_player, task.correlation_id, stringifyValue(task.serialized), task.created, task.origin);
       }
+
+      const insertTombstone = this.db.prepare("INSERT OR IGNORE INTO tombstone(id, recycled_at, reason) VALUES (?, ?, ?)");
+      const now = Date.now();
+      for (const id of world.tombstones ?? []) insertTombstone.run(id, now, null);
     });
   }
 
@@ -469,6 +475,16 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   earliestResumeAt(): number | null {
     const row = this.db.prepare("SELECT MIN(resume_at) AS resume_at FROM task WHERE state = 'suspended' AND resume_at IS NOT NULL").get() as Row | undefined;
     return row?.resume_at === null || row?.resume_at === undefined ? null : Number(row.resume_at);
+  }
+
+  saveTombstone(id: ObjRef, recycledAt: number, reason?: string | null): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO tombstone(id, recycled_at, reason) VALUES (?, ?, ?)")
+      .run(id, recycledAt, reason ?? null);
+  }
+
+  loadTombstones(): ObjRef[] {
+    return (this.db.prepare("SELECT id FROM tombstone").all() as Row[]).map((row) => String(row.id));
   }
 
   nextCounter(name: string): number {

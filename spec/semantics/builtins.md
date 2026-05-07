@@ -76,8 +76,8 @@ name a 1-based local slot directly.
 `create(parent, owner_or_options?)` creates a new persistent object with the
 supplied parent. If the second argument is an object reference, it is the owner;
 if omitted, owner defaults to the current actor. If the second argument is a map,
-it may include `{owner, name, description, aliases, location, fertile,
-recyclable}`. This mirrors the builder-facing create surface, but still applies
+it may include `{owner, name, description, aliases, location, fertile}`.
+This mirrors the builder-facing create surface, but still applies
 the behavior task's ordinary `create()` authority checks. In a sequenced call,
 the new object's anchor is the current space; in a direct/off-space call, the
 anchor is null. `location`, when supplied, is initial placement only; user-level

@@ -168,7 +168,6 @@ describe("authoring", () => {
     expect(built.op).toBe("result");
     const otherBox = (built.op === "result" ? (built.result as Record<string, string>).id : "");
     expect(world.object(otherBox)).toMatchObject({ parent: "$thing", owner: other.actor });
-    expect(world.object(otherBox).flags.recyclable).toBe(true);
 
     const actorChparentDenied = await world.directCall("builder-chparent-actor-denied", other.actor, other.actor, "chparent", [other.actor, otherBox, { dry_run: true }]);
     expect(actorChparentDenied.op).toBe("error");

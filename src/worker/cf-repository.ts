@@ -156,6 +156,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
 
       const snapshots = this.all("SELECT * FROM space_snapshot ORDER BY space_id, seq").map(snapshotFromRow);
       const parkedTasks = this.all("SELECT * FROM task ORDER BY id").map(taskFromRow);
+      const tombstones = this.all("SELECT id FROM tombstone ORDER BY id").map((row) => String(row.id));
       const meta = Object.fromEntries(this.all("SELECT key, value FROM world_meta").map((row) => [String(row.key), String(row.value ?? "")]));
 
       const world: SerializedWorld = {
@@ -167,7 +168,8 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
         sessions,
         logs,
         snapshots,
-        parkedTasks
+        parkedTasks,
+        tombstones
       };
       this.emitMetric({
         kind: "startup_storage",
@@ -228,6 +230,9 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
 
         for (const snapshot of world.snapshots) this.saveSpaceSnapshot(snapshot);
         for (const task of world.parkedTasks) this.saveTask(task);
+
+        const now = Date.now();
+        for (const id of world.tombstones ?? []) this.saveTombstone(id, now, null);
       });
       this.emitMetric({
         kind: "startup_storage",
@@ -625,6 +630,17 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   earliestResumeAt(): number | null {
     const row = this.one("SELECT MIN(resume_at) AS resume_at FROM task WHERE state = 'suspended' AND resume_at IS NOT NULL");
     return row?.resume_at == null ? null : Number(row.resume_at);
+  }
+
+  saveTombstone(id: ObjRef, recycledAt: number, reason?: string | null): void {
+    this.sql.exec(
+      "INSERT OR IGNORE INTO tombstone(id, recycled_at, reason) VALUES (?, ?, ?)",
+      id, recycledAt, reason ?? null
+    );
+  }
+
+  loadTombstones(): ObjRef[] {
+    return this.all("SELECT id FROM tombstone ORDER BY id").map((row) => String(row.id));
   }
 
   // ---- counters & meta ----

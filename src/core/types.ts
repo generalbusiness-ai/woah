@@ -188,7 +188,6 @@ export type WooObject = {
     wizard?: boolean;
     programmer?: boolean;
     fertile?: boolean;
-    recyclable?: boolean;
   };
   created: number;
   modified: number;

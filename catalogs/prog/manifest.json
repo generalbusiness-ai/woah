@@ -94,7 +94,7 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"trace(id, descriptor, opts?)\"] };\n}"
+          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"trace(id, descriptor, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"] };\n}"
         },
         {
           "name": "inspect",
@@ -177,6 +177,15 @@
           "tool_exposed": true,
           "arg_spec": { "args": ["id", "verb_name", "opts?"] },
           "source": "verb :trace(id, verb_name, opts) rxd {\n  // Capture source-span traces for the next N invocations. v1.1.\n  return programmer_trace(id, verb_name, opts);\n}"
+        },
+        {
+          "name": "force_recycle",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": { "args": ["id", "opts?"] },
+          "source": "verb :force_recycle(id, opts) rxd {\n  // Wizard-only force_recycle. Bypasses most §RC6 reserved-list checks\n  // (universal classes other than $system/$root/$nowhere; live actors,\n  // whose sessions are terminated as part of the call). The engine\n  // builtin raises E_PERM for non-wizards; non-wizard programmers see\n  // this verb in tools listings but cannot call it. Audited as a\n  // wiz_force_recycle wizard_action; emits a wiz_force_recycle\n  // observation. Use sparingly — for irreversible world-teardown and\n  // migration only.\n  return wiz_force_recycle(id, opts);\n}"
         }
       ]
     },

@@ -23,7 +23,7 @@ describe("woo core", () => {
     const description = world.describe("the_dubspace");
     expect(description.id).toBe("the_dubspace");
     expect(description.description).toContain("sound-space");
-    expect(description.flags).toEqual({ wizard: false, programmer: false, fertile: false, recyclable: false });
+    expect(description.flags).toEqual({ wizard: false, programmer: false, fertile: false });
     expect(description.verbs).toContain("set_control");
     expect(description.schemas).toContain("control_changed");
   });

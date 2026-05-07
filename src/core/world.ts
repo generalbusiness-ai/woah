@@ -144,6 +144,12 @@ export type HostBridge = {
   resolveVerb?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary | null>;
   commandVerbCandidates?(target: ObjRef, verbName: string, memo?: HostOperationMemo): Promise<CommandVerbSummary[]>;
   isDescendantOf(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
+  /** Probe the owning host's tombstone table. Optional — hosts that don't
+   * yet expose a tombstone probe return false (matching the previous
+   * local-only behavior). Per spec/semantics/recycle.md §RC5 and
+   * spec/reference/persistence.md §14.2.1: each tombstone lives on the
+   * owning host, so cross-host stale-ref answers must come from there. */
+  isRecycled?(objRef: ObjRef, memo?: HostOperationMemo): Promise<boolean>;
   location(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null>;
   dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue>;
   moveObject(objRef: ObjRef, targetRef: ObjRef, options?: { suppressMirrorHost?: string | null }): Promise<MoveObjectResult>;
@@ -275,6 +281,7 @@ type BehaviorSavepoint = {
   sessions: Map<string, Session>;
   snapshots: SpaceSnapshotRecord[];
   parkedTasks: Map<string, ParkedTaskRecord>;
+  tombstones: Set<ObjRef>;
   objectCounter: number;
   parkedTaskCounter: number;
   sessionCounter: number;
@@ -306,6 +313,7 @@ type PersistenceDirtyState = {
   deletedSessions: Set<string>;
   dirtyTasks: Set<string>;
   deletedTasks: Set<string>;
+  dirtyTombstones: Set<ObjRef>;
   dirtyCounters: boolean;
   dirty: boolean;
 };
@@ -348,7 +356,11 @@ export class WooWorld {
   private deletedSessions = new Set<string>();
   private dirtyTasks = new Set<string>();
   private deletedTasks = new Set<string>();
+  private dirtyTombstones = new Set<ObjRef>();
   private dirtyCounters = false;
+  // Tombstoned ULIDs from `recycle()`. Distinct from `objects` having no row,
+  // which can also mean "never existed". Per spec/semantics/recycle.md §RC3.9.
+  tombstones = new Set<ObjRef>();
   // Invalidation token for externally visible state. It is bumped on every
   // path that could change `state(actor)` (object/property/session/task/counter
   // writes, deletes, accepted log rows). It may over-invalidate after rollback;
@@ -381,7 +393,14 @@ export class WooWorld {
   }
 
   enableIncrementalPersistence(): void {
-    if (this.objectRepository) this.incrementalPersistenceEnabled = true;
+    if (!this.objectRepository) return;
+    this.incrementalPersistenceEnabled = true;
+    // Rehydrate tombstones from the persistence layer so dangling-ref
+    // checks survive process restart. Per spec/reference/persistence.md
+    // §14.2.1.
+    for (const id of this.objectRepository.loadTombstones()) {
+      this.tombstones.add(id);
+    }
   }
 
   discardPendingPersistence(): void {
@@ -392,6 +411,7 @@ export class WooWorld {
     this.deletedSessions.clear();
     this.dirtyTasks.clear();
     this.deletedTasks.clear();
+    this.dirtyTombstones.clear();
     this.dirtyCounters = false;
     this.persistenceDirty = false;
   }
@@ -516,6 +536,118 @@ export class WooWorld {
     const obj = this.objects.get(id);
     if (!obj) throw wooError("E_OBJNF", `object not found: ${id}`, id);
     return obj;
+  }
+
+  /**
+   * Synchronous local tombstone lookup. Use isRecycledChecked for the
+   * host-transparent version. Returns true for ULIDs tombstoned on this
+   * host; for ULIDs owned by a remote host, this returns the local view
+   * only (which may be false even if the remote has tombstoned the id).
+   */
+  isRecycled(id: ObjRef): boolean {
+    return this.tombstones.has(id);
+  }
+
+  /**
+   * Host-transparent tombstone probe. Per spec/semantics/recycle.md §RC5
+   * and spec/reference/persistence.md §14.2.1, tombstones live on the
+   * owning host. For an id owned by another host, ask the bridge; for a
+   * local id, consult the local set.
+   *
+   * Returns false (rather than raising) for a never-existed id: the
+   * is_recycled() builtin distinguishes "recycled" from "never existed",
+   * so callers expect false in the never-existed case.
+   */
+  async isRecycledChecked(id: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
+    if (this.tombstones.has(id)) return true;
+    const remoteHost = await this.remoteHostForObject(id, memo);
+    if (remoteHost && this.hostBridge?.isRecycled) {
+      try {
+        return await this.hostBridge.isRecycled(id, memo);
+      } catch {
+        // Best-effort: if the remote host is unreachable, fall back to
+        // the local answer (false). The caller can re-probe.
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Sweep $system's own properties for any value pointing at a tombstoned
+   * ULID, and clear it (set to null). Returns the list of property names
+   * whose value was cleared.
+   *
+   * Per spec/semantics/recycle.md §RC3 step 10 ("forget the corename
+   * binding") and §RC5 (dangling-ref janitor). In the single-host backend,
+   * a "corename" is just an ordinary property on $system whose value is
+   * an ULID (e.g., `$system.help_dbs` holding `[$help_db_main]`). When
+   * the CF backend lands its separate Directory DO, this reconciliation
+   * runs against the Directory's `corename` table per
+   * spec/reference/persistence.md §14.2.
+   *
+   * Walks scalar, list, and map values: a scalar tombstoned ref becomes
+   * null; list elements that point at tombstones are removed; map entries
+   * whose value is tombstoned are removed (keys are not interpreted as
+   * ULIDs). Names of properties whose value structure changed are
+   * returned, sorted.
+   *
+   * Idempotent: safe to call multiple times; never-tombstoned and missing
+   * values are no-ops.
+   */
+  reconcileTombstoneRefsInSystem(): string[] {
+    const cleared = new Set<string>();
+    const sys = this.objects.get("$system");
+    if (!sys) return [];
+    for (const [name, value] of sys.properties) {
+      const next = this.scrubTombstoneRefs(value);
+      if (!valuesEqual(value, next)) {
+        cleared.add(name);
+        this.setProp("$system", name, next);
+      }
+    }
+    return Array.from(cleared).sort();
+  }
+
+  /**
+   * Recursively rewrite a value, replacing scalar tombstoned ULID
+   * references with null and pruning them from list/map containers.
+   * Returns the value unchanged if no rewrite was needed.
+   */
+  private scrubTombstoneRefs(value: WooValue): WooValue {
+    if (typeof value === "string") {
+      return this.tombstones.has(value) ? null : value;
+    }
+    if (Array.isArray(value)) {
+      const out: WooValue[] = [];
+      let changed = false;
+      for (const entry of value) {
+        if (typeof entry === "string" && this.tombstones.has(entry)) {
+          changed = true;
+          continue;
+        }
+        const next = this.scrubTombstoneRefs(entry);
+        if (!valuesEqual(entry, next)) changed = true;
+        out.push(next);
+      }
+      return changed ? out as WooValue : value;
+    }
+    if (value && typeof value === "object") {
+      const src = value as Record<string, WooValue>;
+      const out: Record<string, WooValue> = {};
+      let changed = false;
+      for (const [key, entry] of Object.entries(src)) {
+        if (typeof entry === "string" && this.tombstones.has(entry)) {
+          changed = true;
+          continue;
+        }
+        const next = this.scrubTombstoneRefs(entry);
+        if (!valuesEqual(entry, next)) changed = true;
+        out[key] = next;
+      }
+      return changed ? out as WooValue : value;
+    }
+    return value;
   }
 
   defineProperty(obj: ObjRef, def: Omit<PropertyDef, "version"> & { version?: number }): PropertyDef {
@@ -737,8 +869,7 @@ export class WooWorld {
       flags: {
         wizard: Boolean(obj.flags.wizard),
         programmer: Boolean(obj.flags.programmer),
-        fertile: Boolean(obj.flags.fertile),
-        recyclable: Boolean(obj.flags.recyclable)
+        fertile: Boolean(obj.flags.fertile)
       },
       modified: obj.modified,
       children_count: obj.children.size,
@@ -1398,6 +1529,30 @@ export class WooWorld {
     this.reapSession(sessionId);
     this.persist(true);
     return true;
+  }
+
+  /**
+   * Returns true iff `actor` has at least one live session. Used by recycle
+   * pre-flight (§RC6) to decide whether an actor is currently bound and
+   * therefore unrecyclable through ordinary tools.
+   */
+  hasLiveSessions(actor: ObjRef): boolean {
+    const now = Date.now();
+    for (const session of this.sessions.values()) {
+      if (session.actor === actor && !this.sessionExpired(session, now)) return true;
+    }
+    return false;
+  }
+
+  /** Returns the live sessions bound to `actor` (sorted by id for stability). */
+  liveSessionsForActor(actor: ObjRef): Session[] {
+    const now = Date.now();
+    const out: Session[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.actor === actor && !this.sessionExpired(session, now)) out.push(session);
+    }
+    out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return out;
   }
 
   primarySessionForActor(actor: ObjRef): Session | null {
@@ -2291,8 +2446,7 @@ export class WooWorld {
     const id = this.createBuilderObject(parentRef, actor, anchor, {
       location,
       name: displayName ?? undefined,
-      fertile: optionBool(options, "fertile", false),
-      recyclable: optionBool(options, "recyclable", true)
+      fertile: optionBool(options, "fertile", false)
     });
     if (displayName !== null) this.setProp(id, "name", displayName);
     if (description !== null) this.setProp(id, "description", description);
@@ -2320,17 +2474,58 @@ export class WooWorld {
     return result;
   }
 
-  async builderRecycle(actor: ObjRef, objRef: ObjRef, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
+  async builderRecycle(actor: ObjRef, objRef: ObjRef, opts: WooValue, surfaceClass: ObjRef, ctx?: CallContext): Promise<WooValue> {
     this.assertBuilderActor(actor, surfaceClass);
     const options = progOptions(opts);
     const dryRun = optionBool(options, "dry_run", false);
+    const force = optionBool(options, "force", false);
+
+    // Pre-flight A1 (authority): wizard or owner. assertCanBuildOwnedObject
+    // covers both. We resolve `obj` first because the helpers want it.
+    const obj = this.object(objRef);
+    this.assertCanBuildOwnedObject(actor, objRef);
+
+    // Pre-flight A2 (reserved). The §RC6 forbidden list. Live-actor
+    // detection is the real session-binding check: an actor with at least
+    // one live session is unrecyclable through ordinary tools per §RC6.
+    // Recycling an actor with no live sessions is permitted (subject to
+    // the §RC2 wizard/owner check enforced above by
+    // assertCanBuildOwnedObject).
+    this.assertNotReservedForRecycle(objRef);
+    if (this.inheritsFrom(objRef, "$actor") && this.hasLiveSessions(objRef)) {
+      throw wooError("E_PERM", "actor has live sessions; cannot be recycled through builder tools", { actor, obj: objRef });
+    }
+
+    // Pre-flight A3 (anchored descendants).
+    const anchored = this.findAnchoredDescendants(objRef);
+    if (anchored.length > 0) throw wooError("E_NACC", `${objRef} has anchored descendants`, { obj: objRef, descendants: anchored as WooValue });
+
+    // Pre-flight A4 (cluster collocation): obj's parent, location, children,
+    // and contents must share obj's host (or be the well-known $nowhere
+    // sink). For single-host worlds these are local; for hostBridge-enabled
+    // worlds we ask remoteHostForObject. The existing objRef-side check
+    // catches the most common failure (recycling an object that lives on
+    // another host).
     if (await this.remoteHostForObject(objRef)) {
       throw wooError("E_CROSS_HOST_WRITE", `cross-host recycle is not atomic: ${objRef}`, { actor, obj: objRef });
     }
-    const obj = this.object(objRef);
-    this.assertCanBuildOwnedObject(actor, objRef);
-    if (!this.isWizard(actor) && obj.flags.recyclable !== true) throw wooError("E_PERM", `${objRef} is not recyclable`, { actor, obj: objRef });
-    if (this.inheritsFrom(objRef, "$actor")) throw wooError("E_PERM", "actors cannot be recycled through builder tools", { actor, obj: objRef });
+    if (obj.parent && obj.parent !== "$nowhere" && await this.remoteHostForObject(obj.parent)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via parent: ${objRef} -> ${obj.parent}`, { actor, obj: objRef, parent: obj.parent });
+    }
+    if (obj.location && obj.location !== "$nowhere" && await this.remoteHostForObject(obj.location)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via location: ${objRef} -> ${obj.location}`, { actor, obj: objRef, location: obj.location });
+    }
+    for (const child of obj.children) {
+      if (child !== "$nowhere" && await this.remoteHostForObject(child)) {
+        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via child: ${objRef} -> ${child}`, { actor, obj: objRef, child });
+      }
+    }
+    for (const content of obj.contents) {
+      if (content !== "$nowhere" && await this.remoteHostForObject(content)) {
+        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via content: ${objRef} -> ${content}`, { actor, obj: objRef, content });
+      }
+    }
+
     const impact = {
       id: objRef,
       parent: obj.parent,
@@ -2342,11 +2537,302 @@ export class WooWorld {
       own_verbs: obj.verbs.length,
       own_properties: obj.propertyDefs.size
     };
-    if (obj.children.size > 0 || obj.contents.size > 0) throw wooError("E_RECMOVE", `${objRef} still has children or contents`, impact as WooValue);
+
+    // Builder-surface safety check (§RC3a): refuse non-empty objects unless
+    // `force: true`. The engine apply phase always grafts/displaces; this
+    // safety check exists only at the authoring surface.
+    if (!force && (obj.children.size > 0 || obj.contents.size > 0)) {
+      throw wooError("E_RECMOVE", `${objRef} still has children or contents (pass force: true to recycle anyway)`, impact as WooValue);
+    }
     const result = { ok: true, dry_run: dryRun, id: objRef, impact: impact as WooValue };
     if (dryRun) return result;
+
+    // Apply step 1: fire :recycle handler. Errors caught and surfaced as a
+    // $recycle_handler_error observation; recycle proceeds.
+    await this.invokeRecycleHandler(objRef, ctx);
+
+    // Apply step 1a: post-handler A4 re-check.
+    await this.assertPostHandlerCollocation(actor, objRef);
+
     this.recycleObjectLocal(objRef);
+
+    // Step 10: post-commit corename removal. In the single-host backend,
+    // `$foo` IS the object's id, so `objects.delete(objRef)` already
+    // unbinds the corename. As a defensive sweep we also walk $system's
+    // own properties and clear any whose value is the tombstoned ULID — a
+    // catalog or wizard verb that stamped `$system.my_link = obj` will see
+    // `null` after recycle. Per spec/semantics/recycle.md §RC3 step 10.
+    // Best-effort and idempotent; failure here does NOT abort recycle.
+    try {
+      this.reconcileTombstoneRefsInSystem();
+    } catch {
+      // Ignored: see janitor contract above.
+    }
     return result;
+  }
+
+  /**
+   * Wizard-only force_recycle. Per spec/semantics/recycle.md §RC6.1.
+   *
+   * Bypasses most of the §RC6 reserved-list (universal classes other than
+   * the hard floor; live actors with explicit session teardown).
+   * Bypasses neither:
+   *   - The §RC2 wizard authority (actor must have wizard flag).
+   *   - The hard floor: $system, $root, $nowhere (not recoverable from
+   *     inside the running world).
+   *   - Pre-flight A3 (anchored descendants).
+   *   - Pre-flight A4 (cluster collocation): even a wizard cannot
+   *     atomically recycle across clusters in v1.
+   *
+   * For an actor target with live sessions, terminates each session
+   * (endSession) before invoking the apply phase. Records a
+   * wiz_force_recycle wizard_action audit entry and emits a
+   * wiz_force_recycle observation on the outer call frame.
+   */
+  async wizForceRecycle(actor: ObjRef, objRef: ObjRef, opts: WooValue, ctx?: CallContext): Promise<WooValue> {
+    if (!this.isWizard(actor)) throw wooError("E_PERM", "wizard authority required for force_recycle", { actor, obj: objRef });
+    const options = progOptions(opts);
+    const dryRun = optionBool(options, "dry_run", false);
+    const reason = optionMaybeString(options, "reason") ?? null;
+
+    // Hard floor — even force_recycle refuses these.
+    const hardFloor = new Set(["$system", "$root", "$nowhere"]);
+    if (hardFloor.has(objRef)) {
+      throw wooError("E_INVARG", `${objRef} cannot be force-recycled from inside the running world`, objRef);
+    }
+
+    const obj = this.object(objRef);
+
+    // A3 anchored descendants still applies.
+    const anchored = this.findAnchoredDescendants(objRef);
+    if (anchored.length > 0) throw wooError("E_NACC", `${objRef} has anchored descendants`, { obj: objRef, descendants: anchored as WooValue });
+
+    // A4 cluster collocation still applies.
+    if (await this.remoteHostForObject(objRef)) {
+      throw wooError("E_CROSS_HOST_WRITE", `cross-host force_recycle is not atomic: ${objRef}`, { actor, obj: objRef });
+    }
+    if (obj.parent && obj.parent !== "$nowhere" && await this.remoteHostForObject(obj.parent)) {
+      throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via parent: ${objRef} -> ${obj.parent}`, { actor, obj: objRef, parent: obj.parent });
+    }
+    if (obj.location && obj.location !== "$nowhere" && await this.remoteHostForObject(obj.location)) {
+      throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via location: ${objRef} -> ${obj.location}`, { actor, obj: objRef, location: obj.location });
+    }
+    for (const child of obj.children) {
+      if (child !== "$nowhere" && await this.remoteHostForObject(child)) {
+        throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via child: ${objRef} -> ${child}`, { actor, obj: objRef, child });
+      }
+    }
+    for (const content of obj.contents) {
+      if (content !== "$nowhere" && await this.remoteHostForObject(content)) {
+        throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via content: ${objRef} -> ${content}`, { actor, obj: objRef, content });
+      }
+    }
+
+    const sessionsToKill = this.inheritsFrom(objRef, "$actor") ? this.liveSessionsForActor(objRef) : [];
+    const impact: Record<string, WooValue> = {
+      id: objRef,
+      parent: obj.parent,
+      location: obj.location,
+      child_count: obj.children.size,
+      children: Array.from(obj.children).sort(),
+      contents_count: obj.contents.size,
+      contents: Array.from(obj.contents).sort(),
+      own_verbs: obj.verbs.length,
+      own_properties: obj.propertyDefs.size,
+      sessions_to_kill: sessionsToKill.map((s) => s.id) as WooValue
+    };
+
+    if (dryRun) {
+      return { ok: true, dry_run: true, id: objRef, impact: impact as WooValue, sessions_killed: 0 };
+    }
+
+    // Terminate live sessions before recycle so the apply phase sees an
+    // unbound actor (and any in-flight host_calls return E_GONE per
+    // failures.md §F7).
+    for (const session of sessionsToKill) {
+      this.endSession(session.id);
+    }
+    const sessions_killed = sessionsToKill.length;
+
+    // Apply: handler, post-handler A4 recheck, parked-task kill,
+    // graft/displace, storage delete, tombstone, post-commit corename
+    // sweep. Same path as ordinary recycle.
+    await this.invokeRecycleHandler(objRef, ctx);
+    await this.assertPostHandlerCollocation(actor, objRef);
+    this.recycleObjectLocal(objRef);
+    try {
+      this.reconcileTombstoneRefsInSystem();
+    } catch {
+      // Best-effort: see step 10 contract.
+    }
+
+    // Audit. Per the spec, this is the only path that records a
+    // wiz_force_recycle wizard_action and emits a wiz_force_recycle
+    // observation on the outer call.
+    this.recordWizardAction(actor, "force_recycle", { obj: objRef, reason: reason as WooValue, sessions_killed });
+    if (ctx) {
+      const event: Observation = {
+        type: "wiz_force_recycle",
+        actor,
+        obj: objRef,
+        reason: reason as WooValue,
+        sessions_killed,
+        ts: Date.now(),
+        source: objRef
+      };
+      if (ctx.observe) ctx.observe(event);
+      else ctx.observations.push(event);
+    }
+
+    return { ok: true, dry_run: false, id: objRef, impact: impact as WooValue, sessions_killed };
+  }
+
+  /**
+   * Apply step 1: dispatch :recycle on `obj` if defined. Resolves via
+   * inherited verb-lookup so a handler on any ancestor fires.
+   *
+   * Errors are caught:
+   *   - E_VERBNF: silent (no handler is fine; this is the spec default).
+   *   - other errors: surfaced as a $recycle_handler_error observation on
+   *     the outer frame (or logged if no ctx is available).
+   *
+   * Per spec/semantics/recycle.md §RC4, the handler runs with progr equal
+   * to the resolved verb's owner (standard programmer discipline), this =
+   * obj, caller = obj. Recycle proceeds regardless of handler outcome.
+   */
+  /**
+   * Apply step 1a: re-verify A4 cluster collocation after the :recycle
+   * handler has run. The handler may have moved obj into another cluster,
+   * reparented it, relocated it, or introduced cross-cluster
+   * children/contents — pre-flight only checked the world as it was
+   * before the handler. If the recheck fails, abort: the handler's
+   * intra-cluster mutations roll back with the host transaction;
+   * cross-cluster mutations are explicitly out of scope (§RC3.1).
+   *
+   * Used by both ordinary recycle and wiz_force_recycle so they enforce
+   * the same atomicity invariant.
+   */
+  private async assertPostHandlerCollocation(actor: ObjRef, objRef: ObjRef): Promise<void> {
+    if (await this.remoteHostForObject(objRef)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle: handler moved obj across clusters: ${objRef}`, { actor, obj: objRef });
+    }
+    const objAfter = this.object(objRef);
+    if (objAfter.parent && objAfter.parent !== "$nowhere" && await this.remoteHostForObject(objAfter.parent)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle: handler reparented across clusters: ${objRef} -> ${objAfter.parent}`, { actor, obj: objRef, parent: objAfter.parent });
+    }
+    if (objAfter.location && objAfter.location !== "$nowhere" && await this.remoteHostForObject(objAfter.location)) {
+      throw wooError("E_CROSS_HOST_WRITE", `recycle: handler relocated across clusters: ${objRef} -> ${objAfter.location}`, { actor, obj: objRef, location: objAfter.location });
+    }
+    for (const child of objAfter.children) {
+      if (child !== "$nowhere" && await this.remoteHostForObject(child)) {
+        throw wooError("E_CROSS_HOST_WRITE", `recycle: handler introduced cross-cluster child: ${objRef} -> ${child}`, { actor, obj: objRef, child });
+      }
+    }
+    for (const content of objAfter.contents) {
+      if (content !== "$nowhere" && await this.remoteHostForObject(content)) {
+        throw wooError("E_CROSS_HOST_WRITE", `recycle: handler introduced cross-cluster content: ${objRef} -> ${content}`, { actor, obj: objRef, content });
+      }
+    }
+  }
+
+  private async invokeRecycleHandler(objRef: ObjRef, ctx?: CallContext): Promise<void> {
+    let verbExists = false;
+    try {
+      this.resolveVerb(objRef, "recycle");
+      verbExists = true;
+    } catch (err) {
+      if (isErrorValue(err) && err.code === "E_VERBNF") return;
+      throw err;
+    }
+    if (!verbExists) return;
+
+    const handlerCtx: CallContext = ctx
+      ? { ...ctx, caller: objRef, callerPerms: ctx.progr }
+      : {
+          world: this,
+          space: this.object(objRef).anchor ?? "#-1",
+          seq: -1,
+          session: null,
+          actor: objRef,
+          player: objRef,
+          caller: objRef,
+          callerPerms: this.object(objRef).owner,
+          progr: this.object(objRef).owner,
+          thisObj: objRef,
+          verbName: "recycle",
+          definer: objRef,
+          message: { actor: objRef, target: objRef, verb: "recycle", args: [] },
+          observations: [],
+          hostMemo: createHostOperationMemo(),
+          observe: () => {}
+        };
+
+    try {
+      await this.dispatch(handlerCtx, objRef, "recycle", []);
+    } catch (err) {
+      if (isErrorValue(err) && err.code === "E_VERBNF") return;
+      const code = isErrorValue(err) ? err.code : "E_INTERNAL";
+      const message = isErrorValue(err) ? err.message ?? "" : err instanceof Error ? err.message : String(err);
+      const event: Observation = {
+        type: "$recycle_handler_error",
+        obj: objRef,
+        code,
+        message,
+        source: objRef
+      };
+      if (ctx) {
+        if (ctx.observe) ctx.observe(event);
+        else ctx.observations.push(event);
+      }
+      // Recycle proceeds either way.
+    }
+  }
+
+  /**
+   * Reserved-object guard for recycle (§RC6 forbidden list, except live
+   * actors which are handled separately at the wrapper). Raises E_INVARG
+   * if the target is on the list.
+   */
+  private assertNotReservedForRecycle(objRef: ObjRef): void {
+    const reserved = new Set([
+      "$system",
+      "$nowhere",
+      "$root",
+      "$actor",
+      "$player",
+      "$wiz",
+      "$sequenced_log",
+      "$space",
+      "$thing"
+    ]);
+    if (reserved.has(objRef)) {
+      throw wooError("E_INVARG", `cannot recycle reserved object: ${objRef}`, objRef);
+    }
+  }
+
+  /**
+   * Pre-flight A3: find any local objects whose `anchor` chain transitively
+   * resolves to `obj`. Per spec/semantics/recycle.md §RC3 pre-flight A3,
+   * the check is bounded to obj's own host because anchor co-residency
+   * (objects.md §4.1) places transitively-anchored objects on the anchor
+   * root's host.
+   */
+  private findAnchoredDescendants(obj: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    for (const [id, candidate] of this.objects) {
+      if (id === obj) continue;
+      let cursor: ObjRef | null = candidate.anchor;
+      const seen = new Set<ObjRef>();
+      while (cursor && !seen.has(cursor)) {
+        if (cursor === obj) {
+          out.push(id);
+          break;
+        }
+        seen.add(cursor);
+        cursor = this.objects.has(cursor) ? this.object(cursor).anchor : null;
+      }
+    }
+    return out.sort();
   }
 
   async builderSetProperty(actor: ObjRef, objRef: ObjRef, name: string, value: WooValue, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
@@ -2809,8 +3295,7 @@ export class WooWorld {
       flags: {
         wizard: obj.flags.wizard === true,
         programmer: obj.flags.programmer === true,
-        fertile: obj.flags.fertile === true,
-        recyclable: obj.flags.recyclable === true
+        fertile: obj.flags.fertile === true
       },
       name: obj.name,
       description: this.propOrNullForActor(actor, objRef, "description"),
@@ -2934,7 +3419,23 @@ export class WooWorld {
 
   private editorSessionOrNull(editorRef: ObjRef, actor: ObjRef): VerbEditorSession | null {
     const raw = this.editorSessionMap(editorRef)[actor];
-    return raw === undefined ? null : parseVerbEditorSession(raw);
+    if (raw === undefined) return null;
+    // Lazy dangling-ref filter. Per spec/semantics/recycle.md §RC5
+    // ("defer the check"): if the session's actor or target was recycled
+    // since the session was stored, treat the session as gone. We do not
+    // mutate storage here — that would be rolled back if the surrounding
+    // call errors. Persisted cleanup is the wizard janitor's job
+    // (directory_reconcile_corenames covers $system; editor cleanup is
+    // catalog-side).
+    if (this.tombstones.has(actor)) return null;
+    let session: VerbEditorSession;
+    try {
+      session = parseVerbEditorSession(raw);
+    } catch {
+      return null;
+    }
+    if (this.tombstones.has(session.target)) return null;
+    return session;
   }
 
   private requireEditorSession(editorRef: ObjRef, actor: ObjRef): VerbEditorSession {
@@ -3218,7 +3719,6 @@ export class WooWorld {
     description?: string;
     aliases?: string[];
     fertile?: boolean;
-    recyclable?: boolean;
   } = {}): ObjRef {
     return this.withPersistenceDeferred(() => {
       this.object(parent);
@@ -3226,6 +3726,15 @@ export class WooWorld {
       if (anchor) this.object(anchor);
       const progr = options.progr ?? owner;
       this.assertCanCreateObject(progr, parent, owner);
+      // Self-hosted instances cannot be anchored. Per
+      // spec/semantics/objects.md §4.1, combining `instances_self_host = true`
+      // with a non-null anchor would route the instance to its own DO (rule 1)
+      // while declaring it a member of another cluster, breaking
+      // co-residency. The recycle anchored-descendants check (recycle.md
+      // §RC3 pre-flight A3) relies on this.
+      if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
+        throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
+      }
       const location = options.location ?? null;
       if (location) this.object(location);
       const scope = runtimeObjectScope(anchor ?? parent);
@@ -3235,7 +3744,6 @@ export class WooWorld {
       } while (this.objects.has(id));
       const flags: WooObject["flags"] = {};
       if (typeof options.fertile === "boolean") flags.fertile = options.fertile;
-      if (typeof options.recyclable === "boolean") flags.recyclable = options.recyclable;
       this.createObject({
         id,
         parent,
@@ -3745,10 +4253,15 @@ export class WooWorld {
     this.persist();
   }
 
-  private createBuilderObject(parent: ObjRef, owner: ObjRef, anchor: ObjRef | null, options: { location: ObjRef | null; name?: string; fertile: boolean; recyclable: boolean }): ObjRef {
+  private createBuilderObject(parent: ObjRef, owner: ObjRef, anchor: ObjRef | null, options: { location: ObjRef | null; name?: string; fertile: boolean }): ObjRef {
     this.object(parent);
     this.object(owner);
     if (anchor) this.object(anchor);
+    // Mirror the createRuntimeObject self-host/anchor rejection. See
+    // spec/semantics/objects.md §4.1.
+    if (anchor !== null && this.propOrNull(parent, "instances_self_host") === true) {
+      throw wooError("E_INVARG", `cannot anchor a self-hosted instance`, { parent, anchor });
+    }
     const scope = runtimeObjectScope(anchor ?? parent);
     let id: ObjRef;
     do {
@@ -3761,7 +4274,7 @@ export class WooWorld {
       anchor,
       location: options.location,
       name: options.name,
-      flags: { fertile: options.fertile, recyclable: options.recyclable }
+      flags: { fertile: options.fertile }
     });
     this.persistCounters();
     return id;
@@ -3784,9 +4297,65 @@ export class WooWorld {
 
   private recycleObjectLocal(objRef: ObjRef): void {
     const obj = this.object(objRef);
-    this.scrubEditorSessionsForObject(objRef);
+    // Editor sessions referencing this ULID are cleaned lazily on next
+    // access via editorSessionOrNull — the eager scrub that lived here
+    // moved to a §RC5-style lazy check.
+
+    // Step 2: kill parked tasks anchored to obj. Any task whose parked_on,
+    // awaiting_player, or origin is obj is removed. Per
+    // spec/semantics/recycle.md §RC3 step 2 and failures.md §F7. Awaiting
+    // consumers see E_INTRPT when they next look up the task; the parked-task
+    // table is the single source of truth, so deleting the row is enough.
+    const killedTasks: string[] = [];
+    for (const [id, task] of this.parkedTasks) {
+      if (task.parked_on === objRef || task.awaiting_player === objRef || task.origin === objRef) {
+        killedTasks.push(id);
+      }
+    }
+    for (const id of killedTasks) {
+      this.parkedTasks.delete(id);
+      this.deletePersistedTask(id);
+    }
+
     const parent = obj.parent;
     const location = obj.location;
+
+    // Step 3: graft children up. Each child's parent becomes obj.parent, so
+    // the inheritance chain stays connected. Snapshot the set first because
+    // chparentLocal mutates obj.children. obj.parent is non-null here
+    // because $system is forbidden by §RC6.
+    const childrenSnapshot = Array.from(obj.children);
+    if (parent) {
+      for (const child of childrenSnapshot) {
+        if (!this.objects.has(child)) continue;
+        this.chparentLocal(child, parent);
+      }
+    }
+
+    // Step 4: displace contents to $nowhere. Per spec/semantics/recycle.md
+    // §RC3 step 4: "for each contained `c` whose `location == obj`". The
+    // location field is the source of truth; obj.contents is a cache that
+    // may drift (objects.md §4.3). A stale cache entry whose actual
+    // location is somewhere else must NOT be re-located by recycle —
+    // verify before mutating. $nowhere.contents is not maintained (sink
+    // semantics, bootstrap.md §B2.15), so we set only the local
+    // `c.location` and skip the back-reference write.
+    const contentsSnapshot = Array.from(obj.contents);
+    for (const content of contentsSnapshot) {
+      if (!this.objects.has(content)) continue;
+      const contentObj = this.object(content);
+      if (contentObj.location !== objRef) {
+        // Stale cache entry — drop it from obj.contents but leave the
+        // referenced object's location alone.
+        continue;
+      }
+      contentObj.location = "$nowhere";
+      contentObj.modified = Date.now();
+      this.persistObject(content);
+    }
+    obj.contents.clear();
+
+    // Step 5/6: parent-side and container-side bookkeeping.
     if (parent && this.objects.has(parent)) {
       this.object(parent).children.delete(objRef);
       this.persistObject(parent);
@@ -3795,39 +4364,13 @@ export class WooWorld {
       this.object(location).contents.delete(objRef);
       this.persistObject(location);
     }
+    // Steps 8/9: storage delete and tombstone insert.
     this.objects.delete(objRef);
+    this.tombstones.add(objRef);
     this.deletePersistedObject(objRef);
+    this.persistTombstone(objRef);
     if (this.presenceIndexBuilt) this.invalidatePresenceIndex();
     this.persist();
-  }
-
-  private scrubEditorSessionsForObject(objRef: ObjRef): void {
-    for (const [editorRef] of this.objects) {
-      if (editorRef === objRef || !this.isEditorObject(editorRef)) continue;
-      const raw = this.propOrNull(editorRef, "sessions");
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-      const sessions = raw as Record<string, WooValue>;
-      const next: Record<string, WooValue> = { ...sessions };
-      let changed = false;
-      for (const [actor, value] of Object.entries(sessions)) {
-        if (actor === objRef) {
-          delete next[actor];
-          changed = true;
-          continue;
-        }
-        try {
-          const session = parseVerbEditorSession(value);
-          if (session.actor === objRef || session.target === objRef) {
-            delete next[actor];
-            changed = true;
-          }
-        } catch {
-          // Leave malformed session values untouched; the editor verbs will
-          // report their normal parse error if someone tries to resume them.
-        }
-      }
-      if (changed) this.setProp(editorRef, "sessions", next as WooValue);
-    }
   }
 
   private assertCanCreateObject(progr: ObjRef, parent: ObjRef, owner: ObjRef): void {
@@ -3978,7 +4521,8 @@ export class WooWorld {
       sessions: Array.from(this.sessions.values()).map((session) => this.serializeSession(session)),
       logs: Array.from(this.logs.entries()).map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
-      parkedTasks: Array.from(this.parkedTasks.values()).map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord)
+      parkedTasks: Array.from(this.parkedTasks.values()).map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
+      tombstones: Array.from(this.tombstones).sort()
     };
   }
 
@@ -4001,7 +4545,8 @@ export class WooWorld {
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
       parkedTasks: Array.from(this.parkedTasks.values())
         .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
-        .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord)
+        .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
+      tombstones: Array.from(this.tombstones).sort()
     };
   }
 
@@ -4012,6 +4557,7 @@ export class WooWorld {
       this.logs.clear();
       this.snapshots = [];
       this.parkedTasks.clear();
+      this.tombstones = new Set(serialized.tombstones ?? []);
       this.presenceIndexBuilt = false;
       this.subscribersIndex.clear();
       this.actorPresenceIndex.clear();
@@ -4378,6 +4924,7 @@ export class WooWorld {
       deletedSessions: new Set(this.deletedSessions),
       dirtyTasks: new Set(this.dirtyTasks),
       deletedTasks: new Set(this.deletedTasks),
+      dirtyTombstones: new Set(this.dirtyTombstones),
       dirtyCounters: this.dirtyCounters,
       dirty: this.persistenceDirty
     };
@@ -4391,6 +4938,7 @@ export class WooWorld {
     this.deletedSessions = new Set(state.deletedSessions);
     this.dirtyTasks = new Set(state.dirtyTasks);
     this.deletedTasks = new Set(state.deletedTasks);
+    this.dirtyTombstones = new Set(state.dirtyTombstones);
     this.dirtyCounters = state.dirtyCounters;
     this.persistenceDirty = state.dirty;
   }
@@ -4404,6 +4952,7 @@ export class WooWorld {
       this.deletedSessions.size > 0 ||
       this.dirtyTasks.size > 0 ||
       this.deletedTasks.size > 0 ||
+      this.dirtyTombstones.size > 0 ||
       this.dirtyCounters
     );
   }
@@ -4434,6 +4983,24 @@ export class WooWorld {
     const startedAt = Date.now();
     repo.deleteObject(objRef);
     this.recordMetric({ kind: "storage_direct_write", what: "object_delete", ms: Date.now() - startedAt });
+  }
+
+  /**
+   * Persist a tombstone for `id` to the active repository. Per
+   * spec/reference/persistence.md §14.2.1: write-once, idempotent on
+   * repeat. Best-effort with deferred-persistence: tombstones flushed at
+   * the next persist tick when persistencePaused/persistenceDeferred is
+   * non-zero, just like dirty objects.
+   */
+  private persistTombstone(objRef: ObjRef): void {
+    this.bumpMutationVersion();
+    const repo = this.activeObjectRepository();
+    if (!repo) return;
+    if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
+      this.dirtyTombstones.add(objRef);
+      return;
+    }
+    repo.saveTombstone(objRef, Date.now(), null);
   }
 
   private persistProperty(objRef: ObjRef, name: string): void {
@@ -4564,6 +5131,7 @@ export class WooWorld {
     const deletedSessions = Array.from(this.deletedSessions);
     const dirtyTasks = Array.from(this.dirtyTasks);
     const deletedTasks = Array.from(this.deletedTasks);
+    const dirtyTombstones = Array.from(this.dirtyTombstones);
     const dirtyCounters = this.dirtyCounters;
     const startedAt = Date.now();
     repo.transaction(() => {
@@ -4595,6 +5163,8 @@ export class WooWorld {
         repo.saveMeta("parkedTaskCounter", String(this.parkedTaskCounter));
         repo.saveMeta("sessionCounter", String(this.sessionCounter));
       }
+      const now = Date.now();
+      for (const id of dirtyTombstones) repo.saveTombstone(id, now, null);
     });
     for (const objRef of dirtyObjects) this.dirtyObjects.delete(objRef);
     for (const objRef of deletedObjects) this.deletedObjects.delete(objRef);
@@ -4607,6 +5177,7 @@ export class WooWorld {
     for (const sessionId of deletedSessions) this.deletedSessions.delete(sessionId);
     for (const taskId of dirtyTasks) this.dirtyTasks.delete(taskId);
     for (const taskId of deletedTasks) this.deletedTasks.delete(taskId);
+    for (const id of dirtyTombstones) this.dirtyTombstones.delete(id);
     if (dirtyCounters) this.dirtyCounters = false;
     this.persistenceDirty = this.hasDirtyPersistence();
     const persistedProps = dirtyProperties.filter(({ objRef }) => !deletedObjectSet.has(objRef) && !dirtyObjectSet.has(objRef));
@@ -4901,7 +5472,7 @@ export class WooWorld {
     if (!this.canCarryFeatures(objRef)) throw wooError("E_NOTAPPLICABLE", `${objRef} cannot carry features`, objRef);
   }
 
-  private isWizard(actor: ObjRef): boolean {
+  isWizard(actor: ObjRef): boolean {
     return this.canBypassPerms(actor);
   }
 
@@ -4919,10 +5490,10 @@ export class WooWorld {
    * Wizard-only flag mutation. Updates the target's authority/lifecycle bits
    * in place and records a wizard_action audit entry per changed flag.
    *
-   * Allowed flags: wizard, programmer, fertile, recyclable. Unknown keys are
-   * ignored. Boolean coerced; non-bool values raise E_TYPE. The target must
-   * exist; passing $system or $wiz revokes nothing the substrate would not
-   * already protect, but we still audit.
+   * Allowed flags: wizard, programmer, fertile. Unknown keys are ignored.
+   * Boolean coerced; non-bool values raise E_TYPE. The target must exist;
+   * passing $system or $wiz revokes nothing the substrate would not already
+   * protect, but we still audit.
    *
    * Required for the auth.md §A11 "mint a backup wizard" flow — the only
    * in-world surface that can grant wizard authority to a non-substrate
@@ -4931,7 +5502,7 @@ export class WooWorld {
   setObjectFlags(actor: ObjRef, target: ObjRef, flags: Record<string, unknown>): WooObject["flags"] {
     if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to set object flags", { actor, target });
     if (!this.objects.has(target)) throw wooError("E_OBJNF", `target object not found: ${target}`, target);
-    const allowed = new Set(["wizard", "programmer", "fertile", "recyclable"]);
+    const allowed = new Set(["wizard", "programmer", "fertile"]);
     const obj = this.object(target);
     const before: Record<string, boolean> = { ...obj.flags };
     const changes: Record<string, { from: boolean; to: boolean }> = {};
@@ -5705,6 +6276,7 @@ export class WooWorld {
       sessions: new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)])),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
       parkedTasks: new Map(Array.from(this.parkedTasks.entries()).map(([id, task]) => [id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord])),
+      tombstones: new Set(this.tombstones),
       objectCounter: this.objectCounter,
       parkedTaskCounter: this.parkedTaskCounter,
       sessionCounter: this.sessionCounter,
@@ -5718,6 +6290,7 @@ export class WooWorld {
     this.sessions = new Map(Array.from(savepoint.sessions.entries()).map(([id, session]) => [id, this.cloneSession(session)]));
     this.snapshots = cloneValue(savepoint.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[];
     this.parkedTasks = new Map(Array.from(savepoint.parkedTasks.entries()).map(([id, task]) => [id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord]));
+    this.tombstones = new Set(savepoint.tombstones);
     this.objectCounter = savepoint.objectCounter;
     this.parkedTaskCounter = savepoint.parkedTaskCounter;
     this.sessionCounter = savepoint.sessionCounter;

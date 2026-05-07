@@ -31,7 +31,7 @@ CREATE TABLE object (
   owner       TEXT NOT NULL,
   location    TEXT,                -- ULID or NULL
   anchor      TEXT,                -- ULID of anchor; NULL = no anchor cluster. Atomicity scope, not host placement (objects.md §4.1, §4.2). Immutable.
-  flags       TEXT NOT NULL,       -- JSON {wizard?, programmer?, fertile?, recyclable?}
+  flags       TEXT NOT NULL,       -- JSON {wizard?, programmer?, fertile?}
   created     INTEGER NOT NULL,
   modified    INTEGER NOT NULL
 );
@@ -213,10 +213,20 @@ CREATE TABLE session (
 Directory's SQLite schema:
 
 ```sql
--- Corename map: $foo → ULID.
+-- Corename map: $foo → ULID. Recycle removes the row.
 CREATE TABLE corename (
   name   TEXT PRIMARY KEY,            -- e.g. "$wiz"
   target TEXT NOT NULL                -- ULID
+);
+
+-- ID → host route. Written once at object creation; never updated, never
+-- deleted. Recycle does NOT remove the row: stale refs continue to route
+-- to the host that holds the (now-tombstoned) object, so the host can
+-- distinguish 'recycled' from 'never existed' for is_recycled() and for
+-- authoring-tool diagnostics. See §14.2.1.
+CREATE TABLE id_route (
+  id   TEXT PRIMARY KEY,              -- ULID
+  host TEXT NOT NULL                  -- DO name / host id (§R1.1)
 );
 
 -- World metadata.
@@ -225,6 +235,50 @@ CREATE TABLE world_meta (
   value TEXT NOT NULL
 );
 ```
+
+### 14.2.1 Tombstones
+
+ULID liveness is tracked **per anchor cluster**, not in the central Directory.
+Each cluster's host owns a `tombstone` table:
+
+```sql
+-- Recycled ULIDs. Survive backup/restore.
+CREATE TABLE tombstone (
+  id          TEXT PRIMARY KEY,    -- the recycled ULID
+  recycled_at INTEGER NOT NULL,    -- ms since epoch
+  reason      TEXT                 -- 'recycle' | 'force_recycle'; nullable for legacy entries
+);
+```
+
+Lookup contract (the full path for a stale ULID dereference):
+
+1. The caller resolves the ULID via Directory's `id_route` table. The route row
+   is **immutable** — recycle does not remove it — so the route still resolves,
+   pointing at the tombstone host.
+2. The host receives the dispatch / property request and consults its own
+   `tombstone` table. A hit returns "tombstoned"; the host responds with
+   `E_OBJNF` per
+   [../semantics/failures.md §F7](../semantics/failures.md#f7-lifecycle-failures).
+3. A miss falls through to the ordinary `objects` table lookup.
+
+Two storage invariants make this work:
+
+- **Route immutability.** The `id_route` row is written once at object creation
+  and never updated or deleted. Recycle leaves it in place. This guarantees
+  that stale refs reach the tombstone host instead of failing with a
+  routing-layer not-found.
+- **Tombstone immutability.** A `tombstone` row is immutable once written.
+  Tombstones are never deleted in normal operation; an offline tool may sweep
+  entries past a configurable retention horizon, but doing so risks ULID
+  collision on backup/restore and is therefore disabled by default.
+
+The Directory does **not** mirror tombstones: routing only cares which host
+owns the ULID, and that host is the only authority on liveness.
+
+The recycle transaction inserts the tombstone row in the same SQLite
+transaction that deletes the object's storage rows
+([../semantics/recycle.md §RC3](../semantics/recycle.md#rc3-bookkeeping) step 9).
+Either both happen or neither does.
 
 ### 14.3 Atomicity
 

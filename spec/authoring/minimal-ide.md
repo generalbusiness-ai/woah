@@ -144,7 +144,7 @@ declared_schemas(obj, opts?) -> EventSchemaSummary[]
 ```
 
 `flags` is a name-keyed map for IDE convenience, e.g.
-`{wizard: false, programmer: true, fertile: false, recyclable: true}`. Storage
+`{wizard: false, programmer: true, fertile: false}`. Storage
 remains the bitset defined in [objects.md §4](../semantics/objects.md#4-objects).
 
 `VerbSummary`:
