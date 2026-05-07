@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { compileVerb, installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { InMemoryObjectRepository } from "../src/core/repository";
+import { wooError } from "../src/core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
@@ -140,6 +141,12 @@ function bytecodeVerb(name: string, bytecode: TinyBytecode): VerbDef {
 
 class LocalHostBridge implements HostBridge {
   readonly contentsCalls = new Map<ObjRef, number>();
+  actorSessionLocationsCalls = 0;
+  actorSessionLocationsBatchCalls: Array<ObjRef[]> = [];
+  // Test knob: when set, actorSessionLocationsBatch throws a read-
+  // availability error instead of answering. Lets a test simulate a cold
+  // or unreachable home host.
+  failBatchWith: { code: string; message: string } | null = null;
 
   constructor(
     readonly localHost: string,
@@ -239,7 +246,16 @@ class LocalHostBridge implements HostBridge {
   }
 
   async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    this.actorSessionLocationsCalls += 1;
     return this.worldFor(actor).allLocationsForActor(actor);
+  }
+
+  async actorSessionLocationsBatch(actors: ObjRef[]): Promise<Map<ObjRef, ObjRef[]>> {
+    this.actorSessionLocationsBatchCalls.push([...actors]);
+    if (this.failBatchWith) throw wooError(this.failBatchWith.code, this.failBatchWith.message);
+    const out = new Map<ObjRef, ObjRef[]>();
+    for (const actor of actors) out.set(actor, this.worldFor(actor).allLocationsForActor(actor));
+    return out;
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -677,6 +693,106 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     } finally {
       roomBHarness.cleanup();
       roomAHarness.cleanup();
+      homeHarness.cleanup();
+    }
+  });
+
+  it("issues a single batched cross-host call for scrub instead of one per remote subscriber", async () => {
+    const homeHarness = make();
+    const roomHarness = make();
+    try {
+      const home = homeHarness.world;
+      const roomHost = roomHarness.world;
+      // Three remote-hosted subscribers all on the same `home` host. Without
+      // batching, the room's per-look scrub would fire one cross-host RPC per
+      // actor — N+1 against the home DO and a real subrequest-budget hazard
+      // when N grows.
+      const live1 = home.auth("guest:conf-batch-1").actor;
+      const live2 = home.auth("guest:conf-batch-2").actor;
+      const live3 = home.auth("guest:conf-batch-3").actor;
+      const worlds = new Map<string, WooWorld>([
+        ["home", home],
+        ["room", roomHost]
+      ]);
+      const routes = new Map<ObjRef, string>([
+        [live1, "home"],
+        [live2, "home"],
+        [live3, "home"],
+        ["conf_batch_room", "room"]
+      ]);
+      const homeBridge = new LocalHostBridge("home", worlds, routes);
+      const roomBridge = new LocalHostBridge("room", worlds, routes);
+      home.setHostBridge(homeBridge);
+      roomHost.setHostBridge(roomBridge);
+
+      roomHost.createObject({ id: "conf_batch_room", name: "Batch Room", parent: "$chatroom", owner: "$wiz" });
+      roomHost.setProp("conf_batch_room", "subscribers", [live1, live2, live3]);
+      roomHost.setProp("conf_batch_room", "features", ["$conversational"]);
+      for (const actor of [live1, live2, live3]) {
+        home.setActorPresence(actor, "conf_batch_room", true);
+        home.object(actor).location = "conf_batch_room";
+      }
+
+      const who = await roomHost.directCall("batch-who", live1, "conf_batch_room", "who", []);
+      expect(who.op).toBe("result");
+      if (who.op === "result") {
+        expect(who.result).toEqual([live1, live2, live3]);
+      }
+      // One batch call, all three actors in it; zero per-actor calls.
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
+      expect(new Set(roomBridge.actorSessionLocationsBatchCalls[0])).toEqual(new Set([live1, live2, live3]));
+      expect(roomBridge.actorSessionLocationsCalls).toBe(0);
+    } finally {
+      roomHarness.cleanup();
+      homeHarness.cleanup();
+    }
+  });
+
+  it("leaves remote subscribers in place when the batched location lookup is unavailable", async () => {
+    const homeHarness = make();
+    const roomHarness = make();
+    try {
+      const home = homeHarness.world;
+      const roomHost = roomHarness.world;
+      const live = home.auth("guest:conf-batch-fail-live").actor;
+      const worlds = new Map<string, WooWorld>([
+        ["home", home],
+        ["room", roomHost]
+      ]);
+      const routes = new Map<ObjRef, string>([
+        [live, "home"],
+        ["conf_batch_fail_room", "room"]
+      ]);
+      const homeBridge = new LocalHostBridge("home", worlds, routes);
+      const roomBridge = new LocalHostBridge("room", worlds, routes);
+      home.setHostBridge(homeBridge);
+      roomHost.setHostBridge(roomBridge);
+
+      roomHost.createObject({ id: "conf_batch_fail_room", name: "Batch-Fail Room", parent: "$chatroom", owner: "$wiz" });
+      roomHost.setProp("conf_batch_fail_room", "subscribers", [live]);
+      roomHost.setProp("conf_batch_fail_room", "features", ["$conversational"]);
+      home.setActorPresence(live, "conf_batch_fail_room", true);
+      home.object(live).location = "conf_batch_fail_room";
+
+      // Simulate the home host being unreachable: the batched lookup throws
+      // a read-availability error. The scrub must not interpret "no remote
+      // location data" as "actor is gone" — that would persist a subscriber-
+      // row drop on a transient blip.
+      roomBridge.failBatchWith = { code: "E_TIMEOUT", message: "remote home unreachable" };
+
+      const who = await roomHost.directCall("batch-fail-who", live, "conf_batch_fail_room", "who", []);
+      expect(who.op).toBe("result");
+      // Persisted subscribers row is preserved — the actor is NOT scrubbed
+      // on a transient remote-read failure, so subsequent operations and
+      // any verb that reads `subscribers` directly still see the actor.
+      expect(roomHost.getProp("conf_batch_fail_room", "subscribers")).toEqual([live]);
+      if (who.op === "result") expect(who.result).toEqual([live]);
+      // The batch was attempted (and failed); no per-actor fallback was
+      // tried, since this caller provides the batch method.
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
+      expect(roomBridge.actorSessionLocationsCalls).toBe(0);
+    } finally {
+      roomHarness.cleanup();
       homeHarness.cleanup();
     }
   });
