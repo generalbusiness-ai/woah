@@ -3114,7 +3114,23 @@ export class WooWorld {
 
   private editorSessionOrNull(editorRef: ObjRef, actor: ObjRef): VerbEditorSession | null {
     const raw = this.editorSessionMap(editorRef)[actor];
-    return raw === undefined ? null : parseVerbEditorSession(raw);
+    if (raw === undefined) return null;
+    // Lazy dangling-ref filter. Per spec/semantics/recycle.md §RC5
+    // ("defer the check"): if the session's actor or target was recycled
+    // since the session was stored, treat the session as gone. We do not
+    // mutate storage here — that would be rolled back if the surrounding
+    // call errors. Persisted cleanup is the wizard janitor's job
+    // (directory_reconcile_corenames covers $system; editor cleanup is
+    // catalog-side).
+    if (this.tombstones.has(actor)) return null;
+    let session: VerbEditorSession;
+    try {
+      session = parseVerbEditorSession(raw);
+    } catch {
+      return null;
+    }
+    if (this.tombstones.has(session.target)) return null;
+    return session;
   }
 
   private requireEditorSession(editorRef: ObjRef, actor: ObjRef): VerbEditorSession {
@@ -3976,7 +3992,9 @@ export class WooWorld {
 
   private recycleObjectLocal(objRef: ObjRef): void {
     const obj = this.object(objRef);
-    this.scrubEditorSessionsForObject(objRef);
+    // Editor sessions referencing this ULID are cleaned lazily on next
+    // access via editorSessionOrNull — the eager scrub that lived here
+    // moved to a §RC5-style lazy check.
 
     // Step 2: kill parked tasks anchored to obj. Any task whose parked_on,
     // awaiting_player, or origin is obj is removed. Per
@@ -4037,35 +4055,6 @@ export class WooWorld {
     this.deletePersistedObject(objRef);
     if (this.presenceIndexBuilt) this.invalidatePresenceIndex();
     this.persist();
-  }
-
-  private scrubEditorSessionsForObject(objRef: ObjRef): void {
-    for (const [editorRef] of this.objects) {
-      if (editorRef === objRef || !this.isEditorObject(editorRef)) continue;
-      const raw = this.propOrNull(editorRef, "sessions");
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-      const sessions = raw as Record<string, WooValue>;
-      const next: Record<string, WooValue> = { ...sessions };
-      let changed = false;
-      for (const [actor, value] of Object.entries(sessions)) {
-        if (actor === objRef) {
-          delete next[actor];
-          changed = true;
-          continue;
-        }
-        try {
-          const session = parseVerbEditorSession(value);
-          if (session.actor === objRef || session.target === objRef) {
-            delete next[actor];
-            changed = true;
-          }
-        } catch {
-          // Leave malformed session values untouched; the editor verbs will
-          // report their normal parse error if someone tries to resume them.
-        }
-      }
-      if (changed) this.setProp(editorRef, "sessions", next as WooValue);
-    }
   }
 
   private assertCanCreateObject(progr: ObjRef, parent: ObjRef, owner: ObjRef): void {

@@ -315,6 +315,36 @@ describe("recycle", () => {
     expect(world.reconcileTombstoneRefsInSystem()).toEqual([]);
   });
 
+  it("editor sessions referencing a recycled target are cleaned lazily on next access", async () => {
+    const world = createWorld();
+    const { actor: wiz } = wizActor(world);
+
+    // Build a target verb to edit, open an editor session, then recycle
+    // the target. The editor's stored session is stale until the actor
+    // next opens or accesses it.
+    const target = world.createAuthoredObject(wiz, { parent: "$thing", name: "Edit Target" });
+    installVerbAs(world, wiz, target, "noop", "verb :noop() rx { return 0; }", null);
+    const opened = await world.directCall(`open-${Date.now()}`, wiz, wiz, "edit_verb", [target, "noop", {}]);
+    expect(opened.op).toBe("result");
+
+    // Sanity: the session is stored on the editor.
+    const sessions = world.getProp("the_verb_editor", "sessions") as Record<string, unknown>;
+    expect(sessions[wiz]).toBeDefined();
+
+    // Recycle the target. The session is now stale.
+    await recycleVia(world, wiz, target, { force: true });
+    expect(world.tombstones.has(target)).toBe(true);
+
+    // Next access (e.g., view) on the editor instance raises a
+    // no-active-session error because the lazy filter drops the stale
+    // session — even though the disk entry still exists. (Persisted
+    // cleanup is a wizard-janitor concern; the engine just makes stale
+    // sessions unreachable on read.)
+    const viewed = await world.directCall(`view-${Date.now()}`, wiz, "the_verb_editor", "view", [{}]);
+    expect(viewed.op).toBe("error");
+    if (viewed.op === "error") expect(viewed.error.code).toBe("E_INVARG");
+  });
+
   it("kills parked tasks anchored to the recycled object", async () => {
     const world = createWorld();
     const { actor: wiz } = wizActor(world);
