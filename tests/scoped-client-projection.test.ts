@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
-import { handleRestProtocolRequest, handleWsProtocolFrame, type RestProtocolRequest } from "../src/core/protocol";
-import { publicAppliedFrame, type ObjRef, type Session } from "../src/core/types";
-import type { DeferredHostEffect, WooWorld } from "../src/core/world";
+import { handleRestProtocolRequest, handleWsProtocolFrame, statusForError, type RestProtocolRequest } from "../src/core/protocol";
+import { publicAppliedFrame, wooError, type ObjRef, type Session } from "../src/core/types";
+import type { DeferredHostEffect, RoomSnapshot, WooWorld } from "../src/core/world";
 import { LocalHostBridge } from "./core-support";
 
 function get(pathname: string, headers: Record<string, string> = {}): RestProtocolRequest {
@@ -166,7 +166,7 @@ describe("scoped client projection", () => {
     const world = createWorld();
     const session = world.auth("guest:ws-command");
     const sent: any[] = [];
-    const live: any[] = [];
+    const live: Array<{ result: any; originator?: string }> = [];
     await handleWsProtocolFrame("conn", {
       op: "command",
       id: "ws-command-1",
@@ -197,16 +197,66 @@ describe("scoped client projection", () => {
       deliverInput: async () => null,
       broadcastApplied: async () => { throw new Error("unexpected applied"); },
       broadcastTaskResult: async () => undefined,
-      broadcastLiveEvents: async (result) => { live.push(result); }
+      broadcastLiveEvents: async (result, originator) => { live.push({ result, originator }); }
     });
 
     expect(sent[0]).toMatchObject({
       op: "result",
       id: "ws-command-1",
       result: true,
+      observations: [{ type: "said", source: "the_chatroom", actor: session.actor, text: "hello" }],
       command: { route: "direct", target: "the_chatroom", verb: "say", args: ["hello"] }
     });
     expect(live).toHaveLength(1);
+    expect(live[0].originator).toBe("conn");
+  });
+
+  it("returns websocket direct observations on the caller result frame", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:ws-direct-observations");
+    const sent: any[] = [];
+    const live: Array<{ result: any; originator?: string }> = [];
+    await handleWsProtocolFrame("conn", {
+      op: "direct",
+      id: "ws-direct-1",
+      target: session.actor,
+      verb: "inventory",
+      args: []
+    }, {
+      authenticate: () => session,
+      attach: () => undefined,
+      session: () => ({ sessionId: session.id, actor: session.actor }),
+      send: (_connection, frame) => sent.push(frame),
+      call: async () => { throw new Error("unexpected call"); },
+      direct: async (frameId, wsSession, target, verb, args) => {
+        expect(frameId).toBe("ws-direct-1");
+        expect(wsSession).toMatchObject({ sessionId: session.id, actor: session.actor });
+        expect(target).toBe(session.actor);
+        expect(verb).toBe("inventory");
+        expect(args).toEqual([]);
+        return {
+          op: "result",
+          id: frameId,
+          result: { text: "You are empty-handed." },
+          observations: [{ type: "text", target: session.actor, actor: session.actor, text: "You are empty-handed.", source: session.actor }],
+          audience: session.actor
+        };
+      },
+      replay: async () => { throw new Error("unexpected replay"); },
+      deliverInput: async () => null,
+      broadcastApplied: async () => { throw new Error("unexpected applied"); },
+      broadcastTaskResult: async () => undefined,
+      broadcastLiveEvents: async (result, originator) => { live.push({ result, originator }); }
+    });
+
+    expect(sent[0]).toMatchObject({
+      op: "result",
+      id: "ws-direct-1",
+      result: { text: "You are empty-handed." },
+      observations: [{ type: "text", target: session.actor, actor: session.actor, text: "You are empty-handed.", source: session.actor }]
+    });
+    expect(live).toHaveLength(1);
+    expect(live[0].originator).toBe("conn");
   });
 
   it("returns websocket command errors from invalid command spaces", async () => {
@@ -519,6 +569,95 @@ describe("scoped client projection", () => {
     expect(body.cursor.spaces.the_deck.next_seq).toBe(1);
     expect(body.here).toMatchObject({ id: "the_deck", name: "Deck" });
     expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+  });
+
+  it("only degrades /api/me remote here snapshots for read availability errors", async () => {
+    const home = createWorld();
+    const remote = createWorld();
+    const session = home.auth("guest:remote-scoped-me-errors");
+    home.sessions.get(session.id)!.currentLocation = "the_deck";
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["deck-host", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      ["the_deck", "deck-host"]
+    ]);
+    class FailingRoomBridge extends LocalHostBridge {
+      constructor(readonly code: string) {
+        super("home", worlds, routes);
+      }
+      override async roomSnapshot(): Promise<RoomSnapshot> {
+        throw wooError(this.code, "remote room snapshot failed");
+      }
+    }
+
+    home.setHostBridge(new FailingRoomBridge("E_TIMEOUT"));
+    remote.setHostBridge(new LocalHostBridge("deck-host", worlds, routes));
+    const degraded = await apiMe(home, session);
+    expect(degraded.here).toBeNull();
+
+    remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$room", owner: "$wiz" });
+    routes.set("remote_room", "deck-host");
+    home.sessions.get(session.id)!.currentLocation = "remote_room";
+    class FailingAncestryBridge extends LocalHostBridge {
+      constructor(readonly code: string) {
+        super("home", worlds, routes);
+      }
+      override async isDescendantOf(): Promise<boolean> {
+        throw wooError(this.code, "remote ancestry failed");
+      }
+    }
+
+    home.setHostBridge(new FailingAncestryBridge("E_TIMEOUT"));
+    const degradedBeforeRoomSnapshot = await apiMe(home, session);
+    expect(degradedBeforeRoomSnapshot.here).toBeNull();
+
+    home.setHostBridge(new FailingRoomBridge("E_PERM"));
+    const denied = await handleRestProtocolRequest(get("/api/me"), {
+      world: home,
+      requireSession: () => session,
+      authenticateToken: () => session,
+      state: () => {
+        throw new Error("/api/me must not call full world state");
+      },
+      broadcastApplied: async () => undefined,
+      broadcastLiveEvents: async () => undefined
+    });
+    expect(denied.handled).toBe(true);
+    if (!denied.handled || "raw" in denied) throw new Error("unexpected raw protocol result");
+    expect(denied.status).toBe(403);
+    expect((denied.body as any).error).toMatchObject({ code: "E_PERM" });
+  });
+
+  it("omits unavailable remote present actors from local room snapshots", async () => {
+    const roomHost = createWorld();
+    const actorHost = createWorld();
+    const remoteSession = actorHost.auth("guest:slow-present-actor");
+    const remoteActor = remoteSession.actor;
+    roomHost.setSpaceSubscriber("the_deck", remoteActor, true, remoteSession.id);
+    const worlds = new Map<string, WooWorld>([
+      ["room-host", roomHost],
+      ["actor-host", actorHost]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      [remoteActor, "actor-host"]
+    ]);
+    class SlowActorBridge extends LocalHostBridge {
+      override async actorSessionLocations(): Promise<ObjRef[]> {
+        throw wooError("E_TIMEOUT", "actor host unavailable");
+      }
+    }
+    roomHost.setHostBridge(new SlowActorBridge("room-host", worlds, routes));
+    actorHost.setHostBridge(new LocalHostBridge("actor-host", worlds, routes));
+
+    const snapshot = await roomHost.roomSnapshotForActor("$wiz", "the_deck");
+    expect(snapshot.present_actors.map((actor: { id: string }) => actor.id)).not.toContain(remoteActor);
+    expect(roomHost.propOrNull("the_deck", "subscribers")).toContain(remoteActor);
+  });
+
+  it("maps E_TIMEOUT to HTTP 504", () => {
+    expect(statusForError(wooError("E_TIMEOUT", "remote host unavailable"))).toBe(504);
   });
 
   it("batches remote object summaries while building room contents", async () => {

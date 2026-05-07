@@ -63,7 +63,20 @@ describe("auth credentials: $system:set_object_flags / mint_session_for / api ke
     const sess = world.createSessionForActor(target, "bearer");
     expect(sess.actor).toBe(target);
     expect(sess.tokenClass).toBe("bearer");
-    expect(sess.id).toMatch(/^session-/);
+    expect(sess.id).toMatch(/^session-[0-9a-f]{32}$/);
+  });
+
+  it("mints unguessable session ids instead of counter ids", () => {
+    const world = createWorld({ catalogs: false });
+    const target = makeActor(world);
+    const first = world.createSessionForActor(target, "bearer");
+    const second = world.createSessionForActor(target, "bearer");
+
+    expect(first.id).toMatch(/^session-[0-9a-f]{32}$/);
+    expect(second.id).toMatch(/^session-[0-9a-f]{32}$/);
+    expect(first.id).not.toBe(second.id);
+    expect(first.id).not.toMatch(/^session-\d+$/);
+    expect(second.id).not.toMatch(/^session-\d+$/);
   });
 
   it("createApiKey enforces wizard authority and actor target type", () => {

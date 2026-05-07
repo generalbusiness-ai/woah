@@ -555,6 +555,83 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("bounds read-only cross-host fan-out during routed command planning", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const wooStates = new Map<string, FakeDurableObjectState>();
+    const wooObjects = new Map<string, PersistentObjectDO>();
+    let env: Env;
+    let stallHotTub = false;
+    const stalledHost = {
+      fetch: async () => await new Promise<Response>(() => undefined)
+    };
+    const wooNamespace = new FakeDurableObjectNamespace((name) => {
+      if (name === "the_hot_tub" && stallHotTub) return stalledHost;
+      let object = wooObjects.get(name);
+      if (!object) {
+        const state = new FakeDurableObjectState(name);
+        wooStates.set(name, state);
+        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+        wooObjects.set(name, object);
+      }
+      return object;
+    });
+    env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-command-timeout-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
+      WOO_HOST_READ_TIMEOUT_MS: "5000",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: wooNamespace
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    }
+
+    try {
+      const auth = await post("/api/auth", { token: "guest:cf-command-timeout" });
+      expect(auth.status).toBe(200);
+      const session = String(auth.body.session);
+      expect((await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session)).status).toBe(200);
+      const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session);
+      expect(goDeck.status, JSON.stringify(goDeck.body)).toBe(200);
+      stallHotTub = true;
+      env.WOO_HOST_READ_TIMEOUT_MS = "25";
+
+      const planned = await Promise.race([
+        post("/api/objects/the_deck/calls/command_plan", { args: ["enter tub"] }, session),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1000))
+      ]);
+      if (planned === "timeout") throw new Error("command_plan timed out");
+      expect(planned).toMatchObject({ status: 200 });
+      expect(planned.body.result).toMatchObject({
+        ok: false,
+        route: "huh",
+        target: expect.any(String),
+        verb: "huh",
+        text: "enter tub",
+        error: "I don't understand that."
+      });
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+    }
+  });
+
   it("smokes Worker-routed cross-host room, inventory, and pinboard calls", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });

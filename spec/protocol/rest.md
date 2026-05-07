@@ -202,6 +202,7 @@ the actor into the move-result snapshot deterministically.
 **Pre-sequence vs sequenced errors.** REST distinguishes the two cases [space.md §S3](../semantics/space.md#s3-failure-rules-normative) requires:
 
 - **Pre-sequence errors** (validation, authorization, missing target, workflow gate failures) return non-2xx HTTP with the err in the response body. **No seq is allocated.**
+- `E_TIMEOUT` maps to HTTP `504 Gateway Timeout`. A distributed host may return it for semantic cross-host reads or calls that cannot safely degrade.
 - **Sequenced behavior failures** (verb body raises during execution) return `200` with an applied frame whose `observations` include a `$error` observation. The seq has been allocated; the message is durably in the log.
 
 Workflow gate failures (`E_TRANSITION*`) are pre-sequence: the gate runs before the verb body, so no seq advances and the response is `4xx`, not an applied frame.

@@ -215,7 +215,7 @@ wss.on("connection", (ws) => {
       },
       broadcastApplied: (frameValue, originator) => broadcastApplied(frameValue, originator),
       broadcastTaskResult,
-      broadcastLiveEvents
+      broadcastLiveEvents: (result, originator) => broadcastLiveEvents(result, null, originator)
     });
   });
   ws.on("close", () => {
@@ -296,26 +296,28 @@ function broadcastTaskResult(result: ParkedTaskRun): void {
   }
 }
 
-function broadcastLiveEvents(result: DirectResultFrame, originMcpSessionId?: string | null): void {
+function broadcastLiveEvents(result: DirectResultFrame, originMcpSessionId?: string | null, originator?: WebSocket): void {
   if (!result.audience) return;
   result.observations.forEach((observation, index) => {
     broadcastLiveEvent(
       { op: "event", observation },
       result.audience!,
       result.observationAudiences?.[index] ?? result.audienceActors,
-      result.observationSessionAudiences?.[index] ?? result.audienceSessions
+      result.observationSessionAudiences?.[index] ?? result.audienceSessions,
+      originator
     );
   });
   mcpGateway.routeLiveEvents(result, originMcpSessionId ?? null);
 }
 
-function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[]): void {
+function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[], originator?: WebSocket): void {
   const data = JSON.stringify(frame);
   const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
   const audienceSet = audienceActors ? new Set(audienceActors) : null;
   const sessionSet = audienceSessions ? new Set(audienceSessions) : null;
   for (const [ws, session] of sockets) {
     if (ws.readyState !== ws.OPEN) continue;
+    if (ws === originator) continue;
     if (directedTo || directedFrom) {
       if (session.actor !== directedTo && session.actor !== directedFrom) continue;
     } else if (sessionSet) {

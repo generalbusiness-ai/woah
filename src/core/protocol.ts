@@ -320,6 +320,8 @@ export function statusForError(error: ErrorValue): number {
       return 422;
     case "E_RATE":
       return 429;
+    case "E_TIMEOUT":
+      return 504;
     case "E_NOT_IMPLEMENTED":
     case "E_NOT_SUPPORTED":
       return 501;
@@ -430,7 +432,7 @@ export type WsProtocolHost<Connection> = {
   deliverInput(session: WsProtocolSession, input: WooValue): ParkedTaskRun | null | Promise<ParkedTaskRun | null>;
   broadcastApplied(frame: AppliedFrame, originator?: Connection): void | Promise<void>;
   broadcastTaskResult(result: ParkedTaskRun): void | Promise<void>;
-  broadcastLiveEvents(result: DirectResultFrame): void | Promise<void>;
+  broadcastLiveEvents(result: DirectResultFrame, originator?: Connection): void | Promise<void>;
 };
 
 export async function handleWsProtocolFrame<Connection>(
@@ -488,9 +490,9 @@ export async function handleWsProtocolFrame<Connection>(
       else if (result.op === "result") {
         const command = (result as DirectResultFrame & { command?: WooValue }).command;
         host.send(connection, command === undefined
-          ? { op: "result", id: result.id, result: result.result }
-          : { op: "result", id: result.id, result: result.result, command });
-        await host.broadcastLiveEvents(result);
+          ? { op: "result", id: result.id, result: result.result, observations: result.observations }
+          : { op: "result", id: result.id, result: result.result, command, observations: result.observations });
+        await host.broadcastLiveEvents(result, connection);
       } else {
         host.send(connection, result);
       }
@@ -506,8 +508,8 @@ export async function handleWsProtocolFrame<Connection>(
         Array.isArray(frame.args) ? frame.args as WooValue[] : []
       );
       if (result.op === "result") {
-        host.send(connection, { op: "result", id: result.id, result: result.result });
-        await host.broadcastLiveEvents(result);
+        host.send(connection, { op: "result", id: result.id, result: result.result, observations: result.observations });
+        await host.broadcastLiveEvents(result, connection);
       } else {
         host.send(connection, result);
       }

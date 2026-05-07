@@ -62,7 +62,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will arrive as a note in your inventory when the plug drains the queue.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
         }
       ]
     }
