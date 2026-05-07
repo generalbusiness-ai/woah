@@ -1,0 +1,608 @@
+{
+  "name": "tasks",
+  "version": "1.0.0",
+  "spec_version": "v1",
+  "description": "Task-as-obligation-list coordination. A $task_registry is a $space that authors a policy (roles, obligations, ordered policies per kind) and mints $task children. Each $task carries a snapshotted obligation list whose cursor advances as role-holders :pass; movement of the task is the lease, role-gated by :acceptable. Replaces the v0.3 $taskspace demo.",
+  "license": "MIT",
+  "depends": [
+    "@local:chat",
+    "@local:note"
+  ],
+  "classes": [
+    {
+      "local_name": "$task_registry",
+      "parent": "$space",
+      "flags": {
+        "fertile": true
+      },
+      "description": "A space that mints and coordinates $task children. Authors policy (roles, obligations, policies) through admin verbs and the kanban / admin UI. Tasks colocate with the registry in v1 (one DO per registry).",
+      "properties": [
+        {
+          "name": "roles",
+          "type": "map",
+          "default": {},
+          "perms": "rw"
+        },
+        {
+          "name": "obligations",
+          "type": "map",
+          "default": {},
+          "perms": "rw"
+        },
+        {
+          "name": "policies",
+          "type": "map",
+          "default": {},
+          "perms": "rw"
+        }
+      ],
+      "verbs": [
+        {
+          "name": "holds_role",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "actor_obj",
+              "role_name"
+            ]
+          },
+          "source": "verb :holds_role(actor_obj, role_name) rxd { if (!actor_obj) { return false; } if (has_flag(actor_obj, \"wizard\")) { return true; } if (typeof(role_name) != \"string\") { return false; } if (!(role_name in this.roles)) { return false; } let info = this.roles[role_name]; let ow = info[\"owners\"]; if (typeof(ow) != \"list\") { return false; } return actor_obj in ow; }"
+        },
+        {
+          "name": "acceptable",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "thing"
+            ]
+          },
+          "source": "verb :acceptable(thing) rxd { if (!isa(thing, $task)) { return false; } return thing.registry == this; }"
+        },
+        {
+          "name": "exitfunc",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "thing"
+            ]
+          },
+          "source": "verb :exitfunc(thing) rx { return true; }"
+        },
+        {
+          "name": "_on_release",
+          "perms": "rx",
+          "direct_callable": false,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "child"
+            ]
+          },
+          "source": "verb :_on_release(child) rx { if (!isa(child, $task)) { return false; } if (!child:_is_complete()) { return false; } for edge in child.links { if (typeof(edge) != \"map\") { continue; } let parent = edge[\"to\"]; if (!isa(parent, $task)) { continue; } if (parent == child) { continue; } if (parent.registry != this) { continue; } let next = []; let cleared = false; for c in parent.wait_for { if (typeof(c) == \"map\" && c[\"kind\"] == \"child_complete\" && c[\"task\"] == child) { cleared = true; } else { next = next + [c]; } } if (cleared) { parent.wait_for = next; parent.log = parent.log + [{ \"ts\": now(), \"actor\": $wiz, \"outcome\": \"wait_cleared\", \"evidence\": { \"task\": child } }]; parent.last_change = now(); } } return true; }"
+        },
+        {
+          "name": "create_task",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "kind",
+              "name",
+              "text",
+              "labels",
+              "source_ref"
+            ]
+          },
+          "source": "verb :create_task(kind, name, text, labels, source_ref) rxd { if (typeof(kind) != \"string\" || !(kind in this.policies)) { raise { code: \"E_INVARG\", message: \"unknown kind\", value: kind }; } if (typeof(name) != \"string\" || name == \"\") { raise { code: \"E_INVARG\", message: \"name required\", value: name }; } if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"text must be a string\", value: text }; } let t = create($task, { owner: actor, name: name, location: this }); t.registry = this; t.kind = kind; if (typeof(labels) == \"list\") { t.labels = labels; } else { t.labels = []; } if (source_ref != null) { t.source = source_ref; } let obs = []; for k in this.policies[kind] { obs = obs + [{ \"key\": k, \"met\": false }]; } t.obligations = obs; t.wait_for = []; t.links = []; t.log = [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"created\" }]; t.terminal = false; t.created_at = now(); t.last_change = now(); if (text != \"\") { t:set_text(text); } observe({ type: \"task_created\", task: t, registry: this, name: name, kind: kind, source: source_ref, by: actor, ts: now() }); return t; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "listing",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :listing() rxd { let out = []; for x in contents(this) { if (!isa(x, $task)) { continue; } let cur = x:cursor(); let cur_role = null; if (cur != null) { cur_role = cur[\"role\"]; } out = out + [{ \"task\": x, \"name\": x.name, \"kind\": x.kind, \"labels\": x.labels, \"location\": location(x), \"cursor_role\": cur_role, \"wait_for_count\": length(x.wait_for), \"terminal\": x.terminal, \"complete\": this:_task_complete(x), \"link_count\": length(x.links), \"age_ms\": now() - x.created_at, \"last_change\": x.last_change }]; } return out; }"
+        },
+        {
+          "name": "_task_complete",
+          "perms": "rxd",
+          "direct_callable": false,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "t"
+            ]
+          },
+          "source": "verb :_task_complete(t) rxd { for o in t.obligations { if (!o[\"met\"]) { return false; } } return true; }"
+        },
+        {
+          "name": "available_actions",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "t",
+              "actor_obj"
+            ]
+          },
+          "source": "verb :available_actions(t, actor_obj) rxd { let out = []; if (!isa(t, $task)) { return out; } if (t.terminal) { return out; } let cur = t:cursor(); if (cur == null) { return out; } let here = location(t); if (here == this) { if (this:holds_role(actor_obj, cur[\"role\"]) && length(t.wait_for) == 0) { out = out + [{ \"verb\": \"claim\", \"label\": \"Claim\", \"args\": [] }]; } } else { if (here == actor_obj) { if (length(t.wait_for) == 0) { out = out + [{ \"verb\": \"pass\", \"label\": \"Pass\", \"args\": [{ \"name\": \"evidence\", \"type\": \"map\", \"required\": false }] }]; } out = out + [{ \"verb\": \"reject\", \"label\": \"Reject\", \"args\": [{ \"name\": \"i\", \"type\": \"int\", \"required\": true }, { \"name\": \"why\", \"type\": \"str\", \"required\": true }] }]; out = out + [{ \"verb\": \"wait\", \"label\": \"Wait\", \"args\": [{ \"name\": \"cond\", \"type\": \"map\", \"required\": true }] }]; out = out + [{ \"verb\": \"yield\", \"label\": \"Spawn related\", \"args\": [{ \"name\": \"spec\", \"type\": \"map\", \"required\": true }] }]; out = out + [{ \"verb\": \"handoff\", \"label\": \"Hand off\", \"args\": [{ \"name\": \"target\", \"type\": \"obj\", \"required\": true }] }]; out = out + [{ \"verb\": \"release\", \"label\": \"Release\", \"args\": [] }]; out = out + [{ \"verb\": \"drop_terminal\", \"label\": \"Drop\", \"args\": [{ \"name\": \"why\", \"type\": \"str\", \"required\": true }] }]; } } return out; }"
+        },
+        {
+          "name": "set_role",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "role_name",
+              "info"
+            ]
+          },
+          "source": "verb :set_role(role_name, info) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can edit roles\" }; } if (typeof(role_name) != \"string\" || role_name == \"\") { raise { code: \"E_INVARG\", message: \"role name required\" }; } if (typeof(info) != \"map\") { raise { code: \"E_INVARG\", message: \"role info must be a map\" }; } let before = null; if (role_name in this.roles) { before = this.roles[role_name]; } let desc = \"\"; if (typeof(info[\"description\"]) == \"string\") { desc = info[\"description\"]; } let owners = []; if (typeof(info[\"owners\"]) == \"list\") { owners = info[\"owners\"]; } let normalised = { \"description\": desc, \"owners\": owners }; let next = this.roles; next[role_name] = normalised; this.roles = next; observe({ type: \"registry_role_changed\", registry: this, name: role_name, before: before, after: normalised, actor: actor, ts: now() }); return normalised; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "remove_role",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "role_name"
+            ]
+          },
+          "source": "verb :remove_role(role_name) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can edit roles\" }; } if (!(role_name in this.roles)) { return false; } for k, o in this.obligations { if (o[\"role\"] == role_name) { raise { code: \"E_CONSTRAINT\", message: \"role still referenced by an obligation\", value: k }; } } let before = this.roles[role_name]; let next = {}; for k, v in this.roles { if (k != role_name) { next[k] = v; } } this.roles = next; observe({ type: \"registry_role_changed\", registry: this, name: role_name, before: before, after: null, actor: actor, ts: now() }); return true; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "set_obligation",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "key",
+              "info"
+            ]
+          },
+          "source": "verb :set_obligation(key, info) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can edit obligations\" }; } if (typeof(key) != \"string\" || key == \"\") { raise { code: \"E_INVARG\", message: \"obligation key required\" }; } if (typeof(info) != \"map\" || typeof(info[\"role\"]) != \"string\" || !(info[\"role\"] in this.roles)) { raise { code: \"E_INVARG\", message: \"obligation info must include a known role\" }; } if (typeof(info[\"criterion\"]) != \"string\") { raise { code: \"E_INVARG\", message: \"obligation criterion must be a string\" }; } let before = null; if (key in this.obligations) { before = this.obligations[key]; } let normalised = { \"role\": info[\"role\"], \"criterion\": info[\"criterion\"] }; let next = this.obligations; next[key] = normalised; this.obligations = next; observe({ type: \"registry_obligation_changed\", registry: this, key: key, before: before, after: normalised, actor: actor, ts: now() }); return normalised; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "remove_obligation",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "key"
+            ]
+          },
+          "source": "verb :remove_obligation(key) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can edit obligations\" }; } if (!(key in this.obligations)) { return false; } for kind, keys in this.policies { for k in keys { if (k == key) { raise { code: \"E_CONSTRAINT\", message: \"obligation still referenced by a policy\", value: kind }; } } } let before = this.obligations[key]; let next = {}; for k, v in this.obligations { if (k != key) { next[k] = v; } } this.obligations = next; observe({ type: \"registry_obligation_changed\", registry: this, key: key, before: before, after: null, actor: actor, ts: now() }); for t in contents(this) { if (!isa(t, $task)) { continue; } let touched = false; for o in t.obligations { if (o[\"key\"] == key) { touched = true; } } if (touched) { observe({ type: \"obligation_orphaned\", task: t, obligation_key: key, ts: now() }); } } return true; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "set_policy",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "kind",
+              "keys"
+            ]
+          },
+          "source": "verb :set_policy(kind, keys) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can edit policies\" }; } if (typeof(kind) != \"string\" || kind == \"\") { raise { code: \"E_INVARG\", message: \"policy kind required\" }; } if (typeof(keys) != \"list\") { raise { code: \"E_INVARG\", message: \"policy must be a list of obligation keys\" }; } for k in keys { if (typeof(k) != \"string\" || !(k in this.obligations)) { raise { code: \"E_INVARG\", message: \"unknown obligation key in policy\", value: k }; } } let before = null; if (kind in this.policies) { before = this.policies[kind]; } let next = this.policies; next[kind] = keys; this.policies = next; observe({ type: \"registry_policy_changed\", registry: this, kind: kind, before: before, after: keys, actor: actor, ts: now() }); return keys; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "remove_policy",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "kind"
+            ]
+          },
+          "source": "verb :remove_policy(kind) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can edit policies\" }; } if (!(kind in this.policies)) { return false; } let before = this.policies[kind]; let next = {}; for k, v in this.policies { if (k != kind) { next[k] = v; } } this.policies = next; observe({ type: \"registry_policy_changed\", registry: this, kind: kind, before: before, after: null, actor: actor, ts: now() }); return true; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "seed_minimal_policy",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "seed_owner"
+            ]
+          },
+          "source": "verb :seed_minimal_policy(seed_owner) rxd { if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the registry owner or wizard can seed\" }; } let populated = false; for k, v in this.roles { populated = true; } for k, v in this.obligations { populated = true; } for k, v in this.policies { populated = true; } if (populated) { raise { code: \"E_INVARG\", message: \"registry already populated; refuse to overwrite\" }; } let owner_actor = seed_owner; if (!owner_actor) { owner_actor = actor; } this:set_role(\"doer\", { description: \"Does the work\", owners: [owner_actor] }); this:set_obligation(\"do:it\", { role: \"doer\", criterion: \"Done.\" }); this:set_policy(\"task\", [\"do:it\"]); return true; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        }
+      ]
+    },
+    {
+      "local_name": "$task",
+      "parent": "$note",
+      "flags": {
+        "fertile": true
+      },
+      "description": "A work item minted by a $task_registry. Carries a snapshotted obligation list whose cursor advances as role-holders :pass. Movement is the lease: claim/handoff/release/drop_terminal each call moveto with a transition_intent set, which is what the :acceptable gate checks. Generic take/give/drop on a $task fail because they don't set the intent.",
+      "properties": [
+        {
+          "name": "registry",
+          "type": "obj",
+          "default": null,
+          "perms": "rw"
+        },
+        {
+          "name": "kind",
+          "type": "str",
+          "default": "",
+          "perms": "rw"
+        },
+        {
+          "name": "obligations",
+          "type": "list",
+          "default": [],
+          "perms": "rw"
+        },
+        {
+          "name": "wait_for",
+          "type": "list",
+          "default": [],
+          "perms": "rw"
+        },
+        {
+          "name": "links",
+          "type": "list",
+          "default": [],
+          "perms": "rw"
+        },
+        {
+          "name": "log",
+          "type": "list",
+          "default": [],
+          "perms": "rw"
+        },
+        {
+          "name": "labels",
+          "type": "list",
+          "default": [],
+          "perms": "rw"
+        },
+        {
+          "name": "source",
+          "type": "any",
+          "default": null,
+          "perms": "rw"
+        },
+        {
+          "name": "terminal",
+          "type": "bool",
+          "default": false,
+          "perms": "rw"
+        },
+        {
+          "name": "created_at",
+          "type": "int",
+          "default": 0,
+          "perms": "rw"
+        },
+        {
+          "name": "last_change",
+          "type": "int",
+          "default": 0,
+          "perms": "rw"
+        },
+        {
+          "name": "transition_intent",
+          "type": "any",
+          "default": null,
+          "perms": "rw"
+        }
+      ],
+      "verbs": [
+        {
+          "name": "cursor",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :cursor() rxd { let reg_obs = this.registry.obligations; for o in this.obligations { if (o[\"met\"]) { continue; } let key = o[\"key\"]; if (!(key in reg_obs)) { continue; } let info = reg_obs[key]; return { \"key\": key, \"role\": info[\"role\"], \"criterion\": info[\"criterion\"] }; } return null; }"
+        },
+        {
+          "name": "moveto",
+          "perms": "rx",
+          "direct_callable": false,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "target"
+            ]
+          },
+          "source": "verb :moveto(target) rx { if (!this.transition_intent) { raise { code: \"E_PERM\", message: \"$task moves require a lifecycle verb (claim/handoff/release/drop_terminal)\", value: target }; } if (target != this.registry) { if (!isa(target, $actor)) { raise { code: \"E_PERM\", message: \"$task can only move to actors or its registry\", value: target }; } let cur = this:cursor(); if (cur == null) { raise { code: \"E_PERM\", message: \"task has no live cursor\" }; } if (!this.registry:holds_role(target, cur[\"role\"])) { raise { code: \"E_PERM\", message: \"target does not hold cursor role\", value: cur[\"role\"] }; } } return moveto(this, target); }"
+        },
+        {
+          "name": "_authorized_moveto",
+          "perms": "rx",
+          "direct_callable": false,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "target",
+              "intent_kind"
+            ]
+          },
+          "source": "verb :_authorized_moveto(target, intent_kind) rx { this.transition_intent = intent_kind; let err = null; try { moveto(this, target); } except e { err = e; } this.transition_intent = null; if (err != null) { raise err; } return target; }"
+        },
+        {
+          "name": "claim",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :claim() rxd { if (this.terminal) { raise { code: \"E_INVARG\", message: \"task is terminal\" }; } if (location(this) != this.registry) { raise { code: \"E_INVARG\", message: \"task is not at its registry\", value: location(this) }; } let cur = this:cursor(); if (cur == null) { raise { code: \"E_INVARG\", message: \"task has no live cursor\" }; } if (length(this.wait_for) > 0) { raise { code: \"E_INVARG\", message: \"task has unresolved wait_for\" }; } if (!this.registry:holds_role(actor, cur[\"role\"])) { raise { code: \"E_PERM\", message: \"actor does not hold cursor role\", value: cur[\"role\"] }; } this:_authorized_moveto(actor, \"claim\"); this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"claimed\" }]; this.last_change = now(); observe({ type: \"task_claimed\", task: this, actor: actor, ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "handoff",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "target"
+            ]
+          },
+          "source": "verb :handoff(target) rxd { if (location(this) != actor) { raise { code: \"E_PERM\", message: \"only the holder can handoff\" }; } if (!isa(target, $actor)) { raise { code: \"E_INVARG\", message: \"handoff target must be an actor\", value: target }; } let cur = this:cursor(); if (cur == null) { raise { code: \"E_INVARG\", message: \"task has no live cursor\" }; } if (!this.registry:holds_role(target, cur[\"role\"])) { raise { code: \"E_PERM\", message: \"target does not hold cursor role\", value: cur[\"role\"] }; } let from = location(this); this:_authorized_moveto(target, \"handoff\"); this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"claimed\" }]; this.last_change = now(); observe({ type: \"task_moved\", task: this, from: from, to: target, actor: actor, ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "release",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :release() rxd { if (location(this) != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the holder or a wizard can release\" }; } this:_authorized_moveto(this.registry, \"release\"); this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"released\" }]; this.last_change = now(); observe({ type: \"task_released\", task: this, actor: actor, ts: now() }); this.registry:_on_release(this); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "pass",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "evidence"
+            ]
+          },
+          "source": "verb :pass(evidence) rxd { if (location(this) != actor) { raise { code: \"E_PERM\", message: \"only the holder can pass\" }; } let cur = this:cursor(); if (cur == null) { raise { code: \"E_INVARG\", message: \"no live cursor (orphan or complete)\" }; } if (length(this.wait_for) > 0) { raise { code: \"E_INVARG\", message: \"task has unresolved wait_for\" }; } let next = []; let advanced = false; for o in this.obligations { if (!advanced && !o[\"met\"] && o[\"key\"] == cur[\"key\"]) { next = next + [{ \"key\": o[\"key\"], \"met\": true, \"evidence\": evidence }]; advanced = true; } else { next = next + [o]; } } this.obligations = next; this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"passed\", \"obligation_key\": cur[\"key\"], \"evidence\": evidence }]; this.last_change = now(); observe({ type: \"task_passed\", task: this, obligation_key: cur[\"key\"], actor: actor, evidence: evidence, ts: now() }); if (this:_is_complete()) { this:_authorized_moveto(this.registry, \"release\"); this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"released\" }]; this.last_change = now(); observe({ type: \"task_released\", task: this, actor: actor, ts: now() }); this.registry:_on_release(this); } return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "_is_complete",
+          "perms": "rxd",
+          "direct_callable": false,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :_is_complete() rxd { for o in this.obligations { if (!o[\"met\"]) { return false; } } return true; }"
+        },
+        {
+          "name": "reject",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "i",
+              "why"
+            ]
+          },
+          "source": "verb :reject(i, why) rxd { if (location(this) != actor) { raise { code: \"E_PERM\", message: \"only the holder can reject\" }; } if (typeof(i) != \"number\" || i < 1 || i > length(this.obligations)) { raise { code: \"E_RANGE\", message: \"obligation index out of range\", value: i }; } let target = this.obligations[i]; if (!target[\"met\"]) { raise { code: \"E_INVARG\", message: \"obligation is not met; nothing to rewind\", value: i }; } let next = []; let j = 1; for o in this.obligations { if (j == i) { next = next + [{ \"key\": o[\"key\"], \"met\": false }]; } else { next = next + [o]; } j = j + 1; } this.obligations = next; this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"rejected\", \"obligation_key\": target[\"key\"], \"why\": why }]; this.last_change = now(); observe({ type: \"task_rejected\", task: this, obligation_key: target[\"key\"], actor: actor, why: why, ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "wait",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "cond"
+            ]
+          },
+          "source": "verb :wait(cond) rxd { if (location(this) != actor) { raise { code: \"E_PERM\", message: \"only the holder can wait\" }; } if (typeof(cond) != \"map\" || typeof(cond[\"kind\"]) != \"string\") { raise { code: \"E_INVARG\", message: \"wait condition must be a map with a kind\", value: cond }; } this.wait_for = this.wait_for + [cond]; this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"waited\" }]; this.last_change = now(); observe({ type: \"task_waited\", task: this, actor: actor, condition: cond, ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "yield",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "spec"
+            ]
+          },
+          "source": "verb :yield(spec) rxd { if (location(this) != actor) { raise { code: \"E_PERM\", message: \"only the holder can yield\" }; } if (typeof(spec) != \"map\") { raise { code: \"E_INVARG\", message: \"yield spec must be a map\", value: spec }; } let kind = null; if (\"kind\" in spec) { kind = spec[\"kind\"]; } let sname = null; if (\"name\" in spec) { sname = spec[\"name\"]; } let stext = \"\"; if (\"text\" in spec && typeof(spec[\"text\"]) == \"string\") { stext = spec[\"text\"]; } let labels = []; if (\"labels\" in spec && typeof(spec[\"labels\"]) == \"list\") { labels = spec[\"labels\"]; } let blocking = false; if (\"blocking\" in spec) { blocking = spec[\"blocking\"] == true; } let because = null; if (\"because\" in spec) { because = spec[\"because\"]; } let child = this.registry:create_task(kind, sname, stext, labels, null); child.links = child.links + [{ \"to\": this, \"role\": \"parent\" }]; this.links = this.links + [{ \"to\": child, \"role\": \"parent\" }]; if (typeof(because) == \"string\" && because != \"\") { child.log = [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"created\", \"because\": because }]; } if (blocking) { this.wait_for = this.wait_for + [{ \"kind\": \"child_complete\", \"task\": child }]; } this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"yielded\", \"link_ctx\": { \"to\": child, \"role\": \"parent\" } }]; this.last_change = now(); observe({ type: \"task_yielded\", task: this, actor: actor, child: child, blocking: blocking, because: because, ts: now() }); return { \"child\": child, \"link_role\": \"parent\" }; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "drop_terminal",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "why"
+            ]
+          },
+          "source": "verb :drop_terminal(why) rxd { if (location(this) != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the holder or a wizard can drop\" }; } this.terminal = true; if (location(this) != this.registry) { this:_authorized_moveto(this.registry, \"terminal\"); } this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"dropped\", \"why\": why }]; this.last_change = now(); observe({ type: \"task_dropped\", task: this, why: why, actor: actor, ts: now() }); observe({ type: \"task_returned_home\", task: this, reason: \"drop_terminal\", ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        }
+      ]
+    }
+  ],
+  "schemas": [
+    {
+      "on": "$task_registry",
+      "type": "task_created",
+      "shape": {
+        "task": "obj",
+        "registry": "obj",
+        "name": "str",
+        "kind": "str",
+        "by": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_claimed",
+      "shape": {
+        "task": "obj",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_released",
+      "shape": {
+        "task": "obj",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_moved",
+      "shape": {
+        "task": "obj",
+        "from": "obj",
+        "to": "obj",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_passed",
+      "shape": {
+        "task": "obj",
+        "obligation_key": "str",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_rejected",
+      "shape": {
+        "task": "obj",
+        "obligation_key": "str",
+        "actor": "obj",
+        "why": "str"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_waited",
+      "shape": {
+        "task": "obj",
+        "actor": "obj",
+        "condition": "map"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_yielded",
+      "shape": {
+        "task": "obj",
+        "actor": "obj",
+        "child": "obj",
+        "blocking": "bool"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_dropped",
+      "shape": {
+        "task": "obj",
+        "why": "str",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "task_returned_home",
+      "shape": {
+        "task": "obj",
+        "reason": "str"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "obligation_orphaned",
+      "shape": {
+        "task": "obj",
+        "obligation_key": "str"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "registry_role_changed",
+      "shape": {
+        "registry": "obj",
+        "name": "str",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "registry_obligation_changed",
+      "shape": {
+        "registry": "obj",
+        "key": "str",
+        "actor": "obj"
+      }
+    },
+    {
+      "on": "$task_registry",
+      "type": "registry_policy_changed",
+      "shape": {
+        "registry": "obj",
+        "kind": "str",
+        "actor": "obj"
+      }
+    }
+  ],
+  "seed_hooks": [
+    {
+      "kind": "create_instance",
+      "class": "$task_registry",
+      "as": "the_bug_board",
+      "name": "Bug Board",
+      "description": "A registry that tracks bugs through a role-gated obligation cursor. Operators populate roles, obligations, and policies via the admin verbs (or :seed_minimal_policy for tests).",
+      "properties": {
+        "host_placement": "self"
+      }
+    }
+  ]
+}

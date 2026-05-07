@@ -1,0 +1,6 @@
+{
+  "from": "0.0.0",
+  "to": "1.0.0",
+  "summary": "Initial 1.0 release of the tasks catalog. There is no v0; this file exists so the catalog migrations guard accepts the v1.0.0 manifest. The catalog supersedes @local:taskspace; existing taskspace instances are dropped (no data migration).",
+  "steps": []
+}

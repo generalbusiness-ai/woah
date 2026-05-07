@@ -14,8 +14,9 @@ import manifest8 from "../../catalogs/note/manifest.json";
 import manifest9 from "../../catalogs/perm/manifest.json";
 import manifest10 from "../../catalogs/pinboard/manifest.json";
 import manifest11 from "../../catalogs/prog/manifest.json";
-import manifest12 from "../../catalogs/taskspace/manifest.json";
-import manifest13 from "../../catalogs/weather/manifest.json";
+import manifest12 from "../../catalogs/tasks/manifest.json";
+import manifest13 from "../../catalogs/taskspace/manifest.json";
+import manifest14 from "../../catalogs/weather/manifest.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -35,6 +36,7 @@ export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
   { path: "catalogs/perm/manifest.json", manifest: manifest9 as unknown as CatalogManifest },
   { path: "catalogs/pinboard/manifest.json", manifest: manifest10 as unknown as CatalogManifest },
   { path: "catalogs/prog/manifest.json", manifest: manifest11 as unknown as CatalogManifest },
-  { path: "catalogs/taskspace/manifest.json", manifest: manifest12 as unknown as CatalogManifest },
-  { path: "catalogs/weather/manifest.json", manifest: manifest13 as unknown as CatalogManifest }
+  { path: "catalogs/tasks/manifest.json", manifest: manifest12 as unknown as CatalogManifest },
+  { path: "catalogs/taskspace/manifest.json", manifest: manifest13 as unknown as CatalogManifest },
+  { path: "catalogs/weather/manifest.json", manifest: manifest14 as unknown as CatalogManifest }
 ];

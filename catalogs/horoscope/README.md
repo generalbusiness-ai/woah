@@ -1,6 +1,6 @@
 ---
 name: horoscope
-version: 0.2.0
+version: 0.1.1
 spec_version: v1
 license: MIT
 description: Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The plug derives a clean inventory name (`Horoscope: Scorpio`) from the request and delivers it alongside the markdown body.
