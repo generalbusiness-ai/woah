@@ -4298,6 +4298,15 @@ export class WooWorld {
     this.persistenceDirty = false;
   }
 
+  persistFullSnapshot(): void {
+    if (!this.repository) return;
+    // Use sparingly for whole-world replacement paths such as importing a
+    // repaired host seed; incremental persistence has no dirty-row record for
+    // objects replaced through importWorld().
+    this.repository.save(this.exportWorld());
+    this.discardPendingPersistence();
+  }
+
   private activeObjectRepository(): ObjectRepository | null {
     return this.incrementalPersistenceEnabled ? this.objectRepository : null;
   }

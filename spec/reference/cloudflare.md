@@ -428,17 +428,29 @@ The seed graph from [bootstrap.md](../semantics/bootstrap.md) materializes the f
    - Sets `bootstrapped = true`.
 4. Boot is idempotent; concurrent first-requests serialize on `$system`'s single-threaded execution.
 
-Each object-owning DO also runs a host-scoped local catalog lifecycle after it
-loads or refreshes its host slice. Support objects and seed verbs arrive from
-the gateway's fresh host seed and merge through `mergeHostScopedSeed`. A
-brand-new host records the host-scoped content-addressed catalog schema plan as
-covered by that seed; a host with stored state applies the plan in host scope,
-verifies postconditions, and records the result in
-`$system.catalog_migration_records`.
+Each object-owning DO also runs a host-scoped local catalog lifecycle when it
+cold-loads its host slice. Support objects and seed verbs arrive from the
+gateway's fresh host seed and merge through `mergeHostScopedSeed`. A brand-new
+host records the host-scoped content-addressed catalog schema plan as covered by
+that seed; a host with stored state applies the plan in host scope, verifies
+postconditions, and records the result in `$system.catalog_migration_records`.
+When a fresh gateway seed was available, the host applies that seed again after
+the host-scoped lifecycle so gateway support-object repairs remain authoritative
+over the host's copied class and verb rows.
 Host-local data migrations use the same record path and run against state that
 the host actually owns. The gateway's `$system.applied_migrations` ledger may be
 copied into a host seed, but it does not prove the host's local instance data was
 converted.
+
+A wizard may ask the gateway to refresh live object hosts with
+`POST /api/admin/refresh-host-seeds`. The gateway exports each requested
+host-scoped seed and sends it to the owning DO. The receiving host merges that
+seed into its live world and persists only when the merge changed state. This
+live refresh treats the gateway seed as authoritative and does not run manifest
+repair on the partial host slice; host-local lifecycle repair remains a
+cold-load responsibility. When a wizard supplies an explicit `hosts` list, names
+that do not match any routed object host are reported as skipped with
+`reason = "unmatched_host"`.
 
 ### R9.2 Boot identity
 

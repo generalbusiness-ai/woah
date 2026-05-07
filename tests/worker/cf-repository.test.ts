@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
+import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
 import type { CallContext, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
@@ -764,6 +765,191 @@ describe("CFObjectRepository production-shape coverage", () => {
       const listed = await post("/api/objects/the_pinboard/calls/list_notes", { args: [] }, session);
       expect(listed.status).toBe(200);
       expect(listed.body.result).toContainEqual(expect.objectContaining({ id: pin, text: ["CF smoke edited"], color: "blue", x: 80, y: 96 }));
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+    }
+  });
+
+  it("refreshes live host-scoped support classes from the gateway seed", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const wooStates = new Map<string, FakeDurableObjectState>();
+    const wooObjects = new Map<string, PersistentObjectDO>();
+    let env: Env;
+    const wooNamespace = new FakeDurableObjectNamespace((name) => {
+      let object = wooObjects.get(name);
+      if (!object) {
+        const state = new FakeDurableObjectState(name);
+        wooStates.set(name, state);
+        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+        wooObjects.set(name, object);
+      }
+      return object;
+    });
+    env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-host-refresh-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,note,blocks-demo",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: wooNamespace
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    }
+
+    try {
+      const guestAuth = await post("/api/auth", { token: "guest:cf-host-refresh" });
+      expect(guestAuth.status).toBe(200);
+      const guestSession = String(guestAuth.body.session);
+      const enterChat = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, guestSession);
+      expect(enterChat.status).toBe(200);
+      const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, guestSession);
+      expect(goDeck.status).toBe(200);
+
+      const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
+      const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
+      expect(deckWorld.objects.has("$note")).toBe(true);
+      expect(installVerb(deckWorld, "$note", "title", `verb :title() rxd {
+  return this.name;
+}`, deckWorld.ownVerb("$note", "title")?.version ?? null).ok).toBe(true);
+      deckWorld.createObject({ id: "cf_live_deck_note", name: "Deck note", parent: "$note", owner: "$wiz", location: "$wiz", anchor: "the_deck" });
+      deckWorld.setProp("cf_live_deck_note", "name", "Deck note");
+      gatewayWorld.createObject({ id: "cf_live_deck_note", name: "Deck note", parent: "$note", owner: "$wiz", location: "$wiz", anchor: "the_deck" });
+      gatewayWorld.setProp("cf_live_deck_note", "name", "Deck note");
+      const staleTitle = await deckWorld.directCall("cf-live-note-stale", "$wiz", "cf_live_deck_note", "title", []);
+      expect(staleTitle).toMatchObject({ op: "result", result: "Deck note" });
+
+      expect(installVerb(gatewayWorld, "$note", "title", `verb :title() rxd {
+  return "LIVE " + this.name;
+}`, gatewayWorld.ownVerb("$note", "title")?.version ?? null).ok).toBe(true);
+      const gatewaySeed = gatewayWorld.exportHostScopedWorld("the_deck");
+      expect(gatewaySeed.objects.map((obj) => obj.id)).toContain("$note");
+      expect(gatewaySeed.objects.find((obj) => obj.id === "$note")?.verbs.find((verb) => verb.name === "title")?.source).toContain("LIVE");
+
+      const wizardAuth = await post("/api/auth", { token: "wizard:cf-host-refresh-token" });
+      expect(wizardAuth.status).toBe(200);
+      const refreshed = await post("/api/admin/refresh-host-seeds", { hosts: ["the_deck"] }, String(wizardAuth.body.session));
+      expect(refreshed.status).toBe(200);
+      expect(refreshed.body).toMatchObject({
+        ok: true,
+        refreshed: [expect.objectContaining({ host: "the_deck", changed: true })]
+      });
+      expect(deckWorld.objects.has("cf_live_deck_note")).toBe(true);
+      expect(deckWorld.ownVerb("$note", "title")?.source).toContain("LIVE");
+      const repairedTitle = await deckWorld.directCall("cf-live-note-repaired", "$wiz", "cf_live_deck_note", "title", []);
+      expect(repairedTitle).toMatchObject({ op: "result", result: "LIVE Deck note" });
+
+      const deckState = wooStates.get("the_deck");
+      expect(deckState).toBeDefined();
+      const reloadedDeck = new PersistentObjectDO(deckState as unknown as DurableObjectState, env);
+      wooObjects.set("the_deck", reloadedDeck);
+      const reloadedDeckWorld = await (reloadedDeck as any).getWorld("the_deck") as WooWorld;
+      const reloadedTitle = await reloadedDeckWorld.directCall("cf-live-note-reloaded", "$wiz", "cf_live_deck_note", "title", []);
+      expect(reloadedTitle).toMatchObject({ op: "result", result: "LIVE Deck note" });
+
+      const second = await post("/api/admin/refresh-host-seeds", { hosts: ["missing_host", "the_deck"] }, String(wizardAuth.body.session));
+      expect(second.status).toBe(200);
+      expect(second.body).toMatchObject({
+        ok: true,
+        refreshed: [expect.objectContaining({ host: "the_deck", changed: false })],
+        skipped: [expect.objectContaining({ host: "missing_host", reason: "unmatched_host" })]
+      });
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+    }
+  });
+
+  it("persists cold-load host seed repairs before a later refresh can consume them", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const wooStates = new Map<string, FakeDurableObjectState>();
+    const wooObjects = new Map<string, PersistentObjectDO>();
+    let env: Env;
+    const wooNamespace = new FakeDurableObjectNamespace((name) => {
+      let object = wooObjects.get(name);
+      if (!object) {
+        const state = new FakeDurableObjectState(name);
+        wooStates.set(name, state);
+        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+        wooObjects.set(name, object);
+      }
+      return object;
+    });
+    env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-cold-host-refresh-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,note,blocks-demo",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: wooNamespace
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    }
+
+    try {
+      const guestAuth = await post("/api/auth", { token: "guest:cf-cold-host-refresh" });
+      expect(guestAuth.status).toBe(200);
+      const guestSession = String(guestAuth.body.session);
+      expect((await post("/api/objects/the_chatroom/calls/enter", { args: [] }, guestSession)).status).toBe(200);
+      expect((await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, guestSession)).status).toBe(200);
+
+      const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
+      const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
+      expect(installVerb(deckWorld, "$note", "title", `verb :title() rxd {
+  return this.name;
+}`, deckWorld.ownVerb("$note", "title")?.version ?? null).ok).toBe(true);
+      deckWorld.createObject({ id: "cf_cold_deck_note", name: "Cold note", parent: "$note", owner: "$wiz", location: "$wiz", anchor: "the_deck" });
+      deckWorld.setProp("cf_cold_deck_note", "name", "Cold note");
+      gatewayWorld.createObject({ id: "cf_cold_deck_note", name: "Cold note", parent: "$note", owner: "$wiz", location: "$wiz", anchor: "the_deck" });
+      gatewayWorld.setProp("cf_cold_deck_note", "name", "Cold note");
+      expect(installVerb(gatewayWorld, "$note", "title", `verb :title() rxd {
+  return "LIVE " + this.name;
+}`, gatewayWorld.ownVerb("$note", "title")?.version ?? null).ok).toBe(true);
+
+      const deckState = wooStates.get("the_deck");
+      expect(deckState).toBeDefined();
+      const coldDeck = new PersistentObjectDO(deckState as unknown as DurableObjectState, env);
+      wooObjects.set("the_deck", coldDeck);
+      const coldDeckWorld = await (coldDeck as any).getWorld("the_deck") as WooWorld;
+      expect(coldDeckWorld.ownVerb("$note", "title")?.source).toContain("LIVE");
+      const coldTitle = await coldDeckWorld.directCall("cf-cold-note-repaired", "$wiz", "cf_cold_deck_note", "title", []);
+      expect(coldTitle).toMatchObject({ op: "result", result: "LIVE Cold note" });
+
+      const reloadedDeck = new PersistentObjectDO(deckState as unknown as DurableObjectState, env);
+      wooObjects.set("the_deck", reloadedDeck);
+      const reloadedDeckWorld = await (reloadedDeck as any).getWorld("the_deck") as WooWorld;
+      const reloadedTitle = await reloadedDeckWorld.directCall("cf-cold-note-reloaded", "$wiz", "cf_cold_deck_note", "title", []);
+      expect(reloadedTitle).toMatchObject({ op: "result", result: "LIVE Cold note" });
     } finally {
       logSpy.mockRestore();
       directoryState.close();
