@@ -4,7 +4,7 @@
   "spec_version": "v1",
   "description": "Builder and programmer tooling. The same world is the IDE: tools inspect and mutate the live object graph, with no design-time/runtime split. The catalog deliberately preserves LambdaCore's builder/programmer authority split by installing them as player classes. Builder class membership exposes object/data tools. Programmer class membership exposes source/metadata tools, while progbit and wizbit remain the hard authority facts.",
   "license": "MIT",
-  "depends": [],
+  "depends": ["@local:perm"],
   "classes": [
     {
       "local_name": "$builder",
@@ -66,7 +66,7 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["id", "opts?"] },
-          "source": "verb :recycle(id, opts) rxd {\n  let result = builder_recycle(id, opts);\n  if (result[\"ok\"] && !result[\"dry_run\"]) {\n    observe({ type: \"builder_recycled\", actor: actor, id: id, ts: now() });\n  }\n  return result;\n}"
+          "source": "verb :recycle(id, opts) rxd {\n  // The substrate `recycle()` builtin gates on the verb's effective\n  // principal (progr); this wrapper is catalog-owned, so progr is\n  // wizard. Two layers of defense are needed.\n  //\n  // Layer 1 — actor-side authority gate (LambdaCore @recycle pattern):\n  // route through the_perm so the auth rule lives in one place.\n  \"the_perm\":requires_perm(actor, id, \"only the owner or a wizard can recycle this object\");\n  // Layer 2 — strip user-intent wizard opts before forwarding. The\n  // substrate also gates force_reserved on actor (defense in depth at\n  // the substrate layer), but stripping here keeps the smuggle vector\n  // out of the substrate's parser entirely. force_reserved is the\n  // exclusive concern of $wiz:force_recycle.\n  let safe_opts = {};\n  if (typeof(opts) == \"map\") {\n    for k in keys(opts) {\n      if (k != \"force_reserved\") { safe_opts[k] = opts[k]; }\n    }\n  }\n  let result = recycle(id, safe_opts);\n  if (result[\"ok\"] && !result[\"dry_run\"]) {\n    observe({ type: \"builder_recycled\", actor: actor, id: id, ts: now() });\n  }\n  return result;\n}"
         },
         {
           "name": "set_property",
@@ -185,7 +185,7 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["id", "opts?"] },
-          "source": "verb :force_recycle(id, opts) rxd {\n  // Wizard-only force_recycle. Bypasses most §RC6 reserved-list checks\n  // (universal classes other than $system/$root/$nowhere; live actors,\n  // whose sessions are terminated as part of the call). The engine\n  // builtin raises E_PERM for non-wizards; non-wizard programmers see\n  // this verb in tools listings but cannot call it. Audited as a\n  // wiz_force_recycle wizard_action; emits a wiz_force_recycle\n  // observation. Use sparingly — for irreversible world-teardown and\n  // migration only.\n  return wiz_force_recycle(id, opts);\n}"
+          "source": "verb :force_recycle(id, opts) rxd {\n  // Wizard-only force_recycle. Bypasses most §RC6 reserved-list checks\n  // (universal classes other than $system/$root/$nowhere; live actors,\n  // whose sessions are terminated as part of the call) and the §RC3a\n  // empty-children safety check. Routes through the unified `recycle`\n  // builtin with force_reserved + force.\n  //\n  // The substrate gates RC2 authority on `progr` (the verb's effective\n  // principal), so a wrapper verb running with wizard progr could be\n  // invoked by any actor. We additionally gate on `actor` here so a\n  // non-wizard caller cannot bypass §RC6 by calling this verb. This is\n  // the LambdaCore @recycle convention: substrate trusts progr; the\n  // user-facing wrapper trusts actor. Audited as a force_recycle\n  // wizard_action; emits a wiz_force_recycle observation. Use sparingly —\n  // for irreversible world-teardown and migration only.\n  \"the_perm\":requires_wizard(actor, \"wizard authority required for force_recycle\");\n  let merged = opts;\n  if (typeof(merged) != \"map\") { merged = {}; }\n  merged[\"force_reserved\"] = true;\n  merged[\"force\"] = true;\n  return recycle(id, merged);\n}"
         }
       ]
     },

@@ -109,11 +109,11 @@ const MAX_RUNTIME_LOCALS = 1_024;
 const MAX_RUNTIME_STACK = 4_096;
 const BUILTIN_NAMES = [
   "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
-  "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms",
+  "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms",
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "builder_create_object", "builder_chparent", "builder_recycle", "wiz_force_recycle", "builder_set_property", "builder_inspect", "builder_search",
+  "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
@@ -1045,12 +1045,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "builder_chparent":
         if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "builder_chparent expects object, parent, and optional opts");
         return await frame.ctx.world.builderChparent(frame.ctx.actor, assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), builtinArgs[2] ?? null, frame.ctx.definer);
-      case "builder_recycle":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_recycle expects object and optional opts");
-        return await frame.ctx.world.builderRecycle(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer, frame.ctx);
-      case "wiz_force_recycle":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "wiz_force_recycle expects object and optional opts");
-        return await frame.ctx.world.wizForceRecycle(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx);
+      case "recycle":
+        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "recycle expects object and optional opts");
+        return await frame.ctx.world.recycleChecked(frame.ctx.progr, frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx);
       case "builder_set_property":
         if (builtinArgs.length < 3 || builtinArgs.length > 4) throw wooError("E_INVARG", "builder_set_property expects object, name, value, and optional opts");
         return await frame.ctx.world.builderSetProperty(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]), builtinArgs[2], builtinArgs[3] ?? null, frame.ctx.definer);
