@@ -81,8 +81,11 @@ The catalog ships once these are in place:
    - `builder_create_object(parent, opts)`
    - `builder_chparent(id, parent, opts)` — `opts.dry_run=true` is the
      LambdaCore `@check-chparent` shape
-   - `builder_recycle(id, opts)` — `opts.dry_run=true` returns the impact set
-     without mutation
+   - `recycle(id, opts)` — universal builtin. RC2 (wizard or owner of `id`)
+     gates authority on the calling `progr`. `opts.dry_run=true` returns the
+     impact set without mutation; `opts.force=true` bypasses the §RC3a
+     empty-children safety check; `opts.force_reserved=true` (wizard only)
+     bypasses the §RC6 reserved-list and terminates live actor sessions.
    - `builder_set_property(id, name, value, opts)` — ordinary data value only
    - `builder_inspect(id, opts)` — no source output
    - `builder_search(query, opts)` — object/property channels only

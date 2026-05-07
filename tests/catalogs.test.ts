@@ -3186,6 +3186,117 @@ describe("local catalogs", () => {
       });
     });
 
+    it("$horoscope_note vanishes in a puff of smoke when a non-wizard drops it (verb's progr authorizes recycle, not the actor)", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["horoscope"]);
+      const roomA = "obj_test_puff_room_a";
+      const roomB = "obj_test_puff_room_b";
+      world.createObject({ id: roomA, name: roomA, parent: "$space", owner: "$wiz", location: null });
+      world.createObject({ id: roomB, name: roomB, parent: "$space", owner: "$wiz", location: null });
+      const blockId = "obj_test_puff_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomA });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+      const requester = world.auth("guest:horo-puff-requester").actor;
+
+      // Requester places an order; the dispenser delivers a $horoscope_note
+      // owned by the block (not by the requester).
+      const ordered = await world.directCall("puff-order", requester, blockId, "order", ["aries"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+      const delivered = await world.directCall("puff-deliver", blockId, blockId, "deliver", [orderId, "The stars suggest patience."]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+      expect(world.object(noteId).parent).toBe("$horoscope_note");
+      expect(world.object(noteId).owner).toBe(blockId);
+      expect(world.object(noteId).owner).not.toBe(requester);
+
+      // Place the note directly in roomA so location(note) is a $space and
+      // the puff emits there. The non-wizard requester drives moveto toward
+      // roomB; the override intercepts and recycles. Authority for the
+      // substrate recycle comes from the verb's progr (catalog wizard), not
+      // from the requester — that is the RC2 contract, equivalent to
+      // LambdaMOO's `controls(progr, oid)`.
+      world.object(noteId).location = roomA;
+      world.object("$nowhere").contents.delete(noteId);
+      world.object(roomA).contents.add(noteId);
+
+      const moved = await world.directCall("puff-moveto-space", requester, noteId, "moveto", [roomB]);
+      expect(moved.op).toBe("result");
+      if (moved.op !== "result") return;
+      expect(world.isRecycled(noteId)).toBe(true);
+      expect(world.objects.has(noteId)).toBe(false);
+      expect(moved.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "vanished", note: noteId, text: expect.stringContaining("puff of smoke") })
+      ]));
+    });
+
+    it("$horoscope_note :recycle handler emits the same puff for explicit recycle", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["horoscope"]);
+      const roomId = "obj_test_recycle_puff_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const blockId = "obj_test_recycle_puff_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const ordered = await world.directCall("recycle-puff-order", "$wiz", blockId, "order", ["leo"]);
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+      const delivered = await world.directCall("recycle-puff-deliver", blockId, blockId, "deliver", [orderId, "Lions before lunch."]);
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+
+      // Place note in the room so the puff has a scene to emit into.
+      world.object(noteId).location = roomId;
+      world.object("$nowhere").contents.delete(noteId);
+      world.object(roomId).contents.add(noteId);
+
+      // Calling :recycle directly is the visible path the substrate's
+      // recycle pipeline uses to fire the handler before destruction.
+      const recycled = await world.directCall("recycle-puff-recycle", "$wiz", noteId, "recycle", [], { forceDirect: true });
+      expect(recycled.op).toBe("result");
+      if (recycled.op !== "result") return;
+      expect(recycled.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "vanished", note: noteId, text: expect.stringContaining("puff of smoke") })
+      ]));
+    });
+
+    it("$horoscope_note passes between people without puffing", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["horoscope"]);
+      const roomId = "obj_test_pass_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
+      const alice = world.auth("guest:horo-pass-alice").actor;
+      const bob = world.auth("guest:horo-pass-bob").actor;
+      const blockId = "obj_test_pass_block";
+      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const ordered = await world.directCall("pass-order", alice, blockId, "order", ["taurus"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+      const delivered = await world.directCall("pass-deliver", blockId, blockId, "deliver", [orderId, "Something earthy this way comes."]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+      expect(world.object(noteId).location).toBe(alice);
+
+      const passed = await world.directCall("pass-moveto-bob", "$wiz", noteId, "moveto", [bob]);
+      expect(passed.op).toBe("result");
+      if (passed.op !== "result") return;
+      // Note moves to bob, no puff observation.
+      expect(world.object(noteId).location).toBe(bob);
+      expect(passed.observations).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "vanished" })
+      ]));
+    });
+
     it("$note title and look use the overridable bounded text summary", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["note"]);

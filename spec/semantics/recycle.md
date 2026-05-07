@@ -25,14 +25,17 @@ deliberate woo changes are flagged inline:
   null location sentinel. Woo's universal seed `$nowhere` is a real object that
   can carry recycled-content semantics (see `bootstrap.md §B2.15`).
 
-**Implementation status (2026-05-07).** The host-local path is implemented:
-pre-flight A1–A4 checks, `:recycle` dispatch (§RC4), parked-task kill (RC3
-step 2), child grafting (RC3 step 3), contents displacement to `$nowhere`
+**Implementation status (2026-05-07).** The host-local path is implemented
+as a single `recycle(obj, opts?)` builtin (replacing the earlier
+`builder_recycle` / `wiz_force_recycle` pair). The builtin does pre-flight
+A1–A4 checks, `:recycle` dispatch (§RC4), parked-task kill (RC3 step 2),
+child grafting (RC3 step 3), contents displacement to `$nowhere`
 (RC3 step 4), parent/location chain bookkeeping (steps 5, 6), lazy
 verb/ancestor cache invalidation on dispatch-time tombstone hits (step 7),
-storage-row deletion (step 8), ULID tombstoning persisted across hosts
-(step 9), the builder safety wrapper (§RC3a), and `wiz:force_recycle`
-(§RC6.1). The non-LambdaMOO `obj.flags.recyclable` gate has been removed.
+storage-row deletion (step 8), and ULID tombstoning persisted across hosts
+(step 9). The §RC3a empty-children safety check rides on the builtin as
+the `force` opt; §RC6.1 wizard-only behavior rides as the `force_reserved`
+opt. The non-LambdaMOO `obj.flags.recyclable` gate has been removed.
 Status remains `partial` because `$system.recycle_tick_budget` and the
 cross-host steps in §RC3.1 / §RC10 (cluster co-location enforcement when
 the cluster spans hosts, fire-after-commit Directory reconciliation, and
@@ -157,16 +160,18 @@ What is and isn't in the rollback scope:
 Cross-host recycle (lifting the A4 restriction) is deferred to a later spec
 revision; see §RC10.
 
-### RC3a Builder-surface safety wrapper
+### RC3a Empty-children safety: the `force` opt
 
-The `@recycle` command on `$builder` (catalog `prog`) is a thin wrapper around
-`recycle()`. It adds three things on top of the builtin:
+`recycle(obj, {force: true})` bypasses the empty-children safety check and
+permits recycling a non-empty class or container. Without `force`, the
+builtin refuses with `E_RECMOVE` if `obj` has children or contents. The
+substrate always grafts/displaces; the check exists as a guard against
+fat-finger destruction of populated classes or containers, available to
+any caller with §RC2 authority.
 
-- **Empty-children safety check.** If `obj` has children or contents, the
-  wrapper refuses with `E_RECMOVE` unless the caller passes `{force: true}`.
-  The underlying builtin always grafts; the check exists only at the authoring
-  surface where casually destroying a populated class or container is almost
-  always a mistake.
+The `@recycle` command on `$builder` (catalog `prog`) is a thin wrapper
+around the builtin that may also add:
+
 - **Self-recycle refusal.** Builders cannot recycle their own actor object
   through `@recycle`. (LambdaCore's `@recycle` does the same check; LambdaMOO's
   builtin does not, so the engine layer leaves it to the wrapper.)
@@ -264,38 +269,43 @@ The following objects must not be recycled:
 Attempts raise `E_INVARG` ("cannot recycle reserved object") for the
 universal-class and seed cases, or `E_PERM` for the live-actor case.
 
-### RC6.1 `wiz:force_recycle`
+### RC6.1 Wizard reserved-list bypass: the `force_reserved` opt
 
-`wiz:force_recycle(obj)` is a wizard-only verb shipped with the `prog`
-catalog. It bypasses **most** of §RC6's reserved-object list, with a small
-hard floor and explicit teardown semantics for the cases it does relax:
+`recycle(obj, {force_reserved: true})` is a wizard-only opt that bypasses
+**most** of §RC6's reserved-object list, with a small hard floor and explicit
+teardown semantics for the cases it does relax:
 
-- Caller must be a wizard (the §RC2 authority check still applies; ownership
-  is not enough).
-- **Hard floor:** `$system`, `$root`, and `$nowhere`. Even `force_recycle`
-  refuses these with `E_INVARG`. `$system` and `$root` are removed only by an
-  offline tool because the running world cannot recover from their absence.
-  `$nowhere` is on the floor because RC3 step 4 displaces contents into it;
-  recycling `$nowhere` from inside the running world would orphan that step
-  and any concurrent recycle on another cluster.
+- Caller must be a wizard (the substrate raises `E_PERM` otherwise).
+  The §RC2 authority check (wizard or owner) still applies as well.
+- **Hard floor:** `$system`, `$root`, and `$nowhere`. Even with
+  `force_reserved`, the substrate refuses these with `E_INVARG`. `$system`
+  and `$root` are removed only by an offline tool because the running world
+  cannot recover from their absence. `$nowhere` is on the floor because
+  RC3 step 4 displaces contents into it; recycling `$nowhere` from inside
+  the running world would orphan that step and any concurrent recycle on
+  another cluster.
 - **Other universal classes** (`$actor`, `$player`, `$wiz`,
-  `$sequenced_log`, `$space`, `$thing`) are bypassed. `force_recycle` proceeds
+  `$sequenced_log`, `$space`, `$thing`) are bypassed. The recycle proceeds
   through normal §RC3 apply.
-- **Live actors** are bypassed, but force_recycle terminates the actor's live
-  sessions before invoking the apply phase: each session is closed with a
-  `session_terminated` reason, the connection registry is updated, and any
+- **Live actors** are bypassed, but `force_reserved` terminates the actor's
+  live sessions before invoking the apply phase: each session is closed with
+  a `session_terminated` reason, the connection registry is updated, and any
   in-flight `host_call`s on the session return `E_GONE` per
   [failures.md §F7](failures.md#f7-lifecycle-failures). After session
   teardown, recycle proceeds.
 - **Pre-flight A4 (cluster collocation) still applies** — even a wizard
   cannot atomically recycle across clusters in v1.
 
-It records a `{type: "wiz_force_recycle", actor, obj, reason, sessions_killed, ts}`
-audit observation to the wizard log space (`sessions_killed` is the count of
-live sessions terminated, zero for non-actor objects).
+The substrate records a `{type: "wiz_force_recycle", actor, obj, reason,
+sessions_killed, ts}` audit observation to the wizard log space
+(`sessions_killed` is the count of live sessions terminated, zero for
+non-actor objects). The accompanying `recordWizardAction` entry is keyed
+`force_recycle`.
 
-`wiz:force_recycle` is for irreversible world-teardown and migration; it must
-not appear in normal authoring flows.
+The `prog` catalog ships a wizard-only `:force_recycle(id, opts)` verb on
+`$wiz` that thinly wraps the builtin with `force_reserved: true` and
+`force: true` for convenience. It is for irreversible world-teardown and
+migration; it must not appear in normal authoring flows.
 
 ---
 

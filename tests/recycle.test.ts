@@ -31,7 +31,10 @@ describe("recycle", () => {
     target: string,
     opts: Record<string, unknown> = {}
   ) {
-    return world.builderRecycle(actor, target, opts as any, "$builder");
+    // Direct substrate test path: actor IS the progr (the test simulates a
+    // verb whose effective principal is the actor, which is how
+    // builder/wizard-tooling tests have always used this helper).
+    return world.recycleChecked(actor, actor, target, opts as any);
   }
 
   it("recycles a leaf object: parent.children pruned, ULID tombstoned, is_recycled returns true", async () => {
@@ -537,6 +540,64 @@ describe("recycle", () => {
     expect(result.op).toBe("error");
     if (result.op === "error") expect(result.error.code).toBe("E_PERM");
     expect(world.objects.has(klass)).toBe(true);
+  });
+
+  it("$builder:recycle gates on actor authority — a guest promoted to $builder cannot recycle a $wiz-owned object", async () => {
+    const world = createWorld();
+    // Guest promoted to $builder (programmer + reparented). The catalog
+    // gives them access to $builder:recycle as an inherited verb.
+    const guest = world.auth("guest:builder-attacker").actor;
+    const obj = world.object(guest);
+    obj.owner = guest;
+    obj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", guest, "$builder");
+
+    // A $wiz-owned target the guest has no claim on.
+    const target = world.createAuthoredObject("$wiz", { parent: "$thing", name: "Wizard target" });
+    expect(world.object(target).owner).toBe("$wiz");
+
+    // The substrate `recycle()` builtin gates on the verb's progr (the
+    // catalog wizard). Without an actor-side check in the wrapper, the
+    // guest could recycle anything by reaching the wrapper. The wrapper
+    // must enforce: actor is wizard OR owner of id.
+    const result = await world.directCall(`builder-attacker-${Date.now()}`, guest, guest, "recycle", [target, {}]);
+    expect(result.op).toBe("error");
+    if (result.op === "error") expect(result.error.code).toBe("E_PERM");
+    expect(world.objects.has(target)).toBe(true);
+  });
+
+  it("$builder:recycle does not let a non-wizard owner smuggle force_reserved through opts", async () => {
+    const world = createWorld();
+    // Guest promoted to $builder; owns themselves; has a live session
+    // (from world.auth). The smuggle scenario: actor IS the target IS the
+    // owner, so the wrapper's requires_perm(actor, id) passes trivially.
+    // Without the defense, opts.force_reserved propagates to the substrate,
+    // which gates force_reserved on the verb's progr (catalog wizard, true)
+    // and runs §RC6.1's session-kill + wiz_force_recycle audit for a
+    // non-wizard caller.
+    const session = world.auth("guest:builder-smuggle");
+    const builder = session.actor;
+    const obj = world.object(builder);
+    obj.owner = builder;
+    obj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", builder, "$builder");
+    expect(world.hasLiveSessions(builder)).toBe(true);
+
+    const result = await world.directCall(
+      `smuggle-${Date.now()}`,
+      builder, builder, "recycle",
+      [builder, { force_reserved: true, force: true }]
+    );
+    expect(result.op).toBe("error");
+    if (result.op === "error") {
+      expect(["E_PERM", "E_INVARG"]).toContain(result.error.code);
+    }
+    // Target alive, session intact, no audit, no observation.
+    expect(world.objects.has(builder)).toBe(true);
+    expect(world.hasLiveSessions(builder)).toBe(true);
+    if (result.op === "result") {
+      expect(result.observations.filter((o) => o.type === "wiz_force_recycle")).toHaveLength(0);
+    }
   });
 
   it("directory_reconcile_corenames recursively scrubs lists and maps", async () => {
