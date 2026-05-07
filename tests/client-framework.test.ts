@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
-import { CatalogUiRegistry, createWooClientFramework } from "../src/client/framework";
+import { CatalogUiRegistry, createWooClientFramework, ProjectionFieldFiller } from "../src/client/framework";
 
 describe("client UI framework projection", () => {
   it("keeps optimistic pinboard placement across stale world refreshes until applied confirmation", () => {
@@ -293,6 +293,169 @@ describe("client UI framework projection", () => {
     ui.prune(Date.now() + 2_000);
 
     expect(ui.observe("the_weather")?.props.current).toEqual({ temp: 73, unit: "F" });
+  });
+
+  it("ProjectionFieldFiller fetches when required props are missing even though the thin summary carries parent/ancestors", async () => {
+    const ui = createWooClientFramework();
+    // Mirrors the wire shape /api/me ships: parent/ancestors/aliases/description
+    // but no props. fetchScopedObjectSummary's isCompleteScopedSummary shortcut
+    // would treat this as "complete" — ProjectionFieldFiller must not.
+    ui.ingestSnapshot("here", [
+      { id: "the_chatroom", name: "Living Room", parent: "$chatroom", contents: ["the_weather"] },
+      { id: "the_weather", name: "Weather panel", parent: "$weather_block", ancestors: ["$weather_block", "$block"], description: "A panel" }
+    ]);
+
+    let fetchCalls = 0;
+    let resolves = 0;
+    let pending: ((value: void) => void) | null = null;
+    const filler = new ProjectionFieldFiller(
+      (subject) => ui.observe(subject),
+      (subject) => {
+        fetchCalls += 1;
+        return new Promise<void>((resolve) => {
+          pending = () => {
+            ui.ingestSnapshot(`summary:${subject}`, [
+              {
+                id: subject,
+                name: "Weather panel",
+                parent: "$weather_block",
+                props: { current: { value: 72 }, config_state: { status: "confirmed" }, place: "Mountain View CA", last_error: null }
+              }
+            ]);
+            resolve();
+          };
+        });
+      },
+      () => { resolves += 1; }
+    );
+
+    filler.ensure("the_weather", ["current", "config_state"]);
+    expect(fetchCalls).toBe(1);
+    // Concurrent re-bind while in flight: must dedupe to a single fetch.
+    filler.ensure("the_weather", ["current", "config_state"]);
+    expect(fetchCalls).toBe(1);
+
+    pending!();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolves).toBe(1);
+    expect(ui.observe("the_weather")?.props.current).toMatchObject({ value: 72 });
+
+    // After completion, ensure is a no-op even if a (non-required) reset occurs.
+    filler.ensure("the_weather", ["current", "config_state"]);
+    expect(fetchCalls).toBe(1);
+  });
+
+  it("ProjectionFieldFiller skips the fetch when required props are already projected", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("here", [
+      { id: "the_weather", name: "Weather panel", parent: "$weather_block", props: { current: { value: 65 }, config_state: { status: "confirmed" } } }
+    ]);
+
+    let fetchCalls = 0;
+    const filler = new ProjectionFieldFiller(
+      (subject) => ui.observe(subject),
+      () => { fetchCalls += 1; return Promise.resolve(); }
+    );
+
+    filler.ensure("the_weather", ["current", "config_state"]);
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("ProjectionFieldFiller.reset() lets the next ensure refetch and discards pending stale fills", async () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("here", [
+      { id: "the_weather", name: "Weather panel", parent: "$weather_block" }
+    ]);
+
+    let fetchCalls = 0;
+    let resolves = 0;
+    const pendings: Array<() => void> = [];
+    const filler = new ProjectionFieldFiller(
+      (subject) => ui.observe(subject),
+      () => {
+        fetchCalls += 1;
+        return new Promise<void>((resolve) => { pendings.push(resolve); });
+      },
+      () => { resolves += 1; }
+    );
+
+    // Session A: fire a fill. It is in flight and uncompleted.
+    filler.ensure("the_weather", ["current"]);
+    expect(fetchCalls).toBe(1);
+
+    // Session change. Pending fill from session A must not poison the new
+    // session by marking the subject completed.
+    filler.reset();
+    pendings[0]!();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolves).toBe(0); // stale fill suppressed
+
+    // Session B: ensure must re-fetch since the previous completion was
+    // discarded by the reset.
+    filler.ensure("the_weather", ["current"]);
+    expect(fetchCalls).toBe(2);
+    pendings[1]!();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolves).toBe(1);
+  });
+
+  it("ProjectionFieldFiller does not retry after a failed fetch in the same session", async () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("here", [
+      { id: "the_weather", name: "Weather panel", parent: "$weather_block" }
+    ]);
+
+    let fetchCalls = 0;
+    const filler = new ProjectionFieldFiller(
+      (subject) => ui.observe(subject),
+      () => { fetchCalls += 1; return Promise.reject(new Error("offline")); }
+    );
+
+    filler.ensure("the_weather", ["current"]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetchCalls).toBe(1);
+
+    filler.ensure("the_weather", ["current"]);
+    expect(fetchCalls).toBe(1);
+  });
+
+  it("fills missing component-required props when a per-subject summary lands after a thin room snapshot", () => {
+    const ui = createWooClientFramework();
+    // Fresh viewer: room snapshot ships thin contents (no props) — mirrors
+    // what /api/me's here.contents carries.
+    ui.ingestSnapshot("here", [
+      { id: "the_chatroom", name: "Living Room", parent: "$chatroom", contents: ["the_weather"] },
+      { id: "the_weather", name: "Weather panel", parent: "$weather_block", location: "the_chatroom" }
+    ]);
+
+    expect(ui.observe("the_weather")?.props).toEqual({});
+
+    // ensureProjectionFields' on-bind fill folds a full /api/objects/<id>/summary
+    // into a per-subject snapshot scope. Same path used by navigation summaries.
+    ui.ingestSnapshot("summary:the_weather", [
+      {
+        id: "the_weather",
+        name: "Weather panel",
+        parent: "$weather_block",
+        location: "the_chatroom",
+        props: {
+          place: "Mountain View CA",
+          current: { kind: "scalar", value: 72.4, unit: "°F", weather_code: 1000 },
+          config_state: { status: "confirmed", message: "weather plug confirmed location and timezone" }
+        }
+      }
+    ]);
+
+    const projected = ui.observe("the_weather");
+    expect(projected?.props.current).toMatchObject({ value: 72.4, unit: "°F" });
+    expect(projected?.props.config_state).toMatchObject({ status: "confirmed" });
+    // Live block_data observations from then on top up the same projection.
+    ui.ingestLiveObservation({ type: "block_data", block: "the_weather", name: "current", value: { kind: "scalar", value: 65, unit: "°F" } });
+    expect(ui.observe("the_weather")?.props.current).toMatchObject({ value: 65 });
   });
 
   it("can fold direct authoritative patches into canonical projection", () => {

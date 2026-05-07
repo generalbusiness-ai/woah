@@ -66,6 +66,14 @@
             ]
           },
           "source": "verb :set_color(color) rx { if (color == \"white\") { color = null; } if (color != null && typeof(color) != \"string\") { raise { code: \"E_INVARG\", message: \"color must be a string or null\", value: color }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot recolor pin\", value: this }; } this.color = color; observe({ type: \"pin_recolored\", actor: actor, pin: this, color: color, ts: now() }); return true; }"
+        },
+        {
+          "name": "match_names",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :match_names() rxd { let out = pass(); let color = this.color; if (typeof(color) == \"string\" && color && color != \"white\") { let object_name = str_trim(this.name); if (!object_name) { object_name = \"note\"; } out = out + [color + \" note\", \"the \" + color + \" note\", color + \" \" + object_name, \"the \" + color + \" \" + object_name]; } return out; }"
         }
       ]
     },

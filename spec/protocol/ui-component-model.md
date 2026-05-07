@@ -361,6 +361,7 @@ implements it.
 | `surface` | yes | Primary rendering role: `main`, `presence`, `chat`, `detail`, `item`, `item-list`, `frame`, or catalog-defined string. The `frame` surface is reserved for nested-frame mounts via `core.frame` ([UCM27](#ucm27-bundled-core-components)). |
 | `subject` | optional | Class/object constraint for subjects this component expects. |
 | `neighborhood` | optional | Default object relations this component may observe. See [UCM13](#ucm13-component-neighborhood). |
+| `requires` | optional | Property names the component needs from its subject's projection. The host fills them into the canonical layer when the component binds (see [UCM21](#ucm21-consistent-client-projection)). |
 | `props_schema` | optional | JSON-schema-like declaration for frame props. |
 
 Component ids are referenced by frames and item renderers. A component id
@@ -1237,6 +1238,18 @@ Refreshing the canonical snapshot layer MUST NOT by itself overwrite a higher
 layer. A stale `/api/state` response can update the canonical base, but active
 live-preview or pending optimistic patches continue to win until they are
 reconciled, superseded, or expired.
+
+Room snapshots and other neighborhood payloads MAY ship thin object summaries
+that omit `props` to keep the projection wire small. When a component declares
+`requires` ([UCM8](#ucm8-component-declarations)) and the projection lacks any
+of those fields at bind time, the host MUST trigger a one-shot fill that folds
+a full object summary into the canonical layer (typically via the same
+authoritative-direct-result path used for navigation summaries). The fill is
+de-duplicated per subject and is not retried beyond a single round-trip; if
+the field is genuinely absent on the server, subsequent `block_data` /
+`property_changed` / catalog-specific observations remain the source of truth.
+Components render a skeleton from whatever projection state is available and
+re-render when the fill resolves.
 
 Some direct calls return server-confirmed state without writing a sequenced log
 entry. The framework may fold those authoritative direct results into the

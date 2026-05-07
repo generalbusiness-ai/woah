@@ -211,7 +211,80 @@ Custom worlds can extend this list by overriding `$match.prepositions` (a list p
 
 ---
 
-## MA6. What's not in `$match`
+## MA6. The `:match_names()` extension hook
+
+Static `aliases` is enough for most catalogs — a list of strings on the
+object, world-readable, exposed via the same property convention LambdaMOO
+uses. When a class needs match keywords that vary by *who is matching*
+(text-line aliases gated on `:is_readable_by`, color variants on a pin, an
+encrypted note exposing different keywords per reader), it can override
+the optional verb hook:
+
+```
+verb :match_names() rxd { ... return list<str> ... }
+```
+
+For candidates local to the matching host, the substrate calls this verb
+when the candidate defines it at any level of the parent chain during
+`:match_object`'s alias-tier walk. Returned strings join the per-candidate
+match pool alongside the `name` property and the `aliases` list. Remote
+candidates remain read-only for matching per §MA2: the matcher uses their
+summary `name` and `aliases`, and does not dispatch object behavior on the
+remote host. The result is bounded by `dispatch(... max_chars=4096)` — see
+[builtins.md §19.4](builtins.md#194-object); a verb that exceeds the bound
+contributes no match names from this hook on that call.
+
+### MA6.1 Protocol
+
+The verb takes **no arguments**. The acting principal is read from the
+verb-frame `actor` global (the session-bound real actor; substrate-supplied
+and unspoofable). Authoring `:match_names(actor_obj)` and reading the
+parameter is a footgun: the substrate calls the verb with no arguments, so
+`actor_obj` would arrive as `null`, and an external caller invoking the
+verb directly could otherwise pass any object id to bypass an
+`is_readable_by(actor_obj)` gate.
+
+Because the verb is `direct_callable: true` so the substrate can dispatch it
+through the normal verb-perm path, every implementation must gate its
+returned keywords on the same `actor` it would gate `:text()` on, and must
+not trust any caller-supplied principal.
+
+### MA6.2 Bound and timing
+
+`:match_names()` runs synchronously for each local candidate, inside the
+parallel fanout that already enriches match candidates. The 4096-character
+total bound is the substrate's protection against a single hostile or
+accidentally-large note brick-walling a chat utterance; it is a hard cap and
+the substrate silently drops the contribution from any candidate that
+overshoots. Catalog implementations should keep the verb cheap (no
+cross-host RPC, no logging) — the matcher fires on every unhandled chat
+utterance.
+
+---
+
+## MA7. Substrate-hardcoded conventions
+
+A small vocabulary is wired into the substrate's command-resolution path
+rather than into a catalog: the pseudo-names `me` and `here`, the sentinel
+corerefs `$failed_match` / `$ambiguous_match` / `$nothing`, and the `#<id>`
+direct-object syntax. These are not catalog-extensible; any chat-shaped
+surface inherits them, and an alternate world cannot redefine them locally.
+
+This is intentional and follows LambdaMOO's `match.c`, where the same
+identifiers are baked into the C-level matcher. They are part of the
+universal command-parsing protocol, not policy: changing them would break
+the meaning of every command pattern in every catalog. Catalog authors who
+want a different word for "the actor" or "this room" should add an alias on
+the relevant object's `aliases` property; they should not try to redefine
+`me` or `here`.
+
+If a future surface needs richer parser globals (a tabletop or roguelike
+might want `north`, `up`, `target`), those are catalog-defined verbs/aliases
+on `$match` or on the room — not new substrate sentinels.
+
+---
+
+## MA8. What's not in `$match`
 
 - **Sentence parsing.** `$match` parses one verb-shaped command per call. Multi-clause input (`get the book and read it`) is the caller's responsibility.
 - **Spell correction or fuzzy matching.** Prefix matching is the only forgiveness offered. Worlds that want Damerau-Levenshtein or phonetic matching layer it on top.
@@ -225,7 +298,7 @@ These deferrals keep `$match` small. The pattern is "scaffolding for the 80% cas
 
 ---
 
-## MA7. Errors
+## MA9. Errors
 
 | Code | Meaning |
 |---|---|

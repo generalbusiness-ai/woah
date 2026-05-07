@@ -96,6 +96,14 @@
           "source": "verb :is_readable_by(actor_obj) rxd { return true; }"
         },
         {
+          "name": "match_names",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [] },
+          "source": "verb :match_names() rxd { let out = []; if (!this:is_readable_by(actor)) { return out; } let lines = this.text; for line in lines { if (typeof(line) == \"string\") { let trimmed = str_trim(line); if (trimmed) { out = out + [trimmed]; } } } return out; }"
+        },
+        {
           "name": "is_writable_by",
           "perms": "rxd",
           "direct_callable": true,

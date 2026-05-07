@@ -2117,9 +2117,19 @@ export class WooWorld {
         this.callDepth -= 1;
       }
     }
-    if (typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 0
-        && typeof result === "string" && result.length > maxChars) {
-      throw wooError("E_TOOBIG", `dispatch result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: result.length, max: maxChars });
+    if (typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 0) {
+      if (typeof result === "string" && result.length > maxChars) {
+        throw wooError("E_TOOBIG", `dispatch result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: result.length, max: maxChars });
+      }
+      if (Array.isArray(result)) {
+        let total = 0;
+        for (const entry of result) {
+          if (typeof entry === "string") total += entry.length;
+          if (total > maxChars) {
+            throw wooError("E_TOOBIG", `dispatch list result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: total, max: maxChars });
+          }
+        }
+      }
     }
     return result;
   }
@@ -6803,8 +6813,7 @@ export class WooWorld {
 
   private isActorForLook(item: ObjRef, present: ObjRef[]): boolean {
     if (present.includes(item)) return true;
-    if (this.objects.has(item) && this.objects.has("$block") && this.inheritsFrom(item, "$block")) return false;
-    return this.objects.has(item) && this.inheritsFrom(item, "$actor");
+    return this.objects.has(item) && this.inheritsFrom(item, "$player");
   }
 
   private async propOrNullForActorAsync(actor: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
@@ -7722,7 +7731,7 @@ export class WooWorld {
     names.push(obj.name);
     const [title] = await Promise.all([
       this.titleForLook(ctx, ctx.thisObj, id).catch(() => null),
-      this.addLocalNoteMatchNames(ctx, id, names)
+      this.addCatalogMatchNames(ctx, id, names)
     ]);
     if (typeof title === "string") names.push(title);
     const localAliases = this.propOrNull(id, "aliases");
@@ -7730,18 +7739,25 @@ export class WooWorld {
     return { id, names, aliases };
   }
 
-  private async addLocalNoteMatchNames(ctx: CallContext, id: ObjRef, names: string[]): Promise<void> {
-    if (!this.isDescendantOf(id, "$note")) return;
-    const color = this.propOrNullForActor(ctx.actor, id, "color");
-    if (typeof color === "string" && color && color !== "white") {
-      const objectName = this.object(id).name.trim() || "note";
-      names.push(`${color} note`, `the ${color} note`, `${color} ${objectName}`, `the ${color} ${objectName}`);
-    }
-    const text = await this.dispatch({ ...ctx, caller: ctx.thisObj, progr: ctx.actor }, id, "text", []).catch(() => null);
-    if (Array.isArray(text)) {
-      for (const line of text) {
-        if (typeof line === "string" && line.trim()) names.push(line.trim());
-      }
+  private async addCatalogMatchNames(ctx: CallContext, id: ObjRef, names: string[]): Promise<void> {
+    // Hard-cap the result so a hostile or accidentally-huge :match_names()
+    // can't blow up the matcher. Skip the dispatch entirely when the verb
+    // isn't defined; matching runs on every unhandled chat utterance, so
+    // avoiding a throw-on-miss for the common no-:match_names case matters.
+    if (!this.resolveVerbFrom(id, "match_names", false)) return;
+    const result = await this.dispatch(
+      { ...ctx, caller: ctx.thisObj, progr: ctx.actor },
+      id,
+      "match_names",
+      [],
+      undefined,
+      4096
+    ).catch(() => null);
+    if (!Array.isArray(result)) return;
+    for (const entry of result) {
+      if (typeof entry !== "string") continue;
+      const trimmed = entry.trim();
+      if (trimmed) names.push(trimmed);
     }
   }
 

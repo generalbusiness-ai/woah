@@ -57,6 +57,12 @@
           "source": "verb :title() rxd { if (this.last_pushed_at == 0) { return this.name + \" (disconnected)\"; } return this.name; }"
         },
         {
+          "name": "default_note_name",
+          "perms": "rxd",
+          "arg_spec": { "args": ["entry", "body"] },
+          "source": "verb :default_note_name(entry, body) rxd { let req = \"\"; if (typeof(entry) == \"map\" && has(entry, \"request\") && typeof(entry[\"request\"]) == \"string\") { req = str_trim(entry[\"request\"]); } if (!req) { return \"Horoscope reading\"; } let cap = 60; if (length(req) > cap) { req = str_slice(req, 1, cap - 3) + \"...\"; } return \"Horoscope: \" + req; }"
+        },
+        {
           "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,

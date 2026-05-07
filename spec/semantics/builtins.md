@@ -124,14 +124,24 @@ policy: parser conventions such as chat prefixes or room commands live in
 catalog source.
 
 When `max_chars` is supplied as a non-negative integer, the substrate enforces a
-size bound on the verb's return value: if the return is a string whose
-`length` exceeds `max_chars`, dispatch raises `E_TOOBIG` instead of returning
-the value, with `value = {verb, size, max}`. Non-string returns pass through
-unchanged. The bound is intentionally a hard cap rather than a silent truncation
-so callers must decide what to substitute when the verb's natural answer would
-not fit; pair it with a `try ... except err in (E_TOOBIG)` fallback when
-calling potentially-unbounded catalog affordances such as `:title()` or
-`:match_names()` from substrate paths that must not materialize unbounded text.
+size bound on the verb's return value:
+
+- If the return is a string whose `length` exceeds `max_chars`, dispatch raises
+  `E_TOOBIG` instead of returning the value.
+- If the return is a list, the substrate sums the `length` of every string
+  element (non-string elements are ignored for the count) and raises
+  `E_TOOBIG` if the running total exceeds `max_chars`. This is the natural
+  bound for `list<str>` affordances like `:match_names()` and `:aliases`
+  where high cardinality and per-element size are both unbounded by default.
+- Other return shapes (maps, numbers, objects, null) pass through unchanged.
+
+The error value is `{target, verb, size, max}`, where `size` is the offending
+string length or running total. The bound is intentionally a hard cap rather
+than a silent truncation so callers must decide what to substitute when the
+verb's natural answer would not fit; pair it with a
+`try ... except err in (E_TOOBIG)` fallback when calling potentially-unbounded
+catalog affordances such as `:title()` or `:match_names()` from substrate
+paths that must not materialize unbounded text.
 The bound is checked after the verb returns; v1 does not propagate the cap to
 remote hosts, so cross-host calls may transmit the full value before the local
 side enforces the limit.

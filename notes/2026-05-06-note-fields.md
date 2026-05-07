@@ -1,5 +1,29 @@
 # `$note` fields — title, description, body
 
+## Status: completed
+
+This note is historical. The horoscope-note inventory bug described below has
+been fixed by the compatible implementation path rather than by the full
+`$note` v0.2 `body: str` schema migration sketched later in this document.
+
+The completed change keeps the current `$note.text: list<str>` storage shape
+and makes producers set explicit note identity instead of relying on generated
+object names:
+
+- `$dispenser_block:deliver(order_id, body)` normalizes the delivered body,
+  asks hook verbs for a note name and description, creates the note with those
+  explicit fields, then stores the body in `note.text`.
+- `$dispenser_block:default_note_name(entry, body)` and
+  `$dispenser_block:default_note_description(entry, body)` provide bounded
+  defaults derived from the request.
+- `$horoscope_block:default_note_name(entry, body)` overrides the name to the
+  user-facing `"Horoscope: <sign>"` form.
+- Tests cover the long-single-line horoscope body case so inventory remains
+  bounded and the delivered note has useful `name` and `description` fields.
+
+The broader `body: str` migration discussion below remains useful background,
+but it is no longer an open prerequisite for the horoscope/dispenser bug.
+
 ## The bug
 
 Dispensed horoscope notes render their full content in inventory listings

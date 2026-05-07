@@ -10,7 +10,7 @@ import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
 import * as taskspaceUiModule from "../../catalogs/taskspace/ui/taskspace-workspace";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
-import { createWooClientFramework, escapeHtml, liveProjectionKey, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
@@ -270,6 +270,7 @@ function connect() {
       state.actor = frame.actor;
       state.session = frame.session;
       storeSession(frame.session);
+      projectionFiller.reset();
       render();
       try {
         await refresh();
@@ -1012,6 +1013,37 @@ function isCompleteScopedSummary(summary: any): boolean {
   if (Array.isArray(summary.ancestors) && summary.ancestors.length > 0) return true;
   if (summary.props && typeof summary.props === "object" && !Array.isArray(summary.props) && Object.keys(summary.props).length > 0) return true;
   return typeof summary.name === "string" && summary.name !== String(summary.id ?? "");
+}
+
+// Direct fetch path that ignores fetchScopedObjectSummary's "good enough for
+// navigation" cache shortcut: thin room-contents summaries carry parent and
+// ancestors, satisfying that shortcut, but still lack the props a title-badge
+// component needs. Field-level fills must hit the network.
+async function fetchObjectSummaryForFill(subject: string): Promise<void> {
+  const response = await fetch(`/api/objects/${encodeURIComponent(subject)}/summary`, { headers: authHeaders() });
+  if (!response.ok) throw new Error(`/api/objects/${subject}/summary ${response.status}`);
+  const summary = await response.json();
+  state.scopedObjectSummaries = { ...state.scopedObjectSummaries, [subject]: summary };
+  ui.ingestSnapshot(`summary:${subject}`, [summary]);
+}
+
+let projectionFillRenderQueued = false;
+const projectionFiller = new ProjectionFieldFiller(
+  (subject) => ui.observe(subject),
+  fetchObjectSummaryForFill,
+  () => {
+    if (projectionFillRenderQueued) return;
+    projectionFillRenderQueued = true;
+    queueMicrotask(() => {
+      projectionFillRenderQueued = false;
+      render();
+    });
+  }
+);
+
+function ensureProjectionFields(subject: string, fields: readonly string[]): void {
+  if (!scopedProjectionEnabled) return;
+  projectionFiller.ensure(subject, fields);
 }
 
 function tabForScopedSummary(id: string, summary: any): AppState["tab"] | undefined {
@@ -3331,6 +3363,7 @@ function roomTitleBadges(room: string): ChatTitleBadge[] {
       return typeof constraint === "string" && clientClassDistance(subject, constraint) !== false;
     });
     if (!component) continue;
+    ensureProjectionFields(subject, component.declaration.requires ?? []);
     const projected = ui.observe(subject) ?? item;
     badges.push({
       id: `${component.qualifiedId}:${subject}`,
