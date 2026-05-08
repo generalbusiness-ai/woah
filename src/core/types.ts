@@ -230,8 +230,28 @@ export type MetricEvent =
   | { kind: "broadcast"; audience_size: number; obs_count: number; ms: number; origin_session?: string }
   | { kind: "compose_look"; room: ObjRef; present_count: number; contents_count: number; remote_titles: number; remote_describe_batches: number; ms: number }
   | { kind: "cross_host_rpc"; route: string; host: string; ms: number; status: "ok" | "error" | "timeout"; error?: string; queue_ms?: number }
-  | { kind: "storage_flush"; objects: number; properties: number; sessions: number; deleted_sessions: number; tasks: number; deleted_tasks: number; counters: boolean; ms: number; top_properties?: Array<[string, number]>; top_objects?: Array<[ObjRef, number]> }
-  | { kind: "storage_direct_write"; what: "object" | "object_delete" | "property" | "property_delete" | "session" | "session_delete" | "task" | "task_delete" | "counters"; ms: number }
+  | { kind: "storage_flush"; objects: number; properties: number; sessions: number; deleted_sessions: number; tasks: number; deleted_tasks: number; counters: boolean; ms: number; rows?: number; top_properties?: Array<[string, number]>; top_objects?: Array<[ObjRef, number]> }
+  // `rows` is a logical-operations estimate, not a measured SQL row count.
+  // Single-row ops (`session`, `task`, `tombstone`, `snapshot`,
+  // `log_outcome`) report 1. Direct `property`/`property_delete` report 3
+  // (def/value/version rows), direct `counters` reports 3, flush `counters`
+  // reports 4 (version + three counters), and `log_append` reports 4 (3 from
+  // the implicit next_seq saveProperty plus the space_message insert).
+  // `log_truncate` is the only `what` that reports the engine-returned count
+  // (the DELETE's row total). For object writes the count is derived from the
+  // SerializedObject shape — `serializedObjectRowCount` in src/core/world.ts.
+  // Object deletes report 1 (the cascade DELETEs across property_def,
+  // property_value, property_version, verb, child, content, event_schema were
+  // already accounted for when those rows were last written; the metric is
+  // counting "logical persistence operations", not physical SQL row touches).
+  | { kind: "storage_direct_write"; what: "object" | "object_delete" | "property" | "property_delete" | "session" | "session_delete" | "task" | "task_delete" | "counters" | "log_append" | "log_outcome" | "snapshot" | "log_truncate" | "tombstone"; ms: number; rows?: number }
+  // Full-world rewrites (`repository.save`). One emission per call, regardless
+  // of backend. `trigger` names the call site so a regression like the May 2026
+  // counter-drift loop is visible from a single grep. `rows` follows the same
+  // logical-operations convention as `storage_direct_write` — it's the sum
+  // from `serializedWorldRowStats`, derived from SerializedWorld shape rather
+  // than measured against the SQL engine.
+  | { kind: "storage_full_save"; trigger: "world_persist" | "persist_full_snapshot" | "host_seed_apply"; rows: number; objects: number; properties: number; verbs: number; logs: number; snapshots: number; sessions: number; tasks: number; tombstones: number; ms: number }
   | { kind: "subscribers_write"; space: ObjRef; size: number; delta: number }
   | { kind: "applied"; space: ObjRef; seq: number; verb: string; ms: number }
   | { kind: "direct_call"; target: ObjRef; verb: string; audience: ObjRef | null; observations: number; ms: number; status: "ok" | "error"; error?: string }

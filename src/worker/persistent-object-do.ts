@@ -758,7 +758,7 @@ export class PersistentObjectDO {
     const merged = mergeHostScopedSeedWithStatus(current, scopedSeed);
     if (merged.changed) {
       world.importWorld(merged.world);
-      world.persistFullSnapshot();
+      world.persistFullSnapshot("host_seed_apply");
       this.hostStateCache.clear();
       this.crossHostPropCache.clear();
     }
