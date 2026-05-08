@@ -1,6 +1,6 @@
 ---
 name: prog
-version: 0.1.0
+version: 0.2.0
 spec_version: v1
 license: MIT
 description: Builder and programmer tooling for in-world authoring.
@@ -163,6 +163,7 @@ The catalog ships once these are in place:
 | `set_property_info(id, name, opts?)` | Define/update property metadata, perms, defaults, and type hints. |
 | `edit_verb(id, descriptor, opts?)` | Enter the verb editor room for a per-actor source-buffer session. |
 | `trace(id, verb_name, opts?)` | Next-N-invocations source-span trace. v1.1. |
+| `eval(source, opts?)` | Compile and run a Woo expression (`opts.mode="expr"`, default) or statement block (`opts.mode="stmts"`) under the invoking actor's `progr`. `opts.dry_run=true` compiles only. Chat alias: `;expr` and `;;stmts`. |
 
 ### Editor tools
 
@@ -270,9 +271,11 @@ surfaces. See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor
 - **Bytecode or VM tools in v1**. The authoring surface is source-level.
   Diagnostics and traces use source spans. Add a separate expert-only
   disassembler later only if operators need runtime debugging at that level.
-- **`eval` in v1**. LambdaCore's `$no_one` proves that powerless eval is useful,
-  but it is a separate safety story. First ship dry-run/install against real
-  verbs; add read-only or `$no_one`-style eval later if agents need it.
+- **`$no_one`-style sandboxed eval**. Programmer `eval` runs under the invoking
+  actor's `progr` and is the largest authority surface in the catalog; it is
+  gated by `assertProgrammerActor` (wizard or progbit + `$programmer` ancestry).
+  A powerless reduced-authority eval (LambdaCore's `$no_one`) is a separate
+  safety story and is not yet provided.
 - **`profile`**. The metric stream already covers it; promote when an agent
   explicitly asks.
 - **Refactor primitives** (`rename_verb`, `rename_property`). Dynamic dispatch

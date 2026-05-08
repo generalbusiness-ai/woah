@@ -146,4 +146,9 @@ name is supplied at runtime.
 - No `async`/`await` (everything is implicitly suspendable).
 - No `import` (verbs cannot pull in other modules in v1).
 - No prototype manipulation.
-- No `eval` (compilation is explicit via `setVerb`).
+- No DSL-level `eval(string)` builtin. Programmer authoring includes a
+  `$programmer:eval(source, opts?)` verb (catalog `prog`, with chat aliases
+  `;expr` and `;;stmts`) that compiles and runs source through the same path
+  as `setVerb`-style installs, but the wrapped verb runs as the invoking
+  programmer's `progr` and is never persisted. The DSL itself stays free of
+  string-to-bytecode primitives.

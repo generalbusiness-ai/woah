@@ -122,7 +122,8 @@ export const BUILTIN_NAMES = [
   // New entries MUST be appended; spec/semantics/builtins.md §19 fixes numeric
   // indices, and persisted bytecode encodes builtins by index. Mid-list inserts
   // would shift every later index and misdispatch already-stored verbs.
-  "str_split"
+  "str_split",
+  "programmer_eval"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1083,6 +1084,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "programmer_install_verb":
         if (builtinArgs.length < 3 || builtinArgs.length > 4) throw wooError("E_INVARG", "programmer_install_verb expects object, descriptor, source, and optional opts");
         return await frame.ctx.world.programmerInstallVerb(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], assertString(builtinArgs[2]), builtinArgs[3] ?? null, frame.ctx.definer);
+      case "programmer_eval":
+        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "programmer_eval expects source and optional opts");
+        return await frame.ctx.world.programmerEval(frame.ctx, assertString(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
       case "programmer_set_verb_info":
         if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "programmer_set_verb_info expects object, descriptor, and optional opts");
         return await frame.ctx.world.programmerSetVerbInfo(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], builtinArgs[2] ?? null, frame.ctx.definer);
