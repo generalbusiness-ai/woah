@@ -4575,11 +4575,15 @@ export class WooWorld {
 
   exportHostScopedWorld(host: ObjRef): SerializedWorld {
     const scope = this.hostScope(host);
+    const parkedTasks = Array.from(this.parkedTasks.values())
+      .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
+      .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord);
     return {
       version: 1,
-      objectCounter: this.objectCounter,
-      parkedTaskCounter: this.parkedTaskCounter,
-      sessionCounter: this.sessionCounter,
+      objectCounter: nextScopedObjectCounter(scope.objects),
+      parkedTaskCounter: nextScopedParkedTaskCounter(parkedTasks),
+      // Sessions are not exported, so this seed contributes nothing about session allocation.
+      sessionCounter: 1,
       objects: Array.from(scope.objects)
         .sort()
         .map((id) => this.serializeScopedObject(this.object(id), scope.objects, scope.hostedObjects)),
@@ -4590,9 +4594,7 @@ export class WooWorld {
       snapshots: (this.snapshots ?? [])
         .filter((snapshot) => scope.hostedSpaces.has(snapshot.space_id))
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
-      parkedTasks: Array.from(this.parkedTasks.values())
-        .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
-        .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
+      parkedTasks,
       tombstones: Array.from(this.tombstones).sort()
     };
   }
@@ -8221,6 +8223,30 @@ function normalizeHelpTopic(value: string): string {
 function runtimeObjectScope(value: ObjRef): string {
   const cleaned = value.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   return cleaned || "world";
+}
+
+function nextScopedObjectCounter(ids: Iterable<ObjRef>): number {
+  // Mirrors the createRuntimeObject/createBuilderObject allocator format: obj_<scope>_<counter>.
+  let next = 1;
+  for (const id of ids) {
+    const match = /^obj_.+_(\d+)$/.exec(id);
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (Number.isSafeInteger(value) && value >= next) next = value + 1;
+  }
+  return next;
+}
+
+function nextScopedParkedTaskCounter(tasks: readonly ParkedTaskRecord[]): number {
+  // Mirrors the scheduleFork/park*Continuation allocator format: ptask_<counter>.
+  let next = 1;
+  for (const task of tasks) {
+    const match = /^ptask_(\d+)$/.exec(task.id);
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (Number.isSafeInteger(value) && value >= next) next = value + 1;
+  }
+  return next;
 }
 
 function isPlainValueMap(value: WooValue | undefined): value is Record<string, WooValue> {
