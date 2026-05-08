@@ -710,7 +710,7 @@ describe("McpGateway", () => {
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
-      params: { name: createName, arguments: { title: "via gateway", description: "from MCP" } }
+      params: { name: createName, arguments: { name: "via gateway", text: "from MCP" } }
     }, { "mcp-session-id": sessionId! }));
     expect(call.ok).toBe(true);
     const callBody = (await call.json()) as { result: { isError?: boolean; structuredContent?: { applied?: { space: string; seq: number } } } };

@@ -1,9 +1,9 @@
 ---
 name: horoscope
-version: 0.1.1
+version: 0.2.0
 spec_version: v1
 license: MIT
-description: Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM.
+description: Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The plug derives a clean inventory name (`Horoscope: Scorpio`) from the request and delivers it alongside the markdown body.
 keywords:
   - block
   - dispenser
@@ -24,7 +24,9 @@ on the class, while deployed horoscope machines are ordinary instances.
 The plug Worker lives at [`plug/`](plug/). It runs on a short cron
 trigger, reads `pending_orders` via the apikey-bound REST surface,
 calls Workers AI (`@cf/meta/llama-3.2-1b-instruct`) with
-`system_prompt + request`, and calls `:deliver(order_id, body)`.
+`system_prompt + request`, and calls `:deliver(order_id, name, text)`
+with a derived listing name (e.g. `"Horoscope: Scorpio"`) and the LLM
+reply as the note text.
 
 See [DESIGN.md](DESIGN.md) for design notes.
 

@@ -2,6 +2,7 @@ import { escapeHtml, type WooComponentRegistry, type WooContext } from "../../..
 
 export type TaskspaceTask = {
   id: string;
+  name?: string;
   props: Record<string, unknown>;
 };
 
@@ -95,9 +96,9 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     return `
       <div class="task-node" style="--depth:${depth}">
         <div class="task-row ${selected ? "selected" : ""} ${matches ? "" : "filtered-context"}">
-          <button class="task-toggle" data-toggle-task="${escapeHtml(id)}" aria-label="Toggle ${escapeHtml(String(props.title ?? id))}" ${subtasks.length === 0 ? "disabled" : ""}>${subtasks.length === 0 ? "" : expanded ? "-" : "+"}</button>
+          <button class="task-toggle" data-toggle-task="${escapeHtml(id)}" aria-label="Toggle ${escapeHtml(String(task.name ?? id))}" ${subtasks.length === 0 ? "disabled" : ""}>${subtasks.length === 0 ? "" : expanded ? "-" : "+"}</button>
           <button class="task-select" data-select-task="${escapeHtml(id)}">
-            <span class="task-title">${escapeHtml(String(props.title ?? id))}</span>
+            <span class="task-title">${escapeHtml(String(task.name ?? id))}</span>
             <span class="task-meta">
               <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
               <span>${escapeHtml(String(props.assignee ? this.actorLabel(String(props.assignee)) : "unassigned"))}</span>
@@ -120,8 +121,8 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     return `
       <div class="task-inspector-head">
         <div>
-          <h2>${escapeHtml(String(props.title ?? task.id ?? ""))}</h2>
-          <p>${escapeHtml(String(props.description ?? "No description."))}</p>
+          <h2>${escapeHtml(String(task.name ?? task.id ?? ""))}</h2>
+          <p>${escapeHtml(String(props.text ?? "No description."))}</p>
         </div>
         <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
       </div>
@@ -167,7 +168,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     const props = task.props ?? {};
     return `
       <button class="related-task" data-select-task="${escapeHtml(id)}">
-        <span>${escapeHtml(String(props.title ?? id))}</span>
+        <span>${escapeHtml(String(task.name ?? id))}</span>
         <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
       </button>
     `;
@@ -188,16 +189,16 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     this.querySelectorAll<HTMLButtonElement>("[data-task-status]").forEach((button) => button.addEventListener("click", () => this.dispatch("status-filter", { status: button.dataset.taskStatus ?? "" })));
     this.querySelector<HTMLButtonElement>("[data-create-task]")?.addEventListener("click", () => {
       this.dispatch("create", {
-        title: this.querySelector<HTMLInputElement>("[data-new-title]")?.value ?? "",
-        description: this.querySelector<HTMLInputElement>("[data-new-description]")?.value ?? ""
+        name: this.querySelector<HTMLInputElement>("[data-new-title]")?.value ?? "",
+        text: this.querySelector<HTMLInputElement>("[data-new-description]")?.value ?? ""
       });
     });
     this.querySelectorAll<HTMLButtonElement>("[data-toggle-task]").forEach((button) => button.addEventListener("click", () => this.dispatch("toggle", { id: button.dataset.toggleTask ?? "" })));
     this.querySelectorAll<HTMLButtonElement>("[data-select-task]").forEach((button) => button.addEventListener("click", () => this.dispatch("select", { id: button.dataset.selectTask ?? "" })));
     this.querySelectorAll<HTMLButtonElement>("[data-task-action]").forEach((button) => button.addEventListener("click", () => this.dispatch("task-action", { action: button.dataset.taskAction ?? "" })));
     this.querySelector<HTMLButtonElement>("[data-add-subtask]")?.addEventListener("click", () => this.dispatch("add-subtask", {
-      title: this.querySelector<HTMLInputElement>("[data-subtask-title]")?.value ?? "",
-      description: this.querySelector<HTMLInputElement>("[data-subtask-description]")?.value ?? ""
+      name: this.querySelector<HTMLInputElement>("[data-subtask-title]")?.value ?? "",
+      text: this.querySelector<HTMLInputElement>("[data-subtask-description]")?.value ?? ""
     }));
     this.querySelector<HTMLButtonElement>("[data-add-requirement]")?.addEventListener("click", () => this.dispatch("add-requirement", { text: this.querySelector<HTMLInputElement>("[data-requirement]")?.value ?? "" }));
     this.querySelectorAll<HTMLInputElement>("[data-check-req]").forEach((input) => input.addEventListener("change", () => this.dispatch("check-requirement", { index: Number(input.dataset.checkReq), checked: input.checked })));

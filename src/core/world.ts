@@ -813,6 +813,28 @@ export class WooWorld {
     return obj.verbs[writtenIndex];
   }
 
+  removeVerb(objRef: ObjRef, name: string): boolean {
+    const obj = this.object(objRef);
+    const before = obj.verbs.length;
+    obj.verbs = obj.verbs.filter((verb) => verb.name !== name);
+    if (obj.verbs.length === before) return false;
+    this.reindexVerbs(obj);
+    this.persistObject(objRef);
+    this.persist();
+    return true;
+  }
+
+  setObjectName(objRef: ObjRef, name: string): void {
+    // Keep both name surfaces in sync: WooObject.name (SerializedObject /
+    // ScopedObjectSummary) and the inherited "name" property (woocode
+    // `this.name`). Different consumers read different surfaces.
+    const obj = this.object(objRef);
+    obj.name = name;
+    obj.modified = Date.now();
+    this.persistObject(objRef);
+    this.setProp(objRef, "name", name);
+  }
+
   ownVerb(objRef: ObjRef, name: string): VerbDef | null {
     return this.ownVerbNamed(objRef, name);
   }

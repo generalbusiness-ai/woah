@@ -13,7 +13,7 @@ Sketch of the v1 builtin function set (registered with stable indices for the `B
 
 ## 19. Builtins (sketch — not exhaustive)
 
-Builtins are functions, not verbs. They are registered with stable indices for the `BUILTIN` opcode. The list will grow; v1 minimum below. **New builtins MUST be appended** to the registry — never inserted mid-list — so persisted bytecode that encodes a builtin by numeric index keeps dispatching to the same function.
+Builtins are functions, not verbs. They are registered with stable indices for the `BUILTIN` opcode. The list will grow; v1 minimum:
 
 ### 19.1 Core
 
@@ -25,18 +25,13 @@ Builtins are functions, not verbs. They are registered with stable indices for t
 ### 19.2 String
 
 `str_slice(s, from, to?)` / `strsub(s, from, to)`, `str_index(s, sub)` / `index(s, sub)`, `rindex`, `match(s, pattern)`, `pcre`,  
-`str_lower(s)` / `tolower`, `toupper`, `str_trim(s)` / `trim`, `str_starts(s, prefix)`, `str_char(codepoint)`, `str_split(s, sep)`, `str_join(list, sep)` / `join(list, sep)`,
+`str_lower(s)` / `tolower`, `toupper`, `str_trim(s)` / `trim`, `str_starts(s, prefix)`, `str_char(codepoint)`, `split(s, sep)`, `str_join(list, sep)` / `join(list, sep)`,
 `encode_json(v)`, `decode_json(s)`.
 
 `str_join(list, sep)` joins the list with a string separator. String elements
 are used directly; non-string elements are converted with the runtime's ordinary
 JSON-style value rendering. Callers that need a particular presentation should
 convert values explicitly before joining.
-
-`str_split(s, sep)` returns a list of strings produced by splitting `s` on each
-occurrence of `sep`. An empty `sep` returns the per-character list. The empty
-string splits to `[""]`. `str_split(str_join(parts, sep), sep)` round-trips when
-no element of `parts` contains `sep`.
 
 ### 19.3 List / map
 
@@ -121,35 +116,12 @@ tasks. `current_location()` returns the current session's location or `null`.
 sessions of an actor; for non-actors it returns the object's ordinary location
 as a singleton list, or `[]` when there is none.
 
-`dispatch(obj, verb, args?, start_at?, max_chars?)` invokes the normal
-verb-dispatch path from source code, using the current task permissions. Catalog
-code that wants to route a command as the calling actor should first call
+`dispatch(obj, verb, args?, start_at?)` invokes the normal verb-dispatch path
+from source code, using the current task permissions. Catalog code that wants to
+route a command as the calling actor should first call
 `set_task_perms(caller_perms())`. `dispatch` is a mechanism, not a command
 policy: parser conventions such as chat prefixes or room commands live in
 catalog source.
-
-When `max_chars` is supplied as a non-negative integer, the substrate enforces a
-size bound on the verb's return value:
-
-- If the return is a string whose `length` exceeds `max_chars`, dispatch raises
-  `E_TOOBIG` instead of returning the value.
-- If the return is a list, the substrate sums the `length` of every string
-  element (non-string elements are ignored for the count) and raises
-  `E_TOOBIG` if the running total exceeds `max_chars`. This is the natural
-  bound for `list<str>` affordances like `:match_names()` and `:aliases`
-  where high cardinality and per-element size are both unbounded by default.
-- Other return shapes (maps, numbers, objects, null) pass through unchanged.
-
-The error value is `{target, verb, size, max}`, where `size` is the offending
-string length or running total. The bound is intentionally a hard cap rather
-than a silent truncation so callers must decide what to substitute when the
-verb's natural answer would not fit; pair it with a
-`try ... except err in (E_TOOBIG)` fallback when calling potentially-unbounded
-catalog affordances such as `:title()` or `:match_names()` from substrate
-paths that must not materialize unbounded text.
-The bound is checked after the verb returns; v1 does not propagate the cap to
-remote hosts, so cross-host calls may transmit the full value before the local
-side enforces the limit.
 
 `execute_command_plan(plan)` consumes a command plan produced by
 `$match:plan_command`. Direct plans execute through the normal dispatch path and
@@ -257,7 +229,6 @@ override uses these to surface `is sleeping` / `awake and looks alert` /
 | `E_CONFLICT` | State conflict (e.g., already claimed by another actor). |
 | `E_PRECONDITION` | Required condition was not met. |
 | `E_QUOTA` | Resource quota exceeded. |
-| `E_TOOBIG` | Caller-imposed `max_chars` size bound exceeded by a verb return value. |
 | `E_FLOAT` | Floating-point exception. |
 | `E_TICKS` | Tick limit exceeded. |
 | `E_MEM` | Memory limit exceeded. |

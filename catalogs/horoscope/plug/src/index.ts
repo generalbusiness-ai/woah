@@ -161,19 +161,20 @@ export async function runHoroscopeTick(
     if (!next || typeof next !== "object" || !next.order_id) break;
 
     try {
-      const body = await generateHoroscope(env.AI, {
+      const text = await generateHoroscope(env.AI, {
         systemPrompt,
         request: next.request,
         maxTokens
       });
-      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, body]);
+      const name = horoscopeNoteName(next.request);
+      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, name, text]);
       delivered++;
       logEvent({
         event: "order_delivered",
         block: env.BLOCK_ID,
         order_id: next.order_id,
         requester: next.requester,
-        body_chars: body.length
+        text_chars: text.length
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -205,6 +206,22 @@ function numEnv(value: string | undefined, fallback: number): number {
   if (value === undefined || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+// Build the inventory listing name for a delivered horoscope from the
+// requester's order text. Most requests are a sign or short topic; we
+// title-case them and prefix with "Horoscope:" so an inventory line reads
+// "Horoscope: Capricorn" instead of leaking body content into the title.
+export function horoscopeNoteName(request: string): string {
+  const trimmed = (request ?? "").trim();
+  if (!trimmed) return "Horoscope reading";
+  const head = trimmed.split(/\s+/).slice(0, 4).join(" ");
+  const truncated = head.length > 40 ? head.slice(0, 40).trimEnd() : head;
+  const titled = truncated.replace(
+    /\b([a-z])([a-z']*)/gi,
+    (_, first: string, rest: string) => first.toUpperCase() + rest.toLowerCase()
+  );
+  return `Horoscope: ${titled}`;
 }
 
 // Single line of JSON to console — CF Workers' Logs tab parses it

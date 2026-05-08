@@ -8,10 +8,10 @@
         "type": "object",
         "properties": {
           "space": { "type": "string" },
-          "title": { "type": "string" },
-          "description": { "type": "string" }
+          "name": { "type": "string" },
+          "text": { "type": "string" }
         },
-        "required": ["space", "title"]
+        "required": ["space", "name"]
       }
     },
     {
@@ -42,4 +42,3 @@
     }
   ]
 }
-

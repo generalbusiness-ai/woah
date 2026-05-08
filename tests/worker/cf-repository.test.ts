@@ -741,7 +741,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       const wizardAuth = await post("/api/auth", { token: "wizard:cf-smoke-token" });
       expect(wizardAuth.status).toBe(200);
       const wizardSession = String(wizardAuth.body.session);
-      const deliver = await post("/api/objects/the_horoscope/calls/deliver", { args: [orderId, "The stars prefer bounded route tables."] }, wizardSession);
+      const deliver = await post("/api/objects/the_horoscope/calls/deliver", { args: [orderId, "Horoscope: Gemini", "The stars prefer bounded route tables."] }, wizardSession);
       expect(deliver.status).toBe(200);
       const deliveredNote = String((deliver.body.result as { note: string }).note);
       const lookDeliveredNote = await post("/api/objects/the_deck/calls/look_at", {

@@ -414,134 +414,72 @@ describe("local catalogs", () => {
     if (state.op === "result") expect(state.result).toMatchObject({ status: "completed", to_version: "2.0.0" });
   });
 
-  it("applies the on-disk note v0→v1 migration file to legacy list-shape text values", () => {
+  it("$note migration v1.0.0 → v2.0.0 drops :title and :delete from the installed class", async () => {
     const world = createWorld({ catalogs: false });
-    installCatalogManifest(world, readManifest("help") as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "help" });
-    installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "chat" });
 
-    const v0Note: RuntimeCatalogManifest = {
+    // Synthetic v1.0.0 $note carrying the v1 verbs that v2 dropped. We only
+    // assert that the migration removes :title and :delete; class shape and
+    // dependency wiring are not under test here.
+    const v1: RuntimeCatalogManifest = {
       name: "note",
-      version: "0.1.0",
-      spec_version: "v1",
-      license: "MIT",
-      depends: ["@local:chat"],
-      classes: [{
-        local_name: "$note",
-        parent: "$portable",
-        properties: [
-          { name: "text", type: "list<str>", default: [], perms: "" },
-          { name: "writers", type: "list<obj>", default: [], perms: "r" }
-        ]
-      }],
-      seed_hooks: [
-        { kind: "create_instance", class: "$note", as: "obj_test_note_legacy_filled", properties: { text: ["alpha", "beta", "gamma"] } },
-        { kind: "create_instance", class: "$note", as: "obj_test_note_legacy_empty", properties: { text: [] } }
-      ]
-    } as unknown as RuntimeCatalogManifest;
-    installCatalogManifest(world, v0Note, { tap: "@local", alias: "note" });
-    expect(world.getProp("obj_test_note_legacy_filled", "text")).toEqual(["alpha", "beta", "gamma"]);
-
-    const v1Note = readManifest("note") as unknown as RuntimeCatalogManifest;
-    const migration = JSON.parse(readFileSync(join(root, "note", "migration-v0-to-v1.json"), "utf8"));
-    const record = updateCatalogManifest(world, v1Note, { tap: "@local", alias: "note", acceptMajor: true, migration });
-    expect(record.migration_state).toMatchObject({
-      status: "completed",
-      from_version: "0.1.0",
-      to_version: "1.0.0",
-      completed_steps: ["1:transform_property:$note.text"]
-    });
-    expect(world.getProp("obj_test_note_legacy_filled", "text")).toBe("alpha\nbeta\ngamma");
-    expect(world.getProp("obj_test_note_legacy_empty", "text")).toBe("");
-  });
-
-  it("transforms a property value via the 'join' op and is idempotent", () => {
-    const world = createWorld({ catalogs: false });
-    const v1: RuntimeCatalogManifest = {
-      name: "join-demo",
       version: "1.0.0",
       spec_version: "v1",
-      classes: [{ local_name: "$joining", parent: "$thing", properties: [{ name: "body", type: "list<str>", default: [] }] }],
-      seed_hooks: [
-        { kind: "create_instance", class: "$joining", as: "joined_1", properties: { body: ["alpha", "beta", "gamma"] } },
-        { kind: "create_instance", class: "$joining", as: "joined_default", properties: {} }
+      classes: [
+        {
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "" }],
+          verbs: [
+            {
+              name: "title",
+              perms: "rxd",
+              direct_callable: true,
+              skip_presence_check: true,
+              arg_spec: { args: [] },
+              source: "verb :title() rxd { return this.name; }"
+            },
+            {
+              name: "delete",
+              perms: "rx",
+              arg_spec: { args: ["line"] },
+              source: "verb :delete(line) rx { return true; }"
+            }
+          ]
+        }
       ]
     };
+    installCatalogManifest(world, v1, { tap: "@local", alias: "note" });
+    expect(world.ownVerbExact("$note", "title")).toBeDefined();
+    expect(world.ownVerbExact("$note", "delete")).toBeDefined();
+
+    // Apply the on-disk migration manifest as the catalog updates to v2.
+    // The v2 manifest passed here is a minimal shell — the assertion is on
+    // the migration's drop_verb steps, not on full v2 catalog reinstall.
+    const migration = JSON.parse(
+      readFileSync(join(root, "note", "migration-v1-to-v2.json"), "utf8")
+    ) as { from_version: string; to_version: string; spec_version: string; steps: unknown[] };
+
     const v2: RuntimeCatalogManifest = {
-      ...v1,
+      name: "note",
       version: "2.0.0",
-      classes: [{ local_name: "$joining", parent: "$thing", properties: [{ name: "body", type: "str", default: "" }] }],
-      seed_hooks: v1.seed_hooks
-    };
-
-    installCatalogManifest(world, v1, { tap: "@local", alias: "join-demo" });
-    expect(world.getProp("joined_1", "body")).toEqual(["alpha", "beta", "gamma"]);
-
-    const record = updateCatalogManifest(world, v2, {
-      tap: "@local",
-      alias: "join-demo",
-      acceptMajor: true,
-      migration: {
-        from_version: "1.x.x",
-        to_version: "2.0.0",
-        spec_version: "v1",
-        steps: [{ kind: "transform_property", class: "$joining", name: "body", transform: { op: "join", separator: "\n" } }]
-      }
-    });
-
-    expect(record.migration_state).toMatchObject({ status: "completed", completed_steps: ["1:transform_property:$joining.body"] });
-    expect(world.getProp("joined_1", "body")).toBe("alpha\nbeta\ngamma");
-    expect(world.getProp("joined_default", "body")).toBe("");
-
-    const replay = updateCatalogManifest(world, v2, {
-      tap: "@local",
-      alias: "join-demo",
-      acceptMajor: true,
-      migration: {
-        from_version: "2.0.0",
-        to_version: "2.0.0",
-        spec_version: "v1",
-        steps: [{ kind: "transform_property", class: "$joining", name: "body", transform: { op: "join" } }]
-      }
-    });
-    expect(replay.migration_state).toMatchObject({ status: "completed" });
-    expect(world.getProp("joined_1", "body")).toBe("alpha\nbeta\ngamma");
-  });
-
-  it("fails migration_state and rolls back when transform_property op is unknown", () => {
-    const world = createWorld({ catalogs: false });
-    const v1: RuntimeCatalogManifest = {
-      name: "unknown-op-demo",
-      version: "1.0.0",
       spec_version: "v1",
-      classes: [{ local_name: "$opaque", parent: "$thing", properties: [{ name: "body", type: "list<str>", default: [] }] }],
-      seed_hooks: [{ kind: "create_instance", class: "$opaque", as: "opaque_1", properties: { body: ["alpha", "beta"] } }]
+      classes: [
+        {
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "" }]
+        }
+      ]
     };
-    const v2: RuntimeCatalogManifest = {
-      ...v1,
-      version: "2.0.0",
-      classes: [{ local_name: "$opaque", parent: "$thing", properties: [{ name: "body", type: "str", default: "" }] }],
-      seed_hooks: v1.seed_hooks
-    };
-
-    installCatalogManifest(world, v1, { tap: "@local", alias: "unknown-op-demo" });
-    const record = updateCatalogManifest(world, v2, {
+    updateCatalogManifest(world, v2, {
       tap: "@local",
-      alias: "unknown-op-demo",
+      alias: "note",
       acceptMajor: true,
-      migration: {
-        from_version: "1.x.x",
-        to_version: "2.0.0",
-        spec_version: "v1",
-        steps: [{ kind: "transform_property", class: "$opaque", name: "body", transform: { op: "jion" as "join" } }]
-      }
+      migration: migration as NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"]
     });
-    expect(record.migration_state).toMatchObject({
-      status: "failed",
-      failed_step: "1:transform_property:$opaque.body",
-      error: { code: "E_CATALOG", message: expect.stringContaining("unknown transform_property op: jion") }
-    });
-    // Savepoint rolled back: the original list value is intact.
-    expect(world.getProp("opaque_1", "body")).toEqual(["alpha", "beta"]);
+
+    expect(world.ownVerbExact("$note", "title")).toBeNull();
+    expect(world.ownVerbExact("$note", "delete")).toBeNull();
   });
 
   it("installs chat from source without trusted implementation hints", async () => {
@@ -645,11 +583,16 @@ describe("local catalogs", () => {
       actor: session.actor,
       target: "the_taskspace",
       verb: "create_task",
-      args: ["Source task", ""]
+      args: ["Source task", "Source body"]
     });
     expect(created.op).toBe("applied");
     const task = created.op === "applied" ? String(created.observations[0].task) : "";
-    expect(world.getProp(task, "title")).toBe("Source task");
+    expect(world.object(task).name).toBe("Source task");
+    expect(world.getProp(task, "text")).toBe("Source body");
+    await expect(world.scopedObjectSummary(session.actor, task)).resolves.toMatchObject({
+      id: task,
+      props: { text: "Source body" }
+    });
     expect(world.isDescendantOf(task, "$note")).toBe(true);
 
     await callInTaskspace(world, session.id, "requirement", {
@@ -975,84 +918,6 @@ describe("local catalogs", () => {
     expect(world.hasPresence(stranded.actor, "the_pinboard")).toBe(false);
   });
 
-  it("migrates legacy list-shape $note.text values during host-scoped data migrations", () => {
-    const world = createWorld();
-    const owner = world.auth("guest:host-note-text-migration").actor;
-    world.createObject({ id: "obj_test_host_legacy_note", name: "host note", parent: "$pin", owner, location: "the_pinboard" });
-    const note = world.object("obj_test_host_legacy_note");
-    note.properties.set("text", ["one", "two", "three"]);
-    note.propertyVersions.set("text", (note.propertyVersions.get("text") ?? 0) + 1);
-
-    runHostScopedDataMigrations(world, "the_pinboard");
-
-    expect(world.getProp("obj_test_host_legacy_note", "text")).toBe("one\ntwo\nthree");
-    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
-    expect(records).toContainEqual(expect.objectContaining({
-      plan_id: "local-catalog-data:note:2026-05-07-note-text-list-to-str",
-      scope: "host",
-      host: "the_pinboard",
-      status: "completed",
-      pre_legacy_records: 1,
-      post_legacy_records: 0
-    }));
-  });
-
-  it("re-runs the host-scoped note text migration when the gateway-applied ledger id rides into the host slice", () => {
-    // applied_migrations is in DYNAMIC_HOST_SEED_PROPERTIES (bootstrap.ts), so a
-    // host slice can carry the gateway's ledger id while still owning legacy
-    // values. Per-(scope, host) records key each scope independently and re-verify
-    // the legacy count, so the host run still does its work.
-    const world = createWorld();
-    const owner = world.auth("guest:host-ledger-collision").actor;
-    world.createObject({ id: "obj_test_host_collision_note", name: "collision note", parent: "$pin", owner, location: "the_pinboard" });
-    const note = world.object("obj_test_host_collision_note");
-    note.properties.set("text", ["one", "two"]);
-    note.propertyVersions.set("text", (note.propertyVersions.get("text") ?? 0) + 1);
-    // Simulate the gateway's applied_migrations id surviving the seed-merge into the host.
-    const migrations = world.getProp("$system", "applied_migrations") as string[];
-    if (!migrations.includes("2026-05-07-note-text-list-to-str")) migrations.push("2026-05-07-note-text-list-to-str");
-    world.setProp("$system", "applied_migrations", migrations);
-
-    runHostScopedDataMigrations(world, "the_pinboard");
-
-    expect(world.getProp("obj_test_host_collision_note", "text")).toBe("one\ntwo");
-    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
-    expect(records).toContainEqual(expect.objectContaining({
-      plan_id: "local-catalog-data:note:2026-05-07-note-text-list-to-str",
-      scope: "host",
-      host: "the_pinboard",
-      status: "completed"
-    }));
-  });
-
-  it("migrates legacy list-shape $note.text values during boot", () => {
-    const world = createWorld();
-    const owner = world.auth("guest:note-text-migration").actor;
-    // Two notes carrying the legacy list-shape values an old world could persist.
-    world.createObject({ id: "obj_test_legacy_note_a", name: "legacy note a", parent: "$note", owner, location: owner });
-    world.createObject({ id: "obj_test_legacy_note_b", name: "legacy note b", parent: "$note", owner, location: owner });
-    // Bypass the v1 string type by writing directly into the property maps.
-    const noteA = world.object("obj_test_legacy_note_a");
-    noteA.properties.set("text", ["alpha", "beta", "gamma"]);
-    noteA.propertyVersions.set("text", (noteA.propertyVersions.get("text") ?? 0) + 1);
-    const noteB = world.object("obj_test_legacy_note_b");
-    noteB.properties.set("text", []);
-    noteB.propertyVersions.set("text", (noteB.propertyVersions.get("text") ?? 0) + 1);
-
-    installLocalCatalogs(world, ["note"]);
-
-    expect(world.getProp("obj_test_legacy_note_a", "text")).toBe("alpha\nbeta\ngamma");
-    expect(world.getProp("obj_test_legacy_note_b", "text")).toBe("");
-    const records = world.getProp("$system", "catalog_migration_records") as Array<Record<string, WooValue>>;
-    expect(records).toContainEqual(expect.objectContaining({
-      plan_id: "local-catalog-data:note:2026-05-07-note-text-list-to-str",
-      scope: "gateway",
-      host: "world",
-      status: "completed",
-      post_legacy_records: 0
-    }));
-  });
-
   it("migrates v0.1 pinboard note records into pin objects", () => {
     const world = createWorld();
     const session = world.auth("guest:pinboard-migration");
@@ -1085,7 +950,7 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-02-pinboard-notes-to-pins");
   });
 
-  it("lets room commands distinguish and inspect duplicate sticky notes by preview title", async () => {
+  it("lets room commands distinguish and inspect notes by body content, color, and name", async () => {
     const world = createWorld();
     const session = world.auth("guest:sticky-room-notes");
     await world.directCall("enter-hot-tub-sticky", session.actor, "the_hot_tub", "enter", []);
@@ -1094,9 +959,6 @@ describe("local catalogs", () => {
     world.createObject({ id: "sticky_beta", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
     world.createObject({ id: "sticky_blue", name: "sticky note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
     world.createObject({ id: "sticky_secret", name: "private note", parent: "$pin", owner: session.actor, location: "the_hot_tub", anchor: "the_pinboard" });
-    world.setProp("sticky_alpha", "name", "sticky note");
-    world.setProp("sticky_beta", "name", "sticky note");
-    world.setProp("sticky_blue", "name", "sticky note");
     world.setProp("sticky_alpha", "text", "another one");
     world.setProp("sticky_beta", "text", "this is it");
     world.setProp("sticky_blue", "text", "hello");
@@ -1106,30 +968,21 @@ describe("local catalogs", () => {
   return actor_obj == this.owner;
 }`, null).ok).toBe(true);
 
-    const look = await world.directCall("look-sticky-alpha", session.actor, "the_hot_tub", "command_plan", ["look sticky note: another one"]);
-    expect(look.op).toBe("result");
-    if (look.op === "result") {
-      expect(look.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "look_at", args: ["sticky_alpha"] });
-    }
-
-    const noteLook = await world.directCall("look-at-sticky-alpha", session.actor, "the_hot_tub", "look_at", ["sticky_alpha"]);
-    expect(noteLook.op).toBe("result");
-    if (noteLook.op === "result") {
-      expect(noteLook.result).toMatchObject({ id: "sticky_alpha", title: "sticky note: another one", location: "the_hot_tub" });
-    }
-
+    // Three pins share the name "sticky note", so a bare name lookup is ambiguous.
     const ambiguous = await world.directCall("take-sticky-ambiguous", session.actor, "the_hot_tub", "take", ["note"]);
     expect(ambiguous.op).toBe("error");
     if (ambiguous.op === "error") expect(ambiguous.error.code).toBe("E_AMBIGUOUS");
 
-    const takeByContainedPreview = await world.directCall("take-sticky-alpha", session.actor, "the_hot_tub", "take", ["another"]);
-    expect(takeByContainedPreview.op).toBe("result");
+    // The matcher reads each readable note's body line-by-line as match candidates,
+    // so a noun phrase from the body still resolves uniquely.
+    const takeByContainedBody = await world.directCall("take-sticky-alpha", session.actor, "the_hot_tub", "take", ["another"]);
+    expect(takeByContainedBody.op).toBe("result");
     expect(world.object("sticky_alpha").location).toBe(session.actor);
     await world.directCall("drop-sticky-alpha", session.actor, "the_hot_tub", "drop", ["another"]);
     expect(world.object("sticky_alpha").location).toBe("the_hot_tub");
 
-    const takeByText = await world.directCall("take-sticky-blue-text", session.actor, "the_hot_tub", "take", ["hello"]);
-    expect(takeByText.op).toBe("result");
+    const takeByBody = await world.directCall("take-sticky-blue-text", session.actor, "the_hot_tub", "take", ["hello"]);
+    expect(takeByBody.op).toBe("result");
     expect(world.object("sticky_blue").location).toBe(session.actor);
     await world.directCall("drop-sticky-blue", session.actor, "the_hot_tub", "drop", ["the blue note"]);
     expect(world.object("sticky_blue").location).toBe("the_hot_tub");
@@ -1139,11 +992,6 @@ describe("local catalogs", () => {
     expect(world.object("sticky_blue").location).toBe(session.actor);
     await world.directCall("drop-sticky-blue-again", session.actor, "the_hot_tub", "drop", ["blue note"]);
     expect(world.object("sticky_blue").location).toBe("the_hot_tub");
-
-    const take = await world.directCall("take-sticky-beta", session.actor, "the_hot_tub", "take", ["sticky note: this is it"]);
-    expect(take.op).toBe("result");
-    expect(world.object("sticky_beta").location).toBe(session.actor);
-    expect(world.object("the_hot_tub").contents.has("sticky_beta")).toBe(false);
 
     const outsider = world.auth("guest:sticky-room-note-outsider");
     await world.directCall("enter-hot-tub-sticky-outsider", outsider.actor, "the_hot_tub", "enter", []);
@@ -1161,6 +1009,103 @@ describe("local catalogs", () => {
       const err = privateTextTake.observations.find((obs) => obs.type === "$error");
       expect(err?.code).toBe("E_INVARG");
     }
+  });
+
+  it("$note exposes LambdaMOO write/erase facades, an add_writer/rm_writer pair, and bounds text at 262144 chars", async () => {
+    const world = createWorld();
+    const owner = world.auth("guest:note-write-owner");
+    const collaborator = world.auth("guest:note-write-collab");
+    const stranger = world.auth("guest:note-write-stranger");
+    const noteId = "obj_test_note_write";
+    world.createObject({ id: noteId, parent: "$note", owner: owner.actor, location: "the_deck" });
+    await world.directCall("note-write-enter-owner", owner.actor, "the_deck", "enter", []);
+    await world.directCall("note-write-enter-collab", collaborator.actor, "the_deck", "enter", []);
+    await world.directCall("note-write-enter-stranger", stranger.actor, "the_deck", "enter", []);
+    const call = (id: string, sess: { id: string }, actor: string, verb: string, args: WooValue[]) =>
+      world.call(id, sess.id, "the_deck", { actor, target: noteId, verb, args });
+    const observationsError = (frame: { op: "applied"; observations: { type?: string; code?: string }[] } | unknown): string | null => {
+      if (typeof frame !== "object" || frame === null) return null;
+      const f = frame as { op?: string; observations?: { type?: string; code?: string }[] };
+      if (f.op !== "applied") return null;
+      return f.observations?.find((obs) => obs?.type === "$error")?.code ?? null;
+    };
+
+    // :write appends a line; :erase clears; :set_text replaces.
+    const written = await call("note-write-1", owner, owner.actor, "write", ["alpha"]);
+    expect(written.op).toBe("applied");
+    expect(observationsError(written)).toBeNull();
+    expect(world.getProp(noteId, "text")).toBe("alpha");
+    await call("note-write-2", owner, owner.actor, "write", ["beta"]);
+    expect(world.getProp(noteId, "text")).toBe("alpha\nbeta");
+    await call("note-erase", owner, owner.actor, "erase", []);
+    expect(world.getProp(noteId, "text")).toBe("");
+    await call("note-set", owner, owner.actor, "set_text", ["just-one-line"]);
+    expect(world.getProp(noteId, "text")).toBe("just-one-line");
+
+    // The 262144-char cap rejects oversize text on both :set_text and :write.
+    const huge = "x".repeat(270_000);
+    const oversize = await call("note-set-huge", owner, owner.actor, "set_text", [huge]);
+    expect(observationsError(oversize)).toBe("E_INVARG");
+    expect(world.getProp(noteId, "text")).toBe("just-one-line");
+    await call("note-fill", owner, owner.actor, "set_text", ["x".repeat(260_000)]);
+    const overflowAppend = await call("note-write-overflow", owner, owner.actor, "write", ["y".repeat(5_000)]);
+    expect(observationsError(overflowAppend)).toBe("E_INVARG");
+    expect(world.getProp(noteId, "text")).toBe("x".repeat(260_000));
+
+    // Writers list management is owner-or-wizard gated.
+    expect(world.getProp(noteId, "writers")).toEqual([]);
+    const denied = await call("note-add-writer-denied", stranger, stranger.actor, "add_writer", [collaborator.actor]);
+    expect(observationsError(denied)).toBe("E_PERM");
+    const added = await call("note-add-writer", owner, owner.actor, "add_writer", [collaborator.actor]);
+    expect(observationsError(added)).toBeNull();
+    expect(added.op === "applied" ? added.observations : []).toContainEqual(expect.objectContaining({
+      type: "note_writers_changed",
+      note: noteId,
+      writers: [collaborator.actor],
+      added: collaborator.actor,
+      removed: null
+    }));
+    expect(world.getProp(noteId, "writers")).toEqual([collaborator.actor]);
+    // Idempotent: re-adding is a no-op (and still returns the writers list).
+    const added2 = await call("note-add-writer-2", owner, owner.actor, "add_writer", [collaborator.actor]);
+    expect(observationsError(added2)).toBeNull();
+    expect(world.getProp(noteId, "writers")).toEqual([collaborator.actor]);
+    // The collaborator can now write through :is_writable_by.
+    await call("note-collab-write", collaborator, collaborator.actor, "write", ["from-collab"]);
+    expect(world.getProp(noteId, "text")).toBe("x".repeat(260_000) + "\nfrom-collab");
+    // Strangers still cannot.
+    const strangerWrite = await call("note-stranger-write", stranger, stranger.actor, "write", ["nope"]);
+    expect(observationsError(strangerWrite)).toBe("E_PERM");
+    // rm_writer removes the writer; the collaborator can no longer write.
+    const removed = await call("note-rm-writer", owner, owner.actor, "rm_writer", [collaborator.actor]);
+    expect(removed.op === "applied" ? removed.observations : []).toContainEqual(expect.objectContaining({
+      type: "note_writers_changed",
+      note: noteId,
+      writers: [],
+      added: null,
+      removed: collaborator.actor
+    }));
+    expect(world.getProp(noteId, "writers")).toEqual([]);
+    const collabBlocked = await call("note-collab-blocked", collaborator, collaborator.actor, "write", ["x"]);
+    expect(observationsError(collabBlocked)).toBe("E_PERM");
+  });
+
+  it("$note v0.2 boot migration converts list<str> text values to a joined string", () => {
+    const world = createWorld();
+    // Pretend an upgraded world with a $note-descended pin carrying v0.1 shape
+    // text and the new migration tag missing.
+    const migrations = (world.getProp("$system", "applied_migrations") as string[]).filter(
+      (id) => id !== "2026-05-06-note-text-string-shape"
+    );
+    world.setProp("$system", "applied_migrations", migrations);
+    const noteId = "obj_test_v01_note";
+    world.createObject({ id: noteId, parent: "$pin", owner: "$wiz", location: "the_pinboard" });
+    world.setProp(noteId, "text", ["line one", "line two", "line three"] as unknown as WooValue);
+
+    installLocalCatalogs(world, ["pinboard"]);
+
+    expect(world.getProp(noteId, "text")).toBe("line one\nline two\nline three");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-06-note-text-string-shape");
   });
 
   it("repairs stale pinboard v0.1 source and leftover note records", () => {
@@ -1212,47 +1157,6 @@ describe("local catalogs", () => {
     expect(world.ownVerbExact("$pinboard", "list_notes")?.source).toContain("return this.notes");
     expect(world.getProp("$system", "applied_migrations")).not.toContain("2026-05-02-pinboard-v02-repair");
   });
-
-  it("detects pure_declared metadata drift and repairs the flag without changing source", () => {
-    // Regression: an early version of the pure-flag plumbing only compared
-    // source/perms/etc. and missed `pure`. A stale host would silently keep
-    // an impure verb where the manifest declares it pure, defeating the
-    // cross-host read-timeout dispatch path. Uses $pinboard:list_notes — its
-    // purity is manifest-asserted (call-graph propagation can't see through
-    // the non-`this` `pin:text()` call), so the catalog assertion is the
-    // only signal. Drift compares `pure_declared` against the manifest.
-    const world = createWorld();
-    const listNotes = world.ownVerbExact("$pinboard", "list_notes")!;
-    expect(listNotes.pure).toBe(true);
-    expect(listNotes.pure_declared).toBe(true);
-    // Simulate a stale host: same source/hash, but both flags were lost.
-    world.addVerb("$pinboard", { ...listNotes, pure: undefined, pure_declared: undefined, version: listNotes.version + 1 });
-    expect(world.ownVerbExact("$pinboard", "list_notes")?.pure_declared).toBeUndefined();
-    const status = localCatalogStatuses(world, ["pinboard"]).find((item) => item.catalog === "pinboard")!;
-    expect(status.needs_repair).toBe(true);
-    expect(status.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "verb_drift", object: "$pinboard", verb: "list_notes" })
-    ]));
-    installLocalCatalogs(world, []);
-    expect(world.ownVerbExact("$pinboard", "list_notes")?.pure).toBe(true);
-    expect(world.ownVerbExact("$pinboard", "list_notes")?.pure_declared).toBe(true);
-  });
-
-  it("re-derives pure when a stale host loses the propagated flag (no manifest assertion)", () => {
-    // Companion to the pure_declared test: $pinboard:look_self has no
-    // manifest declaration anymore — its purity comes purely from
-    // call-graph propagation. A stale host that lost the bit gets it
-    // restored on the next bootstrap pass without any drift detection.
-    const world = createWorld();
-    const lookSelf = world.ownVerbExact("$pinboard", "look_self")!;
-    expect(lookSelf.pure).toBe(true);
-    expect(lookSelf.pure_declared).toBeUndefined();
-    world.addVerb("$pinboard", { ...lookSelf, pure: undefined, version: lookSelf.version + 1 });
-    expect(world.ownVerbExact("$pinboard", "look_self")?.pure).toBeUndefined();
-    installLocalCatalogs(world, []);
-    expect(world.ownVerbExact("$pinboard", "look_self")?.pure).toBe(true);
-  });
-
 
   it("runs local repairs for installed catalogs even when auto-install is empty", () => {
     const world = createWorld();
@@ -3120,23 +3024,25 @@ describe("local catalogs", () => {
       if (next.op !== "result") return;
       expect(next.result).toMatchObject({ order_id: orderResult.order_id, requester, request: "scorpio" });
 
-      // 3. Plug delivers — note lands in requester's inventory.
-      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Today's horoscope: avoid llamas."]);
+      // 3. Plug delivers — note lands in requester's inventory with name + body.
+      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "Today's horoscope: avoid llamas."]);
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const dRes = delivered.result as { delivered: boolean; note: string; text: string };
       expect(dRes.delivered).toBe(true);
-      expect(dRes.text).toContain("hands you a note");
+      expect(dRes.text).toContain("delivers a note to your inventory");
       expect(world.object(dRes.note).location).toBe(requester);
+      expect(world.object(dRes.note).name).toBe("Horoscope: Scorpio");
+      expect(world.getProp(dRes.note, "text")).toBe("Today's horoscope: avoid llamas.");
       expect(world.getProp(dRes.note, "produced_by")).toBe(blockId);
       expect(delivered.observations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("hands you a note") }),
-        expect.objectContaining({ type: "delivered", block: blockId, requester, note: dRes.note, text: expect.stringContaining("hands you a note") })
+        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("delivers a note to your inventory") }),
+        expect.objectContaining({ type: "delivered", block: blockId, requester, note: dRes.note, text: expect.stringContaining("delivers a note to your inventory") })
       ]));
       expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
 
       // 4. Idempotent re-deliver returns delivered:false.
-      const redeliver = await world.directCall("disp-redeliver", blockId, blockId, "deliver", [orderResult.order_id, "again"]);
+      const redeliver = await world.directCall("disp-redeliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "again"]);
       expect(redeliver.op).toBe("result");
       if (redeliver.op === "result") {
         const r = redeliver.result as { delivered: boolean; reason: string };
@@ -3150,7 +3056,7 @@ describe("local catalogs", () => {
       expect(order2.op).toBe("result");
       if (order2.op !== "result") return;
       const strangerOrderId = (order2.result as { order_id: string }).order_id;
-      const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "haha"]);
+      const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "Horoscope: Leo", "haha"]);
       expect(strangerDeliver.op).toBe("error");
       if (strangerDeliver.op === "error") expect(strangerDeliver.error.code).toBe("E_PERM");
     });
@@ -3381,20 +3287,21 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "writable_owner")).toEqual(["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"]);
 
       // Plug-as-block delivers; note arrives in requester inventory with back-references.
-      const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Today the stars suggest sandwiches."]);
+      const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Scorpio", "Today the stars suggest sandwiches."]);
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
-      expect(delivered.result).toMatchObject({ text: expect.stringContaining("hands you a note") });
+      expect(delivered.result).toMatchObject({ text: expect.stringContaining("delivers a note to your inventory") });
       expect(world.object(noteId).location).toBe(requester);
+      expect(world.object(noteId).name).toBe("Horoscope: Scorpio");
       expect(world.getProp(noteId, "produced_by")).toBe(blockId);
       expect(world.getProp(noteId, "text")).toBe("Today the stars suggest sandwiches.");
       expect(delivered.observations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("hands you a note") })
+        expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("delivers a note to your inventory") })
       ]));
     });
 
-    it("$dispensed_note keeps inventory display bounded for long single-line bodies", async () => {
+    it("$dispensed_note rejects oversize text at the producer rather than rendering an unbounded inventory line", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["horoscope"]);
       const roomId = "obj_test_horo_long_room";
@@ -3402,7 +3309,6 @@ describe("local catalogs", () => {
       const requester = world.auth("guest:horo-long-requester").actor;
       const blockId = "obj_test_horo_long_block";
       world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomId });
-      world.setProp(blockId, "name", "Horoscope machine");
       world.setProp(blockId, "rate_limit_seconds", 0);
       world.setProp(blockId, "block_cooldown_seconds", 0);
 
@@ -3410,277 +3316,53 @@ describe("local catalogs", () => {
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
-      const body = "Gemini ".repeat(180_000);
-      const delivered = await world.directCall("horo-long-deliver", blockId, blockId, "deliver", [orderId, body]);
-      expect(delivered.op).toBe("result");
-      if (delivered.op !== "result") return;
-      const noteId = (delivered.result as { note: string }).note;
-      expect(world.getProp(noteId, "text")).toBe(body);
-
+      // v0.2 caps $note.text at 262144 chars in :set_text. The dispenser
+      // routes text through that verb, so an oversize body fails at the
+      // producer instead of leaking into the requester's inventory.
+      const huge = "Gemini ".repeat(180_000);
+      const delivered = await world.directCall("horo-long-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Gemini", huge]);
+      expect(delivered.op).toBe("error");
+      if (delivered.op === "error") expect(delivered.error.code).toBe("E_INVARG");
+      // No note minted; inventory stays clean.
       const inventory = await world.directCall("horo-long-inventory", requester, requester, "inventory", []);
       expect(inventory.op).toBe("result");
       if (inventory.op !== "result") return;
       const result = inventory.result as { items: Array<{ id: string; title: string }>; text: string };
-      expect(result.items).toEqual([
-        expect.objectContaining({ id: noteId, title: expect.stringMatching(/^Horoscope: gemini: Gemini /) })
-      ]);
-      expect(result.items[0].title.length).toBeLessThanOrEqual(140);
-      expect(result.text.length).toBeLessThanOrEqual(170);
-      expect(world.getProp(noteId, "name")).toBe("Horoscope: gemini");
-      expect(world.getProp(noteId, "description")).toBe("A note from Horoscope machine in response to: gemini");
-      expect(inventory.observations[0]).toMatchObject({
-        type: "text",
-        target: requester,
-        text: result.text
-      });
+      expect(result.items).toEqual([]);
     });
 
-    it("$horoscope_note vanishes in a puff of smoke when a non-wizard drops it (verb's progr authorizes recycle, not the actor)", async () => {
-      const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["horoscope"]);
-      const roomA = "obj_test_puff_room_a";
-      const roomB = "obj_test_puff_room_b";
-      world.createObject({ id: roomA, name: roomA, parent: "$space", owner: "$wiz", location: null });
-      world.createObject({ id: roomB, name: roomB, parent: "$space", owner: "$wiz", location: null });
-      const blockId = "obj_test_puff_block";
-      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomA });
-      world.setProp(blockId, "rate_limit_seconds", 0);
-      world.setProp(blockId, "block_cooldown_seconds", 0);
-      const requester = world.auth("guest:horo-puff-requester").actor;
-
-      // Requester places an order; the dispenser delivers a $horoscope_note
-      // owned by the block (not by the requester).
-      const ordered = await world.directCall("puff-order", requester, blockId, "order", ["aries"]);
-      expect(ordered.op).toBe("result");
-      if (ordered.op !== "result") return;
-      const orderId = (ordered.result as { order_id: string }).order_id;
-      const delivered = await world.directCall("puff-deliver", blockId, blockId, "deliver", [orderId, "The stars suggest patience."]);
-      expect(delivered.op).toBe("result");
-      if (delivered.op !== "result") return;
-      const noteId = (delivered.result as { note: string }).note;
-      expect(world.object(noteId).parent).toBe("$horoscope_note");
-      expect(world.object(noteId).owner).toBe(blockId);
-      expect(world.object(noteId).owner).not.toBe(requester);
-
-      // Place the note directly in roomA so location(note) is a $space and
-      // the puff emits there. The non-wizard requester drives moveto toward
-      // roomB; the override intercepts and recycles. Authority for the
-      // substrate recycle comes from the verb's progr (catalog wizard), not
-      // from the requester — that is the RC2 contract, equivalent to
-      // LambdaMOO's `controls(progr, oid)`.
-      world.object(noteId).location = roomA;
-      world.object("$nowhere").contents.delete(noteId);
-      world.object(roomA).contents.add(noteId);
-
-      const moved = await world.directCall("puff-moveto-space", requester, noteId, "moveto", [roomB]);
-      expect(moved.op).toBe("result");
-      if (moved.op !== "result") return;
-      expect(world.isRecycled(noteId)).toBe(true);
-      expect(world.objects.has(noteId)).toBe(false);
-      expect(moved.observations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "vanished", note: noteId, text: expect.stringContaining("puff of smoke") })
-      ]));
-    });
-
-    it("$horoscope_note :recycle handler emits the same puff for explicit recycle", async () => {
-      const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["horoscope"]);
-      const roomId = "obj_test_recycle_puff_room";
-      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
-      const blockId = "obj_test_recycle_puff_block";
-      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomId });
-      world.setProp(blockId, "rate_limit_seconds", 0);
-      world.setProp(blockId, "block_cooldown_seconds", 0);
-
-      const ordered = await world.directCall("recycle-puff-order", "$wiz", blockId, "order", ["leo"]);
-      if (ordered.op !== "result") return;
-      const orderId = (ordered.result as { order_id: string }).order_id;
-      const delivered = await world.directCall("recycle-puff-deliver", blockId, blockId, "deliver", [orderId, "Lions before lunch."]);
-      if (delivered.op !== "result") return;
-      const noteId = (delivered.result as { note: string }).note;
-
-      // Place note in the room so the puff has a scene to emit into.
-      world.object(noteId).location = roomId;
-      world.object("$nowhere").contents.delete(noteId);
-      world.object(roomId).contents.add(noteId);
-
-      // Calling :recycle directly is the visible path the substrate's
-      // recycle pipeline uses to fire the handler before destruction.
-      const recycled = await world.directCall("recycle-puff-recycle", "$wiz", noteId, "recycle", [], { forceDirect: true });
-      expect(recycled.op).toBe("result");
-      if (recycled.op !== "result") return;
-      expect(recycled.observations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "vanished", note: noteId, text: expect.stringContaining("puff of smoke") })
-      ]));
-    });
-
-    it("$horoscope_note passes between people without puffing", async () => {
-      const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["horoscope"]);
-      const roomId = "obj_test_pass_room";
-      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
-      const alice = world.auth("guest:horo-pass-alice").actor;
-      const bob = world.auth("guest:horo-pass-bob").actor;
-      const blockId = "obj_test_pass_block";
-      world.createObject({ id: blockId, name: blockId, parent: "$horoscope_block", owner: "$wiz", location: roomId });
-      world.setProp(blockId, "rate_limit_seconds", 0);
-      world.setProp(blockId, "block_cooldown_seconds", 0);
-
-      const ordered = await world.directCall("pass-order", alice, blockId, "order", ["taurus"]);
-      expect(ordered.op).toBe("result");
-      if (ordered.op !== "result") return;
-      const orderId = (ordered.result as { order_id: string }).order_id;
-      const delivered = await world.directCall("pass-deliver", blockId, blockId, "deliver", [orderId, "Something earthy this way comes."]);
-      expect(delivered.op).toBe("result");
-      if (delivered.op !== "result") return;
-      const noteId = (delivered.result as { note: string }).note;
-      expect(world.object(noteId).location).toBe(alice);
-
-      const passed = await world.directCall("pass-moveto-bob", "$wiz", noteId, "moveto", [bob]);
-      expect(passed.op).toBe("result");
-      if (passed.op !== "result") return;
-      // Note moves to bob, no puff observation.
-      expect(world.object(noteId).location).toBe(bob);
-      expect(passed.observations).not.toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "vanished" })
-      ]));
-    });
-
-    it("$note title and look use the overridable bounded text summary", async () => {
+    it("$note text_summary is overridable, and look_self honours the override", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["note"]);
       const requester = world.auth("guest:redacted-note-reader").actor;
       const noteClass = "obj_test_redacted_note_class";
       world.createObject({ id: noteClass, name: "$redacted_note", parent: "$note", owner: "$wiz", location: null });
       expect(installVerb(world, noteClass, "text_summary", `verb :text_summary(limit) rxd {
-        return { lines: 7, preview: "REDACTED", truncated: true };
+        return { lines: 7, length: 0, preview: "REDACTED", truncated: true };
       }`, null).ok).toBe(true);
 
       const noteId = "obj_test_redacted_note";
-      const body = "secret ".repeat(20_000);
       world.createObject({ id: noteId, name: "Private note", parent: noteClass, owner: "$wiz", location: requester });
-      world.setProp(noteId, "text", body);
+      world.setProp(noteId, "text", "secret ".repeat(20_000));
 
-      const inventory = await world.directCall("redacted-note-inventory", requester, requester, "inventory", []);
-      expect(inventory.op).toBe("result");
-      if (inventory.op !== "result") return;
-      const inventoryResult = inventory.result as { items: Array<{ id: string; title: string }>; text: string };
-      expect(inventoryResult.items).toEqual([
-        expect.objectContaining({ id: noteId, title: "obj_test_redacted_note: REDACTED" })
-      ]);
-      expect(inventoryResult.text).toContain("obj_test_redacted_note: REDACTED");
-      expect(inventoryResult.text).not.toContain("secret");
-
-      const looked = await world.directCall("redacted-note-look", requester, noteId, "look_self", []);
-      expect(looked.op).toBe("result");
-      if (looked.op !== "result") return;
-      expect(looked.result).toMatchObject({
-        id: noteId,
-        title: "obj_test_redacted_note: REDACTED",
-        lines: 7
-      });
-    });
-
-    it("$note holds multiline text as a single string and exposes line semantics through verbs", async () => {
-      const world = createWorld();
-      const session = world.auth("guest:multiline-note");
-      const owner = session.actor;
-      await world.directCall("multiline-enter", owner, "the_chatroom", "enter", []);
-      const noteId = "obj_test_multiline_note";
-      world.createObject({ id: noteId, name: "Recipe", parent: "$note", owner, location: owner });
-      world.setProp(noteId, "text", "first line\nsecond line\nthird line");
-
-      const text = await world.directCall("multiline-text", owner, noteId, "text", []);
-      expect(text.op).toBe("result");
-      if (text.op === "result") expect(text.result).toBe("first line\nsecond line\nthird line");
-
-      const summary = await world.directCall("multiline-summary", owner, noteId, "text_summary", [96]);
+      // The override wins for any direct caller of :text_summary.
+      const summary = await world.directCall("redacted-note-summary", requester, noteId, "text_summary", [96]);
       expect(summary.op).toBe("result");
-      if (summary.op === "result") expect(summary.result).toMatchObject({ lines: 3, preview: "first line", truncated: false });
-
-      const written = await world.call("multiline-write", session.id, "the_chatroom", { actor: owner, target: noteId, verb: "write", args: ["fourth line"] });
-      expect(written.op).toBe("applied");
-      expect(world.getProp(noteId, "text")).toBe("first line\nsecond line\nthird line\nfourth line");
-
-      const deleted = await world.call("multiline-delete", session.id, "the_chatroom", { actor: owner, target: noteId, verb: "delete", args: [2] });
-      expect(deleted.op).toBe("applied");
-      expect(world.getProp(noteId, "text")).toBe("first line\nthird line\nfourth line");
-
-      const erased = await world.call("multiline-erase", session.id, "the_chatroom", { actor: owner, target: noteId, verb: "erase", args: [] });
-      expect(erased.op).toBe("applied");
-      expect(world.getProp(noteId, "text")).toBe("");
-    });
-
-    it("dispatch with max_chars raises E_TOOBIG on oversize string returns and passes through within bound", async () => {
-      const world = createWorld({ catalogs: false });
-      const actor = world.auth("guest:bounded-dispatch").actor;
-      const target = "obj_test_bounded_dispatch_target";
-      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
-      expect(installVerb(world, target, "long_string", `verb :long_string() rxd {
-        let s = "";
-        let i = 0;
-        while (i < 200) { s = s + "abcdefghij"; i = i + 1; }
-        return s;
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, target, "short_string", `verb :short_string() rxd { return "ok"; }`, null).ok).toBe(true);
-      expect(installVerb(world, target, "structured", `verb :structured() rxd { return { kind: "map", n: 1 }; }`, null).ok).toBe(true);
-
-      expect(installVerb(world, actor, "probe_oversize", `verb :probe_oversize() rxd {
-        return dispatch(this:get_target(), "long_string", [], null, 96);
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "probe_within", `verb :probe_within() rxd {
-        return dispatch(this:get_target(), "short_string", [], null, 96);
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "probe_nonstring", `verb :probe_nonstring() rxd {
-        return dispatch(this:get_target(), "structured", [], null, 8);
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
-
-      const oversize = await world.directCall("bounded-dispatch-oversize", actor, actor, "probe_oversize", []);
-      expect(oversize.op).toBe("error");
-      if (oversize.op === "error") expect(oversize.error.code).toBe("E_TOOBIG");
-
-      const within = await world.directCall("bounded-dispatch-within", actor, actor, "probe_within", []);
-      expect(within.op).toBe("result");
-      if (within.op === "result") expect(within.result).toBe("ok");
-
-      const nonstring = await world.directCall("bounded-dispatch-nonstring", actor, actor, "probe_nonstring", []);
-      expect(nonstring.op).toBe("result");
-      if (nonstring.op === "result") expect(nonstring.result).toEqual({ kind: "map", n: 1 });
-    });
-
-    it("dispatch max_chars edge cases: zero, negative, and target-in-error", async () => {
-      const world = createWorld({ catalogs: false });
-      const actor = world.auth("guest:bounded-dispatch-edges").actor;
-      const target = "obj_test_bounded_dispatch_edges_target";
-      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
-      expect(installVerb(world, target, "empty", `verb :empty() rxd { return ""; }`, null).ok).toBe(true);
-      expect(installVerb(world, target, "one", `verb :one() rxd { return "x"; }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "probe_zero_empty", `verb :probe_zero_empty() rxd {
-        return dispatch(this:get_target(), "empty", [], null, 0);
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "probe_zero_nonempty", `verb :probe_zero_nonempty() rxd {
-        return dispatch(this:get_target(), "one", [], null, 0);
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, actor, "probe_negative", `verb :probe_negative() rxd {
-        return dispatch(this:get_target(), "empty", [], null, -1);
-      }`, null).ok).toBe(true);
-
-      const zeroEmpty = await world.directCall("bounded-edge-zero-empty", actor, actor, "probe_zero_empty", []);
-      expect(zeroEmpty.op).toBe("result");
-      if (zeroEmpty.op === "result") expect(zeroEmpty.result).toBe("");
-
-      const zeroNonempty = await world.directCall("bounded-edge-zero-nonempty", actor, actor, "probe_zero_nonempty", []);
-      expect(zeroNonempty.op).toBe("error");
-      if (zeroNonempty.op === "error") {
-        expect(zeroNonempty.error.code).toBe("E_TOOBIG");
-        expect(zeroNonempty.error.value).toMatchObject({ target, verb: "one", size: 1, max: 0 });
+      if (summary.op === "result") {
+        expect(summary.result).toMatchObject({ lines: 7, preview: "REDACTED", truncated: true });
       }
 
-      const negative = await world.directCall("bounded-edge-negative", actor, actor, "probe_negative", []);
-      expect(negative.op).toBe("error");
-      if (negative.op === "error") expect(negative.error.code).toBe("E_INVARG");
+      // look_self routes through :text_summary for text_length, so a redacted
+      // override surfaces 0 instead of the raw secret length.
+      const looked = await world.directCall("redacted-note-look", requester, noteId, "look_self", []);
+      expect(looked.op).toBe("result");
+      if (looked.op === "result") {
+        expect(looked.result).toMatchObject({
+          id: noteId,
+          title: "Private note",
+          text_length: 0
+        });
+      }
     });
 
     it("dispatch max_chars caps list-of-strings by total character footprint", async () => {

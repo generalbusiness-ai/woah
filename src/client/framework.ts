@@ -881,7 +881,27 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
       const obs = envelope.observation;
       const note = String(obs.note ?? obs.pin ?? obs.id ?? "");
       if (!note) return;
-      draft.patchCatalogState(note, "pinboard_note", { text: obs.text });
+      const text = obs.text;
+      // $note descendants live under several catalog overlays; without a
+      // class hint on the wire we patch all the surfaces that subscribe
+      // to note text. Surfaces that don't carry the note key ignore the
+      // patch (catalogState is per-subject scoped).
+      draft.patchCatalogState(note, "pinboard_note", { text });
+      draft.patchCatalogState(note, "taskspace_task", { text });
+      draft.patchObjectProps(note, { text });
+    }
+  });
+  registry.observation({
+    types: ["note_writers_changed"],
+    route: "sequenced",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const note = String(obs.note ?? obs.pin ?? obs.id ?? "");
+      if (!note) return;
+      const writers = Array.isArray(obs.writers) ? obs.writers.filter((item) => typeof item === "string") : [];
+      draft.patchCatalogState(note, "pinboard_note", { writers });
+      draft.patchCatalogState(note, "taskspace_task", { writers });
+      draft.patchObjectProps(note, { writers });
     }
   });
   registry.observation({
@@ -1064,16 +1084,22 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
       if (!task) return;
       const parent = typeof obs.parent === "string" ? obs.parent : null;
       const space = String(obs.space ?? envelope.delivered.space ?? "");
-      const title = typeof obs.title === "string" ? obs.title : undefined;
-      draft.patchObject(task, { name: title });
+      // The taskspace verb emits `name` (the v0.2 $note identity slot).
+      // Tolerate the legacy `title` shape from older world frames during
+      // gap recovery so a mid-upgrade replay still projects cleanly.
+      const name = typeof obs.name === "string" ? obs.name : typeof obs.title === "string" ? obs.title : undefined;
+      draft.patchObject(task, { name });
+      const text = typeof obs.text === "string" ? obs.text : undefined;
       draft.patchObjectProps(task, {
-        title,
+        name,
+        text,
         parent_task: parent,
         status: "open",
         space: space || undefined
       });
       draft.patchCatalogState(task, "taskspace_task", {
-        title,
+        name,
+        text,
         parent_task: parent,
         status: "open",
         space: space || undefined

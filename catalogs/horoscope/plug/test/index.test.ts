@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
+import { horoscopeNoteName, runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
 import type { HoroscopeAi } from "../src/horoscope";
 
 type Call = { url: string; method: string; body?: unknown };
@@ -84,10 +84,10 @@ describe("runHoroscopeTick", () => {
 
     const deliver1 = calls[3];
     expect(deliver1.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/deliver");
-    expect((deliver1.body as { args: unknown[] }).args).toEqual(["ord_1", "destiny calls."]);
+    expect((deliver1.body as { args: unknown[] }).args).toEqual(["ord_1", "Horoscope: Scorpio", "destiny calls."]);
 
     const deliver2 = calls[5];
-    expect((deliver2.body as { args: unknown[] }).args).toEqual(["ord_2", "destiny calls."]);
+    expect((deliver2.body as { args: unknown[] }).args).toEqual(["ord_2", "Horoscope: Leo", "destiny calls."]);
     const heartbeat = calls[7];
     expect(heartbeat.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/set_properties");
     expect((heartbeat.body as { args: [Record<string, unknown>] }).args[0]).toMatchObject({ last_pushed_at: expect.any(Number), last_error: null });
@@ -168,5 +168,23 @@ describe("runHoroscopeTick", () => {
     expect(result.delivered).toBe(1);
     const aiCall = ai.run.mock.calls[0][1] as { messages: Array<{ role: string; content: string }> };
     expect(aiCall.messages[0].content).toMatch(/horoscope/i);
+  });
+});
+
+describe("horoscopeNoteName", () => {
+  it("title-cases a single-word zodiac sign", () => {
+    expect(horoscopeNoteName("scorpio")).toBe("Horoscope: Scorpio");
+    expect(horoscopeNoteName("LEO")).toBe("Horoscope: Leo");
+  });
+
+  it("falls back to a generic label when the request is empty", () => {
+    expect(horoscopeNoteName("")).toBe("Horoscope reading");
+    expect(horoscopeNoteName("   ")).toBe("Horoscope reading");
+  });
+
+  it("clips long requests to a sensible label", () => {
+    const long = "scorpio rising with cancer moon and aquarius midheaven aspecting jupiter";
+    expect(horoscopeNoteName(long).length).toBeLessThanOrEqual("Horoscope: ".length + 40);
+    expect(horoscopeNoteName(long).startsWith("Horoscope: ")).toBe(true);
   });
 });

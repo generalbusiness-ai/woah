@@ -1,5 +1,4 @@
 import { BUNDLED_CATALOGS } from "../generated/bundled-catalogs";
-import { propagateVerbPurity } from "./authoring";
 import {
   applyCatalogSchemaPlan,
   catalogManifestStatus,
@@ -68,7 +67,11 @@ const LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION = "2026-05-04-chat-transp
 const LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION = "2026-05-04-drop-presence-in-property";
 const LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION = "2026-05-04-chat-room-exits-restore";
 const LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION = "2026-05-04-chat-room-leave-filter";
-const LOCAL_CATALOG_NOTE_TEXT_LIST_TO_STR_MIGRATION = "2026-05-07-note-text-list-to-str";
+const LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION = "2026-05-06-note-text-string-shape";
+const LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-note-stale-class-verbs";
+const LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-pinboard-stale-class-verbs";
+const LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-dispenser-stale-class-verbs";
+const LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION = "2026-05-06-taskspace-note-shape";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -119,7 +122,12 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION },
   { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION },
-  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" }
+  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, only: "pinboard" },
+  { id: LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, only: "dispenser" },
+  { id: LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION, only: "taskspace" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -149,11 +157,6 @@ export function installLocalCatalogs(world: WooWorld, names: readonly string[] =
   installMissingLocalCatalogDependencies(world, repairNames);
   const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
   runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered);
-  // Final pass: any prior step that touched verbs (fresh install, migration,
-  // schema sync, ad-hoc repair) may have left transitively-pure verbs without
-  // the propagated flag. Idempotent — only reaches a fixed point that the
-  // call graph already implies.
-  propagateVerbPurity(world);
 }
 
 export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): boolean {
@@ -347,7 +350,11 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runDropPresenceInPropertyMigration(world);
   runChatRoomExitsRestoreMigration(world);
   runChatRoomLeaveFilterMigration(world, names);
-  runNoteTextListToStrMigration(world, names);
+  runNoteTextStringShapeMigration(world, names);
+  run(LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
+  run(LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
+  run(LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
+  runTaskspaceNoteShapeMigration(world, names);
   return covered;
 }
 
@@ -606,92 +613,6 @@ function runChatRoomLeaveFilterMigration(world: WooWorld, names: readonly string
   markMigrationApplied(world, LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION);
 }
 
-function runNoteTextListToStrMigration(world: WooWorld, _names: readonly string[], scope: CatalogSchemaPlanScope = "gateway", host = "world"): void {
-  if (!world.objects.has("$note")) return;
-  // The note v0→v1 catalog migration retypes $note.text from list<str> to str
-  // (see catalogs/note/migration-v0-to-v1.json). The bundled-catalog schema
-  // sync only reconciles class shape, so worlds whose live $note descendants
-  // hold legacy list values need this transform applied at boot — both on the
-  // gateway and on every host that owns $note descendants.
-  //
-  // The gate uses (plan_id, scope, host) records from $system.catalog_migration_records,
-  // not the $system.applied_migrations ledger. applied_migrations is preserved on
-  // hosts during seed merge (see DYNAMIC_HOST_SEED_PROPERTIES in bootstrap.ts), so
-  // a gateway-marked id can ride into a host slice and falsely short-circuit a
-  // host that still owns legacy list values. The per-(scope, host) record keys
-  // each scope independently, and we still verify zero remaining legacy values
-  // before treating a previously-recorded run as conclusive.
-  const planId = `local-catalog-data:note:${LOCAL_CATALOG_NOTE_TEXT_LIST_TO_STR_MIGRATION}`;
-  const manifestHash = localCatalogManifestHashForRecord(world, "note", scope, host);
-  const preLegacy = countLegacyNoteTextValues(world);
-  if (catalogMigrationRecordCompleted(world, planId, scope, host) && preLegacy === 0) return;
-  const startedAt = Date.now();
-  let migrated = 0;
-  try {
-    world.withMutationSavepoint(() => {
-      for (const id of Array.from(world.objects.keys())) {
-        if (id.startsWith("$")) continue;
-        if (!world.isDescendantOf(id, "$note")) continue;
-        const obj = world.object(id);
-        if (!obj.properties.has("text")) continue;
-        const value = obj.properties.get("text") as WooValue;
-        if (typeof value === "string") continue;
-        if (!Array.isArray(value)) continue;
-        const lines = value.filter((item): item is string => typeof item === "string");
-        world.setProp(id, "text", lines.join("\n"));
-        migrated += 1;
-      }
-    });
-  } catch (err) {
-    recordCatalogDataMigrationResult(world, {
-      plan_id: planId,
-      catalog: "note",
-      version: String(LOCAL_CATALOGS.get("note")?.version ?? ""),
-      manifest_hash: manifestHash,
-      scope,
-      host,
-      status: "failed",
-      started_at: startedAt,
-      completed_at: Date.now(),
-      pre_legacy_records: preLegacy,
-      post_legacy_records: countLegacyNoteTextValues(world),
-      steps: [{ id: "1:transform_note_text_list_to_str", kind: "data_migration", target: "$note.text", status: "failed", error: repairErrorSummary(err) }],
-      error: repairErrorSummary(err)
-    });
-    return;
-  }
-  const postLegacy = countLegacyNoteTextValues(world);
-  recordCatalogDataMigrationResult(world, {
-    plan_id: planId,
-    catalog: "note",
-    version: String(LOCAL_CATALOGS.get("note")?.version ?? ""),
-    manifest_hash: manifestHash,
-    scope,
-    host,
-    status: postLegacy === 0 ? "completed" : "failed",
-    started_at: startedAt,
-    completed_at: Date.now(),
-    pre_legacy_records: preLegacy,
-    post_legacy_records: postLegacy,
-    migrated,
-    steps: [{ id: "1:transform_note_text_list_to_str", kind: "data_migration", target: "$note.text", status: postLegacy === 0 ? "applied" : "failed" }]
-  });
-}
-
-function countLegacyNoteTextValues(world: WooWorld): number {
-  if (!world.objects.has("$note")) return 0;
-  let count = 0;
-  for (const id of world.objects.keys()) {
-    if (id.startsWith("$")) continue;
-    if (!world.isDescendantOf(id, "$note")) continue;
-    const obj = world.object(id);
-    if (!obj.properties.has("text")) continue;
-    const value = obj.properties.get("text");
-    if (Array.isArray(value)) count += 1;
-  }
-  return count;
-}
-
 function runChatTransparentFeatureMigration(world: WooWorld, names: readonly string[]): void {
   if (migrationApplied(world, LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION)) return;
   const transparentConsumers = transparentFeatureConsumers();
@@ -814,6 +735,114 @@ function runTaskspaceTaskNoteParentMigration(world: WooWorld, names: readonly st
     if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_TASK_NOTE_PARENT_MIGRATION);
+}
+
+// v0.1 of $note declared `text: list<str>`. v0.2 retypes the same property
+// to `text: str` (markdown). Walk every $note descendant on whichever host
+// holds it and join any list value with \n. Idempotent: skip when the value
+// is already a string. Safe to call from both gateway and host slices —
+// each only sees the objects it owns.
+function migrateNoteTextStringShapeData(world: WooWorld): void {
+  if (!world.objects.has("$note")) return;
+  for (const id of world.objects.keys()) {
+    if (!world.isDescendantOf(id, "$note")) continue;
+    const own = world.object(id).properties;
+    if (!own.has("text")) continue;
+    const value = own.get("text");
+    if (typeof value === "string") continue;
+    if (Array.isArray(value)) {
+      const joined = value
+        .map((line) => (typeof line === "string" ? line : String(line ?? "")))
+        .join("\n");
+      world.setProp(id, "text", joined);
+      continue;
+    }
+    if (value === null || value === undefined) {
+      world.setProp(id, "text", "");
+    }
+  }
+}
+
+function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string[]): void {
+  // Gateway path. Runs the data walk so any $note descendants the gateway
+  // owns get converted, then marks the gateway-scope ledger entry. Host
+  // slices run their own walk via runHostScopedDataMigrations.
+  if (!names.includes("note")) return;
+  if (!localCatalogInstalled(world, "note")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION)) return;
+  if (!world.objects.has("$note")) return;
+  migrateNoteTextStringShapeData(world);
+  markMigrationApplied(world, LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION);
+}
+
+// v0.2 of taskspace declared `title` and `description` as own properties on
+// $task, shadowing the inherited $root.name and $root.description. v0.3
+// drops both shadow defs. For each $task instance: copy title → name,
+// description → text, then strip the obsolete own values. Runs anywhere
+// the data lives. Idempotent: each copy gates on a non-empty source value
+// and a missing destination; deletes only when own value is still present.
+function migrateTaskspaceNoteShapeData(world: WooWorld): void {
+  if (!world.objects.has("$task")) return;
+  // Per-instance: copy title→name (using the public setter so both
+  // SerializedObject.name and the "name" property persist), copy
+  // description→text when not already set, then strip the obsolete own values.
+  for (const id of world.objects.keys()) {
+    if (!world.isDescendantOf(id, "$task")) continue;
+    if (id === "$task") continue;
+    const obj = world.object(id);
+    const own = obj.properties;
+    const title = own.get("title");
+    if (typeof title === "string" && title) {
+      // v0.2 always set `task.title` via :create_task and never set the
+      // inherited `obj.name`, which therefore defaults to the object id.
+      // Always overwrite name with the explicit title — it's the
+      // user-supplied label, the id-shaped default never was.
+      world.setObjectName(id, title);
+    }
+    const description = own.get("description");
+    if (typeof description === "string" && description && !own.has("text")) {
+      world.setProp(id, "text", description);
+    }
+    if (own.has("title")) world.deleteProp(id, "title");
+    if (own.has("description")) world.deleteProp(id, "description");
+  }
+}
+
+function migrateTaskspaceNoteShapeClassDefs(world: WooWorld): void {
+  // Strip the v0.2 shadow property defs on $task itself. Without this step
+  // the v0.2 shadows of $root.name and $root.description persist on $task
+  // and continue to mask the inherited slots. Gateway-only — class
+  // definitions are owned by the gateway, not by host slices.
+  //
+  // TODO(catalog-installer): this is a workaround for a gap in
+  // runLocalCatalogSchemaPlan / repairCatalogManifest — `reconcileClassVerbs`
+  // drops verbs not in the manifest, but there is no `reconcileClassProps`
+  // peer that drops property defs not in the manifest. Future major-version
+  // bumps that drop class property defs will rediscover this. The fix
+  // belongs in src/core/catalog-installer.ts:repairCatalogManifest.
+  if (!world.objects.has("$task")) return;
+  const taskClass = world.object("$task");
+  if (taskClass.propertyDefs.has("title")) world.deleteProp("$task", "title");
+  if (taskClass.propertyDefs.has("description")) world.deleteProp("$task", "description");
+}
+
+function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[]): void {
+  // Gateway path. Walks $task instances on the gateway, then runs the
+  // schema plan + reconcileClassVerbs to strip the obsolete property defs
+  // from the $task class object. Host slices run their own data walk via
+  // runHostScopedDataMigrations; class-def reconciliation is gateway-only.
+  if (!names.includes("taskspace")) return;
+  if (!localCatalogInstalled(world, "taskspace")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION)) return;
+  if (!world.objects.has("$task")) return;
+  migrateTaskspaceNoteShapeData(world);
+  migrateTaskspaceNoteShapeClassDefs(world);
+  const result = runLocalCatalogSchemaPlan(world, "taskspace", LOCAL_CATALOGS.get("taskspace")!, "gateway", "world", {
+    allowImplementationHints: true,
+    reconcileClassVerbs: true
+  });
+  if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
+  markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION);
 }
 
 function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>): void {
@@ -1143,9 +1172,16 @@ export function runHostScopedDataMigrations(world: WooWorld, host = "host"): voi
   if (world.objects.has("$pin") && world.objects.has("$pinboard")) {
     runPinboardNotesToPinsDataPlan(world, LOCAL_CATALOG_PINBOARD_NOTES_TO_PINS_MIGRATION, "host", host);
   }
-  if (world.objects.has("$note")) {
-    runNoteTextListToStrMigration(world, ["note"], "host", host);
-  }
+  // $note descendants (dispensed notes, pins, tasks) often live on
+  // self-hosted slices. Walk text: list<str> → str here so the host's
+  // own copies get converted; gateway runs the same walk for objects it
+  // owns. Both paths gate on value shape and skip when there's nothing
+  // to do.
+  migrateNoteTextStringShapeData(world);
+  // $task instances on a host slice need title→name, description→text,
+  // and obsolete-property strip. Class-def reconciliation stays
+  // gateway-only (runs in runTaskspaceNoteShapeMigration).
+  migrateTaskspaceNoteShapeData(world);
 }
 
 function runPinboardNotesToPinsMigration(world: WooWorld, names: readonly string[], id: string): void {
@@ -1220,12 +1256,13 @@ function migratePinboardNoteRecords(world: WooWorld): void {
       const record = raw as Record<string, WooValue>;
       if (hasEquivalentMigratedPin(world, board, record)) continue;
       const owner = pinOwner(world, board, record.author);
-      const text = noteTextString(record.text);
+      const lines = noteTextLines(record.text);
+      const text = lines.length > 0 ? lines.join("\n") : "";
       const pin = world.createRuntimeObject("$pin", owner, board, {
         progr: "$wiz",
         location: board,
         name: "sticky note",
-        description: text ? `A sticky note. It says: ${text}` : "A sticky note."
+        description: "A sticky note."
       });
       world.setProp(pin, "text", text);
       world.setProp(pin, "color", typeof record.color === "string" ? record.color : null);
@@ -1265,7 +1302,8 @@ function countPinboardLegacyNoteRecords(world: WooWorld): number {
 
 function hasEquivalentMigratedPin(world: WooWorld, board: ObjRef, record: Record<string, WooValue>): boolean {
   const layout = mapValue(world.propOrNull(board, "layout"));
-  const expectedText = noteTextString(record.text);
+  const expectedLines = noteTextLines(record.text);
+  const expectedText = expectedLines.length > 0 ? expectedLines.join("\n") : "";
   const expectedColor = typeof record.color === "string" ? record.color : null;
   for (const id of world.object(board).contents) {
     if (!world.objects.has(id) || !world.isDescendantOf(id, "$pin")) continue;
@@ -1302,10 +1340,10 @@ function pinOwner(world: WooWorld, board: ObjRef, value: WooValue | undefined): 
   return world.objects.has(owner) ? owner : "$wiz";
 }
 
-function noteTextString(value: WooValue | undefined): string {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string").join("\n");
-  return "";
+function noteTextLines(value: WooValue | undefined): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (typeof value === "string") return value.split(/\r?\n/);
+  return [];
 }
 
 function mapValue(value: WooValue): Record<string, WooValue> {

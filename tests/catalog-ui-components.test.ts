@@ -141,7 +141,7 @@ describe("bundled catalog UI components", () => {
     element.data = {
       space: "the_taskspace",
       tasks: {
-        task_1: { id: "task_1", props: { title: "Plan", status: "open", assignee: "guest_1", requirements: [] } }
+        task_1: { id: "task_1", name: "Plan", props: { status: "open", assignee: "guest_1", requirements: [] } }
       },
       rootTasks: ["task_1"],
       selectedTask: "task_1",
@@ -154,6 +154,6 @@ describe("bundled catalog UI components", () => {
     element.addEventListener("woo-taskspace-create", (event: Event) => { detail = (event as CustomEvent).detail; });
     element.querySelector<HTMLInputElement>("[data-new-title]")!.value = "New root";
     element.querySelector<HTMLButtonElement>("[data-create-task]")!.click();
-    expect(detail).toMatchObject({ title: "New root" });
+    expect(detail).toMatchObject({ name: "New root" });
   });
 });

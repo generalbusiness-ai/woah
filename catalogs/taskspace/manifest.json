@@ -1,8 +1,8 @@
 {
   "name": "taskspace",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "spec_version": "v1",
-  "description": "Hierarchical task coordination demo.",
+  "description": "Hierarchical task coordination demo. Tasks are $note descendants: name is the listing/title, text is the markdown description, and the inherited description slot stays cosmetic. v0.3 drops the v0.2 own-property shadows of title/description in favor of the canonical $note slots.",
   "license": "MIT",
   "depends": ["@local:chat", "@local:note"],
   "ui": {
@@ -47,17 +47,16 @@
         { "name": "root_tasks", "type": "list<obj>", "default": [], "perms": "rw" }
       ],
       "verbs": [
-        { "name": "create_task", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": ["title", "description"] }, "source": "verb :create_task(title, description) rx { let task = create($task, actor); task.title = title; task.description = description; task.parent_task = null; task.space = this; this.root_tasks = this.root_tasks + [task]; move(task, this); observe({ type: \"task_created\", task: task, parent: null, title: title }); return task; }" },
-        { "name": "list_tasks", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :list_tasks() rxd { let out = []; for t in contents(this) { if (isa(t, $task) && t.space == this) { out = out + [{ id: t, title: t.title, status: t.status, assignee: t.assignee, parent_task: t.parent_task }]; } } return out; }" }
+        { "name": "create_task", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": ["name", "text"] }, "source": "verb :create_task(name, text) rx { let task = create($task, { owner: actor, name: name }); task.parent_task = null; task.space = this; this.root_tasks = this.root_tasks + [task]; move(task, this); observe({ type: \"task_created\", task: task, parent: null, name: name, text: text }); task:set_text(text); return task; }" },
+        { "name": "list_tasks", "perms": "rxd", "direct_callable": true, "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :list_tasks() rxd { let out = []; for t in contents(this) { if (isa(t, $task) && t.space == this) { let text = \"\"; try { text = t:text(); } except err { text = \"\"; } out = out + [{ id: t, name: t.name, text: text, status: t.status, assignee: t.assignee, parent_task: t.parent_task }]; } } return out; }" }
       ]
     },
     {
       "local_name": "$task",
       "parent": "note:$note",
-      "description": "Base class for taskspace work items. Tasks are note descendants, so they can also participate in note/card surfaces while keeping task-specific lifecycle verbs.",
+      "description": "Base class for taskspace work items. Tasks are $note descendants — name is the listing identity, text is the markdown description, and the inherited cosmetic description slot is left empty by default. The task adds parent/subtask wiring, claim/status lifecycle, requirements, artifacts, and messages on top of the note shape.",
       "properties": [
-        { "name": "title", "type": "str", "default": "", "perms": "rw" },
-        { "name": "description", "type": "str", "default": "", "perms": "rw" },
+        { "name": "text", "type": "str", "default": "", "perms": "r" },
         { "name": "parent_task", "type": "obj|null", "default": null, "perms": "rw" },
         { "name": "subtasks", "type": "list<obj>", "default": [], "perms": "rw" },
         { "name": "status", "type": "str", "default": "open", "perms": "rw" },
@@ -68,7 +67,7 @@
         { "name": "space", "type": "obj|null", "default": null, "perms": "rw" }
       ],
       "verbs": [
-        { "name": "add_subtask", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": ["title", "description"] }, "source": "verb :add_subtask(title, description) rx { let child = create($task, actor); child.title = title; child.description = description; child.parent_task = this; child.space = this.space; this.subtasks = this.subtasks + [child]; move(child, this.space); observe({ type: \"task_created\", task: child, parent: this, title: title }); observe({ type: \"subtask_added\", parent: this, child: child, index: length(this.subtasks) - 1 }); return child; }" },
+        { "name": "add_subtask", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": ["name", "text"] }, "source": "verb :add_subtask(name, text) rx { let child = create($task, { owner: actor, name: name }); child.parent_task = this; child.space = this.space; this.subtasks = this.subtasks + [child]; move(child, this.space); observe({ type: \"task_created\", task: child, parent: this, name: name, text: text }); observe({ type: \"subtask_added\", parent: this, child: child, index: length(this.subtasks) - 1 }); child:set_text(text); return child; }" },
         { "name": "move", "perms": "rx", "arg_spec": { "args": ["parent", "index"] }, "source": "verb :move(parent, index) rx { if (parent == this) { raise { code: \"E_RECMOVE\", message: \"recursive task move\" }; } let stack = this.subtasks; while (length(stack) > 0) { let child = stack[1]; if (child == parent) { raise { code: \"E_RECMOVE\", message: \"recursive task move\" }; } let rest = []; let stack_i = 1; for stack_item in stack { if (stack_i > 1) { rest = rest + [stack_item]; } stack_i = stack_i + 1; } stack = rest + child.subtasks; } if (parent != null && parent.space != this.space) { raise { code: \"E_INVARG\", message: \"cross-taskspace move is not supported\" }; } if (index < 0) { raise { code: \"E_RANGE\", message: \"task move index out of range\", value: index }; } let from = this.parent_task; let without = []; let base = []; if (from == null) { for item in this.space.root_tasks { if (item != this) { without = without + [item]; } } } else { for item in from.subtasks { if (item != this) { without = without + [item]; } } } if (parent == null) { base = this.space.root_tasks; } else { base = parent.subtasks; } let cleaned = []; for item in base { if (item != this) { cleaned = cleaned + [item]; } } if (from == parent) { cleaned = without; } if (index > length(cleaned)) { raise { code: \"E_RANGE\", message: \"task move index out of range\", value: index }; } let next = []; let i = 0; let inserted = false; for item in cleaned { if (i == index) { next = next + [this]; inserted = true; } next = next + [item]; i = i + 1; } if (!inserted) { next = next + [this]; } if (from == null) { this.space.root_tasks = without; } else { from.subtasks = without; } if (parent == null) { this.space.root_tasks = next; } else { parent.subtasks = next; } this.parent_task = parent; observe({ type: \"task_moved\", task: this, from_parent: from, to_parent: parent, index: index }); return this; }" },
         { "name": "claim", "perms": "rx", "tool_exposed": true, "arg_spec": { "args": [] }, "source": "verb :claim() rx { if (this.assignee == actor) { return this; } if (this.assignee != null) { raise { code: \"E_CONFLICT\", message: \"task already claimed\", value: this.assignee }; } this.assignee = actor; this.status = \"claimed\"; observe({ type: \"task_claimed\", task: this, actor: actor }); return this; }" },
         { "name": "release", "perms": "rx", "arg_spec": { "args": [] }, "source": "verb :release() rx { if (this.assignee != null && this.assignee != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only assignee or wizard can release\" }; } this.assignee = null; if (this.status != \"done\") { this.status = \"open\"; } observe({ type: \"task_released\", task: this }); return this; }" },
@@ -82,7 +81,7 @@
   ],
   "features": [],
   "schemas": [
-    { "on": "$taskspace", "type": "task_created", "shape": { "task": "obj", "parent": "obj|null", "title": "str" } },
+    { "on": "$taskspace", "type": "task_created", "shape": { "task": "obj", "parent": "obj|null", "name": "str", "text": "str" } },
     { "on": "$task", "type": "subtask_added", "shape": { "parent": "obj", "child": "obj", "index": "int" } },
     { "on": "$task", "type": "task_moved", "shape": { "task": "obj", "from_parent": "obj|null", "to_parent": "obj|null", "index": "int" } },
     { "on": "$task", "type": "task_claimed", "shape": { "task": "obj", "actor": "obj" } },

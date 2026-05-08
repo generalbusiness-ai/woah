@@ -9,7 +9,7 @@ requirements, statuses, messages, and references to artifacts.
 | Class | Parent | Description |
 |---|---|---|
 | `$taskspace` | `$space` | Coordination space for hierarchical work. Extends `$space` with root task ordering and task-creation behavior. |
-| `$task` | `$note` | Work item and note/card artifact. Inherits note text/writer semantics while storing task-specific title, description, status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
+| `$task` | `$note` | Work item and note/card artifact. Uses the v0.2 `$note` slots: inherited `name` is the task title (listing identity), `text` is redeclared readable on `$task` because task descriptions are part of the taskspace public surface, and the cosmetic `description` slot is left empty by default. Adds task-specific status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
 
 ## Goal
 
@@ -52,7 +52,7 @@ cross the boundary as `woo-taskspace-*` custom events.
 
 ## Persistent State
 
-- Task title and description.
+- Task name (listing title) and readable markdown text (description).
 - Parent task/project ref.
 - Ordered child task refs.
 - Task status: `open`, `claimed`, `in_progress`, `blocked`, `done`.
@@ -63,8 +63,8 @@ cross the boundary as `woo-taskspace-*` custom events.
 
 ## Calls
 
-- `taskspace:create_task(title, description)`
-- `task:add_subtask(title, description)`
+- `taskspace:create_task(name, text)`
+- `task:add_subtask(name, text)`
 - `task:move(parent, index)`
 - `task:claim()`
 - `task:release()`
@@ -102,7 +102,7 @@ Each observation the taskspace emits has a defined payload shape:
 
 | Observation | Payload | When emitted |
 |---|---|---|
-| `task_created` | `{task: obj, parent: obj \| null, title: str}` | After `:create_task` or `:add_subtask`. |
+| `task_created` | `{task: obj, parent: obj \| null, name: str, text: str}` | After `:create_task` or `:add_subtask`. |
 | `subtask_added` | `{parent: obj, child: obj, index: int}` | When a subtask is added to a parent task. |
 | `task_moved` | `{task: obj, from_parent: obj \| null, to_parent: obj \| null, index: int}` | After `:move`. |
 | `task_claimed` | `{task: obj, actor: obj}` | After `:claim`. |

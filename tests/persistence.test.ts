@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized, scopeSerializedWorldToHost } from "../src/core/bootstrap";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest } from "../src/core/catalog-installer";
+import { installLocalCatalogs } from "../src/core/local-catalogs";
 import type { SerializedWorld } from "../src/core/repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, TinyBytecode, VerbDef } from "../src/core/types";
 import { dumpSerializedObjectsToJsonFolder, JsonFolderWorldRepository } from "../src/server/json-folder-repository";
@@ -204,7 +205,8 @@ describe("sqlite persistence", () => {
       secondRepo.saves = 0;
 
       expect(secondCluster.object(task).parent).toBe("$task");
-      expect(secondCluster.getProp(task, "title")).toBe("Cluster persisted");
+      expect(secondCluster.object(task).name).toBe("Cluster persisted");
+      expect(secondCluster.getProp(task, "text")).toBe("written after host seed");
       expect(secondCluster.getProp("the_taskspace", "root_tasks")).toContain(task);
       expect(secondCluster.replay("the_taskspace", 1, 10).map((entry) => entry.message.verb)).toEqual(["create_task"]);
 
@@ -547,6 +549,143 @@ describe("json folder persistence", () => {
       const verifyWorld = createWorld({ repository: verifyRepo });
       expect(verifyWorld.getProp("obj_test_sticky_persist_filled", "body")).toBe("one\ntwo");
       expect(verifyWorld.getProp("obj_test_sticky_persist_empty", "body")).toBe("");
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists a $note v1 → v2 drop_verb migration across SQLite reload", () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      const v1Note: CatalogManifest = {
+        name: "note",
+        version: "1.0.0",
+        spec_version: "v1",
+        license: "MIT",
+        classes: [{
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "", perms: "" }],
+          verbs: [
+            {
+              name: "title",
+              perms: "rxd",
+              direct_callable: true,
+              skip_presence_check: true,
+              arg_spec: { args: [] },
+              source: "verb :title() rxd { return this.name; }"
+            },
+            {
+              name: "delete",
+              perms: "rx",
+              arg_spec: { args: ["line"] },
+              source: "verb :delete(line) rx { return true; }"
+            }
+          ]
+        }]
+      } as unknown as CatalogManifest;
+      seedRepo.transaction(() => installCatalogManifest(seedWorld, v1Note, { tap: "@local", alias: "note" }));
+      expect(seedWorld.ownVerbExact("$note", "title")).toBeTruthy();
+      expect(seedWorld.ownVerbExact("$note", "delete")).toBeTruthy();
+      seedRepo.close();
+
+      const upgradeRepo = new LocalSQLiteRepository(path);
+      const upgradeWorld = createWorld({ repository: upgradeRepo, catalogs: false });
+      expect(upgradeWorld.ownVerbExact("$note", "title")).toBeTruthy();
+      expect(upgradeWorld.ownVerbExact("$note", "delete")).toBeTruthy();
+      const v2Note: CatalogManifest = {
+        ...v1Note,
+        version: "2.0.0",
+        classes: [{
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "", perms: "" }]
+        }]
+      } as unknown as CatalogManifest;
+      const migration = readCatalogManifest("note", "migration-v1-to-v2.json") as NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"];
+      const record = upgradeRepo.transaction(() => updateCatalogManifest(upgradeWorld, v2Note, {
+        tap: "@local",
+        alias: "note",
+        acceptMajor: true,
+        migration
+      }));
+      expect(record.migration_state).toMatchObject({ status: "completed", to_version: "2.0.0" });
+      expect(upgradeWorld.ownVerbExact("$note", "title")).toBeNull();
+      expect(upgradeWorld.ownVerbExact("$note", "delete")).toBeNull();
+      upgradeRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      expect(verifyWorld.ownVerbExact("$note", "title")).toBeNull();
+      expect(verifyWorld.ownVerbExact("$note", "delete")).toBeNull();
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("taskspace v0.2 → v0.3 migration persists task.name across SQLite reload", () => {
+    const { dir, path } = tempDb();
+    try {
+      // Seed: a normal full-bootstrap world (taskspace v0.3 already
+      // installed, migration marker already in $system.applied_migrations).
+      // Then pretend it's an upgraded v0.2 world by re-introducing the v0.2
+      // shadow `title` / `description` property defs on $task, dropping the
+      // migration marker, and inserting an instance whose v0.2 :create_task
+      // path set title/description as own values without touching
+      // SerializedObject.name. Calling installLocalCatalogs(["taskspace"])
+      // exercises the real gateway entry — runTaskspaceNoteShapeMigration —
+      // including ledger marking, schema-plan run, and class-def cleanup.
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo });
+      seedRepo.transaction(() => {
+        seedWorld.defineProperty("$task", { name: "title", defaultValue: "", typeHint: "str", perms: "", owner: "$wiz" });
+        seedWorld.defineProperty("$task", { name: "description", defaultValue: "", typeHint: "str", perms: "", owner: "$wiz" });
+        const stale = (seedWorld.getProp("$system", "applied_migrations") as string[])
+          .filter((id) => id !== "2026-05-06-taskspace-note-shape");
+        seedWorld.setProp("$system", "applied_migrations", stale);
+        seedWorld.createObject({ id: "obj_test_task_persist", parent: "$task", owner: "$wiz" });
+        seedWorld.setProp("obj_test_task_persist", "title", "Persisted Title");
+        seedWorld.setProp("obj_test_task_persist", "description", "Body markdown");
+      });
+      // Pre-migration: object name is the id and shadow defs sit on $task.
+      expect(seedWorld.object("obj_test_task_persist").name).toBe("obj_test_task_persist");
+      expect(seedWorld.getProp("obj_test_task_persist", "title")).toBe("Persisted Title");
+      expect(seedWorld.object("$task").propertyDefs.has("title")).toBe(true);
+      expect(seedWorld.object("$task").propertyDefs.has("description")).toBe(true);
+
+      // Drive the real gateway entry point. installLocalCatalogs notices the
+      // missing migration marker and runs runTaskspaceNoteShapeMigration:
+      // data walk → class-def cleanup → schema plan → mark applied.
+      seedRepo.transaction(() => installLocalCatalogs(seedWorld, ["taskspace"]));
+
+      // In-memory: name persists on both surfaces, text replaced description,
+      // stale instance values stripped, class shadows gone, marker applied.
+      expect(seedWorld.object("obj_test_task_persist").name).toBe("Persisted Title");
+      expect(seedWorld.getProp("obj_test_task_persist", "name")).toBe("Persisted Title");
+      expect(seedWorld.getProp("obj_test_task_persist", "text")).toBe("Body markdown");
+      expect(seedWorld.object("obj_test_task_persist").properties.has("title")).toBe(false);
+      expect(seedWorld.object("obj_test_task_persist").properties.has("description")).toBe(false);
+      expect(seedWorld.object("$task").propertyDefs.has("title")).toBe(false);
+      expect(seedWorld.object("$task").propertyDefs.has("description")).toBe(false);
+      expect(seedWorld.getProp("$system", "applied_migrations")).toContain("2026-05-06-taskspace-note-shape");
+      seedRepo.close();
+
+      // Reload from SQLite. Without setObjectName persisting WooObject.name,
+      // the object name would revert to "obj_test_task_persist" — the
+      // primary bug this test guards against.
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo });
+      expect(verifyWorld.object("obj_test_task_persist").name).toBe("Persisted Title");
+      expect(verifyWorld.getProp("obj_test_task_persist", "name")).toBe("Persisted Title");
+      expect(verifyWorld.getProp("obj_test_task_persist", "text")).toBe("Body markdown");
+      expect(verifyWorld.object("obj_test_task_persist").properties.has("title")).toBe(false);
+      expect(verifyWorld.object("obj_test_task_persist").properties.has("description")).toBe(false);
+      expect(verifyWorld.object("$task").propertyDefs.has("title")).toBe(false);
+      expect(verifyWorld.object("$task").propertyDefs.has("description")).toBe(false);
       verifyRepo.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

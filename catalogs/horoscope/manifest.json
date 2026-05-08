@@ -1,46 +1,18 @@
 {
   "name": "horoscope",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "spec_version": "v1",
-  "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory carrying the generated text.",
+  "description": "Horoscope vending-machine block — a $dispenser_block subclass driven by a small Workers-AI LLM. The owner sets the persona via system_prompt; requesters :order(\"scorpio\") (or any prompt) and a $dispensed_note arrives in their inventory with name `Horoscope: Scorpio` and the generated text as its markdown body.",
   "license": "MIT",
   "depends": ["@local:dispenser"],
   "classes": [
     {
-      "local_name": "$horoscope_note",
-      "parent": "$dispensed_note",
-      "description": "A self-destructing horoscope reading. Passes between people freely (player→player moves are normal). If the note is dropped into a room (player→space), it is recycled instead of landing in the room. The :recycle handler emits a puff observation in the surrounding space before the substrate destroys the note, so explicit recycle and drop-into-space share the same visible effect.",
-      "properties": [],
-      "verbs": [
-        {
-          "name": "moveto",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "arg_spec": { "args": ["target"] },
-          "source": "verb :moveto(target) rxd { if (target != null && isa(target, $space)) { recycle(this); return $nowhere; } return moveto(this, target); }"
-        },
-        {
-          "name": "recycle",
-          "perms": "rxd",
-          "arg_spec": { "args": [] },
-          "source": "verb :recycle() rxd { let here = location(this); if (here == null) { return null; } let scene = here; if (!isa(scene, $space)) { scene = location(scene); } if (scene == null || !isa(scene, $space)) { return null; } observe_to_space(scene, { type: \"vanished\", source: this, note: this, text: \"The note vanishes in a small puff of smoke.\", ts: now() }); }"
-        }
-      ]
-    },
-    {
       "local_name": "$horoscope_block",
       "parent": "$dispenser_block",
       "flags": { "fertile": true },
-      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, and calls :deliver to drop a $horoscope_note into the requester's inventory. The note self-destructs in a puff of smoke when dropped or explicitly recycled, but passes between people freely. Default rate_limit_seconds=60 (one order per requester per minute).",
+      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, derives a note name from the request (e.g. `Horoscope: Scorpio`), and calls :deliver(order_id, name, text) to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
       "properties": [],
       "verbs": [
-        {
-          "name": "default_note_class",
-          "perms": "rxd",
-          "arg_spec": { "args": [] },
-          "source": "verb :default_note_class() rxd { return $horoscope_note; }"
-        },
         {
           "name": "assert_configurable",
           "perms": "rxd",
@@ -85,12 +57,6 @@
           "source": "verb :title() rxd { if (this.last_pushed_at == 0) { return this.name + \" (disconnected)\"; } return this.name; }"
         },
         {
-          "name": "default_note_name",
-          "perms": "rxd",
-          "arg_spec": { "args": ["entry", "body"] },
-          "source": "verb :default_note_name(entry, body) rxd { let req = \"\"; if (typeof(entry) == \"map\" && has(entry, \"request\") && typeof(entry[\"request\"]) == \"string\") { req = str_trim(entry[\"request\"]); } if (!req) { return \"Horoscope reading\"; } let cap = 60; if (length(req) > cap) { req = str_slice(req, 1, cap - 3) + \"...\"; } return \"Horoscope: \" + req; }"
-        },
-        {
           "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
@@ -99,17 +65,6 @@
           "source": "verb :look_self() rxd { let connected = this.last_pushed_at != 0; let status = \"connected\"; if (!connected) { status = \"disconnected\"; } let usage = \"Use `order \" + this.name + \" <sign or topic>` to request a horoscope; it will deliver a note to you when ready.\"; let pending = length(this.pending_orders); let text = this.description + \" Status: \" + status + \". \" + usage; if (pending > 0) { text = text + \" Pending orders: \" + to_string(pending) + \".\"; } return { id: this, title: this:title(), description: text, status: status, connected: connected, last_pushed_at: this.last_pushed_at, last_error: this.last_error, pending_count: pending, usage: usage, location: location(this) }; }"
         }
       ]
-    }
-  ],
-  "schemas": [
-    {
-      "on": "$horoscope_note",
-      "type": "vanished",
-      "shape": {
-        "note": "obj",
-        "text": "str",
-        "ts": "int"
-      }
     }
   ]
 }
