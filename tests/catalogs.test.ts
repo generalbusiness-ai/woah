@@ -3742,6 +3742,30 @@ describe("local catalogs", () => {
       }
     });
 
+    it("$room:look_at omits the looking actor from the Present: text", async () => {
+      const world = createWorld();
+      const looker = world.auth("guest:look-at-present-self").actor;
+      const witness = world.auth("guest:look-at-present-other").actor;
+      world.setProp(looker, "name", "Looker McLook");
+      world.setProp(witness, "name", "Witness McSee");
+      const enterLooker = await world.directCall("enter-looker", looker, "the_chatroom", "enter", []);
+      const enterWitness = await world.directCall("enter-witness", witness, "the_chatroom", "enter", []);
+      expect(enterLooker.op).toBe("result");
+      expect(enterWitness.op).toBe("result");
+
+      const looked = await world.directCall("look-at-room-from-looker", looker, "the_chatroom", "look_at", ["the_chatroom"]);
+      expect(looked.op).toBe("result");
+      if (looked.op !== "result") return;
+      const obs = looked.observations.find((o) => o.type === "looked");
+      expect(obs).toBeDefined();
+      const text = String(obs?.text ?? "");
+      const presentMatch = text.match(/Present: ([^.]*)\./);
+      expect(presentMatch).not.toBeNull();
+      const presentNames = (presentMatch?.[1] ?? "").split(",").map((s) => s.trim());
+      expect(presentNames).toContain("Witness McSee");
+      expect(presentNames).not.toContain("Looker McLook");
+    });
+
     it(":match_names() is zero-arg and uses the verb-frame `actor` global, contributing actor-sensitive keywords", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["chat"]);
