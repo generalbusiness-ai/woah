@@ -68,6 +68,7 @@ const LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION = "2026-05-06-note-text-str
 const LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-note-stale-class-verbs";
 const LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-pinboard-stale-class-verbs";
 const LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-dispenser-stale-class-verbs";
+const LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION = "2026-05-08-tasks-transparent-feature";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -115,7 +116,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_TRANSPARENT_FEATURE_MIGRATION },
   { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION },
-  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" }
+  { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION, only: "tasks" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -339,6 +341,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
   run(LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
+  runTasksTransparentFeatureMigration(world, names);
   return covered;
 }
 
@@ -651,7 +654,7 @@ function chatTransparentFeaturePostcondition(world: WooWorld, names: readonly st
     const announce = world.objects.has("$room") ? world.ownVerbExact("$room", "announce_all_but") : null;
     if (!announce?.source.includes("hear_parent_announce")) return false;
   }
-  for (const name of ["dubspace", "pinboard"]) {
+  for (const name of ["dubspace", "pinboard", "tasks"]) {
     if (!names.includes(name) || !localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name);
     for (const def of manifest?.classes ?? []) {
@@ -665,6 +668,34 @@ function chatTransparentFeaturePostcondition(world: WooWorld, names: readonly st
     if (features[0] !== "$transparent" || features.includes("$conversational")) return false;
   }
   return true;
+}
+
+// Worlds bootstrapped before the_taskboard had its $transparent attach_feature
+// hook will have the older `2026-05-04-chat-transparent-feature` migration
+// already marked applied. That migration only considered dubspace and pinboard
+// consumers, so `the_taskboard.features` is left empty and the post-merge
+// schema-plan reconciler reports feature_drift on every boot. Run a focused
+// re-attach for just the tasks consumer; idempotent and safe to re-run.
+function runTasksTransparentFeatureMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION)) return;
+  if (!names.includes("tasks") || !localCatalogInstalled(world, "tasks")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION);
+    return;
+  }
+  if (!world.objects.has("$transparent")) return;
+  const manifest = LOCAL_CATALOGS.get("tasks");
+  for (const hook of manifest?.seed_hooks ?? []) {
+    if (hook.kind !== "attach_feature" || hook.feature !== "chat:$transparent") continue;
+    const consumer = typeof hook.consumer === "string" ? (hook.consumer as ObjRef) : null;
+    if (!consumer || !world.objects.has(consumer)) continue;
+    const raw = world.propOrNull(consumer, "features");
+    const features = Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
+    const next = ["$transparent", ...features.filter((item) => item !== "$transparent" && item !== "$conversational")];
+    if (features.length === next.length && features.every((item, i) => item === next[i])) continue;
+    world.setProp(consumer, "features", next);
+    world.setProp(consumer, "features_version", Number(world.propOrNull(consumer, "features_version") ?? 0) + 1);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION);
 }
 
 function runDemoSpacesNoAutoPresenceMigration(world: WooWorld): void {

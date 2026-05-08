@@ -49,6 +49,27 @@ describe("tasks catalog", () => {
     expect(world.verbInfo("the_taskboard", "say").definer).toBe("$transparent");
   });
 
+  it("re-attaches $transparent on the_taskboard for an upgraded world that drifted", () => {
+    const world = setupWorld();
+    // Mimic a world that bootstrapped with the older chat-transparent migration
+    // (which only knew dubspace + pinboard consumers). The marker is set so
+    // runChatTransparentFeatureMigration short-circuits, and the_taskboard's
+    // features have drifted away from $transparent. The dedicated tasks
+    // transparent-feature migration is expected to fix it on next install.
+    world.setProp("the_taskboard", "features", []);
+    world.setProp("the_taskboard", "features_version", 0);
+    const ledger = world.getProp("$system", "applied_migrations") as string[];
+    if (!ledger.includes("2026-05-04-chat-transparent-feature")) {
+      world.setProp("$system", "applied_migrations", [...ledger, "2026-05-04-chat-transparent-feature"]);
+    }
+    world.setProp("$system", "applied_migrations", (world.getProp("$system", "applied_migrations") as string[]).filter((id) => id !== "2026-05-08-tasks-transparent-feature"));
+
+    installLocalCatalogs(world, ["chat", "note", "tasks"]);
+    const features = world.propOrNull("the_taskboard", "features");
+    expect(Array.isArray(features) && features.includes("$transparent")).toBe(true);
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-08-tasks-transparent-feature");
+  });
+
   it("rejects create_task for an unknown kind", async () => {
     const world = setupWorld();
     const session = world.auth("guest:create-bug");
