@@ -194,6 +194,92 @@ describe("bundled catalog UI components", () => {
     expect(element.querySelector("form[data-tasks-prompt]")).toBeNull();
   });
 
+  it("admin overlay sets a role / obligation / policy and fires the verbs in order, plus remove buttons", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const calls: { target: string; verb: string; args: unknown[] }[] = [];
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    const registryProps: Record<string, unknown> = {
+      roles: { doer: { description: "Does", owners: ["$wiz"] } },
+      obligations: { "do:it": { role: "doer", criterion: "Done." } },
+      policies: { task: ["do:it"] }
+    };
+    const woo: WooContext = {
+      actor: "$wiz",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, owner: "$wiz", props: ref === "the_taskboard" ? registryProps : {}, catalogState: {} }),
+      directCall: async (target, verb, args = []) => {
+        calls.push({ target, verb, args });
+        if (verb === "listing") return [];
+        return null;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "$wiz",
+      actorNames: {},
+      tasks: [],
+      policies: ["task"],
+      isOwner: true,
+      roles: [{ name: "doer", description: "Does", owners: ["$wiz"] }],
+      obligations: [{ key: "do:it", role: "doer", criterion: "Done." }],
+      policiesMap: { task: ["do:it"] }
+    };
+
+    // Toggle open the admin panel.
+    element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
+    const panel = element.querySelector("[data-tasks-admin-form='role']") as HTMLFormElement | null;
+    expect(panel).not.toBeNull();
+
+    // Add a role.
+    const roleForm = element.querySelector("[data-tasks-admin-form='role']") as HTMLFormElement;
+    roleForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = "reviewer";
+    roleForm.querySelector<HTMLInputElement>('input[name="description"]')!.value = "Reviews work";
+    roleForm.querySelector<HTMLInputElement>('input[name="owners"]')!.value = "guest_a, guest_b";
+    roleForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    const setRole = calls.find((c) => c.verb === "set_role");
+    expect(setRole?.args).toEqual(["reviewer", { description: "Reviews work", owners: ["guest_a", "guest_b"] }]);
+
+    // Add an obligation.
+    const obForm = element.querySelector("[data-tasks-admin-form='obligation']") as HTMLFormElement;
+    obForm.querySelector<HTMLInputElement>('input[name="key"]')!.value = "review:approve";
+    obForm.querySelector<HTMLSelectElement>('select[name="role"]')!.value = "doer";
+    obForm.querySelector<HTMLInputElement>('input[name="criterion"]')!.value = "Reviewer approves.";
+    obForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    const setOb = calls.find((c) => c.verb === "set_obligation");
+    expect(setOb?.args).toEqual(["review:approve", { role: "doer", criterion: "Reviewer approves." }]);
+
+    // Add a policy.
+    const polForm = element.querySelector("[data-tasks-admin-form='policy']") as HTMLFormElement;
+    polForm.querySelector<HTMLInputElement>('input[name="kind"]')!.value = "review";
+    polForm.querySelector<HTMLInputElement>('input[name="keys"]')!.value = "do:it, review:approve";
+    polForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    const setPol = calls.find((c) => c.verb === "set_policy");
+    expect(setPol?.args).toEqual(["review", ["do:it", "review:approve"]]);
+
+    // Remove buttons fire the matching remove_* verbs with the targeted key.
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="obligation"][data-key="do:it"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="policy"][data-key="task"]')!.click();
+    await flush();
+    expect(calls.find((c) => c.verb === "remove_role")?.args).toEqual(["doer"]);
+    expect(calls.find((c) => c.verb === "remove_obligation")?.args).toEqual(["do:it"]);
+    expect(calls.find((c) => c.verb === "remove_policy")?.args).toEqual(["task"]);
+  });
+
   it("opens a detail panel on card click, fetching :detail and rendering obligations + log", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);

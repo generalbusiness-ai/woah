@@ -68,6 +68,18 @@ export type TaskDetail = {
   location: string | null;
 };
 
+export type RegistryRole = {
+  name: string;
+  description: string;
+  owners: string[];
+};
+
+export type RegistryObligation = {
+  key: string;
+  role: string;
+  criterion: string;
+};
+
 export type KanbanData = {
   registryId: string;
   registryName: string;
@@ -76,6 +88,9 @@ export type KanbanData = {
   tasks: KanbanTask[];
   policies: string[];
   isOwner: boolean;
+  roles: RegistryRole[];
+  obligations: RegistryObligation[];
+  policiesMap: Record<string, string[]>;
 };
 
 type ColumnId = "ready" | "waiting" | "in_flight" | "done" | "dropped";
@@ -290,7 +305,10 @@ export class WooTasksKanbanElement extends HTMLElement {
     actorNames: {},
     tasks: [],
     policies: [],
-    isOwner: false
+    isOwner: false,
+    roles: [],
+    obligations: [],
+    policiesMap: {}
   };
   private boundClick = false;
   private boundDrag = false;
@@ -298,12 +316,16 @@ export class WooTasksKanbanElement extends HTMLElement {
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private openPrompt: { taskId: string; verb: string } | null = null;
   private createOpen = false;
+  private adminOpen = false;
   private openDetail: { taskId: string; detail: TaskDetail | null; loading: boolean; error?: string } | null = null;
 
   set data(value: Partial<KanbanData> & Pick<KanbanData, "registryId" | "registryName" | "actor" | "actorNames" | "tasks">) {
     this.model = {
       policies: [],
       isOwner: false,
+      roles: [],
+      obligations: [],
+      policiesMap: {},
       ...value
     };
     this.render();
@@ -418,9 +440,37 @@ export class WooTasksKanbanElement extends HTMLElement {
     }
     const props = (projected?.props ?? {}) as Record<string, unknown>;
     const rawPolicies = props.policies;
-    const policies = rawPolicies && typeof rawPolicies === "object" && !Array.isArray(rawPolicies)
-      ? Object.keys(rawPolicies)
-      : [];
+    const policiesMap: Record<string, string[]> = {};
+    if (rawPolicies && typeof rawPolicies === "object" && !Array.isArray(rawPolicies)) {
+      for (const [kind, keys] of Object.entries(rawPolicies as Record<string, unknown>)) {
+        if (Array.isArray(keys)) policiesMap[kind] = keys.filter((k): k is string => typeof k === "string");
+      }
+    }
+    const policies = Object.keys(policiesMap);
+    const rawRoles = props.roles;
+    const roles: RegistryRole[] = [];
+    if (rawRoles && typeof rawRoles === "object" && !Array.isArray(rawRoles)) {
+      for (const [name, info] of Object.entries(rawRoles as Record<string, unknown>)) {
+        const i = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, unknown> : {};
+        roles.push({
+          name,
+          description: typeof i.description === "string" ? i.description : "",
+          owners: Array.isArray(i.owners) ? i.owners.filter((o): o is string => typeof o === "string") : []
+        });
+      }
+    }
+    const rawObs = props.obligations;
+    const obligations: RegistryObligation[] = [];
+    if (rawObs && typeof rawObs === "object" && !Array.isArray(rawObs)) {
+      for (const [key, info] of Object.entries(rawObs as Record<string, unknown>)) {
+        const i = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, unknown> : {};
+        obligations.push({
+          key,
+          role: typeof i.role === "string" ? i.role : "",
+          criterion: typeof i.criterion === "string" ? i.criterion : ""
+        });
+      }
+    }
     const ownerRef = typeof projected?.owner === "string" ? projected.owner : null;
     // Heuristic gate: show admin CTAs to the registry owner or $wiz. The
     // verb's own permission check is the truth — this just hides the button
@@ -433,7 +483,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       actorNames,
       tasks,
       policies,
-      isOwner
+      isOwner,
+      roles,
+      obligations,
+      policiesMap
     };
   }
 
@@ -476,6 +529,20 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.render();
       return;
     }
+    if (target.closest<HTMLButtonElement>("[data-tasks-admin-toggle]")) {
+      event.preventDefault();
+      this.adminOpen = !this.adminOpen;
+      this.render();
+      return;
+    }
+    const removeBtn = target.closest<HTMLButtonElement>("[data-tasks-admin-remove]");
+    if (removeBtn) {
+      event.preventDefault();
+      const kind = removeBtn.dataset.tasksAdminRemove ?? "";
+      const key = removeBtn.dataset.key ?? "";
+      if (kind && key) void this.removeAdminEntry(kind, key);
+      return;
+    }
     const cancel = target.closest<HTMLButtonElement>("[data-tasks-prompt-cancel]");
     if (cancel) {
       event.preventDefault();
@@ -516,6 +583,12 @@ export class WooTasksKanbanElement extends HTMLElement {
 
   private handleSubmit = (event: Event): void => {
     const target = event.target as HTMLElement | null;
+    const adminForm = target?.closest<HTMLFormElement>("[data-tasks-admin-form]");
+    if (adminForm) {
+      event.preventDefault();
+      void this.submitAdminForm(adminForm);
+      return;
+    }
     const createForm = target?.closest<HTMLFormElement>("[data-tasks-create]");
     if (createForm) {
       event.preventDefault();
@@ -557,6 +630,59 @@ export class WooTasksKanbanElement extends HTMLElement {
     } catch {
       // Errors land as observations; refresh will repaint either way.
     }
+    await this.refresh();
+  }
+
+  private async submitAdminForm(form: HTMLFormElement): Promise<void> {
+    const woo = this.woo;
+    const subject = this.subject ?? this.model.registryId;
+    if (!woo || !subject) return;
+    const kind = form.dataset.tasksAdminForm ?? "";
+    if (kind === "role") {
+      const name = (form.querySelector<HTMLInputElement>('input[name="name"]')?.value ?? "").trim();
+      const description = (form.querySelector<HTMLInputElement>('input[name="description"]')?.value ?? "").trim();
+      const ownersRaw = (form.querySelector<HTMLInputElement>('input[name="owners"]')?.value ?? "").trim();
+      const owners = ownersRaw.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!name) return;
+      try {
+        await woo.directCall(subject, "set_role", [name, { description, owners }]);
+      } catch { /* surfaces in next refresh */ }
+      await this.refresh();
+      return;
+    }
+    if (kind === "obligation") {
+      const key = (form.querySelector<HTMLInputElement>('input[name="key"]')?.value ?? "").trim();
+      const role = (form.querySelector<HTMLSelectElement>('select[name="role"]')?.value ?? "").trim();
+      const criterion = (form.querySelector<HTMLInputElement>('input[name="criterion"]')?.value ?? "").trim();
+      if (!key || !role || !criterion) return;
+      try {
+        await woo.directCall(subject, "set_obligation", [key, { role, criterion }]);
+      } catch { /* surfaces in next refresh */ }
+      await this.refresh();
+      return;
+    }
+    if (kind === "policy") {
+      const policyKind = (form.querySelector<HTMLInputElement>('input[name="kind"]')?.value ?? "").trim();
+      const keysRaw = (form.querySelector<HTMLInputElement>('input[name="keys"]')?.value ?? "").trim();
+      const keys = keysRaw.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!policyKind || keys.length === 0) return;
+      try {
+        await woo.directCall(subject, "set_policy", [policyKind, keys]);
+      } catch { /* surfaces in next refresh */ }
+      await this.refresh();
+      return;
+    }
+  }
+
+  private async removeAdminEntry(kind: string, key: string): Promise<void> {
+    const woo = this.woo;
+    const subject = this.subject ?? this.model.registryId;
+    if (!woo || !subject) return;
+    const verb = kind === "role" ? "remove_role" : kind === "obligation" ? "remove_obligation" : kind === "policy" ? "remove_policy" : "";
+    if (!verb) return;
+    try {
+      await woo.directCall(subject, verb, [key]);
+    } catch { /* surfaces in next refresh */ }
     await this.refresh();
   }
 
@@ -815,21 +941,94 @@ export class WooTasksKanbanElement extends HTMLElement {
   private renderHeader(registryName: string): string {
     const { policies, isOwner } = this.model;
     const havePolicies = policies.length > 0;
-    let toolbar = "";
+    const buttons: string[] = [];
     if (havePolicies) {
-      toolbar = this.createOpen
-        ? this.renderCreateForm()
-        : `<button type="button" data-tasks-create-open>+ New task</button>`;
+      buttons.push(this.createOpen
+        ? "" // form is rendered below; suppress the open button while editing
+        : `<button type="button" data-tasks-create-open>+ New task</button>`);
     } else if (isOwner) {
-      toolbar = `<button type="button" data-tasks-seed-policy title="Install a doer/do:it/task fixture so create_task has a kind to bind to">Seed minimal policy</button>`;
+      buttons.push(`<button type="button" data-tasks-seed-policy title="Install a doer/do:it/task fixture so create_task has a kind to bind to">Seed minimal policy</button>`);
     } else {
-      toolbar = `<span class="woo-tasks-kanban-empty-toolbar">No policies configured. Ask the registry owner to seed one.</span>`;
+      buttons.push(`<span class="woo-tasks-kanban-empty-toolbar">No policies configured. Ask the registry owner to seed one.</span>`);
     }
+    if (isOwner) {
+      buttons.push(`<button type="button" data-tasks-admin-toggle aria-expanded="${this.adminOpen ? "true" : "false"}">${this.adminOpen ? "Close admin" : "⚙ Admin"}</button>`);
+    }
+    const toolbar = buttons.filter(Boolean).join(" ");
     return `
       <header class="woo-tasks-kanban-header">
         <h2>${escapeHtml(registryName)}</h2>
         <div class="woo-tasks-kanban-toolbar">${toolbar}</div>
       </header>
+      ${this.createOpen ? this.renderCreateForm() : ""}
+      ${this.adminOpen ? this.renderAdminPanel() : ""}
+    `;
+  }
+
+  private renderAdminPanel(): string {
+    const { roles, obligations, policiesMap } = this.model;
+    const roleNames = roles.map((r) => r.name);
+    const obligationKeys = obligations.map((o) => o.key);
+    const rolesList = roles.length === 0
+      ? `<p class="woo-tasks-admin-empty">No roles. Add one below.</p>`
+      : `<ul class="woo-tasks-admin-list">${roles.map((r) => `
+          <li class="woo-tasks-admin-row">
+            <span class="woo-tasks-admin-key">${escapeHtml(r.name)}</span>
+            <span class="woo-tasks-admin-desc">${escapeHtml(r.description || "—")}</span>
+            <span class="woo-tasks-admin-owners">${escapeHtml(r.owners.join(", ") || "(no owners)")}</span>
+            <button type="button" data-tasks-admin-remove="role" data-key="${escapeHtml(r.name)}">remove</button>
+          </li>`).join("")}</ul>`;
+    const obsList = obligations.length === 0
+      ? `<p class="woo-tasks-admin-empty">No obligations. Add one below.</p>`
+      : `<ul class="woo-tasks-admin-list">${obligations.map((o) => `
+          <li class="woo-tasks-admin-row">
+            <span class="woo-tasks-admin-key">${escapeHtml(o.key)}</span>
+            <span class="woo-tasks-admin-role">${escapeHtml(o.role || "—")}</span>
+            <span class="woo-tasks-admin-criterion">${escapeHtml(o.criterion || "—")}</span>
+            <button type="button" data-tasks-admin-remove="obligation" data-key="${escapeHtml(o.key)}">remove</button>
+          </li>`).join("")}</ul>`;
+    const polList = Object.keys(policiesMap).length === 0
+      ? `<p class="woo-tasks-admin-empty">No policies. Add one below.</p>`
+      : `<ul class="woo-tasks-admin-list">${Object.entries(policiesMap).map(([kind, keys]) => `
+          <li class="woo-tasks-admin-row">
+            <span class="woo-tasks-admin-key">${escapeHtml(kind)}</span>
+            <span class="woo-tasks-admin-keys">${escapeHtml(keys.join(" → ") || "(empty)")}</span>
+            <button type="button" data-tasks-admin-remove="policy" data-key="${escapeHtml(kind)}">remove</button>
+          </li>`).join("")}</ul>`;
+    const roleSelectOptions = roleNames.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("");
+    const policyKeySuggestions = obligationKeys.join(", ");
+    return `
+      <section class="woo-tasks-admin">
+        <div class="woo-tasks-admin-section">
+          <h3>Roles</h3>
+          ${rolesList}
+          <form class="woo-tasks-admin-form" data-tasks-admin-form="role">
+            <input type="text" name="name" placeholder="role name" required autocomplete="off">
+            <input type="text" name="description" placeholder="description" autocomplete="off">
+            <input type="text" name="owners" placeholder="owner refs, comma-separated" autocomplete="off">
+            <button type="submit">Add / update</button>
+          </form>
+        </div>
+        <div class="woo-tasks-admin-section">
+          <h3>Obligations</h3>
+          ${obsList}
+          <form class="woo-tasks-admin-form" data-tasks-admin-form="obligation">
+            <input type="text" name="key" placeholder="obligation key" required autocomplete="off">
+            <select name="role" required>${roleNames.length === 0 ? `<option value="" disabled selected>no roles yet</option>` : roleSelectOptions}</select>
+            <input type="text" name="criterion" placeholder="completion criterion" required autocomplete="off">
+            <button type="submit"${roleNames.length === 0 ? " disabled" : ""}>Add / update</button>
+          </form>
+        </div>
+        <div class="woo-tasks-admin-section">
+          <h3>Policies</h3>
+          ${polList}
+          <form class="woo-tasks-admin-form" data-tasks-admin-form="policy">
+            <input type="text" name="kind" placeholder="task kind" required autocomplete="off">
+            <input type="text" name="keys" placeholder="ordered obligation keys, comma-separated${policyKeySuggestions ? ` (e.g. ${policyKeySuggestions})` : ""}" required autocomplete="off">
+            <button type="submit"${obligationKeys.length === 0 ? " disabled" : ""}>Add / update</button>
+          </form>
+        </div>
+      </section>
     `;
   }
 
