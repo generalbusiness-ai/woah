@@ -102,6 +102,16 @@ direct call, so the `delivered` observation is live. The note arrival
 in the requester's inventory is durable regardless; direct requester text
 is a live notification and may not survive a reconnect.
 
+## Ephemeral by drop
+
+`$dispensed_note` overrides `:moveto` so that moving the note into a
+`$space` (a room) recycles it instead, emitting a `note_dispersed`
+observation to the room ("X drops Horoscope: Scorpio, which disperses in
+a puff of smoke."). Hand-offs to other actors or containers fall through
+to the default move chain. The intent: dispensed notes are read in
+inventory and then thrown away, not pinned to walls. If a player wants a
+durable copy they can `:write` its content into a regular `$note`.
+
 ## TTL on pending orders (deferred)
 
 A long-offline plug can accumulate ghost orders. The design note's

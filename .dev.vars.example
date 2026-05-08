@@ -17,5 +17,10 @@ WOO_INTERNAL_SECRET=local-dev-internal-secret
 # Local SQLite database path. Created on first run.
 WOO_DB=.woo/dev.sqlite
 
+# Optional: local-only wizard login for the browser UI. If both are set,
+# `npm run dev` ensures this apikey is bound to $wiz and prints it.
+# WOO_LOCALDEV_WIZ_API_ID=localwiz
+# WOO_LOCALDEV_WIZ_API_KEY=localwiz-secret
+
 # Optional: override the default port (5173).
 # PORT=5173

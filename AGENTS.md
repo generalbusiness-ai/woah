@@ -67,6 +67,66 @@ DSL or VM cannot yet express them efficiently. Each `native()` call
 carries a doc-string of the equivalent Woo verb signature; the direction
 of travel is woocode-ward, not native-ward.
 
+## Orientation: where things live
+
+A pragmatic map for navigating the codebase quickly. Spec is still the
+source of truth — this just points at the implementation.
+
+**Catalogs (`catalogs/<name>/manifest.json`)** are the woocode. Each class
+entry has inline DSL `source` strings for verbs. To change a verb's
+behavior, edit the `source` literal — there is no separate `.woo` file.
+`DESIGN.md` next to the manifest carries the rationale; `migration-v*.json`
+ships with major-version bumps. The `manifest.json` `schemas` block declares
+observation shapes the catalog emits.
+
+**Substrate runtime (`src/core/`):**
+- `world.ts` — the world object. Hot paths to know:
+  - `movetoChecked` (~3894): receiver-driven move chain — dispatches
+    `obj:moveto(target)` if defined, then `target:acceptable`, then
+    `oldLocation:exitfunc`, physical move, `target:enterfunc`. Recursive
+    `moveto(this, target)` from inside `:moveto` falls through via a
+    per-call marker set, so a verb can decorate the move and still let
+    the default chain finish it.
+  - `observationAudienceActors` (~5821): who receives an `observe()`.
+    Order: `_audience_override` → typed routing for `looked`/`who`
+    (`to`-only) → directed recipients (`to`/`from`) → `observation.source`
+    if it's a $space → fallback to the call's audience. `entered`/`left`/
+    `taken`/`dropped` exclude the actor from the room broadcast (the
+    actor's own `tell(...)` line covers their view).
+- `tiny-vm.ts` — verb bytecode interpreter. `OBSERVE`/`EMIT` ops invoke
+  `ctx.observe(...)`; `recycle`/`moveto`/`create`/`isa` etc. are builtins
+  in the big switch around line 1000.
+- `dsl-compiler.ts` — DSL → bytecode. `observe(...)` and `emit(...)`
+  are special-cased to OBSERVE/EMIT ops.
+- `bootstrap.ts` — seed graph delivered before any catalog installs.
+
+**Client (`src/client/`):**
+- `main.ts` `isChatObservation` (~2989) is the *allow-list* of observation
+  types that route to the chat panel; `chatSystemText` (~3367) supplies
+  the rendered line when the observation lacks a `text:` field, or wraps
+  the raw `text:` field for known types. **A new observation type that
+  should appear in chat must be added to BOTH lists.** Otherwise it lands
+  in the generic observations panel and the user sees "the observation
+  shows up but not in chat."
+- `framework.ts` `registerCoreObservationHandlers` reduces structured
+  observations into client state (e.g. `taken`/`dropped` patches an
+  object's `location`).
+
+**Common patterns:**
+- `observe(event)` — catalog code emits to whoever the audience model
+  selects (usually the calling space).
+- `observe_to_space(space, event)` — explicit space-targeted broadcast,
+  sequenced when reached via `$space:call`.
+- `tell(actor, text)` — direct line to one actor (live, not durable).
+- `$note` three-slot rule: `.name` is the listing label, `.description`
+  is the cosmetic look-at flavour, `.text` is the markdown payload.
+  Inventory uses name; `look` uses description; `read` uses text. Never
+  mix them.
+- Dispenser pattern: `:order` enqueues, an external plug drains the queue
+  and calls `:deliver(order_id, name, text, description)` to mint a
+  `$dispensed_note` into the requester's inventory. See
+  `catalogs/dispenser/DESIGN.md`.
+
 ## Development Process
 
 Implementation notes are not formal specs or commitments, and do not

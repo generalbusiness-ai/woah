@@ -1251,6 +1251,49 @@ export class WooWorld {
     return this.createApiKeyRecord(actor, target, label, "create_api_key");
   }
 
+  /** Dev/ops helper: ensure a caller-specified apikey exists with exactly the
+   * provided id+secret and target. Intended for localdev bootstrap code that
+   * already owns the secret; ordinary user-facing minting should use
+   * createApiKey/createApiKeyForOwner so secrets remain one-time generated. */
+  ensureApiKey(actor: ObjRef, target: ObjRef, id: string, secret: string, label: string | null): { id: string; secret: string; actor: ObjRef; label: string | null; created_at: number; created: boolean } {
+    if (!this.canBypassPerms(actor)) throw wooError("E_PERM", "wizard authority required to ensure api keys", { actor });
+    if (!this.objects.has(target)) throw wooError("E_OBJNF", `target actor not found: ${target}`, target);
+    if (!this.inheritsFrom(target, "$actor")) throw wooError("E_TYPE", `target must be an $actor descendant: ${target}`, target);
+    if (!id || id.includes(":")) throw wooError("E_INVARG", "apikey id must be non-empty and must not contain ':'", { id });
+    if (!secret) throw wooError("E_INVARG", "apikey secret must be non-empty");
+
+    const raw = this.propOrNull("$system", "api_keys");
+    const map = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, WooValue>) } : {};
+    const existing = map[id];
+    if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+      const record = existing as Record<string, WooValue>;
+      if (record.actor !== target) throw wooError("E_PERM", "apikey id is already bound to a different actor", { id, actor: record.actor, target });
+      if (record.revoked_at != null) throw wooError("E_PERM", "apikey id is revoked and cannot be reused", { id, target });
+      const salt = String(record.salt ?? "");
+      const expected = String(record.hash ?? "");
+      if (!salt || !expected || !constantTimeEqual(hashSource(`${salt}:${secret}`), expected)) {
+        throw wooError("E_PERM", "apikey id exists with a different secret", { id, target });
+      }
+      return {
+        id,
+        secret,
+        actor: target,
+        label: typeof record.label === "string" ? record.label : null,
+        created_at: Number(record.created_at ?? 0),
+        created: false
+      };
+    }
+    if (existing !== undefined) throw wooError("E_TYPE", "apikey record is malformed", { id });
+
+    const salt = randomHex(16);
+    const hash = hashSource(`${salt}:${secret}`);
+    const created_at = Date.now();
+    map[id] = { hash, salt, actor: target, label: label ?? null, created_at } as WooValue;
+    this.setProp("$system", "api_keys", map as WooValue);
+    this.recordWizardAction(actor, "ensure_api_key", { actor: target, key_id: id, label: label ?? null });
+    return { id, secret, actor: target, label, created_at, created: true };
+  }
+
   /** Owner-mint: the owner of `target` may mint an apikey bound to `target`.
    * This is the path catalog code (e.g. `$block:mint_apikey`) uses so blocks
    * can be configured by their creator without wizard escalation. */

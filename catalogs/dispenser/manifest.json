@@ -1,6 +1,6 @@
 {
   "name": "dispenser",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "spec_version": "v1",
   "description": "Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The verb appends to a persistent queue, returns a ticket synchronously, and lets the plug drain the queue on its own cadence; :deliver(order_id, name, text, description) creates a note with the producer-supplied name (inventory listing label), markdown text (capped at 262144 characters; what `read` returns), and optional cosmetic description (one-line look-at flavour, may be omitted/empty), and moves it into the requester's inventory. Subclass for concrete dispenser kinds (horoscope, recipe-of-the-day, ...).",
   "license": "MIT",
@@ -9,10 +9,18 @@
     {
       "local_name": "$dispensed_note",
       "parent": "$note",
-      "description": "A $note produced by a $dispenser_block. Carries back-references to the producing block and the production time so UIs can render a 'from: <block name>' chip and link back to the source.",
+      "description": "A $note produced by a $dispenser_block. Carries back-references to the producing block and the production time so UIs can render a 'from: <block name>' chip and link back to the source. Dispensed notes are ephemeral: dropping one into a $space (room) recycles it and emits a `note_dispersed` observation — they are meant to be read in inventory, not posted on walls.",
       "properties": [
         { "name": "produced_by", "type": "obj", "default": null, "perms": "r" },
         { "name": "produced_at", "type": "int", "default": 0, "perms": "r" }
+      ],
+      "verbs": [
+        {
+          "name": "moveto",
+          "perms": "rx",
+          "arg_spec": { "args": ["target"] },
+          "source": "verb :moveto(target) rx { if (target != null && isa(target, $space)) { let title = this.name; if (typeof(title) != \"string\" || !title) { title = \"the note\"; } let drop_text = title + \" disperses in a puff of smoke.\"; if (actor != null && isa(actor, $actor)) { drop_text = actor.name + \" drops \" + title + \", which disperses in a puff of smoke.\"; } observe_to_space(target, { type: \"note_dispersed\", source: target, room: target, note: this, actor: actor, text: drop_text, ts: now() }); recycle(this); return target; } moveto(this, target); return target; }"
+        }
       ]
     },
     {
@@ -132,6 +140,17 @@
         "block": "obj",
         "order_id": "str",
         "requester": "obj",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$dispensed_note",
+      "type": "note_dispersed",
+      "shape": {
+        "note": "obj",
+        "actor": "obj",
+        "room": "obj",
+        "text": "str",
         "ts": "int"
       }
     }
