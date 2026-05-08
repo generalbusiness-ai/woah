@@ -173,6 +173,7 @@
       "verbs": [
         {
           "name": "look_self",
+          "pure": true,
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": {

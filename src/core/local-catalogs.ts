@@ -1,4 +1,5 @@
 import { BUNDLED_CATALOGS } from "../generated/bundled-catalogs";
+import { propagateVerbPurity } from "./authoring";
 import {
   applyCatalogSchemaPlan,
   catalogManifestStatus,
@@ -142,6 +143,11 @@ export function installLocalCatalogs(world: WooWorld, names: readonly string[] =
   installMissingLocalCatalogDependencies(world, repairNames);
   const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
   runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered);
+  // Final pass: any prior step that touched verbs (fresh install, migration,
+  // schema sync, ad-hoc repair) may have left transitively-pure verbs without
+  // the propagated flag. Idempotent — only reaches a fixed point that the
+  // call graph already implies.
+  propagateVerbPurity(world);
 }
 
 export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): boolean {

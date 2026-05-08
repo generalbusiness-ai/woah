@@ -1132,6 +1132,47 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).not.toContain("2026-05-02-pinboard-v02-repair");
   });
 
+  it("detects pure_declared metadata drift and repairs the flag without changing source", () => {
+    // Regression: an early version of the pure-flag plumbing only compared
+    // source/perms/etc. and missed `pure`. A stale host would silently keep
+    // an impure verb where the manifest declares it pure, defeating the
+    // cross-host read-timeout dispatch path. Uses $pinboard:list_notes — its
+    // purity is manifest-asserted (call-graph propagation can't see through
+    // the non-`this` `pin:text()` call), so the catalog assertion is the
+    // only signal. Drift compares `pure_declared` against the manifest.
+    const world = createWorld();
+    const listNotes = world.ownVerbExact("$pinboard", "list_notes")!;
+    expect(listNotes.pure).toBe(true);
+    expect(listNotes.pure_declared).toBe(true);
+    // Simulate a stale host: same source/hash, but both flags were lost.
+    world.addVerb("$pinboard", { ...listNotes, pure: undefined, pure_declared: undefined, version: listNotes.version + 1 });
+    expect(world.ownVerbExact("$pinboard", "list_notes")?.pure_declared).toBeUndefined();
+    const status = localCatalogStatuses(world, ["pinboard"]).find((item) => item.catalog === "pinboard")!;
+    expect(status.needs_repair).toBe(true);
+    expect(status.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "verb_drift", object: "$pinboard", verb: "list_notes" })
+    ]));
+    installLocalCatalogs(world, []);
+    expect(world.ownVerbExact("$pinboard", "list_notes")?.pure).toBe(true);
+    expect(world.ownVerbExact("$pinboard", "list_notes")?.pure_declared).toBe(true);
+  });
+
+  it("re-derives pure when a stale host loses the propagated flag (no manifest assertion)", () => {
+    // Companion to the pure_declared test: $pinboard:look_self has no
+    // manifest declaration anymore — its purity comes purely from
+    // call-graph propagation. A stale host that lost the bit gets it
+    // restored on the next bootstrap pass without any drift detection.
+    const world = createWorld();
+    const lookSelf = world.ownVerbExact("$pinboard", "look_self")!;
+    expect(lookSelf.pure).toBe(true);
+    expect(lookSelf.pure_declared).toBeUndefined();
+    world.addVerb("$pinboard", { ...lookSelf, pure: undefined, version: lookSelf.version + 1 });
+    expect(world.ownVerbExact("$pinboard", "look_self")?.pure).toBeUndefined();
+    installLocalCatalogs(world, []);
+    expect(world.ownVerbExact("$pinboard", "look_self")?.pure).toBe(true);
+  });
+
+
   it("runs local repairs for installed catalogs even when auto-install is empty", () => {
     const world = createWorld();
     const migrations = (world.getProp("$system", "applied_migrations") as string[])

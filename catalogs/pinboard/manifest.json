@@ -221,6 +221,7 @@
         },
         {
           "name": "list_notes",
+          "pure": true,
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,

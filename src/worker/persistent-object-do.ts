@@ -62,6 +62,7 @@ export interface Env {
   WOO_INTERNAL_SECRET?: string;
   WOO_AUTO_INSTALL_CATALOGS?: string;
   WOO_HOST_READ_TIMEOUT_MS?: string;
+  WOO_HOST_WRITE_TIMEOUT_MS?: string;
   WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
 }
 
@@ -73,7 +74,23 @@ const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
 const HOST_STATE_CACHE_LIMIT = 32;
 const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
-const HOST_READ_RPC_TIMEOUT_MS = 2500;
+// Read-only cross-host RPCs (room-snapshot, remote-get-prop, contents, etc.)
+// are deadlined tightly so a wedge surfaces fast and the local task chain
+// can fall back to a degraded reply. 5s is the working ceiling: a hot
+// remote settles in ~50ms, but a cold-start DO has to load persistence,
+// run bootstrap, and serve the snapshot, which can spike to 3-4s on first
+// touch. Override per deployment via WOO_HOST_READ_TIMEOUT_MS.
+const HOST_READ_RPC_TIMEOUT_MS = 5000;
+// Mutating cross-host RPCs do not have an inherent deadline (a write that
+// takes 30s may still be making progress), but a wedged DO can park a slot
+// forever and the local task chain along with it. The watchdog is a
+// generous safety net: if no response has come back by this point, the
+// remote is assumed unreachable, the slot is released, and the caller sees
+// E_TIMEOUT. Aborting mid-write may leave ambiguous remote state — but
+// indefinite hang is already a worse failure mode (the whole DO becomes
+// unresponsive). Most operations on this codebase are inherently
+// idempotent (set_property, observe, mirror-contents).
+const HOST_WRITE_RPC_TIMEOUT_MS = 30_000;
 // Cap on concurrent DO->DO fetch() subrequests issued by this isolate. The
 // Workers runtime enforces its own ~6-slot limit; we self-limit slightly under
 // that and queue the overflow so cold-start fan-outs (compose_look hitting 4
@@ -543,9 +560,10 @@ export class PersistentObjectDO {
             world.touchSessionInput(sessionId);
             const session = { sessionId, actor };
             const host = await this.resolveObjectHost(target, WORLD_HOST);
+            const { pure } = this.resolveDispatchPath(world, target, verb, host, WORLD_HOST);
             return host === WORLD_HOST
               ? await world.directCall(undefined, actor, target, verb, args)
-              : await this.forwardWsDirect(world, host, undefined, session, target, verb, args);
+              : await this.forwardWsDirect(world, host, undefined, session, target, verb, args, { pure });
           }
         },
         broadcasts: {
@@ -740,7 +758,7 @@ export class PersistentObjectDO {
     const merged = mergeHostScopedSeedWithStatus(current, scopedSeed);
     if (merged.changed) {
       world.importWorld(merged.world);
-      world.persistFullSnapshot();
+      world.persistFullSnapshot("host_seed_apply");
       this.hostStateCache.clear();
       this.crossHostPropCache.clear();
     }
@@ -1101,8 +1119,16 @@ export class PersistentObjectDO {
       },
       dispatch: async (ctx, target, verbName, args, startAt) => {
         const host = await hostForObject(startAt ?? target, ctx.hostMemo);
-        if (!host || host === localHost) return await world.hostDispatch(ctx, target, verbName, args, startAt);
-        const response = await this.forwardInternalChecked<{
+        const resolvedHost = host ?? localHost;
+        const { pure, path } = this.resolveDispatchPath(world, target, verbName, resolvedHost, localHost);
+        if (path === "local") return await world.hostDispatch(ctx, target, verbName, args, startAt);
+        // Pure verbs route through forwardInternalReadChecked for its 2.5s
+        // read deadline. A timed-out look_self surfaces as E_TIMEOUT to the
+        // caller and frees the host queue rather than wedging it.
+        const forward = pure
+          ? this.forwardInternalReadChecked.bind(this)
+          : this.forwardInternalChecked.bind(this);
+        const response = await forward<{
           result: WooValue;
             observations?: Observation[];
             audience_actors?: ObjRef[];
@@ -1110,7 +1136,7 @@ export class PersistentObjectDO {
             audience_sessions?: string[];
             observation_session_audiences?: string[][];
             deferred_host_effects?: DeferredHostEffect[];
-        }>(host, "/__internal/remote-dispatch", {
+        }>(resolvedHost, "/__internal/remote-dispatch", {
           ctx: this.serializedCallContext(ctx),
           target,
           verb: verbName,
@@ -2073,6 +2099,7 @@ export class PersistentObjectDO {
       direct: async (frameId, session, target, verb, args) => {
         world.touchSessionInput(session.sessionId);
         const host = await this.resolveObjectHost(target, WORLD_HOST);
+        const { pure } = this.resolveDispatchPath(world, target, verb, host, WORLD_HOST);
         return host === WORLD_HOST
             ? await world.directCall(
                 frameId,
@@ -2082,7 +2109,7 @@ export class PersistentObjectDO {
                 args,
                 { sessionId: session.sessionId }
               )
-          : await this.forwardWsDirect(world, host, frameId, session, target, verb, args);
+          : await this.forwardWsDirect(world, host, frameId, session, target, verb, args, { pure });
       },
       replay: async (frameId, session, space, fromValue, limitValue) => {
         // Replay is recovery, not user input — does NOT touch lastInputAt.
@@ -2189,15 +2216,42 @@ export class PersistentObjectDO {
     session: { sessionId: string; actor: ObjRef },
     target: ObjRef,
     verb: string,
-    args: WooValue[]
+    args: WooValue[],
+    options: { pure?: boolean } = {}
   ): Promise<DirectResultFrame | ErrorFrame> {
     const body = this.forwardBody(world, session, { frame_id: frameId, target, verb, args });
-    const result = await this.forwardInternal<((DirectResultFrame & { deferred_host_effects?: DeferredHostEffect[] }) | ErrorFrame)>(host, "/__internal/ws-direct", body);
+    // Pure verbs get the read deadline; mutating verbs pass through the
+    // default write watchdog in forwardInternalRaw.
+    const timeoutMs = options.pure === true ? this.hostReadRpcTimeoutMs() : undefined;
+    const result = await this.forwardInternal<((DirectResultFrame & { deferred_host_effects?: DeferredHostEffect[] }) | ErrorFrame)>(host, "/__internal/ws-direct", body, { timeoutMs });
     if (result.op === "result" && Array.isArray(result.deferred_host_effects)) {
       await world.applyDeferredHostEffects(result.deferred_host_effects);
       delete result.deferred_host_effects;
     }
     return result;
+  }
+
+  // Helper used at every cross-host verb-dispatch site to (a) probe verb
+  // purity from the local class registry and (b) emit a `dispatch_resolved`
+  // event so we always have a tail trace of the verb routed to which host
+  // along which path. Uses the full resolveVerb walk (parent chain + feature
+  // chain), matching the way the dispatcher itself resolves at run time —
+  // otherwise feature-contributed pure verbs would silently take the
+  // mutating path. Best-effort: when the verb can't be resolved locally
+  // (instance-only verb on a host we don't seed), defaults to `pure=false`
+  // (mutating path), matching pre-flag conservative behavior.
+  private resolveDispatchPath(world: WooWorld | null | undefined, target: ObjRef, verb: string, resolvedHost: string, localHost: string): { pure: boolean; path: "local" | "read" | "mutating" } {
+    const local = resolvedHost === localHost;
+    let pure = false;
+    if (world) {
+      try {
+        const resolved = world.resolveVerb(target, verb);
+        if (resolved.verb.pure === true) pure = true;
+      } catch { /* not resolvable locally; mutating fallback */ }
+    }
+    const path: "local" | "read" | "mutating" = local ? "local" : (pure ? "read" : "mutating");
+    world?.recordMetric({ kind: "dispatch_resolved", target, verb, host: resolvedHost, path, pure });
+    return { pure, path };
   }
 
   private async executeWsCommand(
@@ -2214,9 +2268,10 @@ export class PersistentObjectDO {
 
     if (plan.route === "direct") {
       const host = await this.resolveObjectHost(plan.target, WORLD_HOST);
+      const { pure } = this.resolveDispatchPath(world, plan.target, plan.verb, host, WORLD_HOST);
       const result = host === WORLD_HOST
         ? await world.directCall(frameId, session.actor, plan.target, plan.verb, plan.args, { sessionId: session.sessionId })
-        : await this.forwardWsDirect(world, host, frameId, session, plan.target, plan.verb, plan.args);
+        : await this.forwardWsDirect(world, host, frameId, session, plan.target, plan.verb, plan.args, { pure });
       return result.op === "result" ? { ...result, command: plan } as DirectResultFrame : result;
     }
 
@@ -2248,6 +2303,11 @@ export class PersistentObjectDO {
   private hostReadRpcTimeoutMs(): number {
     const configured = Number(this.env.WOO_HOST_READ_TIMEOUT_MS);
     return Number.isFinite(configured) && configured > 0 ? configured : HOST_READ_RPC_TIMEOUT_MS;
+  }
+
+  private hostWriteRpcTimeoutMs(): number {
+    const configured = Number(this.env.WOO_HOST_WRITE_TIMEOUT_MS);
+    return Number.isFinite(configured) && configured > 0 ? configured : HOST_WRITE_RPC_TIMEOUT_MS;
   }
 
   private hostOutFetchConcurrency(): number {
@@ -2357,22 +2417,20 @@ export class PersistentObjectDO {
     // Logged here so a wedged fetch leaves a trace; the existing
     // `cross_host_rpc` end event only fires on settle.
     this.world?.recordMetric({ kind: "cross_host_rpc_start", route: path, host });
-    const timeoutMs = options.timeoutMs;
-    // For paths with an explicit deadline, the AbortController cancels both
-    // the queue wait and the underlying fetch on timeout; without this, a
-    // timed-out caller would still leave a Promise + a slot parked behind a
-    // wedged downstream. Mutating callers do NOT pass timeoutMs and so do
-    // not get cancellation — abort-mid-write would leave ambiguous remote
-    // state, and we have no idempotency layer to fix that yet.
-    const useTimeout = !!(timeoutMs && timeoutMs > 0);
-    const controller = useTimeout ? new AbortController() : undefined;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    if (controller && timeoutMs) {
-      timeout = setTimeout(() => controller.abort(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs })), timeoutMs);
-    }
+    // Every cross-host RPC gets a deadline. Read-only callers pick a tight
+    // one (HOST_READ_RPC_TIMEOUT_MS via forwardInternalReadChecked); mutating
+    // callers fall back to the much more generous HOST_WRITE_RPC_TIMEOUT_MS
+    // watchdog so a wedged downstream can't park the slot — and the entire
+    // local task chain — indefinitely. The AbortController cancels both the
+    // queue wait and the underlying fetch on timeout; aborting mid-write
+    // can leave ambiguous remote state, but indefinite hang is the worse
+    // failure mode (the whole DO becomes unresponsive).
+    const timeoutMs = options.timeoutMs ?? this.hostWriteRpcTimeoutMs();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs })), timeoutMs);
     let observedQueueMs = 0;
     try {
-      const { response, queueMs } = await this.outboundFetch(id, request, controller?.signal);
+      const { response, queueMs } = await this.outboundFetch(id, request, controller.signal);
       observedQueueMs = queueMs;
       const parsed = await response.json() as T;
       const queueField = observedQueueMs > 0 ? { queue_ms: observedQueueMs } : {};
@@ -2382,16 +2440,16 @@ export class PersistentObjectDO {
       const queueField = observedQueueMs > 0 ? { queue_ms: observedQueueMs } : {};
       // E_TIMEOUT lifted out of the abort reason so callers see the same shape
       // as before this refactor.
-      const isAbortTimeout = controller?.signal.aborted && (controller.signal.reason as { code?: string } | undefined)?.code === "E_TIMEOUT";
+      const isAbortTimeout = controller.signal.aborted && (controller.signal.reason as { code?: string } | undefined)?.code === "E_TIMEOUT";
       if (isAbortTimeout) {
         this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "timeout", ...queueField });
-        throw controller!.signal.reason;
+        throw controller.signal.reason;
       }
       const error = normalizeError(err);
       this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "error", error: error.code, ...queueField });
       throw err;
     } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
+      clearTimeout(timeout);
     }
   }
 

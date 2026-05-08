@@ -1,5 +1,5 @@
 import { hashSource } from "./source-hash";
-import type { CompileDiagnostic, CompileResult, TinyBytecode, TinyOp, WooValue } from "./types";
+import type { CompileDiagnostic, CompileResult, TinyBytecode, TinyOp, VerbCallSite, WooValue } from "./types";
 import { valuesEqual, wooError } from "./types";
 
 type Span = {
@@ -160,7 +160,8 @@ export function compileWooSource(source: string): CompileResult {
       metadata: {
         name: program.name,
         perms: program.perms,
-        arg_spec: program.argSpec
+        arg_spec: program.argSpec,
+        calls: compiled.calls
       }
     };
   } catch (err) {
@@ -733,10 +734,13 @@ class Codegen {
   private readonly lineMap: Record<string, WooValue> = {};
   private readonly locals = new Map<string, number>();
   private readonly loops: { breaks: number[]; continues: number[]; continueTarget: number }[] = [];
+  // Recorded `this:name(...)` and `obj:name(...)` call sites. The static
+  // verb-call validator and the call-graph purity analysis both consume this.
+  private readonly calls: VerbCallSite[] = [];
   private activeSpan: Span | null = null;
   private localCount = 0;
 
-  compile(program: Program): { bytecode: TinyBytecode; lineMap: Record<string, WooValue> } {
+  compile(program: Program): { bytecode: TinyBytecode; lineMap: Record<string, WooValue>; calls: VerbCallSite[] } {
     for (const param of program.params) this.declareLocal(param, program.span);
     this.compileBlock(program.body);
     this.withSpan(program.body.span, () => {
@@ -751,7 +755,8 @@ class Codegen {
         max_stack: 128,
         version: 1
       },
-      lineMap: this.lineMap
+      lineMap: this.lineMap,
+      calls: this.calls
     };
   }
 
@@ -1019,12 +1024,15 @@ class Codegen {
         case "CallExpr":
           this.compileCall(expr);
           break;
-        case "VerbCallExpr":
+        case "VerbCallExpr": {
+          const isThisCall = expr.object.kind === "IdentifierExpr" && (expr.object as IdentifierExpr).name === "this";
+          this.calls.push({ name: expr.name, this_call: isThisCall });
           this.compileExpr(expr.object);
           this.emit("PUSH_LIT", this.literal(expr.name));
           for (const arg of expr.args) this.compileExpr(arg);
           this.emit("CALL_VERB", expr.args.length);
           break;
+        }
       }
     });
   }

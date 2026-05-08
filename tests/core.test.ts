@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
-import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHostScopedWorld, scopeSerializedWorldToHost } from "../src/core/bootstrap";
+import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld, scopeSerializedWorldToHost } from "../src/core/bootstrap";
 import { bundledCatalogAliases, installLocalCatalogs } from "../src/core/local-catalogs";
+import type { ParkedTaskRecord } from "../src/core/repository";
 import type { CallContext, WooWorld } from "../src/core/world";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 import {
@@ -740,6 +741,18 @@ describe("woo core", () => {
   it("exports host-scoped worlds for routed cluster hosts", async () => {
     const world = createWorld();
     world.auth("guest:host-scope");
+    const parked: ParkedTaskRecord = {
+      id: "ptask_12",
+      parked_on: "the_pinboard",
+      state: "suspended",
+      resume_at: Date.now() + 1000,
+      awaiting_player: null,
+      correlation_id: null,
+      serialized: { kind: "test", space: "the_pinboard", target: "the_pinboard" },
+      created: Date.now(),
+      origin: "the_pinboard"
+    };
+    world.parkedTasks.set(parked.id, parked);
     const scoped = world.exportHostScopedWorld("the_pinboard");
     const ids = scoped.objects.map((obj) => obj.id);
 
@@ -750,6 +763,7 @@ describe("woo core", () => {
     expect(ids).not.toContain("the_dubspace");
     expect(scoped.sessions).toEqual([]);
     expect(scoped.logs.every(([space]) => space === "the_pinboard")).toBe(true);
+    expect(scoped.parkedTaskCounter).toBe(13);
 
     const cluster = createWorldFromSerialized(scoped, { persist: false });
     const clusterSession = cluster.auth("guest:host-scope");
@@ -763,6 +777,21 @@ describe("woo core", () => {
     expect(pin).toMatch(/^obj_the_pinboard_/);
     expect(cluster.object(pin).parent).toBe("$pin");
     expect(cluster.objectRoutes()).toContainEqual({ id: pin, host: "the_pinboard", anchor: "the_pinboard" });
+  });
+
+  it("does not copy gateway-global counters into host-scoped seed exports", () => {
+    const stored = createWorld();
+    const fresh = createWorld();
+    for (let i = 0; i < 5; i += 1) {
+      fresh.createRuntimeObject("$thing", "$wiz", null, { name: `Gateway-only ${i}` });
+    }
+
+    const storedScoped = stored.exportHostScopedWorld("the_taskspace");
+    const freshScoped = fresh.exportHostScopedWorld("the_taskspace");
+
+    expect(fresh.exportWorld().objectCounter).toBeGreaterThan(stored.exportWorld().objectCounter);
+    expect(freshScoped.objectCounter).toBe(storedScoped.objectCounter);
+    expect(mergeHostScopedSeedWithStatus(storedScoped, freshScoped).changed).toBe(false);
   });
 
   it("treats stored worlds without a host slice as unusable for cluster boot", async () => {

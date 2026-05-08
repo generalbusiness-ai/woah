@@ -467,6 +467,10 @@ postconditions, and records the result in `$system.catalog_migration_records`.
 When a fresh gateway seed was available, the host applies that seed again after
 the host-scoped lifecycle so gateway support-object repairs remain authoritative
 over the host's copied class and verb rows.
+Host-scoped seed exports do not carry the gateway's global allocation counters:
+object and parked-task counters are derived from the exported host slice, and
+sessions are omitted from host seeds. A counter bump elsewhere in the cluster is
+therefore not a host-slice repair and must not force a full host snapshot write.
 Host-local data migrations use the same record path and run against state that
 the host actually owns. The gateway's `$system.applied_migrations` ledger may be
 copied into a host seed, but it does not prove the host's local instance data was

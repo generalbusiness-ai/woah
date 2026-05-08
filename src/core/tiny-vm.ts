@@ -107,7 +107,7 @@ const DEFAULT_WALL_MS = 10_000;
 const MAX_VM_FRAMES = 128;
 const MAX_RUNTIME_LOCALS = 1_024;
 const MAX_RUNTIME_STACK = 4_096;
-const BUILTIN_NAMES = [
+export const BUILTIN_NAMES = [
   "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
   "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms",
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
