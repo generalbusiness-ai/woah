@@ -4017,6 +4017,9 @@ function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChat
   }, () => panel.scrollFeedToEnd?.());
   bindSpaceChatComponentEvents(panel);
   bindSpaceChatResize(panel);
+  // Sync the shell's --space-chat-h on mount so the divider lands at the saved
+  // height from the start, not just after the user first drags the resizer.
+  applySpaceChatHeight(panel, spaceChatHeight(space));
 }
 
 function bindSpaceChatComponentEvents(panel: HTMLElement & WooElement) {
@@ -4080,6 +4083,12 @@ function applySpaceChatHeight(panel: HTMLElement, height: number) {
   if (space) state.spaceChatHeights = { ...state.spaceChatHeights, [space]: normalizedHeight };
   const rounded = `${Math.round(normalizedHeight)}px`;
   panel.style.height = rounded;
+  // The grid container (.space-chat-shell) is what reads --space-chat-h to size
+  // the chat row vs the workarea row. CSS vars only propagate down the tree, so
+  // the var must land on the shell itself — not just on a child of it — for the
+  // divider to actually move when the user drags the resizer.
+  const shell = panel.closest<HTMLElement>("[data-space-chat-shell]");
+  if (shell) shell.style.setProperty("--space-chat-h", rounded);
   if (!(panel.parentElement instanceof HTMLElement)) return;
   panel.parentElement.style.setProperty("--space-chat-h", rounded);
   const layout = panel.parentElement.querySelector<HTMLElement>(`[data-space-chat-layout="${cssAttrValue(space)}"]`);
