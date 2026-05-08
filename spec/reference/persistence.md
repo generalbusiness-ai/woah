@@ -272,13 +272,60 @@ Two storage invariants make this work:
   entries past a configurable retention horizon, but doing so risks ULID
   collision on backup/restore and is therefore disabled by default.
 
-The Directory does **not** mirror tombstones: routing only cares which host
-owns the ULID, and that host is the only authority on liveness.
+The Directory does **not** mirror tombstones for live hosts: routing only
+cares which host owns the ULID, and that host is the only authority on
+liveness while it is alive. One bounded exception applies once the host
+has been torn down — see §14.2.2.
 
 The recycle transaction inserts the tombstone row in the same SQLite
 transaction that deletes the object's storage rows
 ([../semantics/recycle.md §RC3](../semantics/recycle.md#rc3-bookkeeping) step 9).
 Either both happen or neither does.
+
+### 14.2.2 Inherited tombstones (after host teardown)
+
+When a recycle leaves a DO with no live hosted **payload** objects
+(host-scoped support copies excluded — see [../semantics/recycle.md §RC11.1](../semantics/recycle.md#rc111-trigger)),
+the DO migrates its tombstone roster to the Directory in one or more
+batched requests and then calls `state.storage.deleteAll()`, which
+deallocates its stored data. The DO id remains reachable; reactivations
+hit the §RC11.6 cold-load guard. See
+[../semantics/recycle.md §RC11](../semantics/recycle.md#rc11-host-teardown-after-recycle)
+for the full sequence. After the handoff completes, the Directory holds
+the tombstone authority for those ULIDs:
+
+```sql
+-- Tombstones inherited from torn-down hosts. Append-only.
+CREATE TABLE inherited_tombstone (
+  id          TEXT PRIMARY KEY,    -- the recycled ULID
+  former_host TEXT NOT NULL,       -- ULID of the self-hosted root whose DO is gone
+  recycled_at INTEGER NOT NULL,    -- ms since epoch (preserved from the host's tombstone row)
+  reason      TEXT                 -- 'recycle' | 'force_recycle'; preserved from host's tombstone
+);
+```
+
+The host populates this table by POSTing to the Directory's
+`/__internal/inherit-tombstones` endpoint (recycle.md §RC11.3 step 2), in
+the same teardown sequence that ends with `state.storage.deleteAll()`.
+
+Lookup contract — extended for inherited tombstones. The §14.2.1 path
+gains a Directory-local branch when the route is gone:
+
+1. Caller resolves the ULID via Directory's `id_route` table.
+2. **(new)** If no `id_route` row exists, the Directory checks
+   `inherited_tombstone`:
+    - Hit → respond `E_OBJNF` ([../semantics/failures.md §F7](../semantics/failures.md#f7-lifecycle-failures))
+      with `is_recycled() = true`. No DO is woken.
+    - Miss → respond "never existed" with `is_recycled() = false`.
+3. Otherwise dispatch to the host (the §14.2.1 path).
+
+This is the *only* path that removes a row from `id_route`, and it does so
+only for ULIDs whose tombstone has been promoted to the Directory in the
+same operation. Route immutability (§14.2.1) is preserved for live hosts.
+
+The Directory does not vacuum `inherited_tombstone` in normal operation;
+the table grows monotonically. An offline tool may sweep entries past a
+configurable horizon with the same backup/restore caveat as §14.2.1.
 
 ### 14.3 Atomicity
 
