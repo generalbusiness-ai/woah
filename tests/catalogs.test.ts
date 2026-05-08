@@ -3024,8 +3024,16 @@ describe("local catalogs", () => {
       if (next.op !== "result") return;
       expect(next.result).toMatchObject({ order_id: orderResult.order_id, requester, request: "scorpio" });
 
-      // 3. Plug delivers — note lands in requester's inventory with name + body.
-      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "Today's horoscope: avoid llamas."]);
+      // 3. Plug delivers — note lands in requester's inventory with name +
+      //    description (cosmetic look-at flavour) + body. Per LambdaCore
+      //    $note, .description is what `look` shows; .text is what `read`
+      //    returns.
+      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [
+        orderResult.order_id,
+        "Horoscope: Scorpio",
+        "Today's horoscope: avoid llamas.",
+        "A horoscope reading for scorpio."
+      ]);
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const dRes = delivered.result as { delivered: boolean; note: string; text: string };
@@ -3033,6 +3041,7 @@ describe("local catalogs", () => {
       expect(dRes.text).toContain("delivers a note to your inventory");
       expect(world.object(dRes.note).location).toBe(requester);
       expect(world.object(dRes.note).name).toBe("Horoscope: Scorpio");
+      expect(world.getProp(dRes.note, "description")).toBe("A horoscope reading for scorpio.");
       expect(world.getProp(dRes.note, "text")).toBe("Today's horoscope: avoid llamas.");
       expect(world.getProp(dRes.note, "produced_by")).toBe(blockId);
       expect(delivered.observations).toEqual(expect.arrayContaining([

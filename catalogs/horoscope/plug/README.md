@@ -17,11 +17,15 @@ Cron-triggered every minute. Each tick:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
      `system_prompt + request`.
-   - POSTs `:deliver(order_id, name, text)` — `name` is built from the
-     order request (`scorpio` → `"Horoscope: Scorpio"`) so the inventory
-     listing reads cleanly; `text` is the markdown content. The block
-     creates a `$note` with that name and text, moves it to the
-     orderer's inventory, and tells the orderer it arrived.
+   - POSTs `:deliver(order_id, name, text, description)` — `name` is
+     built from the order request (`scorpio` → `"Horoscope: Scorpio"`)
+     so the inventory listing reads cleanly; `text` is the markdown
+     content shown by `read`; `description` is a one-line look-at
+     flavour (`A horoscope reading the machine produced for "scorpio".
+     Try \`read\` to see what it says.`) shown by `look`, per the
+     LambdaCore `$note` slot split. The block creates a `$note` with
+     those fields, moves it to the orderer's inventory, and tells the
+     orderer it arrived.
 
 Failure handling:
 

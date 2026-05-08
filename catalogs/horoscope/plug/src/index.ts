@@ -199,8 +199,9 @@ export async function runHoroscopeTick(
       aiFallbacks.push({ order_id: next.order_id, message: fallbackMessage });
     }
 
+    const description = horoscopeNoteDescription(request);
     try {
-      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, name, text]);
+      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, name, text, description]);
       delivered++;
       logEvent({
         event: "order_delivered",
@@ -303,6 +304,18 @@ export function horoscopeNoteName(request: string): string {
     (_, first: string, rest: string) => first.toUpperCase() + rest.toLowerCase()
   );
   return `Horoscope: ${titled}`;
+}
+
+// Build the cosmetic look-at description for a delivered horoscope. Per
+// LambdaCore $note convention, .description is what `look` shows (a one-
+// line flavour) while .text holds the body shown by `read`. We keep the
+// description short and focused on provenance so a player who types
+// `look giraffe` learns it's a horoscope reading and can `read` it.
+export function horoscopeNoteDescription(request: string): string {
+  const trimmed = (request ?? "").trim();
+  if (!trimmed) return "A horoscope reading from the machine. Try `read` to see what it says.";
+  const subject = trimmed.length > 60 ? trimmed.slice(0, 60).trimEnd() + "..." : trimmed;
+  return `A horoscope reading the machine produced for "${subject}". Try \`read\` to see what it says.`;
 }
 
 // Single line of JSON to console — CF Workers' Logs tab parses it

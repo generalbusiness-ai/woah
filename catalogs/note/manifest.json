@@ -1,6 +1,6 @@
 {
   "name": "note",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "spec_version": "v1",
   "description": "Generic note: a portable text-bearing thing. Notes are first-class movable objects so they can travel between rooms, actor inventories, bulletin boards, and other containers without losing identity. A note has three slots: name (listing identity), description (cosmetic look-at flavour, optional), and text (markdown content; capped at 262144 characters). Subclass for richer behaviors (pinboard pins, dispensed notes, tasks); the base shape is text plus readers/writers permissions.",
   "license": "MIT",
@@ -47,7 +47,10 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": [],
+            "command": { "dobj": "this", "prep": "none", "iobj": "none", "args_from": [] }
+          },
           "source": "verb :read() rxd { let text = this:text(); observe({ type: \"note_read\", actor: actor, note: this, text: text, ts: now() }); return text; }"
         },
         {

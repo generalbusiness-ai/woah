@@ -24,9 +24,11 @@ on the class, while deployed horoscope machines are ordinary instances.
 The plug Worker lives at [`plug/`](plug/). It runs on a short cron
 trigger, reads `pending_orders` via the apikey-bound REST surface,
 calls Workers AI (`@cf/meta/llama-3.2-1b-instruct`) with
-`system_prompt + request`, and calls `:deliver(order_id, name, text)`
-with a derived listing name (e.g. `"Horoscope: Scorpio"`) and the LLM
-reply as the note text.
+`system_prompt + request`, and calls `:deliver(order_id, name, text,
+description)` with a derived listing name (e.g. `"Horoscope: Scorpio"`),
+the LLM reply as the note text, and a one-line look-at description so
+`look <note>` returns the LambdaCore-style cosmetic flavour while
+`read <note>` returns the body.
 
 See [DESIGN.md](DESIGN.md) for design notes.
 
