@@ -496,6 +496,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
 
   appendLog(space: ObjRef, actor: ObjRef, message: Message): { seq: number; ts: number } {
     this.ensureHostedObject(space);
+    const startedAt = Date.now();
     const seq = this.currentSeq(space);
     const nextSeq = this.loadProperty(space, "next_seq");
     this.saveProperty(space, {
@@ -509,10 +510,17 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
       "INSERT INTO space_message(space_id, seq, ts, actor, message, observations, applied_ok, error) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)",
       space, seq, ts, actor, stringifyValue(message as unknown as WooValue), stringifyValue([])
     );
+    // 4 rows per call: the next_seq saveProperty above writes 3 (property_def
+    // or DELETE, property_value or DELETE, property_version) and the
+    // space_message INSERT writes 1. Both `appendLog` and `recordLogOutcome`
+    // bypass world.persistProperty, so this is the only place those writes
+    // surface in the metric stream.
+    this.emitMetric({ kind: "storage_direct_write", what: "log_append", ms: Date.now() - startedAt, rows: 4 });
     return { seq, ts };
   }
 
   recordLogOutcome(space: ObjRef, seq: number, applied_ok: boolean, observations: Observation[] = [], error?: ErrorValue): void {
+    const startedAt = Date.now();
     const row = this.one("SELECT applied_ok, observations, error FROM space_message WHERE space_id = ? AND seq = ?", space, seq);
     if (!row) throw wooError("E_STORAGE", `log entry not found: ${space}:${seq}`);
     if (row.applied_ok !== null && row.applied_ok !== undefined) {
@@ -529,6 +537,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
       error ? stringifyValue(error as unknown as WooValue) : null,
       space, seq
     );
+    this.emitMetric({ kind: "storage_direct_write", what: "log_outcome", ms: Date.now() - startedAt, rows: 1 });
   }
 
   readLog(space: ObjRef, from: number, limit: number): LogReadResult {
@@ -549,10 +558,12 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   }
 
   saveSpaceSnapshot(snapshot: SpaceSnapshotRecord): void {
+    const startedAt = Date.now();
     this.sql.exec(
       "INSERT OR REPLACE INTO space_snapshot(space_id, seq, ts, state, hash) VALUES (?, ?, ?, ?, ?)",
       snapshot.space_id, snapshot.seq, snapshot.ts, stringifyValue(snapshot.state), snapshot.hash
     );
+    this.emitMetric({ kind: "storage_direct_write", what: "snapshot", ms: Date.now() - startedAt, rows: 1 });
   }
 
   loadLatestSnapshot(space: ObjRef): SpaceSnapshotRecord | null {
@@ -561,9 +572,14 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   }
 
   truncateLog(space: ObjRef, covered_seq: number): number {
+    const startedAt = Date.now();
     const before = this.one("SELECT COUNT(*) AS n FROM space_message WHERE space_id = ? AND seq <= ?", space, covered_seq);
     this.sql.exec("DELETE FROM space_message WHERE space_id = ? AND seq <= ?", space, covered_seq);
-    return Number(before?.n ?? 0);
+    const rows = Number(before?.n ?? 0);
+    if (rows > 0) {
+      this.emitMetric({ kind: "storage_direct_write", what: "log_truncate", ms: Date.now() - startedAt, rows });
+    }
+    return rows;
   }
 
   // ---- sessions ----
@@ -634,10 +650,12 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   }
 
   saveTombstone(id: ObjRef, recycledAt: number, reason?: string | null): void {
+    const startedAt = Date.now();
     this.sql.exec(
       "INSERT OR IGNORE INTO tombstone(id, recycled_at, reason) VALUES (?, ?, ?)",
       id, recycledAt, reason ?? null
     );
+    this.emitMetric({ kind: "storage_direct_write", what: "tombstone", ms: Date.now() - startedAt, rows: 1 });
   }
 
   loadTombstones(): ObjRef[] {

@@ -1433,6 +1433,79 @@ describe("CFObjectRepository production-shape coverage", () => {
       gatewayState.close();
     }
   });
+
+  it("emits storage_direct_write metrics for log, snapshot, truncate, and tombstone writes", async () => {
+    const state = new FakeDurableObjectState();
+    const events: Array<{ kind: string; what?: string; rows?: number }> = [];
+    try {
+      const repo = new CFObjectRepository(state as unknown as DurableObjectState, (event) => {
+        events.push({ kind: event.kind, what: (event as { what?: string }).what, rows: (event as { rows?: number }).rows });
+      });
+      const world = createWorld({ repository: repo });
+      const session = world.auth("guest:cf-write-metrics");
+      const applied = await callInDubspace(world, session.id, "cf-write-metric-frame",
+        message(session.actor, "the_dubspace", "set_control", ["delay_1", "wet", 0.42]));
+      expect(applied.op).toBe("applied");
+      world.saveSnapshot("the_dubspace");
+      const truncated = repo.truncateLog("the_dubspace", 1);
+      expect(truncated).toBeGreaterThan(0);
+      repo.saveTombstone("ulid_doomed", Date.now(), "test");
+
+      const writes = events.filter((event) => event.kind === "storage_direct_write");
+      const findWith = (what: string): { rows?: number } | undefined => writes.find((event) => event.what === what);
+      const logAppend = findWith("log_append");
+      expect(logAppend).toBeTruthy();
+      expect(logAppend?.rows).toBe(4);
+      const logOutcome = findWith("log_outcome");
+      expect(logOutcome).toBeTruthy();
+      expect(logOutcome?.rows).toBe(1);
+      const snapshot = findWith("snapshot");
+      expect(snapshot).toBeTruthy();
+      expect(snapshot?.rows).toBe(1);
+      const truncateMetric = findWith("log_truncate");
+      expect(truncateMetric).toBeTruthy();
+      expect(truncateMetric?.rows).toBe(truncated);
+      const tombstone = findWith("tombstone");
+      expect(tombstone).toBeTruthy();
+      expect(tombstone?.rows).toBe(1);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("emits storage_full_save with non-zero rows when persistFullSnapshot rewrites the world", () => {
+    const state = new FakeDurableObjectState();
+    try {
+      const repo = new CFObjectRepository(state as unknown as DurableObjectState);
+      const fullSaves: Array<{ trigger?: string; rows?: number; objects?: number }> = [];
+      const world = createWorld({
+        repository: repo,
+        metricsHook: (event) => {
+          if (event.kind === "storage_full_save") {
+            fullSaves.push({ trigger: event.trigger, rows: event.rows, objects: event.objects });
+          }
+        }
+      });
+      // Bootstrap fires the first save; ignore it. Importing the same snapshot
+      // twice exercises both the explicit trigger label and the row-count path.
+      fullSaves.length = 0;
+      const snapshot = world.exportWorld();
+      world.importWorld(snapshot);
+      world.persistFullSnapshot();
+      world.importWorld(snapshot);
+      world.persistFullSnapshot("host_seed_apply");
+
+      expect(fullSaves).toHaveLength(2);
+      expect(fullSaves[0].trigger).toBe("persist_full_snapshot");
+      expect(fullSaves[1].trigger).toBe("host_seed_apply");
+      for (const event of fullSaves) {
+        expect(event.rows ?? 0).toBeGreaterThan(0);
+        expect(event.objects ?? 0).toBe(snapshot.objects.length);
+      }
+    } finally {
+      state.close();
+    }
+  });
 });
 
 // Focused regressions for the outbound-fetch limiter introduced to mitigate

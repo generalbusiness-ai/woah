@@ -74,7 +74,13 @@ const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
 const HOST_STATE_CACHE_LIMIT = 32;
 const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
-const HOST_READ_RPC_TIMEOUT_MS = 2500;
+// Read-only cross-host RPCs (room-snapshot, remote-get-prop, contents, etc.)
+// are deadlined tightly so a wedge surfaces fast and the local task chain
+// can fall back to a degraded reply. 5s is the working ceiling: a hot
+// remote settles in ~50ms, but a cold-start DO has to load persistence,
+// run bootstrap, and serve the snapshot, which can spike to 3-4s on first
+// touch. Override per deployment via WOO_HOST_READ_TIMEOUT_MS.
+const HOST_READ_RPC_TIMEOUT_MS = 5000;
 // Mutating cross-host RPCs do not have an inherent deadline (a write that
 // takes 30s may still be making progress), but a wedged DO can park a slot
 // forever and the local task chain along with it. The watchdog is a
@@ -752,7 +758,7 @@ export class PersistentObjectDO {
     const merged = mergeHostScopedSeedWithStatus(current, scopedSeed);
     if (merged.changed) {
       world.importWorld(merged.world);
-      world.persistFullSnapshot();
+      world.persistFullSnapshot("host_seed_apply");
       this.hostStateCache.clear();
       this.crossHostPropCache.clear();
     }

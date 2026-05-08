@@ -4614,11 +4614,15 @@ export class WooWorld {
 
   exportHostScopedWorld(host: ObjRef): SerializedWorld {
     const scope = this.hostScope(host);
+    const parkedTasks = Array.from(this.parkedTasks.values())
+      .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
+      .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord);
     return {
       version: 1,
-      objectCounter: this.objectCounter,
-      parkedTaskCounter: this.parkedTaskCounter,
-      sessionCounter: this.sessionCounter,
+      objectCounter: nextScopedObjectCounter(scope.objects),
+      parkedTaskCounter: nextScopedParkedTaskCounter(parkedTasks),
+      // Sessions are not exported, so this seed contributes nothing about session allocation.
+      sessionCounter: 1,
       objects: Array.from(scope.objects)
         .sort()
         .map((id) => this.serializeScopedObject(this.object(id), scope.objects, scope.hostedObjects)),
@@ -4629,9 +4633,7 @@ export class WooWorld {
       snapshots: (this.snapshots ?? [])
         .filter((snapshot) => scope.hostedSpaces.has(snapshot.space_id))
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
-      parkedTasks: Array.from(this.parkedTasks.values())
-        .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
-        .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
+      parkedTasks,
       tombstones: Array.from(this.tombstones).sort()
     };
   }
@@ -4926,17 +4928,49 @@ export class WooWorld {
       this.persistenceDirty = true;
       return;
     }
-    this.repository.save(this.exportWorld());
+    this.runFullSave("world_persist");
     this.persistenceDirty = false;
   }
 
-  persistFullSnapshot(): void {
+  persistFullSnapshot(trigger: "persist_full_snapshot" | "host_seed_apply" = "persist_full_snapshot"): void {
     if (!this.repository) return;
     // Use sparingly for whole-world replacement paths such as importing a
     // repaired host seed; incremental persistence has no dirty-row record for
-    // objects replaced through importWorld().
-    this.repository.save(this.exportWorld());
+    // objects replaced through importWorld(). Callers that drive a known
+    // trigger (e.g. host-seed apply) pass it through so the metric stream
+    // names the call site without having to walk the stack.
+    this.runFullSave(trigger);
     this.discardPendingPersistence();
+  }
+
+  /** Drive `repository.save()` with metric instrumentation. The MetricEvent
+   * row count is derived from the same SerializedWorld passed to save() so the
+   * metric matches the actual write set across every backend. The CF backend's
+   * own `cf_repository_save` startup metric still fires (it covers ms +
+   * status), but `storage_full_save` is the runtime-level signal; one grep
+   * surfaces every full-world rewrite without joining startup vs steady-state
+   * channels. */
+  private runFullSave(trigger: "world_persist" | "persist_full_snapshot" | "host_seed_apply"): void {
+    const repo = this.repository;
+    if (!repo) return;
+    const serialized = this.exportWorld();
+    const startedAt = Date.now();
+    repo.save(serialized);
+    const stats = serializedWorldRowStats(serialized);
+    this.recordMetric({
+      kind: "storage_full_save",
+      trigger,
+      rows: stats.rows,
+      objects: stats.objects,
+      properties: stats.properties,
+      verbs: stats.verbs,
+      logs: stats.logs,
+      snapshots: stats.snapshots,
+      sessions: stats.sessions,
+      tasks: stats.tasks,
+      tombstones: stats.tombstones,
+      ms: Date.now() - startedAt
+    });
   }
 
   private activeObjectRepository(): ObjectRepository | null {
@@ -5054,8 +5088,9 @@ export class WooWorld {
     const obj = this.objects.get(objRef);
     if (!obj) return;
     const startedAt = Date.now();
-    repo.saveObject(this.serializeObject(obj));
-    this.recordMetric({ kind: "storage_direct_write", what: "object", ms: Date.now() - startedAt });
+    const serialized = this.serializeObject(obj);
+    repo.saveObject(serialized);
+    this.recordMetric({ kind: "storage_direct_write", what: "object", ms: Date.now() - startedAt, rows: serializedObjectRowCount(serialized) });
   }
 
   private deletePersistedObject(objRef: ObjRef): void {
@@ -5068,7 +5103,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.deleteObject(objRef);
-    this.recordMetric({ kind: "storage_direct_write", what: "object_delete", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "object_delete", ms: Date.now() - startedAt, rows: 1 });
   }
 
   /**
@@ -5099,7 +5134,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.saveProperty(objRef, this.serializeProperty(objRef, name));
-    this.recordMetric({ kind: "storage_direct_write", what: "property", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "property", ms: Date.now() - startedAt, rows: 3 });
   }
 
   private deletePersistedProperty(objRef: ObjRef, name: string): void {
@@ -5114,7 +5149,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.deleteProperty(objRef, name);
-    this.recordMetric({ kind: "storage_direct_write", what: "property_delete", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "property_delete", ms: Date.now() - startedAt, rows: 3 });
   }
 
   private serializeProperty(objRef: ObjRef, name: string): SerializedProperty {
@@ -5141,7 +5176,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.saveSession(this.serializeSession(session));
-    this.recordMetric({ kind: "storage_direct_write", what: "session", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "session", ms: Date.now() - startedAt, rows: 1 });
   }
 
   private deletePersistedSession(sessionId: string): void {
@@ -5154,7 +5189,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.deleteSession(sessionId);
-    this.recordMetric({ kind: "storage_direct_write", what: "session_delete", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "session_delete", ms: Date.now() - startedAt, rows: 1 });
   }
 
   private persistTask(task: ParkedTaskRecord): void {
@@ -5167,7 +5202,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.saveTask(task);
-    this.recordMetric({ kind: "storage_direct_write", what: "task", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "task", ms: Date.now() - startedAt, rows: 1 });
   }
 
   private persistCounters(): void {
@@ -5182,7 +5217,7 @@ export class WooWorld {
     repo.saveMeta("objectCounter", String(this.objectCounter));
     repo.saveMeta("parkedTaskCounter", String(this.parkedTaskCounter));
     repo.saveMeta("sessionCounter", String(this.sessionCounter));
-    this.recordMetric({ kind: "storage_direct_write", what: "counters", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "counters", ms: Date.now() - startedAt, rows: 3 });
   }
 
   private deletePersistedTask(taskId: string): void {
@@ -5195,7 +5230,7 @@ export class WooWorld {
     }
     const startedAt = Date.now();
     repo.deleteTask(taskId);
-    this.recordMetric({ kind: "storage_direct_write", what: "task_delete", ms: Date.now() - startedAt });
+    this.recordMetric({ kind: "storage_direct_write", what: "task_delete", ms: Date.now() - startedAt, rows: 1 });
   }
 
   private flushIncrementalState(): void {
@@ -5220,37 +5255,62 @@ export class WooWorld {
     const dirtyTombstones = Array.from(this.dirtyTombstones);
     const dirtyCounters = this.dirtyCounters;
     const startedAt = Date.now();
+    let rows = 0;
     repo.transaction(() => {
-      for (const objRef of deletedObjects) repo.deleteObject(objRef);
-      for (const sessionId of deletedSessions) repo.deleteSession(sessionId);
+      for (const objRef of deletedObjects) {
+        repo.deleteObject(objRef);
+        rows += 1; // single object row delete; the cascade rows were already committed in earlier flushes
+      }
+      for (const sessionId of deletedSessions) {
+        repo.deleteSession(sessionId);
+        rows += 1;
+      }
       for (const sessionId of dirtySessions) {
         if (this.deletedSessions.has(sessionId)) continue;
         const session = this.sessions.get(sessionId);
-        if (session) repo.saveSession(this.serializeSession(session));
+        if (session) {
+          repo.saveSession(this.serializeSession(session));
+          rows += 1;
+        }
       }
-      for (const taskId of deletedTasks) repo.deleteTask(taskId);
+      for (const taskId of deletedTasks) {
+        repo.deleteTask(taskId);
+        rows += 1;
+      }
       for (const taskId of dirtyTasks) {
         if (this.deletedTasks.has(taskId)) continue;
         const task = this.parkedTasks.get(taskId);
-        if (task) repo.saveTask(task);
+        if (task) {
+          repo.saveTask(task);
+          rows += 1;
+        }
       }
       for (const objRef of dirtyObjects) {
         if (deletedObjectSet.has(objRef)) continue;
         const obj = this.objects.get(objRef);
-        if (obj) repo.saveObject(this.serializeObject(obj));
+        if (obj) {
+          const serialized = this.serializeObject(obj);
+          repo.saveObject(serialized);
+          rows += serializedObjectRowCount(serialized);
+        }
       }
       for (const { objRef, name } of dirtyProperties) {
         if (deletedObjectSet.has(objRef) || dirtyObjectSet.has(objRef) || !this.objects.has(objRef)) continue;
         repo.saveProperty(objRef, this.serializeProperty(objRef, name));
+        rows += 3; // property_def or DELETE + property_value or DELETE + property_version
       }
       if (dirtyCounters) {
         repo.saveMeta("version", "1");
         repo.saveMeta("objectCounter", String(this.objectCounter));
         repo.saveMeta("parkedTaskCounter", String(this.parkedTaskCounter));
         repo.saveMeta("sessionCounter", String(this.sessionCounter));
+        rows += 4;
       }
       const now = Date.now();
-      for (const id of dirtyTombstones) repo.saveTombstone(id, now, null);
+      for (const id of dirtyTombstones) {
+        repo.saveTombstone(id, now, null);
+        rows += 1;
+      }
     });
     for (const objRef of dirtyObjects) this.dirtyObjects.delete(objRef);
     for (const objRef of deletedObjects) this.deletedObjects.delete(objRef);
@@ -5283,6 +5343,7 @@ export class WooWorld {
       deleted_tasks: deletedTasks.length,
       counters: dirtyCounters,
       ms: Date.now() - startedAt,
+      rows,
       top_properties: topByName(persistedProps.map(({ name }) => name), STORAGE_FLUSH_TOP_N),
       top_objects: topByName(persistedProps.map(({ objRef }) => objRef), STORAGE_FLUSH_TOP_N)
     });
@@ -8260,6 +8321,93 @@ function normalizeHelpTopic(value: string): string {
 function runtimeObjectScope(value: ObjRef): string {
   const cleaned = value.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   return cleaned || "world";
+}
+
+function nextScopedObjectCounter(ids: Iterable<ObjRef>): number {
+  // Mirrors the createRuntimeObject/createBuilderObject allocator format: obj_<scope>_<counter>.
+  let next = 1;
+  for (const id of ids) {
+    const match = /^obj_.+_(\d+)$/.exec(id);
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (Number.isSafeInteger(value) && value >= next) next = value + 1;
+  }
+  return next;
+}
+
+type SerializedWorldRowStats = {
+  rows: number;
+  objects: number;
+  properties: number;
+  verbs: number;
+  logs: number;
+  snapshots: number;
+  sessions: number;
+  tasks: number;
+  tombstones: number;
+};
+
+// Count the SQL rows a backend will write for `repository.saveObject(obj)`.
+// One `object` row plus property_def + property_value + property_version +
+// verb + child + content + event_schema rows. Mirrors the row layout in
+// src/core/sql-shape.ts so the metric stream matches what hits disk without
+// peeking at per-backend schemas.
+function serializedObjectRowCount(obj: SerializedObject): number {
+  return (
+    1 +
+    obj.propertyDefs.length +
+    obj.properties.length +
+    obj.propertyVersions.length +
+    obj.verbs.length +
+    obj.children.length +
+    obj.contents.length +
+    obj.eventSchemas.length
+  );
+}
+
+// Count the SQL rows a backend will write for `repository.save(world)`.
+// Per-object rows via serializedObjectRowCount, plus session / space_message /
+// space_snapshot / task / tombstone rows, plus four `world_meta` rows
+// (version + three counters). Used to make `storage_full_save` row counts
+// comparable across backends.
+function serializedWorldRowStats(world: SerializedWorld): SerializedWorldRowStats {
+  let properties = 0;
+  let verbs = 0;
+  let perObjectRows = 0;
+  for (const obj of world.objects) {
+    properties += obj.properties.length;
+    verbs += obj.verbs.length;
+    perObjectRows += serializedObjectRowCount(obj);
+  }
+  const logs = world.logs.reduce((sum, [, entries]) => sum + entries.length, 0);
+  const snapshots = world.snapshots.length;
+  const sessions = world.sessions.length;
+  const tasks = world.parkedTasks.length;
+  const tombstones = (world.tombstones ?? []).length;
+  const META_ROWS = 4; // version + objectCounter + parkedTaskCounter + sessionCounter
+  return {
+    rows: perObjectRows + logs + snapshots + sessions + tasks + tombstones + META_ROWS,
+    objects: world.objects.length,
+    properties,
+    verbs,
+    logs,
+    snapshots,
+    sessions,
+    tasks,
+    tombstones
+  };
+}
+
+function nextScopedParkedTaskCounter(tasks: readonly ParkedTaskRecord[]): number {
+  // Mirrors the scheduleFork/park*Continuation allocator format: ptask_<counter>.
+  let next = 1;
+  for (const task of tasks) {
+    const match = /^ptask_(\d+)$/.exec(task.id);
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (Number.isSafeInteger(value) && value >= next) next = value + 1;
+  }
+  return next;
 }
 
 function isPlainValueMap(value: WooValue | undefined): value is Record<string, WooValue> {

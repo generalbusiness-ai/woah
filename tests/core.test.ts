@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
-import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHostScopedWorld, scopeSerializedWorldToHost } from "../src/core/bootstrap";
+import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld, scopeSerializedWorldToHost } from "../src/core/bootstrap";
 import { bundledCatalogAliases, installLocalCatalogs } from "../src/core/local-catalogs";
+import type { ParkedTaskRecord } from "../src/core/repository";
 import type { CallContext, WooWorld } from "../src/core/world";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 import {
@@ -741,6 +742,18 @@ describe("woo core", () => {
   it("exports host-scoped worlds for routed cluster hosts", async () => {
     const world = createWorld();
     const session = world.auth("guest:host-scope");
+    const parked: ParkedTaskRecord = {
+      id: "ptask_12",
+      parked_on: "the_taskspace",
+      state: "suspended",
+      resume_at: Date.now() + 1000,
+      awaiting_player: null,
+      correlation_id: null,
+      serialized: { kind: "test", space: "the_taskspace", target: "the_taskspace" },
+      created: Date.now(),
+      origin: "the_taskspace"
+    };
+    world.parkedTasks.set(parked.id, parked);
     const scoped = world.exportHostScopedWorld("the_taskspace");
     const ids = scoped.objects.map((obj) => obj.id);
 
@@ -752,6 +765,7 @@ describe("woo core", () => {
     expect(ids).not.toContain("the_chatroom");
     expect(scoped.sessions).toEqual([]);
     expect(scoped.logs.every(([space]) => space === "the_taskspace")).toBe(true);
+    expect(scoped.parkedTaskCounter).toBe(13);
 
     const cluster = createWorldFromSerialized(scoped, { persist: false });
     const clusterSession = cluster.auth("guest:host-scope");
@@ -764,6 +778,21 @@ describe("woo core", () => {
     expect(task).toMatch(/^obj_the_taskspace_/);
     expect(cluster.object(task).parent).toBe("$task");
     expect(cluster.objectRoutes()).toContainEqual({ id: task, host: "the_taskspace", anchor: "the_taskspace" });
+  });
+
+  it("does not copy gateway-global counters into host-scoped seed exports", () => {
+    const stored = createWorld();
+    const fresh = createWorld();
+    for (let i = 0; i < 5; i += 1) {
+      fresh.createRuntimeObject("$thing", "$wiz", null, { name: `Gateway-only ${i}` });
+    }
+
+    const storedScoped = stored.exportHostScopedWorld("the_taskspace");
+    const freshScoped = fresh.exportHostScopedWorld("the_taskspace");
+
+    expect(fresh.exportWorld().objectCounter).toBeGreaterThan(stored.exportWorld().objectCounter);
+    expect(freshScoped.objectCounter).toBe(storedScoped.objectCounter);
+    expect(mergeHostScopedSeedWithStatus(storedScoped, freshScoped).changed).toBe(false);
   });
 
   it("treats stored worlds without a host slice as unusable for cluster boot", async () => {
