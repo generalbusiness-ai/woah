@@ -24,6 +24,10 @@ type SessionRoute = {
 
 const WORLD_HOST = "world";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+// Per spec/semantics/recycle.md §RC11.3 step 2: inherit-tombstones batches are
+// capped at 512 KiB to leave headroom under the 1 MiB worker limit. Hosts
+// chunk a long roster into multiple batches.
+const MAX_INHERIT_BODY_BYTES = 512 * 1024;
 
 export class DirectoryDO {
   private state: DurableObjectState;
@@ -41,9 +45,9 @@ export class DirectoryDO {
       try {
         this.ensureSchema();
         this.schemaEnsured = true;
-        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 3 });
+        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 5 });
       } catch (err) {
-        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 3, error: metricErrorCode(err) });
+        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 5, error: metricErrorCode(err) });
         throw err;
       }
     }
@@ -111,6 +115,16 @@ export class DirectoryDO {
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
       }
 
+      if (request.method === "POST" && url.pathname === "/__internal/inherit-tombstones") {
+        return await this.handleInheritTombstones(request);
+      }
+
+      if (request.method === "POST" && url.pathname === "/__internal/lookup-inherited-tombstone") {
+        const body = await readJson(request);
+        const id = String(body.id ?? "");
+        return json(this.lookupInheritedTombstone(id));
+      }
+
       return json({ error: { code: "E_OBJNF", message: `no Directory route for ${request.method} ${url.pathname}` } }, 404);
     } catch (err) {
       const error = err && typeof err === "object" && "code" in err
@@ -140,7 +154,15 @@ export class DirectoryDO {
       `CREATE TABLE IF NOT EXISTS directory_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
-      )`
+      )`,
+      `CREATE TABLE IF NOT EXISTS inherited_tombstone (
+        id TEXT PRIMARY KEY,
+        former_host TEXT NOT NULL,
+        recycled_at INTEGER NOT NULL,
+        reason TEXT
+      )`,
+      `CREATE INDEX IF NOT EXISTS inherited_tombstone_former_host
+        ON inherited_tombstone(former_host)`
     ]) {
       this.state.storage.sql.exec(stmt);
     }
@@ -220,6 +242,141 @@ export class DirectoryDO {
     };
   }
 
+  private async handleInheritTombstones(request: Request): Promise<Response> {
+    // verifyInternalRequest already ran in the outer fetch handler. After
+    // that, x-woo-host-key is HMAC-bound to the request body, so we can
+    // trust its value as the authenticated caller. Per spec/semantics/recycle.md
+    // §RC11.3 step 2 + §RC11.7: the v1 single-shared-secret model means
+    // these checks defend against public clients and honest-but-buggy
+    // internal callers, not against a compromised worker.
+    const authedHost = request.headers.get("x-woo-host-key") || "";
+    if (!authedHost) {
+      return json({ error: { code: "E_PERM", message: "missing x-woo-host-key" } }, 403);
+    }
+
+    const startedAt = Date.now();
+    const body = await readJson(request, MAX_INHERIT_BODY_BYTES);
+    const declaredHost = typeof body.host === "string" ? body.host : "";
+    const batchSeq = Number(body.batch_seq);
+    const final = body.final === true;
+    const tombstones = Array.isArray(body.tombstones) ? body.tombstones : [];
+
+    if (declaredHost !== authedHost) {
+      return json({ error: { code: "E_PERM", message: "body.host does not match authenticated host" } }, 403);
+    }
+    if (!Number.isFinite(batchSeq) || batchSeq < 0) {
+      return json({ error: { code: "E_INVARG", message: "batch_seq must be a non-negative integer" } }, 400);
+    }
+
+    type Entry = { id: string; recycled_at: number; reason: string | null };
+    const accepted: Entry[] = [];
+    for (const raw of tombstones) {
+      if (!raw || typeof raw !== "object") continue;
+      const r = raw as Record<string, unknown>;
+      const id = typeof r.id === "string" ? r.id : "";
+      const recycledAt = Number(r.recycled_at);
+      const reason = typeof r.reason === "string" ? r.reason : null;
+      if (!id || !Number.isFinite(recycledAt)) {
+        return json({ error: { code: "E_INVARG", message: `invalid tombstone entry for id ${id}` } }, 400);
+      }
+      accepted.push({ id, recycled_at: recycledAt, reason });
+    }
+
+    // Roster ownership: every id must currently route to this host, OR be
+    // already-inherited under this same former_host (idempotent retries).
+    // Reject the whole batch on any mismatch — partial application would
+    // leave the host's teardown bookkeeping inconsistent.
+    for (const entry of accepted) {
+      const routeRow = firstRow(this.state.storage.sql.exec(
+        "SELECT host FROM object_route WHERE id = ?",
+        entry.id
+      ));
+      if (routeRow) {
+        if (String(routeRow.host) !== authedHost) {
+          this.emitMetric({
+            kind: "startup_storage", phase: "directory_inherit_tombstones",
+            ms: Date.now() - startedAt, status: "error",
+            error: "route_mismatch", count: accepted.length
+          });
+          return json({ error: {
+            code: "E_PERM",
+            message: `id ${entry.id} routed to ${String(routeRow.host)}, not ${authedHost}`
+          } }, 403);
+        }
+        continue;
+      }
+      const inheritedRow = firstRow(this.state.storage.sql.exec(
+        "SELECT former_host FROM inherited_tombstone WHERE id = ?",
+        entry.id
+      ));
+      if (inheritedRow && String(inheritedRow.former_host) !== authedHost) {
+        return json({ error: {
+          code: "E_PERM",
+          message: `id ${entry.id} already inherited from ${String(inheritedRow.former_host)}`
+        } }, 403);
+      }
+      // No route, no inherited row → never existed. Spec doesn't forbid
+      // inheriting an unknown id from a host that claims it; treat as a
+      // no-op for the route-deletion side and still record the tombstone.
+    }
+
+    let inserted = 0;
+    let routesRemoved = 0;
+    this.state.storage.transactionSync(() => {
+      for (const entry of accepted) {
+        const inheritedBefore = this.countRows("inherited_tombstone");
+        this.state.storage.sql.exec(
+          "INSERT OR IGNORE INTO inherited_tombstone(id, former_host, recycled_at, reason) VALUES (?, ?, ?, ?)",
+          entry.id, authedHost, entry.recycled_at, entry.reason
+        );
+        if (this.countRows("inherited_tombstone") > inheritedBefore) inserted += 1;
+        const hadRoute = firstRow(this.state.storage.sql.exec(
+          "SELECT 1 FROM object_route WHERE id = ? AND host = ?",
+          entry.id, authedHost
+        )) !== null;
+        if (hadRoute) {
+          this.state.storage.sql.exec(
+            "DELETE FROM object_route WHERE id = ? AND host = ?",
+            entry.id, authedHost
+          );
+          routesRemoved += 1;
+        }
+      }
+    });
+
+    this.emitMetric({
+      kind: "startup_storage", phase: "directory_inherit_tombstones",
+      ms: Date.now() - startedAt, status: "ok",
+      count: accepted.length, inserted, routes_removed: routesRemoved,
+      batch_seq: batchSeq, final
+    });
+
+    return json({
+      ok: true,
+      accepted: accepted.length,
+      inserted,
+      routes_removed: routesRemoved,
+      batch_seq: batchSeq,
+      final
+    });
+  }
+
+  private lookupInheritedTombstone(id: string): { id: string; tombstoned: boolean; former_host: string | null; recycled_at: number | null; reason: string | null } {
+    if (!id) return { id, tombstoned: false, former_host: null, recycled_at: null, reason: null };
+    const row = firstRow(this.state.storage.sql.exec(
+      "SELECT former_host, recycled_at, reason FROM inherited_tombstone WHERE id = ?",
+      id
+    ));
+    if (!row) return { id, tombstoned: false, former_host: null, recycled_at: null, reason: null };
+    return {
+      id,
+      tombstoned: true,
+      former_host: String(row.former_host),
+      recycled_at: Number(row.recycled_at),
+      reason: row.reason === null ? null : String(row.reason)
+    };
+  }
+
   private ensureColumn(table: string, column: string, definition: string): void {
     if (this.tableColumns(table).has(column)) return;
     this.state.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -261,9 +418,9 @@ function metricErrorCode(err: unknown): string {
   return err instanceof Error ? err.name : "E_INTERNAL";
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown>> {
+async function readJson(request: Request, maxBytes: number = MAX_JSON_BODY_BYTES): Promise<Record<string, unknown>> {
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(await readLimitedBody(request)));
+    const parsed = JSON.parse(new TextDecoder().decode(await readLimitedBody(request, maxBytes)));
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch (err) {
     if (err && typeof err === "object" && "code" in err) throw err;
@@ -271,10 +428,10 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-async function readLimitedBody(request: Request): Promise<ArrayBuffer> {
+async function readLimitedBody(request: Request, maxBytes: number): Promise<ArrayBuffer> {
   const declared = Number(request.headers.get("content-length") ?? 0);
-  if (Number.isFinite(declared) && declared > MAX_JSON_BODY_BYTES) throw wooError("E_RATE", `request body exceeds ${MAX_JSON_BODY_BYTES} bytes`);
+  if (Number.isFinite(declared) && declared > maxBytes) throw wooError("E_RATE", `request body exceeds ${maxBytes} bytes`);
   const body = await request.arrayBuffer();
-  if (body.byteLength > MAX_JSON_BODY_BYTES) throw wooError("E_RATE", `request body exceeds ${MAX_JSON_BODY_BYTES} bytes`);
+  if (body.byteLength > maxBytes) throw wooError("E_RATE", `request body exceeds ${maxBytes} bytes`);
   return body;
 }
