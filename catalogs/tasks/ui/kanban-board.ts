@@ -74,6 +74,62 @@ function actorDisplay(ref: string, names: Record<string, string>): string {
   return names[ref] ?? ref;
 }
 
+function readListingRow(row: unknown): KanbanTask | null {
+  if (!row || typeof row !== "object") return null;
+  const r = row as Record<string, unknown>;
+  const id = typeof r.task === "string" ? r.task : "";
+  if (!id) return null;
+  const cursor = r.cursor_role && typeof r.cursor_role === "object" ? r.cursor_role as Record<string, unknown> : null;
+  const cursorRole = cursor && typeof cursor.role === "string"
+    ? cursor.role
+    : typeof r.cursor_role === "string" ? r.cursor_role : null;
+  const cursorKey = cursor && typeof cursor.key === "string" ? cursor.key : null;
+  const cursorCriterion = cursor && typeof cursor.criterion === "string" ? cursor.criterion : null;
+  const labels = Array.isArray(r.labels) ? r.labels.filter((l): l is string => typeof l === "string") : [];
+  return {
+    id,
+    name: typeof r.name === "string" ? r.name : id,
+    kind: typeof r.kind === "string" ? r.kind : "",
+    labels,
+    location: typeof r.location === "string" ? r.location : "",
+    cursorRole,
+    cursorKey,
+    cursorCriterion,
+    waitForCount: typeof r.wait_for_count === "number" ? r.wait_for_count : 0,
+    terminal: r.terminal === true,
+    complete: r.complete === true,
+    linkCount: typeof r.link_count === "number" ? r.link_count : 0,
+    ageMs: typeof r.age_ms === "number" ? r.age_ms : 0,
+    lastChange: typeof r.last_change === "number" ? r.last_change : 0,
+    actions: []
+  };
+}
+
+function readActionRow(row: unknown): KanbanAction | null {
+  if (!row || typeof row !== "object") return null;
+  const r = row as Record<string, unknown>;
+  const verb = typeof r.verb === "string" ? r.verb : "";
+  if (!verb) return null;
+  const args: KanbanActionArg[] = Array.isArray(r.args)
+    ? r.args.flatMap((spec) => {
+        if (!spec || typeof spec !== "object") return [];
+        const s = spec as Record<string, unknown>;
+        const name = typeof s.name === "string" ? s.name : "";
+        if (!name) return [];
+        return [{
+          name,
+          type: typeof s.type === "string" ? s.type : "any",
+          required: s.required === true
+        }];
+      })
+    : [];
+  return {
+    verb,
+    label: typeof r.label === "string" ? r.label : verb,
+    args
+  };
+}
+
 export class WooTasksKanbanElement extends HTMLElement {
   woo?: WooContext;
   subject?: string;
@@ -97,6 +153,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.addEventListener("click", this.handleClick);
       this.boundClick = true;
     }
+    if (this.woo) void this.refresh();
   }
 
   disconnectedCallback(): void {
@@ -104,6 +161,61 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.removeEventListener("click", this.handleClick);
       this.boundClick = false;
     }
+  }
+
+  async refresh(): Promise<void> {
+    const woo = this.woo;
+    const subject = this.subject ?? this.model.registryId;
+    if (!woo || !subject) return;
+    const projected = woo.observe(subject);
+    const registryName = projected?.name ?? this.model.registryName ?? subject;
+    const actor = woo.actor ?? this.model.actor;
+    const actorNames = this.collectActorNames(woo, projected);
+    let listing: unknown;
+    try {
+      listing = await woo.call(subject, "listing", []);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(listing)) return;
+    const tasks = listing.flatMap((row) => {
+      const parsed = readListingRow(row);
+      return parsed ? [parsed] : [];
+    });
+    if (actor) {
+      await Promise.all(tasks.map(async (task) => {
+        try {
+          const result = await woo.call(subject, "available_actions", [task.id, actor]);
+          if (Array.isArray(result)) {
+            task.actions = result.flatMap((row) => {
+              const parsed = readActionRow(row);
+              return parsed ? [parsed] : [];
+            });
+          }
+        } catch {
+          task.actions = [];
+        }
+      }));
+    }
+    this.data = {
+      registryId: subject,
+      registryName,
+      actor: actor ?? null,
+      actorNames,
+      tasks
+    };
+  }
+
+  private collectActorNames(woo: WooContext, projected: ReturnType<WooContext["observe"]>): Record<string, string> {
+    const names: Record<string, string> = { ...this.model.actorNames };
+    if (projected?.name && (this.subject || this.model.registryId)) {
+      names[this.subject ?? this.model.registryId] = projected.name;
+    }
+    if (woo.actor) {
+      const actorProj = woo.observe(woo.actor);
+      if (actorProj?.name) names[woo.actor] = actorProj.name;
+    }
+    return names;
   }
 
   private handleClick = (event: Event): void => {
@@ -123,7 +235,25 @@ export class WooTasksKanbanElement extends HTMLElement {
       bubbles: true,
       detail: { taskId, verb: action.verb, label: action.label, args: action.args }
     }));
+    void this.invokeAction(taskId, action);
   };
+
+  private async invokeAction(taskId: string, action: KanbanAction): Promise<void> {
+    const woo = this.woo;
+    if (!woo) return;
+    const required = action.args.filter((arg) => arg.required);
+    if (required.length > 0) {
+      // Required-args prompts land in phase c.4. Skip dispatch for now;
+      // the woo-tasks-action event still fires so a host can intervene.
+      return;
+    }
+    try {
+      await woo.call(taskId, action.verb, []);
+    } catch {
+      // Errors surface as observations; phase c.2 wires live reconciliation.
+    }
+    await this.refresh();
+  }
 
   private render(): void {
     const { registryId, registryName, tasks, actorNames } = this.model;

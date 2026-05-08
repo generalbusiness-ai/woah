@@ -63,6 +63,61 @@ describe("bundled catalog UI components", () => {
     expect(element.querySelector(".weather-badge-condition")?.textContent).toBe("sunny");
   });
 
+  it("self-fetches listing + available_actions via WooContext on connect and dispatches verbs on click", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const calls: { target: string; verb: string; args: unknown[] }[] = [];
+    const listing = [
+      {
+        task: "obj_t_ready",
+        name: "Triage cockatoo bug",
+        kind: "bug",
+        labels: ["urgent"],
+        location: "the_bug_board",
+        cursor_role: { key: "do:it", role: "doer", criterion: "Done." },
+        wait_for_count: 0,
+        terminal: false,
+        complete: false,
+        link_count: 0,
+        age_ms: 12_000,
+        last_change: 0
+      }
+    ];
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_bug_board", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_bug_board", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_bug_board" ? "Bug Board" : ref === "guest_1" ? "Guest 1" : ref, props: {}, catalogState: {} }),
+      call: async (target, verb, args = []) => {
+        calls.push({ target, verb, args });
+        if (verb === "listing") return listing;
+        if (verb === "available_actions") return [{ verb: "claim", label: "Claim", args: [] }];
+        if (verb === "claim") return null;
+        return undefined;
+      },
+      send: async () => undefined,
+      directCall: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; refresh?: () => Promise<void> };
+    element.woo = woo;
+    element.subject = "the_bug_board";
+    document.body.appendChild(element);
+    await element.refresh!();
+
+    expect(element.querySelector<HTMLElement>("[data-tasks-card]")?.dataset.tasksCard).toBe("obj_t_ready");
+    expect(element.querySelector("h2")?.textContent).toBe("Bug Board");
+    expect(element.querySelector("[data-tasks-action=\"claim\"]")?.textContent).toBe("Claim");
+
+    let detail: any;
+    element.addEventListener("woo-tasks-action", (event: Event) => { detail = (event as CustomEvent).detail; });
+    element.querySelector<HTMLButtonElement>("[data-tasks-action=\"claim\"]")?.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(detail).toMatchObject({ taskId: "obj_t_ready", verb: "claim" });
+    expect(calls.some((c) => c.target === "obj_t_ready" && c.verb === "claim")).toBe(true);
+  });
+
   it("renders the tasks kanban with state columns, cursor badges, and actions", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
