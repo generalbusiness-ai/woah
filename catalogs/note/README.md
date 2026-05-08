@@ -1,6 +1,6 @@
 ---
 name: note
-version: 2.0.0
+version: 2.0.1
 spec_version: v1
 license: MIT
 description: Generic note class — portable text-bearing things, modeled after LambdaMOO's $note (#9). Identity (name), cosmetic flavour (description), markdown content (text). Subclass for richer per-note behavior.

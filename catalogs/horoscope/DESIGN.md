@@ -39,7 +39,7 @@ and the note in your hand is how you know it's done.
 4. Calls Workers AI: `@cf/meta/llama-3.2-1b-instruct` with
    `messages: [{role: "system", content: block.system_prompt},
                 {role: "user",   content: order.request}]`.
-5. Calls `:deliver(order_id, name, text)` with the derived listing name (e.g. `"Horoscope: Scorpio"`) and the model's reply as the note text.
+5. Calls `:deliver(order_id, name, text, description)` with the derived listing name (e.g. `"Horoscope: Scorpio"`), the model's reply as the note text, and a short cosmetic look-at description (e.g. `A horoscope reading the machine produced for "scorpio". Try \`read\` to see what it says.`). Per LambdaCore `$note`, the description is what `look` shows; the text is what `read` returns.
 
 Failure modes set `last_error` via `:set_property` so `:look` surfaces
 the trouble.

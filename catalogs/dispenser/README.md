@@ -1,9 +1,9 @@
 ---
 name: dispenser
-version: 0.2.0
+version: 0.2.2
 spec_version: v1
 license: MIT
-description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The plug supplies the note's listing name and markdown text via :deliver(order_id, name, text).
+description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The plug supplies the note's listing name, markdown text, and optional one-line look-at description via :deliver(order_id, name, text, description).
 keywords:
   - block
   - dispenser
@@ -48,8 +48,8 @@ sequencing details.
 | Verb | Caller | Notes |
 |---|---|---|
 | `:order(request)` | public | Checks request size, queue cap, block cooldown, and requester rate limit; appends to `pending_orders`, tells the requester it was accepted, returns `{order_id, queued, text, ts}`, emits `order_placed` (sequenced when invoked through space-call). |
-| `:deliver(order_id, name, text)` | block actor (plug) or wizard | Idempotent. Removes the entry, creates a `$dispensed_note` with the supplied `name` (the inventory listing label) and markdown `text`, owned by the block, moves it to the requester, and tells them the note arrived. Emits `delivered`. Both `name` and `text` are required strings; `text` is subject to the 262144-char cap on `$note.text`. |
-| `:cancel(order_id)` | requester / owner / wizard | Removes the entry, emits `canceled`. |
+| `:deliver(order_id, name, text, description)` | block actor (plug) or wizard | Idempotent. Removes the entry, creates a `$dispensed_note` owned by the block with the supplied `name` (inventory listing label), markdown `text` (what `read` returns, capped at 262144 chars by `$note.set_text`), and optional `description` (the one-line cosmetic look-at flavour; per LambdaCore `$note`, this is what `look` shows — pass null/empty to leave it unset). `name` and `text` are required strings. Moves the note to the requester, tells them it arrived, and emits `delivered`. |
+| `:cancel(order_id)` | requester / owner / plug / wizard | Removes the entry, emits `canceled`. The plug (block-actor session, authenticated via apikey) can cancel its own pending orders so a poisoned queue head doesn't block delivery of every following order. |
 | `:next_pending()` | block actor (plug) or wizard | Returns the oldest queued entry, or `null`. |
 | `:status(order_id)` | public | Returns `{state: "queued", ts}` or `{state: "unknown"}`. |
 

@@ -10,7 +10,7 @@
       "local_name": "$horoscope_block",
       "parent": "$dispenser_block",
       "flags": { "fertile": true },
-      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, derives a note name from the request (e.g. `Horoscope: Scorpio`), and calls :deliver(order_id, name, text) to drop a note into the requester's inventory. Default rate_limit_seconds=60 (one order per requester per minute).",
+      "description": "A vending-machine block that produces short generated text artifacts. Owner configures `system_prompt` (the persona / instructions the LLM operates under). The plug Worker (catalogs/horoscope/plug) reads pending_orders, runs @cf/meta/llama-3.2-1b-instruct with `system_prompt + request`, derives a note name from the request (e.g. `Horoscope: Scorpio`), and calls :deliver(order_id, name, text, description) to drop a note into the requester's inventory — name is the inventory listing label, text is the LLM body shown by `read`, description is the one-line look-at flavour shown by `look`. Default rate_limit_seconds=60 (one order per requester per minute).",
       "properties": [],
       "verbs": [
         {

@@ -17,15 +17,34 @@ Cron-triggered every minute. Each tick:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
      `system_prompt + request`.
-   - POSTs `:deliver(order_id, name, text)` — `name` is built from the
-     order request (`scorpio` → `"Horoscope: Scorpio"`) so the inventory
-     listing reads cleanly; `text` is the markdown content. The block
-     creates a `$note` with that name and text, moves it to the
-     orderer's inventory, and tells the orderer it arrived.
+   - POSTs `:deliver(order_id, name, text, description)` — `name` is
+     built from the order request (`scorpio` → `"Horoscope: Scorpio"`)
+     so the inventory listing reads cleanly; `text` is the markdown
+     content shown by `read`; `description` is a one-line look-at
+     flavour (`A horoscope reading the machine produced for "scorpio".
+     Try \`read\` to see what it says.`) shown by `look`, per the
+     LambdaCore `$note` slot split. The block creates a `$note` with
+     those fields, moves it to the orderer's inventory, and tells the
+     orderer it arrived.
 
-Errors during AI generation leave the order on the queue and are reported in
-the tick's response body. The block's TTL handles abandoned orders. `:deliver`
-is idempotent on `order_id`, so retries are safe.
+Failure handling:
+
+- **AI generation failed** (rate limit, model timeout, empty response) — the
+  plug delivers a placeholder note instead so the queue drains, and writes
+  an `ai fallback: <reason>` line to `last_error` so `:look_self` reflects
+  the degraded mode.
+- **`:deliver` raised a permanent code** (`E_INVARG`, `E_PERM`, `E_VERBNF`,
+  `E_TYPE`, `E_RANGE`) — retrying with the same data won't change the
+  outcome, so the plug calls the catalog's plug-actor `:cancel` path to
+  peel the order off the queue head. The user gets nothing for that order;
+  the trail is in `last_error`.
+- **Anything else** (`E_TIMEOUT`, `E_INTERNAL`, `E_GATEWAY`, 5xx, transport
+  failure) — treated as transient. The order stays on the queue and the
+  plug stops the tick. The next cron retries.
+- **`E_NOSESSION`** — the apikey-bound session no longer authenticates;
+  the plug stops the tick and the next cron re-auths.
+
+`:deliver` is idempotent on `order_id`, so retries are safe.
 
 ## Why REST, not MCP
 

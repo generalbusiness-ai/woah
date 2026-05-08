@@ -154,27 +154,62 @@ export async function runHoroscopeTick(
   const systemPrompt = typeof promptValue === "string" ? promptValue : "";
 
   const errors: HoroscopeTickResult["errors"] = [];
+  const aiFallbacks: Array<{ order_id: string; message: string }> = [];
   let delivered = 0;
 
+  let lastSeenOrderId: string | null = null;
   for (let i = 0; i < maxOrdersPerTick; i++) {
     const next = (await client.directCall(env.BLOCK_ID, "next_pending")) as PendingOrder | null;
     if (!next || typeof next !== "object" || !next.order_id) break;
 
+    // :next_pending peeks (it does not pop). If we see the same head twice
+    // in a row, the previous iteration left it on the queue (transient
+    // :deliver failure), so re-attempting now would just re-fail. Stop the
+    // tick and let the next cron retry rather than spin.
+    if (lastSeenOrderId === next.order_id) break;
+    lastSeenOrderId = next.order_id;
+
+    const request = typeof next.request === "string" ? next.request : "";
+    const name = horoscopeNoteName(request);
+    let text = "";
+    let textOrigin: "ai" | "fallback" = "ai";
+    let aiError: unknown = null;
     try {
-      const text = await generateHoroscope(env.AI, {
-        systemPrompt,
-        request: next.request,
-        maxTokens
+      const generated = await generateHoroscope(env.AI, { systemPrompt, request, maxTokens });
+      // belt-and-braces against an unexpected AI binding return shape:
+      // the verb rejects non-string text with E_INVARG, which previously
+      // poisoned the queue head and stalled every following order.
+      text = typeof generated === "string" ? generated.trim() : "";
+    } catch (err) {
+      aiError = err;
+      logEvent({
+        event: "ai_fallback",
+        block: env.BLOCK_ID,
+        order_id: next.order_id,
+        requester: next.requester,
+        ...errorBreadcrumb(err)
       });
-      const name = horoscopeNoteName(next.request);
-      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, name, text]);
+    }
+    if (!text) {
+      textOrigin = "fallback";
+      text = "The horoscope machine paused — it couldn't compose a reading just now. Try again in a moment.";
+      const fallbackMessage = aiError instanceof Error
+        ? aiError.message
+        : aiError != null ? String(aiError) : "ai produced no text";
+      aiFallbacks.push({ order_id: next.order_id, message: fallbackMessage });
+    }
+
+    const description = horoscopeNoteDescription(request);
+    try {
+      await client.directCall(env.BLOCK_ID, "deliver", [next.order_id, name, text, description]);
       delivered++;
       logEvent({
         event: "order_delivered",
         block: env.BLOCK_ID,
         order_id: next.order_id,
         requester: next.requester,
-        text_chars: text.length
+        text_chars: text.length,
+        text_origin: textOrigin
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -186,21 +221,68 @@ export async function runHoroscopeTick(
         requester: next.requester,
         ...errorBreadcrumb(err)
       });
-      // Don't drop the order — leave it on the queue. The block's TTL
-      // handles abandoned entries; transient errors retry next tick.
-      break;
+      // E_NOSESSION → re-auth issue, every subsequent call will hit the
+      // same wall this tick. Stop and let the next tick re-authenticate.
+      if (err instanceof WooError && err.code === "E_NOSESSION") break;
+      // Permanent verb-side rejections (bad args, perm, missing verb)
+      // mean retrying with the same data will keep failing. Cancel so the
+      // queue drains; the user gets nothing for this order, but at least
+      // every order behind it isn't blocked. last_error keeps the trail.
+      // Anything else (E_TIMEOUT / E_INTERNAL / E_GATEWAY / 5xx /
+      // transport failure / unmapped runtime errors) is treated as
+      // potentially transient — leave the order on the queue and stop
+      // the tick so the next cron retries. Better to spin a few cron
+      // ticks than silently drop a user's order on a flaky network.
+      if (err instanceof WooError && PERMANENT_DELIVER_ERRORS.has(err.code)) {
+        try {
+          await client.directCall(env.BLOCK_ID, "cancel", [next.order_id]);
+          logEvent({
+            event: "order_canceled_by_plug",
+            block: env.BLOCK_ID,
+            order_id: next.order_id,
+            requester: next.requester,
+            code: err.code,
+            reason: message
+          });
+        } catch (cancelErr) {
+          logEvent({
+            event: "order_cancel_failed",
+            block: env.BLOCK_ID,
+            order_id: next.order_id,
+            ...errorBreadcrumb(cancelErr)
+          });
+          break;
+        }
+      } else {
+        // Transient: leave on queue, stop the tick. The lastSeenOrderId
+        // guard would also catch this on next iter, but breaking here
+        // makes the intent explicit and avoids a wasted next_pending RPC.
+        break;
+      }
     }
   }
+
+  // Surface AI-degraded delivery in last_error even when no :deliver call
+  // failed, so look_self / status reports reflect that the block is only
+  // shipping fallback notes (per catalogs/horoscope/DESIGN.md). Genuine
+  // :deliver errors take precedence — they're more actionable.
+  let lastErrorValue: string | null = null;
+  if (errors.length > 0) lastErrorValue = errors[errors.length - 1].message;
+  else if (aiFallbacks.length > 0) lastErrorValue = `ai fallback: ${aiFallbacks[aiFallbacks.length - 1].message}`;
 
   await client.directCall(env.BLOCK_ID, "set_properties", [
     {
       last_pushed_at: now(),
-      last_error: errors.length > 0 ? errors[errors.length - 1].message : null
+      last_error: lastErrorValue
     }
   ]);
 
   return { block: env.BLOCK_ID, delivered, errors };
 }
+
+// Verb-side rejections that won't change on retry. Anything outside this
+// set is treated as transient and left on the queue for the next cron tick.
+const PERMANENT_DELIVER_ERRORS: ReadonlySet<string> = new Set(["E_INVARG", "E_PERM", "E_VERBNF", "E_TYPE", "E_RANGE"]);
 
 function numEnv(value: string | undefined, fallback: number): number {
   if (value === undefined || value === "") return fallback;
@@ -222,6 +304,18 @@ export function horoscopeNoteName(request: string): string {
     (_, first: string, rest: string) => first.toUpperCase() + rest.toLowerCase()
   );
   return `Horoscope: ${titled}`;
+}
+
+// Build the cosmetic look-at description for a delivered horoscope. Per
+// LambdaCore $note convention, .description is what `look` shows (a one-
+// line flavour) while .text holds the body shown by `read`. We keep the
+// description short and focused on provenance so a player who types
+// `look giraffe` learns it's a horoscope reading and can `read` it.
+export function horoscopeNoteDescription(request: string): string {
+  const trimmed = (request ?? "").trim();
+  if (!trimmed) return "A horoscope reading from the machine. Try `read` to see what it says.";
+  const subject = trimmed.length > 60 ? trimmed.slice(0, 60).trimEnd() + "..." : trimmed;
+  return `A horoscope reading the machine produced for "${subject}". Try \`read\` to see what it says.`;
 }
 
 // Single line of JSON to console — CF Workers' Logs tab parses it

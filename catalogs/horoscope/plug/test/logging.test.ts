@@ -116,7 +116,7 @@ describe("runLoggedHoroscopeTick", () => {
     expect(lines[3].duration_ms).toBeGreaterThan(0);
   });
 
-  it("emits order_error with category=ai when generateHoroscope throws", async () => {
+  it("emits ai_fallback then order_delivered when generateHoroscope throws", async () => {
     const ai: HoroscopeAi = { run: vi.fn().mockRejectedValue(new Error("model timeout")) };
     const env = makeEnv(ai);
 
@@ -124,27 +124,33 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "guest_x", request: "x", ts: 1 }),
+      () => callReply({ ok: true }),
+      () => callReply(null),
       () => callReply({ ok: true })
     ]);
 
     const result = await runLoggedHoroscopeTick(env, "cron", { fetchImpl });
-    expect(result.delivered).toBe(0);
-    expect(result.errors).toEqual([{ order_id: "ord_1", message: "model timeout" }]);
+    expect(result.delivered).toBe(1);
+    expect(result.errors).toEqual([]);
 
     const events = lines.map((l) => l.event);
-    expect(events).toEqual(["tick_start", "order_error", "tick_ok"]);
+    expect(events).toEqual(["tick_start", "ai_fallback", "order_delivered", "tick_ok"]);
     expect(lines[1]).toMatchObject({
-      event: "order_error",
+      event: "ai_fallback",
       order_id: "ord_1",
       requester: "guest_x",
       category: "ai",
       message: "model timeout"
     });
-    // Tick still completes — errors counted, not throwing.
-    expect(lines[2]).toMatchObject({ event: "tick_ok", delivered: 0, errors: 1 });
+    expect(lines[2]).toMatchObject({
+      event: "order_delivered",
+      order_id: "ord_1",
+      text_origin: "fallback"
+    });
+    expect(lines[3]).toMatchObject({ event: "tick_ok", delivered: 1, errors: 0 });
   });
 
-  it("emits order_error with category=woo:<code> when :deliver raises", async () => {
+  it("cancels and continues on a permanent :deliver error (E_INVARG)", async () => {
     const ai: HoroscopeAi = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
     const env = makeEnv(ai);
 
@@ -152,7 +158,9 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
-      () => ({ status: 404, body: { error: { code: "E_OBJNF", message: "order not found" } } }),
+      () => ({ status: 400, body: { error: { code: "E_INVARG", message: "deliver requires a text string" } } }),
+      () => callReply({ order_id: "ord_1", canceled: true }),
+      () => callReply(null),
       () => callReply({ ok: true })
     ]);
 
@@ -161,10 +169,42 @@ describe("runLoggedHoroscopeTick", () => {
 
     const errLine = lines.find((l) => l.event === "order_error");
     expect(errLine).toMatchObject({
-      category: "woo:E_OBJNF",
-      code: "E_OBJNF",
+      category: "woo:E_INVARG",
+      code: "E_INVARG",
       order_id: "ord_1"
     });
+    const cancelLine = lines.find((l) => l.event === "order_canceled_by_plug");
+    expect(cancelLine).toMatchObject({
+      order_id: "ord_1",
+      code: "E_INVARG",
+      reason: "deliver requires a text string"
+    });
+  });
+
+  it("leaves the order on the queue and stops the tick on a transient :deliver error", async () => {
+    const ai: HoroscopeAi = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+
+    const { fetchImpl, calls } = makeFetch([
+      authReply,
+      () => propertyReply("p"),
+      () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => ({ status: 504, body: { error: { code: "E_GATEWAY", message: "upstream timed out" } } }),
+      () => callReply({ ok: true })
+    ]);
+
+    const result = await runLoggedHoroscopeTick(env, "cron", { fetchImpl });
+    expect(result.delivered).toBe(0);
+    expect(result.errors).toEqual([{ order_id: "ord_1", message: "upstream timed out" }]);
+    // No :cancel was attempted — transient errors leave the order alone so a
+    // momentary upstream blip doesn't silently drop a user's request.
+    expect(calls.find((c) => c.url.includes("/calls/cancel"))).toBeUndefined();
+    // The tick still wraps up with set_properties so last_error is recorded.
+    const heartbeat = calls.find((c) => c.url.includes("/calls/set_properties"));
+    expect((heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error).toBe("upstream timed out");
+    const events = lines.map((l) => l.event);
+    expect(events).toContain("order_error");
+    expect(events).not.toContain("order_canceled_by_plug");
   });
 
   it("emits tick_start then tick_ok with delivered=0 when the queue is empty", async () => {

@@ -16,10 +16,16 @@ import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
 
+type AuthStatus = "checking" | "anonymous" | "authenticated";
+type AuthMethod = "guest" | "apikey";
+
 type AppState = {
   socket?: WebSocket;
   actor?: string;
   session?: string;
+  authStatus: AuthStatus;
+  loginError?: string;
+  loginPending?: boolean;
   tab: "chat" | "dubspace" | "pinboard" | "tasks" | "ide";
   world?: any;
   scopedProjection?: ScopedProjectionStateModel;
@@ -115,6 +121,7 @@ type PinboardRenderModel = {
 
 const state: AppState = {
   tab: "chat",
+  authStatus: "checking",
   scopedObjectSummaries: {},
   routedSubjects: {},
   audioOn: false,
@@ -150,6 +157,8 @@ const bundledCatalogManifests: Record<string, any> = {
   tasks: tasksManifest
 };
 const sessionKey = "woo.session";
+const usernameKey = "woo.username";
+const authMethodKey = "woo.authMethod";
 const chatHistoryKey = "woo.chat.history";
 const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
@@ -228,7 +237,9 @@ let routeInitialized = false;
 state.spaceChatHeights = loadSpaceChatHeights();
 
 installBundledCatalogUi();
-connect();
+state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
+if (state.authStatus === "authenticated") connect();
+else render();
 window.setInterval(pruneLiveControls, 700);
 window.addEventListener("resize", () => {
   normalizeSpaceChatHeights();
@@ -240,6 +251,7 @@ window.addEventListener("popstate", () => {
 });
 
 function connect() {
+  if (state.authStatus !== "authenticated") return;
   if (state.socket?.readyState === WebSocket.OPEN || state.socket?.readyState === WebSocket.CONNECTING) return;
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -247,8 +259,13 @@ function connect() {
   socket.addEventListener("open", () => {
     reconnectDelayMs = reconnectBaseDelayMs;
     lastPongAt = Date.now();
+    const token = authToken();
+    if (!token) {
+      socket.close();
+      return;
+    }
     const cursor = scopedProjectionEnabled ? state.scopedProjection?.cursor : undefined;
-    sendSocket(socket, cursor ? { op: "auth", token: authToken(), cursor } : { op: "auth", token: authToken() });
+    sendSocket(socket, cursor ? { op: "auth", token, cursor } : { op: "auth", token });
     startHeartbeat(socket);
   });
   socket.addEventListener("message", async (event) => {
@@ -370,7 +387,15 @@ function connect() {
       }
       if (frame.error?.code === "E_NOSESSION") {
         clearSession();
-        if (socket.readyState === WebSocket.OPEN) sendSocket(socket, { op: "auth", token: "guest:local" });
+        if (socket.readyState === WebSocket.OPEN) socket.close();
+        if (readAuthMethod() === "guest") {
+          void loginAsGuest({ silent: true });
+        } else {
+          state.actor = undefined;
+          state.session = undefined;
+          state.authStatus = "anonymous";
+          render();
+        }
         return;
       }
       state.observations.unshift({ error: frame.error });
@@ -408,6 +433,7 @@ function sendFrame(frame: Record<string, unknown>) {
 }
 
 function scheduleReconnect() {
+  if (state.authStatus !== "authenticated") return;
   if (reconnectTimer !== undefined) return;
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = undefined;
@@ -440,13 +466,13 @@ function stopHeartbeat() {
   heartbeatTimer = undefined;
 }
 
-function authToken() {
-  const session = readSessionStorage(sessionKey);
-  return session ? `session:${session}` : "guest:local";
+function authToken(): string | null {
+  const session = readStorage(sessionKey);
+  return session ? `session:${session}` : null;
 }
 
 function storeSession(session: string | undefined) {
-  if (session) writeSessionStorage(sessionKey, session);
+  if (session) writeStorage(sessionKey, session);
 }
 
 function clearSession() {
@@ -454,7 +480,150 @@ function clearSession() {
     sessionStorage.removeItem(sessionKey);
     localStorage.removeItem(sessionKey);
   } catch {
-    // Ignore storage failures; auth falls back to a fresh guest.
+    // Ignore storage failures; the next boot falls back to the login screen.
+  }
+}
+
+function readAuthMethod(): AuthMethod | null {
+  const value = readStorage(authMethodKey);
+  return value === "guest" || value === "apikey" ? value : null;
+}
+
+function storeAuthMethod(method: AuthMethod) {
+  writeStorage(authMethodKey, method);
+}
+
+function clearAuthMethod() {
+  try {
+    localStorage.removeItem(authMethodKey);
+  } catch {
+    // Ignore.
+  }
+}
+
+function readUsername(): string {
+  return readStorage(usernameKey) ?? "";
+}
+
+function storeUsername(username: string) {
+  writeStorage(usernameKey, username);
+}
+
+async function postAuth(token: string): Promise<{ session: string; actor: string } | { error: string }> {
+  let response: Response;
+  try {
+    response = await fetch("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token })
+    });
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : "network error" };
+  }
+  let body: any;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const message = body?.error?.message ?? `HTTP ${response.status}`;
+    return { error: String(message) };
+  }
+  if (typeof body?.session !== "string" || typeof body?.actor !== "string") {
+    return { error: "malformed auth response" };
+  }
+  return { session: body.session, actor: body.actor };
+}
+
+async function loginAsGuest(options: { silent?: boolean } = {}) {
+  if (state.loginPending) return;
+  state.loginPending = true;
+  if (!options.silent) {
+    state.loginError = undefined;
+    render();
+  }
+  const result = await postAuth("guest:local");
+  state.loginPending = false;
+  if ("error" in result) {
+    state.loginError = `Could not start guest session: ${result.error}`;
+    state.authStatus = "anonymous";
+    render();
+    return;
+  }
+  storeSession(result.session);
+  storeAuthMethod("guest");
+  state.actor = result.actor;
+  state.session = result.session;
+  state.authStatus = "authenticated";
+  state.loginError = undefined;
+  render();
+  connect();
+}
+
+async function loginWithApiKey(username: string, secret: string) {
+  if (state.loginPending) return;
+  if (!username || !secret) {
+    state.loginError = "Username and password are required.";
+    render();
+    return;
+  }
+  state.loginPending = true;
+  state.loginError = undefined;
+  render();
+  const result = await postAuth(`apikey:${username}:${secret}`);
+  state.loginPending = false;
+  if ("error" in result) {
+    state.loginError = `Sign-in failed: ${result.error}`;
+    render();
+    return;
+  }
+  storeSession(result.session);
+  storeAuthMethod("apikey");
+  storeUsername(username);
+  state.actor = result.actor;
+  state.session = result.session;
+  state.authStatus = "authenticated";
+  render();
+  connect();
+}
+
+async function logout() {
+  const sessionId = state.session;
+  state.socket?.close();
+  state.socket = undefined;
+  if (sessionId) {
+    try {
+      await fetch("/api/session", { method: "DELETE", headers: { authorization: `Session ${sessionId}` } });
+    } catch {
+      // best-effort; the local session is already cleared
+    }
+  }
+  // Drop everything account-scoped (chat history, replay cursors, pinboard
+  // prefs, etc.) so the next login starts clean. Keep `woo.username` so the
+  // form pre-fills.
+  clearAccountScopedStorage();
+  // Reload to drop module-level state (framework caches, pending maps, audio,
+  // chatHistory) without needing to enumerate every field.
+  location.reload();
+}
+
+function clearAccountScopedStorage() {
+  try {
+    const keep = new Set([usernameKey]);
+    const drop: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("woo.") && !keep.has(key)) drop.push(key);
+    }
+    for (const key of drop) localStorage.removeItem(key);
+  } catch {
+    // Storage unavailable — nothing to clear.
+  }
+  try {
+    sessionStorage.clear();
+  } catch {
+    // ignore
   }
 }
 
@@ -493,28 +662,11 @@ function readStorage(key: string) {
   }
 }
 
-function readSessionStorage(key: string) {
-  try {
-    return sessionStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
 function writeStorage(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
   } catch {
     // Local storage is an optimization for reconnect continuity.
-  }
-}
-
-function writeSessionStorage(key: string, value: string) {
-  try {
-    sessionStorage.setItem(key, value);
-    localStorage.removeItem(key);
-  } catch {
-    // Session storage is an optimization for reconnect continuity.
   }
 }
 
@@ -1619,7 +1771,7 @@ function dubspaceSpace() {
     if (route?.view === "dubspace" && route.objectId) return route.objectId;
     if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
     const scoped = scopedToolSubject("dubspace");
-    return scoped;
+    return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
   }
   return String(state.world?.dubspaceMeta?.space ?? "");
 }
@@ -2036,6 +2188,10 @@ function pruneLiveControls() {
 }
 
 function render() {
+  if (state.authStatus !== "authenticated") {
+    renderLogin();
+    return;
+  }
   const focus = captureRenderFocus();
   const app = document.querySelector<HTMLDivElement>("#app")!;
   app.innerHTML = `
@@ -2070,6 +2226,55 @@ function render() {
   if (state.tab === "tasks") bindTasks();
   if (state.tab === "ide") bindIde();
   if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
+}
+
+function renderLogin() {
+  const app = document.querySelector<HTMLDivElement>("#app")!;
+  const username = readUsername();
+  const pending = state.loginPending === true;
+  const error = state.loginError ?? "";
+  app.innerHTML = `
+    <div class="login-shell">
+      <form class="login-card" data-login-form autocomplete="on">
+        <h1 class="login-brand">world of objects</h1>
+        <button type="button" class="login-guest" data-login-guest ${pending ? "disabled" : ""}>
+          ${pending ? "Connecting..." : "Continue as guest"}
+        </button>
+        <div class="login-divider"><span>or sign in</span></div>
+        <label class="login-field">
+          <span>Username</span>
+          <input type="text" name="username" autocomplete="username" required value="${escapeHtml(username)}" ${pending ? "disabled" : ""} />
+        </label>
+        <label class="login-field">
+          <span>Password</span>
+          <input type="password" name="password" autocomplete="current-password" required ${pending ? "disabled" : ""} />
+        </label>
+        <button type="submit" class="login-submit" ${pending ? "disabled" : ""}>
+          ${pending ? "Signing in..." : "Sign in"}
+        </button>
+        ${error ? `<p class="login-error" role="alert">${escapeHtml(error)}</p>` : ""}
+      </form>
+    </div>
+  `;
+  bindLogin();
+}
+
+function bindLogin() {
+  document.querySelector<HTMLButtonElement>("[data-login-guest]")?.addEventListener("click", () => {
+    void loginAsGuest();
+  });
+  const form = document.querySelector<HTMLFormElement>("[data-login-form]");
+  form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.loginPending) return;
+    const data = new FormData(form);
+    const usernameValue = String(data.get("username") ?? "").trim();
+    const passwordValue = String(data.get("password") ?? "");
+    void loginWithApiKey(usernameValue, passwordValue);
+  });
+  const usernameInput = document.querySelector<HTMLInputElement>("[data-login-form] input[name=\"username\"]");
+  if (usernameInput && !usernameInput.value) usernameInput.focus();
+  else document.querySelector<HTMLInputElement>("[data-login-form] input[name=\"password\"]")?.focus();
 }
 
 function captureRenderFocus(): RenderFocusSnapshot | null {
@@ -2149,6 +2354,9 @@ function renderObservationsPanel() {
           ${state.observations.map((item) => `<pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre>`).join("") || "<p>No observations yet.</p>"}
         </div>
       `}
+      <button class="events-logout" data-logout aria-label="Log out${state.actor ? ` ${state.actor}` : ""}" title="Log out${state.actor ? ` ${state.actor}` : ""}">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
     </aside>
   `;
 }
@@ -2173,6 +2381,9 @@ function bindCommon() {
   document.querySelector<HTMLButtonElement>("[data-observations-toggle]")?.addEventListener("click", () => {
     state.observationsCollapsed = !state.observationsCollapsed;
     render();
+  });
+  document.querySelector<HTMLButtonElement>("[data-logout]")?.addEventListener("click", () => {
+    void logout();
   });
 }
 
@@ -2778,6 +2989,18 @@ function receiveChatEvent(observation: any, shouldRender = true) {
   if (kind === "left" && typeof observation.actor === "string") {
     state.chatPresent = state.chatPresent.filter((id) => id !== observation.actor);
   }
+  // `taken` / `dropped` (and `entered` / `left`) are room-broadcasts that the
+  // server's audience computation excludes the doer from (world.ts'
+  // observationAudienceActors). The originator still receives them in their
+  // DirectResultFrame.observations envelope by design, so the doer-exclusion
+  // has to be applied here before the chat line is pushed; the verb's own
+  // tell(actor, …) line ("You drop X.") already covers the doer's view.
+  if (
+    (kind === "taken" || kind === "dropped" || kind === "entered" || kind === "left")
+    && typeof observation.actor === "string"
+    && state.actor
+    && observation.actor === state.actor
+  ) return;
   pushChatLine({
     kind,
     actor: typeof observation.actor === "string" ? observation.actor : undefined,
@@ -4440,10 +4663,6 @@ function renderScopedIde() {
     </section>
     <section class="split">
       <div class="panel"><pre>${escapeHtml(JSON.stringify(summary ?? { id: object, loading: Boolean(object) }, null, 2))}</pre></div>
-      <div class="panel editor">
-        <h2>Scoped Mode</h2>
-        <p>The production client is using scoped summaries, /api/me, overlay snapshots, and observations. Verb install/edit tools remain on the explicit legacy state path.</p>
-      </div>
     </section>
     ${scopedSmoke}
   `;

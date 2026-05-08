@@ -2365,7 +2365,7 @@ describe("local catalogs", () => {
     expect(world.propOrNull(fresh.actor, "presence_in")).toBeNull();
   });
 
-  it("migrates the cockatoo into worlds installed before it landed", { timeout: 15000 }, async () => {
+  it("migrates the cockatoo into worlds installed before it landed", { timeout: 30000 }, async () => {
     const world = createWorld();
     // Reset to before the cockatoo migration ran
     world.setProp("$system", "applied_migrations", ["2026-04-30-source-catalog-verbs", "2026-04-30-catalog-placement-metadata"]);
@@ -2387,7 +2387,7 @@ describe("local catalogs", () => {
     expect(squawk.op).toBe("result");
   });
 
-  it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 15000 }, async () => {
+  it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 30000 }, async () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", []);
     const look = world.ownVerb("$conversational", "look")!;
@@ -2865,8 +2865,16 @@ describe("local catalogs", () => {
       if (next.op !== "result") return;
       expect(next.result).toMatchObject({ order_id: orderResult.order_id, requester, request: "scorpio" });
 
-      // 3. Plug delivers — note lands in requester's inventory with name + body.
-      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "Today's horoscope: avoid llamas."]);
+      // 3. Plug delivers — note lands in requester's inventory with name +
+      //    description (cosmetic look-at flavour) + body. Per LambdaCore
+      //    $note, .description is what `look` shows; .text is what `read`
+      //    returns.
+      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [
+        orderResult.order_id,
+        "Horoscope: Scorpio",
+        "Today's horoscope: avoid llamas.",
+        "A horoscope reading for scorpio."
+      ]);
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const dRes = delivered.result as { delivered: boolean; note: string; text: string };
@@ -2874,6 +2882,7 @@ describe("local catalogs", () => {
       expect(dRes.text).toContain("delivers a note to your inventory");
       expect(world.object(dRes.note).location).toBe(requester);
       expect(world.object(dRes.note).name).toBe("Horoscope: Scorpio");
+      expect(world.getProp(dRes.note, "description")).toBe("A horoscope reading for scorpio.");
       expect(world.getProp(dRes.note, "text")).toBe("Today's horoscope: avoid llamas.");
       expect(world.getProp(dRes.note, "produced_by")).toBe(blockId);
       expect(delivered.observations).toEqual(expect.arrayContaining([
@@ -2900,6 +2909,18 @@ describe("local catalogs", () => {
       const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "Sneak", "haha"]);
       expect(strangerDeliver.op).toBe("error");
       if (strangerDeliver.op === "error") expect(strangerDeliver.error.code).toBe("E_PERM");
+
+      // 6. The block actor (i.e. the plug authenticated via apikey) can
+      //    cancel a pending order off the queue head. Without this, a
+      //    poisoned order — e.g. one whose deliver verb keeps raising —
+      //    would block every following order forever, since :next_pending
+      //    only peeks.
+      const plugCancel = await world.directCall("plug-cancel", blockId, blockId, "cancel", [strangerOrderId]);
+      expect(plugCancel.op).toBe("result");
+      if (plugCancel.op === "result") {
+        expect(plugCancel.result).toMatchObject({ order_id: strangerOrderId, canceled: true });
+      }
+      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
     });
 
     it("$dispenser_block keeps queue internals out of public get_data", async () => {

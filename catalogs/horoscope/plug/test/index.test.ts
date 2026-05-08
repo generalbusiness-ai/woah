@@ -84,10 +84,20 @@ describe("runHoroscopeTick", () => {
 
     const deliver1 = calls[3];
     expect(deliver1.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/deliver");
-    expect((deliver1.body as { args: unknown[] }).args).toEqual(["ord_1", "Horoscope: Scorpio", "destiny calls."]);
+    expect((deliver1.body as { args: unknown[] }).args).toEqual([
+      "ord_1",
+      "Horoscope: Scorpio",
+      "destiny calls.",
+      expect.stringContaining("scorpio")
+    ]);
 
     const deliver2 = calls[5];
-    expect((deliver2.body as { args: unknown[] }).args).toEqual(["ord_2", "Horoscope: Leo", "destiny calls."]);
+    expect((deliver2.body as { args: unknown[] }).args).toEqual([
+      "ord_2",
+      "Horoscope: Leo",
+      "destiny calls.",
+      expect.stringContaining("leo")
+    ]);
     const heartbeat = calls[7];
     expect(heartbeat.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/set_properties");
     expect((heartbeat.body as { args: [Record<string, unknown>] }).args[0]).toMatchObject({ last_pushed_at: expect.any(Number), last_error: null });
@@ -112,7 +122,7 @@ describe("runHoroscopeTick", () => {
     expect(ai.run).toHaveBeenCalledTimes(2);
   });
 
-  it("leaves the order on the queue and reports the error when AI fails", async () => {
+  it("delivers a fallback note when the AI fails so the queue still drains", async () => {
     const ai = { run: vi.fn().mockRejectedValue(new Error("model timeout")) };
     const env = makeEnv(ai);
 
@@ -120,19 +130,34 @@ describe("runHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => callReply({ ok: true }),
+      () => callReply(null),
       () => callReply({ ok: true })
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
-    expect(result).toEqual({
-      block: env.BLOCK_ID,
-      delivered: 0,
-      errors: [{ order_id: "ord_1", message: "model timeout" }]
-    });
-    // Plug never called :deliver.
-    expect(calls.find((c) => c.url.includes("/calls/deliver"))).toBeUndefined();
+    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 1, errors: [] });
+    // The plug now calls :deliver with a non-empty placeholder string instead
+    // of leaving the order at the queue head where it would block every
+    // following request.
+    const deliver = calls.find((c) => c.url.includes("/calls/deliver"));
+    expect(deliver).toBeDefined();
+    const args = (deliver!.body as { args: unknown[] }).args;
+    expect(args[0]).toBe("ord_1");
+    expect(typeof args[2]).toBe("string");
+    expect((args[2] as string).length).toBeGreaterThan(0);
+    // Description is passed even on fallback so `look <note>` shows the
+    // LambdaCore-style flavour line and the player learns to `read`.
+    expect(typeof args[3]).toBe("string");
+    expect((args[3] as string).length).toBeGreaterThan(0);
+    // Fallback delivery is degraded service — last_error must surface that
+    // so :look_self / status reports don't show a healthy block while the
+    // user is silently receiving placeholder text.
     const heartbeat = calls.find((c) => c.url.includes("/calls/set_properties"));
-    expect((heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error).toBe("model timeout");
+    const recordedError = (heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error;
+    expect(typeof recordedError).toBe("string");
+    expect(recordedError as string).toContain("ai fallback");
+    expect(recordedError as string).toContain("model timeout");
   });
 
   it("does nothing if the queue is empty", async () => {

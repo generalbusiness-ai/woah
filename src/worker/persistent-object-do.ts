@@ -2544,7 +2544,6 @@ export class PersistentObjectDO {
   }
 
   private broadcastLiveEvents(world: WooWorld, result: DirectResultFrame, originMcpSessionId?: string | null, originator?: WebSocket): void {
-    if (!result.audience) return;
     const startedAt = Date.now();
     let audienceSize = 0;
     result.observations.forEach((observation, index) => {
@@ -2552,7 +2551,7 @@ export class PersistentObjectDO {
       audienceSize += this.broadcastLiveEvent(
         world,
         frame,
-        result.audience!,
+        result.audience,
         result.observationAudiences?.[index] ?? result.audienceActors,
         result.observationSessionAudiences?.[index] ?? result.audienceSessions,
         originator
@@ -2562,7 +2561,7 @@ export class PersistentObjectDO {
     world.recordMetric({ kind: "broadcast", audience_size: audienceSize, obs_count: result.observations.length, ms: Date.now() - startedAt });
   }
 
-  private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[], originator?: WebSocket): number {
+  private broadcastLiveEvent(world: WooWorld, frame: LiveEventFrame, audience: ObjRef | null, audienceActors?: ObjRef[], audienceSessions?: string[], originator?: WebSocket): number {
     const data = JSON.stringify(frame);
     const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
     let delivered = 0;
@@ -2589,7 +2588,9 @@ export class PersistentObjectDO {
     }
     const actorsIter: Iterable<ObjRef> | null = audienceActors
       ? audienceActors
-      : world.presenceActorsIn(audience);
+      : audience
+        ? world.presenceActorsIn(audience)
+        : null;
     if (!actorsIter) return delivered;
     for (const actor of actorsIter) sendAll(this.socketsByActor.get(actor));
     return delivered;

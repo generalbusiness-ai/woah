@@ -297,11 +297,10 @@ function broadcastTaskResult(result: ParkedTaskRun): void {
 }
 
 function broadcastLiveEvents(result: DirectResultFrame, originMcpSessionId?: string | null, originator?: WebSocket): void {
-  if (!result.audience) return;
   result.observations.forEach((observation, index) => {
     broadcastLiveEvent(
       { op: "event", observation },
-      result.audience!,
+      result.audience,
       result.observationAudiences?.[index] ?? result.audienceActors,
       result.observationSessionAudiences?.[index] ?? result.audienceSessions,
       originator
@@ -310,7 +309,7 @@ function broadcastLiveEvents(result: DirectResultFrame, originMcpSessionId?: str
   mcpGateway.routeLiveEvents(result, originMcpSessionId ?? null);
 }
 
-function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[], audienceSessions?: string[], originator?: WebSocket): void {
+function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef | null, audienceActors?: ObjRef[], audienceSessions?: string[], originator?: WebSocket): void {
   const data = JSON.stringify(frame);
   const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
   const audienceSet = audienceActors ? new Set(audienceActors) : null;
@@ -324,7 +323,7 @@ function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef, audienceAct
       if (!sessionSet.has(session.sessionId)) continue;
     } else if (audienceSet) {
       if (!audienceSet.has(session.actor)) continue;
-    } else if (!world.hasPresence(session.actor, audience)) {
+    } else if (!audience || !world.hasPresence(session.actor, audience)) {
       continue;
     }
     ws.send(data);
@@ -343,18 +342,18 @@ function broadcastAppliedSse(frame: AppliedFrame): void {
   }
 }
 
-function broadcastLiveEventSse(frame: LiveEventFrame, audience: ObjRef, audienceActors?: ObjRef[]): void {
+function broadcastLiveEventSse(frame: LiveEventFrame, audience: ObjRef | null, audienceActors?: ObjRef[]): void {
   const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
   const audienceSet = audienceActors ? new Set(audienceActors) : null;
   for (const stream of Array.from(restStreams)) {
     if (directedTo || directedFrom) {
       if (stream.actor !== directedTo && stream.actor !== directedFrom) continue;
     } else if (stream.scope === "space") {
-      if (stream.target !== audience) continue;
+      if (!audience || stream.target !== audience) continue;
       if (audienceSet ? !audienceSet.has(stream.actor) : !world.hasPresence(stream.actor, audience)) continue;
     } else if (audienceSet) {
       if (!audienceSet.has(stream.actor)) continue;
-    } else if (!world.hasPresence(stream.actor, audience)) {
+    } else if (!audience || !world.hasPresence(stream.actor, audience)) {
       continue;
     }
     writeSse(stream, "event", frame);

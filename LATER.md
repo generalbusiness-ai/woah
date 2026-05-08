@@ -11,6 +11,7 @@ The sections below distinguish three flavors of pending item:
 ## random stuff to do
 
 - $wiz name/description
+- a small agentic pet that wanders around (plug/block), interested, sleeps some
 - structured review process
 - get the elves to build santa's workshop (using the kanban)
 - chat transparency isn't really working
