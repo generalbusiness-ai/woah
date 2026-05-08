@@ -3297,6 +3297,156 @@ describe("local catalogs", () => {
       }
     });
 
+    it("dispatch max_chars caps list-of-strings by total character footprint", async () => {
+      const world = createWorld({ catalogs: false });
+      const actor = world.auth("guest:bounded-list").actor;
+      const target = "obj_test_bounded_list_target";
+      world.createObject({ id: target, name: "target", parent: "$thing", owner: "$wiz", location: actor });
+      expect(installVerb(world, target, "tiny_list", `verb :tiny_list() rxd { return ["a", "b", "c"]; }`, null).ok).toBe(true);
+      // 100 strings of 32 chars = 3200 chars — exceeds a 1024 cap.
+      expect(installVerb(world, target, "fat_list", `verb :fat_list() rxd {
+        let out = [];
+        let i = 0;
+        while (i < 100) { out = out + ["abcdefghijabcdefghijabcdefghij12"]; i = i + 1; }
+        return out;
+      }`, null).ok).toBe(true);
+      // List with non-string elements — those don't count toward the bound.
+      expect(installVerb(world, target, "mixed_list", `verb :mixed_list() rxd { return [1, 2, "ok", null]; }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "get_target", `verb :get_target() rxd { return "${target}"; }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_tiny", `verb :probe_tiny() rxd { return dispatch(this:get_target(), "tiny_list", [], null, 1024); }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_fat", `verb :probe_fat() rxd { return dispatch(this:get_target(), "fat_list", [], null, 1024); }`, null).ok).toBe(true);
+      expect(installVerb(world, actor, "probe_mixed", `verb :probe_mixed() rxd { return dispatch(this:get_target(), "mixed_list", [], null, 8); }`, null).ok).toBe(true);
+
+      const tiny = await world.directCall("list-bound-tiny", actor, actor, "probe_tiny", []);
+      expect(tiny.op).toBe("result");
+      if (tiny.op === "result") expect(tiny.result).toEqual(["a", "b", "c"]);
+
+      const fat = await world.directCall("list-bound-fat", actor, actor, "probe_fat", []);
+      expect(fat.op).toBe("error");
+      if (fat.op === "error") {
+        expect(fat.error.code).toBe("E_TOOBIG");
+        expect(fat.error.value).toMatchObject({ target, verb: "fat_list", max: 1024 });
+      }
+
+      const mixed = await world.directCall("list-bound-mixed", actor, actor, "probe_mixed", []);
+      expect(mixed.op).toBe("result");
+      if (mixed.op === "result") expect(mixed.result).toEqual([1, 2, "ok", null]);
+    });
+
+    it("$actor descendants that aren't $player render as room contents, not as present actors", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat"]);
+      const roomId = "obj_test_actor_display_room";
+      world.createObject({ id: roomId, name: "Demo Room", parent: "$room", owner: "$wiz" });
+      const presentPlayer = world.auth("guest:actor-display-test").actor;
+      world.setProp(presentPlayer, "location", roomId);
+      world.setProp(roomId, "subscribers", [presentPlayer]);
+      // An $actor that is not a $player — apikey-bound principal that should
+      // render as a thing in the room, not as a person standing in it.
+      const objectActor = "obj_test_actor_not_player";
+      world.createObject({ id: objectActor, name: "Helpdesk Bot", parent: "$actor", owner: "$wiz", location: roomId });
+
+      const looked = await world.directCall("actor-display-look", presentPlayer, roomId, "look_self", []);
+      expect(looked.op).toBe("result");
+      if (looked.op !== "result") return;
+      const view = looked.result as { contents: Array<{ id: string }>; present_actors?: string[] };
+      expect(view.contents.map((c) => c.id)).toContain(objectActor);
+      if (Array.isArray(view.present_actors)) {
+        expect(view.present_actors).not.toContain(objectActor);
+      }
+    });
+
+    it("$room:look_at omits the looking actor from the Present: text", async () => {
+      const world = createWorld();
+      const looker = world.auth("guest:look-at-present-self").actor;
+      const witness = world.auth("guest:look-at-present-other").actor;
+      world.setProp(looker, "name", "Looker McLook");
+      world.setProp(witness, "name", "Witness McSee");
+      const enterLooker = await world.directCall("enter-looker", looker, "the_chatroom", "enter", []);
+      const enterWitness = await world.directCall("enter-witness", witness, "the_chatroom", "enter", []);
+      expect(enterLooker.op).toBe("result");
+      expect(enterWitness.op).toBe("result");
+
+      const looked = await world.directCall("look-at-room-from-looker", looker, "the_chatroom", "look_at", ["the_chatroom"]);
+      expect(looked.op).toBe("result");
+      if (looked.op !== "result") return;
+      const obs = looked.observations.find((o) => o.type === "looked");
+      expect(obs).toBeDefined();
+      const text = String(obs?.text ?? "");
+      const presentMatch = text.match(/Present: ([^.]*)\./);
+      expect(presentMatch).not.toBeNull();
+      const presentNames = (presentMatch?.[1] ?? "").split(",").map((s) => s.trim());
+      expect(presentNames).toContain("Witness McSee");
+      expect(presentNames).not.toContain("Looker McLook");
+    });
+
+    it(":match_names() is zero-arg and uses the verb-frame `actor` global, contributing actor-sensitive keywords", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat"]);
+      const roomId = "obj_test_match_extension_room";
+      world.createObject({ id: roomId, name: "Match Room", parent: "$room", owner: "$wiz" });
+      const insider = world.auth("guest:match-insider").actor;
+      const outsider = world.auth("guest:match-outsider").actor;
+      world.setProp(insider, "location", roomId);
+      world.setProp(outsider, "location", roomId);
+      world.setProp(roomId, "subscribers", [insider, outsider]);
+      const itemId = "obj_test_match_extension_item";
+      world.createObject({ id: itemId, name: "stone", parent: "$thing", owner: "$wiz", location: roomId });
+      // Zero-arg verb that branches on the verb-frame `actor` global. Only
+      // the insider gets the secret keyword in their match pool.
+      expect(installVerb(world, itemId, "match_names", `verb :match_names() rxd {
+        if (actor == "${insider}") { return ["pebble", "secret-stone"]; }
+        return ["pebble"];
+      }`, null).ok).toBe(true);
+
+      const insiderMatch = await world.directCall("match-insider-secret", insider, "$match", "match_object", ["secret-stone", roomId]);
+      expect(insiderMatch.op).toBe("result");
+      if (insiderMatch.op === "result") expect(insiderMatch.result).toBe(itemId);
+
+      const outsiderMatch = await world.directCall("match-outsider-secret", outsider, "$match", "match_object", ["secret-stone", roomId]);
+      expect(outsiderMatch.op).toBe("result");
+      if (outsiderMatch.op === "result") expect(outsiderMatch.result).toBe("$failed_match");
+
+      // The shared keyword resolves for both actors.
+      const insiderShared = await world.directCall("match-insider-shared", insider, "$match", "match_object", ["pebble", roomId]);
+      expect(insiderShared.op).toBe("result");
+      if (insiderShared.op === "result") expect(insiderShared.result).toBe(itemId);
+      const outsiderShared = await world.directCall("match-outsider-shared", outsider, "$match", "match_object", ["pebble", roomId]);
+      expect(outsiderShared.op).toBe("result");
+      if (outsiderShared.op === "result") expect(outsiderShared.result).toBe(itemId);
+
+      // The base name still resolves regardless.
+      const fallback = await world.directCall("match-extension-resolve-name", insider, "$match", "match_object", ["stone", roomId]);
+      expect(fallback.op).toBe("result");
+      if (fallback.op === "result") expect(fallback.result).toBe(itemId);
+    });
+
+    it("inventory bounds :title() returns and falls back when the verb exceeds max_chars", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat"]);
+      const actor = world.auth("guest:title-overflow").actor;
+      const itemId = "obj_test_title_overflow_item";
+      world.createObject({ id: itemId, name: "thing-with-name", parent: "$thing", owner: "$wiz", location: actor });
+      // A :title() verb that returns ~2KB — beyond the 1024-char titleForLook cap.
+      expect(installVerb(world, itemId, "title", `verb :title() rxd {
+        let s = "";
+        let i = 0;
+        while (i < 200) { s = s + "abcdefghij"; i = i + 1; }
+        return s;
+      }`, null).ok).toBe(true);
+
+      const inv = await world.directCall("title-overflow-inventory", actor, actor, "inventory", []);
+      expect(inv.op).toBe("result");
+      if (inv.op !== "result") return;
+      const result = inv.result as { items: Array<{ id: string; title: string }> };
+      const entry = result.items.find((c) => c.id === itemId);
+      expect(entry).toBeDefined();
+      // The 2KB :title() return must not flow into composition. The inventory
+      // verb's fallback for an erroring :title() is `to_string(item)`, the id.
+      expect(entry?.title.length).toBeLessThan(200);
+      expect(entry?.title).not.toContain("abcdefghij");
+    });
+
     it("$weather_block installs cleanly and ships the configured tier lists", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["weather"]);

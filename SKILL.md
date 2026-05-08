@@ -199,7 +199,7 @@ Use this when a public request produces an artifact later.
 
 Before finishing a woocode change:
 
-- Does behavior belong in a catalog rather than `src/core`?
+- Almost all behavior belongs in a catalog; core changes must be strongly justified.
 - Is the relevant spec explicit enough, and does it need updating?
 - Are property defaults and type hints correct for already-installed worlds?
 - Are writes permission-gated through local policy verbs?

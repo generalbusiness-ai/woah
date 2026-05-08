@@ -4541,7 +4541,19 @@ export class WooWorld {
   }
 
   async runDueTasks(now = Date.now()): Promise<ParkedTaskRun[]> {
+    // Pre-check before enqueueing so an idle dev poll (every 250ms) doesn't
+    // flood structured-log tails with no-op host_task_* metrics. A concurrent
+    // task insert between this check and the next tick is fine: the next
+    // poll re-checks.
+    if (!this.hasDueParkedTask(now)) return [];
     return await this.enqueueHostTask(() => this.runDueTasksNow(now), "runDueTasks");
+  }
+
+  private hasDueParkedTask(now: number): boolean {
+    for (const task of this.parkedTasks.values()) {
+      if (task.state === "suspended" && task.resume_at !== null && task.resume_at <= now) return true;
+    }
+    return false;
   }
 
   private async runDueTasksNow(now = Date.now()): Promise<ParkedTaskRun[]> {

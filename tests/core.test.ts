@@ -995,6 +995,17 @@ describe("woo core", () => {
     });
   });
 
+  it("runDueTasks short-circuits with no metrics when no task is due", async () => {
+    const world = createWorld();
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+
+    const ran = await world.runDueTasks();
+    expect(ran).toEqual([]);
+    const noise = metrics.filter((event) => event.kind.startsWith("host_task_") && (event as { label?: string }).label === "runDueTasks");
+    expect(noise).toEqual([]);
+  });
+
   it("resumes a live session token", async () => {
     const world = createWorld();
     const first = world.auth("guest:resume");
