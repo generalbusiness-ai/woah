@@ -554,6 +554,78 @@ describe("json folder persistence", () => {
     }
   });
 
+  it("persists a $note v1 → v2 drop_verb migration across SQLite reload", () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      const v1Note: CatalogManifest = {
+        name: "note",
+        version: "1.0.0",
+        spec_version: "v1",
+        license: "MIT",
+        classes: [{
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "", perms: "" }],
+          verbs: [
+            {
+              name: "title",
+              perms: "rxd",
+              direct_callable: true,
+              skip_presence_check: true,
+              arg_spec: { args: [] },
+              source: "verb :title() rxd { return this.name; }"
+            },
+            {
+              name: "delete",
+              perms: "rx",
+              arg_spec: { args: ["line"] },
+              source: "verb :delete(line) rx { return true; }"
+            }
+          ]
+        }]
+      } as unknown as CatalogManifest;
+      seedRepo.transaction(() => installCatalogManifest(seedWorld, v1Note, { tap: "@local", alias: "note" }));
+      expect(seedWorld.ownVerbExact("$note", "title")).toBeTruthy();
+      expect(seedWorld.ownVerbExact("$note", "delete")).toBeTruthy();
+      seedRepo.close();
+
+      const upgradeRepo = new LocalSQLiteRepository(path);
+      const upgradeWorld = createWorld({ repository: upgradeRepo, catalogs: false });
+      expect(upgradeWorld.ownVerbExact("$note", "title")).toBeTruthy();
+      expect(upgradeWorld.ownVerbExact("$note", "delete")).toBeTruthy();
+      const v2Note: CatalogManifest = {
+        ...v1Note,
+        version: "2.0.0",
+        classes: [{
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "", perms: "" }]
+        }]
+      } as unknown as CatalogManifest;
+      const migration = readCatalogManifest("note", "migration-v1-to-v2.json") as NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"];
+      const record = upgradeRepo.transaction(() => updateCatalogManifest(upgradeWorld, v2Note, {
+        tap: "@local",
+        alias: "note",
+        acceptMajor: true,
+        migration
+      }));
+      expect(record.migration_state).toMatchObject({ status: "completed", to_version: "2.0.0" });
+      expect(upgradeWorld.ownVerbExact("$note", "title")).toBeNull();
+      expect(upgradeWorld.ownVerbExact("$note", "delete")).toBeNull();
+      upgradeRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      expect(verifyWorld.ownVerbExact("$note", "title")).toBeNull();
+      expect(verifyWorld.ownVerbExact("$note", "delete")).toBeNull();
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("dumps selected objects as a partial JSON folder", async () => {
     const { dir, path } = tempDb();
     try {

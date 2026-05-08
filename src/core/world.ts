@@ -813,6 +813,17 @@ export class WooWorld {
     return obj.verbs[writtenIndex];
   }
 
+  removeVerb(objRef: ObjRef, name: string): boolean {
+    const obj = this.object(objRef);
+    const before = obj.verbs.length;
+    obj.verbs = obj.verbs.filter((verb) => verb.name !== name);
+    if (obj.verbs.length === before) return false;
+    this.reindexVerbs(obj);
+    this.persistObject(objRef);
+    this.persist();
+    return true;
+  }
+
   ownVerb(objRef: ObjRef, name: string): VerbDef | null {
     return this.ownVerbNamed(objRef, name);
   }

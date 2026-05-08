@@ -414,6 +414,74 @@ describe("local catalogs", () => {
     if (state.op === "result") expect(state.result).toMatchObject({ status: "completed", to_version: "2.0.0" });
   });
 
+  it("$note migration v1.0.0 → v2.0.0 drops :title and :delete from the installed class", async () => {
+    const world = createWorld({ catalogs: false });
+
+    // Synthetic v1.0.0 $note carrying the v1 verbs that v2 dropped. We only
+    // assert that the migration removes :title and :delete; class shape and
+    // dependency wiring are not under test here.
+    const v1: RuntimeCatalogManifest = {
+      name: "note",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [
+        {
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "" }],
+          verbs: [
+            {
+              name: "title",
+              perms: "rxd",
+              direct_callable: true,
+              skip_presence_check: true,
+              arg_spec: { args: [] },
+              source: "verb :title() rxd { return this.name; }"
+            },
+            {
+              name: "delete",
+              perms: "rx",
+              arg_spec: { args: ["line"] },
+              source: "verb :delete(line) rx { return true; }"
+            }
+          ]
+        }
+      ]
+    };
+    installCatalogManifest(world, v1, { tap: "@local", alias: "note" });
+    expect(world.ownVerbExact("$note", "title")).toBeDefined();
+    expect(world.ownVerbExact("$note", "delete")).toBeDefined();
+
+    // Apply the on-disk migration manifest as the catalog updates to v2.
+    // The v2 manifest passed here is a minimal shell — the assertion is on
+    // the migration's drop_verb steps, not on full v2 catalog reinstall.
+    const migration = JSON.parse(
+      readFileSync(join(root, "note", "migration-v1-to-v2.json"), "utf8")
+    ) as { from_version: string; to_version: string; spec_version: string; steps: unknown[] };
+
+    const v2: RuntimeCatalogManifest = {
+      name: "note",
+      version: "2.0.0",
+      spec_version: "v1",
+      classes: [
+        {
+          local_name: "$note",
+          parent: "$thing",
+          properties: [{ name: "text", type: "str", default: "" }]
+        }
+      ]
+    };
+    updateCatalogManifest(world, v2, {
+      tap: "@local",
+      alias: "note",
+      acceptMajor: true,
+      migration: migration as NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"]
+    });
+
+    expect(world.ownVerbExact("$note", "title")).toBeNull();
+    expect(world.ownVerbExact("$note", "delete")).toBeNull();
+  });
+
   it("installs chat from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
     installHelpDependency(world);

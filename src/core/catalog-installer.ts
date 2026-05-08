@@ -1460,9 +1460,7 @@ function applyMigrationStep(
     }
     case "drop_verb": {
       const classRef = resolveObjectRef(world, step.class, localObjects, localSeeds, installed);
-      const obj = world.object(classRef);
-      obj.verbs = obj.verbs.filter((verb) => verb.name !== step.verb).map((verb, index) => ({ ...verb, slot: index + 1 }));
-      touchObject(world, classRef);
+      world.removeVerb(classRef, step.verb);
       return;
     }
     case "change_parent": {
