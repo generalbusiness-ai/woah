@@ -16,6 +16,8 @@ const IMPURE_BUILTIN_NAMES: ReadonlySet<string> = new Set([
   "set_task_perms", "set_presence", "observe_to_space", "tell",
   "builder_create_object", "builder_chparent", "builder_set_property",
   "programmer_install_verb", "programmer_set_verb_info", "programmer_set_property_info",
+  // eval can do anything the actor's progr permits; treat as conservatively impure.
+  "programmer_eval",
   "editor_invoke", "editor_replace", "editor_insert", "editor_delete",
   "editor_save", "editor_pause", "editor_abort",
   // dispatch/execute_command_plan call into other verbs whose purity we
@@ -937,6 +939,7 @@ const VALID_BUILTINS = new Set([
   "programmer_set_verb_info",
   "programmer_set_property_info",
   "programmer_trace",
+  "programmer_eval",
   "editor_invoke",
   "editor_what",
   "editor_view",
