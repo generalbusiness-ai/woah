@@ -3059,6 +3059,18 @@ describe("local catalogs", () => {
       const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "Horoscope: Leo", "haha"]);
       expect(strangerDeliver.op).toBe("error");
       if (strangerDeliver.op === "error") expect(strangerDeliver.error.code).toBe("E_PERM");
+
+      // 6. The block actor (i.e. the plug authenticated via apikey) can
+      //    cancel a pending order off the queue head. Without this, a
+      //    poisoned order — e.g. one whose deliver verb keeps raising —
+      //    would block every following order forever, since :next_pending
+      //    only peeks.
+      const plugCancel = await world.directCall("plug-cancel", blockId, blockId, "cancel", [strangerOrderId]);
+      expect(plugCancel.op).toBe("result");
+      if (plugCancel.op === "result") {
+        expect(plugCancel.result).toMatchObject({ order_id: strangerOrderId, canceled: true });
+      }
+      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
     });
 
     it("$dispenser_block keeps queue internals out of public get_data", async () => {

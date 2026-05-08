@@ -1,6 +1,6 @@
 ---
 name: dispenser
-version: 0.2.0
+version: 0.2.1
 spec_version: v1
 license: MIT
 description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The plug supplies the note's listing name and markdown text via :deliver(order_id, name, text).
