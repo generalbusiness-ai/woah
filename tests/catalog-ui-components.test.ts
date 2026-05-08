@@ -132,6 +132,68 @@ describe("bundled catalog UI components", () => {
     expect(calls.some((c) => c.target === "obj_t_ready" && c.verb === "claim")).toBe(true);
   });
 
+  it("prompts for required args and dispatches with collected values", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const calls: { target: string; verb: string; args: unknown[] }[] = [];
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_bug_board", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_bug_board", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_bug_board" ? "Bug Board" : ref, props: {}, catalogState: {} }),
+      call: async (target, verb, args = []) => {
+        calls.push({ target, verb, args });
+        if (verb === "listing") return [];
+        return null;
+      },
+      send: async () => undefined,
+      directCall: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = woo;
+    element.subject = "the_bug_board";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_bug_board",
+      registryName: "Bug Board",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [{
+        id: "obj_t_drop",
+        name: "Drop me",
+        kind: "bug",
+        labels: [],
+        location: "guest_1",
+        cursorRole: "doer",
+        cursorKey: "do:it",
+        cursorCriterion: "Done.",
+        waitForCount: 0,
+        terminal: false,
+        complete: false,
+        linkCount: 0,
+        ageMs: 1000,
+        lastChange: 0,
+        actions: [{ verb: "drop_terminal", label: "Drop", args: [{ name: "why", type: "str", required: true }] }]
+      }]
+    };
+
+    const button = element.querySelector<HTMLButtonElement>("[data-tasks-action=\"drop_terminal\"]")!;
+    expect(button.dataset.tasksActionNeedsArgs).toBe("true");
+    button.click();
+    const form = element.querySelector<HTMLFormElement>("form[data-tasks-prompt]")!;
+    expect(form.dataset.taskId).toBe("obj_t_drop");
+    expect(form.dataset.verb).toBe("drop_terminal");
+    const why = form.querySelector<HTMLTextAreaElement>("textarea[name=\"why\"]")!;
+    why.value = "duplicate";
+    form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.find((c) => c.verb === "drop_terminal")?.args).toEqual(["duplicate"]);
+    expect(element.querySelector("form[data-tasks-prompt]")).toBeNull();
+  });
+
   it("drags a Ready card into In flight to dispatch claim", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);

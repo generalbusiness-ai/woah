@@ -42,7 +42,8 @@ type ColumnId = "ready" | "waiting" | "in_flight" | "done" | "dropped";
 
 const DRAG_VERB_BY_TRANSITION: Partial<Record<`${ColumnId}->${ColumnId}`, string>> = {
   "ready->in_flight": "claim",
-  "in_flight->ready": "release"
+  "in_flight->ready": "release",
+  "in_flight->dropped": "drop_terminal"
 };
 
 const COLUMN_LABELS: Record<ColumnId, string> = {
@@ -77,6 +78,40 @@ function formatAge(ageMs: number): string {
 
 function actorDisplay(ref: string, names: Record<string, string>): string {
   return names[ref] ?? ref;
+}
+
+function cssEscape(value: string): string {
+  // Conservative escape sufficient for our identifiers (verb / arg names);
+  // jsdom doesn't ship CSS.escape so we hand-roll.
+  return value.replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);
+}
+
+function coerceArg(raw: string, type: string): unknown {
+  const trimmed = raw.trim();
+  if (trimmed === "") return type === "str" ? "" : null;
+  if (type === "str") return raw;
+  if (type === "int") {
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? Math.trunc(n) : trimmed;
+  }
+  if (type === "float" || type === "number") {
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : trimmed;
+  }
+  if (type === "bool") {
+    if (/^(true|yes|1)$/i.test(trimmed)) return true;
+    if (/^(false|no|0)$/i.test(trimmed)) return false;
+    return trimmed;
+  }
+  if (type === "obj") return trimmed;
+  if (type === "list" || type === "map" || type === "any") {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+  return raw;
 }
 
 function readListingRow(row: unknown): KanbanTask | null {
@@ -149,7 +184,9 @@ export class WooTasksKanbanElement extends HTMLElement {
   };
   private boundClick = false;
   private boundDrag = false;
+  private boundSubmit = false;
   private pollHandle: ReturnType<typeof setInterval> | null = null;
+  private openPrompt: { taskId: string; verb: string } | null = null;
 
   set data(value: KanbanData) {
     this.model = value;
@@ -169,6 +206,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.addEventListener("dragend", this.handleDragEnd);
       this.boundDrag = true;
     }
+    if (!this.boundSubmit) {
+      this.addEventListener("submit", this.handleSubmit);
+      this.boundSubmit = true;
+    }
     if (this.woo) void this.refresh();
     this.startPolling();
   }
@@ -184,6 +225,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.removeEventListener("drop", this.handleDrop);
       this.removeEventListener("dragend", this.handleDragEnd);
       this.boundDrag = false;
+    }
+    if (this.boundSubmit) {
+      this.removeEventListener("submit", this.handleSubmit);
+      this.boundSubmit = false;
     }
     this.stopPolling();
   }
@@ -279,6 +324,12 @@ export class WooTasksKanbanElement extends HTMLElement {
   private handleClick = (event: Event): void => {
     const target = event.target as HTMLElement | null;
     if (!target) return;
+    const cancel = target.closest<HTMLButtonElement>("[data-tasks-prompt-cancel]");
+    if (cancel) {
+      event.preventDefault();
+      this.closePrompt();
+      return;
+    }
     const button = target.closest<HTMLButtonElement>("[data-tasks-action]");
     if (!button) return;
     const taskId = button.dataset.taskId ?? "";
@@ -293,8 +344,45 @@ export class WooTasksKanbanElement extends HTMLElement {
       bubbles: true,
       detail: { taskId, verb: action.verb, label: action.label, args: action.args }
     }));
-    void this.invokeAction(taskId, action);
+    if (action.args.some((arg) => arg.required)) {
+      this.openPromptFor(taskId, action.verb);
+      return;
+    }
+    void this.invokeAction(taskId, action, []);
   };
+
+  private handleSubmit = (event: Event): void => {
+    const form = (event.target as HTMLElement | null)?.closest<HTMLFormElement>("[data-tasks-prompt]");
+    if (!form) return;
+    const taskId = form.dataset.taskId ?? "";
+    const verb = form.dataset.verb ?? "";
+    if (!taskId || !verb) return;
+    event.preventDefault();
+    const action = this.model.tasks
+      .find((task) => task.id === taskId)?.actions
+      .find((entry) => entry.verb === verb);
+    if (!action) return;
+    const args = action.args.map((arg) => {
+      const input = form.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[name="${cssEscape(arg.name)}"]`);
+      const raw = input?.value ?? "";
+      return coerceArg(raw, arg.type);
+    });
+    this.closePrompt();
+    void this.invokeAction(taskId, action, args);
+  };
+
+  private openPromptFor(taskId: string, verb: string): void {
+    this.openPrompt = { taskId, verb };
+    this.render();
+    const form = this.querySelector<HTMLFormElement>(`[data-tasks-prompt][data-task-id="${cssEscape(taskId)}"][data-verb="${cssEscape(verb)}"]`);
+    form?.querySelector<HTMLInputElement | HTMLTextAreaElement>("input,textarea")?.focus();
+  }
+
+  private closePrompt(): void {
+    if (!this.openPrompt) return;
+    this.openPrompt = null;
+    this.render();
+  }
 
   private handleDragStart = (event: DragEvent): void => {
     const target = event.target as HTMLElement | null;
@@ -348,22 +436,20 @@ export class WooTasksKanbanElement extends HTMLElement {
       bubbles: true,
       detail: { taskId, verb: action.verb, label: action.label, args: action.args, source: "drag" }
     }));
-    void this.invokeAction(taskId, action);
-  };
-
-  private async invokeAction(taskId: string, action: KanbanAction): Promise<void> {
-    const woo = this.woo;
-    if (!woo) return;
-    const required = action.args.filter((arg) => arg.required);
-    if (required.length > 0) {
-      // Required-args prompts land in phase c.4. Skip dispatch for now;
-      // the woo-tasks-action event still fires so a host can intervene.
+    if (action.args.some((arg) => arg.required)) {
+      this.openPromptFor(taskId, action.verb);
       return;
     }
+    void this.invokeAction(taskId, action, []);
+  };
+
+  private async invokeAction(taskId: string, action: KanbanAction, args: unknown[]): Promise<void> {
+    const woo = this.woo;
+    if (!woo) return;
     try {
-      await woo.call(taskId, action.verb, []);
+      await woo.call(taskId, action.verb, args);
     } catch {
-      // Errors surface as observations; phase c.2 wires live reconciliation.
+      // Errors surface as observations; live reconciliation tightens this later.
     }
     await this.refresh();
   }
@@ -424,12 +510,19 @@ export class WooTasksKanbanElement extends HTMLElement {
     const actions = task.actions.length === 0
       ? ""
       : `<div class="woo-tasks-card-actions" data-tasks-card-actions>${
-          task.actions.map((action) => `
-            <button type="button" data-tasks-action="${escapeHtml(action.verb)}" data-task-id="${escapeHtml(task.id)}">${escapeHtml(action.label)}</button>
-          `).join("")
+          task.actions.map((action) => {
+            const needsArgs = action.args.some((arg) => arg.required);
+            const flag = needsArgs ? ' data-tasks-action-needs-args="true"' : "";
+            return `
+              <button type="button" data-tasks-action="${escapeHtml(action.verb)}" data-task-id="${escapeHtml(task.id)}"${flag}>${escapeHtml(action.label)}${needsArgs ? "…" : ""}</button>
+            `;
+          }).join("")
         }</div>`;
     const dragVerbs = task.actions.map((action) => action.verb);
-    const draggable = dragVerbs.includes("claim") || dragVerbs.includes("release");
+    const draggable = dragVerbs.includes("claim") || dragVerbs.includes("release") || dragVerbs.includes("drop_terminal");
+    const prompt = this.openPrompt && this.openPrompt.taskId === task.id
+      ? this.renderPrompt(task, this.openPrompt.verb)
+      : "";
     return `
       <article class="woo-tasks-card" data-tasks-card="${escapeHtml(task.id)}"${draggable ? ' draggable="true"' : ""}>
         <header class="woo-tasks-card-header">
@@ -438,7 +531,35 @@ export class WooTasksKanbanElement extends HTMLElement {
         <div class="woo-tasks-card-meta">${meta}</div>
         ${labels ? `<div class="woo-tasks-card-labels">${labels}</div>` : ""}
         ${actions}
+        ${prompt}
       </article>
+    `;
+  }
+
+  private renderPrompt(task: KanbanTask, verb: string): string {
+    const action = task.actions.find((entry) => entry.verb === verb);
+    if (!action) return "";
+    const fields = action.args.map((arg) => {
+      const required = arg.required ? " required" : "";
+      const placeholder = arg.type === "map" || arg.type === "list" ? "JSON literal" : arg.type;
+      return `
+        <label class="woo-tasks-prompt-field">
+          <span class="woo-tasks-prompt-label">${escapeHtml(arg.name)}<span class="woo-tasks-prompt-type"> (${escapeHtml(arg.type)})</span></span>
+          ${arg.type === "str" || arg.type === "map" || arg.type === "list" || arg.type === "any"
+            ? `<textarea name="${escapeHtml(arg.name)}" placeholder="${escapeHtml(placeholder)}"${required}></textarea>`
+            : `<input type="text" name="${escapeHtml(arg.name)}" placeholder="${escapeHtml(placeholder)}"${required}>`}
+        </label>
+      `;
+    }).join("");
+    return `
+      <form class="woo-tasks-prompt" data-tasks-prompt data-task-id="${escapeHtml(task.id)}" data-verb="${escapeHtml(action.verb)}">
+        <div class="woo-tasks-prompt-header">${escapeHtml(action.label)}</div>
+        ${fields}
+        <div class="woo-tasks-prompt-actions">
+          <button type="submit" data-tasks-prompt-submit>Submit</button>
+          <button type="button" data-tasks-prompt-cancel>Cancel</button>
+        </div>
+      </form>
     `;
   }
 }
