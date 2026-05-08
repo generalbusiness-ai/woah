@@ -280,6 +280,88 @@ describe("bundled catalog UI components", () => {
     expect(calls.find((c) => c.verb === "remove_policy")?.args).toEqual(["task"]);
   });
 
+  it("inline-edits name, body, and labels in the detail panel", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const calls: { target: string; verb: string; args: unknown[] }[] = [];
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    const detail = {
+      id: "obj_t_edit",
+      name: "Old name",
+      text: "old body",
+      kind: "task",
+      labels: ["alpha"],
+      obligations: [],
+      log: [],
+      wait_for: [],
+      links: [],
+      terminal: false,
+      complete: false,
+      cursor: null,
+      location: "the_taskboard"
+    };
+    const woo: WooContext = {
+      actor: "$wiz",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (target, verb, args = []) => {
+        calls.push({ target, verb, args });
+        if (verb === "listing") return [];
+        if (verb === "detail") return detail;
+        return null;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "$wiz",
+      actorNames: {},
+      tasks: [{
+        id: "obj_t_edit", name: "Old name", kind: "task", labels: ["alpha"],
+        location: "the_taskboard", cursorRole: null, cursorKey: null, cursorCriterion: null,
+        waitForCount: 0, terminal: false, complete: false, linkCount: 0,
+        ageMs: 1000, lastChange: 0, actions: []
+      }],
+      policies: ["task"],
+      isOwner: true
+    };
+    element.querySelector<HTMLElement>('[data-tasks-card="obj_t_edit"]')!.click();
+    await flush();
+
+    // Rename
+    element.querySelector<HTMLButtonElement>('[data-tasks-detail-edit-open="name"]')!.click();
+    const nameForm = element.querySelector<HTMLFormElement>('[data-tasks-detail-edit="name"]')!;
+    nameForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = "Renamed";
+    nameForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    expect(calls.find((c) => c.verb === "set_name")?.args).toEqual(["Renamed"]);
+
+    // Edit body
+    element.querySelector<HTMLButtonElement>('[data-tasks-detail-edit-open="text"]')!.click();
+    const textForm = element.querySelector<HTMLFormElement>('[data-tasks-detail-edit="text"]')!;
+    textForm.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!.value = "new body content";
+    textForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    expect(calls.find((c) => c.verb === "set_text")?.args).toEqual(["new body content"]);
+
+    // Edit labels
+    element.querySelector<HTMLButtonElement>('[data-tasks-detail-edit-open="labels"]')!.click();
+    const labForm = element.querySelector<HTMLFormElement>('[data-tasks-detail-edit="labels"]')!;
+    labForm.querySelector<HTMLInputElement>('input[name="labels"]')!.value = "beta, gamma";
+    labForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+    expect(calls.find((c) => c.verb === "set_labels")?.args).toEqual([["beta", "gamma"]]);
+  });
+
   it("opens a detail panel on card click, fetching :detail and rendering obligations + log", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
@@ -356,7 +438,7 @@ describe("bundled catalog UI components", () => {
     await Promise.resolve();
     const panel = element.querySelector<HTMLElement>('[data-tasks-detail]');
     expect(panel).not.toBeNull();
-    expect(panel!.querySelector("h3")?.textContent).toBe("Refactor verb dispatch");
+    expect(panel!.querySelector(".woo-tasks-detail-name")?.textContent).toBe("Refactor verb dispatch");
     expect(panel!.querySelector(".woo-tasks-detail-text")?.textContent).toContain("multi-line");
     const obligations = Array.from(panel!.querySelectorAll(".woo-tasks-detail-obligation"));
     expect(obligations).toHaveLength(2);

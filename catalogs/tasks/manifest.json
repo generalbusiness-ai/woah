@@ -518,6 +518,32 @@
           "source": "verb :drop_terminal(why) rxd { if (location(this) != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the holder or a wizard can drop\" }; } this.terminal = true; if (location(this) != this.registry) { this:_authorized_moveto(this.registry, \"terminal\"); } this.log = this.log + [{ \"ts\": now(), \"actor\": actor, \"outcome\": \"dropped\", \"why\": why }]; this.last_change = now(); observe({ type: \"task_dropped\", task: this, why: why, actor: actor, ts: now() }); observe({ type: \"task_returned_home\", task: this, reason: \"drop_terminal\", ts: now() }); return this; }",
           "direct_callable": true,
           "skip_presence_check": true
+        },
+        {
+          "name": "set_name",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "name"
+            ]
+          },
+          "source": "verb :set_name(name) rxd { if (typeof(name) != \"string\" || name == \"\") { raise { code: \"E_INVARG\", message: \"set_name requires a non-empty string\", value: name }; } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot rename task\", value: this }; } this.name = name; this.last_change = now(); observe({ type: \"task_renamed\", task: this, name: name, actor: actor, ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "set_labels",
+          "perms": "rxd",
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": [
+              "labels"
+            ]
+          },
+          "source": "verb :set_labels(labels) rxd { if (typeof(labels) != \"list\") { raise { code: \"E_INVARG\", message: \"set_labels requires a list of strings\", value: labels }; } for l in labels { if (typeof(l) != \"string\") { raise { code: \"E_INVARG\", message: \"set_labels: every label must be a string\", value: l }; } } if (!this:is_writable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot relabel task\", value: this }; } this.labels = labels; this.last_change = now(); observe({ type: \"task_relabeled\", task: this, labels: labels, actor: actor, ts: now() }); return this; }",
+          "direct_callable": true,
+          "skip_presence_check": true
         }
       ]
     }

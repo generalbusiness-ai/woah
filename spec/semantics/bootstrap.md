@@ -392,6 +392,9 @@ Lifecycle verbs are all `direct_callable: true` and `tool_exposed: true`. The le
 | `:wait(cond)` | map | Holder appends a wait condition (e.g. `{ kind: "child_complete", task: <child> }`) blocking subsequent claims/passes until cleared. Emits `task_waited`. |
 | `:yield(spec)` | map | Holder spawns a related child task on the same registry, optionally blocking until the child completes. Emits `task_yielded`. |
 | `:drop_terminal(why)` | str | Marks the task terminal and returns it home. Holder or wizard only. Emits `task_dropped` and `task_returned_home`. |
+| `:set_name(name)` | str | Renames the task. Gated by `:is_writable_by`. Emits `task_renamed`. |
+| `:set_labels(labels)` | list&lt;str&gt; | Replaces the labels list. Gated by `:is_writable_by`. Emits `task_relabeled`. |
+| `:set_text(text)` (inherited from `$note`) | str | Replaces the task body. Gated by note writer permissions. |
 | `:moveto(target)` / `:_authorized_moveto(target, intent_kind)` | obj / obj, str | Internal movement primitives — `:moveto` is the gate, `:_authorized_moveto` is the only path that sets the intent. Not direct-callable. |
 
 ---

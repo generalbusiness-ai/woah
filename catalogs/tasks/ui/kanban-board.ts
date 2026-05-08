@@ -318,6 +318,7 @@ export class WooTasksKanbanElement extends HTMLElement {
   private createOpen = false;
   private adminOpen = false;
   private openDetail: { taskId: string; detail: TaskDetail | null; loading: boolean; error?: string } | null = null;
+  private detailEdit: "name" | "text" | "labels" | null = null;
 
   set data(value: Partial<KanbanData> & Pick<KanbanData, "registryId" | "registryName" | "actor" | "actorNames" | "tasks">) {
     this.model = {
@@ -526,6 +527,27 @@ export class WooTasksKanbanElement extends HTMLElement {
     if (target.closest<HTMLButtonElement>("[data-tasks-detail-close]")) {
       event.preventDefault();
       this.openDetail = null;
+      this.detailEdit = null;
+      this.render();
+      return;
+    }
+    const editOpen = target.closest<HTMLButtonElement>("[data-tasks-detail-edit-open]");
+    if (editOpen) {
+      event.preventDefault();
+      const field = editOpen.dataset.tasksDetailEditOpen;
+      if (field === "name" || field === "text" || field === "labels") {
+        this.detailEdit = field;
+        this.render();
+        const focusSel = field === "text"
+          ? "[data-tasks-detail-edit] textarea"
+          : `[data-tasks-detail-edit] input[name="${field}"]`;
+        this.querySelector<HTMLInputElement | HTMLTextAreaElement>(focusSel)?.focus();
+      }
+      return;
+    }
+    if (target.closest<HTMLButtonElement>("[data-tasks-detail-edit-cancel]")) {
+      event.preventDefault();
+      this.detailEdit = null;
       this.render();
       return;
     }
@@ -583,6 +605,12 @@ export class WooTasksKanbanElement extends HTMLElement {
 
   private handleSubmit = (event: Event): void => {
     const target = event.target as HTMLElement | null;
+    const detailEditForm = target?.closest<HTMLFormElement>("[data-tasks-detail-edit]");
+    if (detailEditForm) {
+      event.preventDefault();
+      void this.submitDetailEditForm(detailEditForm);
+      return;
+    }
     const adminForm = target?.closest<HTMLFormElement>("[data-tasks-admin-form]");
     if (adminForm) {
       event.preventDefault();
@@ -695,6 +723,30 @@ export class WooTasksKanbanElement extends HTMLElement {
     } catch {
       // Non-owner / non-wizard will see E_PERM; surface lands in the next refresh.
     }
+    await this.refresh();
+  }
+
+  private async submitDetailEditForm(form: HTMLFormElement): Promise<void> {
+    const woo = this.woo;
+    if (!woo || !this.openDetail || !this.openDetail.detail) return;
+    const taskId = this.openDetail.taskId;
+    const field = form.dataset.tasksDetailEdit;
+    if (field === "name") {
+      const value = (form.querySelector<HTMLInputElement>('input[name="name"]')?.value ?? "").trim();
+      if (!value) return;
+      try { await woo.directCall(taskId, "set_name", [value]); } catch { /* surfaces in refresh */ }
+    } else if (field === "text") {
+      const value = form.querySelector<HTMLTextAreaElement>('textarea[name="text"]')?.value ?? "";
+      try { await woo.directCall(taskId, "set_text", [value]); } catch { /* surfaces in refresh */ }
+    } else if (field === "labels") {
+      const raw = form.querySelector<HTMLInputElement>('input[name="labels"]')?.value ?? "";
+      const labels = raw.split(",").map((s) => s.trim()).filter(Boolean);
+      try { await woo.directCall(taskId, "set_labels", [labels]); } catch { /* surfaces in refresh */ }
+    } else {
+      return;
+    }
+    this.detailEdit = null;
+    await this.openTaskDetail(taskId);
     await this.refresh();
   }
 
@@ -861,12 +913,37 @@ export class WooTasksKanbanElement extends HTMLElement {
       `;
     }
     const detail = open.detail;
-    const labels = detail.labels.length === 0
-      ? ""
-      : `<div class="woo-tasks-detail-labels">${detail.labels.map((l) => `<span class="woo-tasks-card-label">${escapeHtml(l)}</span>`).join("")}</div>`;
-    const text = detail.text
-      ? `<pre class="woo-tasks-detail-text">${escapeHtml(detail.text)}</pre>`
-      : `<p class="woo-tasks-detail-empty">No body.</p>`;
+    const editing = this.detailEdit;
+    const labelsBody = editing === "labels"
+      ? `<form class="woo-tasks-detail-edit" data-tasks-detail-edit="labels">
+          <input type="text" name="labels" value="${escapeHtml(detail.labels.join(", "))}" autocomplete="off">
+          <button type="submit" data-tasks-detail-edit-submit>Save</button>
+          <button type="button" data-tasks-detail-edit-cancel>Cancel</button>
+        </form>`
+      : `<div class="woo-tasks-detail-labels" data-tasks-detail-field="labels">
+          ${detail.labels.length === 0
+            ? `<span class="woo-tasks-detail-empty-inline">no labels</span>`
+            : detail.labels.map((l) => `<span class="woo-tasks-card-label">${escapeHtml(l)}</span>`).join("")}
+          <button type="button" data-tasks-detail-edit-open="labels" class="woo-tasks-detail-edit-icon" aria-label="Edit labels">✎</button>
+        </div>`;
+    const labels = labelsBody;
+    const text = editing === "text"
+      ? `<form class="woo-tasks-detail-edit" data-tasks-detail-edit="text">
+          <textarea name="text" rows="6" autocomplete="off">${escapeHtml(detail.text)}</textarea>
+          <div class="woo-tasks-detail-edit-actions">
+            <button type="submit" data-tasks-detail-edit-submit>Save</button>
+            <button type="button" data-tasks-detail-edit-cancel>Cancel</button>
+          </div>
+        </form>`
+      : detail.text
+        ? `<div class="woo-tasks-detail-text-wrap" data-tasks-detail-field="text">
+            <pre class="woo-tasks-detail-text">${escapeHtml(detail.text)}</pre>
+            <button type="button" data-tasks-detail-edit-open="text" class="woo-tasks-detail-edit-icon" aria-label="Edit body">✎</button>
+          </div>`
+        : `<div class="woo-tasks-detail-text-wrap" data-tasks-detail-field="text">
+            <p class="woo-tasks-detail-empty">No body.</p>
+            <button type="button" data-tasks-detail-edit-open="text" class="woo-tasks-detail-edit-icon" aria-label="Edit body">✎</button>
+          </div>`;
     const obligationsHtml = detail.obligations.length === 0
       ? `<p class="woo-tasks-detail-empty">No obligations.</p>`
       : `<ol class="woo-tasks-detail-obligations">${detail.obligations.map((o) => {
@@ -909,10 +986,20 @@ export class WooTasksKanbanElement extends HTMLElement {
           <ul>${detail.links.map((l) => `<li>${escapeHtml(l.role ?? "link")} → ${escapeHtml(l.to ?? "—")}</li>`).join("")}</ul>
         </section>`;
     const status = detail.complete ? "complete" : detail.terminal ? "dropped" : detail.location && detail.location !== this.model.registryId ? `held by ${actorDisplay(detail.location, actorNames)}` : "ready";
+    const nameBody = editing === "name"
+      ? `<form class="woo-tasks-detail-edit" data-tasks-detail-edit="name">
+          <input type="text" name="name" value="${escapeHtml(detail.name || detail.id)}" required autocomplete="off">
+          <button type="submit" data-tasks-detail-edit-submit>Save</button>
+          <button type="button" data-tasks-detail-edit-cancel>Cancel</button>
+        </form>`
+      : `<h3 data-tasks-detail-field="name">
+          <span class="woo-tasks-detail-name">${escapeHtml(detail.name || detail.id)}</span>
+          <button type="button" data-tasks-detail-edit-open="name" class="woo-tasks-detail-edit-icon" aria-label="Rename task">✎</button>
+        </h3>`;
     return `
       <aside class="woo-tasks-detail" data-tasks-detail data-task-id="${escapeHtml(detail.id)}">
         <header class="woo-tasks-detail-header">
-          <h3>${escapeHtml(detail.name || detail.id)}</h3>
+          ${nameBody}
           <button type="button" data-tasks-detail-close aria-label="Close">×</button>
         </header>
         <div class="woo-tasks-detail-meta">
