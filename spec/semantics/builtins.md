@@ -108,27 +108,6 @@ that session's current location. This keeps command parsing and room verbs scope
 to the tab/tool session that issued the call. It is a behavior-readable core
 field, not a property lookup.
 
-`note_text_summary(note, limit?)` returns `{lines, length, preview, truncated}`
-for the base note display path without materializing an unbounded note body in
-the Tiny VM. `limit` defaults to 96 and is clamped to `0..512` characters. The
-builtin first requires `note` to be a local `$note` descendant and raises
-`E_TYPE` otherwise. It then calls `note:is_readable_by(actor)` and raises
-`E_PERM` if it does not return true. The reference implementation then reads
-the note object's raw `.text` property locally. As of `$note` v0.2, `.text` is
-a single markdown string capped at 262144 characters by `:set_text`/`:write`;
-the v0.1 `list<str>` shape is tolerated by joining string elements with `\n`,
-so summary calls during a partial upgrade still succeed. `length` is the
-character count of the resolved text, `lines` is the number of `\r?\n`-split
-lines (or 0 for an empty string), and `preview` is the first line only. If
-the preview exceeds the clamped limit, it is truncated and `truncated` is
-true; when there is room for an ellipsis, the returned preview ends with
-`...`.
-
-This builtin is intentionally narrow and catalog-supporting, not the public note
-text contract. Catalog callers should use the overridable `$note:text_summary`
-verb so subclasses that decrypt, redact, or derive text can keep title and look
-semantics aligned with their full `:text()` behavior.
-
 `current_session()` returns the current session id or `null` for host/bootstrap
 tasks. `current_location()` returns the current session's location or `null`.
 `session_location(id)` returns that live session's location or `null`.
