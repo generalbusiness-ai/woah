@@ -115,6 +115,28 @@ describe("auth credentials: $system:set_object_flags / mint_session_for / api ke
     expect(sess.tokenClass).toBe("apikey");
   });
 
+  it("ensureApiKey creates a caller-specified key and is idempotent for the same secret", () => {
+    const world = createWorld({ catalogs: false });
+    const target = makeActor(world);
+    const key = world.ensureApiKey("$wiz", target, "localdev", "local-secret", "localdev-test");
+    expect(key).toMatchObject({ id: "localdev", secret: "local-secret", actor: target, label: "localdev-test", created: true });
+    expect(world.auth("apikey:localdev:local-secret").actor).toBe(target);
+
+    const again = world.ensureApiKey("$wiz", target, "localdev", "local-secret", "ignored-label");
+    expect(again.created).toBe(false);
+    expect(again.label).toBe("localdev-test");
+    expect(world.auth("apikey:localdev:local-secret").actor).toBe(target);
+  });
+
+  it("ensureApiKey rejects conflicting ids and wrong presented secrets", () => {
+    const world = createWorld({ catalogs: false });
+    const target = makeActor(world);
+    const other = makeActor(world);
+    world.ensureApiKey("$wiz", target, "localdev-conflict", "local-secret", "localdev-test");
+    expectError(() => world.ensureApiKey("$wiz", target, "localdev-conflict", "wrong-secret", "localdev-test"), "E_PERM");
+    expectError(() => world.ensureApiKey("$wiz", other, "localdev-conflict", "local-secret", "localdev-test"), "E_PERM");
+  });
+
   it("rejects unknown id and wrong secret with the same E_NOSESSION (no oracle)", () => {
     const world = createWorld({ catalogs: false });
     const target = makeActor(world);

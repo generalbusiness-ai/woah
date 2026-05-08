@@ -21,6 +21,21 @@ npm run dev
 
 The local dev server reads `.dev.vars` automatically via `tsx`/`vite`. Defaults in the example are safe for local-only experimentation.
 
+For local UI login as `$wiz`, you may provide an explicit dev-only apikey:
+
+```sh
+WOO_LOCALDEV_WIZ_API_ID=localwiz
+WOO_LOCALDEV_WIZ_API_KEY=localwiz-secret
+npm run dev
+```
+
+On startup, the dev server ensures that key exists, is bound to `$wiz`,
+and prints the username/password pair for the login form. If the id
+already exists for `$wiz` with the same secret it is reused; if it exists
+for another actor or with another secret, startup fails loudly. This
+convenience exists only in `src/server/dev-server.ts`; Cloudflare
+deployments do not read these variables.
+
 By default, local development uses the persistent `.woo/dev.sqlite` file:
 
 ```sh

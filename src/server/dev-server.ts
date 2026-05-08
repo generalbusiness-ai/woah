@@ -27,6 +27,7 @@ import { McpGateway } from "../mcp/gateway";
 // defer to the world's object-authoring permission checks.
 const repository = new LocalSQLiteRepository(process.env.WOO_DB ?? ".woo/dev.sqlite");
 const world = createWorld({ repository, catalogs: parseAutoInstallCatalogs(process.env.WOO_AUTO_INSTALL_CATALOGS) });
+ensureLocaldevWizardApiKey();
 if (process.env.WOO_METRICS !== "off") {
   world.setMetricsHook((event) => console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: "dev" })));
 }
@@ -237,6 +238,23 @@ setInterval(() => {
   });
   expireAttachedSessions(world.reapExpiredSessions());
 }, 250).unref();
+
+function ensureLocaldevWizardApiKey(): void {
+  const id = process.env.WOO_LOCALDEV_WIZ_API_ID;
+  const secret = process.env.WOO_LOCALDEV_WIZ_API_KEY;
+  if (!id && !secret) return;
+  if (!id || !secret) {
+    throw wooError("E_INVARG", "set both WOO_LOCALDEV_WIZ_API_ID and WOO_LOCALDEV_WIZ_API_KEY, or neither");
+  }
+  const ensured = world.ensureApiKey("$wiz", "$wiz", id, secret, "localdev-wiz");
+  const action = ensured.created ? "created" : "found";
+  console.log("");
+  console.log(`Localdev wizard API key ${action} (unsafe local convenience):`);
+  console.log(`  Username: ${id}`);
+  console.log(`  Password: ${secret}`);
+  console.log("  Actor: $wiz");
+  console.log("");
+}
 
 function attachedSession(ws: WebSocket): AttachedSocket | null {
   const session = sockets.get(ws);
