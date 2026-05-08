@@ -395,6 +395,9 @@ export class WooTasksKanbanElement extends HTMLElement {
   private detailEdit: "name" | "text" | "labels" | null = null;
   private groupBy: GroupBy = "state";
   private boundChange = false;
+  private boundInput = false;
+  private filterText = "";
+  private filterLabels = new Set<string>();
 
   set data(value: Partial<KanbanData> & Pick<KanbanData, "registryId" | "registryName" | "actor" | "actorNames" | "tasks">) {
     this.model = {
@@ -429,6 +432,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.addEventListener("change", this.handleChange);
       this.boundChange = true;
     }
+    if (!this.boundInput) {
+      this.addEventListener("input", this.handleInput);
+      this.boundInput = true;
+    }
     if (this.woo) void this.refresh();
     this.startPolling();
   }
@@ -452,6 +459,10 @@ export class WooTasksKanbanElement extends HTMLElement {
     if (this.boundChange) {
       this.removeEventListener("change", this.handleChange);
       this.boundChange = false;
+    }
+    if (this.boundInput) {
+      this.removeEventListener("input", this.handleInput);
+      this.boundInput = false;
     }
     this.stopPolling();
   }
@@ -655,6 +666,33 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.closePrompt();
       return;
     }
+    const filterAdd = target.closest<HTMLElement>("[data-tasks-filter-add-label]");
+    if (filterAdd) {
+      event.preventDefault();
+      const label = filterAdd.dataset.tasksFilterAddLabel ?? "";
+      if (label && !this.filterLabels.has(label)) {
+        this.filterLabels.add(label);
+        this.render();
+      }
+      return;
+    }
+    const filterRemove = target.closest<HTMLButtonElement>("[data-tasks-filter-remove-label]");
+    if (filterRemove) {
+      event.preventDefault();
+      const label = filterRemove.dataset.tasksFilterRemoveLabel ?? "";
+      if (label && this.filterLabels.has(label)) {
+        this.filterLabels.delete(label);
+        this.render();
+      }
+      return;
+    }
+    if (target.closest<HTMLButtonElement>("[data-tasks-filter-clear]")) {
+      event.preventDefault();
+      this.filterLabels.clear();
+      this.filterText = "";
+      this.render();
+      return;
+    }
     const button = target.closest<HTMLButtonElement>("[data-tasks-action]");
     if (!button) {
       const card = target.closest<HTMLElement>("[data-tasks-card]");
@@ -694,6 +732,25 @@ export class WooTasksKanbanElement extends HTMLElement {
     if (isGroupBy(select.value) && select.value !== this.groupBy) {
       this.groupBy = select.value;
       this.render();
+    }
+  };
+
+  private handleInput = (event: Event): void => {
+    const target = event.target as HTMLElement | null;
+    const search = target?.closest<HTMLInputElement>("[data-tasks-filter-text]");
+    if (!search) return;
+    this.filterText = search.value;
+    const start = search.selectionStart;
+    const end = search.selectionEnd;
+    this.render();
+    const refocus = this.querySelector<HTMLInputElement>("[data-tasks-filter-text]");
+    if (refocus) {
+      refocus.focus();
+      try {
+        if (start !== null && end !== null) refocus.setSelectionRange(start, end);
+      } catch {
+        // Some inputs throw on setSelectionRange (e.g. type=email); ignore.
+      }
     }
   };
 
@@ -946,8 +1003,27 @@ export class WooTasksKanbanElement extends HTMLElement {
     await this.refresh();
   }
 
+  private filteredTasks(): KanbanTask[] {
+    const tasks = this.model.tasks;
+    const q = this.filterText.trim().toLowerCase();
+    const labels = this.filterLabels;
+    if (!q && labels.size === 0) return tasks;
+    return tasks.filter((task) => {
+      if (labels.size > 0) {
+        const have = new Set(task.labels);
+        for (const l of labels) if (!have.has(l)) return false;
+      }
+      if (q) {
+        const hay = [task.name, task.kind, task.id, ...task.labels].join(" ").toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
   private render(): void {
-    const { registryId, registryName, tasks, actorNames } = this.model;
+    const { registryId, registryName, actorNames } = this.model;
+    const tasks = this.filteredTasks();
     const { columns, bucketFor } = computeGrouping(this.groupBy, tasks, registryId, actorNames);
     const buckets = new Map<string, KanbanTask[]>();
     for (const col of columns) buckets.set(col.id, []);
@@ -1156,8 +1232,30 @@ export class WooTasksKanbanElement extends HTMLElement {
         <h2>${escapeHtml(registryName)}</h2>
         <div class="woo-tasks-kanban-toolbar">${toolbar}</div>
       </header>
+      ${this.renderFilterBar()}
       ${this.createOpen ? this.renderCreateForm() : ""}
       ${this.adminOpen ? this.renderAdminPanel() : ""}
+    `;
+  }
+
+  private renderFilterBar(): string {
+    const labels = Array.from(this.filterLabels);
+    const chips = labels.map((label) => `
+      <span class="woo-tasks-filter-chip" data-tasks-filter-chip>
+        <span class="woo-tasks-filter-chip-label">${escapeHtml(label)}</span>
+        <button type="button" data-tasks-filter-remove-label="${escapeHtml(label)}" aria-label="Remove ${escapeHtml(label)} filter">×</button>
+      </span>
+    `).join("");
+    const hasFilter = this.filterText.length > 0 || labels.length > 0;
+    const clear = hasFilter
+      ? `<button type="button" data-tasks-filter-clear class="woo-tasks-filter-clear">Clear</button>`
+      : "";
+    return `
+      <div class="woo-tasks-kanban-filterbar">
+        <input type="search" data-tasks-filter-text placeholder="Search tasks…" value="${escapeHtml(this.filterText)}" autocomplete="off">
+        <div class="woo-tasks-filter-chips" data-tasks-filter-chips>${chips}</div>
+        ${clear}
+      </div>
     `;
   }
 
@@ -1266,7 +1364,10 @@ export class WooTasksKanbanElement extends HTMLElement {
     const labels = task.labels
       .filter((label) => typeof label === "string" && label.length > 0)
       .slice(0, 3)
-      .map((label) => `<span class="woo-tasks-card-label">${escapeHtml(label)}</span>`)
+      .map((label) => {
+        const active = this.filterLabels.has(label);
+        return `<button type="button" class="woo-tasks-card-label${active ? " active" : ""}" data-tasks-filter-add-label="${escapeHtml(label)}"${active ? " disabled" : ""}>${escapeHtml(label)}</button>`;
+      })
       .join("");
     const holder = task.location && task.location !== this.model.registryId
       ? `<span class="woo-tasks-card-holder">held by ${escapeHtml(actorDisplay(task.location, actorNames))}</span>`

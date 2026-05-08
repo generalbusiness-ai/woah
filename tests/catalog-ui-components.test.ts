@@ -858,6 +858,75 @@ describe("bundled catalog UI components", () => {
     expect(draggableCard.getAttribute("draggable")).toBe("true");
   });
 
+  it("filters by free-text search and label chips", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any };
+    element.woo = testWooContext({ guest_1: "Guest 1" });
+    document.body.appendChild(element);
+
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [
+        { id: "obj_t_a", name: "Triage cockatoo bug",     kind: "bug",  labels: ["urgent", "frontend"], location: "the_taskboard", cursorRole: "doer", cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] },
+        { id: "obj_t_b", name: "Update copy on landing",  kind: "task", labels: ["frontend"],           location: "the_taskboard", cursorRole: "doer", cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] },
+        { id: "obj_t_c", name: "Backend cron lag",        kind: "bug",  labels: ["backend", "urgent"],  location: "the_taskboard", cursorRole: "doer", cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] }
+      ]
+    };
+
+    const cardIds = () => Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-card]")).map((c) => c.dataset.tasksCard);
+    expect(cardIds().sort()).toEqual(["obj_t_a", "obj_t_b", "obj_t_c"]);
+
+    // free-text search on name
+    const search = element.querySelector<HTMLInputElement>("[data-tasks-filter-text]")!;
+    search.value = "cockatoo";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(cardIds()).toEqual(["obj_t_a"]);
+
+    // search also matches kind / labels
+    const search2 = element.querySelector<HTMLInputElement>("[data-tasks-filter-text]")!;
+    search2.value = "backend";
+    search2.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(cardIds()).toEqual(["obj_t_c"]);
+
+    // clear search; click a label chip on a card
+    const search3 = element.querySelector<HTMLInputElement>("[data-tasks-filter-text]")!;
+    search3.value = "";
+    search3.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(cardIds().sort()).toEqual(["obj_t_a", "obj_t_b", "obj_t_c"]);
+
+    const urgentLabel = element.querySelector<HTMLButtonElement>('[data-tasks-filter-add-label="urgent"]');
+    expect(urgentLabel).toBeTruthy();
+    urgentLabel!.click();
+    expect(cardIds().sort()).toEqual(["obj_t_a", "obj_t_c"]);
+
+    // active chip is rendered with × button
+    const chip = element.querySelector<HTMLElement>('[data-tasks-filter-remove-label="urgent"]');
+    expect(chip).toBeTruthy();
+
+    // adding a second label narrows further (AND semantics)
+    const frontendLabel = element.querySelector<HTMLButtonElement>('[data-tasks-card="obj_t_a"] [data-tasks-filter-add-label="frontend"]');
+    expect(frontendLabel).toBeTruthy();
+    frontendLabel!.click();
+    expect(cardIds()).toEqual(["obj_t_a"]);
+
+    // remove a chip
+    element.querySelector<HTMLButtonElement>('[data-tasks-filter-remove-label="frontend"]')!.click();
+    expect(cardIds().sort()).toEqual(["obj_t_a", "obj_t_c"]);
+
+    // the active label on the visible card is disabled (already in filter)
+    const stillActive = element.querySelector<HTMLButtonElement>('[data-tasks-card="obj_t_a"] [data-tasks-filter-add-label="urgent"]');
+    expect(stillActive?.disabled).toBe(true);
+
+    // clear all filters
+    element.querySelector<HTMLButtonElement>("[data-tasks-filter-clear]")!.click();
+    expect(cardIds().sort()).toEqual(["obj_t_a", "obj_t_b", "obj_t_c"]);
+    expect(element.querySelector<HTMLButtonElement>("[data-tasks-filter-clear]")).toBe(null);
+  });
+
   it("renders pinboard notes and emits create events", async () => {
     const { WooPinboardBoardElement } = await import("../catalogs/pinboard/ui/pinboard-board");
     defineOnce("woo-pinboard-board", WooPinboardBoardElement);
