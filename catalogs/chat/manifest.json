@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -435,7 +435,7 @@
             ],
             "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr"] }
           },
-          "source": "verb :drop(object) rxd { let name = str_trim(object); if (!name) { raise { code: \"E_INVARG\", message: \"drop requires an object name\" }; } let item = $match:match_object(name, actor); if (item == $failed_match || item == $ambiguous_match || location(item) != actor) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + str_char(34) + name + str_char(34) + \".\", value: name }; } let title = \"\"; try { title = item:title(); } except err { title = \"\"; } if (!title) { title = to_string(item); } moveto(item, this); tell(actor, \"You drop \" + title + \".\"); observe({ type: \"dropped\", actor: actor, item: item, room: this, text: actor.name + \" drops \" + title + \".\", ts: now() }); return { item: item, title: title, room: this }; }"
+          "source": "verb :drop(object) rxd { let name = str_trim(object); if (!name) { raise { code: \"E_INVARG\", message: \"drop requires an object name\" }; } let item = $match:match_object(name, actor); if (item == $failed_match || item == $ambiguous_match || location(item) != actor) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + str_char(34) + name + str_char(34) + \".\", value: name }; } let title = \"\"; try { title = item:title(); } except err { title = \"\"; } if (!title) { title = to_string(item); } moveto(item, this); if (is_recycled(item)) { return { item: item, title: title, room: this, recycled: true }; } tell(actor, \"You drop \" + title + \".\"); observe({ type: \"dropped\", actor: actor, item: item, room: this, text: actor.name + \" drops \" + title + \".\", ts: now() }); return { item: item, title: title, room: this }; }"
         }
       ]
     },

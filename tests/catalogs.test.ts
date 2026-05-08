@@ -3197,6 +3197,127 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "pending_orders")).toEqual([]);
     });
 
+    it("$dispensed_note disperses in a puff of smoke when dropped into a $space via chat:drop", async () => {
+      const world = createWorld();
+      const roomId = "the_hot_tub";
+      const ownerSess = world.auth("guest:puff-owner");
+      const blockId = "obj_test_disp_puff_block";
+      world.createObject({ id: blockId, name: "Vending Machine", parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const requesterSess = world.auth("guest:puff-requester");
+      const requester = requesterSess.actor;
+      // Place the requester in the room so chat:drop can match the note in
+      // their inventory. enter() is the standard entry point.
+      const entered = await world.directCall("puff-enter", requester, roomId, "enter", []);
+      expect(entered.op).toBe("result");
+
+      const ordered = await world.directCall("puff-order", requester, blockId, "order", ["scorpio"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+      const key = world.createApiKey("$wiz", blockId, "test-puff-plug");
+      world.auth(`apikey:${key.id}:${key.secret}`);
+      const delivered = await world.directCall("puff-deliver", blockId, blockId, "deliver", [
+        orderId,
+        "Horoscope: Scorpio",
+        "Avoid llamas today.",
+        "A small folded slip."
+      ]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+      expect(world.object(noteId).location).toBe(requester);
+
+      // The real `drop` path: chat:drop is the user-facing verb on $room.
+      const dropped = await world.directCall("puff-drop", requester, roomId, "drop", ["Horoscope: Scorpio"]);
+      expect(dropped.op).toBe("result");
+      if (dropped.op !== "result") return;
+      expect((dropped.result as { recycled?: boolean }).recycled).toBe(true);
+
+      // The note is gone (recycled), a `note_dispersed` observation describes
+      // the puff to the room, and chat:drop suppressed its `dropped`
+      // observation and "You drop X." tell so the room sees one chat line,
+      // not two.
+      expect(world.objects.has(noteId)).toBe(false);
+      const dispersed = dropped.observations.find((o) => o.type === "note_dispersed");
+      expect(dispersed).toMatchObject({ type: "note_dispersed", note: noteId, room: roomId, actor: requester });
+      expect(String((dispersed as { text?: string }).text ?? "")).toContain("puff of smoke");
+      expect(String((dispersed as { text?: string }).text ?? "")).toContain("Horoscope: Scorpio");
+      expect(dropped.observations.some((o) => o.type === "dropped")).toBe(false);
+      expect(dropped.observations.some((o) => o.type === "text" && (o as { target?: string }).target === requester && String((o as { text?: string }).text ?? "").startsWith("You drop"))).toBe(false);
+    });
+
+    it("$dispensed_note moves normally between non-space targets (e.g. handed to another actor)", async () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_handoff_room";
+      world.createObject({ id: roomId, name: "Lobby", parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:handoff-owner");
+      const blockId = "obj_test_disp_handoff_block";
+      world.createObject({ id: blockId, name: "Vending", parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const aliceSess = world.auth("guest:handoff-alice");
+      const bobSess = world.auth("guest:handoff-bob");
+      const ordered = await world.directCall("handoff-order", aliceSess.actor, blockId, "order", ["leo"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+      const key = world.createApiKey("$wiz", blockId, "test-handoff-plug");
+      world.auth(`apikey:${key.id}:${key.secret}`);
+      const delivered = await world.directCall("handoff-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Leo", "Roar.", null]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+      expect(world.object(noteId).location).toBe(aliceSess.actor);
+
+      // Wizard helper to drive the moveto chain across the actor->actor
+      // hand-off (no chat verb covers this case yet).
+      installVerb(world, "$wiz", "give_for_test", `verb :give_for_test(item, recipient) rxd { return moveto(item, recipient); }`, null);
+      const handed = await world.directCall("handoff-give", aliceSess.actor, "$wiz", "give_for_test", [noteId, bobSess.actor]);
+      expect(handed.op).toBe("result");
+      // Note still exists, just changed location.
+      expect(world.objects.has(noteId)).toBe(true);
+      expect(world.object(noteId).location).toBe(bobSess.actor);
+      expect(handed.op === "result" && handed.observations.some((o) => o.type === "note_dispersed")).toBe(false);
+    });
+
+    it("$dispensed_note:moveto is not a public direct-callable surface", async () => {
+      // Lockdown: a REST/MCP caller who knows a dispensed-note id must not be
+      // able to recycle or move it by calling :moveto directly. The verb is
+      // dispatched only from the substrate's moveto chain (drop/give).
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["dispenser"]);
+      const roomId = "obj_test_disp_lockdown_room";
+      world.createObject({ id: roomId, name: "Vault", parent: "$space", owner: "$wiz", location: null });
+      const ownerSess = world.auth("guest:lock-owner");
+      const blockId = "obj_test_disp_lockdown_block";
+      world.createObject({ id: blockId, name: "Vending", parent: "$dispenser_block", owner: ownerSess.actor, location: roomId });
+      world.setProp(blockId, "rate_limit_seconds", 0);
+      world.setProp(blockId, "block_cooldown_seconds", 0);
+
+      const aliceSess = world.auth("guest:lock-alice");
+      const ordered = await world.directCall("lock-order", aliceSess.actor, blockId, "order", ["aries"]);
+      expect(ordered.op).toBe("result");
+      if (ordered.op !== "result") return;
+      const orderId = (ordered.result as { order_id: string }).order_id;
+      const key = world.createApiKey("$wiz", blockId, "test-lock-plug");
+      world.auth(`apikey:${key.id}:${key.secret}`);
+      const delivered = await world.directCall("lock-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Aries", "Charge ahead.", null]);
+      expect(delivered.op).toBe("result");
+      if (delivered.op !== "result") return;
+      const noteId = (delivered.result as { note: string }).note;
+
+      const stranger = world.auth("guest:lock-stranger");
+      const attack = await world.directCall("lock-attack", stranger.actor, noteId, "moveto", [roomId]);
+      expect(attack.op).toBe("error");
+      if (attack.op === "error") expect(attack.error.code).toBe("E_DIRECT_DENIED");
+      expect(world.objects.has(noteId)).toBe(true);
+    });
+
     it("blocks-demo seeds visible weather and horoscope blocks with useful look output", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["blocks-demo"]);

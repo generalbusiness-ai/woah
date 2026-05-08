@@ -3004,6 +3004,8 @@ function isChatObservation(observation: any) {
     "blocked_exit",
     "taken",
     "dropped",
+    "note_read",
+    "note_dispersed",
     "huh",
     "dubspace_activity",
     "dubspace_entered",
@@ -3264,6 +3266,18 @@ function receiveChatEvent(observation: any, shouldRender = true) {
     && state.actor
     && observation.actor === state.actor
   ) return;
+  // `note_read` carries the full note body in `observation.text` (per the
+  // $note schema). The reader wants to see the body inline in chat;
+  // bystanders should get a brief "X reads Y." line instead of the entire
+  // body dumped into their feed.
+  let lineText = typeof observation.text === "string" ? observation.text : chatSystemText(observation);
+  if (
+    kind === "note_read"
+    && typeof observation.actor === "string"
+    && (!state.actor || observation.actor !== state.actor)
+  ) {
+    lineText = chatSystemText(observation);
+  }
   pushChatLine({
     kind,
     actor: typeof observation.actor === "string" ? observation.actor : undefined,
@@ -3272,7 +3286,7 @@ function receiveChatEvent(observation: any, shouldRender = true) {
     style: typeof observation.style === "string" ? observation.style : undefined,
     reason: typeof observation.reason === "string" ? observation.reason : undefined,
     source: chatObservationSource(observation),
-    text: typeof observation.text === "string" ? observation.text : chatSystemText(observation),
+    text: lineText,
     ts: typeof observation.ts === "number" ? observation.ts : undefined
   }, shouldRender);
 }
@@ -3378,6 +3392,8 @@ function chatSystemText(observation: any): string | undefined {
   if (type === "blocked_exit") return String(observation.text ?? "You can't go that way.");
   if (type === "taken") return String(observation.text ?? `${actorLabel(String(observation.actor ?? ""))} takes something.`);
   if (type === "dropped") return String(observation.text ?? `${actorLabel(String(observation.actor ?? ""))} drops something.`);
+  if (type === "note_read") return `${actorLabel(String(observation.actor ?? ""))} reads ${actorLabel(String(observation.note ?? ""))}.`;
+  if (type === "note_dispersed") return String(observation.text ?? `${actorLabel(String(observation.note ?? ""))} disperses in a puff of smoke.`);
   return undefined;
 }
 

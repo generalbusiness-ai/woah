@@ -1,6 +1,6 @@
 ---
 name: dispenser
-version: 0.2.2
+version: 0.2.3
 spec_version: v1
 license: MIT
 description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The plug supplies the note's listing name, markdown text, and optional one-line look-at description via :deliver(order_id, name, text, description).
@@ -60,6 +60,10 @@ A `$note` subclass with `produced_by` (the producing block) and
 requester's inventory; the room sees a sequenced `delivered`
 observation describing the event for bystanders. The requester also gets
 a direct text observation when the note lands.
+
+Dispensed notes are ephemeral: dropping one into a `$space` recycles it
+and emits `note_dispersed` ("X drops Y, which disperses in a puff of
+smoke."). Hand-offs to other actors or containers move normally.
 
 ## Subclassing
 
