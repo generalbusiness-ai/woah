@@ -28,6 +28,24 @@ export function scopedHerePresentActors(here: any): string[] {
   return idsFromRefsOrSummaries(Array.isArray(here?.present_actors) ? here.present_actors : []);
 }
 
+// `who` puts present_actors at the top level of the observation; `looked`
+// (built by chat's `:look_at`) nests the room view — including its
+// present_actors — under `look`. The look-derived list is only meaningful
+// when the looker was looking at the room itself; `look at <object>`
+// dispatches to the target's own `look_self`, whose present_actors (if
+// any) belongs to that target, not the looker's room.
+export function presentActorsFromObservation(observation: any): string[] {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return [];
+  if (Array.isArray(observation.present_actors)) return idsFromRefsOrSummaries(observation.present_actors);
+  if (String(observation.type ?? "") !== "looked") return [];
+  const room = typeof observation.room === "string" ? observation.room : "";
+  const target = typeof observation.target === "string" ? observation.target : "";
+  if (target && target !== room) return [];
+  const view = observation.look;
+  if (!view || typeof view !== "object" || Array.isArray(view) || !Array.isArray(view.present_actors)) return [];
+  return idsFromRefsOrSummaries(view.present_actors);
+}
+
 export function scopedModelWithHere(model: ScopedProjectionStateModel, here: any): ScopedProjectionStateModel {
   const cursor = cursorWithHereSnapshot(model.cursor, here);
   const me = model.me && typeof model.me === "object" && !Array.isArray(model.me)

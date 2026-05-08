@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   advanceProjectionCursor,
   idsFromRefsOrSummaries,
+  presentActorsFromObservation,
   scopedHerePresentActors,
   scopedModelWithMoveResult,
   type ScopedProjectionStateModel
@@ -54,5 +55,51 @@ describe("scoped client projection helpers", () => {
 
   it("normalizes mixed ref and summary arrays", () => {
     expect(idsFromRefsOrSummaries(["guest_1", { id: "guest_2", name: "Guest Two" }, null])).toEqual(["guest_1", "guest_2"]);
+  });
+
+  describe("presentActorsFromObservation", () => {
+    it("prefers a top-level present_actors (the `who` shape)", () => {
+      const observation = {
+        type: "who",
+        room: "the_deck",
+        present_actors: ["guest_3", { id: "guest_5", name: "Guest Five" }]
+      };
+      expect(presentActorsFromObservation(observation)).toEqual(["guest_3", "guest_5"]);
+    });
+
+    it("falls back to `look.present_actors` for `looked` events targeting the room", () => {
+      const observation = {
+        type: "looked",
+        room: "the_deck",
+        target: "the_deck",
+        look: { id: "the_deck", present_actors: ["guest_3", "guest_5"] }
+      };
+      expect(presentActorsFromObservation(observation)).toEqual(["guest_3", "guest_5"]);
+    });
+
+    it("treats a missing target as looking at the room", () => {
+      const observation = {
+        type: "looked",
+        room: "the_deck",
+        look: { present_actors: ["guest_3"] }
+      };
+      expect(presentActorsFromObservation(observation)).toEqual(["guest_3"]);
+    });
+
+    it("does not leak a sub-object's present_actors when looking at it (e.g. pinboard)", () => {
+      const observation = {
+        type: "looked",
+        room: "the_deck",
+        target: "the_pinboard",
+        look: { id: "the_pinboard", present_actors: ["guest_99"] }
+      };
+      expect(presentActorsFromObservation(observation)).toEqual([]);
+    });
+
+    it("returns [] for non-looked observations without a top-level list", () => {
+      expect(presentActorsFromObservation({ type: "text", room: "the_deck" })).toEqual([]);
+      expect(presentActorsFromObservation({ type: "entered", room: "the_deck", actor: "guest_3" })).toEqual([]);
+      expect(presentActorsFromObservation(null)).toEqual([]);
+    });
   });
 });

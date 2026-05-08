@@ -11,7 +11,7 @@ import * as taskspaceUiModule from "../../catalogs/taskspace/ui/taskspace-worksp
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
-import { advanceProjectionCursor, idsFromRefsOrSummaries, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
+import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -3027,7 +3027,7 @@ function receiveChatEvent(observation: any, shouldRender = true) {
   ) return;
   applyScopedChatObservation(observation);
   const kind = chatLineKind(observation);
-  const presentActors = Array.isArray(observation.present_actors) ? observation.present_actors.map(String) : [];
+  const presentActors = presentActorsFromObservation(observation);
   // Only adopt present_actors as the chat sidebar list when the observation
   // came from the actor's current chat room; a `look at pinboard` from the
   // deck would otherwise overwrite the deck's presence list with the
