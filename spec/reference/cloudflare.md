@@ -97,13 +97,43 @@ Suspended tasks (`SUSPEND`, `FORK`, `READ`-with-timeout) are durable on the park
 
 Each WebSocket connects to its player's DO directly (singleton-per-player). The Worker performs auth then forwards the upgraded WebSocket to the appropriate DO via `fetch` with the WebSocket attached.
 
+### R1.8 Teardown
+
+When a recycle drains a DO's hosted *payload* count to zero (host-scoped
+support copies do not count — see [../semantics/recycle.md §RC11.1](../semantics/recycle.md#rc111-trigger)),
+the DO migrates its tombstone roster to the Directory (via
+`POST /__internal/inherit-tombstones`) and calls
+`state.storage.deleteAll()`. Storage is deallocated atomically; the
+in-memory instance is evicted on the next idle. **The DO id remains
+reachable**: a stale stub can re-activate an empty instance under the
+same id, and that activation must hit the cold-load guard below. This is
+the only place in the substrate that uses `deleteAll`. See
+[../semantics/recycle.md §RC11](../semantics/recycle.md#rc11-host-teardown-after-recycle)
+for the full sequence and [persistence.md §14.2.2](persistence.md#1422-inherited-tombstones-after-host-teardown)
+for the Directory's inherited-tombstone authority.
+
+A DO whose storage is empty at cold-load (i.e. a stale stub reached a DO
+that previously tore down) MUST consult Directory's `inherited_tombstone`
+before running any cold-load seed (§R9.1). If the DO's own id appears as
+`former_host`, the DO refuses all inbound requests with `E_HOST_RECYCLED`
+and does not write any storage rows; it remains empty and is evicted on
+the next idle. (Directory lookups for ULIDs covered by inherited
+tombstones answer `E_OBJNF` directly — see [persistence.md §14.2.2](persistence.md#1422-inherited-tombstones-after-host-teardown).
+The two codes intentionally differ: `E_HOST_RECYCLED` flags the dead-DO
+race; `E_OBJNF` flags a stale ULID dereference.)
+
+`DEFAULT_OBJECT_HOST` (the world DO that hosts `$wiz`, `$system`,
+`$catalog_registry`, …) is exempt: its hosted set always contains the
+bootstrap floor, so the trigger never fires. The Directory DO itself
+also never tears down.
+
 ---
 
 ## R2. Singleton DOs
 
 | DO | Purpose |
 |---|---|
-| `Directory` | Holds the corename map, `objref -> host` routing table, session routing index, and small world metadata. Read-mostly, off the hot path. Does **not** mint IDs. |
+| `Directory` | Holds the corename map, `objref -> host` routing table, session routing index, inherited tombstones from torn-down hosts (per [persistence.md §14.2.2](persistence.md#1422-inherited-tombstones-after-host-teardown)), and small world metadata. Read-mostly, off the hot path. Does **not** mint IDs. |
 | `QuotaAccountant` | Periodic eventually-consistent accounting. See [quotas.md](quotas.md). |
 | `$system` (`#0`) | Bootstrap object. Holds corename properties. |
 

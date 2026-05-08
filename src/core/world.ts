@@ -27,7 +27,7 @@ import type { ObjectRepository, ParkedTaskRecord, SerializedObject, SerializedPr
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import { normalizeVerbPerms } from "./verb-perms";
-import { compileVerb } from "./authoring";
+import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
@@ -158,6 +158,12 @@ export type HostBridge = {
   setSpaceSubscriber(space: ObjRef, actor: ObjRef, present: boolean, sessionId?: string): Promise<void>;
   spaceAudienceSessions?(space: ObjRef, actors?: ObjRef[], memo?: HostOperationMemo): Promise<string[]>;
   actorSessionLocations?(actor: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]>;
+  // Batched form of actorSessionLocations: one RPC per host instead of one
+  // per actor. Used by `scrubStaleSubscribersForSpace`, which on a busy room
+  // would otherwise issue N parallel calls (a chat room with 11 subscribers
+  // wedged the worker's subrequest budget in production). Hosts that don't
+  // implement this fall back to the single-actor path.
+  actorSessionLocationsBatch?(actors: ObjRef[], memo?: HostOperationMemo): Promise<Map<ObjRef, ObjRef[]>>;
   contents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]>;
   // Cross-host MCP reachability (spec/protocol/mcp.md §M3). Asks the host
   // owning each id for tool descriptors covering that id's tool-exposed verbs
@@ -374,6 +380,13 @@ export class WooWorld {
   // One host runs one behavior at a time. Awaited cross-host RPC must not let a
   // second local behavior mutate the same in-memory state mid-savepoint.
   private hostQueue: Promise<unknown> = Promise.resolve();
+  // Diagnostic instrumentation for the host-task queue. `currentHostTask`
+  // tracks the task that's actively executing (between start and done) so a
+  // newly-enqueued task can log who it's blocked behind. `hostTaskQueueDepth`
+  // is the count of tasks waiting for the current to settle.
+  private hostTaskCounter = 0;
+  private currentHostTask: { id: number; label: string; startedAt: number } | null = null;
+  private hostTaskQueueDepth = 0;
   private metricsHook: ((event: MetricEvent) => void) | null = null;
   // O(1) presence lookup. `session_subscribers` is authoritative for live
   // sessions; `subscribers` remains a compatibility actor projection for
@@ -1637,7 +1650,7 @@ export class WooWorld {
   }
 
   async call(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.callNow(frameId, sessionId, space, message));
+    return await this.enqueueHostTask(() => this.callNow(frameId, sessionId, space, message), `call:${message.target}:${message.verb}`);
   }
 
   private async callNow(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
@@ -1664,8 +1677,81 @@ export class WooWorld {
     return frame;
   }
 
-  private async enqueueHostTask<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.hostQueue.then(fn, fn);
+  private async enqueueHostTask<T>(fn: () => Promise<T>, label: string = "task"): Promise<T> {
+    const id = ++this.hostTaskCounter;
+    this.hostTaskQueueDepth += 1;
+    const queueDepth = this.hostTaskQueueDepth;
+    this.recordMetric({ kind: "host_task_enqueue", id, label, queue_depth: queueDepth });
+    // If a task is currently in flight when we enqueue, surface who we're
+    // queued behind and how long they've already been running. This is the
+    // primary fingerprint of a wedge: when an MCP call hangs forever, the
+    // tail will show its host_task_blocked event pointing at the in-flight
+    // task that never settles.
+    if (this.currentHostTask) {
+      this.recordMetric({
+        kind: "host_task_blocked",
+        new_id: id,
+        new_label: label,
+        current_id: this.currentHostTask.id,
+        current_label: this.currentHostTask.label,
+        current_elapsed_ms: Date.now() - this.currentHostTask.startedAt,
+        queue_depth: queueDepth
+      });
+    }
+    const enqueuedAt = Date.now();
+    const run = this.hostQueue.then(async () => {
+      const startedAt = Date.now();
+      this.currentHostTask = { id, label, startedAt };
+      this.hostTaskQueueDepth -= 1;
+      this.recordMetric({ kind: "host_task_start", id, label, queued_ms: startedAt - enqueuedAt });
+      // 3-second watchdog. Wedged tasks stay in this loop indefinitely until
+      // the task settles, surfacing a steady drumbeat in the tail. Cleared
+      // in the finally below so a settled task emits no further long-running
+      // events.
+      const watchdogTimers: ReturnType<typeof setTimeout>[] = [];
+      const armWatchdog = (afterMs: number): void => {
+        const timer = setTimeout(() => {
+          if (this.currentHostTask?.id === id) {
+            this.recordMetric({ kind: "host_task_long_running", id, label, elapsed_ms: Date.now() - startedAt });
+            armWatchdog(3000);
+          }
+        }, afterMs);
+        watchdogTimers.push(timer);
+      };
+      armWatchdog(3000);
+      try {
+        const result = await fn();
+        this.recordMetric({ kind: "host_task_done", id, label, ms: Date.now() - startedAt, status: "ok" });
+        return result;
+      } catch (err) {
+        const error = normalizeError(err);
+        this.recordMetric({ kind: "host_task_done", id, label, ms: Date.now() - startedAt, status: "error", error: error.code });
+        throw err;
+      } finally {
+        for (const timer of watchdogTimers) clearTimeout(timer);
+        if (this.currentHostTask?.id === id) this.currentHostTask = null;
+      }
+    }, async () => {
+      // Previous link rejected. We don't propagate that rejection to this
+      // task — preserve the original semantics where errors from one task
+      // don't poison subsequent tasks. The old code had the same shape via
+      // `then(fn, fn)`; this just keeps the diagnostic wrapping consistent.
+      const startedAt = Date.now();
+      this.currentHostTask = { id, label, startedAt };
+      this.hostTaskQueueDepth -= 1;
+      this.recordMetric({ kind: "host_task_start", id, label, queued_ms: startedAt - enqueuedAt });
+      try {
+        const result = await fn();
+        this.recordMetric({ kind: "host_task_done", id, label, ms: Date.now() - startedAt, status: "ok" });
+        return result;
+      } catch (err) {
+        const error = normalizeError(err);
+        this.recordMetric({ kind: "host_task_done", id, label, ms: Date.now() - startedAt, status: "error", error: error.code });
+        throw err;
+      } finally {
+        if (this.currentHostTask?.id === id) this.currentHostTask = null;
+      }
+    });
     this.hostQueue = run.then(
       () => undefined,
       () => undefined
@@ -1674,15 +1760,15 @@ export class WooWorld {
   }
 
   async directCall(frameId: string | undefined, actor: ObjRef, target: ObjRef, verbName: string, args: WooValue[], options: DirectCallOptions = {}): Promise<DirectResultFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.directCallNow(frameId, actor, target, verbName, args, options));
+    return await this.enqueueHostTask(() => this.directCallNow(frameId, actor, target, verbName, args, options), `directCall:${target}:${verbName}`);
   }
 
   async planCommand(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.planCommandNow(frameId, sessionId, space, text));
+    return await this.enqueueHostTask(() => this.planCommandNow(frameId, sessionId, space, text), `planCommand:${space}`);
   }
 
   async command(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
-    return await this.enqueueHostTask(() => this.commandNow(frameId, sessionId, space, text, options));
+    return await this.enqueueHostTask(() => this.commandNow(frameId, sessionId, space, text, options), `command:${space}`);
   }
 
   private async commandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string, options: CommandOptions = {}): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
@@ -2076,44 +2162,62 @@ export class WooWorld {
   }
 
   async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
-    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt));
+    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt), `dispatch:${target}:${verbName}`);
   }
 
-  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
+  async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {
+    let result: WooValue;
     if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      return await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
-    }
-    if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
-    this.callDepth += 1;
-    try {
-      // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
-      // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
-      // as "no parent override" and fall back to the standard resolveVerb walk.
-      const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
-      this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-      const runCtx: CallContext = {
-        ...ctx,
-        thisObj: target,
-        verbName,
-        definer,
-        callerPerms: ctx.progr,
-        progr: verb.owner,
-        player: ctx.player ?? ctx.actor,
-        caller: ctx.caller ?? "#-1"
-      };
-      if (verb.kind === "native") {
-        // Native handlers are an implementation detail behind ordinary verb
-        // dispatch. The dispatch path above has already enforced verb execute
-        // permissions and set progr/definer/caller frame fields.
-        const handler = this.nativeHandlers.get(verb.native);
-        if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
-        return await handler(runCtx, args);
+      result = await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
+    } else {
+      if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
+      this.callDepth += 1;
+      try {
+        // startAt is `undefined` for an ordinary call and a definer ref for `pass()`.
+        // Cross-host dispatch serializes `undefined` as JSON `null`, so treat both
+        // as "no parent override" and fall back to the standard resolveVerb walk.
+        const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
+        this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
+        const runCtx: CallContext = {
+          ...ctx,
+          thisObj: target,
+          verbName,
+          definer,
+          callerPerms: ctx.progr,
+          progr: verb.owner,
+          player: ctx.player ?? ctx.actor,
+          caller: ctx.caller ?? "#-1"
+        };
+        if (verb.kind === "native") {
+          // Native handlers are an implementation detail behind ordinary verb
+          // dispatch. The dispatch path above has already enforced verb execute
+          // permissions and set progr/definer/caller frame fields.
+          const handler = this.nativeHandlers.get(verb.native);
+          if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
+          result = await handler(runCtx, args);
+        } else {
+          result = await runTinyVm(runCtx, verb.bytecode, args);
+        }
+      } finally {
+        this.callDepth -= 1;
       }
-      return await runTinyVm(runCtx, verb.bytecode, args);
-    } finally {
-      this.callDepth -= 1;
     }
+    if (typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 0) {
+      if (typeof result === "string" && result.length > maxChars) {
+        throw wooError("E_TOOBIG", `dispatch result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: result.length, max: maxChars });
+      }
+      if (Array.isArray(result)) {
+        let total = 0;
+        for (const entry of result) {
+          if (typeof entry === "string") total += entry.length;
+          if (total > maxChars) {
+            throw wooError("E_TOOBIG", `dispatch list result exceeded ${maxChars}-character bound`, { target, verb: verbName, size: total, max: maxChars });
+          }
+        }
+      }
+    }
+    return result;
   }
 
   state(actor?: ObjRef): WorldSnapshot {
@@ -2474,59 +2578,93 @@ export class WooWorld {
     return result;
   }
 
-  async builderRecycle(actor: ObjRef, objRef: ObjRef, opts: WooValue, surfaceClass: ObjRef, ctx?: CallContext): Promise<WooValue> {
-    this.assertBuilderActor(actor, surfaceClass);
+  /**
+   * The single `recycle(obj, opts?)` builtin — replaces the former
+   * builder_recycle / wiz_force_recycle pair. Per spec/semantics/recycle.md
+   * §RC1–RC6.
+   *
+   * Authority (RC2): the calling `progr` must be a wizard or `obj.owner` —
+   * equivalent to LambdaMOO's `controls(progr, oid)`. The substrate gates on
+   * `progr` (the verb's effective principal), not `actor` (the original
+   * caller), so a verb running with elevated authority can recycle objects it
+   * owns even when the actor that triggered the verb cannot. The `actor` is
+   * preserved separately for audit and observation traceability.
+   *
+   * opts:
+   *   - dry_run:        bool — preview the impact, no mutation.
+   *   - force:          bool — bypass §RC3a empty-children safety check.
+   *                     Available to anyone with §RC2 authority. The substrate
+   *                     always grafts/displaces; the check exists as a
+   *                     guard against fat-finger destruction of populated
+   *                     classes/containers.
+   *   - force_reserved: bool — wizard-only (checked against `actor`, not
+   *                     `progr`). Bypasses §RC6 reserved-list (universal
+   *                     classes other than hard floor) and terminates live
+   *                     actor sessions before apply. Hard floor ($system,
+   *                     $root, $nowhere) and pre-flights A3/A4 still apply.
+   *                     Records a wiz_force_recycle wizard_action audit and
+   *                     emits a wiz_force_recycle observation. Gating on
+   *                     actor (not progr) prevents privilege escalation
+   *                     through catalog-owned wrappers: a non-wizard caller
+   *                     cannot smuggle force_reserved into a wizard-owned
+   *                     wrapper that forwards opts unchanged.
+   *   - reason:         str — audit text (used when force_reserved is true).
+   */
+  async recycleChecked(progr: ObjRef, actor: ObjRef, objRef: ObjRef, opts: WooValue, ctx?: CallContext): Promise<WooValue> {
     const options = progOptions(opts);
     const dryRun = optionBool(options, "dry_run", false);
     const force = optionBool(options, "force", false);
+    const forceReserved = optionBool(options, "force_reserved", false);
+    const reason = optionMaybeString(options, "reason") ?? null;
 
-    // Pre-flight A1 (authority): wizard or owner. assertCanBuildOwnedObject
-    // covers both. We resolve `obj` first because the helpers want it.
-    const obj = this.object(objRef);
-    this.assertCanBuildOwnedObject(actor, objRef);
-
-    // Pre-flight A2 (reserved). The §RC6 forbidden list. Live-actor
-    // detection is the real session-binding check: an actor with at least
-    // one live session is unrecyclable through ordinary tools per §RC6.
-    // Recycling an actor with no live sessions is permitted (subject to
-    // the §RC2 wizard/owner check enforced above by
-    // assertCanBuildOwnedObject).
-    this.assertNotReservedForRecycle(objRef);
-    if (this.inheritsFrom(objRef, "$actor") && this.hasLiveSessions(objRef)) {
-      throw wooError("E_PERM", "actor has live sessions; cannot be recycled through builder tools", { actor, obj: objRef });
+    // force_reserved gates on actor, not progr. The opt expresses end-user
+    // intent to invoke RC6.1 sweeping authority (terminate sessions, bypass
+    // reserved-list); a wizard-owned wrapper forwarding opts must not
+    // launder that intent on behalf of a non-wizard caller.
+    if (forceReserved && !this.isWizard(actor)) {
+      throw wooError("E_PERM", "wizard authority required for force_reserved", { progr, actor, obj: objRef });
     }
 
-    // Pre-flight A3 (anchored descendants).
+    const obj = this.object(objRef);
+    this.assertCanBuildOwnedObject(progr, objRef);
+
+    const hardFloor = new Set(["$system", "$root", "$nowhere"]);
+    if (hardFloor.has(objRef)) {
+      throw wooError("E_INVARG", `${objRef} cannot be recycled from inside the running world`, objRef);
+    }
+
+    if (!forceReserved) {
+      this.assertNotReservedForRecycle(objRef);
+      if (this.inheritsFrom(objRef, "$actor") && this.hasLiveSessions(objRef)) {
+        throw wooError("E_PERM", "actor has live sessions; cannot be recycled (wizard may pass force_reserved: true to terminate sessions)", { progr, actor, obj: objRef });
+      }
+    }
+
     const anchored = this.findAnchoredDescendants(objRef);
     if (anchored.length > 0) throw wooError("E_NACC", `${objRef} has anchored descendants`, { obj: objRef, descendants: anchored as WooValue });
 
-    // Pre-flight A4 (cluster collocation): obj's parent, location, children,
-    // and contents must share obj's host (or be the well-known $nowhere
-    // sink). For single-host worlds these are local; for hostBridge-enabled
-    // worlds we ask remoteHostForObject. The existing objRef-side check
-    // catches the most common failure (recycling an object that lives on
-    // another host).
     if (await this.remoteHostForObject(objRef)) {
-      throw wooError("E_CROSS_HOST_WRITE", `cross-host recycle is not atomic: ${objRef}`, { actor, obj: objRef });
+      throw wooError("E_CROSS_HOST_WRITE", `cross-host recycle is not atomic: ${objRef}`, { progr, actor, obj: objRef });
     }
     if (obj.parent && obj.parent !== "$nowhere" && await this.remoteHostForObject(obj.parent)) {
-      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via parent: ${objRef} -> ${obj.parent}`, { actor, obj: objRef, parent: obj.parent });
+      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via parent: ${objRef} -> ${obj.parent}`, { progr, actor, obj: objRef, parent: obj.parent });
     }
     if (obj.location && obj.location !== "$nowhere" && await this.remoteHostForObject(obj.location)) {
-      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via location: ${objRef} -> ${obj.location}`, { actor, obj: objRef, location: obj.location });
+      throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via location: ${objRef} -> ${obj.location}`, { progr, actor, obj: objRef, location: obj.location });
     }
     for (const child of obj.children) {
       if (child !== "$nowhere" && await this.remoteHostForObject(child)) {
-        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via child: ${objRef} -> ${child}`, { actor, obj: objRef, child });
+        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via child: ${objRef} -> ${child}`, { progr, actor, obj: objRef, child });
       }
     }
     for (const content of obj.contents) {
       if (content !== "$nowhere" && await this.remoteHostForObject(content)) {
-        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via content: ${objRef} -> ${content}`, { actor, obj: objRef, content });
+        throw wooError("E_CROSS_HOST_WRITE", `recycle would cross clusters via content: ${objRef} -> ${content}`, { progr, actor, obj: objRef, content });
       }
     }
 
-    const impact = {
+    const sessionsToKill = forceReserved && this.inheritsFrom(objRef, "$actor") ? this.liveSessionsForActor(objRef) : [];
+    const impact: Record<string, WooValue> = {
       id: objRef,
       parent: obj.parent,
       location: obj.location,
@@ -2537,154 +2675,53 @@ export class WooWorld {
       own_verbs: obj.verbs.length,
       own_properties: obj.propertyDefs.size
     };
+    if (forceReserved) impact.sessions_to_kill = sessionsToKill.map((s) => s.id) as WooValue;
 
-    // Builder-surface safety check (§RC3a): refuse non-empty objects unless
-    // `force: true`. The engine apply phase always grafts/displaces; this
-    // safety check exists only at the authoring surface.
+    // RC3a: empty-children safety check.
     if (!force && (obj.children.size > 0 || obj.contents.size > 0)) {
       throw wooError("E_RECMOVE", `${objRef} still has children or contents (pass force: true to recycle anyway)`, impact as WooValue);
     }
-    const result = { ok: true, dry_run: dryRun, id: objRef, impact: impact as WooValue };
-    if (dryRun) return result;
-
-    // Apply step 1: fire :recycle handler. Errors caught and surfaced as a
-    // $recycle_handler_error observation; recycle proceeds.
-    await this.invokeRecycleHandler(objRef, ctx);
-
-    // Apply step 1a: post-handler A4 re-check.
-    await this.assertPostHandlerCollocation(actor, objRef);
-
-    this.recycleObjectLocal(objRef);
-
-    // Step 10: post-commit corename removal. In the single-host backend,
-    // `$foo` IS the object's id, so `objects.delete(objRef)` already
-    // unbinds the corename. As a defensive sweep we also walk $system's
-    // own properties and clear any whose value is the tombstoned ULID — a
-    // catalog or wizard verb that stamped `$system.my_link = obj` will see
-    // `null` after recycle. Per spec/semantics/recycle.md §RC3 step 10.
-    // Best-effort and idempotent; failure here does NOT abort recycle.
-    try {
-      this.reconcileTombstoneRefsInSystem();
-    } catch {
-      // Ignored: see janitor contract above.
-    }
-    return result;
-  }
-
-  /**
-   * Wizard-only force_recycle. Per spec/semantics/recycle.md §RC6.1.
-   *
-   * Bypasses most of the §RC6 reserved-list (universal classes other than
-   * the hard floor; live actors with explicit session teardown).
-   * Bypasses neither:
-   *   - The §RC2 wizard authority (actor must have wizard flag).
-   *   - The hard floor: $system, $root, $nowhere (not recoverable from
-   *     inside the running world).
-   *   - Pre-flight A3 (anchored descendants).
-   *   - Pre-flight A4 (cluster collocation): even a wizard cannot
-   *     atomically recycle across clusters in v1.
-   *
-   * For an actor target with live sessions, terminates each session
-   * (endSession) before invoking the apply phase. Records a
-   * wiz_force_recycle wizard_action audit entry and emits a
-   * wiz_force_recycle observation on the outer call frame.
-   */
-  async wizForceRecycle(actor: ObjRef, objRef: ObjRef, opts: WooValue, ctx?: CallContext): Promise<WooValue> {
-    if (!this.isWizard(actor)) throw wooError("E_PERM", "wizard authority required for force_recycle", { actor, obj: objRef });
-    const options = progOptions(opts);
-    const dryRun = optionBool(options, "dry_run", false);
-    const reason = optionMaybeString(options, "reason") ?? null;
-
-    // Hard floor — even force_recycle refuses these.
-    const hardFloor = new Set(["$system", "$root", "$nowhere"]);
-    if (hardFloor.has(objRef)) {
-      throw wooError("E_INVARG", `${objRef} cannot be force-recycled from inside the running world`, objRef);
-    }
-
-    const obj = this.object(objRef);
-
-    // A3 anchored descendants still applies.
-    const anchored = this.findAnchoredDescendants(objRef);
-    if (anchored.length > 0) throw wooError("E_NACC", `${objRef} has anchored descendants`, { obj: objRef, descendants: anchored as WooValue });
-
-    // A4 cluster collocation still applies.
-    if (await this.remoteHostForObject(objRef)) {
-      throw wooError("E_CROSS_HOST_WRITE", `cross-host force_recycle is not atomic: ${objRef}`, { actor, obj: objRef });
-    }
-    if (obj.parent && obj.parent !== "$nowhere" && await this.remoteHostForObject(obj.parent)) {
-      throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via parent: ${objRef} -> ${obj.parent}`, { actor, obj: objRef, parent: obj.parent });
-    }
-    if (obj.location && obj.location !== "$nowhere" && await this.remoteHostForObject(obj.location)) {
-      throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via location: ${objRef} -> ${obj.location}`, { actor, obj: objRef, location: obj.location });
-    }
-    for (const child of obj.children) {
-      if (child !== "$nowhere" && await this.remoteHostForObject(child)) {
-        throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via child: ${objRef} -> ${child}`, { actor, obj: objRef, child });
-      }
-    }
-    for (const content of obj.contents) {
-      if (content !== "$nowhere" && await this.remoteHostForObject(content)) {
-        throw wooError("E_CROSS_HOST_WRITE", `force_recycle would cross clusters via content: ${objRef} -> ${content}`, { actor, obj: objRef, content });
-      }
-    }
-
-    const sessionsToKill = this.inheritsFrom(objRef, "$actor") ? this.liveSessionsForActor(objRef) : [];
-    const impact: Record<string, WooValue> = {
-      id: objRef,
-      parent: obj.parent,
-      location: obj.location,
-      child_count: obj.children.size,
-      children: Array.from(obj.children).sort(),
-      contents_count: obj.contents.size,
-      contents: Array.from(obj.contents).sort(),
-      own_verbs: obj.verbs.length,
-      own_properties: obj.propertyDefs.size,
-      sessions_to_kill: sessionsToKill.map((s) => s.id) as WooValue
-    };
 
     if (dryRun) {
-      return { ok: true, dry_run: true, id: objRef, impact: impact as WooValue, sessions_killed: 0 };
+      const result: Record<string, WooValue> = { ok: true, dry_run: true, id: objRef, impact: impact as WooValue };
+      if (forceReserved) result.sessions_killed = 0;
+      return result;
     }
 
-    // Terminate live sessions before recycle so the apply phase sees an
-    // unbound actor (and any in-flight host_calls return E_GONE per
-    // failures.md §F7).
     for (const session of sessionsToKill) {
       this.endSession(session.id);
     }
     const sessions_killed = sessionsToKill.length;
 
-    // Apply: handler, post-handler A4 recheck, parked-task kill,
-    // graft/displace, storage delete, tombstone, post-commit corename
-    // sweep. Same path as ordinary recycle.
     await this.invokeRecycleHandler(objRef, ctx);
-    await this.assertPostHandlerCollocation(actor, objRef);
+    await this.assertPostHandlerCollocation(progr, objRef);
     this.recycleObjectLocal(objRef);
     try {
       this.reconcileTombstoneRefsInSystem();
     } catch {
-      // Best-effort: see step 10 contract.
+      // Best-effort post-commit corename sweep; see RC3 step 10.
     }
 
-    // Audit. Per the spec, this is the only path that records a
-    // wiz_force_recycle wizard_action and emits a wiz_force_recycle
-    // observation on the outer call.
-    this.recordWizardAction(actor, "force_recycle", { obj: objRef, reason: reason as WooValue, sessions_killed });
-    if (ctx) {
-      const event: Observation = {
-        type: "wiz_force_recycle",
-        actor,
-        obj: objRef,
-        reason: reason as WooValue,
-        sessions_killed,
-        ts: Date.now(),
-        source: objRef
-      };
-      if (ctx.observe) ctx.observe(event);
-      else ctx.observations.push(event);
+    if (forceReserved) {
+      this.recordWizardAction(actor, "force_recycle", { obj: objRef, reason: reason as WooValue, sessions_killed });
+      if (ctx) {
+        const event: Observation = {
+          type: "wiz_force_recycle",
+          actor,
+          obj: objRef,
+          reason: reason as WooValue,
+          sessions_killed,
+          ts: Date.now(),
+          source: objRef
+        };
+        if (ctx.observe) ctx.observe(event);
+        else ctx.observations.push(event);
+      }
     }
 
-    return { ok: true, dry_run: false, id: objRef, impact: impact as WooValue, sessions_killed };
+    const result: Record<string, WooValue> = { ok: true, dry_run: false, id: objRef, impact: impact as WooValue };
+    if (forceReserved) result.sessions_killed = sessions_killed;
+    return result;
   }
 
   /**
@@ -2709,8 +2746,8 @@ export class WooWorld {
    * intra-cluster mutations roll back with the host transaction;
    * cross-cluster mutations are explicitly out of scope (§RC3.1).
    *
-   * Used by both ordinary recycle and wiz_force_recycle so they enforce
-   * the same atomicity invariant.
+   * Used by `recycleChecked` (force or non-force path) so all flavors
+   * enforce the same atomicity invariant.
    */
   private async assertPostHandlerCollocation(actor: ObjRef, objRef: ObjRef): Promise<void> {
     if (await this.remoteHostForObject(objRef)) {
@@ -2965,6 +3002,11 @@ export class WooWorld {
       version
     });
     if (dryRun) return summary;
+    const finalBytecode = { ...compiled.bytecode, version };
+    // Re-classify on every install — analyzer drives purity, manifest-style
+    // claims aren't available on this surface, and a `pure` flag set by an
+    // earlier install must NOT carry over silently when the source changes.
+    const pure = combineVerbPurity(analyzeBytecodePurity(finalBytecode), undefined, `${objRef}:${selected.name}`);
     this.addVerb(objRef, {
       kind: "bytecode",
       name: selected.name,
@@ -2975,12 +3017,17 @@ export class WooWorld {
       direct_callable: parsedPerms.directCallable,
       skip_presence_check: selected.current?.skip_presence_check,
       tool_exposed: selected.current?.tool_exposed,
+      pure: pure || undefined,
+      calls: compiled.metadata?.calls,
       source,
       source_hash: compiled.source_hash ?? hashSource(source),
-      bytecode: { ...compiled.bytecode, version },
+      bytecode: finalBytecode,
       version,
       line_map: compiled.line_map ?? {}
     }, { append: selected.append, slot: selected.current ? selected.slot : undefined });
+    // Run propagation so a transitively-pure new verb (and any callers that
+    // depend on it) get their flag updated to match the call graph.
+    propagateVerbPurity(this);
     return summary;
   }
 
@@ -4478,7 +4525,7 @@ export class WooWorld {
   }
 
   async deliverInput(player: ObjRef, input: WooValue): Promise<ParkedTaskRun | null> {
-    return await this.enqueueHostTask(() => this.deliverInputNow(player, input));
+    return await this.enqueueHostTask(() => this.deliverInputNow(player, input), `deliverInput:${player}`);
   }
 
   private async deliverInputNow(player: ObjRef, input: WooValue): Promise<ParkedTaskRun | null> {
@@ -4494,7 +4541,7 @@ export class WooWorld {
   }
 
   async runDueTasks(now = Date.now()): Promise<ParkedTaskRun[]> {
-    return await this.enqueueHostTask(() => this.runDueTasksNow(now));
+    return await this.enqueueHostTask(() => this.runDueTasksNow(now), "runDueTasks");
   }
 
   private async runDueTasksNow(now = Date.now()): Promise<ParkedTaskRun[]> {
@@ -6629,32 +6676,158 @@ export class WooWorld {
 
   private async scrubStaleSubscribersForSpace(space: ObjRef, progr: ObjRef, subscribers: ObjRef[], memo?: HostOperationMemo): Promise<ObjRef[]> {
     void progr;
-    if (!this.objects.has(space) || subscribers.length === 0) return subscribers;
+    if (!this.objects.has(space)) return subscribers;
     const now = Date.now();
     const last = this.lastSubscriberScrubAt.get(space) ?? 0;
     if (now - last < SUBSCRIBER_SCRUB_FLOOR_MS) return subscribers;
     this.lastSubscriberScrubAt.set(space, now);
-    const kept: ObjRef[] = [];
-    const stale: ObjRef[] = [];
-    await Promise.all(subscribers.map(async (actor) => {
-      const remote = await this.remoteHostForObject(actor, memo);
-      const localLocations = this.allLocationsForActor(actor);
-      let remoteLocations: ObjRef[] = [];
-      if (remote) {
-        try {
-          remoteLocations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
-        } catch (err) {
-          if (isReadAvailabilityError(err)) return;
-          throw err;
-        }
+    let survivingActors = subscribers;
+    if (subscribers.length > 0) {
+      const remoteActorsSet = new Set<ObjRef>();
+      for (const actor of subscribers) {
+        if (await this.remoteHostForObject(actor, memo)) remoteActorsSet.add(actor);
       }
-      const locations = remote ? Array.from(new Set([...localLocations, ...remoteLocations])) : localLocations;
-      if (locations.includes(space)) kept.push(actor);
-      else stale.push(actor);
+      const remoteLocationsByActor = await this.fetchRemoteSessionLocations(
+        Array.from(remoteActorsSet),
+        memo
+      );
+      const kept: ObjRef[] = [];
+      const stale: ObjRef[] = [];
+      for (const actor of subscribers) {
+        // A remote actor whose home host failed to answer (read-availability
+        // error) is left in `subscribers` and excluded from this read's
+        // survivingActors view, mirroring the per-actor path's behavior
+        // under the same error class. Without this guard a transient remote
+        // blip would mark the actor stale and persist a subscriber-row drop.
+        if (remoteActorsSet.has(actor) && !remoteLocationsByActor.has(actor)) continue;
+        const localLocations = this.allLocationsForActor(actor);
+        const remoteLocations = remoteLocationsByActor.get(actor) ?? [];
+        const locations = remoteActorsSet.has(actor)
+          ? Array.from(new Set([...localLocations, ...remoteLocations]))
+          : localLocations;
+        if (locations.includes(space)) kept.push(actor);
+        else stale.push(actor);
+      }
+      for (const actor of stale) this.updateSpaceSubscriberLocal(space, actor, false);
+      const keptSet = new Set(kept);
+      survivingActors = subscribers.filter((actor) => keptSet.has(actor));
+    }
+    // Sibling scrub: drop session_subscribers rows whose session has been
+    // reaped on this DO but whose row was never cleaned up because
+    // `removeSessionPresence` walks only the local object map and has no
+    // way to learn that a different DO recently expired a session it shares.
+    // Runs even for empty `subscribers` because session_subscribers can
+    // accumulate independently and an emptied room is exactly when stale
+    // session rows pile up. The returned `survivingActors` reflects the
+    // actor scrub only; the persisted `subscribers` property may be
+    // further trimmed by the session pass — by design, the two views
+    // converge under the property-change hook in setPropLocal which
+    // reinvalidates the presence index.
+    this.scrubExpiredSessionSubscribersForSpace(space);
+    return survivingActors;
+  }
+
+  /**
+   * Resolve `currentLocation` for each actor whose home host is not this DO,
+   * preferring a batched cross-host call so a room with N remote subscribers
+   * costs one RPC per host instead of N. Falls back to per-actor lookup for
+   * bridges that don't implement the batch method (older deployments and
+   * in-memory test bridges). Read-availability errors are swallowed so a
+   * cold or slow remote host doesn't hold the local single-threaded queue —
+   * actors whose locations are unknown stay in `subscribers` until the next
+   * scrub window. */
+  private async fetchRemoteSessionLocations(
+    remoteActors: ObjRef[],
+    memo?: HostOperationMemo
+  ): Promise<Map<ObjRef, ObjRef[]>> {
+    const out = new Map<ObjRef, ObjRef[]>();
+    if (remoteActors.length === 0 || !this.hostBridge) return out;
+    if (this.hostBridge.actorSessionLocationsBatch) {
+      try {
+        return await this.hostBridge.actorSessionLocationsBatch(remoteActors, memo);
+      } catch (err) {
+        if (!isReadAvailabilityError(err)) throw err;
+        return out;
+      }
+    }
+    await Promise.all(remoteActors.map(async (actor) => {
+      try {
+        const locations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
+        out.set(actor, locations);
+      } catch (err) {
+        if (!isReadAvailabilityError(err)) throw err;
+      }
     }));
-    for (const actor of stale) this.updateSpaceSubscriberLocal(space, actor, false);
-    const keptSet = new Set(kept);
-    return subscribers.filter((actor) => keptSet.has(actor));
+    return out;
+  }
+
+  /**
+   * Drop entries in `<space>.session_subscribers` whose session is present
+   * in this DO's session table AND already expired. Recomputes the
+   * actor-level `subscribers` mirror from the surviving rows so both views
+   * stay consistent.
+   *
+   * Intentionally narrow: rows whose session is missing from `this.sessions`
+   * may legitimately belong to a different DO that hasn't synced the session
+   * here yet, so dropping them would race cross-host setup. The actor-level
+   * scrub already handles dropping subscribers whose remote-host
+   * actorSessionLocations no longer reports this space; the broadcast layer
+   * (broadcastLiveEvent) handles the data-pollution case where rows remain
+   * but don't resolve to live sockets. TODO(cross-host-session-gc): have the
+   * gateway's session-end signal propagate to peer DOs (or have the
+   * Directory participate) so cross-host pollution can be cleaned at source
+   * instead of bandaged at broadcast time.
+   *
+   * `legacy:<actor>` placeholder entries are kept regardless: they are
+   * synthesized by `updateSpaceSubscriberLocal` for bridge-era hosts that
+   * have no per-session attribution.
+   *
+   * Throttling is the wrapper's job (`scrubStaleSubscribersForSpace` gates
+   * both passes under a single per-space window). This helper is unguarded
+   * by design — keep it that way and add a guard here if a second caller
+   * appears.
+   */
+  private scrubExpiredSessionSubscribersForSpace(space: ObjRef): void {
+    if (!this.objects.has(space)) return;
+    const raw = this.propOrNull(space, "session_subscribers");
+    if (!Array.isArray(raw) || raw.length === 0) return;
+    const now = Date.now();
+    let changed = false;
+    const out: WooValue[] = [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        changed = true;
+        continue;
+      }
+      const map = entry as Record<string, WooValue>;
+      const sessionId = typeof map.session === "string" ? map.session : "";
+      const actor: ObjRef | "" = typeof map.actor === "string" ? map.actor : "";
+      if (!sessionId || !actor) {
+        changed = true;
+        continue;
+      }
+      if (sessionId.startsWith("legacy:")) {
+        out.push(entry);
+        continue;
+      }
+      const session = this.sessions.get(sessionId);
+      if (session && this.sessionExpired(session, now)) {
+        changed = true;
+        continue;
+      }
+      out.push(entry);
+    }
+    if (!changed) return;
+    const nextActors = Array.from(new Set(out
+      .map((entry) => (entry as Record<string, WooValue>).actor)
+      .filter((actor): actor is ObjRef => typeof actor === "string")
+    )).sort();
+    // setProp invalidates the presence index via setPropLocal's
+    // subscribers/session_subscribers hook; no explicit invalidation needed.
+    this.withPersistenceDeferred(() => {
+      this.setProp(space, "session_subscribers", out as unknown as WooValue);
+      this.setProp(space, "subscribers", nextActors as unknown as WooValue);
+    });
   }
 
   private async defaultLookSelf(ctx: CallContext): Promise<WooValue> {
@@ -6710,8 +6883,7 @@ export class WooWorld {
 
   private isActorForLook(item: ObjRef, present: ObjRef[]): boolean {
     if (present.includes(item)) return true;
-    if (this.objects.has(item) && this.objects.has("$block") && this.inheritsFrom(item, "$block")) return false;
-    return this.objects.has(item) && this.inheritsFrom(item, "$actor");
+    return this.objects.has(item) && this.inheritsFrom(item, "$player");
   }
 
   private async propOrNullForActorAsync(actor: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
@@ -7164,53 +7336,19 @@ export class WooWorld {
     }
     if (!this.objects.has(item)) return item;
     try {
-      const value = await this.dispatch({ ...ctx, caller: room, progr: ctx.actor }, item, "title", []);
+      // 1024 chars is a generous upper bound for inventory/look titles
+      // (typical `name + ": " + 96-char preview` runs under 200) while still
+      // preventing a misbehaving or hostile :title() verb from materializing
+      // megabytes of text into room/inventory composition. On overflow,
+      // fall back to the bare object name like a missing :title() does.
+      const value = await this.dispatch({ ...ctx, caller: room, progr: ctx.actor }, item, "title", [], undefined, 1024);
       if (typeof value !== "string") throw wooError("E_TYPE", `${item}:title() must return a string`, value);
       return value;
     } catch (err) {
       const error = normalizeError(err);
-      if (error.code !== "E_VERBNF") throw err;
+      if (error.code !== "E_VERBNF" && error.code !== "E_TOOBIG") throw err;
       return this.objects.has(item) ? this.object(item).name : item;
     }
-  }
-
-  async noteTextSummary(ctx: CallContext, note: ObjRef, rawLimit: number): Promise<Record<string, WooValue>> {
-    // TODO(note-catalog): this substrate helper knows about $note's raw .text
-    // property and :is_readable_by verb. It exists to keep note display
-    // summaries bounded without materializing full note bodies in the Tiny VM;
-    // the catalog-facing contract should remain the overridable
-    // $note:text_summary(limit) verb.
-    if (!this.objects.has(note) || !this.inheritsFrom(note, "$note")) {
-      throw wooError("E_TYPE", `note_text_summary target must be a $note descendant: ${note}`, note);
-    }
-    const readable = await this.dispatch(
-      { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
-      note,
-      "is_readable_by",
-      [ctx.actor]
-    );
-    if (readable !== true) throw wooError("E_PERM", "cannot read note", note);
-
-    const limit = Math.max(0, Math.min(512, Math.floor(rawLimit)));
-    // v0.2 of $note stores .text as a single markdown string (capped at 65536
-    // chars by :set_text/:write). Tolerate the v0.1 list-of-strings shape too
-    // so summary calls during a partial upgrade replay still succeed.
-    const raw = this.object(note).properties.get("text");
-    const text = typeof raw === "string"
-      ? raw
-      : Array.isArray(raw)
-        ? raw.filter((line): line is string => typeof line === "string").join("\n")
-        : "";
-    const newlineIdx = text.indexOf("\n");
-    const first = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
-    let preview = first;
-    let truncated = false;
-    if (preview.length > limit) {
-      preview = limit > 3 ? `${preview.slice(0, limit - 3)}...` : preview.slice(0, limit);
-      truncated = true;
-    }
-    const lines = text.length === 0 ? 0 : text.split(/\r?\n/).length;
-    return { lines, length: text.length, preview, truncated };
   }
 
   // Cross-host-aware display name. The local stub of a remote object
@@ -7663,7 +7801,7 @@ export class WooWorld {
     names.push(obj.name);
     const [title] = await Promise.all([
       this.titleForLook(ctx, ctx.thisObj, id).catch(() => null),
-      this.addLocalNoteMatchNames(ctx, id, names)
+      this.addCatalogMatchNames(ctx, id, names)
     ]);
     if (typeof title === "string") names.push(title);
     const localAliases = this.propOrNull(id, "aliases");
@@ -7671,21 +7809,25 @@ export class WooWorld {
     return { id, names, aliases };
   }
 
-  private async addLocalNoteMatchNames(ctx: CallContext, id: ObjRef, names: string[]): Promise<void> {
-    if (!this.isDescendantOf(id, "$note")) return;
-    const color = this.propOrNullForActor(ctx.actor, id, "color");
-    if (typeof color === "string" && color && color !== "white") {
-      const objectName = this.object(id).name.trim() || "note";
-      names.push(`${color} note`, `the ${color} note`, `${color} ${objectName}`, `the ${color} ${objectName}`);
-    }
-    const text = await this.dispatch({ ...ctx, caller: ctx.thisObj, progr: ctx.actor }, id, "text", []).catch(() => null);
-    if (typeof text === "string") {
-      // Note text is capped at 65536 chars by :set_text/:write, so a per-note
-      // line scan stays bounded; no further trimming needed for matching.
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed) names.push(trimmed);
-      }
+  private async addCatalogMatchNames(ctx: CallContext, id: ObjRef, names: string[]): Promise<void> {
+    // Hard-cap the result so a hostile or accidentally-huge :match_names()
+    // can't blow up the matcher. Skip the dispatch entirely when the verb
+    // isn't defined; matching runs on every unhandled chat utterance, so
+    // avoiding a throw-on-miss for the common no-:match_names case matters.
+    if (!this.resolveVerbFrom(id, "match_names", false)) return;
+    const result = await this.dispatch(
+      { ...ctx, caller: ctx.thisObj, progr: ctx.actor },
+      id,
+      "match_names",
+      [],
+      undefined,
+      4096
+    ).catch(() => null);
+    if (!Array.isArray(result)) return;
+    for (const entry of result) {
+      if (typeof entry !== "string") continue;
+      const trimmed = entry.trim();
+      if (trimmed) names.push(trimmed);
     }
   }
 

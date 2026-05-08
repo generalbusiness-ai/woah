@@ -1068,6 +1068,59 @@ describe("McpGateway", () => {
     expect(body.error.message).toContain("session not found");
     expect(body.error.data?.code).toBe("E_NOSESSION");
   });
+
+  it("resumes a session on a fresh gateway when the world session still exists (DO hibernation recovery)", async () => {
+    const world = bootstrapWorld();
+    const gateway1 = new McpGateway(world);
+
+    const init = await gateway1.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "vitest", version: "0.0.0" }
+      }
+    }, { "mcp-token": "guest:hibernation-resume" }));
+    expect(init.ok).toBe(true);
+    const sessionId = init.headers.get("mcp-session-id");
+    expect(typeof sessionId).toBe("string");
+    expect((sessionId ?? "").length).toBeGreaterThan(0);
+
+    const originalActor = world.sessions.get(sessionId!)?.actor;
+    expect(originalActor).toBeTruthy();
+
+    // Simulate DO hibernation by dropping gateway1 (its in-memory `sessions`
+    // map dies with it) and standing up a fresh gateway over the same world.
+    // The persisted world.sessions table is what carries the actor binding
+    // across the cycle.
+    const gateway2 = new McpGateway(world);
+
+    const list = await gateway2.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list"
+    }, { "mcp-session-id": sessionId! }));
+    expect(list.ok).toBe(true);
+    const listBody = (await list.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(Array.isArray(listBody.result.tools)).toBe(true);
+    expect(listBody.result.tools.some((t) => t.name === "woo_call")).toBe(true);
+
+    // Resumed entry must be bound to the same actor; calling a stable tool
+    // that returns actor-scoped data should succeed.
+    const stableCall = await gateway2.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "woo_list_reachable_tools", arguments: { scope: "active", limit: 4 } }
+    }, { "mcp-session-id": sessionId! }));
+    expect(stableCall.ok).toBe(true);
+    const stableBody = (await stableCall.json()) as { result: { isError?: boolean } };
+    expect(stableBody.result.isError).not.toBe(true);
+
+    expect(world.sessions.get(sessionId!)?.actor).toBe(originalActor);
+  });
 });
 
 function jsonRpcRequest(url: string, body: unknown, headers: Record<string, string>): Request {

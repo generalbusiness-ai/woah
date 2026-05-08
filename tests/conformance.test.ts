@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { compileVerb, installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { InMemoryObjectRepository } from "../src/core/repository";
+import { wooError } from "../src/core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
@@ -140,6 +141,12 @@ function bytecodeVerb(name: string, bytecode: TinyBytecode): VerbDef {
 
 class LocalHostBridge implements HostBridge {
   readonly contentsCalls = new Map<ObjRef, number>();
+  actorSessionLocationsCalls = 0;
+  actorSessionLocationsBatchCalls: Array<ObjRef[]> = [];
+  // Test knob: when set, actorSessionLocationsBatch throws a read-
+  // availability error instead of answering. Lets a test simulate a cold
+  // or unreachable home host.
+  failBatchWith: { code: string; message: string } | null = null;
 
   constructor(
     readonly localHost: string,
@@ -239,7 +246,16 @@ class LocalHostBridge implements HostBridge {
   }
 
   async actorSessionLocations(actor: ObjRef): Promise<ObjRef[]> {
+    this.actorSessionLocationsCalls += 1;
     return this.worldFor(actor).allLocationsForActor(actor);
+  }
+
+  async actorSessionLocationsBatch(actors: ObjRef[]): Promise<Map<ObjRef, ObjRef[]>> {
+    this.actorSessionLocationsBatchCalls.push([...actors]);
+    if (this.failBatchWith) throw wooError(this.failBatchWith.code, this.failBatchWith.message);
+    const out = new Map<ObjRef, ObjRef[]>();
+    for (const actor of actors) out.set(actor, this.worldFor(actor).allLocationsForActor(actor));
+    return out;
   }
 
   async contents(objRef: ObjRef): Promise<ObjRef[]> {
@@ -681,6 +697,106 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
+  it("issues a single batched cross-host call for scrub instead of one per remote subscriber", async () => {
+    const homeHarness = make();
+    const roomHarness = make();
+    try {
+      const home = homeHarness.world;
+      const roomHost = roomHarness.world;
+      // Three remote-hosted subscribers all on the same `home` host. Without
+      // batching, the room's per-look scrub would fire one cross-host RPC per
+      // actor — N+1 against the home DO and a real subrequest-budget hazard
+      // when N grows.
+      const live1 = home.auth("guest:conf-batch-1").actor;
+      const live2 = home.auth("guest:conf-batch-2").actor;
+      const live3 = home.auth("guest:conf-batch-3").actor;
+      const worlds = new Map<string, WooWorld>([
+        ["home", home],
+        ["room", roomHost]
+      ]);
+      const routes = new Map<ObjRef, string>([
+        [live1, "home"],
+        [live2, "home"],
+        [live3, "home"],
+        ["conf_batch_room", "room"]
+      ]);
+      const homeBridge = new LocalHostBridge("home", worlds, routes);
+      const roomBridge = new LocalHostBridge("room", worlds, routes);
+      home.setHostBridge(homeBridge);
+      roomHost.setHostBridge(roomBridge);
+
+      roomHost.createObject({ id: "conf_batch_room", name: "Batch Room", parent: "$chatroom", owner: "$wiz" });
+      roomHost.setProp("conf_batch_room", "subscribers", [live1, live2, live3]);
+      roomHost.setProp("conf_batch_room", "features", ["$conversational"]);
+      for (const actor of [live1, live2, live3]) {
+        home.setActorPresence(actor, "conf_batch_room", true);
+        home.object(actor).location = "conf_batch_room";
+      }
+
+      const who = await roomHost.directCall("batch-who", live1, "conf_batch_room", "who", []);
+      expect(who.op).toBe("result");
+      if (who.op === "result") {
+        expect(who.result).toEqual([live1, live2, live3]);
+      }
+      // One batch call, all three actors in it; zero per-actor calls.
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
+      expect(new Set(roomBridge.actorSessionLocationsBatchCalls[0])).toEqual(new Set([live1, live2, live3]));
+      expect(roomBridge.actorSessionLocationsCalls).toBe(0);
+    } finally {
+      roomHarness.cleanup();
+      homeHarness.cleanup();
+    }
+  });
+
+  it("leaves remote subscribers in place when the batched location lookup is unavailable", async () => {
+    const homeHarness = make();
+    const roomHarness = make();
+    try {
+      const home = homeHarness.world;
+      const roomHost = roomHarness.world;
+      const live = home.auth("guest:conf-batch-fail-live").actor;
+      const worlds = new Map<string, WooWorld>([
+        ["home", home],
+        ["room", roomHost]
+      ]);
+      const routes = new Map<ObjRef, string>([
+        [live, "home"],
+        ["conf_batch_fail_room", "room"]
+      ]);
+      const homeBridge = new LocalHostBridge("home", worlds, routes);
+      const roomBridge = new LocalHostBridge("room", worlds, routes);
+      home.setHostBridge(homeBridge);
+      roomHost.setHostBridge(roomBridge);
+
+      roomHost.createObject({ id: "conf_batch_fail_room", name: "Batch-Fail Room", parent: "$chatroom", owner: "$wiz" });
+      roomHost.setProp("conf_batch_fail_room", "subscribers", [live]);
+      roomHost.setProp("conf_batch_fail_room", "features", ["$conversational"]);
+      home.setActorPresence(live, "conf_batch_fail_room", true);
+      home.object(live).location = "conf_batch_fail_room";
+
+      // Simulate the home host being unreachable: the batched lookup throws
+      // a read-availability error. The scrub must not interpret "no remote
+      // location data" as "actor is gone" — that would persist a subscriber-
+      // row drop on a transient blip.
+      roomBridge.failBatchWith = { code: "E_TIMEOUT", message: "remote home unreachable" };
+
+      const who = await roomHost.directCall("batch-fail-who", live, "conf_batch_fail_room", "who", []);
+      expect(who.op).toBe("result");
+      // Persisted subscribers row is preserved — the actor is NOT scrubbed
+      // on a transient remote-read failure, so subsequent operations and
+      // any verb that reads `subscribers` directly still see the actor.
+      expect(roomHost.getProp("conf_batch_fail_room", "subscribers")).toEqual([live]);
+      if (who.op === "result") expect(who.result).toEqual([live]);
+      // The batch was attempted (and failed); no per-actor fallback was
+      // tried, since this caller provides the batch method.
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
+      expect(roomBridge.actorSessionLocationsCalls).toBe(0);
+    } finally {
+      roomHarness.cleanup();
+      homeHarness.cleanup();
+    }
+  });
+
   it("lazily scrubs stale remote subscribers from room reads and direct audiences", async () => {
     const homeHarness = make();
     const roomHarness = make();
@@ -726,6 +842,113 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     } finally {
       roomHarness.cleanup();
       homeHarness.cleanup();
+    }
+  });
+
+  it("scrubs session_subscribers rows whose session is in this DO's table and expired", async () => {
+    // Regression: rows in `<space>.session_subscribers` whose session has
+    // expired on this DO sit there forever once the actor-level scrub no
+    // longer reaches them — `removeSessionPresence` is only called when
+    // `reapSession` runs on this DO, and that loop is racy on cold-start
+    // hosts. The session-level sibling scrub now drops any expired-in-table
+    // row alongside the actor-level pass, recomputing the `subscribers`
+    // mirror from the survivors.
+    //
+    // Scope is intentionally narrow: rows whose session is unknown to this
+    // DO are left alone, since they may legitimately belong to a different
+    // DO that hasn't synced the session here. The data pollution observed
+    // in production (`session-N` counter rows whose sessions had been
+    // reaped everywhere) is dealt with by broadcastLiveEvent's actor-keyed
+    // fallback in src/worker/persistent-object-do.ts; only DO replacement
+    // or an explicit wizard sweep clears those rows from disk.
+    const harness = make();
+    try {
+      const world = harness.world;
+      const live = world.auth("guest:conf-session-scrub-live");
+      world.createObject({ id: "conf_session_scrub_room", name: "Session Scrub Room", parent: "$chatroom", owner: "$wiz" });
+      world.setProp("conf_session_scrub_room", "features", ["$conversational"]);
+      const expiredAuth = world.auth("guest:conf-session-scrub-expired");
+      const expired = world.sessions.get(expiredAuth.id);
+      if (!expired) throw new Error("expected expired session in table");
+      expired.expiresAt = Date.now() - 60_000;
+      expired.lastDetachAt = Date.now() - 60_000;
+      // Pre-populate: live row, expired-in-table row, malformed row,
+      // `legacy:` placeholder, and an unknown-session row representing a
+      // hypothetical cross-host bridge subscriber. The unknown row must
+      // survive — see scope note above.
+      world.setProp("conf_session_scrub_room", "session_subscribers", [
+        { session: live.id, actor: live.actor },
+        { session: expired.id, actor: expiredAuth.actor },
+        { session: "", actor: "guest_blank" },
+        { session: `legacy:${live.actor}`, actor: live.actor },
+        { session: "session-cross-host", actor: "guest_remote" }
+      ]);
+      world.setProp("conf_session_scrub_room", "subscribers", [
+        live.actor,
+        expiredAuth.actor,
+        "guest_blank",
+        "guest_remote"
+      ]);
+      world.setActorPresence(live.actor, "conf_session_scrub_room", true);
+      world.object(live.actor).location = "conf_session_scrub_room";
+      world.sessions.get(live.id)!.currentLocation = "conf_session_scrub_room";
+
+      // First call paid the per-space throttle and runs both scrubs.
+      const looked = await world.directCall("conf-session-scrub-look", live.actor, "conf_session_scrub_room", "look", []);
+      expect(looked.op, looked.op === "error" ? JSON.stringify(looked.error) : "").toBe("result");
+
+      const remainingRows = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string; actor: string }>;
+      expect(remainingRows.map((row) => row.session).sort()).toEqual([
+        live.id,
+        `legacy:${live.actor}`,
+        "session-cross-host"
+      ].sort());
+      // Both scrubs collaborated to recompute `subscribers`. The actor pass
+      // dropped guest_blank — note that the drop happens in
+      // updateSpaceSubscriberLocal's parse step (the malformed empty-session
+      // row is filtered when the session pass rebuilds `subscribers` from
+      // surviving session_subscribers rows), not via the actor pass's
+      // present=false call. The session pass dropped expiredAuth.actor.
+      // guest_remote stays because its row is still in session_subscribers.
+      expect((world.getProp("conf_session_scrub_room", "subscribers") as ObjRef[]).sort()).toEqual([
+        live.actor,
+        "guest_remote"
+      ].sort());
+
+      // Re-running look within the SUBSCRIBER_SCRUB_FLOOR_MS window must NOT
+      // re-trigger the scrub. Plant a row that the scrub would otherwise
+      // remove and verify the throttle holds it in place. The throttle is
+      // the only thing keeping write amplification bounded for chatty rooms.
+      const survivors = world.getProp("conf_session_scrub_room", "session_subscribers") as WooValue;
+      const replant = (survivors as Array<Record<string, WooValue>>).concat([{ session: expired.id, actor: expiredAuth.actor }]);
+      world.setProp("conf_session_scrub_room", "session_subscribers", replant as unknown as WooValue);
+      const lookedAgain = await world.directCall("conf-session-scrub-look-throttled", live.actor, "conf_session_scrub_room", "look", []);
+      expect(lookedAgain.op).toBe("result");
+      const stillThere = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
+      expect(stillThere.map((row) => row.session)).toContain(expired.id);
+
+      // Sanity: when reapSession runs through removeSessionPresence first,
+      // there's nothing left for the new scrub to do. The session and its
+      // row both go away through the existing path; this pins that the
+      // sibling scrub stays a safety net rather than the primary cleanup.
+      world.setProp("conf_session_scrub_room", "session_subscribers", survivors);
+      const reapedActor = "guest_reaped" as ObjRef;
+      const reapedSession = "session-conf-reaped";
+      world.createObject({ id: reapedActor, name: reapedActor, parent: "$guest", owner: "$wiz" });
+      world.ensureSessionForActor(reapedSession, reapedActor, "guest", Date.now() + 60_000);
+      world.setSpaceSubscriber("conf_session_scrub_room", reapedActor, true, reapedSession);
+      const beforeReap = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
+      expect(beforeReap.map((row) => row.session)).toContain(reapedSession);
+      const reapedRecord = world.sessions.get(reapedSession);
+      if (reapedRecord) {
+        reapedRecord.expiresAt = Date.now() - 60_000;
+        reapedRecord.lastDetachAt = Date.now() - 60_000;
+      }
+      world.reapExpiredSessions();
+      const afterReap = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
+      expect(afterReap.map((row) => row.session)).not.toContain(reapedSession);
+    } finally {
+      harness.cleanup();
     }
   });
 

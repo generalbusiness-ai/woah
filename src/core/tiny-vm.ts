@@ -107,19 +107,22 @@ const DEFAULT_WALL_MS = 10_000;
 const MAX_VM_FRAMES = 128;
 const MAX_RUNTIME_LOCALS = 1_024;
 const MAX_RUNTIME_STACK = 4_096;
-const BUILTIN_NAMES = [
+export const BUILTIN_NAMES = [
   "length", "keys", "values", "has", "typeof", "to_string", "min", "max", "floor", "ceil", "round", "abs",
-  "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms",
+  "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms",
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "builder_create_object", "builder_chparent", "builder_recycle", "wiz_force_recycle", "builder_set_property", "builder_inspect", "builder_search",
+  "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
   "to_int", "to_float",
-  "note_text_summary"
+  // New entries MUST be appended; spec/semantics/builtins.md §19 fixes numeric
+  // indices, and persisted bytecode encodes builtins by index. Mid-list inserts
+  // would shift every later index and misdispatch already-stored verbs.
+  "str_split"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -840,12 +843,12 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const separator = assertString(builtinArgs[1] ?? "");
         return list.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(separator);
       }
-      case "note_text_summary": {
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "note_text_summary expects note and optional preview limit");
-        const limit = builtinArgs.length >= 2 && builtinArgs[1] !== null
-          ? numeric(builtinArgs[1], "note_text_summary limit")
-          : 96;
-        return await frame.ctx.world.noteTextSummary(frame.ctx, assertObj(builtinArgs[0]), limit);
+      case "str_split": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "str_split expects text and separator");
+        const text = assertString(builtinArgs[0] ?? "");
+        const separator = assertString(builtinArgs[1] ?? "");
+        if (separator === "") return Array.from(text);
+        return text.split(separator);
       }
       case "min":
         return Math.min(...builtinArgs.map((value) => numeric(value, "min argument")));
@@ -1012,15 +1015,22 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return null;
       }
       case "dispatch": {
-        if (builtinArgs.length < 2 || builtinArgs.length > 4) throw wooError("E_INVARG", "dispatch expects target, verb, optional args, and optional start_at");
+        if (builtinArgs.length < 2 || builtinArgs.length > 5) throw wooError("E_INVARG", "dispatch expects target, verb, optional args, optional start_at, optional max_chars");
         const callArgs = builtinArgs.length >= 3 && builtinArgs[2] !== null ? assertList(builtinArgs[2]) : [];
         const startAt = builtinArgs.length >= 4 && builtinArgs[3] !== null ? assertObj(builtinArgs[3]) : undefined;
+        let maxChars: number | undefined;
+        if (builtinArgs.length >= 5 && builtinArgs[4] !== null) {
+          const raw = numeric(builtinArgs[4], "dispatch max_chars");
+          if (!Number.isFinite(raw) || raw < 0) throw wooError("E_INVARG", "dispatch max_chars must be a non-negative finite number", builtinArgs[4]);
+          maxChars = Math.floor(raw);
+        }
         return await frame.ctx.world.dispatch(
           { ...frame.ctx, caller: frame.ctx.thisObj, callerPerms: frame.ctx.progr },
           assertObj(builtinArgs[0]),
           assertString(builtinArgs[1]),
           callArgs,
-          startAt
+          startAt,
+          maxChars
         );
       }
       case "execute_command_plan": {
@@ -1046,12 +1056,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "builder_chparent":
         if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "builder_chparent expects object, parent, and optional opts");
         return await frame.ctx.world.builderChparent(frame.ctx.actor, assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), builtinArgs[2] ?? null, frame.ctx.definer);
-      case "builder_recycle":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_recycle expects object and optional opts");
-        return await frame.ctx.world.builderRecycle(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer, frame.ctx);
-      case "wiz_force_recycle":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "wiz_force_recycle expects object and optional opts");
-        return await frame.ctx.world.wizForceRecycle(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx);
+      case "recycle":
+        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "recycle expects object and optional opts");
+        return await frame.ctx.world.recycleChecked(frame.ctx.progr, frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx);
       case "builder_set_property":
         if (builtinArgs.length < 3 || builtinArgs.length > 4) throw wooError("E_INVARG", "builder_set_property expects object, name, value, and optional opts");
         return await frame.ctx.world.builderSetProperty(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]), builtinArgs[2], builtinArgs[3] ?? null, frame.ctx.definer);

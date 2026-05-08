@@ -112,6 +112,11 @@ export type UiComponentDecl = {
   surface: string;
   subject?: string;
   neighborhood?: Record<string, unknown>;
+  // Property names the component needs from its subject's projection. The host
+  // uses these to ensure a full object summary is folded into the canonical
+  // projection layer when the component binds — room-contents snapshots and
+  // similar thin payloads do not carry props.
+  requires?: string[];
 };
 
 export type UiFrameDecl = {
@@ -774,6 +779,53 @@ export class WooClientFramework {
 
 export function createWooClientFramework() {
   return new WooClientFramework();
+}
+
+// Room-contents snapshots are thin by design (no props), so a viewer who just
+// entered a room sees only id/name/parent for the subject until live
+// observations or a full summary fill in the rest. One round-trip per subject
+// per session: if the server's summary did not carry the requested field,
+// refetching cannot conjure it; live observations remain authoritative.
+export class ProjectionFieldFiller {
+  private inFlight = new Set<string>();
+  private completed = new Set<string>();
+  private generation = 0;
+  constructor(
+    private observe: (subject: string) => { props?: Record<string, unknown> } | null | undefined,
+    private fetchSummary: (subject: string) => Promise<unknown>,
+    private onResolved?: () => void
+  ) {}
+
+  ensure(subject: string, fields: readonly string[]): void {
+    if (!subject || !fields || fields.length === 0) return;
+    if (this.completed.has(subject)) return;
+    const projected = this.observe(subject);
+    const props = projected?.props ?? {};
+    if (fields.every((field) => Object.prototype.hasOwnProperty.call(props, field))) {
+      this.completed.add(subject);
+      return;
+    }
+    if (this.inFlight.has(subject)) return;
+    this.inFlight.add(subject);
+    const generation = this.generation;
+    void this.fetchSummary(subject)
+      .catch(() => undefined)
+      .finally(() => {
+        if (generation !== this.generation) return;
+        this.inFlight.delete(subject);
+        this.completed.add(subject);
+        this.onResolved?.();
+      });
+  }
+
+  // Drop memoization so the next ensure() can re-fetch. Pending fills from
+  // before the reset resolve into a no-op (generation mismatch) so they
+  // cannot suppress fresh fetches under the new session.
+  reset(): void {
+    this.generation += 1;
+    this.inFlight.clear();
+    this.completed.clear();
+  }
 }
 
 export function registerCoreObservationHandlers(registry: ObservationRegistry) {

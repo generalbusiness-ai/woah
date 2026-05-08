@@ -126,6 +126,8 @@ Other storage incidents:
 
 **Recycle of an object holding parked tasks.** The parked tasks are killed (E_INTRPT delivered to handlers if any). Recycle proceeds.
 
+**Host teardown after recycle.** When a recycle drains a DO's hosted-payload count to zero ([recycle.md §RC11](recycle.md#rc11-host-teardown-after-recycle)), the DO enters a `tearing_down` state and then calls `state.storage.deleteAll()`. Requests that race the teardown raise `E_HOST_RECYCLED`. Cold-loaded DOs whose id appears in Directory's `inherited_tombstone` table also raise `E_HOST_RECYCLED`. Callers that do not distinguish between "gone-just-now" and "long-since-recycled" treat `E_HOST_RECYCLED` as equivalent to `E_OBJNF`. `is_recycled(<id>)` returns true for any ULID covered by an inherited tombstone.
+
 **Browser-host disconnect mid-call.** [browser-host.md §18.5](../protocol/browser-host.md#185-disconnect) covers this: in-flight `host_call`s return `E_GONE`; tasks awaiting reads on the player remain for the grace period; sessions persist for the broader timeout.
 
 ---

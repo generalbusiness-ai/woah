@@ -1,5 +1,5 @@
 import { hashSource } from "./source-hash";
-import type { CompileDiagnostic, CompileResult, TinyBytecode, TinyOp, WooValue } from "./types";
+import type { CompileDiagnostic, CompileResult, TinyBytecode, TinyOp, VerbCallSite, WooValue } from "./types";
 import { valuesEqual, wooError } from "./types";
 
 type Span = {
@@ -134,13 +134,12 @@ const FRAME_GLOBALS = new Map<string, string>([
 
 const BUILTINS = new Set([
   "length", "keys", "values", "has", "typeof", "to_string", "tostr", "to_int", "toint", "to_float", "tofloat", "min", "max", "floor", "ceil", "round", "abs",
-  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join",
-  "note_text_summary",
-  "now", "create", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms", "caller_perms",
+  "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join", "str_split",
+  "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms", "caller_perms",
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "builder_create_object", "builder_chparent", "builder_recycle", "wiz_force_recycle", "builder_set_property", "builder_inspect", "builder_search",
+  "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort"
@@ -161,7 +160,8 @@ export function compileWooSource(source: string): CompileResult {
       metadata: {
         name: program.name,
         perms: program.perms,
-        arg_spec: program.argSpec
+        arg_spec: program.argSpec,
+        calls: compiled.calls
       }
     };
   } catch (err) {
@@ -734,10 +734,13 @@ class Codegen {
   private readonly lineMap: Record<string, WooValue> = {};
   private readonly locals = new Map<string, number>();
   private readonly loops: { breaks: number[]; continues: number[]; continueTarget: number }[] = [];
+  // Recorded `this:name(...)` and `obj:name(...)` call sites. The static
+  // verb-call validator and the call-graph purity analysis both consume this.
+  private readonly calls: VerbCallSite[] = [];
   private activeSpan: Span | null = null;
   private localCount = 0;
 
-  compile(program: Program): { bytecode: TinyBytecode; lineMap: Record<string, WooValue> } {
+  compile(program: Program): { bytecode: TinyBytecode; lineMap: Record<string, WooValue>; calls: VerbCallSite[] } {
     for (const param of program.params) this.declareLocal(param, program.span);
     this.compileBlock(program.body);
     this.withSpan(program.body.span, () => {
@@ -752,7 +755,8 @@ class Codegen {
         max_stack: 128,
         version: 1
       },
-      lineMap: this.lineMap
+      lineMap: this.lineMap,
+      calls: this.calls
     };
   }
 
@@ -1020,12 +1024,15 @@ class Codegen {
         case "CallExpr":
           this.compileCall(expr);
           break;
-        case "VerbCallExpr":
+        case "VerbCallExpr": {
+          const isThisCall = expr.object.kind === "IdentifierExpr" && (expr.object as IdentifierExpr).name === "this";
+          this.calls.push({ name: expr.name, this_call: isThisCall });
           this.compileExpr(expr.object);
           this.emit("PUSH_LIT", this.literal(expr.name));
           for (const arg of expr.args) this.compileExpr(arg);
           this.emit("CALL_VERB", expr.args.length);
           break;
+        }
       }
     });
   }

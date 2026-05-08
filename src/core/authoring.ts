@@ -1,9 +1,327 @@
 import { compileWooSource } from "./dsl-compiler";
 import { hashSource } from "./source-hash";
-import type { CompileResult, InstallResult, ObjRef, TinyBytecode, TinyOp, WooValue } from "./types";
+import { BUILTIN_NAMES } from "./tiny-vm";
+import type { CompileResult, InstallResult, ObjRef, TinyBytecode, TinyOp, VerbCallSite, VerbDef, WooValue } from "./types";
 import { isErrorValue, wooError } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import type { WooWorld } from "./world";
+
+// Builtins whose execution definitively mutates world or session state, or
+// has externally-visible side effects (broadcasts, scheduled tasks, presence
+// changes, cross-host dispatch into possibly-impure verbs). Any verb that
+// invokes one of these CANNOT be pure.
+const IMPURE_BUILTIN_NAMES: ReadonlySet<string> = new Set([
+  "create", "recycle", "move", "moveto", "chparent",
+  "directory_reconcile_corenames",
+  "set_task_perms", "set_presence", "observe_to_space", "tell",
+  "builder_create_object", "builder_chparent", "builder_set_property",
+  "programmer_install_verb", "programmer_set_verb_info", "programmer_set_property_info",
+  "editor_invoke", "editor_replace", "editor_insert", "editor_delete",
+  "editor_save", "editor_pause", "editor_abort",
+  // dispatch/execute_command_plan call into other verbs whose purity we
+  // can't classify from this verb's bytecode alone — conservatively impure.
+  "dispatch", "execute_command_plan"
+]);
+
+const IMPURE_OPCODES: ReadonlySet<string> = new Set([
+  "SET_PROP", "SET_PROP_INFO",
+  "DEFINE_PROP", "UNDEFINE_PROP",
+  "OBSERVE", "EMIT",
+  "FORK", "SUSPEND", "READ"
+]);
+
+// Static purity classification for a bytecode verb. Returns:
+//  - "impure":  contains an opcode or builtin that definitely mutates state
+//               or broadcasts. The verb cannot be marked pure.
+//  - "pure":    contains no impure opcodes/builtins AND no CALL_VERB/PASS.
+//               Safe to mark pure on its own.
+//  - "unknown": calls another verb (CALL_VERB) — purity depends on
+//               transitively-called verbs. Catalog author may assert
+//               `"pure": true` to override; we trust the manual claim.
+export function analyzeBytecodePurity(bytecode: TinyBytecode | null | undefined): "pure" | "impure" | "unknown" {
+  if (!bytecode || !Array.isArray(bytecode.ops)) return "unknown";
+  let unknown = false;
+  for (const op of bytecode.ops) {
+    if (!Array.isArray(op)) continue;
+    const name = op[0];
+    if (typeof name !== "string") continue;
+    if (IMPURE_OPCODES.has(name)) return "impure";
+    if (name === "CALL_VERB" || name === "PASS") { unknown = true; continue; }
+    if (name === "BUILTIN") {
+      const operand = op[1];
+      const builtinName = typeof operand === "number" ? BUILTIN_NAMES[operand] : typeof operand === "string" ? operand : undefined;
+      if (!builtinName) { unknown = true; continue; }
+      if (IMPURE_BUILTIN_NAMES.has(builtinName)) return "impure";
+    }
+  }
+  return unknown ? "unknown" : "pure";
+}
+
+// Whether the bytecode contains a PASS opcode. PASS dispatches to the
+// parent class's verb of the same name as the current verb, which the call
+// extractor does not record in `calls` metadata. Propagation treats PASS as
+// an opaque dispatch — the caller must be catalog-declared pure (the author
+// is asserting the parent-chain remains pure) for the verb to stay pure.
+function bytecodeHasPass(bytecode: TinyBytecode | null | undefined): boolean {
+  if (!bytecode || !Array.isArray(bytecode.ops)) return false;
+  for (const op of bytecode.ops) {
+    if (Array.isArray(op) && op[0] === "PASS") return true;
+  }
+  return false;
+}
+
+// Combine static analysis with an optional manifest claim. Analysis wins on
+// "impure" — a `"pure": true` declaration that contradicts the bytecode is a
+// catalog bug and we throw so it surfaces at install time. For "pure" the
+// claim is unnecessary; the verb is auto-pure. For "unknown" (verb dispatches
+// to other verbs) we trust the catalog author's declaration — but only as
+// a fallback after the call-graph propagation pass; see `propagateVerbPurity`.
+export function combineVerbPurity(analyzed: "pure" | "impure" | "unknown", declared: boolean | undefined, verbLabel: string): boolean {
+  if (analyzed === "impure" && declared === true) {
+    throw wooError("E_CATALOG", `verb declared pure but bytecode is impure: ${verbLabel}`, { verb: verbLabel });
+  }
+  if (analyzed === "impure") return false;
+  if (analyzed === "pure") return true;
+  return declared === true;
+}
+
+// Returns the names of `this:name(...)` call targets in `calls` that don't
+// resolve to any verb on `definer`'s lineage. Used at install time to fail
+// loudly on dead call references — typos and stale renames that would
+// otherwise surface as `E_VERBNF` only at runtime.
+//
+// Polymorphic template calls — a parent verb that calls a method only
+// implemented on subclasses — are accepted. The check only fails if NO class
+// reachable as a possible runtime receiver of `this` (definer + ancestors +
+// features + descendants) defines a verb of that name.
+//
+// Non-`this` calls (`obj:name()` where the object is not the literal `this`)
+// are skipped: the receiver class isn't statically knowable.
+export function findUnresolvedThisCalls(world: WooWorld, definer: ObjRef, calls: ReadonlyArray<VerbCallSite> | undefined): string[] {
+  if (!calls || calls.length === 0) return [];
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  for (const site of calls) {
+    if (!site.this_call) continue;
+    if (seen.has(site.name)) continue;
+    seen.add(site.name);
+    if (collectThisCallTargets(world, definer, site.name).length === 0) {
+      missing.push(site.name);
+    }
+  }
+  return missing;
+}
+
+// All classes reachable as possible runtime receivers of `this` from a verb
+// defined on `definer` that have a verb named `name`: the inherited resolution
+// from the definer's chain (ancestors + features), plus every descendant that
+// overrides `name`. Native verbs and bytecode verbs are returned uniformly.
+function collectThisCallTargets(world: WooWorld, definer: ObjRef, name: string): Array<{ definer: ObjRef; verb: VerbDef }> {
+  const seen = new Map<string, { definer: ObjRef; verb: VerbDef }>();
+  const keyOf = (obj: ObjRef, vname: string) => `${obj}\x00${vname}`;
+  try {
+    const inherited = world.resolveVerb(definer, name);
+    if (inherited) seen.set(keyOf(inherited.definer, inherited.verb.name), inherited);
+  } catch { /* not on definer chain — descendants may still have it */ }
+  for (const descendant of descendantsOf(world, definer)) {
+    const obj = world.objects.get(descendant);
+    if (!obj) continue; // tolerate transient holes (e.g. mid-install state)
+    const own = obj.verbs.find((v) => v.name === name);
+    if (own) seen.set(keyOf(descendant, own.name), { definer: descendant, verb: own });
+  }
+  return Array.from(seen.values());
+}
+
+// `pass(...)` from a verb defined on `definer` dispatches to the closest
+// ancestor of `definer` that defines a verb of the same name. Returns the
+// resolution or null if the inheritance chain has no such verb. Tolerates
+// transient holes (deleted ancestor mid-install) by returning null instead
+// of throwing.
+function resolvePassTarget(world: WooWorld, definer: ObjRef, name: string): { definer: ObjRef; verb: VerbDef } | null {
+  const start = world.objects.get(definer);
+  if (!start) return null;
+  let cursor: ObjRef | null = start.parent;
+  const seen = new Set<ObjRef>();
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    const obj = world.objects.get(cursor);
+    if (!obj) return null;
+    const verb = world.ownVerbExact(cursor, name);
+    if (verb) return { definer: cursor, verb };
+    cursor = obj.parent;
+  }
+  return null;
+}
+
+function descendantsOf(world: WooWorld, root: ObjRef): ObjRef[] {
+  const result: ObjRef[] = [];
+  const visited = new Set<ObjRef>([root]);
+  const stack: ObjRef[] = [];
+  const rootObj = world.objects.get(root);
+  if (rootObj) for (const child of rootObj.children) stack.push(child);
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    result.push(id);
+    const obj = world.objects.get(id);
+    if (!obj) continue;
+    for (const child of obj.children) stack.push(child);
+  }
+  return result;
+}
+
+// Fixed-point purity propagation across the verb call graph. Walks every
+// bytecode verb in the world. A verb stays pure iff:
+//   - its bytecode contains no impure opcodes/builtins (analyzer = pure or
+//     unknown), AND
+//   - every `this:name(...)` site resolves to verb(s) that are themselves
+//     pure across all possible runtime receivers (definer chain + descendant
+//     overrides — `this` dispatches polymorphically), AND
+//   - every non-`this` call site has a target whose purity we can vouch for.
+//
+// Convergence model: monotonic *decrease*. Every analyzable verb is seeded
+// optimistically; iterations only flip `pure → impure` when a dependency
+// fails to verify. Once a callee is poisoned, every transitive caller is
+// poisoned too. (The previous "pure || previous" monotonic-increase pinned
+// callers pure even after a callee was demoted.)
+//
+// Manifest-declared `pure: true` is a hint, not authority. It is honored
+// for verbs the analyzer cannot decide AND whose dependencies it cannot
+// verify (typically `obj:name()` opaque dispatch into another catalog), but
+// a demonstrable bytecode impurity still wins — `combineVerbPurity` rejects
+// declaration-vs-analysis conflicts at install time. Native targets without
+// an explicit `pure` flag are treated as opaque; pure-marked natives are
+// trusted.
+//
+// Should be called after a catalog install or any batch of verb edits.
+export function propagateVerbPurity(world: WooWorld): { changed: number } {
+  // Snapshot every bytecode verb's identity + analysis. `calls === null`
+  // means the verb was compiled before the call-graph extractor existed; we
+  // can't reason about it (treat as opaque-impure unless catalog-declared).
+  // `declared` records a catalog `pure: true` assertion that lets non-this
+  // dispatch survive when the rest of the call graph checks out.
+  type Entry = {
+    object: ObjRef;
+    name: string;
+    analyzed: "pure" | "impure" | "unknown";
+    hasPass: boolean;
+    calls: ReadonlyArray<VerbCallSite> | null;
+    declared: boolean;
+  };
+  const entries: Entry[] = [];
+  const pureMap = new Map<string, boolean>();
+  const key = (obj: ObjRef, name: string) => `${obj}\x00${name}`;
+  for (const [objRef, obj] of world.objects) {
+    for (const verb of obj.verbs) {
+      if (verb.kind !== "bytecode") continue;
+      const analyzed = analyzeBytecodePurity(verb.bytecode);
+      entries.push({
+        object: objRef,
+        name: verb.name,
+        analyzed,
+        hasPass: bytecodeHasPass(verb.bytecode),
+        calls: verb.calls ?? null,
+        // The catalog's manifest assertion. Stays in sync with the manifest
+        // via drift detection — distinct from `pure`, which is the derived
+        // flag that propagation writes back.
+        declared: verb.pure_declared === true
+      });
+      // Optimistic seed: pure unless the bytecode is definitively impure.
+      pureMap.set(key(objRef, verb.name), analyzed !== "impure");
+    }
+  }
+  // Cache per-call-site resolution across iterations — neither the world's
+  // class graph nor the call sites change during propagation, so the set of
+  // possible targets for `this:name()` is invariant.
+  const targetCache = new Map<string, Array<{ definer: ObjRef; verb: VerbDef }>>();
+  const targetsFor = (definer: ObjRef, name: string) => {
+    const k = key(definer, name);
+    let cached = targetCache.get(k);
+    if (!cached) {
+      cached = collectThisCallTargets(world, definer, name);
+      targetCache.set(k, cached);
+    }
+    return cached;
+  };
+  // A target is pure iff: native with explicit pure flag, OR bytecode whose
+  // current pureMap entry says pure. The caller may inherit from its own
+  // manifest declaration: a declared-pure caller trusts unmarked-native
+  // callees (the catalog author accepted responsibility for the chain) —
+  // bytecode callees are still required to verify, since we have the data.
+  const targetIsPure = (target: { definer: ObjRef; verb: VerbDef }, callerDeclared: boolean) => {
+    if (target.verb.kind === "native") {
+      if (target.verb.pure === true) return true;
+      return callerDeclared;
+    }
+    return pureMap.get(key(target.definer, target.verb.name)) === true;
+  };
+  let iter = true;
+  while (iter) {
+    iter = false;
+    for (const entry of entries) {
+      const k = key(entry.object, entry.name);
+      if (pureMap.get(k) !== true) continue; // already poisoned
+      if (entry.analyzed === "pure") continue; // no calls in bytecode
+      // analyzed === "unknown": verb has CALL_VERB or PASS, must verify graph.
+      // Without call metadata we can't reason — old worlds compiled before
+      // the extractor. Conservatively poison; the catalog drift detector
+      // will repair the missing field on the next install/sync, after which
+      // a subsequent propagation pass can derive the correct flag. We do not
+      // honor a stored `pure: true` on a calls-less verb, because that flag
+      // could equally be a stale fossil from the buggy monotonic-increase
+      // pass and we have no way to tell.
+      if (entry.calls === null) {
+        pureMap.set(k, false);
+        iter = true;
+        continue;
+      }
+      // PASS dispatches to the parent class's verb of the same name. We can
+      // resolve this by walking up from the definer to find the next ancestor
+      // that defines the verb, and require that verb to be pure.
+      if (entry.hasPass) {
+        const parentTarget = resolvePassTarget(world, entry.object, entry.name);
+        if (!parentTarget || !targetIsPure(parentTarget, entry.declared)) {
+          pureMap.set(k, false);
+          iter = true;
+          continue;
+        }
+      }
+      let stillPure = true;
+      for (const site of entry.calls) {
+        if (!site.this_call) {
+          // Opaque receiver — only the manifest claim can keep us pure.
+          if (!entry.declared) { stillPure = false; break; }
+          continue;
+        }
+        const targets = targetsFor(entry.object, site.name);
+        if (targets.length === 0) { stillPure = false; break; }
+        for (const target of targets) {
+          if (!targetIsPure(target, entry.declared)) { stillPure = false; break; }
+        }
+        if (!stillPure) break;
+      }
+      if (!stillPure) {
+        pureMap.set(k, false);
+        iter = true;
+      }
+    }
+  }
+  // Commit final purity to the world for verbs whose flag actually changed.
+  let changed = 0;
+  for (const entry of entries) {
+    const finalPure = pureMap.get(key(entry.object, entry.name)) === true;
+    const obj = world.objects.get(entry.object);
+    if (!obj) continue;
+    const verb = obj.verbs.find((v) => v.name === entry.name);
+    if (!verb || verb.kind !== "bytecode") continue;
+    if ((verb.pure === true) !== finalPure) {
+      world.addVerb(entry.object, { ...verb, pure: finalPure ? true : undefined });
+      changed += 1;
+    }
+  }
+  return { changed };
+}
 
 type AuthoringOptions = {
   format?: "t0-source" | "woo-source" | "t0-json-bytecode";
@@ -80,6 +398,11 @@ function installVerbWithOwner(world: WooWorld, obj: ObjRef, name: string, source
   );
   const compiledArgSpec = compiled.metadata?.arg_spec ?? {};
   const argSpec = options.argSpec ? { ...compiledArgSpec, ...options.argSpec } : (compiled.metadata?.arg_spec ?? current?.arg_spec ?? {});
+  // Re-classify on every install — analyzer drives purity; never carry an
+  // older install's `pure: true` over a freshly-compiled bytecode that the
+  // analyzer can't confirm.
+  const finalBytecode = { ...compiled.bytecode, version };
+  const pure = combineVerbPurity(analyzeBytecodePurity(finalBytecode), undefined, `${obj}:${name}`);
   world.addVerb(obj, {
     kind: "bytecode",
     name,
@@ -90,12 +413,17 @@ function installVerbWithOwner(world: WooWorld, obj: ObjRef, name: string, source
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: current?.skip_presence_check,
     tool_exposed: current?.tool_exposed,
+    pure: pure || undefined,
+    calls: compiled.metadata?.calls,
     source,
     source_hash: compiled.source_hash ?? hashSource(source),
-    bytecode: { ...compiled.bytecode, version },
+    bytecode: finalBytecode,
     version,
     line_map: compiled.line_map ?? {}
   });
+  // Propagate so a transitively-pure new verb (and any callers that reach it
+  // through `this:name(...)`) get their flag updated to match the call graph.
+  propagateVerbPurity(world);
   return { ok: true, version };
 }
 
@@ -566,9 +894,10 @@ const VALID_BUILTINS = new Set([
   "str_slice",
   "str_char",
   "str_join",
-  "note_text_summary",
+  "str_split",
   "now",
   "create",
+  "recycle",
   "move",
   "moveto",
   "chparent",
@@ -597,8 +926,6 @@ const VALID_BUILTINS = new Set([
   "idle_seconds",
   "builder_create_object",
   "builder_chparent",
-  "builder_recycle",
-  "wiz_force_recycle",
   "builder_set_property",
   "builder_inspect",
   "builder_search",

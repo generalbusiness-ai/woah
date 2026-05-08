@@ -3,10 +3,16 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized, scopeSerializedWorldToHost } from "../src/core/bootstrap";
+import { installCatalogManifest, updateCatalogManifest, type CatalogManifest } from "../src/core/catalog-installer";
 import type { SerializedWorld } from "../src/core/repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, TinyBytecode, VerbDef } from "../src/core/types";
 import { dumpSerializedObjectsToJsonFolder, JsonFolderWorldRepository } from "../src/server/json-folder-repository";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
+
+const catalogsRoot = new URL("../catalogs", import.meta.url).pathname;
+function readCatalogManifest(name: string, file = "manifest.json"): unknown {
+  return JSON.parse(readFileSync(join(catalogsRoot, name, file), "utf8"));
+}
 
 function message(actor: string, target: string, verb: string, args: unknown[] = []): Message {
   return { actor, target, verb, args: args as any[] };
@@ -480,6 +486,69 @@ describe("json folder persistence", () => {
       expect(secondWorld.replay("the_dubspace", 1, 10)).toHaveLength(1);
       expect(secondWorld.latestSnapshot("the_dubspace")?.seq).toBe(1);
       expect(existsSync(join(path, "objects", "delay_1.json"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists a transform_property list-to-string migration across SQLite reload", () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo });
+      const v0Sticky: CatalogManifest = {
+        name: "sticky-test",
+        version: "0.1.0",
+        spec_version: "v1",
+        license: "MIT",
+        classes: [{
+          local_name: "$sticky_test",
+          parent: "$thing",
+          properties: [{ name: "body", type: "list<str>", default: [], perms: "" }]
+        }],
+        seed_hooks: [
+          { kind: "create_instance", class: "$sticky_test", as: "obj_test_sticky_persist_filled", properties: { body: ["one", "two"] } },
+          { kind: "create_instance", class: "$sticky_test", as: "obj_test_sticky_persist_empty", properties: { body: [] } }
+        ]
+      } as unknown as CatalogManifest;
+      seedRepo.transaction(() => installCatalogManifest(seedWorld, v0Sticky, { tap: "@local", alias: "sticky-test" }));
+      expect(seedWorld.getProp("obj_test_sticky_persist_filled", "body")).toEqual(["one", "two"]);
+      seedRepo.close();
+
+      const upgradeRepo = new LocalSQLiteRepository(path);
+      const upgradeWorld = createWorld({ repository: upgradeRepo });
+      expect(upgradeWorld.getProp("obj_test_sticky_persist_filled", "body")).toEqual(["one", "two"]);
+      const v1Sticky: CatalogManifest = {
+        ...v0Sticky,
+        version: "1.0.0",
+        classes: [{
+          local_name: "$sticky_test",
+          parent: "$thing",
+          properties: [{ name: "body", type: "str", default: "", perms: "" }]
+        }],
+        seed_hooks: v0Sticky.seed_hooks
+      } as unknown as CatalogManifest;
+      const record = upgradeRepo.transaction(() => updateCatalogManifest(upgradeWorld, v1Sticky, {
+        tap: "@local",
+        alias: "sticky-test",
+        acceptMajor: true,
+        migration: {
+          from_version: "0.x.x",
+          to_version: "1.0.0",
+          spec_version: "v1",
+          steps: [{ kind: "transform_property", class: "$sticky_test", name: "body", transform: { op: "join", separator: "\n" } }]
+        }
+      }));
+      expect(record.migration_state).toMatchObject({ status: "completed", from_version: "0.1.0", to_version: "1.0.0" });
+      expect(upgradeWorld.getProp("obj_test_sticky_persist_filled", "body")).toBe("one\ntwo");
+      expect(upgradeWorld.getProp("obj_test_sticky_persist_empty", "body")).toBe("");
+      upgradeRepo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo });
+      expect(verifyWorld.getProp("obj_test_sticky_persist_filled", "body")).toBe("one\ntwo");
+      expect(verifyWorld.getProp("obj_test_sticky_persist_empty", "body")).toBe("");
+      verifyRepo.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

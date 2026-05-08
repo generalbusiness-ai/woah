@@ -27,6 +27,14 @@
           "skip_presence_check": true,
           "arg_spec": { "args": ["who", "what", "message_text?"] },
           "source": "verb :requires_perm(who, what, message_text) rxd { if (this:controls(who, what)) { return true; } let msg = message_text; if (typeof(msg) != \"string\" || !msg) { msg = \"permission denied\"; } raise { code: \"E_PERM\", message: msg, value: { who: who, what: what } }; }"
+        },
+        {
+          "name": "requires_wizard",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["who", "message_text?"] },
+          "source": "verb :requires_wizard(who, message_text) rxd { if (has_flag(who, \"wizard\")) { return true; } let msg = message_text; if (typeof(msg) != \"string\" || !msg) { msg = \"wizard authority required\"; } raise { code: \"E_PERM\", message: msg, value: { who: who } }; }"
         }
       ]
     }

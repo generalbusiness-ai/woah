@@ -64,8 +64,18 @@ export class McpGateway {
     let entry: SessionEntry | undefined = sessionHeader ? this.sessions.get(sessionHeader) : undefined;
 
     if (sessionHeader && !entry) {
-      this.world.recordMetric({ kind: "mcp_request", method: probe.method ?? "unknown", tool: probe.tool, ms: Date.now() - startedAt, status: "error" });
-      return mcpError(request, 404, -32001, "E_NOSESSION", "MCP session not found; reinitialize");
+      // The in-memory `sessions` map is per-DO-instance and lost across
+      // hibernation. Because we minted the MCP session id from the woo
+      // session id (see `bind` below), the persisted world.sessions table
+      // still has the actor binding — resume by rebinding a fresh transport
+      // around it, with a synthetic initialize so the SDK transport ends up
+      // in the same `_initialized` state the original handshake left it in.
+      const resumed = await this.tryResume(sessionHeader);
+      if (!resumed) {
+        this.world.recordMetric({ kind: "mcp_request", method: probe.method ?? "unknown", tool: probe.tool, ms: Date.now() - startedAt, status: "error" });
+        return mcpError(request, 404, -32001, "E_NOSESSION", "MCP session not found; reinitialize");
+      }
+      entry = resumed;
     }
 
     if (!entry) {
@@ -146,8 +156,11 @@ export class McpGateway {
       serverVersion: this.options.serverVersion ?? "0.0.0"
     });
 
+    // Mint the MCP transport session id from the woo session id so the
+    // resume path on a hibernated DO can recover state from the (already
+    // persisted) world.sessions table without any extra writes.
     const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomSessionId(),
+      sessionIdGenerator: () => woo.id,
       enableJsonResponse: true,
       onsessionclosed: (id) => { this.closeSession(id); }
     });
@@ -155,6 +168,35 @@ export class McpGateway {
     void server.connect(transport).catch(() => {});
 
     return { woo, server, transport, dispose };
+  }
+
+  private async tryResume(sessionId: string): Promise<SessionEntry | null> {
+    let woo: Session;
+    try {
+      woo = this.world.auth(`session:${sessionId}`);
+    } catch {
+      return null;
+    }
+    const entry = this.bind(woo);
+    try {
+      const initResponse = await entry.transport.handleRequest(synthesizeInitializeRequest());
+      // Drain any body to release the underlying stream.
+      await initResponse.body?.cancel().catch(() => {});
+    } catch {
+      entry.dispose();
+      void entry.transport.close().catch(() => {});
+      return null;
+    }
+    if (entry.transport.sessionId !== woo.id) {
+      // SDK refused the synthetic initialize for some reason; bail rather than
+      // leak a half-bound entry.
+      entry.dispose();
+      void entry.transport.close().catch(() => {});
+      return null;
+    }
+    this.sessions.set(woo.id, entry);
+    this.host.bindSession(woo.id, woo.actor);
+    return entry;
   }
 }
 
@@ -235,9 +277,24 @@ function jsonRpcIdFromValue(value: unknown): string | number | null {
   return typeof id === "string" || typeof id === "number" || id === null ? id : null;
 }
 
-function randomSessionId(): string {
-  const crypto = (globalThis as unknown as { crypto: { randomUUID: () => string } }).crypto;
-  return crypto.randomUUID();
+function synthesizeInitializeRequest(): Request {
+  return new Request("http://gateway.internal/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "accept": "application/json, text/event-stream"
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "resume",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "woo-resume", version: "0.0.0" }
+      }
+    })
+  });
 }
 
 export type { ObjRef };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileVerb, definePropertyVersioned, definePropertyVersionedAs, installVerb, installVerbAs } from "../src/core/authoring";
+import { analyzeBytecodePurity, combineVerbPurity, compileVerb, definePropertyVersioned, definePropertyVersionedAs, installVerb, installVerbAs, propagateVerbPurity } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { wooError, type TinyBytecode } from "../src/core/types";
 import {
@@ -622,5 +622,137 @@ describe("authoring", () => {
     });
     const applied = await callInDubspace(world, session.id, "eq", message(actor, "delay_1", "observe_eq", []));
     if (applied.op === "applied") expect(applied.observations[0].value).toBe(true);
+  });
+
+  describe("verb purity analysis", () => {
+    function compile(source: string): TinyBytecode {
+      const r = compileVerb(source);
+      if (!r.ok || !r.bytecode) throw new Error(`compile failed: ${JSON.stringify(r.diagnostics)}`);
+      return r.bytecode;
+    }
+
+    it("classifies a no-op getter as pure", () => {
+      expect(analyzeBytecodePurity(compile(`verb :title() rxd { return this.name; }`))).toBe("pure");
+    });
+
+    it("classifies a SET_PROP-only setter as impure", () => {
+      expect(analyzeBytecodePurity(compile(`verb :rename(n) rx { this.name = n; return n; }`))).toBe("impure");
+    });
+
+    it("classifies an OBSERVE emitter as impure even without property writes", () => {
+      // This is exactly the $note:read mistake that slipped past hand-marking.
+      const bc = compile(`verb :read() rxd { let t = this.text; observe({ type: "note_read", note: this, ts: now() }); return t; }`);
+      expect(analyzeBytecodePurity(bc)).toBe("impure");
+    });
+
+    it("classifies an impure-builtin call (moveto) as impure", () => {
+      expect(analyzeBytecodePurity(compile(`verb :hand(to) rx { moveto(this, to); return this; }`))).toBe("impure");
+    });
+
+    it("classifies a verb that calls another verb as unknown (transitive)", () => {
+      // text_summary calls is_readable_by — analyzer can't see through CALL_VERB,
+      // so it returns unknown and the catalog author's `pure: true` claim is
+      // accepted as an assertion.
+      expect(analyzeBytecodePurity(compile(`verb :summary() rxd { return this:title(); }`))).toBe("unknown");
+    });
+
+    it("rejects a `pure: true` claim that contradicts an impure bytecode", () => {
+      const bc = compile(`verb :read() rxd { observe({ type: "note_read" }); return this.text; }`);
+      expect(() => combineVerbPurity(analyzeBytecodePurity(bc), true, "$note:read")).toThrow(/declared pure/);
+    });
+
+    it("auto-pure verbs need no manifest claim and still get pure=true", () => {
+      const bc = compile(`verb :title() rxd { return this.name; }`);
+      expect(combineVerbPurity(analyzeBytecodePurity(bc), undefined, "$x:title")).toBe(true);
+    });
+
+    it("unknown verbs without a claim default to impure", () => {
+      const bc = compile(`verb :composite() rxd { return this:helper(); }`);
+      expect(combineVerbPurity(analyzeBytecodePurity(bc), undefined, "$x:composite")).toBe(false);
+      expect(combineVerbPurity(analyzeBytecodePurity(bc), true, "$x:composite")).toBe(true);
+    });
+  });
+
+  describe("propagateVerbPurity", () => {
+    it("flips a caller back to impure when a transitive callee turns impure", () => {
+      // H2 regression: with the old monotonic-increase fixed point, once
+      // `caller` was marked pure (because the initial helper was pure), a
+      // later impure rewrite of `helper` could not demote the caller. The
+      // monotonic-decrease pass must allow pure to clear.
+      const world = createWorld({ catalogs: false });
+      const wiz = "$wiz";
+      installVerbAs(world, wiz, wiz, "helper", `verb :helper() rxd { return this.name; }`, null);
+      installVerbAs(world, wiz, wiz, "caller", `verb :caller() rxd { return this:helper(); }`, null);
+      expect(world.ownVerbExact(wiz, "caller")?.pure).toBe(true);
+      // Now rewrite helper to be impure.
+      const helperVer = world.ownVerbExact(wiz, "helper")!.version;
+      installVerbAs(world, wiz, wiz, "helper", `verb :helper() rxd { observe({ type: "x" }); return 1; }`, helperVer);
+      expect(world.ownVerbExact(wiz, "helper")?.pure).toBeUndefined();
+      expect(world.ownVerbExact(wiz, "caller")?.pure).toBeUndefined();
+    });
+
+    it("treats verbs missing call metadata as opaque (H1 regression)", () => {
+      // Old persisted worlds pre-date the call-graph extractor. Verbs there
+      // have `calls === undefined`. Static analysis is "unknown" (CALL_VERB
+      // present); without a call graph we cannot prove purity.
+      const world = createWorld({ catalogs: false });
+      const wiz = "$wiz";
+      installVerbAs(world, wiz, wiz, "wrapper", `verb :wrapper() rxd { return this:helper(); }`, null);
+      // Strip the calls metadata to simulate an old world.
+      const v = world.ownVerbExact(wiz, "wrapper")!;
+      world.addVerb(wiz, { ...v, pure: true, calls: undefined });
+      expect(world.ownVerbExact(wiz, "wrapper")?.pure).toBe(true);
+      propagateVerbPurity(world);
+      // No declaration → without `calls`, conservatively impure.
+      expect(world.ownVerbExact(wiz, "wrapper")?.pure).toBeUndefined();
+    });
+
+    it("derives pass()-using verbs from the parent chain", () => {
+      // pass() dispatches to the parent class's verb of the same name.
+      // Propagation walks the inheritance chain to resolve the target and
+      // treats it like any other this:name call — the parent's verb must be
+      // pure for the caller to be pure.
+      const world = createWorld({ catalogs: false });
+      const wiz = "$wiz";
+      world.createObject({ id: "$base2", name: "$base2", parent: "$nothing", owner: wiz });
+      world.createObject({ id: "$child2", name: "$child2", parent: "$base2", owner: wiz });
+      installVerbAs(world, wiz, "$base2", "match", `verb :match() rxd { return [this.name]; }`, null);
+      installVerbAs(world, wiz, "$child2", "match", `verb :match() rxd { let out = pass(); return out + [this.name]; }`, null);
+      expect(world.ownVerbExact("$base2", "match")?.pure).toBe(true);
+      expect(world.ownVerbExact("$child2", "match")?.pure).toBe(true);
+    });
+
+    it("demotes pass()-using verbs when the parent is impure", () => {
+      const world = createWorld({ catalogs: false });
+      const wiz = "$wiz";
+      world.createObject({ id: "$base3", name: "$base3", parent: "$nothing", owner: wiz });
+      world.createObject({ id: "$child3", name: "$child3", parent: "$base3", owner: wiz });
+      installVerbAs(world, wiz, "$base3", "match", `verb :match() rxd { observe({ type: "x" }); return [this.name]; }`, null);
+      installVerbAs(world, wiz, "$child3", "match", `verb :match() rxd { let out = pass(); return out + [this.name]; }`, null);
+      expect(world.ownVerbExact("$base3", "match")?.pure).toBeUndefined();
+      expect(world.ownVerbExact("$child3", "match")?.pure).toBeUndefined();
+    });
+
+    it("demotes a parent verb when a subclass override is impure (Medium regression)", () => {
+      // `this:method()` dispatches at runtime against the receiver class.
+      // If a subclass overrides the method with impure behavior, the parent
+      // verb that invokes it must NOT be pure — the runtime call could land
+      // on the impure override. Static resolution against the definer alone
+      // would miss this and wrongly mark the parent pure.
+      const world = createWorld({ catalogs: false });
+      const wiz = "$wiz";
+      world.createObject({ id: "$base", name: "$base", parent: "$nothing", owner: wiz });
+      world.createObject({ id: "$sub", name: "$sub", parent: "$base", owner: wiz });
+      installVerbAs(world, wiz, "$base", "act", `verb :act() rxd { return this:behaviour(); }`, null);
+      installVerbAs(world, wiz, "$base", "behaviour", `verb :behaviour() rxd { return 1; }`, null);
+      // Pure so far: act calls behaviour (pure) → act is pure.
+      expect(world.ownVerbExact("$base", "act")?.pure).toBe(true);
+      // Add an impure subclass override.
+      installVerbAs(world, wiz, "$sub", "behaviour", `verb :behaviour() rxd { observe({ type: "boom" }); return 0; }`, null);
+      expect(world.ownVerbExact("$sub", "behaviour")?.pure).toBeUndefined();
+      // Now act on $base must NOT be pure: a $sub instance calling act would
+      // dispatch to the impure override.
+      expect(world.ownVerbExact("$base", "act")?.pure).toBeUndefined();
+    });
   });
 });

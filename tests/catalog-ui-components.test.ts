@@ -38,6 +38,9 @@ describe("bundled catalog UI components", () => {
     expect(registry.resolveFrame("the_pinboard", undefined, (_subject, classRef) => classRef === "$pinboard" ? 1 : false)?.frame.id).toBe("pinboard.board");
     expect(registry.resolveFrame("the_taskspace", undefined, (_subject, classRef) => classRef === "$taskspace" ? 1 : false)?.frame.id).toBe("taskspace.workspace");
     expect(registry.componentsForSurface("title-badge").map((component) => component.declaration.tag)).toContain("woo-weather-badge");
+
+    const weatherBadge = registry.componentsForSurface("title-badge").find((component) => component.declaration.tag === "woo-weather-badge");
+    expect(weatherBadge?.declaration.requires).toEqual(expect.arrayContaining(["current", "config_state"]));
   });
 
   it("renders the weather title badge from current block data", async () => {

@@ -22,7 +22,8 @@
         "subject": "$weather_block",
         "neighborhood": {
           "include": ["subject"]
-        }
+        },
+        "requires": ["current", "config_state", "place", "last_error"]
       }
     ]
   },

@@ -1,7 +1,7 @@
-import { compileVerb } from "./authoring";
+import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
 import { fixtureByName } from "./fixtures";
 import { hashSource } from "./source-hash";
-import { wooError, type ErrorValue, type ObjRef, type TinyBytecode, type VerbDef, type WooValue } from "./types";
+import { wooError, type ErrorValue, type ObjRef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import type { WooWorld } from "./world";
 
@@ -46,6 +46,7 @@ type CatalogVerbDef = {
   direct_callable?: boolean;
   skip_presence_check?: boolean;
   tool_exposed?: boolean;
+  pure?: boolean;
   implementation?: { kind: "native"; handler: string } | { kind: "fixture"; name: keyof typeof fixtureByName };
 };
 
@@ -92,8 +93,11 @@ export type CatalogMigrationStep =
   | { kind: "drop_verb"; class: string; verb: string }
   | { kind: "change_parent"; class: string; parent: string }
   | { kind: "rename_class"; from: string; to: string }
-  | { kind: "transform_property"; class: string; name: string; transform: string }
+  | { kind: "transform_property"; class: string; name: string; transform: CatalogMigrationTransform }
   | { kind: "custom"; verb: string };
+
+export type CatalogMigrationTransform =
+  | { op: "join"; separator?: string };
 
 export type CatalogMigrationManifest = {
   from_version: string;
@@ -530,6 +534,30 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
   }
   populateSeedExitAliasMaps(world, manifest, localSeeds);
 
+  // Static call-graph validation: every `this:name(...)` referenced from a
+  // catalog verb must resolve on the definer's class chain (parents +
+  // features). A missing target is a typo or a stale rename — surface it
+  // here rather than at runtime as `E_VERBNF`.
+  for (const def of objectDefs) {
+    for (const verbDef of def.verbs ?? []) {
+      const installed = world.ownVerbExact(def.local_name, verbDef.name);
+      if (!installed) continue;
+      const missing = findUnresolvedThisCalls(world, def.local_name, installed.calls);
+      if (missing.length > 0) {
+        throw wooError("E_CATALOG", `verb references unresolved this:targets: ${def.local_name}:${verbDef.name} -> ${missing.join(", ")}`, {
+          object: def.local_name,
+          verb: verbDef.name,
+          missing
+        });
+      }
+    }
+  }
+  // Fixed-point purity propagation: with the call graph now complete for
+  // this catalog and its dependencies, mark transitively-pure verbs
+  // automatically. Catalog-declared `pure: true` claims survive only when
+  // the graph confirms them.
+  propagateVerbPurity(world);
+
   const record: InstalledCatalogRecord = {
     tap,
     catalog: manifest.name,
@@ -667,6 +695,12 @@ export function applyCatalogSchemaPlan(world: WooWorld, manifest: CatalogManifes
       break;
     }
   }
+
+  // ensure_verb steps recompile verbs from manifest source, which resets the
+  // transitively-derived `pure` flag on any verb whose purity comes from the
+  // call-graph rather than a manifest declaration. Re-run propagation so the
+  // post-sync state matches a fresh install.
+  if (!failed) propagateVerbPurity(world);
 
   const issues = failed ? [] : verifyCatalogSchemaPlan(world, manifest, plan);
   const completedAt = Date.now();
@@ -1128,6 +1162,10 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         direct_callable: parsedPerms.directCallable,
         skip_presence_check: existing.skip_presence_check || def.skip_presence_check === true,
         tool_exposed: existing.tool_exposed || def.tool_exposed === true,
+        // pure_declared mirrors the manifest assertion exactly — declarations
+        // can be added or removed without changing source. The derived `pure`
+        // is left to propagation.
+        pure_declared: def.pure === true ? true : undefined,
         aliases: def.aliases ?? existing.aliases,
         arg_spec: catalogVerbArgSpec(def, existing.arg_spec)
       };
@@ -1136,6 +1174,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         next.direct_callable !== existing.direct_callable ||
         next.skip_presence_check !== existing.skip_presence_check ||
         next.tool_exposed !== existing.tool_exposed ||
+        next.pure_declared !== existing.pure_declared ||
         stableStringify(next.aliases ?? []) !== stableStringify(existing.aliases ?? []) ||
         stableStringify(next.arg_spec ?? {}) !== stableStringify(existing.arg_spec ?? {})
       ) world.addVerb(obj, next);
@@ -1153,6 +1192,13 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
       (existing.direct_callable === true) !== (repaired.direct_callable === true) ||
       (existing.skip_presence_check === true) !== (repaired.skip_presence_check === true) ||
       (existing.tool_exposed === true) !== (repaired.tool_exposed === true) ||
+      (existing.pure_declared === true) !== (repaired.pure_declared === true) ||
+      (
+        repaired.kind !== "native" &&
+        existing.kind !== "native" &&
+        Array.isArray(repaired.calls) &&
+        !Array.isArray(existing.calls)
+      ) ||
       (repaired.kind !== "native" && Object.keys(existing.line_map ?? {}).length === 0);
     if (changed) world.addVerb(obj, repaired);
     return;
@@ -1172,6 +1218,8 @@ function dropStaleOwnVerbs(world: WooWorld, objRef: ObjRef, manifestVerbNames: S
 function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, version: number, allowImplementationHints: boolean): VerbDef {
   const parsedPerms = normalizeVerbPerms(def.perms ?? "rx", def.direct_callable === true);
   const argSpec = catalogVerbArgSpec(def);
+  // For native and fixture verbs we have no bytecode to analyze. Native: trust
+  // the manifest claim (default false). Fixture: analyze the precompiled bytecode.
   const base = {
     name: def.name,
     aliases: def.aliases ?? [],
@@ -1188,13 +1236,18 @@ function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, 
   };
 
   if (allowImplementationHints && def.implementation?.kind === "native") {
-    return { ...base, kind: "native", native: def.implementation.handler };
+    // Native verbs have no bytecode to analyze, so the manifest's `pure: true`
+    // is the only signal — declaration *is* derivation here.
+    const native_pure = def.pure === true ? true : undefined;
+    return { ...base, kind: "native", native: def.implementation.handler, pure: native_pure, pure_declared: native_pure };
   }
 
   if (allowImplementationHints && def.implementation?.kind === "fixture") {
     const bytecode = fixtureByName[def.implementation.name] as TinyBytecode | undefined;
     if (!bytecode) throw wooError("E_CATALOG", `unknown fixture implementation: ${def.implementation.name}`);
-    return { ...base, kind: "bytecode", bytecode: { ...bytecode, version } };
+    const finalBytecode: TinyBytecode = { ...bytecode, version };
+    const pure = combineVerbPurity(analyzeBytecodePurity(finalBytecode), def.pure, `${obj}:${def.name}`);
+    return { ...base, kind: "bytecode", bytecode: finalBytecode, pure: pure || undefined, pure_declared: def.pure === true ? true : undefined };
   }
 
   return compileCatalogVerb(obj, def, owner, version);
@@ -1208,6 +1261,22 @@ function compileCatalogVerb(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, ver
     });
   }
   const parsedPerms = normalizeVerbPerms(def.perms ?? compiled.metadata?.perms ?? "rx", def.direct_callable === true);
+  const finalBytecode: TinyBytecode = { ...compiled.bytecode, version };
+  // The static analyzer + call-graph propagation derive purity for almost
+  // every verb. A manifest `pure: true` claim is an *assertion* — accepted
+  // only when justified (the verb has at least one opaque non-`this` call
+  // site that propagation cannot resolve) and when consistent with the
+  // bytecode (analyzer agrees the verb isn't demonstrably impure).
+  const analyzed = analyzeBytecodePurity(finalBytecode);
+  const calls = compiled.metadata?.calls;
+  // Verbs that ship a native implementation are also installable as bytecode
+  // (when `allowImplementationHints` is false). Their `pure: true` is for the
+  // native handler — not redundant against bytecode propagation — so skip the
+  // check here.
+  if (def.pure === true && !def.implementation) {
+    assertPureDeclarationJustified(analyzed, calls, `${obj}:${def.name}`);
+  }
+  const pure = combineVerbPurity(analyzed, def.pure, `${obj}:${def.name}`);
   return {
     kind: "bytecode",
     name: def.name,
@@ -1218,12 +1287,34 @@ function compileCatalogVerb(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, ver
     source: def.source,
     source_hash: compiled.source_hash ?? hashSource(def.source),
     version,
-    bytecode: { ...compiled.bytecode, version },
+    bytecode: finalBytecode,
     line_map: compiled.line_map ?? {},
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: def.skip_presence_check === true,
-    tool_exposed: def.tool_exposed === true
+    tool_exposed: def.tool_exposed === true,
+    pure: pure || undefined,
+    pure_declared: def.pure === true ? true : undefined,
+    calls
   };
+}
+
+// A manifest `pure: true` is justified iff the analyzer cannot decide on
+// its own AND the call graph contains at least one site propagation cannot
+// resolve — i.e. a non-`this` opaque receiver. Anything the analyzer or
+// propagation can derive must NOT carry a redundant declaration.
+function assertPureDeclarationJustified(analyzed: "pure" | "impure" | "unknown", calls: VerbCallSite[] | undefined, label: string): void {
+  if (analyzed === "pure") {
+    throw wooError("E_CATALOG", `redundant pure declaration: analyzer derives ${label} pure from bytecode alone`, { verb: label });
+  }
+  if (analyzed === "impure") {
+    // combineVerbPurity will throw the canonical conflict error; nothing to
+    // add here.
+    return;
+  }
+  const hasOpaqueCall = (calls ?? []).some((c) => !c.this_call);
+  if (!hasOpaqueCall) {
+    throw wooError("E_CATALOG", `redundant pure declaration: call-graph propagation can derive ${label} pure (no opaque non-this call sites)`, { verb: label });
+  }
 }
 
 function catalogVerbArgSpec(def: CatalogVerbDef, compiledArgSpec: Record<string, WooValue> = {}): Record<string, WooValue> {
@@ -1382,10 +1473,45 @@ function applyMigrationStep(
     }
     case "rename_class":
       throw wooError("E_NOT_IMPLEMENTED", "catalog rename_class migrations are deferred", step as unknown as WooValue);
-    case "transform_property":
-      throw wooError("E_NOT_IMPLEMENTED", "catalog transform_property migrations are deferred", step as unknown as WooValue);
+    case "transform_property": {
+      const classRef = resolveObjectRef(world, step.class, localObjects, localSeeds, installed);
+      for (const objRef of classAndDescendants(world, classRef)) transformPropertyLocal(world, objRef, step.name, step.transform);
+      return;
+    }
     case "custom":
       throw wooError("E_NOT_IMPLEMENTED", "catalog custom migrations are deferred", step as unknown as WooValue);
+  }
+}
+
+function transformPropertyLocal(world: WooWorld, objRef: ObjRef, name: string, transform: CatalogMigrationTransform): void {
+  const obj = world.object(objRef);
+  if (!obj.properties.has(name)) return;
+  const oldValue = obj.properties.get(name) as WooValue;
+  const newValue = applyMigrationTransform(oldValue, transform);
+  if (newValue === oldValue) return;
+  world.setProp(objRef, name, newValue);
+}
+
+function applyMigrationTransform(value: WooValue, transform: CatalogMigrationTransform): WooValue {
+  const op = (transform as { op?: unknown }).op;
+  switch (op) {
+    case "join": {
+      if (typeof value === "string") return value;
+      if (!Array.isArray(value)) {
+        throw wooError("E_INVARG", "transform op 'join' requires a list value", value);
+      }
+      const separator = typeof transform.separator === "string" ? transform.separator : "\n";
+      const parts: string[] = [];
+      for (const entry of value) {
+        if (typeof entry !== "string") {
+          throw wooError("E_INVARG", "transform op 'join' requires list entries to be strings", entry as WooValue);
+        }
+        parts.push(entry);
+      }
+      return parts.join(separator);
+    }
+    default:
+      throw wooError("E_CATALOG", `unknown transform_property op: ${typeof op === "string" ? op : String(op)}`, transform as unknown as WooValue);
   }
 }
 
@@ -1692,6 +1818,23 @@ function catalogVerbDrift(actual: VerbDef, expected: VerbDef): string[] {
   if ((actual.direct_callable === true) !== (expected.direct_callable === true)) drift.push("direct_callable");
   if ((actual.skip_presence_check === true) !== (expected.skip_presence_check === true)) drift.push("skip_presence_check");
   if ((actual.tool_exposed === true) !== (expected.tool_exposed === true)) drift.push("tool_exposed");
+  // Drift on the manifest-declared bit only. The derived `pure` flag is
+  // owned by propagation and may diverge from a freshly-compiled expected
+  // (because expected hasn't been propagated against the world). Comparing
+  // `pure_declared` lets a catalog cleanly add/remove an assertion without
+  // needing a source change.
+  if ((expected.pure_declared === true) !== (actual.pure_declared === true)) drift.push("pure_declared");
+  // Worlds compiled before the call-graph extractor have `calls === undefined`
+  // entirely. Without that metadata, propagation conservatively treats
+  // unknown-analyzed verbs as opaque/impure, so the missing field needs
+  // repair. Empty arrays mean "compiled with the extractor, no call sites
+  // recorded" and are honored as-is.
+  if (
+    expected.kind !== "native" &&
+    actual.kind !== "native" &&
+    Array.isArray(expected.calls) &&
+    !Array.isArray(actual.calls)
+  ) drift.push("calls");
   if (expected.kind !== "native" && Object.keys(actual.line_map ?? {}).length === 0) drift.push("line_map");
   return drift;
 }
@@ -1705,6 +1848,8 @@ function catalogVerbSummary(verb: VerbDef): Record<string, WooValue> {
     direct_callable: verb.direct_callable === true,
     skip_presence_check: verb.skip_presence_check === true,
     tool_exposed: verb.tool_exposed === true,
+    pure: verb.pure === true,
+    pure_declared: verb.pure_declared === true,
     source_hash: verb.source_hash,
     native: verb.kind === "native" ? verb.native : null
   };
