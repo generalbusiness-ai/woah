@@ -1055,7 +1055,6 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       expect(world.reapExpiredSessions(detachedAt + 60_001)).toEqual([session.id]);
       expect(world.sessions.has(session.id)).toBe(false);
       expect(world.hasPresence(actor, "the_dubspace")).toBe(false);
-      expect(world.hasPresence(actor, "the_dubspace")).toBe(false);
       expect(world.hasPresence(actor, "the_chatroom")).toBe(false);
       expect(world.getProp(actor, "description")).toBe("");
       expect(world.getProp(actor, "aliases")).toEqual([]);

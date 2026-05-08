@@ -697,7 +697,7 @@ function runChatTransparentFeatureMigration(world: WooWorld, names: readonly str
     });
     if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
-  for (const name of ["dubspace", "pinboard"]) {
+  for (const name of ["dubspace", "pinboard", "tasks"]) {
     if (!names.includes(name) || !localCatalogInstalled(world, name)) continue;
     const result = runLocalCatalogSchemaPlan(world, name, LOCAL_CATALOGS.get(name)!, "gateway", "world", {
       allowImplementationHints: true,
@@ -720,7 +720,7 @@ function runChatTransparentFeatureMigration(world: WooWorld, names: readonly str
 
 function transparentFeatureConsumers(): ObjRef[] {
   const out: ObjRef[] = [];
-  for (const name of ["dubspace", "pinboard"]) {
+  for (const name of ["dubspace", "pinboard", "tasks"]) {
     const manifest = LOCAL_CATALOGS.get(name);
     for (const hook of manifest?.seed_hooks ?? []) {
       if (hook.kind === "attach_feature" && hook.feature === "chat:$transparent" && typeof hook.consumer === "string") {

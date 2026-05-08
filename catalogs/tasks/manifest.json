@@ -603,6 +603,11 @@
       "properties": {
         "host_placement": "self"
       }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_bug_board",
+      "feature": "chat:$transparent"
     }
   ]
 }

@@ -165,8 +165,8 @@ verb $task:locate() rxd {
   return {
     object: this,
     view: "tasks",
-    parent: this.tasks,
-    title: this.title
+    parent: this.registry,
+    title: this.name
   };
 }
 

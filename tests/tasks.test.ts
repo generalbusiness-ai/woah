@@ -42,6 +42,13 @@ describe("tasks catalog", () => {
     expect(world.propOrNull("the_bug_board", "policies")).toEqual({});
   });
 
+  it("attaches $transparent so the_bug_board exposes embedded chat verbs", () => {
+    const world = setupWorld();
+    const features = world.propOrNull("the_bug_board", "features");
+    expect(Array.isArray(features) && features.includes("$transparent")).toBe(true);
+    expect(world.verbInfo("the_bug_board", "say").definer).toBe("$transparent");
+  });
+
   it("rejects create_task for an unknown kind", async () => {
     const world = setupWorld();
     const session = world.auth("guest:create-bug");

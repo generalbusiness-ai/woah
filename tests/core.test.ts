@@ -45,14 +45,14 @@ describe("woo core", () => {
 
     world.defineProperty("the_dubspace", {
       name: "description",
-      defaultValue: "private taskspace",
+      defaultValue: "private dubspace",
       owner: "$wiz",
       perms: "w",
       typeHint: "str"
     });
-    world.setProp("the_dubspace", "description", "private taskspace");
+    world.setProp("the_dubspace", "description", "private dubspace");
     expect((world.state(actor).objects.the_dubspace as Record<string, unknown>).description).toBeNull();
-    expect((world.state("$wiz").objects.the_dubspace as Record<string, unknown>).description).toBe("private taskspace");
+    expect((world.state("$wiz").objects.the_dubspace as Record<string, unknown>).description).toBe("private dubspace");
 
     await callInDubspace(world, session.id, "enter-describe", message(actor, "the_dubspace", "enter", []));
     const described = await callInDubspace(world, session.id, "describe-private", message(actor, "the_dubspace", "describe", []));

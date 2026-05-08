@@ -539,9 +539,11 @@ Strongly typed verb signatures (return types, raised errors, named-arg shapes) w
 A catalog may ship **UI components alongside its code** — control surfaces for
 its classes, dashboards, frame declarations, custom renderers, and observation
 handlers for the observations it emits. The dubspace catalog's mixer panel,
-the tasks catalog's Kanban view, a pinboard catalog's spatial board, and a
-chat catalog's transcript renderer are natural extensions of "the things this
-catalog provides."
+a pinboard catalog's spatial board, and a chat catalog's transcript renderer
+are natural extensions of "the things this catalog provides." A future kanban
+or registry view for the tasks catalog would fit the same mould — the v1 tasks
+catalog ships only verbs and observations, not UI; it's the canonical example
+of a catalog whose UI is yet to be authored.
 
 **Status: draft.** The browser client framework is specified in
 [protocol/ui-component-model.md](../protocol/ui-component-model.md). It defines
@@ -560,7 +562,7 @@ Catalog UI follows the same catalog lifecycle as code:
 - **Versioning + trust**: UI changes ride along with catalog versions and are
   wizard-installed trusted client code.
 
-Authors picking up the repo should expect their first-party UI work (the dubspace mixer, the tasks board, the chat transcript) to migrate from `src/client/` into their respective catalogs once the framework exists. The current bundled client is a v1 expedient, not an architectural choice.
+Authors picking up the repo should expect their first-party UI work (the dubspace mixer, a future tasks board, the chat transcript) to migrate from `src/client/` into their respective catalogs once the framework exists. The current bundled client is a v1 expedient, not an architectural choice.
 
 ---
 

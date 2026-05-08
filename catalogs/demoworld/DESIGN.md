@@ -12,7 +12,7 @@ demo apps refer to.
 
 ## Why it exists
 
-`chat`, `dubspace`, `pinboard`, and `taskspace` are catalogs of *types*.
+`chat`, `dubspace`, `pinboard`, and `tasks` are catalogs of *types*.
 A world that installs them gets the classes and features but no opinion
 about what specific rooms or instances should exist. demoworld is the
 catalog of *opinions*: it picks the names, locations, exits, props, and
@@ -58,7 +58,7 @@ squawking is actor-driven.
   `$exit`, `$conversational`, `$chatroom`, `$portable`, `$furniture`,
   `$match` — the building blocks. demoworld only assembles them.
 - Not a long-term home for new world-content. Each new bundled demo
-  should ship its own seed catalog (dubspace / pinboard / taskspace
+  should ship its own seed catalog (dubspace / pinboard / tasks
   pattern) rather than appending to demoworld.
 - Not a foundation for third-party catalogs. A world that installs
   `chat` + a community-published room set should not need demoworld.

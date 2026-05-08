@@ -25,6 +25,9 @@ function testWooContext(names: Record<string, string> = {}): WooContext {
 }
 
 describe("bundled catalog UI components", () => {
+  // The tasks catalog ships no UI in v1 (no `ui` block in manifest, no ui/ dir);
+  // see spec/discovery/catalogs.md §CT12. A future kanban or registry view would
+  // be authored here.
   it("declares and resolves first-party tool frames", () => {
     const registry = new CatalogUiRegistry();
     expect(registry.installCatalogUi({ alias: "chat", catalog: "chat", objects: { "$space": "$space", "$chatroom": "$chatroom" }, ui: (chatManifest as any).ui })).toEqual([]);

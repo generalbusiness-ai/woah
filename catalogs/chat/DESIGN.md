@@ -1,6 +1,6 @@
 # Chat Demo
 
-A canonical MOO surface — rooms, presence, talk, emote, tell — built as a feature-object composition rather than a `$space` subclass. Sits alongside dubspace/tasks/IDE; can also embed inside them.
+A canonical MOO surface — rooms, presence, talk, emote, tell — built as a feature-object composition rather than a `$space` subclass. Sits alongside the dubspace, tasks, and IDE catalogs; can also embed inside them.
 
 ## Classes
 
@@ -48,7 +48,7 @@ The chat verbs use the **direct live interaction** pattern from [core.md §C13](
 
 Because the chat verbs route directly, every observation they emit is live-only by [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route): pushed to the room's session audience, never stored. A late-joining client sees no scrollback. This matches MOO's `notify()` semantics. Object commands that mutate state can still route through the room's sequenced log; for example `teach bird "hello"` plans as a `$space:call` against the cockatoo, so the mutation and observation are replay-visible.
 
-**Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a tasks's `:claim`, `:transition`); chat traffic flows past it.
+**Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a queue handler that needs strict ordering, an admin verb whose effect must be reproducible from the log); chat traffic flows past it.
 
 > Being a `$space` does not mean every verb on the object is sequenced ([core.md §C12](../../spec/semantics/core.md#c12-direct-messages-vs-space-mediated-messages)). A `$chatroom` is a `$space` and a feature consumer; chat verbs run as direct calls and never enter the room's sequence log. Saying something does not advance `next_seq`.
 
@@ -227,7 +227,7 @@ For embedded mode, `the_bug_board` (a `$task_registry`) gets the transparent cha
 the_bug_board.features = [$transparent]
 ```
 
-Now `the_bug_board:say("starting standup")` works. The utterance is a direct call, so the `said` observation is live-only — pushed to tasks's session audience, separate from the tasks's own sequenced log of task mutations.
+Now `the_bug_board:say("starting standup")` works. The utterance is a direct call, so the `said` observation is live-only — pushed to the registry's session audience, separate from the registry's own sequenced log of task mutations.
 
 ## Seeded Rooms And Things
 
@@ -315,8 +315,8 @@ This is what stress-tests `$match`: a real chat surface using the parser end-to-
 ## Embedded mode
 
 The same chat client connecting to `the_bug_board` shows:
-- The tasks's chat (`said`, `emoted`, `entered`, `left` live observations).
-- The tasks's task-state changes (`task_created`, `status_changed`, etc.) as applied frames in the *same* feed.
+- The registry's chat (`said`, `emoted`, `entered`, `left` live observations).
+- The registry's task-state changes (`task_created`, `task_claimed`, `task_passed`, `task_released`, etc.) as direct observations on the *same* feed.
 
 Two streams, one timeline. The renderer distinguishes by observation type but renders both as text lines. This is what makes "chat embedded inside a workspace" not a separate UI mode — it's the same UI, with one extra feature attached.
 

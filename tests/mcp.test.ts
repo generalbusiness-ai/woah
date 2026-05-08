@@ -401,6 +401,56 @@ describe("McpHost", () => {
     expect(bobDrain.observations.map((o) => o.type)).toEqual(["pong"]);
   });
 
+  it("invokes a sequenced tool through the enclosing space and returns applied", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-seq");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+    const enteredPinboard = await world.directCall(undefined, session.actor, "the_pinboard", "enter", []);
+    expect(enteredPinboard.op).toBe("result");
+
+    const addNote = (await host.enumerateTools(session.actor)).find((t) => t.object === "the_pinboard" && t.verb === "add_note")!;
+    expect(addNote).toBeDefined();
+    expect(addNote.direct).toBe(false);
+    expect(addNote.enclosingSpace).toBe("the_pinboard");
+
+    const result = await host.invokeTool(session.actor, session.id, addNote, ["MCP-routed note"]);
+    expect(result.applied).toBeDefined();
+    expect(result.applied?.space).toBe("the_pinboard");
+    expect(typeof result.applied?.seq).toBe("number");
+    expect(result.observations.some((o) => o.type === "note_added")).toBe(true);
+  });
+
+  it("focus extends reachability so a focused $task's lifecycle verbs join the tool list", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-focus-task");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+
+    const seeded = await world.directCall("seed-min", "$wiz", "the_bug_board", "seed_minimal_policy", [session.actor], { forceDirect: true, forceReason: "test" });
+    expect(seeded.op).toBe("result");
+    const created = await world.directCall("mcp-create-task", session.actor, "the_bug_board", "create_task", ["task", "Focus me", "test body", [], null], { forceDirect: true, forceReason: "test" });
+    expect(created.op).toBe("result");
+    const taskRef = (created.op === "result" ? created.result : null) as string | null;
+    expect(typeof taskRef).toBe("string");
+    if (typeof taskRef !== "string") return;
+
+    expect((await host.enumerateTools(session.actor, { scope: "focus" })).some((t) => t.object === taskRef)).toBe(false);
+
+    const focus = (await host.enumerateTools(session.actor)).find((t) => t.object === session.actor && t.verb === "focus")!;
+    await host.invokeTool(session.actor, session.id, focus, [taskRef]);
+
+    const taskTools = (await host.enumerateTools(session.actor, { scope: "focus" })).filter((t) => t.object === taskRef);
+    expect(taskTools.length).toBeGreaterThan(0);
+    for (const lifecycle of ["claim", "pass", "release", "handoff", "reject", "wait", "yield", "drop_terminal"]) {
+      expect(taskTools.some((t) => t.verb === lifecycle)).toBe(true);
+    }
+
+    const unfocus = (await host.enumerateTools(session.actor)).find((t) => t.object === session.actor && t.verb === "unfocus")!;
+    await host.invokeTool(session.actor, session.id, unfocus, [taskRef]);
+    expect((await host.enumerateTools(session.actor, { scope: "focus" })).some((t) => t.object === taskRef)).toBe(false);
+  });
+
   it("uses dispatch hooks for MCP direct and sequenced invocation routes", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-dispatch-hooks");

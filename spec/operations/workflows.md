@@ -57,7 +57,7 @@ Example: a `$design_review_registry` class has `workflow` defaulting to:
 }
 ```
 
-Tasks created in such a space get `status` initialized to the workflow's `initial`; `:set_status` consults the workflow for transition rules.
+Items in such a space get a `status` property initialized to the workflow's `initial`; the gated `:set_status` verb (see §WF5) consults the workflow for transition rules. Note: this is a separate design pattern from the v1 `tasks` catalog, which uses an obligation cursor (`:claim`, `:pass`, …) rather than a named-state machine. A `$workflow_space` would extend `$space` directly, not `$task_registry`.
 
 ---
 
@@ -94,10 +94,10 @@ If the role property is null (e.g., reviewer not set), transition rejects with `
 
 ## WF5. The gated `:set_status`
 
-The task registry's `:set_status` integrates the workflow check:
+A `$workflow_task` subclass (a peer of `$task`, not an extension of v1 `$task`) integrates the workflow check on its `:set_status`:
 
 ```woo
-verb $task:set_status(status) {
+verb $workflow_task:set_status(status) {
   let workflow = this.space.workflow;
   let from     = this.status;
   let to       = status;
@@ -124,7 +124,7 @@ verb $task:set_status(status) {
 }
 ```
 
-For workflow-bearing task registries, this replaces the unguarded `set_status` from the open-policy demo. The unguarded form survives on `$task` for the workflow-free demo; the workflow-aware form is on a `$workflow_task` subclass.
+The v1 `tasks` catalog does not include `$workflow_task`: it picks the obligation-cursor model instead, where state is the position in an ordered obligation list rather than a named state in a transition graph. A workflow-bearing class is a peer pattern that catalogs may build on top of `$space` when a named-state machine is the better fit.
 
 `:transition(to)` is offered as ergonomic sugar — equivalent to `:set_status(to)` but reads better in agent code.
 
@@ -272,7 +272,7 @@ $workflow_space:items_in_state(state, max_capability?) -> list<obj>
 When `max_capability` is set, only items with `capability ≤ max_capability` (or null) are returned. The conventional agent loop:
 
 ```
-items = $task_registry:items_unfilled("performer", $me.capability)
+items = $workflow_space:items_unfilled("performer", $me.capability)
 ```
 
 — and the agent only sees what it is allowed to claim.

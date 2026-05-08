@@ -325,52 +325,74 @@ hints until the VM can express them directly.
 
 > **Non-normative.** The `tasks` catalog is a **demo application** (see [catalogs.md §CT15](../discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo)). Documented here for reader convenience; canonical source is `catalogs/tasks/manifest.json` and [`catalogs/tasks/DESIGN.md`](../../catalogs/tasks/DESIGN.md). A world without the demo will not have `$task_registry` or `$task`.
 
+The model is task-as-obligation-list. A registry authors a policy graph (named roles, named obligations gated by a role and a criterion, ordered policies per task kind) and mints `$task` children that carry a snapshotted obligation list. The cursor advances as the holder calls `:pass`; movement of the task between actors is the lease, and the registry's `:acceptable` gate enforces role-holding on every transition. See [`notes/2026-05-06-task-obligation-model.md`](../../notes/2026-05-06-task-obligation-model.md) for design notes.
+
 | Corename | Parent | Anchor | Description |
 |---|---|---|---|
-| `$task_registry` | `$space` | n/a (own host) | Base class for spaces that coordinate hierarchical work. It extends `$space` with root task ordering and task-creation behavior for asynchronous human and agent collaboration. |
-| `$task` | `$note` | n/a | Base class for task work items. A task is also a note/card artifact, and stores title, description, status, assignee, requirements, artifacts, messages, parent linkage, and ordered subtasks. |
+| `$task_registry` | `$space` | n/a (own host) | A space that mints and coordinates `$task` children. Authors a policy graph (roles, obligations, ordered policies per kind) and exposes admin verbs for editing it. Tasks colocate with the registry in v1 (one DO per registry). |
+| `$task` | `$note` | n/a | A work item minted by a `$task_registry`. Carries a snapshotted obligation list whose cursor advances as role-holders `:pass`. Movement is the lease: lifecycle verbs set `transition_intent` so the registry's `:acceptable` gate can authorize the move; generic `take`/`give`/`drop` fail because they don't set the intent. |
 
 ### B4.1 `$task_registry` additional properties
 
-| Property | Type | Default |
-|---|---|---|
-| `root_tasks` | list<obj> | `[]` | Top-level tasks ordered. |
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `roles` | map | `{}` | `role_name → { description: str, owners: list<obj> }`. |
+| `obligations` | map | `{}` | `key → { role: str, criterion: str }`. |
+| `policies` | map | `{}` | `kind → list<obligation_key>` — the ordered obligation list a new task of `kind` is minted with. |
 
 ### B4.2 `$task` properties
 
-| Property | Type | Default |
-|---|---|---|
-| `title` | str | `""` |
-| `description` | str | `""` |
-| `parent_task` | obj \| null | null | null = directly under registry root |
-| `subtasks` | list<obj> | `[]` | Ordered. |
-| `status` | str | `"open"` | One of: `open`, `claimed`, `in_progress`, `blocked`, `done`. |
-| `assignee` | obj \| null | null | The claimer. |
-| `requirements` | list<map> | `[]` | `[{text: str, checked: bool}, ...]`. |
-| `artifacts` | list<map> | `[]` | `[{kind: str, ref: str, label?: str}, ...]`. |
-| `messages` | list<map> | `[]` | `[{actor: obj, ts: int, body: str}, ...]`. |
-| `space` | obj | (set at create) | The task registry this task belongs to (for emit routing). |
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `registry` | obj | null (set at create) | The `$task_registry` that minted this task. |
+| `kind` | str | `""` | Policy kind selected at create time (key into `registry.policies`). |
+| `obligations` | list<map> | `[]` | Snapshotted obligation list — `[{ key: str, met: bool, evidence?: any }, ...]`. The cursor is the first unmet entry whose key still resolves in `registry.obligations`. |
+| `wait_for` | list<map> | `[]` | Outstanding wait conditions; non-empty blocks `:claim`/`:pass`. |
+| `links` | list<map> | `[]` | Soft edges to other tasks: `[{ to: obj, role: str }, ...]`. |
+| `log` | list<map> | `[]` | Per-task journal of lifecycle events. |
+| `labels` | list<str> | `[]` | Free-form labels for filtering. |
+| `source` | any | null | Optional caller-supplied origin reference. |
+| `terminal` | bool | false | True after `:drop_terminal`; further lifecycle verbs reject. |
+| `created_at` | int | 0 | ms-since-epoch at create. |
+| `last_change` | int | 0 | ms-since-epoch of last lifecycle mutation. |
+| `transition_intent` | any | null | Set by `:_authorized_moveto` for the duration of one move; consulted by `:moveto` and `:acceptable`. |
+
+`$task` inherits `$note`'s `text` storage, so the task body is a single `$note` text used by `:set_text` from `:create_task`.
 
 ### B4.3 `$task_registry` verbs
 
-`:create_task(title, description)` returning the new task ref. Body is ordinary
-catalog source: `create($task, actor)`, set task properties, append to
-`root_tasks`, and emit `task_created`. The registry uses the generic `create`
-builtin; no task-specific native runtime handler is required.
-
-### B4.4 `$task` verbs
+All listed verbs are `direct_callable: true` (no sequenced log entry). Tool-exposed verbs are surfaced through MCP per [routing.md](../protocol/routing.md).
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:add_subtask(title, description)` | str, str | Creates a child task. Emits `subtask_added`. |
-| `:move(parent, index)` | obj \| null, int | Re-parent or reorder; emits `task_moved`. |
-| `:claim()` | — | Sets `assignee = actor`, status `claimed`. Emits `task_claimed`. |
-| `:release()` | — | Clears assignee, status `open` unless already `done`. Emits `task_released`. |
-| `:set_status(status)` | str | Sets status; non-`done` changes on claimed tasks require assignee or wizard. On `done` with unchecked requirements, also emits `done_premature`. Emits `status_changed`. |
-| `:add_requirement(text)` | str | Appends to requirements. Emits `requirement_added`. |
-| `:check_requirement(index, checked)` | int, bool | Updates checked. Emits `requirement_checked`. |
-| `:add_message(body)` | str | Appends to messages. Emits `message_added`. |
-| `:add_artifact(ref)` | map | Appends to artifacts. Emits `artifact_attached`. |
+| `:holds_role(actor_obj, role_name)` | obj, str | Returns true iff `actor_obj` is a wizard or appears in `roles[role_name].owners`. |
+| `:acceptable(thing)` | obj | Movement gate: returns true only for `$task` children whose `registry == this`. |
+| `:create_task(kind, name, text, labels, source_ref)` | str, str, str, list, any | Mints a `$task`, snapshots `policies[kind]` into `obligations`, sets text via `:set_text`, and emits `task_created`. |
+| `:listing()` | — | Returns a per-task summary (cursor role, wait_for count, terminal/complete flags, age) for kanban/list rendering. |
+| `:available_actions(t, actor_obj)` | obj, obj | Returns the lifecycle verbs `actor_obj` may invoke on task `t` from its current location, with arg specs — used by UI affordance discovery. |
+| `:set_role(role_name, info)` / `:remove_role(role_name)` | str, map / str | Owner/wizard-only registry admin. Emits `registry_role_changed`. `:remove_role` rejects when an obligation still references the role. |
+| `:set_obligation(key, info)` / `:remove_obligation(key)` | str, map / str | Owner/wizard-only registry admin. Emits `registry_obligation_changed`. `:remove_obligation` rejects when a policy still references the key, and emits `obligation_orphaned` for any live task whose snapshot still names the key. |
+| `:set_policy(kind, keys)` / `:remove_policy(kind)` | str, list / str | Owner/wizard-only registry admin. Emits `registry_policy_changed`. |
+| `:seed_minimal_policy(seed_owner)` | obj | Owner/wizard-only convenience for tests/demos: refuses if any role/obligation/policy is set, otherwise installs a single `doer` role, a single `do:it` obligation, and a `task` policy. |
+
+Helper verbs (`:exitfunc`, `:_on_release`, `:_task_complete`) are not direct-callable and exist to participate in object move and cascade-completion bookkeeping.
+
+### B4.4 `$task` verbs
+
+Lifecycle verbs are all `direct_callable: true` and `tool_exposed: true`. The lease invariant is encoded in `:moveto` (which refuses without `transition_intent`) and `:_authorized_moveto` (which sets the intent for one move). Generic `take`/`give`/`drop` therefore fail on a `$task`.
+
+| Verb | Args | Purpose |
+|---|---|---|
+| `:cursor()` | — | Returns the first unmet obligation map `{ key, role, criterion }`, or `null` if the snapshot is complete. |
+| `:claim()` | — | At-registry → with-actor. Refuses on terminal task, missing cursor, unresolved `wait_for`, or actor without cursor role. Emits `task_claimed`. |
+| `:handoff(target)` | obj | With-actor → with-different-actor; both must hold the cursor role. Emits `task_moved`. |
+| `:release()` | — | With-actor → at-registry. Holder or wizard only. Emits `task_released` and notifies the registry via `:_on_release`. |
+| `:pass(evidence)` | any | Marks the cursor obligation `met` with caller-supplied evidence and advances. If the snapshot becomes complete, also performs the implicit release. Emits `task_passed` (and `task_released` on completion). |
+| `:reject(i, why)` | int, str | Holder rewinds an already-met obligation by 1-based index, clearing its `met` flag. Emits `task_rejected`. |
+| `:wait(cond)` | map | Holder appends a wait condition (e.g. `{ kind: "child_complete", task: <child> }`) blocking subsequent claims/passes until cleared. Emits `task_waited`. |
+| `:yield(spec)` | map | Holder spawns a related child task on the same registry, optionally blocking until the child completes. Emits `task_yielded`. |
+| `:drop_terminal(why)` | str | Marks the task terminal and returns it home. Holder or wizard only. Emits `task_dropped` and `task_returned_home`. |
+| `:moveto(target)` / `:_authorized_moveto(target, intent_kind)` | obj / obj, str | Internal movement primitives — `:moveto` is the gate, `:_authorized_moveto` is the only path that sets the intent. Not direct-callable. |
 
 ---
 
