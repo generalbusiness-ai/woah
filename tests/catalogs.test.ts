@@ -2422,7 +2422,13 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-01-agent-tool-exposure-repair");
   });
 
-  it("migrates the cockatoo into worlds installed before it landed", { timeout: 15000 }, async () => {
+  // Heavy by design: the runLocalCatalogs install path runs the full
+  // catalog schema-sync pass against chat + demoworld (manifest hash check,
+  // verb compile/diff, seed reconcile), which is the contract this test
+  // verifies. Whether `applied_migrations` excludes one entry or many makes
+  // little difference — schema sync always walks the requested catalogs in
+  // full. ~10s on memory, ~12s on sqlite is the real cost of the work.
+  it("migrates the cockatoo into worlds installed before it landed", { timeout: 30000 }, async () => {
     const world = createWorld();
     // Reset to before the cockatoo migration ran
     world.setProp("$system", "applied_migrations", ["2026-04-30-source-catalog-verbs", "2026-04-30-catalog-placement-metadata"]);
@@ -2444,7 +2450,10 @@ describe("local catalogs", () => {
     expect(squawk.op).toBe("result");
   });
 
-  it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 15000 }, async () => {
+  // Heavy by design (see "migrates the cockatoo" comment above): exercises
+  // the full schema-sync pass on chat + taskspace, plus a forced re-apply of
+  // the four native-verb migrations the test names. ~12-15s on memory.
+  it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 30000 }, async () => {
     const world = createWorld();
     world.setProp("$system", "applied_migrations", []);
     const look = world.ownVerb("$conversational", "look")!;

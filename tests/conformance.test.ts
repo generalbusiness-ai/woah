@@ -16,23 +16,33 @@ type Harness = {
   cleanup: () => void;
 };
 
+// Tests that pass a repository skip the boot-snapshot cache, so each
+// createWorld() pays the full bundled-catalog install cost (~4s, since
+// chat/demoworld/dubspace/pinboard/taskspace all compile their DSL verbs
+// from manifest sources). Cross-host tests build three worlds, which adds
+// up to ~12s of setup before the test body even runs. Tests that don't
+// need the bundled catalogs (only $space / $thing / $actor in core) should
+// pass `catalogs: false`; tests that need a subset should name it.
+type MakeOptions = { catalogs?: readonly string[] | false };
+
 type Backend = {
   name: string;
-  make: () => Harness;
+  make: (options?: MakeOptions) => Harness;
 };
 
 const backends: Backend[] = [
   {
     name: "memory",
-    make: () => {
+    make: (options) => {
+      const catalogs = options?.catalogs;
       const repo = new InMemoryObjectRepository();
-      let world = createWorld({ repository: repo });
+      let world = createWorld({ repository: repo, catalogs });
       return {
         get world() {
           return world;
         },
         restart: () => {
-          world = createWorld({ repository: repo });
+          world = createWorld({ repository: repo, catalogs });
           return world;
         },
         cleanup: () => undefined
@@ -41,11 +51,12 @@ const backends: Backend[] = [
   },
   {
     name: "sqlite",
-    make: () => {
+    make: (options) => {
+      const catalogs = options?.catalogs;
       const dir = mkdtempSync(join(tmpdir(), "woo-conformance-"));
       const path = join(dir, "world.sqlite");
       let repo = new LocalSQLiteRepository(path);
-      let world = createWorld({ repository: repo });
+      let world = createWorld({ repository: repo, catalogs });
       return {
         get world() {
           return world;
@@ -53,7 +64,7 @@ const backends: Backend[] = [
         restart: () => {
           repo.close();
           repo = new LocalSQLiteRepository(path);
-          world = createWorld({ repository: repo });
+          world = createWorld({ repository: repo, catalogs });
           return world;
         },
         cleanup: () => {
@@ -509,9 +520,13 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
   });
 
   it("moves objects across hosts by updating owner location and container mirrors", async () => {
-    const homeHarness = make();
-    const roomAHarness = make();
-    const roomBHarness = make();
+    // Pure substrate test: only $space / $thing / $actor (all in core). Skip
+    // bundled catalogs so the three-world harness setup doesn't dominate the
+    // 30s budget — without this it spends ~12s in createWorld() before the
+    // test body starts.
+    const homeHarness = make({ catalogs: false });
+    const roomAHarness = make({ catalogs: false });
+    const roomBHarness = make({ catalogs: false });
     try {
       const home = homeHarness.world;
       const roomA = roomAHarness.world;
@@ -555,9 +570,13 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
   });
 
   it("moves chat actors across room hosts with presence and contents mirrors", async () => {
-    const homeHarness = make();
-    const roomAHarness = make();
-    const roomBHarness = make();
+    // Needs $guest (chat) + the_chatroom / the_deck / the_hot_tub (demoworld).
+    // Trim everything else so the three-world harness fits comfortably under
+    // the 30s budget on a busy `npm test` run.
+    const harnessOpts = { catalogs: ["chat", "demoworld"] as const };
+    const homeHarness = make(harnessOpts);
+    const roomAHarness = make(harnessOpts);
+    const roomBHarness = make(harnessOpts);
     try {
       const home = homeHarness.world;
       const roomA = roomAHarness.world;
