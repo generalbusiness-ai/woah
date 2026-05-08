@@ -783,6 +783,9 @@ function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string
 // and a missing destination; deletes only when own value is still present.
 function migrateTaskspaceNoteShapeData(world: WooWorld): void {
   if (!world.objects.has("$task")) return;
+  // Per-instance: copy title→name (using the public setter so both
+  // SerializedObject.name and the "name" property persist), copy
+  // description→text when not already set, then strip the obsolete own values.
   for (const id of world.objects.keys()) {
     if (!world.isDescendantOf(id, "$task")) continue;
     if (id === "$task") continue;
@@ -794,8 +797,7 @@ function migrateTaskspaceNoteShapeData(world: WooWorld): void {
       // inherited `obj.name`, which therefore defaults to the object id.
       // Always overwrite name with the explicit title — it's the
       // user-supplied label, the id-shaped default never was.
-      obj.name = title;
-      world.setProp(id, "name", title);
+      world.setObjectName(id, title);
     }
     const description = own.get("description");
     if (typeof description === "string" && description && !own.has("text")) {
@@ -804,6 +806,24 @@ function migrateTaskspaceNoteShapeData(world: WooWorld): void {
     if (own.has("title")) world.deleteProp(id, "title");
     if (own.has("description")) world.deleteProp(id, "description");
   }
+}
+
+function migrateTaskspaceNoteShapeClassDefs(world: WooWorld): void {
+  // Strip the v0.2 shadow property defs on $task itself. Without this step
+  // the v0.2 shadows of $root.name and $root.description persist on $task
+  // and continue to mask the inherited slots. Gateway-only — class
+  // definitions are owned by the gateway, not by host slices.
+  //
+  // TODO(catalog-installer): this is a workaround for a gap in
+  // runLocalCatalogSchemaPlan / repairCatalogManifest — `reconcileClassVerbs`
+  // drops verbs not in the manifest, but there is no `reconcileClassProps`
+  // peer that drops property defs not in the manifest. Future major-version
+  // bumps that drop class property defs will rediscover this. The fix
+  // belongs in src/core/catalog-installer.ts:repairCatalogManifest.
+  if (!world.objects.has("$task")) return;
+  const taskClass = world.object("$task");
+  if (taskClass.propertyDefs.has("title")) world.deleteProp("$task", "title");
+  if (taskClass.propertyDefs.has("description")) world.deleteProp("$task", "description");
 }
 
 function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[]): void {
@@ -816,6 +836,7 @@ function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[
   if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION)) return;
   if (!world.objects.has("$task")) return;
   migrateTaskspaceNoteShapeData(world);
+  migrateTaskspaceNoteShapeClassDefs(world);
   const result = runLocalCatalogSchemaPlan(world, "taskspace", LOCAL_CATALOGS.get("taskspace")!, "gateway", "world", {
     allowImplementationHints: true,
     reconcileClassVerbs: true

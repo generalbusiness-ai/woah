@@ -824,6 +824,17 @@ export class WooWorld {
     return true;
   }
 
+  setObjectName(objRef: ObjRef, name: string): void {
+    // Keep both name surfaces in sync: WooObject.name (SerializedObject /
+    // ScopedObjectSummary) and the inherited "name" property (woocode
+    // `this.name`). Different consumers read different surfaces.
+    const obj = this.object(objRef);
+    obj.name = name;
+    obj.modified = Date.now();
+    this.persistObject(objRef);
+    this.setProp(objRef, "name", name);
+  }
+
   ownVerb(objRef: ObjRef, name: string): VerbDef | null {
     return this.ownVerbNamed(objRef, name);
   }
