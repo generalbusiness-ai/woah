@@ -123,6 +123,12 @@ describe("host teardown gate", () => {
     const body = await resp.json() as any;
     expect(body.error.code).toBe("E_HOST_RECYCLED");
 
+    // The gate re-scheduled the teardown sequence on this wake (per
+    // §RC11.2 recoverable crash path). One waitUntil promise should have
+    // been queued.
+    expect(hostState.waitUntilPromises.length).toBeGreaterThanOrEqual(1);
+    await Promise.allSettled(hostState.waitUntilPromises);
+
     directoryState.close();
     hostState.close();
   });
@@ -173,6 +179,10 @@ describe("host teardown sequence", () => {
     await registerRoute("obj_a");
     await registerRoute("obj_b");
     await registerRoute("obj_c");
+    // Self-hosted root registers its own route at create time (see
+    // registerObjectRoutes); the teardown roster includes the root so
+    // this id_route entry must exist for §RC11.3 step 2 ownership check.
+    await registerRoute(hostKey);
 
     // Seed: pre-populate the host's tombstone table directly so the
     // teardown sequence has a roster to migrate.
@@ -231,10 +241,21 @@ describe("host teardown sequence", () => {
     )`);
     hostState.db.exec("CREATE TABLE IF NOT EXISTS world_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     const insertTomb = hostState.db.prepare("INSERT INTO tombstone(id, recycled_at, reason) VALUES (?, ?, NULL)");
+    const allIds: string[] = [];
     for (let i = 0; i < 2500; i++) {
       const id = `obj_${String(i).padStart(5, "0")}`;
+      allIds.push(id);
       insertTomb.run(id, i);
     }
+    // Register each id as routed to hostKey so §RC11.3 step 2's roster
+    // ownership check accepts the inherit batch.
+    const registerReq = await signInternalRequest(authEnv(), new Request("https://woo.test/register-objects", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-woo-host-key": hostKey },
+      body: JSON.stringify({ routes: allIds.map((id) => ({ id, host: hostKey, anchor: null })) })
+    }));
+    const registerResp = await directory.fetch(registerReq);
+    expect(registerResp.ok).toBe(true);
 
     // Spy on Directory fetches to count batches.
     const original = directory.fetch.bind(directory);
@@ -346,6 +367,89 @@ describe("host teardown sequence", () => {
     // 410 with E_HOST_RECYCLED — the guard didn't trip.
     expect(resp.status).not.toBe(410);
     expect(guardChecked).toBe(true);
+
+    directoryState.close();
+    hostState.close();
+  });
+
+  it("post-handler trigger fires when self-hosted root is in world.tombstones and not in world.objects", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, authEnv());
+
+    const hostKey = "trigger_host";
+    // Pre-register the root's route so a later inherit batch passes
+    // ownership check.
+    const reg = await signInternalRequest(authEnv(), new Request("https://woo.test/register-objects", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-woo-host-key": hostKey },
+      body: JSON.stringify({ routes: [{ id: hostKey, host: hostKey, anchor: null }] })
+    }));
+    await directory.fetch(reg);
+
+    const hostState = new FakeDurableObjectState(hostKey);
+    const env = makeEnv(directory, (_n) => ({ fetch: async () => new Response(null, { status: 503 }) }));
+    const hostDO = new PersistentObjectDO(hostState as unknown as DurableObjectState, env);
+
+    // Pre-seed the host's repo so the trigger condition holds when getWorld
+    // rehydrates: tombstone for hostKey present, no object row for hostKey.
+    // The world_meta table is created by the CF repo's migrate; we add a
+    // tombstone row directly so world.tombstones contains hostKey on load.
+    hostState.db.exec("CREATE TABLE IF NOT EXISTS world_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    hostState.db.exec(`CREATE TABLE IF NOT EXISTS tombstone (
+      id TEXT PRIMARY KEY,
+      recycled_at INTEGER NOT NULL,
+      reason TEXT
+    )`);
+    hostState.db.prepare("INSERT INTO tombstone(id, recycled_at, reason) VALUES (?, ?, ?)").run(hostKey, 1, "recycle");
+
+    // Drive a request through the DO. getWorld() will fetch a host seed
+    // (mocked 503) but the trigger evaluation runs in the finally block
+    // — even on the error path — and reads from `postHandlerWorld` only
+    // when getWorld succeeded. To exercise the trigger we synthesize a
+    // minimal world manually via the (private) maybeStartTeardown hook,
+    // which is the same code path the real finally block invokes.
+    const fakeWorld = {
+      tombstones: new Set([hostKey]),
+      objects: new Map<string, unknown>()
+    };
+    (hostDO as unknown as { maybeStartTeardown: (w: unknown, h: string) => void }).maybeStartTeardown(fakeWorld, hostKey);
+
+    // host_state is now persisted as tearing_down.
+    const meta = hostState.db.prepare("SELECT value FROM world_meta WHERE key = 'host_state'").get() as { value?: string };
+    expect(meta?.value).toBe("tearing_down");
+
+    // ensureTeardownScheduled queued a waitUntil.
+    expect(hostState.waitUntilPromises.length).toBeGreaterThanOrEqual(1);
+
+    // Wait for the queued teardown to finish, then verify deleteAll ran.
+    await Promise.allSettled(hostState.waitUntilPromises);
+    expect(hostState.deleteAll).toHaveBeenCalledTimes(1);
+
+    directoryState.close();
+    hostState.close();
+  });
+
+  it("trigger does not fire when the root object is still alive", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, authEnv());
+
+    const hostKey = "still_alive_host";
+    const hostState = new FakeDurableObjectState(hostKey);
+    const env = makeEnv(directory, (_n) => ({ fetch: async () => new Response(null, { status: 503 }) }));
+    const hostDO = new PersistentObjectDO(hostState as unknown as DurableObjectState, env);
+
+    hostState.db.exec("CREATE TABLE IF NOT EXISTS world_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+
+    const fakeWorld = {
+      tombstones: new Set<string>(),
+      objects: new Map<string, unknown>([[hostKey, {}]])
+    };
+    (hostDO as unknown as { maybeStartTeardown: (w: unknown, h: string) => void }).maybeStartTeardown(fakeWorld, hostKey);
+
+    const meta = hostState.db.prepare("SELECT value FROM world_meta WHERE key = 'host_state'").get() as { value?: string } | undefined;
+    expect(meta?.value).toBeUndefined();
+    expect(hostState.waitUntilPromises.length).toBe(0);
+    expect(hostState.deleteAll).not.toHaveBeenCalled();
 
     directoryState.close();
     hostState.close();

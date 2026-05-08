@@ -6,6 +6,16 @@ type ObjectRoute = {
   host: string;
   anchor: ObjRef | null;
   updated_at: number;
+  /** Set when the id has no `id_route` row but appears in
+   * `inherited_tombstone`. Per spec/semantics/recycle.md §RC11.4 +
+   * spec/reference/persistence.md §14.2.2, Directory is the tombstone
+   * authority for ids whose host has been torn down. Callers that need
+   * to distinguish "recycled" from "never existed" check this flag;
+   * `host` is set to the fallback so legacy callers that ignore the
+   * flag continue routing as before. */
+  tombstoned?: boolean;
+  former_host?: string | null;
+  recycled_at?: number | null;
 };
 
 type SessionRoute = {
@@ -196,7 +206,26 @@ export class DirectoryDO {
         updated_at: Number(row.updated_at)
       };
     }
+    // §RC11.4 step 2: no id_route — fall through to inherited_tombstone
+    // before answering with a generic fallback. A hit means the id was
+    // tombstoned on a host that has since been torn down; Directory is
+    // the authority on liveness for those ids.
+    const inherited = firstRow(this.state.storage.sql.exec(
+      "SELECT former_host, recycled_at FROM inherited_tombstone WHERE id = ?",
+      id
+    ));
     const host = id.startsWith("$") ? WORLD_HOST : fallbackHost;
+    if (inherited) {
+      return {
+        id,
+        host,
+        anchor: null,
+        updated_at: Date.now(),
+        tombstoned: true,
+        former_host: String(inherited.former_host),
+        recycled_at: Number(inherited.recycled_at)
+      };
+    }
     return { id, host, anchor: null, updated_at: Date.now() };
   }
 
@@ -309,15 +338,24 @@ export class DirectoryDO {
         "SELECT former_host FROM inherited_tombstone WHERE id = ?",
         entry.id
       ));
-      if (inheritedRow && String(inheritedRow.former_host) !== authedHost) {
-        return json({ error: {
-          code: "E_PERM",
-          message: `id ${entry.id} already inherited from ${String(inheritedRow.former_host)}`
-        } }, 403);
+      if (inheritedRow) {
+        if (String(inheritedRow.former_host) !== authedHost) {
+          return json({ error: {
+            code: "E_PERM",
+            message: `id ${entry.id} already inherited from ${String(inheritedRow.former_host)}`
+          } }, 403);
+        }
+        continue;
       }
-      // No route, no inherited row → never existed. Spec doesn't forbid
-      // inheriting an unknown id from a host that claims it; treat as a
-      // no-op for the route-deletion side and still record the tombstone.
+      // Per spec/semantics/recycle.md §RC11.3 step 2: an id qualifies for
+      // inheritance only if it currently routes to the caller OR is
+      // already inherited under the caller. An id with no route and no
+      // inherited row is treated as not owned by the caller — reject
+      // rather than recording a vacuous tombstone.
+      return json({ error: {
+        code: "E_PERM",
+        message: `id ${entry.id} has no route and no prior inherited row; ${authedHost} cannot claim it`
+      } }, 403);
     }
 
     let inserted = 0;

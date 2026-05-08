@@ -277,6 +277,47 @@ describe("DirectoryDO inherit-tombstones", () => {
     }
   });
 
+  it("resolveObject reports tombstoned: true when id is in inherited_tombstone", async () => {
+    const { directory, cleanup } = makeDirectory();
+    try {
+      await registerObjectRoute(directory, "vanished", "host_m");
+      const inh = await inheritTombstones(directory, "host_m", {
+        tombstones: [{ id: "vanished", recycled_at: 42, reason: "recycle" }]
+      });
+      expect(inh.status).toBe(200);
+      expect(inh.body.routes_removed).toBe(1);
+
+      const r = await resolveObject(directory, "host_m", "vanished");
+      expect(r).toMatchObject({
+        id: "vanished",
+        tombstoned: true,
+        former_host: "host_m",
+        recycled_at: 42
+      });
+
+      // For an id that was never registered or inherited, no tombstoned flag.
+      const ghost = await resolveObject(directory, "host_m", "never_existed");
+      expect(ghost.tombstoned).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("rejects ids that have no route and no prior inherited row", async () => {
+    const { directory, cleanup } = makeDirectory();
+    try {
+      // No routes registered, no inherited rows. host_l tries to inherit
+      // a tombstone for a totally unknown id.
+      const result = await inheritTombstones(directory, "host_l", {
+        tombstones: [{ id: "ghost_id", recycled_at: 1 }]
+      });
+      expect(result.status).toBe(403);
+      expect(result.body.error.code).toBe("E_PERM");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("rejects malformed batch_seq", async () => {
     const { directory, cleanup } = makeDirectory();
     try {

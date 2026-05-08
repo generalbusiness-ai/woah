@@ -153,7 +153,7 @@ export class PersistentObjectDO {
     // run. If teardown is in progress but no waitUntil is currently
     // running it (e.g. a wake from hibernation between batches), schedule
     // a resume so the sequence completes idempotently.
-    if (!gatewayHost && this.getHostStateUncached() === HOST_STATE_TEARING_DOWN) {
+    if (!gatewayHost && this.getHostState() === HOST_STATE_TEARING_DOWN) {
       this.ensureTeardownScheduled(this.durableHostKey());
       return jsonResponse(
         { error: { code: "E_HOST_RECYCLED", message: "host is tearing down" } },
@@ -292,9 +292,11 @@ export class PersistentObjectDO {
 
   // ---- §RC11 host teardown ----
 
-  /** Read the persisted host_state. Returns "live" by default; "tearing_down"
-   * once §RC11 has begun. Cached for the DO lifetime; resets on eviction. */
-  private getHostStateUncached(): string {
+  /** Read the persisted host_state, cached for the DO lifetime (resets on
+   * eviction). Returns "live" by default; "tearing_down" once §RC11 has
+   * begun. The first call reads from the repo; subsequent calls return
+   * the cached value until setHostStateTearingDown overwrites it. */
+  private getHostState(): string {
     if (this.cachedTeardownState !== null) return this.cachedTeardownState;
     let value: string | null = null;
     try {

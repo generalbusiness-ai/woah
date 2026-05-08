@@ -402,10 +402,14 @@ the cold-load guard (§RC11.6), so observable behavior is correct, but the
 spec deliberately does not claim "the DO ceases to exist" — only that its
 storage is gone and any reactivation answers `E_HOST_RECYCLED`.
 
-**Status: deferred.** Specified here to constrain the destruction story for
-self-hosted spaces (catalog removal, owner-initiated room destruction,
-factory cleanup of decommissioned instances). Until this lands, deleting a
-self-hosted root leaves a present-but-empty DO.
+**Status: partial.** §RC11.1 (trigger), §RC11.2 (host_state), §RC11.3
+(teardown sequence), §RC11.5 (concurrent operations), and §RC11.6
+(cold-load guard) are implemented in the worker (`PersistentObjectDO`,
+`DirectoryDO`). §RC11.4's lookup branch is wired into Directory's
+`/resolve-object`. §RC11.7 items remain deferred (multi-cluster
+teardown, per-host signing keys, vacuum). Catalog removal, owner-
+initiated room destruction, and factory cleanup of decommissioned
+instances now all use this path.
 
 ### RC11.1 Trigger
 
@@ -453,15 +457,31 @@ The DO persists a `host_state` value in its `meta` table:
 | `live` | Default. Writes proceed normally. |
 | `tearing_down` | Teardown in progress. New writes raise `E_HOST_RECYCLED`. Reads on tombstoned ULIDs continue to answer "recycled" until §RC11.3 step 4. |
 
-The flag is set in the same SQLite transaction as the final recycle's
-tombstone insert (§RC3 step 9). A crash with `host_state = tearing_down`
-persisted is recoverable: on next wake the DO repeats §RC11.3 from step 2.
-Steps 2 and 4 are idempotent; step 3 is best-effort.
+The flag is set as a post-handler trigger after the recycle commit
+returns: the host evaluates `livePayloadCount` in the same fetch-handler
+turn that ran the recycle, and on a hit writes `host_state` via the
+ordinary meta-write path. Cloudflare DO single-threading guarantees no
+other request runs between the recycle commit and the host_state write,
+so a concurrent caller cannot observe an "empty host with `live`
+state". A crash *between* the recycle commit and the host_state write
+is recoverable: on next wake the DO re-evaluates the trigger condition
+(`world.tombstones.has(rootId) && !world.objects.has(rootId)`), which
+still holds, and re-fires the §RC11.3 sequence. Steps 2 and 4 are
+idempotent; step 3 is best-effort.
+
+(An earlier draft of this section called for the host_state write to
+share the recycle's SQLite transaction. That isn't currently feasible:
+recycle commits in core/world.ts, while the worker layer that owns
+host_state has no hook into that transaction. The post-handler trigger
++ recovery-on-wake gives the same observable safety; the only divergence
+is that a midpoint crash leaves `host_state = live` until the next wake
+re-fires the trigger, vs. leaving it `tearing_down`.)
 
 ### RC11.3 Teardown sequence
 
-1. **Mark.** `host_state = tearing_down`. Persisted within the recycle
-   transaction that drained `livePayloadCount` to zero.
+1. **Mark.** `host_state = tearing_down`. Written by the post-handler
+   trigger after the recycle commit that drained `livePayloadCount` to
+   zero (see §RC11.2 for the recovery-on-wake guarantee).
 2. **Hand tombstones to the Directory.** The host POSTs *one or more*
    inherit-tombstones requests covering its full tombstone roster. A
    long-lived host can accumulate more tombstones than fit in a single
