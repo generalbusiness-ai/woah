@@ -1,6 +1,6 @@
 {
   "name": "note",
-  "version": "0.2.0",
+  "version": "2.0.0",
   "spec_version": "v1",
   "description": "Generic note: a portable text-bearing thing. Notes are first-class movable objects so they can travel between rooms, actor inventories, bulletin boards, and other containers without losing identity. A note has three slots: name (listing identity), description (cosmetic look-at flavour, optional), and text (markdown content; capped at 262144 characters). Subclass for richer behaviors (pinboard pins, dispensed notes, tasks); the base shape is text plus readers/writers permissions.",
   "license": "MIT",
@@ -29,7 +29,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": ["limit"] },
-          "source": "verb :text_summary(limit) rxd { return note_text_summary(this, limit); }"
+          "source": "verb :text_summary(limit) rxd { if (!this:is_readable_by(actor)) { raise { code: \"E_PERM\", message: \"cannot read note\", value: this }; } let cap = limit; if (typeof(cap) != \"number\") { cap = 96; } if (cap < 0) { cap = 0; } if (cap > 512) { cap = 512; } let body = this.text; if (typeof(body) != \"string\") { body = \"\"; } let total = length(body); let lines = []; if (body) { lines = str_split(body, \"\\n\"); } let count = length(lines); let preview = \"\"; if (count > 0) { preview = lines[1]; } let truncated = false; if (length(preview) > cap) { if (cap > 3) { preview = str_slice(preview, 1, cap - 3) + \"...\"; } else { preview = str_slice(preview, 1, cap); } truncated = true; } return { \"lines\": count, \"length\": total, \"preview\": preview, \"truncated\": truncated }; }"
         },
         {
           "name": "text",

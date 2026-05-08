@@ -105,7 +105,7 @@ that streams or paginates.
 
 LambdaMOO's `$note` had `name + description + text` and three verb
 paths (`look at`, `read`, plus `name`-based inventory listing). Each
-slot has one job. Pre-v0.2 woo combined them with a "title is
+slot has one job. Pre-v2 woo combined them with a "title is
 name + ': ' + first line of text" heuristic, which produced unreadable
 inventory titles whenever a text was a long single string (the
 horoscope/dispensed-note bug). The fix is to restore the discipline:
@@ -144,7 +144,7 @@ that mirror posts to a `$mail_recipient` listen for these and forward.
 ## Cross-references
 
 - `notes/2026-05-06-note-fields.md` — the design exploration that drove
-  the v0.2 reshape (option D: `name` + `description` + `text`).
+  the v2.0.0 reshape (option D: `name` + `description` + `text`).
 - `lambdamoo-mail-and-boards.md` — the LambdaMOO inspiration: notes,
   bulletin boards, mail recipients as three distinct surfaces.
 - `catalogs/pinboard/DESIGN.md` — first concrete subclass (`$pin < $note`).

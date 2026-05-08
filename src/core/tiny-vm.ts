@@ -119,7 +119,6 @@ export const BUILTIN_NAMES = [
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
   "to_int", "to_float",
-  "note_text_summary",
   // New entries MUST be appended; spec/semantics/builtins.md §19 fixes numeric
   // indices, and persisted bytecode encodes builtins by index. Mid-list inserts
   // would shift every later index and misdispatch already-stored verbs.
@@ -843,13 +842,6 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const list = assertList(builtinArgs[0]);
         const separator = assertString(builtinArgs[1] ?? "");
         return list.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(separator);
-      }
-      case "note_text_summary": {
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "note_text_summary expects note and optional preview limit");
-        const limit = builtinArgs.length >= 2 && builtinArgs[1] !== null
-          ? numeric(builtinArgs[1], "note_text_summary limit")
-          : 96;
-        return await frame.ctx.world.noteTextSummary(frame.ctx, assertObj(builtinArgs[0]), limit);
       }
       case "str_split": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "str_split expects text and separator");

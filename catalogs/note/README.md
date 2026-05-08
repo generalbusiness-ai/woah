@@ -1,6 +1,6 @@
 ---
 name: note
-version: 0.2.0
+version: 2.0.0
 spec_version: v1
 license: MIT
 description: Generic note class — portable text-bearing things, modeled after LambdaMOO's $note (#9). Identity (name), cosmetic flavour (description), markdown content (text). Subclass for richer per-note behavior.
@@ -99,30 +99,41 @@ subclasses: `$voting_note` (adds vote counts), `$ephemeral_note`
 `:is_readable_by` with key check). Each adds verbs/properties; the base
 shape stays the same.
 
-## Breaking change from v0.1
+## Breaking change from v1.0.0
 
-v0.1 had `text: list<str>` and a `:title()` heuristic that prepended the
-first text line onto the name. v0.2 keeps the property name `text` but
-changes the type to a single string, drops the heuristic, and bounds the
-text size:
+v1.0.0 (the previous shipped version) joined `.text` into a single string
+but kept LambdaMOO's `:title()`, `:delete(line)`, and `:match_names()`
+verbs as inline DSL with no size cap. v2.0.0 keeps the same property
+shape (`text: str`, `writers: list<obj>`) but tightens the contract:
 
-- `text: list<str>` → `text: str` (markdown, capped at 262144 characters)
-- `:title()` → inherited from `$root`, returns `this.name`
-- `:set_text(lines)` → `:set_text(str)` — same name, different argument shape
-- `:write(line)` keeps its LambdaMOO semantics (append a line, inserting
-  a newline if the text is non-empty)
-- `:erase` keeps its LambdaMOO semantics (clear the text)
-- `:delete(line)` removed — line numbers no longer make sense for a
-  single string body
+- `.text` is now capped at **262144 characters** (256 KiB). `:set_text`
+  and `:write` raise `E_INVARG` if the resulting body would exceed the
+  cap. The cap protects the per-edit log/observation/WS broadcast cost
+  from arbitrary growth.
+- `:title()` is dropped; the inherited `:title` on `$root` returns
+  `this.name` directly. The pre-v1 first-line-is-title heuristic was
+  already gone in v1; v2 removes the verb itself.
+- `:delete(line)` is dropped; line numbers are not a primary concept on
+  a single-string body. Edit by `:set_text` or `:write`/`:erase`.
+- `:add_writer(who)` / `:rm_writer(who)` are added; owner/wizard-gated
+  ACL management for the existing `.writers` list. They emit
+  `note_writers_changed` so UIs can update edit affordances without a
+  full rehydration.
+- `:look_self` returns `text_length` (character count) instead of
+  `lines`; line counts are reachable via `:text_summary`.
+- New `note_writers_changed` schema declared.
 
-Upgrades from v0.1 worlds run two automatic boot migrations:
+The catalog migration in `migration-v1-to-v2.json` drops the obsolete
+`:title` and `:delete` verb definitions from any installed v1 worlds;
+the new shape is otherwise reinstalled by the standard catalog update
+path.
 
-- `2026-05-06-note-text-string-shape` walks every `$note` descendant and
-  joins any list-of-strings `text` value into a single newline-joined
-  string. Idempotent on already-string values.
-- `2026-05-06-note-stale-class-verbs` reconciles class verbs on `$note`
-  and its bundled subclasses, removing the v0.1 `:title` heuristic and
-  the `:delete`/`:set_text(list)` shapes that no longer apply.
+### v0.x → v1.0.0 (historical)
+
+v0.x had `text: list<str>` and a `:title()` heuristic that prepended the
+first text line onto the name. v1.0.0 joined the list into a single
+string and dropped the heuristic. The `migration-v0-to-v1.json`
+transform handles existing v0.x worlds.
 
 ## Future
 

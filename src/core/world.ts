@@ -4524,45 +4524,6 @@ export class WooWorld {
     return id;
   }
 
-  async noteTextSummary(ctx: CallContext, note: ObjRef, rawLimit: number): Promise<Record<string, WooValue>> {
-    // TODO(note-catalog): this substrate helper knows about $note's raw .text
-    // property and :is_readable_by verb. It exists to keep note display
-    // summaries bounded without materializing full note bodies in the Tiny VM;
-    // the catalog-facing contract should remain the overridable
-    // $note:text_summary(limit) verb.
-    if (!this.objects.has(note) || !this.inheritsFrom(note, "$note")) {
-      throw wooError("E_TYPE", `note_text_summary target must be a $note descendant: ${note}`, note);
-    }
-    const readable = await this.dispatch(
-      { ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr },
-      note,
-      "is_readable_by",
-      [ctx.actor]
-    );
-    if (readable !== true) throw wooError("E_PERM", "cannot read note", note);
-
-    const limit = Math.max(0, Math.min(512, Math.floor(rawLimit)));
-    // v0.2 of $note stores .text as a single markdown string (capped at
-    // 262144 chars by :set_text/:write). Tolerate the v0.1 list-of-strings
-    // shape too so summary calls during a partial upgrade replay still succeed.
-    const raw = this.object(note).properties.get("text");
-    const text = typeof raw === "string"
-      ? raw
-      : Array.isArray(raw)
-        ? raw.filter((line): line is string => typeof line === "string").join("\n")
-        : "";
-    const newlineIdx = text.indexOf("\n");
-    const first = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
-    let preview = first;
-    let truncated = false;
-    if (preview.length > limit) {
-      preview = limit > 3 ? `${preview.slice(0, limit - 3)}...` : preview.slice(0, limit);
-      truncated = true;
-    }
-    const lines = text.length === 0 ? 0 : text.split(/\r?\n/).length;
-    return { lines, length: text.length, preview, truncated };
-  }
-
   async deliverInput(player: ObjRef, input: WooValue): Promise<ParkedTaskRun | null> {
     return await this.enqueueHostTask(() => this.deliverInputNow(player, input), `deliverInput:${player}`);
   }

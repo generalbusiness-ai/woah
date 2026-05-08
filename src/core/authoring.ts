@@ -946,6 +946,5 @@ const VALID_BUILTINS = new Set([
   "editor_dry_run",
   "editor_save",
   "editor_pause",
-  "editor_abort",
-  "note_text_summary"
+  "editor_abort"
 ]);

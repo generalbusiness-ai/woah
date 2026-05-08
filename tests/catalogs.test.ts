@@ -3297,29 +3297,6 @@ describe("local catalogs", () => {
       }
     });
 
-    it("note_text_summary rejects non-note objects before reading raw private text", async () => {
-      const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["note"]);
-      const requester = world.auth("guest:note-summary-probe").actor;
-      const nonNoteId = "obj_test_not_a_note_with_text";
-      world.createObject({ id: nonNoteId, name: "Not a note", parent: "$thing", owner: "$wiz", location: requester });
-      world.defineProperty(nonNoteId, { name: "text", defaultValue: "", owner: "$wiz", perms: "", typeHint: "str" });
-      world.setProp(nonNoteId, "text", "private text that must not leak");
-      expect(installVerb(world, nonNoteId, "is_readable_by", `verb :is_readable_by(actor_obj) rxd {
-        return true;
-      }`, null).ok).toBe(true);
-      expect(installVerb(world, requester, "probe_note_summary", `verb :probe_note_summary(obj) rxd {
-        return note_text_summary(obj, 512);
-      }`, null).ok).toBe(true);
-
-      const result = await world.directCall("note-summary-nonnote", requester, requester, "probe_note_summary", [nonNoteId]);
-      expect(result.op).toBe("error");
-      if (result.op === "error") {
-        expect(result.error.code).toBe("E_TYPE");
-        expect(result.error.message).toContain("$note descendant");
-      }
-    });
-
     it("$weather_block installs cleanly and ships the configured tier lists", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["weather"]);
