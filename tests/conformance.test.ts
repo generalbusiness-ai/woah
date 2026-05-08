@@ -854,13 +854,12 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     // row alongside the actor-level pass, recomputing the `subscribers`
     // mirror from the survivors.
     //
-    // Scope is intentionally narrow: rows whose session is unknown to this
-    // DO are left alone, since they may legitimately belong to a different
-    // DO that hasn't synced the session here. The data pollution observed
-    // in production (`session-N` counter rows whose sessions had been
-    // reaped everywhere) is dealt with by broadcastLiveEvent's actor-keyed
-    // fallback in src/worker/persistent-object-do.ts; only DO replacement
-    // or an explicit wizard sweep clears those rows from disk.
+    // The actor-level pass now also evicts every row for an actor with
+    // no live local session and no remote-host bridge confirmation —
+    // see "evicts subscribers whose session vanished without a clean
+    // reap" below for the dedicated coverage. Cross-host actors whose
+    // home host *does* confirm presence are exercised by "lazily scrubs
+    // stale remote subscribers from room reads and direct audiences".
     const harness = make();
     try {
       const world = harness.world;
@@ -872,22 +871,18 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       if (!expired) throw new Error("expected expired session in table");
       expired.expiresAt = Date.now() - 60_000;
       expired.lastDetachAt = Date.now() - 60_000;
-      // Pre-populate: live row, expired-in-table row, malformed row,
-      // `legacy:` placeholder, and an unknown-session row representing a
-      // hypothetical cross-host bridge subscriber. The unknown row must
-      // survive — see scope note above.
+      // Pre-populate: live row, expired-in-table row, malformed row, and
+      // `legacy:` placeholder.
       world.setProp("conf_session_scrub_room", "session_subscribers", [
         { session: live.id, actor: live.actor },
         { session: expired.id, actor: expiredAuth.actor },
         { session: "", actor: "guest_blank" },
-        { session: `legacy:${live.actor}`, actor: live.actor },
-        { session: "session-cross-host", actor: "guest_remote" }
+        { session: `legacy:${live.actor}`, actor: live.actor }
       ]);
       world.setProp("conf_session_scrub_room", "subscribers", [
         live.actor,
         expiredAuth.actor,
-        "guest_blank",
-        "guest_remote"
+        "guest_blank"
       ]);
       world.setActorPresence(live.actor, "conf_session_scrub_room", true);
       world.object(live.actor).location = "conf_session_scrub_room";
@@ -900,19 +895,14 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const remainingRows = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string; actor: string }>;
       expect(remainingRows.map((row) => row.session).sort()).toEqual([
         live.id,
-        `legacy:${live.actor}`,
-        "session-cross-host"
+        `legacy:${live.actor}`
       ].sort());
       // Both scrubs collaborated to recompute `subscribers`. The actor pass
-      // dropped guest_blank — note that the drop happens in
-      // updateSpaceSubscriberLocal's parse step (the malformed empty-session
-      // row is filtered when the session pass rebuilds `subscribers` from
-      // surviving session_subscribers rows), not via the actor pass's
-      // present=false call. The session pass dropped expiredAuth.actor.
-      // guest_remote stays because its row is still in session_subscribers.
+      // drops guest_blank (malformed row, no live session) and expiredAuth
+      // (expired session in table, no other live session). What's left is
+      // the live actor.
       expect((world.getProp("conf_session_scrub_room", "subscribers") as ObjRef[]).sort()).toEqual([
-        live.actor,
-        "guest_remote"
+        live.actor
       ].sort());
 
       // Re-running look within the SUBSCRIBER_SCRUB_FLOOR_MS window must NOT
@@ -947,6 +937,54 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       world.reapExpiredSessions();
       const afterReap = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
       expect(afterReap.map((row) => row.session)).not.toContain(reapedSession);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("evicts subscribers whose session vanished without a clean reap (DO hibernation / gateway loss)", async () => {
+    // Production failure: an MCP gateway session lives only in the DO's
+    // in-memory map. On hibernation the session row disappears from
+    // `world.sessions` without going through `reapSession`, so the actor's
+    // persistent `.location` keeps pointing at the room. The previous
+    // scrubber consulted `allLocationsForActor`, whose final fallback to
+    // the actor's `.location` property then masked the dead session and
+    // pinned the guest to the subscribers list forever — the deck would
+    // accumulate dozens of `Guest 1, Guest 2, …` over a day's hibernations.
+    //
+    // The fix narrows the scrubber to live sessions only and drops every
+    // session_subscribers row for the stale actor (the orphan row's
+    // session is gone from this DO's table, so the default sessionId
+    // resolution can't match it).
+    const harness = make();
+    try {
+      const world = harness.world;
+      const watcher = world.auth("guest:conf-vanished-watcher");
+      const stale = world.auth("guest:conf-vanished-stale");
+      world.createObject({ id: "conf_vanished_room", name: "Vanished Room", parent: "$chatroom", owner: "$wiz" });
+      world.setProp("conf_vanished_room", "features", ["$conversational"]);
+
+      world.setSpaceSubscriber("conf_vanished_room", watcher.actor, true, watcher.id);
+      world.setSpaceSubscriber("conf_vanished_room", stale.actor, true, stale.id);
+      world.setActorPresence(watcher.actor, "conf_vanished_room", true);
+      world.object(watcher.actor).location = "conf_vanished_room";
+      world.sessions.get(watcher.id)!.currentLocation = "conf_vanished_room";
+      world.object(stale.actor).location = "conf_vanished_room";
+      world.sessions.get(stale.id)!.currentLocation = "conf_vanished_room";
+
+      // Both subscribers in place, then the stale actor's session vanishes
+      // out from under the world without a clean reap. `.location` stays.
+      world.sessions.delete(stale.id);
+      expect(world.object(stale.actor).location).toBe("conf_vanished_room");
+      expect((world.getProp("conf_vanished_room", "subscribers") as ObjRef[]).sort()).toEqual([watcher.actor, stale.actor].sort());
+
+      const looked = await world.directCall("conf-vanished-look", watcher.actor, "conf_vanished_room", "look", [], { sessionId: watcher.id });
+      expect(looked.op, looked.op === "error" ? JSON.stringify(looked.error) : "").toBe("result");
+
+      expect(world.getProp("conf_vanished_room", "subscribers")).toEqual([watcher.actor]);
+      const remainingRows = world.getProp("conf_vanished_room", "session_subscribers") as Array<{ session: string; actor: string }>;
+      expect(remainingRows.map((row) => row.actor)).toEqual([watcher.actor]);
+      expect(remainingRows.map((row) => row.session)).not.toContain(stale.id);
     } finally {
       harness.cleanup();
     }
