@@ -8,6 +8,54 @@
     "@local:chat",
     "@local:note"
   ],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "tasks-ui",
+        "entry": "ui/kanban-board.ts"
+      }
+    ],
+    "components": [
+      {
+        "id": "tasks.kanban",
+        "module": "tasks-ui",
+        "tag": "woo-tasks-kanban",
+        "surface": "main",
+        "subject": "$task_registry",
+        "neighborhood": {
+          "include": [
+            "subject",
+            "contents",
+            "subscribers",
+            "actor"
+          ]
+        }
+      }
+    ],
+    "frames": [
+      {
+        "id": "tasks.kanban",
+        "subject": "$task_registry",
+        "view": "default",
+        "layout": "space-workspace",
+        "regions": {
+          "main": [
+            {
+              "component": "tasks.kanban",
+              "subject": "this"
+            }
+          ],
+          "chat": [
+            {
+              "component": "chat:chat.space-mini",
+              "subject": "this"
+            }
+          ]
+        }
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$task_registry",

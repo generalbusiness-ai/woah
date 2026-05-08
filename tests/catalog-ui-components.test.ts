@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import chatManifest from "../catalogs/chat/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
+import tasksManifest from "../catalogs/tasks/manifest.json";
 import weatherManifest from "../catalogs/weather/manifest.json";
 import { CatalogUiRegistry, type WooContext } from "../src/client/framework";
 
@@ -25,18 +26,17 @@ function testWooContext(names: Record<string, string> = {}): WooContext {
 }
 
 describe("bundled catalog UI components", () => {
-  // The tasks catalog ships no UI in v1 (no `ui` block in manifest, no ui/ dir);
-  // see spec/discovery/catalogs.md §CT12. A future kanban or registry view would
-  // be authored here.
   it("declares and resolves first-party tool frames", () => {
     const registry = new CatalogUiRegistry();
     expect(registry.installCatalogUi({ alias: "chat", catalog: "chat", objects: { "$space": "$space", "$chatroom": "$chatroom" }, ui: (chatManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "dubspace", catalog: "dubspace", objects: { "$dubspace": "$dubspace" }, ui: (dubspaceManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "pinboard", catalog: "pinboard", objects: { "$pinboard": "$pinboard" }, ui: (pinboardManifest as any).ui })).toEqual([]);
+    expect(registry.installCatalogUi({ alias: "tasks", catalog: "tasks", objects: { "$task_registry": "$task_registry" }, ui: (tasksManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "weather", catalog: "weather", objects: { "$weather_block": "$weather_block" }, ui: (weatherManifest as any).ui })).toEqual([]);
 
     expect(registry.resolveFrame("the_dubspace", undefined, (_subject, classRef) => classRef === "$dubspace" ? 1 : false)?.frame.id).toBe("dubspace.workspace");
     expect(registry.resolveFrame("the_pinboard", undefined, (_subject, classRef) => classRef === "$pinboard" ? 1 : false)?.frame.id).toBe("pinboard.board");
+    expect(registry.resolveFrame("the_bug_board", undefined, (_subject, classRef) => classRef === "$task_registry" ? 1 : false)?.frame.id).toBe("tasks.kanban");
     expect(registry.componentsForSurface("title-badge").map((component) => component.declaration.tag)).toContain("woo-weather-badge");
 
     const weatherBadge = registry.componentsForSurface("title-badge").find((component) => component.declaration.tag === "woo-weather-badge");
@@ -61,6 +61,23 @@ describe("bundled catalog UI components", () => {
 
     expect(element.querySelector(".weather-badge-temp")?.textContent).toBe("72°F");
     expect(element.querySelector(".weather-badge-condition")?.textContent).toBe("sunny");
+  });
+
+  it("renders the tasks kanban placeholder for a $task_registry", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any };
+    element.woo = testWooContext({ guest_1: "Guest 1" });
+    document.body.appendChild(element);
+
+    element.data = {
+      registryId: "the_bug_board",
+      registryName: "Bug Board",
+      actor: "guest_1"
+    };
+
+    expect(element.querySelector("h2")?.textContent).toBe("Bug Board");
+    expect(element.querySelector(".woo-tasks-kanban-empty")?.textContent).toContain("not yet implemented");
   });
 
   it("renders pinboard notes and emits create events", async () => {
