@@ -93,15 +93,17 @@ export type KanbanData = {
   policiesMap: Record<string, string[]>;
 };
 
-type ColumnId = "ready" | "waiting" | "in_flight" | "done" | "dropped";
+type StateColumnId = "ready" | "waiting" | "in_flight" | "done" | "dropped";
 
-const DRAG_VERB_BY_TRANSITION: Partial<Record<`${ColumnId}->${ColumnId}`, string>> = {
+export type GroupBy = "state" | "role" | "holder" | "kind";
+
+const DRAG_VERB_BY_TRANSITION: Partial<Record<`${StateColumnId}->${StateColumnId}`, string>> = {
   "ready->in_flight": "claim",
   "in_flight->ready": "release",
   "in_flight->dropped": "drop_terminal"
 };
 
-const COLUMN_LABELS: Record<ColumnId, string> = {
+const STATE_COLUMN_LABELS: Record<StateColumnId, string> = {
   ready: "Ready",
   waiting: "Waiting",
   in_flight: "In flight",
@@ -109,14 +111,86 @@ const COLUMN_LABELS: Record<ColumnId, string> = {
   dropped: "Dropped"
 };
 
-const COLUMN_ORDER: ColumnId[] = ["ready", "waiting", "in_flight", "done", "dropped"];
+const STATE_COLUMN_ORDER: StateColumnId[] = ["ready", "waiting", "in_flight", "done", "dropped"];
 
-function columnFor(task: KanbanTask, registryId: string): ColumnId {
+const GROUP_BY_LABELS: Record<GroupBy, string> = {
+  state: "State",
+  role: "Role",
+  holder: "Holder",
+  kind: "Kind"
+};
+
+const GROUP_BY_ORDER: GroupBy[] = ["state", "role", "holder", "kind"];
+
+function isGroupBy(value: string | null): value is GroupBy {
+  return value === "state" || value === "role" || value === "holder" || value === "kind";
+}
+
+function stateColumnFor(task: KanbanTask, registryId: string): StateColumnId {
   if (task.complete) return "done";
   if (task.terminal) return "dropped";
   if (task.location !== registryId) return "in_flight";
   if (task.waitForCount > 0) return "waiting";
   return "ready";
+}
+
+type Column = { id: string; label: string };
+
+function computeGrouping(
+  groupBy: GroupBy,
+  tasks: KanbanTask[],
+  registryId: string,
+  actorNames: Record<string, string>
+): { columns: Column[]; bucketFor: (task: KanbanTask) => string } {
+  if (groupBy === "state") {
+    return {
+      columns: STATE_COLUMN_ORDER.map((id) => ({ id, label: STATE_COLUMN_LABELS[id] })),
+      bucketFor: (task) => stateColumnFor(task, registryId)
+    };
+  }
+  if (groupBy === "role") {
+    const seen = new Set<string>();
+    for (const t of tasks) seen.add(t.cursorRole ?? "");
+    const ids = Array.from(seen).sort((a, b) => {
+      if (a === b) return 0;
+      if (a === "") return 1;
+      if (b === "") return -1;
+      return a.localeCompare(b);
+    });
+    return {
+      columns: ids.map((id) => ({ id, label: id || "no cursor" })),
+      bucketFor: (task) => task.cursorRole ?? ""
+    };
+  }
+  if (groupBy === "holder") {
+    const seen = new Set<string>();
+    for (const t of tasks) {
+      seen.add(t.location && t.location !== registryId ? t.location : "");
+    }
+    const ids = Array.from(seen).sort((a, b) => {
+      if (a === b) return 0;
+      if (a === "") return -1; // "in registry" first
+      if (b === "") return 1;
+      return a.localeCompare(b);
+    });
+    return {
+      columns: ids.map((id) => ({ id, label: id ? actorNames[id] ?? id : "in registry" })),
+      bucketFor: (task) => (task.location && task.location !== registryId ? task.location : "")
+    };
+  }
+  // kind
+  const seen = new Set<string>();
+  for (const t of tasks) seen.add(t.kind ?? "");
+  const ids = Array.from(seen).sort((a, b) => {
+    if (a === b) return 0;
+    if (a === "") return 1;
+    if (b === "") return -1;
+    return a.localeCompare(b);
+  });
+  return {
+    columns: ids.map((id) => ({ id, label: id || "(no kind)" })),
+    bucketFor: (task) => task.kind ?? ""
+  };
 }
 
 function formatAge(ageMs: number): string {
@@ -319,6 +393,8 @@ export class WooTasksKanbanElement extends HTMLElement {
   private adminOpen = false;
   private openDetail: { taskId: string; detail: TaskDetail | null; loading: boolean; error?: string } | null = null;
   private detailEdit: "name" | "text" | "labels" | null = null;
+  private groupBy: GroupBy = "state";
+  private boundChange = false;
 
   set data(value: Partial<KanbanData> & Pick<KanbanData, "registryId" | "registryName" | "actor" | "actorNames" | "tasks">) {
     this.model = {
@@ -349,6 +425,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.addEventListener("submit", this.handleSubmit);
       this.boundSubmit = true;
     }
+    if (!this.boundChange) {
+      this.addEventListener("change", this.handleChange);
+      this.boundChange = true;
+    }
     if (this.woo) void this.refresh();
     this.startPolling();
   }
@@ -368,6 +448,10 @@ export class WooTasksKanbanElement extends HTMLElement {
     if (this.boundSubmit) {
       this.removeEventListener("submit", this.handleSubmit);
       this.boundSubmit = false;
+    }
+    if (this.boundChange) {
+      this.removeEventListener("change", this.handleChange);
+      this.boundChange = false;
     }
     this.stopPolling();
   }
@@ -603,6 +687,16 @@ export class WooTasksKanbanElement extends HTMLElement {
     void this.invokeAction(taskId, action, []);
   };
 
+  private handleChange = (event: Event): void => {
+    const target = event.target as HTMLElement | null;
+    const select = target?.closest<HTMLSelectElement>("[data-tasks-group-by]");
+    if (!select) return;
+    if (isGroupBy(select.value) && select.value !== this.groupBy) {
+      this.groupBy = select.value;
+      this.render();
+    }
+  };
+
   private handleSubmit = (event: Event): void => {
     const target = event.target as HTMLElement | null;
     const detailEditForm = target?.closest<HTMLFormElement>("[data-tasks-detail-edit]");
@@ -802,10 +896,11 @@ export class WooTasksKanbanElement extends HTMLElement {
   };
 
   private handleDragOver = (event: DragEvent): void => {
+    if (this.groupBy !== "state") return;
     const col = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tasks-col]");
     if (!col || !event.dataTransfer) return;
-    const sourceCol = event.dataTransfer.getData("application/x-woo-task-source-col") as ColumnId | "";
-    const targetCol = (col.dataset.tasksCol ?? "") as ColumnId | "";
+    const sourceCol = event.dataTransfer.getData("application/x-woo-task-source-col") as StateColumnId | "";
+    const targetCol = (col.dataset.tasksCol ?? "") as StateColumnId | "";
     if (!sourceCol || !targetCol || sourceCol === targetCol) return;
     if (!DRAG_VERB_BY_TRANSITION[`${sourceCol}->${targetCol}`]) return;
     event.preventDefault();
@@ -814,11 +909,12 @@ export class WooTasksKanbanElement extends HTMLElement {
   };
 
   private handleDrop = (event: DragEvent): void => {
+    if (this.groupBy !== "state") return;
     const col = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tasks-col]");
     if (!col || !event.dataTransfer) return;
     const taskId = event.dataTransfer.getData("application/x-woo-task");
-    const sourceCol = event.dataTransfer.getData("application/x-woo-task-source-col") as ColumnId | "";
-    const targetCol = (col.dataset.tasksCol ?? "") as ColumnId | "";
+    const sourceCol = event.dataTransfer.getData("application/x-woo-task-source-col") as StateColumnId | "";
+    const targetCol = (col.dataset.tasksCol ?? "") as StateColumnId | "";
     if (!taskId || !sourceCol || !targetCol) return;
     const verb = DRAG_VERB_BY_TRANSITION[`${sourceCol}->${targetCol}`];
     if (!verb) return;
@@ -852,24 +948,27 @@ export class WooTasksKanbanElement extends HTMLElement {
 
   private render(): void {
     const { registryId, registryName, tasks, actorNames } = this.model;
-    const buckets: Record<ColumnId, KanbanTask[]> = {
-      ready: [],
-      waiting: [],
-      in_flight: [],
-      done: [],
-      dropped: []
-    };
-    for (const task of tasks) buckets[columnFor(task, registryId)].push(task);
+    const { columns, bucketFor } = computeGrouping(this.groupBy, tasks, registryId, actorNames);
+    const buckets = new Map<string, KanbanTask[]>();
+    for (const col of columns) buckets.set(col.id, []);
+    for (const task of tasks) {
+      const bucket = bucketFor(task);
+      if (!buckets.has(bucket)) buckets.set(bucket, []);
+      buckets.get(bucket)!.push(task);
+    }
+    const renderableColumns = columns.length > 0
+      ? columns
+      : [{ id: "_empty", label: "No tasks" }];
 
-    const columnsHtml = COLUMN_ORDER.map((col) => {
-      const items = buckets[col];
+    const columnsHtml = renderableColumns.map((col) => {
+      const items = buckets.get(col.id) ?? [];
       const cards = items.length === 0
-        ? `<div class="woo-tasks-kanban-empty-col" data-tasks-empty="${col}">No tasks.</div>`
+        ? `<div class="woo-tasks-kanban-empty-col" data-tasks-empty="${escapeHtml(col.id)}">No tasks.</div>`
         : items.map((task) => this.renderCard(task, actorNames)).join("");
       return `
-        <section class="woo-tasks-kanban-col" data-tasks-col="${col}">
+        <section class="woo-tasks-kanban-col" data-tasks-col="${escapeHtml(col.id)}">
           <header class="woo-tasks-kanban-col-header">
-            <span class="woo-tasks-kanban-col-name">${escapeHtml(COLUMN_LABELS[col])}</span>
+            <span class="woo-tasks-kanban-col-name">${escapeHtml(col.label)}</span>
             <span class="woo-tasks-kanban-col-count" data-tasks-col-count>${items.length}</span>
           </header>
           <div class="woo-tasks-kanban-col-body">${cards}</div>
@@ -1038,6 +1137,16 @@ export class WooTasksKanbanElement extends HTMLElement {
     } else {
       buttons.push(`<span class="woo-tasks-kanban-empty-toolbar">No policies configured. Ask the registry owner to seed one.</span>`);
     }
+    const groupOptions = GROUP_BY_ORDER.map((key) => {
+      const selected = this.groupBy === key ? " selected" : "";
+      return `<option value="${escapeHtml(key)}"${selected}>${escapeHtml(GROUP_BY_LABELS[key])}</option>`;
+    }).join("");
+    buttons.push(`
+      <label class="woo-tasks-kanban-groupby">
+        Group by
+        <select data-tasks-group-by aria-label="Group tasks by">${groupOptions}</select>
+      </label>
+    `);
     if (isOwner) {
       buttons.push(`<button type="button" data-tasks-admin-toggle aria-expanded="${this.adminOpen ? "true" : "false"}">${this.adminOpen ? "Close admin" : "⚙ Admin"}</button>`);
     }
@@ -1180,7 +1289,8 @@ export class WooTasksKanbanElement extends HTMLElement {
           }).join("")
         }</div>`;
     const dragVerbs = task.actions.map((action) => action.verb);
-    const draggable = dragVerbs.includes("claim") || dragVerbs.includes("release") || dragVerbs.includes("drop_terminal");
+    const draggable = this.groupBy === "state"
+      && (dragVerbs.includes("claim") || dragVerbs.includes("release") || dragVerbs.includes("drop_terminal"));
     const prompt = this.openPrompt && this.openPrompt.taskId === task.id
       ? this.renderPrompt(task, this.openPrompt.verb)
       : "";

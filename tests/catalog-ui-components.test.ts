@@ -785,6 +785,79 @@ describe("bundled catalog UI components", () => {
     expect(detail).toMatchObject({ taskId: "obj_t_ready", verb: "claim", label: "Claim" });
   });
 
+  it("regroups columns by role / holder / kind when the group-by selector changes", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any };
+    element.woo = testWooContext({ guest_1: "Guest 1", guest_2: "Guest 2" });
+    document.body.appendChild(element);
+
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1", guest_2: "Guest 2" },
+      tasks: [
+        { id: "obj_t_a", name: "A", kind: "bug",  labels: [], location: "the_taskboard", cursorRole: "doer",     cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] },
+        { id: "obj_t_b", name: "B", kind: "bug",  labels: [], location: "guest_2",       cursorRole: "doer",     cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] },
+        { id: "obj_t_c", name: "C", kind: "task", labels: [], location: "the_taskboard", cursorRole: "reviewer", cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] }
+      ]
+    };
+
+    const setGroup = (value: string) => {
+      const sel = element.querySelector<HTMLSelectElement>("[data-tasks-group-by]")!;
+      sel.value = value;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+
+    // default: state grouping; 5 columns
+    let cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(cols).toEqual(["ready", "waiting", "in_flight", "done", "dropped"]);
+
+    expect(element.querySelector<HTMLSelectElement>("[data-tasks-group-by]")?.value).toBe("state");
+
+    // group by role: distinct cursor roles
+    setGroup("role");
+    cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(cols).toEqual(["doer", "reviewer"]);
+    const doerCol = element.querySelector<HTMLElement>("[data-tasks-col=\"doer\"]")!;
+    expect(doerCol.querySelectorAll("[data-tasks-card]").length).toBe(2);
+
+    // group by holder: registry first, then guest_2
+    setGroup("holder");
+    cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(cols).toEqual(["", "guest_2"]);
+    const inRegCol = element.querySelector<HTMLElement>("[data-tasks-col=\"\"]")!;
+    expect(inRegCol.querySelector(".woo-tasks-kanban-col-name")?.textContent).toBe("in registry");
+    const guest2Col = element.querySelector<HTMLElement>("[data-tasks-col=\"guest_2\"]")!;
+    expect(guest2Col.querySelector(".woo-tasks-kanban-col-name")?.textContent).toBe("Guest 2");
+
+    // group by kind
+    setGroup("kind");
+    cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(cols).toEqual(["bug", "task"]);
+
+    // when not in state mode, cards lose the draggable attribute even if their actions include claim
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [
+        { id: "obj_t_d", name: "D", kind: "bug", labels: [], location: "the_taskboard", cursorRole: "doer", cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [{ verb: "claim", label: "Claim", args: [] }] }
+      ]
+    };
+    // group-by survives data updates because it is local UI state
+    expect(element.querySelector<HTMLSelectElement>("[data-tasks-group-by]")?.value).toBe("kind");
+    const card = element.querySelector<HTMLElement>("[data-tasks-card]")!;
+    expect(card.getAttribute("draggable")).toBe(null);
+
+    // back to state restores draggability
+    setGroup("state");
+    const draggableCard = element.querySelector<HTMLElement>("[data-tasks-card]")!;
+    expect(draggableCard.getAttribute("draggable")).toBe("true");
+  });
+
   it("renders pinboard notes and emits create events", async () => {
     const { WooPinboardBoardElement } = await import("../catalogs/pinboard/ui/pinboard-board");
     defineOnce("woo-pinboard-board", WooPinboardBoardElement);
