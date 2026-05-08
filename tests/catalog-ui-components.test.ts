@@ -63,21 +63,132 @@ describe("bundled catalog UI components", () => {
     expect(element.querySelector(".weather-badge-condition")?.textContent).toBe("sunny");
   });
 
-  it("renders the tasks kanban placeholder for a $task_registry", async () => {
+  it("renders the tasks kanban with state columns, cursor badges, and actions", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any };
-    element.woo = testWooContext({ guest_1: "Guest 1" });
+    element.woo = testWooContext({ guest_1: "Guest 1", guest_2: "Guest 2" });
     document.body.appendChild(element);
 
     element.data = {
       registryId: "the_bug_board",
       registryName: "Bug Board",
-      actor: "guest_1"
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1", guest_2: "Guest 2" },
+      tasks: [
+        {
+          id: "obj_t_ready",
+          name: "Triage cockatoo bug",
+          kind: "bug",
+          labels: ["urgent", "frontend"],
+          location: "the_bug_board",
+          cursorRole: "doer",
+          cursorKey: "do:it",
+          cursorCriterion: "Done.",
+          waitForCount: 0,
+          terminal: false,
+          complete: false,
+          linkCount: 0,
+          ageMs: 90 * 1000,
+          lastChange: 0,
+          actions: [{ verb: "claim", label: "Claim", args: [] }]
+        },
+        {
+          id: "obj_t_waiting",
+          name: "Wait for review",
+          kind: "task",
+          labels: [],
+          location: "the_bug_board",
+          cursorRole: "doer",
+          cursorKey: "do:it",
+          cursorCriterion: "Done.",
+          waitForCount: 1,
+          terminal: false,
+          complete: false,
+          linkCount: 1,
+          ageMs: 5 * 60 * 1000,
+          lastChange: 0,
+          actions: []
+        },
+        {
+          id: "obj_t_inflight",
+          name: "Refactor verb dispatch",
+          kind: "task",
+          labels: [],
+          location: "guest_2",
+          cursorRole: "doer",
+          cursorKey: "do:it",
+          cursorCriterion: "Done.",
+          waitForCount: 0,
+          terminal: false,
+          complete: false,
+          linkCount: 0,
+          ageMs: 2 * 60 * 60 * 1000,
+          lastChange: 0,
+          actions: []
+        },
+        {
+          id: "obj_t_done",
+          name: "Ship v1 catalog",
+          kind: "task",
+          labels: [],
+          location: "the_bug_board",
+          cursorRole: null,
+          cursorKey: null,
+          cursorCriterion: null,
+          waitForCount: 0,
+          terminal: false,
+          complete: true,
+          linkCount: 0,
+          ageMs: 24 * 60 * 60 * 1000,
+          lastChange: 0,
+          actions: []
+        },
+        {
+          id: "obj_t_dropped",
+          name: "Old plan",
+          kind: "task",
+          labels: [],
+          location: "the_bug_board",
+          cursorRole: null,
+          cursorKey: null,
+          cursorCriterion: null,
+          waitForCount: 0,
+          terminal: true,
+          complete: false,
+          linkCount: 0,
+          ageMs: 0,
+          lastChange: 0,
+          actions: []
+        }
+      ]
     };
 
     expect(element.querySelector("h2")?.textContent).toBe("Bug Board");
-    expect(element.querySelector(".woo-tasks-kanban-empty")?.textContent).toContain("not yet implemented");
+    const colCounts = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((col) => ({
+      id: col.dataset.tasksCol,
+      count: col.querySelector<HTMLElement>("[data-tasks-col-count]")?.textContent
+    }));
+    expect(colCounts).toEqual([
+      { id: "ready", count: "1" },
+      { id: "waiting", count: "1" },
+      { id: "in_flight", count: "1" },
+      { id: "done", count: "1" },
+      { id: "dropped", count: "1" }
+    ]);
+
+    const readyCard = element.querySelector<HTMLElement>("[data-tasks-col=\"ready\"] [data-tasks-card]");
+    expect(readyCard?.dataset.tasksCard).toBe("obj_t_ready");
+    expect(readyCard?.querySelector(".woo-tasks-card-name")?.textContent).toBe("Triage cockatoo bug");
+    expect(readyCard?.querySelector("[data-tasks-card-cursor]")?.textContent).toBe("doer");
+
+    const inflightCard = element.querySelector<HTMLElement>("[data-tasks-col=\"in_flight\"] [data-tasks-card]");
+    expect(inflightCard?.querySelector(".woo-tasks-card-holder")?.textContent).toContain("Guest 2");
+
+    let detail: any;
+    element.addEventListener("woo-tasks-action", (event: Event) => { detail = (event as CustomEvent).detail; });
+    element.querySelector<HTMLButtonElement>("[data-tasks-action=\"claim\"]")?.click();
+    expect(detail).toMatchObject({ taskId: "obj_t_ready", verb: "claim", label: "Claim" });
   });
 
   it("renders pinboard notes and emits create events", async () => {
