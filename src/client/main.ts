@@ -4841,10 +4841,6 @@ function renderScopedIde() {
     </section>
     <section class="split">
       <div class="panel"><pre>${escapeHtml(JSON.stringify(summary ?? { id: object, loading: Boolean(object) }, null, 2))}</pre></div>
-      <div class="panel editor">
-        <h2>Scoped Mode</h2>
-        <p>The production client is using scoped summaries, /api/me, overlay snapshots, and observations. Verb install/edit tools remain on the explicit legacy state path.</p>
-      </div>
     </section>
     ${scopedSmoke}
   `;
