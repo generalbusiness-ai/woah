@@ -79,6 +79,38 @@ editor.
 
 See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md).
 
+## Eval
+
+`$programmer:eval(source, opts?)` is the LambdaCore `eval` analogue. It compiles
+the supplied source through the same DSL pipeline as `programmer_install_verb`
+but does not persist the verb; instead the substrate `programmer_eval` builtin
+runs the wrapped bytecode in a CallContext where `progr = caller`, so the code
+runs with the invoking programmer's authority — never the catalog installer's.
+`opts.mode = "expr"` (the default) wraps the source as `return <source>;`, so a
+single expression like `the_chatroom:say("hi")` works. `opts.mode = "stmts"`
+runs the source verbatim as a verb body. `opts.dry_run = true` compiles and
+returns diagnostics without running anything.
+
+Chat aliases: `;expr` and `;;stmts`, dispatched in the speech-prefix planner
+to `actor:eval` so any actor inheriting from `$programmer` can use the chat
+panel as a CLI. eval is `tool_exposed` so MCP agents see it as a tool, with
+documentation that explains it can stand in for individual `woo_call`
+invocations: a programmer agent can write `;target:verb(arg1, arg2)` from a
+single `eval` tool instead of round-tripping through the gateway's generic
+`woo_call` for each call.
+
+Authority is the same hard surface as the rest of `$programmer`:
+`assertProgrammerActor` requires wizard, or `$programmer` ancestry plus the
+`programmer` flag. A non-programmer who reaches the verb via inheritance gets
+`E_PERM`. Compile errors return `{ok: false, diagnostics: [...]}` because no
+body ran. Runtime errors thrown by the eval body propagate up to the outer
+direct-call transaction, which rolls back property writes, placement changes,
+and parked tasks; the chat layer then renders the error frame. Catching the
+error and returning a structured map would have committed partial mutations
+(e.g. a `create(...)` followed by a `1/0` would leave the new object behind),
+so the transactional contract is preferred even though it means chat shows a
+plain error rather than a structured diagnostic.
+
 ## LambdaCore Alignment
 
 - Builder commands use actor-scoped target resolution, not room matching.
@@ -87,6 +119,8 @@ See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md)
   be inspected and edited precisely.
 - Metadata-only edits (`set_verb_info`) are separate from source installs, like
   LambdaCore's `@args` / `@chmod` split from `@program`.
+- `eval` is on `$programmer` (LambdaCore's `$prog`), not `$builder`. Chat
+  prefix `;` matches LambdaCore convention; `;;` runs a statement block.
 - Editor rooms use ordinary room dispatch and presence. The editor session
   points at the target object/member; it does not move the target object.
 
@@ -96,5 +130,4 @@ See [../../spec/authoring/editor-rooms.md](../../spec/authoring/editor-rooms.md)
   is wired for live calls.
 - Full search indexes are deferred; the first version may use bounded local
   scans.
-- Eval is intentionally absent from v1.
 - Shared live buffers are deferred; first editor-room sessions are per actor.

@@ -3222,6 +3222,54 @@ export class WooWorld {
     throw wooError("E_NOT_IMPLEMENTED", "programmer trace is deferred to v1.1");
   }
 
+  async programmerEval(ctx: CallContext, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
+    this.assertProgrammerActor(ctx.actor, surfaceClass);
+    const options = progOptions(opts);
+    const dryRun = optionBool(options, "dry_run", false);
+    const mode = optionString(options, "mode", "expr");
+    if (!["expr", "stmts"].includes(mode)) throw wooError("E_INVARG", `unknown eval mode: ${mode}`);
+    const trimmed = source.trim();
+    if (!trimmed) throw wooError("E_INVARG", "empty eval source");
+    const body = mode === "expr"
+      ? `return ${trimmed.endsWith(";") ? trimmed.slice(0, -1) : trimmed};`
+      : trimmed;
+    const wrapped = `verb :_eval() rxd {\n  ${body}\n}`;
+    const compiled = compileVerb(wrapped);
+    if (!compiled.ok || !compiled.bytecode) {
+      return { ok: false, dry_run: dryRun, diagnostics: compiled.diagnostics as unknown as WooValue };
+    }
+    if (dryRun) return { ok: true, dry_run: true, diagnostics: [] };
+    // The wrapper verb is not persisted. Run it directly with the actor as
+    // progr so authority follows the LambdaCore @eval rule: code runs as the
+    // invoking programmer, not as the catalog installer that owns the surface
+    // wrapper verb. callerPerms also tracks the actor.
+    //
+    // Runtime errors are deliberately allowed to propagate. The outer
+    // `directCallNow` only restores property writes and placement on throw —
+    // it does NOT roll back `create()`/`recycle()` of objects or session
+    // mutations. eval can do anything the actor's progr permits, so we wrap
+    // the body in the heavier `withBehaviorSavepoint`, which snapshots and
+    // restores the full object table, tombstones, ULID counters, and parked
+    // tasks. Without this, `;create("$thing", {...}); return 1/0;` would
+    // leak the created object even though the call surface looks like a
+    // failure. Compile errors above are safe to return as data because no
+    // body ran.
+    const evalCtx: CallContext = {
+      ...ctx,
+      thisObj: ctx.actor,
+      verbName: "_eval",
+      definer: ctx.actor,
+      caller: ctx.thisObj,
+      callerPerms: ctx.actor,
+      progr: ctx.actor
+    };
+    // Narrowing on `compiled.bytecode` doesn't survive the async closure;
+    // bind to a local so the savepoint callback sees the non-optional type.
+    const bytecode = compiled.bytecode;
+    const value = await this.withBehaviorSavepoint(async () => await runTinyVm(evalCtx, bytecode, []));
+    return { ok: true, dry_run: false, value: value as WooValue };
+  }
+
   async editorInvoke(ctx: CallContext, editorRef: ObjRef, targetRef: ObjRef, descriptor: WooValue, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
     this.assertProgrammerActor(ctx.actor, surfaceClass);
     if (await this.remoteHostForObject(editorRef) || await this.remoteHostForObject(targetRef)) {
@@ -7644,6 +7692,18 @@ export class WooWorld {
     if (text.startsWith("\"") && text.length > 1) {
       const body = text.slice(1).trim();
       return await this.directCommandPlan(ctx, space, "say", [body], await parse(`say ${body}`));
+    }
+    if (text.startsWith(";;") && text.length > 2) {
+      const body = text.slice(2).trim();
+      if (!body) return null;
+      const cmd = await parse(`eval ${body}`);
+      return await this.commandPlanForResolved(ctx, space, actor, "eval", [body, { mode: "stmts" }], cmd);
+    }
+    if (text.startsWith(";") && text.length > 1) {
+      const body = text.slice(1).trim();
+      if (!body) return null;
+      const cmd = await parse(`eval ${body}`);
+      return await this.commandPlanForResolved(ctx, space, actor, "eval", [body], cmd);
     }
     if (text.startsWith("`") && text.length > 1) {
       return await this.directedSpeechPlan(ctx, space, "say_to", text.slice(1), text, actor, location);

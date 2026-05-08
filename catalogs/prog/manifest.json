@@ -1,6 +1,6 @@
 {
   "name": "prog",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "spec_version": "v1",
   "description": "Builder and programmer tooling. The same world is the IDE: tools inspect and mutate the live object graph, with no design-time/runtime split. The catalog deliberately preserves LambdaCore's builder/programmer authority split by installing them as player classes. Builder class membership exposes object/data tools. Programmer class membership exposes source/metadata tools, while progbit and wizbit remain the hard authority facts.",
   "license": "MIT",
@@ -94,7 +94,7 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"trace(id, descriptor, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"] };\n}"
+          "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"trace(id, descriptor, opts?)\", \"eval(source, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"] };\n}"
         },
         {
           "name": "inspect",
@@ -177,6 +177,18 @@
           "tool_exposed": true,
           "arg_spec": { "args": ["id", "verb_name", "opts?"] },
           "source": "verb :trace(id, verb_name, opts) rxd {\n  // Capture source-span traces for the next N invocations. v1.1.\n  return programmer_trace(id, verb_name, opts);\n}"
+        },
+        {
+          "name": "eval",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": ["source", "opts?"],
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+          },
+          "source": "verb :eval(source, opts) rxd {\n  /* Compile and run a Woo expression or statement block under the calling\n   * programmer's authority. This is a strict superset of `woo_call`: any\n   * verb can be invoked as `;target:verb(arg1, arg2)`, any readable property\n   * read as `;obj.prop`, and arbitrary computation expressed inline. Ideal\n   * for chat-as-CLI use and for programmer agents that need to script the\n   * world without round-tripping through individual MCP tools.\n   *\n   * Args:\n   *   source: Woo source text. Default mode wraps as `return <source>;`,\n   *           so an expression like `the_chatroom:say(\"hi\")` is fine.\n   *           Pass opts.mode=\"stmts\" to run a multi-statement body verbatim.\n   *   opts.mode: \"expr\" (default) | \"stmts\"\n   *   opts.dry_run: true compiles only, returns diagnostics, runs nothing.\n   *\n   * Returns a map on success or compile failure:\n   *   { ok: true,  dry_run, value }                          // success\n   *   { ok: false, dry_run, diagnostics: [{severity,code,message,...}] }  // compile error\n   *\n   * Runtime errors thrown by the body propagate as ordinary errors so the\n   * outer direct-call transaction rolls back state, placement, and parked\n   * tasks. A failed `;create(...) ; return 1/0;` does not leave the created\n   * object behind. (LambdaCore @eval renders the traceback into chat; here\n   * the chat layer renders the propagated error frame.)\n   *\n   * Authority: the wrapped code runs with `progr = caller`, not the catalog\n   * installer that owns this verb, so eval cannot escalate. Gated on\n   * wizard-or-progbit + $programmer ancestry; non-programmers get E_PERM.\n   *\n   * Examples:\n   *   ;1 + 2                                    // -> {ok:true,value:3}\n   *   ;the_chatroom:say(\"hello\")                // call a verb\n   *   ;;let x = 0; for i in [1,2,3] { x = x + i; } return x;   // mode=\"stmts\"\n   */\n  let result = programmer_eval(source, opts);\n  if (result[\"ok\"]) {\n    if (result[\"dry_run\"]) {\n      tell(actor, \"(dry_run ok)\");\n    } else {\n      tell(actor, \"=> \" + to_string(result[\"value\"]));\n    }\n  } else {\n    let line = \"compile error\";\n    let diags = result[\"diagnostics\"];\n    if (typeof(diags) == \"list\" && length(diags) > 0) {\n      let d = diags[1];\n      line = \"compile error: \" + d[\"code\"] + \" \" + d[\"message\"];\n    }\n    tell(actor, line);\n  }\n  return result;\n}"
         },
         {
           "name": "force_recycle",
