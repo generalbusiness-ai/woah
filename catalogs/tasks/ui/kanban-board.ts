@@ -130,6 +130,8 @@ function readActionRow(row: unknown): KanbanAction | null {
   };
 }
 
+const DEFAULT_REFRESH_INTERVAL_MS = 3000;
+
 export class WooTasksKanbanElement extends HTMLElement {
   woo?: WooContext;
   subject?: string;
@@ -141,6 +143,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     tasks: []
   };
   private boundClick = false;
+  private pollHandle: ReturnType<typeof setInterval> | null = null;
 
   set data(value: KanbanData) {
     this.model = value;
@@ -154,6 +157,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.boundClick = true;
     }
     if (this.woo) void this.refresh();
+    this.startPolling();
   }
 
   disconnectedCallback(): void {
@@ -161,6 +165,40 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.removeEventListener("click", this.handleClick);
       this.boundClick = false;
     }
+    this.stopPolling();
+  }
+
+  private startPolling(): void {
+    this.stopPolling();
+    const intervalMs = this.pollIntervalMs();
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+    this.pollHandle = setInterval(() => {
+      if (this.isConnected && this.woo) void this.refresh();
+    }, intervalMs);
+  }
+
+  private stopPolling(): void {
+    if (this.pollHandle !== null) {
+      clearInterval(this.pollHandle);
+      this.pollHandle = null;
+    }
+  }
+
+  private pollIntervalMs(): number {
+    const attr = this.getAttribute("refresh-interval-ms");
+    if (attr !== null) {
+      const parsed = Number(attr);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return DEFAULT_REFRESH_INTERVAL_MS;
+  }
+
+  static get observedAttributes(): string[] {
+    return ["refresh-interval-ms"];
+  }
+
+  attributeChangedCallback(name: string): void {
+    if (name === "refresh-interval-ms" && this.isConnected) this.startPolling();
   }
 
   async refresh(): Promise<void> {

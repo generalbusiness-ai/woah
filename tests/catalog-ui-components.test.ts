@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
@@ -116,6 +116,48 @@ describe("bundled catalog UI components", () => {
     await Promise.resolve();
     expect(detail).toMatchObject({ taskId: "obj_t_ready", verb: "claim" });
     expect(calls.some((c) => c.target === "obj_t_ready" && c.verb === "claim")).toBe(true);
+  });
+
+  it("polls listing on the configured interval and stops on disconnect", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    let listingCalls = 0;
+    const woo: WooContext = {
+      actor: null,
+      frame: { id: "test", subject: "the_bug_board", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_bug_board", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_bug_board" ? "Bug Board" : ref, props: {}, catalogState: {} }),
+      call: async (_target, verb) => {
+        if (verb === "listing") {
+          listingCalls += 1;
+          return [];
+        }
+        return [];
+      },
+      send: async () => undefined,
+      directCall: async () => undefined,
+      emit: () => true
+    };
+    vi.useFakeTimers();
+    try {
+      const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+      element.woo = woo;
+      element.subject = "the_bug_board";
+      element.setAttribute("refresh-interval-ms", "100");
+      document.body.appendChild(element);
+      await vi.runOnlyPendingTimersAsync();
+      const initialCalls = listingCalls;
+      expect(initialCalls).toBeGreaterThanOrEqual(1);
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(listingCalls).toBeGreaterThan(initialCalls);
+      const beforeDisconnect = listingCalls;
+      element.remove();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(listingCalls).toBe(beforeDisconnect);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders the tasks kanban with state columns, cursor badges, and actions", async () => {
