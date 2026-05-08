@@ -1434,3 +1434,219 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 });
+
+// Focused regressions for the outbound-fetch limiter introduced to mitigate
+// the Workers ~6-slot subrequest cap. These bypass routed worker.fetch() and
+// poke the DO's private helpers directly via casts, so the invariants
+// (cap, queue-abort, single-flight) are exercised in isolation rather than
+// inferred from end-to-end behavior.
+describe("PersistentObjectDO outbound-fetch limiter", () => {
+  type Helper = {
+    outFetchInFlight: number;
+    outFetchQueue: Array<() => void>;
+    outFetchInflight: Map<string, Promise<unknown>>;
+    acquireOutFetchSlot(signal?: AbortSignal): Promise<void>;
+    releaseOutFetchSlot(): void;
+    outboundFetch(id: { name: string }, request: Request, signal?: AbortSignal): Promise<{ response: Response; queueMs: number }>;
+    forwardInternal<T>(host: string, path: string, body: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<T>;
+  };
+
+  function defer<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (err: unknown) => void } {
+    let resolve!: (value: T) => void;
+    let reject!: (err: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  function buildDO(opts: {
+    fetchHandler: (request: Request) => Promise<Response> | Response;
+    concurrency?: string;
+  }): { po: PersistentObjectDO; helper: Helper; cleanup: () => void } {
+    const state = new FakeDurableObjectState("limiter-test");
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "limiter-test-token",
+      WOO_INTERNAL_SECRET: "limiter-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      ...(opts.concurrency !== undefined ? { WOO_HOST_OUT_FETCH_CONCURRENCY: opts.concurrency } : {}),
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({ fetch: opts.fetchHandler })),
+      WOO: new FakeDurableObjectNamespace(() => ({ fetch: opts.fetchHandler }))
+    } as unknown as Env;
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+    return { po, helper: po as unknown as Helper, cleanup: () => state.close() };
+  }
+
+  function makeRequest(reqId?: number): Request {
+    return new Request("https://woo.internal/__internal/probe", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-woo-host-key": "probe",
+        ...(reqId !== undefined ? { "x-test-req-id": String(reqId) } : {})
+      },
+      body: "{}"
+    });
+  }
+
+  it("never exceeds the configured concurrency cap and processes the queue FIFO", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const order: number[] = [];
+    const { helper, cleanup } = buildDO({
+      concurrency: "2",
+      fetchHandler: async (request) => {
+        // Stamp the call-site's id (from the request header) into `order` at
+        // dispatch time. If the queue were LIFO, the queued ids 2..5 would
+        // arrive in reverse, even though the handler-assigned counter would
+        // still appear monotonic — only call-site identity catches that.
+        const reqId = Number(request.headers.get("x-test-req-id"));
+        order.push(reqId);
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 10));
+        inFlight--;
+        return new Response(JSON.stringify({ ok: true, id: reqId }), { status: 200 });
+      }
+    });
+    try {
+      // Fire 6 concurrent fetches; cap=2 means at any moment ≤ 2 are in flight,
+      // and the other 4 wait in the FIFO queue. Each call carries its own id
+      // in the request header so we can verify the handler observed them in
+      // call-site order.
+      const results = await Promise.all(
+        Array.from({ length: 6 }, (_, i) => helper.outboundFetch({ name: "h" }, makeRequest(i)))
+      );
+      expect(results).toHaveLength(6);
+      expect(maxInFlight).toBe(2);
+      // FIFO: handler observed the ids in registration order (0..5). LIFO
+      // would have produced [0, 1, 5, 4, 3, 2].
+      expect(order).toEqual([0, 1, 2, 3, 4, 5]);
+      // Slot accounting back at zero, queue empty.
+      expect(helper.outFetchInFlight).toBe(0);
+      expect(helper.outFetchQueue).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("removes aborted queued waiters without firing their fetch and without leaking slots", async () => {
+    let fetchCount = 0;
+    const release = defer<void>();
+    const { helper, cleanup } = buildDO({
+      concurrency: "1",
+      fetchHandler: async () => {
+        fetchCount++;
+        await release.promise;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    });
+    try {
+      // Saturate the slot: this fetch will block until release.
+      const heldCall = helper.outboundFetch({ name: "h" }, makeRequest());
+
+      // Two queued waiters with their own controllers; we'll abort both.
+      const abortA = new AbortController();
+      const abortB = new AbortController();
+      const callA = helper.outboundFetch({ name: "h" }, makeRequest(), abortA.signal);
+      const callB = helper.outboundFetch({ name: "h" }, makeRequest(), abortB.signal);
+      // Eagerly attach a no-op catch so the rejection between abort() and the
+      // explicit await isn't seen as an unhandled rejection by the runner.
+      callA.catch(() => {});
+      callB.catch(() => {});
+
+      // One queued waiter that we DO let through.
+      const callC = helper.outboundFetch({ name: "h" }, makeRequest());
+
+      // Give acquire() time to enqueue all three.
+      await new Promise((r) => setTimeout(r, 5));
+      expect(helper.outFetchQueue).toHaveLength(3);
+      expect(fetchCount).toBe(1); // only the held call has fetched
+
+      // abort() with no reason sets signal.reason to a DOMException("AbortError"),
+      // which is what callers naturally pass through when they cancel their own
+      // request. Match on `name` rather than `code` (DOMException's code is a
+      // number, not the string we use for wooError).
+      abortA.abort();
+      abortB.abort();
+      await expect(callA).rejects.toMatchObject({ name: "AbortError" });
+      await expect(callB).rejects.toMatchObject({ name: "AbortError" });
+      // Aborted waiters are gone from the queue; only callC remains.
+      expect(helper.outFetchQueue).toHaveLength(1);
+
+      // Let the held fetch finish so callC can proceed.
+      release.resolve();
+      await heldCall;
+      await callC;
+
+      // Total fetches: held + callC = 2. Aborted A/B never fired.
+      expect(fetchCount).toBe(2);
+      // Slot accounting clean.
+      expect(helper.outFetchInFlight).toBe(0);
+      expect(helper.outFetchQueue).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("coalesces concurrent identical reads on a coalesceable path and clears the entry on settle", async () => {
+    let fetchCount = 0;
+    let nextSeq = 0;
+    const { helper, cleanup } = buildDO({
+      concurrency: "10", // generous; we want to prove coalesce, not the queue
+      fetchHandler: async () => {
+        fetchCount++;
+        const seq = ++nextSeq;
+        await new Promise((r) => setTimeout(r, 5));
+        return new Response(JSON.stringify({ seq }), { status: 200 });
+      }
+    });
+    try {
+      // 5 concurrent identical reads to a coalesceable path → 1 underlying fetch,
+      // all 5 callers see the same seq value.
+      const reads = await Promise.all(
+        Array.from({ length: 5 }, () => helper.forwardInternal<{ seq: number }>("hostA", "/__internal/object-summaries", { ids: ["x", "y"] }))
+      );
+      expect(fetchCount).toBe(1);
+      expect(new Set(reads.map((r) => r.seq))).toEqual(new Set([1]));
+
+      // After the in-flight Promise settled, the table should be cleared so a
+      // subsequent identical call recomputes against fresh world state.
+      expect(helper.outFetchInflight.size).toBe(0);
+      const second = await helper.forwardInternal<{ seq: number }>("hostA", "/__internal/object-summaries", { ids: ["x", "y"] });
+      expect(fetchCount).toBe(2);
+      expect(second.seq).toBe(2);
+
+      // Different host or different body should not coalesce with the previous key.
+      const [a, b] = await Promise.all([
+        helper.forwardInternal<{ seq: number }>("hostB", "/__internal/object-summaries", { ids: ["x", "y"] }),
+        helper.forwardInternal<{ seq: number }>("hostA", "/__internal/object-summaries", { ids: ["different"] })
+      ]);
+      expect(fetchCount).toBe(4);
+      expect(a.seq).not.toBe(b.seq);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not coalesce mutating routes even with byte-identical bodies", async () => {
+    let fetchCount = 0;
+    const { helper, cleanup } = buildDO({
+      concurrency: "10",
+      fetchHandler: async () => {
+        fetchCount++;
+        await new Promise((r) => setTimeout(r, 5));
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    });
+    try {
+      // /__internal/remote-dispatch is a mutating route; coalescing would
+      // silently drop intentional repeated writes.
+      await Promise.all(
+        Array.from({ length: 5 }, () => helper.forwardInternal("hostA", "/__internal/remote-dispatch", { actor: "$wiz", verb: "say", args: ["hi"] }))
+      );
+      expect(fetchCount).toBe(5);
+      expect(helper.outFetchInflight.size).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+});

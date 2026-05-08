@@ -312,6 +312,8 @@ export function statusForError(error: ErrorValue): number {
     case "E_NOTAPPLICABLE":
     case "E_NOTFOUND":
       return 404;
+    case "E_HOST_RECYCLED":
+      return 410;
     case "E_CONFLICT":
       return 409;
     case "E_TRANSITION":

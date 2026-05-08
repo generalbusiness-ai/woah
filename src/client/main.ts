@@ -3013,6 +3013,18 @@ function clearPinboardViewports() {
 }
 
 function receiveChatEvent(observation: any, shouldRender = true) {
+  // `text` is a directed observation (spec/semantics/events.md §12.7.1) — it
+  // belongs in its target's feed only. We still see other actors' lines in
+  // our own DirectResultFrame.observations envelope (the originator gets the
+  // full room fan-out by design), so filter here before they reach the chat
+  // pane. Without this, a verb like `:move`'s `:announce_all_but` echoes
+  // every recipient's line back to the caller.
+  if (
+    String(observation?.type ?? "") === "text"
+    && typeof observation?.target === "string"
+    && state.actor
+    && observation.target !== state.actor
+  ) return;
   applyScopedChatObservation(observation);
   const kind = chatLineKind(observation);
   const presentActors = Array.isArray(observation.present_actors) ? observation.present_actors.map(String) : [];

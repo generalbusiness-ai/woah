@@ -11,6 +11,7 @@ import type {
   SerializedVerb,
   SerializedWorld,
   SpaceSnapshotRecord,
+  TombstoneRecord,
   WorldRepository
 } from "../core/repository";
 import {
@@ -485,6 +486,14 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
   loadTombstones(): ObjRef[] {
     return (this.db.prepare("SELECT id FROM tombstone").all() as Row[]).map((row) => String(row.id));
+  }
+
+  loadTombstoneRecords(): TombstoneRecord[] {
+    return (this.db.prepare("SELECT id, recycled_at, reason FROM tombstone ORDER BY id").all() as Row[]).map((row) => ({
+      id: String(row.id),
+      recycled_at: Number(row.recycled_at),
+      reason: row.reason == null ? null : String(row.reason)
+    }));
   }
 
   nextCounter(name: string): number {

@@ -79,7 +79,7 @@ has undated filenames.
 
 Use Git worktrees for isolation.
 
-**DO NOT commit or deploy** without explicit instruction.
+**DO NOT commit to main, or deploy** without explicit instruction.
 
 **Before a commit or merge to main:**
 - Ensure that the specs and other documentation are aligned with the code.

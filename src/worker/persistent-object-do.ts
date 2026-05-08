@@ -43,7 +43,7 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
 import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SerializedWorld } from "../core/repository";
+import type { SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { CFObjectRepository } from "./cf-repository";
@@ -62,6 +62,7 @@ export interface Env {
   WOO_INTERNAL_SECRET?: string;
   WOO_AUTO_INSTALL_CATALOGS?: string;
   WOO_HOST_READ_TIMEOUT_MS?: string;
+  WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
 }
 
 const WORLD_HOST = "world";
@@ -73,6 +74,60 @@ const METRIC_SAMPLE_WINDOW_MS = 1000;
 const HOST_STATE_CACHE_LIMIT = 32;
 const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
 const HOST_READ_RPC_TIMEOUT_MS = 2500;
+// Cap on concurrent DO->DO fetch() subrequests issued by this isolate. The
+// Workers runtime enforces its own ~6-slot limit; we self-limit slightly under
+// that and queue the overflow so cold-start fan-outs (compose_look hitting 4
+// remote hosts × N concurrent looks) don't all pile against the runtime queue
+// at once. Saturation is visible in the cross_host_rpc metric's queue_ms field.
+const HOST_OUT_FETCH_CONCURRENCY = 5;
+// Race a Promise against an AbortSignal. If the signal aborts first, reject
+// with the signal's reason; the underlying Promise is orphaned (real fetch
+// implementations cancel via the Request signal as well, so this is just a
+// belt-and-suspenders early-out for environments — like test fakes — that
+// don't honor the signal on the Request).
+function raceAgainstAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? wooError("E_ABORTED", "aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? wooError("E_ABORTED", "aborted"));
+    };
+    signal.addEventListener("abort", onAbort);
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (err) => { signal.removeEventListener("abort", onAbort); reject(err); }
+    );
+  });
+}
+
+// Internal RPC routes that are pure reads of world state and therefore safe
+// to coalesce: while one fetch is in flight, identical concurrent requests
+// (same host + path + body) attach to the same Promise rather than each
+// firing a fresh subrequest. Single-flight only — once the Promise settles,
+// the next call computes anew, so freshness is automatic without a TTL.
+// Mutating routes (remote-dispatch, ws-call, ws-direct, mirror-contents,
+// space-subscriber, register-objects, register-session, host-seed, etc.)
+// MUST NOT be added: coalescing them would deduplicate intentional repeated
+// writes.
+const COALESCEABLE_INTERNAL_PATHS: ReadonlySet<string> = new Set([
+  "/__internal/object-summaries",
+  "/__internal/object-summary",
+  "/__internal/remote-describe-many",
+  "/__internal/remote-get-prop",
+  "/__internal/replay",
+  "/__internal/state",
+  "/__internal/actor-session-locations-batch",
+  "/__internal/space-audience-sessions",
+  "/__internal/room-snapshot",
+]);
+// Per spec/semantics/recycle.md §RC11.3 step 2: tombstone roster handed to
+// Directory in batches sized to stay well under the 512 KiB Directory cap.
+// 1000 records × ~80 bytes per JSON entry ≈ 80 KiB, leaving ample headroom
+// for header overhead.
+const INHERIT_TOMBSTONES_BATCH_SIZE = 1000;
+// Meta key under which the §RC11.2 host-teardown state is persisted.
+const HOST_STATE_META_KEY = "host_state";
+const HOST_STATE_TEARING_DOWN = "tearing_down";
 
 export class PersistentObjectDO {
   private state: DurableObjectState;
@@ -103,6 +158,23 @@ export class PersistentObjectDO {
   // on rehydrate and maintained on attach/detach.
   private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
   private socketsBySession = new Map<string, Set<WebSocket>>();
+  // FIFO semaphore for outbound DO->DO fetch() concurrency. See
+  // HOST_OUT_FETCH_CONCURRENCY. The releaser hands the slot directly to the
+  // next waiter (no decrement-then-increment) to avoid an over-cap race when a
+  // releaser and a fresh acquire run concurrently.
+  private outFetchInFlight = 0;
+  private outFetchQueue: Array<() => void> = [];
+  // Single-flight coalesce table for COALESCEABLE_INTERNAL_PATHS. Key is
+  // `${host}\n${path}\n${bodyStr}`; value is the in-flight Promise. Cleared on
+  // settle (resolve or reject) so the next call recomputes against fresh state.
+  private outFetchInflight = new Map<string, Promise<unknown>>();
+  // Per spec/semantics/recycle.md §RC11. Cached host_state — null means
+  // "not yet read this lifetime"; afterwards the cached string is "live"
+  // or "tearing_down". Resets on DO eviction.
+  private cachedTeardownState: string | null = null;
+  // Set true once a teardown sequence has been scheduled in this DO
+  // lifetime so we don't double-fire it from concurrent fetch handlers.
+  private teardownScheduled = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -133,12 +205,27 @@ export class PersistentObjectDO {
 
     if (internalRequest) await verifyInternalRequest(this.env, request);
 
+    // §RC11.5 teardown gate. Once host_state is "tearing_down", this DO
+    // refuses all inbound work with E_HOST_RECYCLED until deleteAll has
+    // run. If teardown is in progress but no waitUntil is currently
+    // running it (e.g. a wake from hibernation between batches), schedule
+    // a resume so the sequence completes idempotently.
+    if (!gatewayHost && this.getHostState() === HOST_STATE_TEARING_DOWN) {
+      this.ensureTeardownScheduled(this.durableHostKey());
+      return jsonResponse(
+        { error: { code: "E_HOST_RECYCLED", message: "host is tearing down" } },
+        410
+      );
+    }
+
     if (!gatewayHost && (pathname === "/api/auth" || pathname === "/ws")) {
       return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
     }
 
+    let postHandlerWorld: WooWorld | null = null;
     try {
       const world = await this.getWorld(hostKey);
+      postHandlerWorld = world;
 
       if (internalRequest) {
         return await this.handleInternal(request, world, pathname, hostKey);
@@ -238,6 +325,10 @@ export class PersistentObjectDO {
     } catch (err) {
       const error = normalizeError(err);
       return jsonResponse({ error }, statusForError(error));
+    } finally {
+      if (!gatewayHost && postHandlerWorld) {
+        this.maybeStartTeardown(postHandlerWorld, this.durableHostKey());
+      }
     }
   }
 
@@ -254,6 +345,182 @@ export class PersistentObjectDO {
    */
   private durableHostKey(): string {
     return this.state.id.name ?? WORLD_HOST;
+  }
+
+  // ---- §RC11 host teardown ----
+
+  /** Read the persisted host_state, cached for the DO lifetime (resets on
+   * eviction). Returns "live" by default; "tearing_down" once §RC11 has
+   * begun. The first call reads from the repo; subsequent calls return
+   * the cached value until setHostStateTearingDown overwrites it. */
+  private getHostState(): string {
+    if (this.cachedTeardownState !== null) return this.cachedTeardownState;
+    let value: string | null = null;
+    try {
+      value = this.repo.loadMeta(HOST_STATE_META_KEY);
+    } catch {
+      value = null;
+    }
+    this.cachedTeardownState = value === HOST_STATE_TEARING_DOWN ? HOST_STATE_TEARING_DOWN : "live";
+    return this.cachedTeardownState;
+  }
+
+  private setHostStateTearingDown(): void {
+    this.repo.saveMeta(HOST_STATE_META_KEY, HOST_STATE_TEARING_DOWN);
+    this.cachedTeardownState = HOST_STATE_TEARING_DOWN;
+  }
+
+  /** Post-handler trigger evaluation per spec/semantics/recycle.md §RC11.1.
+   *
+   * v1 detection: if this DO's self-hosted root is gone (recycled), the host
+   * is empty of payload — pre-flight A3 forces co-resident objects to recycle
+   * first. The trigger evaluates `world.tombstones.has(rootId) &&
+   * !world.objects.has(rootId)`. Future revisions may need a deeper
+   * livePayloadCount that excludes host-scoped support copies row-by-row;
+   * that's not required while the trigger fires only on root recycle. */
+  private maybeStartTeardown(world: WooWorld, hostKey: string): void {
+    if (hostKey === WORLD_HOST) return;
+    if (this.cachedTeardownState === HOST_STATE_TEARING_DOWN) return;
+    if (!world.tombstones.has(hostKey as ObjRef)) return;
+    if (world.objects.has(hostKey as ObjRef)) return;
+
+    try {
+      this.setHostStateTearingDown();
+    } catch (err) {
+      console.warn("woo.host_teardown.mark_failed", { host: hostKey, error: normalizeError(err) });
+      return;
+    }
+    this.ensureTeardownScheduled(hostKey);
+  }
+
+  /** Idempotently schedule the teardown sequence. Multiple fetches that
+   * observe `tearing_down` only ever start one waitUntil promise. */
+  private ensureTeardownScheduled(hostKey: string): void {
+    if (this.teardownScheduled) return;
+    this.teardownScheduled = true;
+    const promise = this.runTeardownSequence(hostKey).catch((err) => {
+      console.warn("woo.host_teardown.failed", { host: hostKey, error: normalizeError(err) });
+      // Leave teardownScheduled=true so we don't loop on a permanently
+      // failing batch; the next DO wake re-evaluates and can retry.
+    });
+    if (typeof this.state.waitUntil === "function") {
+      this.state.waitUntil(promise);
+    }
+  }
+
+  /** Per spec/semantics/recycle.md §RC11.3 steps 2–4. */
+  private async runTeardownSequence(hostKey: string): Promise<void> {
+    const startedAt = Date.now();
+    let tombstones: TombstoneRecord[] = [];
+    try {
+      tombstones = this.repo.loadTombstoneRecords();
+    } catch {
+      tombstones = [];
+    }
+
+    // Step 2: hand the roster to Directory in batches.
+    const batches = chunkTombstones(tombstones, INHERIT_TOMBSTONES_BATCH_SIZE);
+    for (let i = 0; i < batches.length; i++) {
+      const final = i === batches.length - 1;
+      await this.postInheritTombstones(hostKey, i, final, batches[i]);
+    }
+
+    // Step 3: cancel alarms (best-effort; deleteAll also clears them at
+    // the current compatibility date — see spec/semantics/recycle.md
+    // §RC11.3 step 3).
+    try {
+      await this.state.storage.deleteAlarm?.();
+    } catch {
+      // best-effort
+    }
+
+    // Step 4: wipe storage.
+    try {
+      await this.state.storage.deleteAll();
+    } catch (err) {
+      console.warn("woo.host_teardown.deleteAll_failed", { host: hostKey, error: normalizeError(err) });
+      throw err;
+    }
+
+    this.emitMetric({
+      kind: "startup_storage", phase: "directory_inherit_tombstones",
+      ms: Date.now() - startedAt, status: "ok",
+      count: tombstones.length, batch_seq: batches.length - 1, final: true
+    }, hostKey);
+  }
+
+  /** Cold-load guard per spec/semantics/recycle.md §RC11.6. Called on a DO
+   * with empty storage before any cold-load seed runs. RPCs Directory's
+   * `lookup-inherited-tombstone` for our own id; if hit, throws
+   * E_HOST_RECYCLED and the caller refuses to bootstrap. The Directory
+   * RPC is the same one used to answer `is_recycled()` queries, so this
+   * adds at most one Directory round-trip to a cold start that already
+   * RPCs the gateway for a host seed. */
+  private async guardColdLoadAgainstInheritedTombstone(hostKey: string): Promise<void> {
+    if (hostKey === WORLD_HOST) return;
+    let body: Record<string, unknown> | null = null;
+    try {
+      const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(
+        `${INTERNAL_ORIGIN}/__internal/lookup-inherited-tombstone`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "x-woo-host-key": hostKey
+          },
+          body: JSON.stringify({ id: hostKey })
+        }
+      ));
+      const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
+      if (!response.ok) return; // lenient: Directory unreachable → proceed
+      body = await response.json() as Record<string, unknown>;
+    } catch (err) {
+      // Lenient on transport failure; logged for observability. The cost
+      // of a false-negative cold-load (re-creating a DO under a torn-down
+      // id) is bounded — the next request that reaches Directory will
+      // trip the gate, the DO writes host_state=tearing_down, and reruns
+      // §RC11.3 (idempotent on the empty roster).
+      console.warn("woo.host_teardown.cold_load_guard_failed", { host: hostKey, error: normalizeError(err) });
+      return;
+    }
+    if (body && body.tombstoned === true) {
+      throw wooError(
+        "E_HOST_RECYCLED",
+        `host ${hostKey} was recycled; refusing cold-load`,
+        hostKey
+      );
+    }
+  }
+
+  private async postInheritTombstones(
+    hostKey: string,
+    batchSeq: number,
+    final: boolean,
+    tombstones: TombstoneRecord[]
+  ): Promise<void> {
+    const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+    const request = await signInternalRequest(this.env, new Request(
+      `${INTERNAL_ORIGIN}/__internal/inherit-tombstones`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "x-woo-host-key": hostKey
+        },
+        body: JSON.stringify({
+          host: hostKey,
+          batch_seq: batchSeq,
+          final,
+          tombstones
+        })
+      }
+    ));
+    const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`directory inherit-tombstones batch ${batchSeq} failed (${response.status}): ${text}`);
+    }
   }
 
   private getMcpGateway(world: WooWorld): McpGateway {
@@ -338,6 +605,13 @@ export class PersistentObjectDO {
 
   private async createHostScopedWorld(hostKey: ObjRef, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
     const stored = this.repo.load();
+    // §RC11.6 cold-load guard. If storage is empty (a fresh DO or a stale
+    // stub reactivating an empty post-deleteAll instance), check Directory
+    // before running any cold-load seed: if our id is recorded as a
+    // former_host in inherited_tombstone, refuse and write nothing.
+    if (!stored) {
+      await this.guardColdLoadAgainstInheritedTombstone(hostKey);
+    }
     let scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
     if (stored && !scoped) {
       console.warn("woo.cluster_seed_fallback", {
@@ -410,7 +684,7 @@ export class PersistentObjectDO {
         },
         body: JSON.stringify({ host: hostKey })
       }));
-      const response = await this.env.WOO.get(id).fetch(request);
+      const { response } = await this.outboundFetch(id, request);
       const body = await response.json();
       if (!response.ok) {
         throw wooError("E_STORAGE", `failed to load host seed for ${hostKey}`, body as WooValue);
@@ -947,6 +1221,53 @@ export class PersistentObjectDO {
         if (memo) return await memoizeHostOperation(memo.reads, `actor-locations:${actor}`, read);
         return await read();
       },
+      actorSessionLocationsBatch: async (actors, memo) => {
+        const out = new Map<ObjRef, ObjRef[]>();
+        const missingByHost = new Map<string, ObjRef[]>();
+        for (const actor of actors) {
+          const key = `actor-locations:${actor}`;
+          const cached = memo?.reads.get(key) as Promise<ObjRef[]> | undefined;
+          if (cached) {
+            out.set(actor, await cached);
+            continue;
+          }
+          const host = await hostForObject(actor, memo);
+          if (!host || host === localHost) {
+            const locations = world.allLocationsForActor(actor);
+            out.set(actor, locations);
+            if (memo) memo.reads.set(key, Promise.resolve(locations));
+            continue;
+          }
+          const list = missingByHost.get(host) ?? [];
+          list.push(actor);
+          missingByHost.set(host, list);
+        }
+        await Promise.all(Array.from(missingByHost, async ([host, ids]) => {
+          try {
+            const response = await this.forwardInternalReadChecked<{ locations: Record<ObjRef, ObjRef[]> }>(
+              host,
+              "/__internal/actor-session-locations-batch",
+              { actors: ids }
+            );
+            const map = response.locations && typeof response.locations === "object" && !Array.isArray(response.locations)
+              ? response.locations
+              : {};
+            for (const actor of ids) {
+              const raw = map[actor];
+              const locations = Array.isArray(raw)
+                ? raw.filter((item): item is ObjRef => typeof item === "string")
+                : [];
+              out.set(actor, locations);
+              if (memo) memo.reads.set(`actor-locations:${actor}`, Promise.resolve(locations));
+            }
+          } catch (err) {
+            if (!isReadAvailabilityError(err)) throw err;
+            // Leave these actors absent from `out`; the caller treats unknown
+            // remote-location data as "skip scrub for this actor this window".
+          }
+        }));
+        return out;
+      },
       contents: async (objRef, memo) => {
         const read = async (): Promise<ObjRef[]> => {
           const host = await hostForObject(objRef, memo);
@@ -1151,56 +1472,51 @@ export class PersistentObjectDO {
   }
 
   private async fetchHostState(world: WooWorld, host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
     const startedAt = Date.now();
+    // The deadline now drives an AbortController, so on timeout the inner
+    // fetch — and the queue waiter behind it — both wind down rather than
+    // running on in the background after the outer race rejects.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "timeout" });
+      }
+      controller.abort(wooError("E_TIMEOUT", `host state fetch timed out: ${host}`, { host, timeout_ms: HOST_STATE_FETCH_TIMEOUT_MS }));
+    }, HOST_STATE_FETCH_TIMEOUT_MS);
     try {
-      const fetchState = this.fetchHostStateInner(host, actor)
-        .then((remote) => {
-          if (!settled) {
-            settled = true;
-            world.recordMetric({
-              kind: "cross_host_rpc",
-              route: "/__internal/state",
-              host,
-              ms: Date.now() - startedAt,
-              status: remote ? "ok" : "error",
-              ...(remote ? {} : { error: "E_BAD_RESPONSE" })
-            });
-          }
-          return remote;
-        })
-        .catch((err) => {
-          if (!settled) {
-            settled = true;
-            const error = normalizeError(err);
-            world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "error", error: error.code });
-          }
-          return null;
+      const remote = await this.fetchHostStateInner(host, actor, controller.signal);
+      if (!settled) {
+        settled = true;
+        world.recordMetric({
+          kind: "cross_host_rpc",
+          route: "/__internal/state",
+          host,
+          ms: Date.now() - startedAt,
+          status: remote ? "ok" : "error",
+          ...(remote ? {} : { error: "E_BAD_RESPONSE" })
         });
-      const timedOut = new Promise<null>((resolve) => {
-        timeout = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "timeout" });
-          }
-          resolve(null);
-        }, HOST_STATE_FETCH_TIMEOUT_MS);
-      });
-      return await Promise.race([fetchState, timedOut]);
-    } catch {
+      }
+      return remote;
+    } catch (err) {
+      if (!settled) {
+        settled = true;
+        const error = normalizeError(err);
+        world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "error", error: error.code });
+      }
       return null;
     } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
+      clearTimeout(timeout);
     }
   }
 
-  private async fetchHostStateInner(host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
+  private async fetchHostStateInner(host: string, actor: ObjRef, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
     const id = this.env.WOO.idFromName(host);
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/state`, {
       headers: { "x-woo-host-key": host, "x-woo-internal-actor": actor }
     }));
-    const response = await this.env.WOO.get(id).fetch(request);
+    const { response } = await this.outboundFetch(id, request, signal);
     if (!response.ok) return null;
     const body = await response.json();
     return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
@@ -1559,6 +1875,15 @@ export class PersistentObjectDO {
 
       if (request.method === "POST" && pathname === "/__internal/actor-session-locations") {
         return jsonResponse({ locations: world.allLocationsForActor(String(body.actor ?? "") as ObjRef) });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/actor-session-locations-batch") {
+        const actors = Array.isArray(body.actors)
+          ? (body.actors as unknown[]).filter((item): item is ObjRef => typeof item === "string")
+          : [];
+        const out: Record<ObjRef, ObjRef[]> = {};
+        for (const actor of actors) out[actor] = world.allLocationsForActor(actor);
+        return jsonResponse({ locations: out });
       }
 
       if (request.method === "POST" && pathname === "/__internal/contents") {
@@ -1925,7 +2250,100 @@ export class PersistentObjectDO {
     return Number.isFinite(configured) && configured > 0 ? configured : HOST_READ_RPC_TIMEOUT_MS;
   }
 
+  private hostOutFetchConcurrency(): number {
+    const configured = Number(this.env.WOO_HOST_OUT_FETCH_CONCURRENCY);
+    if (!Number.isFinite(configured) || configured <= 0) return HOST_OUT_FETCH_CONCURRENCY;
+    return Math.max(1, Math.floor(configured));
+  }
+
+  // Acquire one outbound subrequest slot. If the cap is reached, the caller is
+  // queued FIFO and the slot is handed off directly by releaseOutFetchSlot
+  // (no decrement-then-increment, so concurrent acquire+release can't go
+  // over cap). If `signal` aborts before the slot is granted, the waiter is
+  // spliced from the queue and the acquire rejects — no fetch is performed,
+  // no slot is consumed.
+  private async acquireOutFetchSlot(signal?: AbortSignal): Promise<void> {
+    if (this.outFetchInFlight < this.hostOutFetchConcurrency()) {
+      this.outFetchInFlight += 1;
+      return;
+    }
+    if (signal?.aborted) throw signal.reason ?? wooError("E_ABORTED", "outbound fetch aborted before queue");
+    await new Promise<void>((resolve, reject) => {
+      let aborted = false;
+      // A handoff after we've already aborted: take the slot and immediately
+      // release it so the next non-aborted waiter (or a fresh acquire) can use
+      // it. Without this, releaseOutFetchSlot would have leaked a slot.
+      const waiter: () => void = () => {
+        if (signal) signal.removeEventListener("abort", onAbort);
+        if (aborted) { this.releaseOutFetchSlot(); return; }
+        resolve();
+      };
+      const onAbort = () => {
+        aborted = true;
+        const idx = this.outFetchQueue.indexOf(waiter);
+        if (idx >= 0) this.outFetchQueue.splice(idx, 1);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        reject(signal!.reason ?? wooError("E_ABORTED", "outbound fetch aborted while queued"));
+      };
+      this.outFetchQueue.push(waiter);
+      signal?.addEventListener("abort", onAbort);
+    });
+  }
+
+  private releaseOutFetchSlot(): void {
+    const next = this.outFetchQueue.shift();
+    if (next) { next(); return; }
+    this.outFetchInFlight -= 1;
+  }
+
+  // Wraps the actual DO->DO fetch with the queue. `signal` is honored for
+  // (a) the queue wait — aborting before a slot is granted splices the waiter
+  // out of the queue without performing the fetch — and (b) the fetch itself,
+  // both via the Request's signal (so the production runtime cancels the
+  // subrequest) and via a manual race (so even if the underlying fetch ignores
+  // the signal — e.g. in tests — the caller's await still rejects promptly
+  // and our slot is released).
+  private async outboundFetch(id: DurableObjectId, request: Request, signal?: AbortSignal): Promise<{ response: Response; queueMs: number }> {
+    const queueStart = Date.now();
+    await this.acquireOutFetchSlot(signal);
+    const queueMs = Date.now() - queueStart;
+    try {
+      const signedRequest = signal ? new Request(request, { signal }) : request;
+      const fetchPromise = this.env.WOO.get(id).fetch(signedRequest);
+      if (!signal) {
+        const response = await fetchPromise;
+        return { response, queueMs };
+      }
+      const response = await raceAgainstAbort(fetchPromise, signal);
+      return { response, queueMs };
+    } finally {
+      this.releaseOutFetchSlot();
+    }
+  }
+
   private async forwardInternal<T>(host: string, path: string, body: Record<string, unknown>, options: { timeoutMs?: number } = {}): Promise<T> {
+    const bodyStr = JSON.stringify(body);
+    // Single-flight: only enabled for explicitly read-only paths. Joiners get
+    // the same Promise as the in-flight leader; they don't pay queue, fetch,
+    // or parse cost, and they share the leader's success/error outcome.
+    const coalesceKey = COALESCEABLE_INTERNAL_PATHS.has(path) ? `${host}\n${path}\n${bodyStr}` : null;
+    if (coalesceKey) {
+      const existing = this.outFetchInflight.get(coalesceKey) as Promise<T> | undefined;
+      if (existing) return existing;
+    }
+    const promise = this.forwardInternalRaw<T>(host, path, bodyStr, options);
+    if (coalesceKey) {
+      this.outFetchInflight.set(coalesceKey, promise as Promise<unknown>);
+      // Clear on settle (resolve or reject) so the next call recomputes.
+      promise.then(
+        () => { if (this.outFetchInflight.get(coalesceKey) === promise) this.outFetchInflight.delete(coalesceKey); },
+        () => { if (this.outFetchInflight.get(coalesceKey) === promise) this.outFetchInflight.delete(coalesceKey); }
+      );
+    }
+    return promise;
+  }
+
+  private async forwardInternalRaw<T>(host: string, path: string, bodyStr: string, options: { timeoutMs?: number }): Promise<T> {
     const id = this.env.WOO.idFromName(host);
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
       method: "POST",
@@ -1933,44 +2351,45 @@ export class PersistentObjectDO {
         "content-type": "application/json; charset=utf-8",
         "x-woo-host-key": host
       },
-      body: JSON.stringify(body)
+      body: bodyStr
     }));
     const startedAt = Date.now();
-    let settled = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const fetchResult = (async () => {
-      const response = await this.env.WOO.get(id).fetch(request);
-      return await response.json() as T;
-    })();
+    // Logged here so a wedged fetch leaves a trace; the existing
+    // `cross_host_rpc` end event only fires on settle.
+    this.world?.recordMetric({ kind: "cross_host_rpc_start", route: path, host });
     const timeoutMs = options.timeoutMs;
+    // For paths with an explicit deadline, the AbortController cancels both
+    // the queue wait and the underlying fetch on timeout; without this, a
+    // timed-out caller would still leave a Promise + a slot parked behind a
+    // wedged downstream. Mutating callers do NOT pass timeoutMs and so do
+    // not get cancellation — abort-mid-write would leave ambiguous remote
+    // state, and we have no idempotency layer to fix that yet.
+    const useTimeout = !!(timeoutMs && timeoutMs > 0);
+    const controller = useTimeout ? new AbortController() : undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    if (controller && timeoutMs) {
+      timeout = setTimeout(() => controller.abort(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs })), timeoutMs);
+    }
+    let observedQueueMs = 0;
     try {
-      if (!timeoutMs || timeoutMs <= 0) {
-        const parsed = await fetchResult;
-        this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok" });
-        return parsed;
+      const { response, queueMs } = await this.outboundFetch(id, request, controller?.signal);
+      observedQueueMs = queueMs;
+      const parsed = await response.json() as T;
+      const queueField = observedQueueMs > 0 ? { queue_ms: observedQueueMs } : {};
+      this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok", ...queueField });
+      return parsed;
+    } catch (err) {
+      const queueField = observedQueueMs > 0 ? { queue_ms: observedQueueMs } : {};
+      // E_TIMEOUT lifted out of the abort reason so callers see the same shape
+      // as before this refactor.
+      const isAbortTimeout = controller?.signal.aborted && (controller.signal.reason as { code?: string } | undefined)?.code === "E_TIMEOUT";
+      if (isAbortTimeout) {
+        this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "timeout", ...queueField });
+        throw controller!.signal.reason;
       }
-      return await new Promise<T>((resolve, reject) => {
-        timeout = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "timeout" });
-          reject(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs }));
-        }, timeoutMs);
-        fetchResult.then((parsed) => {
-          if (settled) return;
-          settled = true;
-          if (timeout !== undefined) clearTimeout(timeout);
-          this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok" });
-          resolve(parsed);
-        }, (err) => {
-          if (settled) return;
-          settled = true;
-          if (timeout !== undefined) clearTimeout(timeout);
-          const error = normalizeError(err);
-          this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "error", error: error.code });
-          reject(err);
-        });
-      });
+      const error = normalizeError(err);
+      this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "error", error: error.code, ...queueField });
+      throw err;
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
     }
@@ -2121,6 +2540,15 @@ export class PersistentObjectDO {
 }
 
 // ---- module-scoped helpers ----
+
+function chunkTombstones(records: TombstoneRecord[], chunkSize: number): TombstoneRecord[][] {
+  if (records.length === 0) return [[]]; // always send at least one batch with final=true
+  const out: TombstoneRecord[][] = [];
+  for (let i = 0; i < records.length; i += chunkSize) {
+    out.push(records.slice(i, i + chunkSize));
+  }
+  return out;
+}
 
 function memoizeHostOperation<T>(cache: Map<string, Promise<unknown>>, key: string, load: () => Promise<T>): Promise<T> {
   const existing = cache.get(key);

@@ -59,6 +59,8 @@ The corename and ULID-tombstone changes are *two distinct state changes on diffe
 
 `recycle` runs as part of a sequenced call. The host-side destruction is one atomic transaction on `obj`'s host (§RC3.1); the Directory corename removal is a fire-after-commit cross-DO operation (§RC3 step 10).
 
+If the recycle leaves the host with zero live (non-tombstoned) payload objects, the host enters teardown — it migrates its tombstone roster to the Directory and calls `state.storage.deleteAll()`, deallocating its storage. The DO id remains reachable; any reactivation hits the cold-load guard. See §RC11.
+
 ---
 
 ## RC2. Permissions
@@ -326,6 +328,7 @@ Recycle destroys the object. **Unanchoring** (changing an object's anchor cluste
 | `E_RECMOVE` | Builder-surface refusal: target has children or contents and `force: true` was not supplied (§RC3a). |
 | `E_CROSS_HOST_WRITE` | `obj.parent`, `obj.location`, or any child/content lives in a different anchor cluster (pre-flight A4, §RC10). |
 | `E_STORAGE` | Storage layer failed during the apply phase. The object is not recycled. |
+| `E_HOST_RECYCLED` | Request reached a DO whose `host_state == tearing_down`, or a cold-loaded DO whose id is recorded in Directory's `inherited_tombstone` table. Treat as "object gone"; equivalent to `E_OBJNF` for callers that don't distinguish (§RC11). |
 
 ---
 
@@ -353,6 +356,12 @@ The conformance suite ([conformance.md §CF3](../tooling/conformance.md#cf3-requ
 - ULID tombstoning: a recycled ULID never resolves and is never reused (per [persistence.md §14.2.1](../reference/persistence.md#1421-tombstones)).
 - Lazy cache invalidation: a host with a cached lookup entry whose definer was tombstoned by a recycle on another host purges and re-resolves on next dispatch; no stale dispatch is observable.
 - `$nowhere` sink: `obj.location = $nowhere` writes only the local field; reads of `$nowhere.contents` return `[]`.
+- Host teardown trigger: a recycle that drops the host's live-payload count to zero (host-scoped support copies excluded — §RC11.1) starts the §RC11 teardown.
+- Host teardown idempotency: a crash between any two §RC11 steps recovers to the same outcome on next wake.
+- Concurrent dispatch during `tearing_down` raises `E_HOST_RECYCLED`.
+- Cold-load guard: a fresh DO instantiated against a torn-down host id observes its id in Directory's `inherited_tombstone`, refuses inbound requests, and writes nothing.
+- After teardown: dispatching to any tombstoned ULID raises `E_OBJNF` via the Directory's inherited-tombstone authority without waking a productive DO; `is_recycled()` returns true.
+- `DEFAULT_OBJECT_HOST` never tears down even when its hosted payload transiently contains only the bootstrap floor.
 
 Of these, only the leaf-object case currently has automated coverage.
 The remaining cases are deferred until the corresponding implementation lands.
@@ -372,3 +381,283 @@ A v2 spec revision will define cross-host recycle. The protocol must address:
 
 Until then, `recycle()` rejects cross-anchor cases with `E_CROSS_HOST_WRITE`
 (§RC3.1).
+
+---
+
+## RC11. Host teardown after recycle
+
+When a recycle leaves a DO with no live (non-tombstoned) hosted payload
+objects, the DO migrates its tombstone roster to the Directory and tears
+itself down. This is the only mechanism by which a DO's storage is fully
+deallocated. Without it, every recycled self-hosted root leaves behind a
+DO whose storage holds only tombstones and meta rows — non-empty, billed
+indefinitely.
+
+After teardown, `state.storage.deleteAll()` deallocates the DO's stored
+data (atomically, per Cloudflare SQLite-DO semantics) and the in-memory
+instance is evicted on the next idle. The **id is not unreachable**: a
+caller holding a stale stub from `idFromName(host)` can still activate a
+fresh empty instance under the same id. Such activations are caught by
+the cold-load guard (§RC11.6), so observable behavior is correct, but the
+spec deliberately does not claim "the DO ceases to exist" — only that its
+storage is gone and any reactivation answers `E_HOST_RECYCLED`.
+
+**Status: partial.** §RC11.1 (trigger), §RC11.2 (host_state), §RC11.3
+(teardown sequence), §RC11.5 (concurrent operations), and §RC11.6
+(cold-load guard) are implemented in the worker (`PersistentObjectDO`,
+`DirectoryDO`). §RC11.4's lookup branch is wired into Directory's
+`/resolve-object`. §RC11.7 items remain deferred (multi-cluster
+teardown, per-host signing keys, vacuum). Catalog removal, owner-
+initiated room destruction, and factory cleanup of decommissioned
+instances now all use this path.
+
+### RC11.1 Trigger
+
+After every successful recycle commit on a host (§RC3 step 9), the host
+evaluates its hosted-payload count:
+
+```
+livePayloadCount := count of non-tombstoned hosted payload objects
+```
+
+A **hosted payload object** is one whose canonical Directory `id_route`
+points to this host: the self-hosted root and its anchored co-resident
+descendants (per [objects.md §4.1](objects.md#41-anchor-and-atomicity-scope)).
+
+**Host-scoped support copies are excluded.** Each object-owning DO carries
+copies of class, verb, and property-def rows merged in by
+`mergeHostScopedSeed` ([cloudflare.md §R9.1](../reference/cloudflare.md#r91-first-request-path))
+so that local dispatch can resolve through the inheritance chain without
+cross-host RPCs. These rows live in the same SQLite tables as payload, but
+their canonical id resolves to a different host (the gateway or another
+self-hosted root). They are caches, not hosted live objects, and do not
+count toward `livePayloadCount`. `state.storage.deleteAll()` (§RC11.3 step 4)
+discards them along with everything else.
+
+If `livePayloadCount == 0`, the host enters teardown. The trigger is
+defined on the count, not on "is the recycled object the self-hosted
+root?" — so the contract remains correct under future placement rules
+where a non-root could plausibly be the last live payload row.
+
+Anchor pinning (pre-flight A3, §RC3) ensures co-resident anchored
+descendants are recycled before their self-hosted root, so in practice
+the trigger fires on the recycle that destroys the root.
+
+`DEFAULT_OBJECT_HOST` (the world DO that holds `$wiz`, `$system`,
+`$catalog_registry`, …) is exempt: its hosted payload set always contains
+the bootstrap floor and the trigger never fires. The Directory DO is also
+exempt — it never tears itself down.
+
+### RC11.2 Host state
+
+The DO persists a `host_state` value in its `meta` table:
+
+| Value | Meaning |
+|---|---|
+| `live` | Default. Writes proceed normally. |
+| `tearing_down` | Teardown in progress. New writes raise `E_HOST_RECYCLED`. Reads on tombstoned ULIDs continue to answer "recycled" until §RC11.3 step 4. |
+
+The flag is set as a post-handler trigger after the recycle commit
+returns: the host evaluates `livePayloadCount` in the same fetch-handler
+turn that ran the recycle, and on a hit writes `host_state` via the
+ordinary meta-write path. Cloudflare DO single-threading guarantees no
+other request runs between the recycle commit and the host_state write,
+so a concurrent caller cannot observe an "empty host with `live`
+state". A crash *between* the recycle commit and the host_state write
+is recoverable: on next wake the DO re-evaluates the trigger condition
+(`world.tombstones.has(rootId) && !world.objects.has(rootId)`), which
+still holds, and re-fires the §RC11.3 sequence. Steps 2 and 4 are
+idempotent; step 3 is best-effort.
+
+(An earlier draft of this section called for the host_state write to
+share the recycle's SQLite transaction. That isn't currently feasible:
+recycle commits in core/world.ts, while the worker layer that owns
+host_state has no hook into that transaction. The post-handler trigger
++ recovery-on-wake gives the same observable safety; the only divergence
+is that a midpoint crash leaves `host_state = live` until the next wake
+re-fires the trigger, vs. leaving it `tearing_down`.)
+
+### RC11.3 Teardown sequence
+
+1. **Mark.** `host_state = tearing_down`. Written by the post-handler
+   trigger after the recycle commit that drained `livePayloadCount` to
+   zero (see §RC11.2 for the recovery-on-wake guarantee).
+2. **Hand tombstones to the Directory.** The host POSTs *one or more*
+   inherit-tombstones requests covering its full tombstone roster. A
+   long-lived host can accumulate more tombstones than fit in a single
+   request, so the protocol is batched.
+
+   ```
+   POST /__internal/inherit-tombstones
+   Headers: signed via internal-auth (x-woo-host-key, x-woo-internal-ts, x-woo-internal-body-sha256, x-woo-internal-signature)
+   Body: {
+     host: <self-hosted-root-ULID>,
+     batch_seq: <0-based monotonic int>,
+     final: <bool>,                                  // true on the last batch
+     tombstones: [{id, recycled_at, reason}, …]      // chunked subset of the host's roster
+   }
+   ```
+
+   The host chunks its roster so each request body stays well under the
+   Directory's body cap (Directory enforces ≤512 KiB JSON per request to
+   leave headroom under the 1 MiB Worker limit). `batch_seq` starts at 0
+   and increments per request; `final: true` marks the last batch. Batches
+   may be retried on transport failure with the same `(host, batch_seq)`
+   pair; the Directory is idempotent on `id`.
+
+   The Directory enforces three authorization invariants before any write:
+
+   - **Signature.** The request passes `verifyInternalRequest` against
+     `WOO_INTERNAL_SECRET` (per existing internal-auth canonical, see
+     [`src/worker/internal-auth.ts`](../../src/worker/internal-auth.ts)).
+     Otherwise `E_PERM`.
+   - **Host self-consistency.** The body's `host` field equals the
+     authenticated `x-woo-host-key` header. Otherwise `E_PERM`. A host can
+     only declare its own teardown.
+   - **Roster ownership.** For each tombstone `id` in the body, the
+     Directory verifies `id_route(id).host == host` (or that an
+     inherited-tombstone row for `id` already exists with
+     `former_host == host`, to keep retried batches idempotent). Any id
+     whose current route points at a different host is rejected; the
+     entire batch is refused with `E_PERM` and no rows are written.
+
+   These invariants protect against public clients and buggy honest
+   callers. They do *not* defend against a compromised worker that holds
+   `WOO_INTERNAL_SECRET`, because the v1 internal-auth model uses a single
+   shared secret and the `x-woo-host-key` header is asserted by the
+   caller. Per-host signing keys are out of scope for v1; see §RC11.7.
+
+   On a clean batch, the Directory:
+
+   - Inserts each row into its `inherited_tombstone` table (idempotent on
+     `id`); see [persistence.md §14.2.2](../reference/persistence.md#1422-inherited-tombstones-after-host-teardown).
+   - Removes the `id_route` row for each tombstone *accepted in this
+     batch*. This is the one documented exception to the §14.2.1
+     route-immutability invariant: it applies *only* to ULIDs that are
+     already tombstoned **and** routed to the authenticated caller, so the
+     observable behavior for callers does not change (`E_OBJNF` was raised
+     by the host before; it is now raised by the Directory).
+   - Returns 200 only after both writes commit.
+
+   **Teardown advances only when all batches are accepted.** The host
+   tracks ack of each `batch_seq` and proceeds to step 3 only after the
+   `final: true` batch has been acknowledged. A crash mid-handoff is
+   recoverable: on next wake, the DO observes `host_state == tearing_down`
+   and replays unacknowledged batches. The Directory's batch idempotency
+   means re-sending an already-applied batch is a no-op and re-sending
+   with a fresh body sha (e.g. after a chunking-policy change) is still
+   safe because the per-`id` insert is idempotent.
+
+3. **Drop alarms and outbox** (best-effort). Cancel any
+   `state.storage.setAlarm()`. Drain or abandon outbox entries — their
+   receivers will see this host as gone after step 4 anyway. This step is
+   belt-and-suspenders: at the runtime's current `compatibility_date`,
+   `state.storage.deleteAll()` (step 4) also clears alarms, so the explicit
+   cancel here only narrows the window of partial alarm fires during the
+   teardown gap. If the compatibility date later changes such that
+   `deleteAll` no longer clears alarms, this step becomes load-bearing.
+
+4. **`state.storage.deleteAll()`.** Atomically deallocates the DO's
+   stored data, including `meta` (so `host_state` is gone), `tombstone`,
+   and per-object tables. The in-memory instance is evicted on the next
+   idle. The DO id remains reachable: a stale stub can re-activate an
+   empty instance under the same id; that path is governed by the
+   §RC11.6 cold-load guard. This call is the only place in woo's
+   substrate that uses `deleteAll`.
+
+5. **Return.** No further messages on this DO.
+
+### RC11.4 Tombstone authority handoff
+
+After §RC11.3 step 2 commits, the Directory is the authority on liveness
+for the tombstoned ULIDs that lived on the torn-down host. The lookup
+contract from [persistence.md §14.2.1](../reference/persistence.md#1421-tombstones)
+gains a new branch — see [§14.2.2](../reference/persistence.md#1422-inherited-tombstones-after-host-teardown):
+
+1. Caller resolves the ULID via Directory `id_route`.
+2. **(new)** If `id_route` has no row, the Directory checks
+   `inherited_tombstone`. A hit returns "recycled" → `E_OBJNF`. A miss
+   returns "never existed" (`is_recycled()` distinguishes the two).
+3. Otherwise dispatch to the host as before.
+
+The Directory's authority is bounded: it answers for ULIDs whose host has
+been torn down. Live hosts retain authority over their own tombstones
+(§14.2.1), and the Directory does not mirror those.
+
+### RC11.5 Concurrent operations during teardown (pre-deleteAll)
+
+While `host_state == tearing_down` is persisted (between §RC11.3 step 1 and
+step 4), a request arriving at the DO is rejected with `E_HOST_RECYCLED`.
+This window covers three paths:
+
+- A direct dispatch that races with teardown (rare: pre-flight A3 prevents
+  the obvious case).
+- A cross-DO RPC that targets a now-empty cluster (e.g. an outbox flush from
+  another host). Caller treats `E_HOST_RECYCLED` as "tombstoned" and stops
+  retrying.
+- A reawaken caused by a stale alarm. The DO sees `tearing_down`, resumes
+  the §RC11.3 sequence, and exits without doing user-visible work.
+
+`E_HOST_RECYCLED` is normative — see [failures.md §F7](failures.md#f7-lifecycle-failures)
+and §RC8. Code that already handles `E_OBJNF` for tombstoned dispatches
+needs no change; code that wants to distinguish "racing teardown" from
+"long-since recycled" checks the code.
+
+### RC11.6 Post-deleteAll behavior (cold-load guard)
+
+After §RC11.3 step 4, the DO's storage is empty. The persisted
+`host_state` flag is gone with it. The post-delete safety relies on two
+mechanisms working together:
+
+1. **Routing layer.** The Directory removed this host's `id_route` entry
+   for every tombstoned ULID in step 2. Future `idFromName(...)` lookups
+   that go through Directory either route to a different host (impossible
+   since payload is gone) or are answered directly by Directory's
+   `inherited_tombstone` table with `E_OBJNF` (per
+   [persistence.md §14.2.2](../reference/persistence.md#1422-inherited-tombstones-after-host-teardown)).
+   Callers that always re-resolve via Directory never reach the dead DO.
+
+2. **Cold-load guard at the DO.** A caller holding a stub from
+   `env.WOO.idFromName(host)` can still reach the dead DO directly,
+   bypassing Directory. Cloudflare may instantiate a fresh DO for that
+   stub. Before any cold-load seed runs (§R9.1), a DO whose storage is
+   empty MUST RPC the Directory to ask whether its own id appears as
+   `former_host` in `inherited_tombstone`. If it does, the DO refuses all
+   inbound requests with `E_HOST_RECYCLED` and writes nothing — its
+   in-memory instance is evicted again on the next idle. If it does not,
+   the DO is a legitimate first-time instance and proceeds with normal
+   cold-load.
+
+Mechanism (2) is the safety net for any caller that didn't go through
+Directory, and is the only correct way to handle stale stubs after
+teardown without re-using the torn-down host's id. It costs one Directory
+RPC per cold-load — acceptable because cold-load is already not on any
+hot path.
+
+**A torn-down host's id is never reused for a new payload object.** The
+Directory's `inherited_tombstone` row is permanent (subject to the same
+offline-vacuum caveat as §14.2.1). Catalog re-installs that need the same
+human-readable name use a fresh ULID for the new self-hosted root, and a
+fresh `id_route` entry.
+
+### RC11.7 Out of scope for v1
+
+- **Teardown of multi-cluster hosts.** v1 anchor clusters are single-host
+  by construction (§RC3.1, §RC10). The §RC11 trigger fires on the host
+  whose `livePayloadCount` reaches zero, period; cross-host coordination
+  is part of the §RC10 deferred work.
+- **Per-host signing keys.** v1 internal-auth uses a single shared
+  `WOO_INTERNAL_SECRET`; `x-woo-host-key` is asserted by the caller and
+  not bound to any host-specific credential. The §RC11.3 step 2 ownership
+  checks therefore protect against public clients and honest-but-buggy
+  internal callers, but not against a compromised worker that has the
+  shared secret. A future revision may bind each DO to a per-host signing
+  key (e.g. derived from its id at first cold-load) so the Directory can
+  reject `x-woo-host-key` values forged by other DOs.
+- **Resurrection.** A torn-down host's ULID is permanently recorded in
+  the Directory's `inherited_tombstone` table; there is no path that
+  re-creates a DO under the same root ULID. Catalog re-installs that need
+  the same human-readable name use a fresh ULID.
+- **Vacuum of `inherited_tombstone`.** The table grows monotonically.
+  An offline tool may sweep entries past a configurable horizon, with the
+  same backup/restore caveat as §14.2.1.

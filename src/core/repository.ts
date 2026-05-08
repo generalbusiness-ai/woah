@@ -330,6 +330,12 @@ export interface ObjectRepository {
   /** Enumerate every tombstone on this host. Used at boot to rebuild the in-memory set. */
   loadTombstones(): ObjRef[];
 
+  /** Enumerate every tombstone on this host with its recycled_at and reason.
+   * Used by the host-teardown teardown sequence (per
+   * spec/semantics/recycle.md §RC11.3 step 2) to migrate the roster to the
+   * Directory's `inherited_tombstone` table. */
+  loadTombstoneRecords(): TombstoneRecord[];
+
   // ----- Host-scoped counters -----
 
   /**
@@ -351,6 +357,10 @@ export interface ObjectRepository {
 type PendingSpaceLogEntry = Omit<SpaceLogEntry, "applied_ok"> & { applied_ok: boolean | null };
 
 type Tombstone = { id: ObjRef; recycled_at: number; reason: string | null };
+
+/** Public-facing record shape for tombstones, mirrored to the Directory at
+ * host teardown (spec/semantics/recycle.md §RC11). */
+export type TombstoneRecord = { id: ObjRef; recycled_at: number; reason: string | null };
 
 type InMemoryObjectRepositoryState = {
   objects: Map<ObjRef, SerializedObject>;
@@ -680,6 +690,10 @@ export class InMemoryObjectRepository implements ObjectRepository, WorldReposito
 
   loadTombstones(): ObjRef[] {
     return Array.from(this.tombstones.keys()).sort();
+  }
+
+  loadTombstoneRecords(): TombstoneRecord[] {
+    return Array.from(this.tombstones.values()).slice().sort((a, b) => a.id.localeCompare(b.id));
   }
 
   nextCounter(name: string): number {
