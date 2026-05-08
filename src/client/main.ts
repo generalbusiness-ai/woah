@@ -1851,7 +1851,7 @@ function dubspaceSpace() {
     if (route?.view === "dubspace" && route.objectId) return route.objectId;
     if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
     const scoped = scopedToolSubject("dubspace");
-    return scoped;
+    return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
   }
   return String(state.world?.dubspaceMeta?.space ?? "");
 }
