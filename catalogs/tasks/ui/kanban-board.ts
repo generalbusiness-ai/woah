@@ -36,6 +36,8 @@ export type KanbanData = {
   actor: string | null;
   actorNames: Record<string, string>;
   tasks: KanbanTask[];
+  policies: string[];
+  isOwner: boolean;
 };
 
 type ColumnId = "ready" | "waiting" | "in_flight" | "done" | "dropped";
@@ -180,16 +182,23 @@ export class WooTasksKanbanElement extends HTMLElement {
     registryName: "Tasks",
     actor: null,
     actorNames: {},
-    tasks: []
+    tasks: [],
+    policies: [],
+    isOwner: false
   };
   private boundClick = false;
   private boundDrag = false;
   private boundSubmit = false;
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private openPrompt: { taskId: string; verb: string } | null = null;
+  private createOpen = false;
 
   set data(value: KanbanData) {
-    this.model = value;
+    this.model = {
+      policies: [],
+      isOwner: false,
+      ...value
+    };
     this.render();
   }
 
@@ -300,12 +309,24 @@ export class WooTasksKanbanElement extends HTMLElement {
         }
       }));
     }
+    const props = (projected?.props ?? {}) as Record<string, unknown>;
+    const rawPolicies = props.policies;
+    const policies = rawPolicies && typeof rawPolicies === "object" && !Array.isArray(rawPolicies)
+      ? Object.keys(rawPolicies)
+      : [];
+    const ownerRef = typeof projected?.owner === "string" ? projected.owner : null;
+    // Heuristic gate: show admin CTAs to the registry owner or $wiz. The
+    // verb's own permission check is the truth — this just hides the button
+    // when we already know it would E_PERM.
+    const isOwner = !!actor && (ownerRef === null || actor === ownerRef || actor === "$wiz");
     this.data = {
       registryId: subject,
       registryName,
       actor: actor ?? null,
       actorNames,
-      tasks
+      tasks,
+      policies,
+      isOwner
     };
   }
 
@@ -324,6 +345,24 @@ export class WooTasksKanbanElement extends HTMLElement {
   private handleClick = (event: Event): void => {
     const target = event.target as HTMLElement | null;
     if (!target) return;
+    if (target.closest<HTMLButtonElement>("[data-tasks-create-open]")) {
+      event.preventDefault();
+      this.createOpen = true;
+      this.render();
+      this.querySelector<HTMLInputElement>("[data-tasks-create] input[name=\"name\"]")?.focus();
+      return;
+    }
+    if (target.closest<HTMLButtonElement>("[data-tasks-create-cancel]")) {
+      event.preventDefault();
+      this.createOpen = false;
+      this.render();
+      return;
+    }
+    if (target.closest<HTMLButtonElement>("[data-tasks-seed-policy]")) {
+      event.preventDefault();
+      void this.seedMinimalPolicy();
+      return;
+    }
     const cancel = target.closest<HTMLButtonElement>("[data-tasks-prompt-cancel]");
     if (cancel) {
       event.preventDefault();
@@ -352,7 +391,20 @@ export class WooTasksKanbanElement extends HTMLElement {
   };
 
   private handleSubmit = (event: Event): void => {
-    const form = (event.target as HTMLElement | null)?.closest<HTMLFormElement>("[data-tasks-prompt]");
+    const target = event.target as HTMLElement | null;
+    const createForm = target?.closest<HTMLFormElement>("[data-tasks-create]");
+    if (createForm) {
+      event.preventDefault();
+      const kind = (createForm.querySelector<HTMLSelectElement>('select[name="kind"]')?.value ?? "").trim();
+      const name = (createForm.querySelector<HTMLInputElement>('input[name="name"]')?.value ?? "").trim();
+      const text = createForm.querySelector<HTMLTextAreaElement>('textarea[name="text"]')?.value ?? "";
+      const labelsRaw = createForm.querySelector<HTMLInputElement>('input[name="labels"]')?.value ?? "";
+      const labels = labelsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!kind || !name) return;
+      void this.createTask(kind, name, text, labels);
+      return;
+    }
+    const form = target?.closest<HTMLFormElement>("[data-tasks-prompt]");
     if (!form) return;
     const taskId = form.dataset.taskId ?? "";
     const verb = form.dataset.verb ?? "";
@@ -370,6 +422,31 @@ export class WooTasksKanbanElement extends HTMLElement {
     this.closePrompt();
     void this.invokeAction(taskId, action, args);
   };
+
+  private async createTask(kind: string, name: string, text: string, labels: string[]): Promise<void> {
+    const woo = this.woo;
+    const subject = this.subject ?? this.model.registryId;
+    if (!woo || !subject) return;
+    try {
+      await woo.directCall(subject, "create_task", [kind, name, text, labels, null]);
+      this.createOpen = false;
+    } catch {
+      // Errors land as observations; refresh will repaint either way.
+    }
+    await this.refresh();
+  }
+
+  private async seedMinimalPolicy(): Promise<void> {
+    const woo = this.woo;
+    const subject = this.subject ?? this.model.registryId;
+    if (!woo || !subject || !woo.actor) return;
+    try {
+      await woo.directCall(subject, "seed_minimal_policy", [woo.actor]);
+    } catch {
+      // Non-owner / non-wizard will see E_PERM; surface lands in the next refresh.
+    }
+    await this.refresh();
+  }
 
   private openPromptFor(taskId: string, verb: string): void {
     this.openPrompt = { taskId, verb };
@@ -483,9 +560,61 @@ export class WooTasksKanbanElement extends HTMLElement {
 
     this.innerHTML = `
       <section class="woo-tasks-kanban">
-        <header class="woo-tasks-kanban-header"><h2>${escapeHtml(registryName || "Tasks")}</h2></header>
+        ${this.renderHeader(registryName || "Tasks")}
         <div class="woo-tasks-kanban-columns">${columnsHtml}</div>
       </section>
+    `;
+  }
+
+  private renderHeader(registryName: string): string {
+    const { policies, isOwner } = this.model;
+    const havePolicies = policies.length > 0;
+    let toolbar = "";
+    if (havePolicies) {
+      toolbar = this.createOpen
+        ? this.renderCreateForm()
+        : `<button type="button" data-tasks-create-open>+ New task</button>`;
+    } else if (isOwner) {
+      toolbar = `<button type="button" data-tasks-seed-policy title="Install a doer/do:it/task fixture so create_task has a kind to bind to">Seed minimal policy</button>`;
+    } else {
+      toolbar = `<span class="woo-tasks-kanban-empty-toolbar">No policies configured. Ask the registry owner to seed one.</span>`;
+    }
+    return `
+      <header class="woo-tasks-kanban-header">
+        <h2>${escapeHtml(registryName)}</h2>
+        <div class="woo-tasks-kanban-toolbar">${toolbar}</div>
+      </header>
+    `;
+  }
+
+  private renderCreateForm(): string {
+    const { policies } = this.model;
+    const options = policies
+      .map((kind) => `<option value="${escapeHtml(kind)}">${escapeHtml(kind)}</option>`)
+      .join("");
+    return `
+      <form class="woo-tasks-create" data-tasks-create>
+        <label class="woo-tasks-create-field">
+          <span class="woo-tasks-create-label">Kind</span>
+          <select name="kind" required>${options}</select>
+        </label>
+        <label class="woo-tasks-create-field">
+          <span class="woo-tasks-create-label">Name</span>
+          <input type="text" name="name" required maxlength="240" autocomplete="off">
+        </label>
+        <label class="woo-tasks-create-field">
+          <span class="woo-tasks-create-label">Body</span>
+          <textarea name="text" rows="3" placeholder="markdown body (optional)"></textarea>
+        </label>
+        <label class="woo-tasks-create-field">
+          <span class="woo-tasks-create-label">Labels <span class="woo-tasks-create-hint">(comma-separated, optional)</span></span>
+          <input type="text" name="labels" autocomplete="off">
+        </label>
+        <div class="woo-tasks-create-actions">
+          <button type="submit" data-tasks-create-submit>Create</button>
+          <button type="button" data-tasks-create-cancel>Cancel</button>
+        </div>
+      </form>
     `;
   }
 

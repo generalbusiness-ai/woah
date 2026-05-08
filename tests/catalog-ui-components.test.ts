@@ -194,6 +194,101 @@ describe("bundled catalog UI components", () => {
     expect(element.querySelector("form[data-tasks-prompt]")).toBeNull();
   });
 
+  it("opens the create-task form, submits with collected fields, and refreshes", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const calls: { target: string; verb: string; args: unknown[] }[] = [];
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (target, verb, args = []) => {
+        calls.push({ target, verb, args });
+        if (verb === "listing") return [];
+        if (verb === "create_task") return "obj_t_new";
+        return undefined;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [],
+      policies: ["task", "bug"],
+      isOwner: true
+    };
+
+    const openBtn = element.querySelector<HTMLButtonElement>("[data-tasks-create-open]");
+    expect(openBtn).not.toBeNull();
+    openBtn!.click();
+    const form = element.querySelector<HTMLFormElement>("[data-tasks-create]");
+    expect(form).not.toBeNull();
+    const kindSelect = form!.querySelector<HTMLSelectElement>('select[name="kind"]')!;
+    expect(Array.from(kindSelect.options).map((opt) => opt.value)).toEqual(["task", "bug"]);
+    kindSelect.value = "bug";
+    form!.querySelector<HTMLInputElement>('input[name="name"]')!.value = "Refactor verb dispatch";
+    form!.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!.value = "details";
+    form!.querySelector<HTMLInputElement>('input[name="labels"]')!.value = "frontend, urgent";
+    form!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const create = calls.find((c) => c.verb === "create_task");
+    expect(create?.args).toEqual(["bug", "Refactor verb dispatch", "details", ["frontend", "urgent"], null]);
+  });
+
+  it("offers seed_minimal_policy when no policies and the actor is owner", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const calls: { target: string; verb: string; args: unknown[] }[] = [];
+    const woo: WooContext = {
+      actor: "$wiz",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (target, verb, args = []) => {
+        calls.push({ target, verb, args });
+        if (verb === "listing") return [];
+        if (verb === "seed_minimal_policy") return true;
+        return undefined;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "$wiz",
+      actorNames: {},
+      tasks: [],
+      policies: [],
+      isOwner: true
+    };
+
+    expect(element.querySelector("[data-tasks-create-open]")).toBeNull();
+    const seedBtn = element.querySelector<HTMLButtonElement>("[data-tasks-seed-policy]");
+    expect(seedBtn).not.toBeNull();
+    seedBtn!.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.find((c) => c.verb === "seed_minimal_policy")?.args).toEqual(["$wiz"]);
+  });
+
   it("drags a Ready card into In flight to dispatch claim", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
