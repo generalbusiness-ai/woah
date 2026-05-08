@@ -43,7 +43,7 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
 import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SerializedWorld } from "../core/repository";
+import type { SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { CFObjectRepository } from "./cf-repository";
@@ -73,6 +73,14 @@ const METRIC_SAMPLE_WINDOW_MS = 1000;
 const HOST_STATE_CACHE_LIMIT = 32;
 const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
 const HOST_READ_RPC_TIMEOUT_MS = 2500;
+// Per spec/semantics/recycle.md §RC11.3 step 2: tombstone roster handed to
+// Directory in batches sized to stay well under the 512 KiB Directory cap.
+// 1000 records × ~80 bytes per JSON entry ≈ 80 KiB, leaving ample headroom
+// for header overhead.
+const INHERIT_TOMBSTONES_BATCH_SIZE = 1000;
+// Meta key under which the §RC11.2 host-teardown state is persisted.
+const HOST_STATE_META_KEY = "host_state";
+const HOST_STATE_TEARING_DOWN = "tearing_down";
 
 export class PersistentObjectDO {
   private state: DurableObjectState;
@@ -103,6 +111,13 @@ export class PersistentObjectDO {
   // on rehydrate and maintained on attach/detach.
   private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
   private socketsBySession = new Map<string, Set<WebSocket>>();
+  // Per spec/semantics/recycle.md §RC11. Cached host_state — null means
+  // "not yet read this lifetime"; afterwards the cached string is "live"
+  // or "tearing_down". Resets on DO eviction.
+  private cachedTeardownState: string | null = null;
+  // Set true once a teardown sequence has been scheduled in this DO
+  // lifetime so we don't double-fire it from concurrent fetch handlers.
+  private teardownScheduled = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -133,12 +148,27 @@ export class PersistentObjectDO {
 
     if (internalRequest) await verifyInternalRequest(this.env, request);
 
+    // §RC11.5 teardown gate. Once host_state is "tearing_down", this DO
+    // refuses all inbound work with E_HOST_RECYCLED until deleteAll has
+    // run. If teardown is in progress but no waitUntil is currently
+    // running it (e.g. a wake from hibernation between batches), schedule
+    // a resume so the sequence completes idempotently.
+    if (!gatewayHost && this.getHostStateUncached() === HOST_STATE_TEARING_DOWN) {
+      this.ensureTeardownScheduled(this.durableHostKey());
+      return jsonResponse(
+        { error: { code: "E_HOST_RECYCLED", message: "host is tearing down" } },
+        410
+      );
+    }
+
     if (!gatewayHost && (pathname === "/api/auth" || pathname === "/ws")) {
       return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
     }
 
+    let postHandlerWorld: WooWorld | null = null;
     try {
       const world = await this.getWorld(hostKey);
+      postHandlerWorld = world;
 
       if (internalRequest) {
         return await this.handleInternal(request, world, pathname, hostKey);
@@ -238,6 +268,10 @@ export class PersistentObjectDO {
     } catch (err) {
       const error = normalizeError(err);
       return jsonResponse({ error }, statusForError(error));
+    } finally {
+      if (!gatewayHost && postHandlerWorld) {
+        this.maybeStartTeardown(postHandlerWorld, this.durableHostKey());
+      }
     }
   }
 
@@ -254,6 +288,136 @@ export class PersistentObjectDO {
    */
   private durableHostKey(): string {
     return this.state.id.name ?? WORLD_HOST;
+  }
+
+  // ---- §RC11 host teardown ----
+
+  /** Read the persisted host_state. Returns "live" by default; "tearing_down"
+   * once §RC11 has begun. Cached for the DO lifetime; resets on eviction. */
+  private getHostStateUncached(): string {
+    if (this.cachedTeardownState !== null) return this.cachedTeardownState;
+    let value: string | null = null;
+    try {
+      value = this.repo.loadMeta(HOST_STATE_META_KEY);
+    } catch {
+      value = null;
+    }
+    this.cachedTeardownState = value === HOST_STATE_TEARING_DOWN ? HOST_STATE_TEARING_DOWN : "live";
+    return this.cachedTeardownState;
+  }
+
+  private setHostStateTearingDown(): void {
+    this.repo.saveMeta(HOST_STATE_META_KEY, HOST_STATE_TEARING_DOWN);
+    this.cachedTeardownState = HOST_STATE_TEARING_DOWN;
+  }
+
+  /** Post-handler trigger evaluation per spec/semantics/recycle.md §RC11.1.
+   *
+   * v1 detection: if this DO's self-hosted root is gone (recycled), the host
+   * is empty of payload — pre-flight A3 forces co-resident objects to recycle
+   * first. The trigger evaluates `world.tombstones.has(rootId) &&
+   * !world.objects.has(rootId)`. Future revisions may need a deeper
+   * livePayloadCount that excludes host-scoped support copies row-by-row;
+   * that's not required while the trigger fires only on root recycle. */
+  private maybeStartTeardown(world: WooWorld, hostKey: string): void {
+    if (hostKey === WORLD_HOST) return;
+    if (this.cachedTeardownState === HOST_STATE_TEARING_DOWN) return;
+    if (!world.tombstones.has(hostKey as ObjRef)) return;
+    if (world.objects.has(hostKey as ObjRef)) return;
+
+    try {
+      this.setHostStateTearingDown();
+    } catch (err) {
+      console.warn("woo.host_teardown.mark_failed", { host: hostKey, error: normalizeError(err) });
+      return;
+    }
+    this.ensureTeardownScheduled(hostKey);
+  }
+
+  /** Idempotently schedule the teardown sequence. Multiple fetches that
+   * observe `tearing_down` only ever start one waitUntil promise. */
+  private ensureTeardownScheduled(hostKey: string): void {
+    if (this.teardownScheduled) return;
+    this.teardownScheduled = true;
+    const promise = this.runTeardownSequence(hostKey).catch((err) => {
+      console.warn("woo.host_teardown.failed", { host: hostKey, error: normalizeError(err) });
+      // Leave teardownScheduled=true so we don't loop on a permanently
+      // failing batch; the next DO wake re-evaluates and can retry.
+    });
+    if (typeof this.state.waitUntil === "function") {
+      this.state.waitUntil(promise);
+    }
+  }
+
+  /** Per spec/semantics/recycle.md §RC11.3 steps 2–4. */
+  private async runTeardownSequence(hostKey: string): Promise<void> {
+    const startedAt = Date.now();
+    let tombstones: TombstoneRecord[] = [];
+    try {
+      tombstones = this.repo.loadTombstoneRecords();
+    } catch {
+      tombstones = [];
+    }
+
+    // Step 2: hand the roster to Directory in batches.
+    const batches = chunkTombstones(tombstones, INHERIT_TOMBSTONES_BATCH_SIZE);
+    for (let i = 0; i < batches.length; i++) {
+      const final = i === batches.length - 1;
+      await this.postInheritTombstones(hostKey, i, final, batches[i]);
+    }
+
+    // Step 3: cancel alarms (best-effort; deleteAll also clears them at
+    // the current compatibility date — see spec/semantics/recycle.md
+    // §RC11.3 step 3).
+    try {
+      await this.state.storage.deleteAlarm?.();
+    } catch {
+      // best-effort
+    }
+
+    // Step 4: wipe storage.
+    try {
+      await this.state.storage.deleteAll();
+    } catch (err) {
+      console.warn("woo.host_teardown.deleteAll_failed", { host: hostKey, error: normalizeError(err) });
+      throw err;
+    }
+
+    this.emitMetric({
+      kind: "startup_storage", phase: "directory_inherit_tombstones",
+      ms: Date.now() - startedAt, status: "ok",
+      count: tombstones.length, batch_seq: batches.length - 1, final: true
+    }, hostKey);
+  }
+
+  private async postInheritTombstones(
+    hostKey: string,
+    batchSeq: number,
+    final: boolean,
+    tombstones: TombstoneRecord[]
+  ): Promise<void> {
+    const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+    const request = await signInternalRequest(this.env, new Request(
+      `${INTERNAL_ORIGIN}/__internal/inherit-tombstones`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "x-woo-host-key": hostKey
+        },
+        body: JSON.stringify({
+          host: hostKey,
+          batch_seq: batchSeq,
+          final,
+          tombstones
+        })
+      }
+    ));
+    const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`directory inherit-tombstones batch ${batchSeq} failed (${response.status}): ${text}`);
+    }
   }
 
   private getMcpGateway(world: WooWorld): McpGateway {
@@ -2177,6 +2341,15 @@ export class PersistentObjectDO {
 }
 
 // ---- module-scoped helpers ----
+
+function chunkTombstones(records: TombstoneRecord[], chunkSize: number): TombstoneRecord[][] {
+  if (records.length === 0) return [[]]; // always send at least one batch with final=true
+  const out: TombstoneRecord[][] = [];
+  for (let i = 0; i < records.length; i += chunkSize) {
+    out.push(records.slice(i, i + chunkSize));
+  }
+  return out;
+}
 
 function memoizeHostOperation<T>(cache: Map<string, Promise<unknown>>, key: string, load: () => Promise<T>): Promise<T> {
   const existing = cache.get(key);

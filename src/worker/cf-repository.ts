@@ -30,6 +30,7 @@ import type {
   SerializedVerb,
   SerializedWorld,
   SpaceSnapshotRecord,
+  TombstoneRecord,
   WorldRepository
 } from "../core/repository";
 import {
@@ -641,6 +642,14 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
 
   loadTombstones(): ObjRef[] {
     return this.all("SELECT id FROM tombstone ORDER BY id").map((row) => String(row.id));
+  }
+
+  loadTombstoneRecords(): TombstoneRecord[] {
+    return this.all("SELECT id, recycled_at, reason FROM tombstone ORDER BY id").map((row) => ({
+      id: String(row.id),
+      recycled_at: Number(row.recycled_at),
+      reason: row.reason == null ? null : String(row.reason)
+    }));
   }
 
   // ---- counters & meta ----
