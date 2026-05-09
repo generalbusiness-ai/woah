@@ -1727,9 +1727,9 @@ input[type="range"] {
   gap: 1rem;
   align-items: end;
   padding: 0.85rem 1rem;
-  border: 1px solid #d5dcd1;
+  border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .woo-tasks-titleblock {
@@ -1762,17 +1762,17 @@ input[type="range"] {
   gap: 0.35rem;
   align-items: baseline;
   padding: 0.35rem 0.5rem;
-  border-color: #ccd6c8;
-  background: #f8faf6;
-  color: #3f4a3d;
+  border-color: var(--color-border);
+  background: var(--color-surface-2);
+  color: var(--color-text);
   text-align: left;
 }
 
 .woo-tasks-status-nav button.active,
 .woo-tasks-overview-counts button.active {
-  border-color: #315f73;
-  background: #e8f2f5;
-  color: #173f50;
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
 }
 
 .woo-tasks-status-nav span,
@@ -1798,9 +1798,9 @@ input[type="range"] {
 }
 
 .woo-tasks-primary-action {
-  border-color: #315f73;
-  background: #315f73;
-  color: #fff;
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-surface);
 }
 
 .woo-tasks-kanban-groupby {
@@ -1808,7 +1808,7 @@ input[type="range"] {
   grid-template-columns: auto minmax(6.5rem, auto);
   gap: 0.35rem;
   align-items: center;
-  color: #5f685d;
+  color: var(--color-text-muted);
   font-size: 0.82rem;
 }
 
@@ -1844,9 +1844,9 @@ input[type="range"] {
   gap: 0.45rem;
   align-items: center;
   padding: 0.55rem;
-  border: 1px solid #d5dcd1;
+  border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .woo-tasks-kanban-filterbar input {
@@ -1869,10 +1869,10 @@ input[type="range"] {
   align-items: center;
   max-width: 11rem;
   padding: 0.18rem 0.28rem 0.18rem 0.45rem;
-  border: 1px solid #cbd7c5;
+  border: 1px solid var(--color-border);
   border-radius: 999px;
-  background: #f3f7f0;
-  color: #314032;
+  background: var(--color-surface-2);
+  color: var(--color-text);
   font-size: 0.76rem;
 }
 
@@ -1891,7 +1891,7 @@ input[type="range"] {
 }
 
 .woo-tasks-filter-count {
-  color: #687365;
+  color: var(--color-text-dim);
   font-size: 0.78rem;
   white-space: nowrap;
 }
@@ -1922,15 +1922,15 @@ input[type="range"] {
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  border: 1px solid #d5dcd1;
+  border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #f7f8f5;
+  background: var(--color-surface-2);
   overflow: hidden;
 }
 
 .woo-tasks-kanban-col[data-tasks-drop-target="true"] {
-  border-color: #315f73;
-  box-shadow: inset 0 0 0 2px #bdd8e1;
+  border-color: var(--color-accent);
+  box-shadow: inset 0 0 0 2px var(--color-accent-soft);
 }
 
 .woo-tasks-kanban-col-header {
@@ -1939,8 +1939,8 @@ input[type="range"] {
   align-items: center;
   justify-content: space-between;
   padding: 0.58rem 0.7rem;
-  border-bottom: 1px solid #d5dcd1;
-  background: #fff;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
 }
 
 .woo-tasks-kanban-col-name {
@@ -1955,8 +1955,8 @@ input[type="range"] {
   min-width: 1.6rem;
   padding: 0.12rem 0.4rem;
   border-radius: 999px;
-  background: #eef2eb;
-  color: #526050;
+  background: var(--color-surface-3);
+  color: var(--color-text-muted);
   font-size: 0.78rem;
   text-align: center;
 }
@@ -1972,7 +1972,7 @@ input[type="range"] {
 
 .woo-tasks-kanban-empty-col {
   padding: 0.75rem;
-  color: #6b7668;
+  color: var(--color-text-dim);
   font-size: 0.84rem;
 }
 
@@ -1980,20 +1980,20 @@ input[type="range"] {
   display: grid;
   gap: 0.5rem;
   padding: 0.65rem;
-  border: 1px solid #d4ddd0;
+  border: 1px solid var(--color-border);
   border-radius: 7px;
-  background: #fff;
-  box-shadow: 0 1px 2px rgb(43 50 42 / 0.06);
+  background: var(--color-surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   cursor: pointer;
 }
 
 .woo-tasks-card:hover {
-  border-color: #aab9a5;
+  border-color: var(--color-border-strong);
 }
 
 .woo-tasks-card.selected {
-  border-color: #315f73;
-  box-shadow: inset 0 0 0 1px #315f73, 0 1px 2px rgb(43 50 42 / 0.06);
+  border-color: var(--color-accent);
+  box-shadow: inset 0 0 0 1px var(--color-accent), 0 1px 2px rgba(0, 0, 0, 0.25);
 }
 
 .woo-tasks-card[data-tasks-dragging="true"] {
@@ -2006,7 +2006,7 @@ input[type="range"] {
 
 .woo-tasks-card-name {
   margin: 0;
-  color: #263026;
+  color: var(--color-text);
   font-size: 0.92rem;
   line-height: 1.28;
   overflow-wrap: anywhere;
@@ -2017,7 +2017,7 @@ input[type="range"] {
   gap: 0.32rem;
   align-items: center;
   flex-wrap: wrap;
-  color: #63705f;
+  color: var(--color-text-dim);
   font-size: 0.74rem;
 }
 
@@ -2030,29 +2030,29 @@ input[type="range"] {
   max-width: 100%;
   padding: 0.12rem 0.38rem;
   border-radius: 999px;
-  background: #eef2eb;
+  background: var(--color-surface-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .woo-tasks-card-cursor {
-  background: #edf2fb;
-  color: #34466c;
+  background: var(--color-info-bg);
+  color: var(--color-info);
 }
 
 .woo-tasks-card-holder {
-  background: #f7efe4;
-  color: #684d24;
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
 }
 
 .woo-tasks-card-label {
   max-width: 9rem;
   padding: 0.14rem 0.42rem;
   border-radius: 999px;
-  border-color: #cbd7c5;
-  background: #f8fbf5;
-  color: #39463a;
+  border-color: var(--color-border);
+  background: var(--color-surface-2);
+  color: var(--color-text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2061,9 +2061,9 @@ input[type="range"] {
 
 .woo-tasks-card-label.active,
 .woo-tasks-card-label:disabled {
-  border-color: #315f73;
-  background: #e8f2f5;
-  color: #173f50;
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
   opacity: 1;
 }
 
@@ -2086,9 +2086,9 @@ input[type="range"] {
 .woo-tasks-prompt,
 .woo-tasks-create,
 .woo-tasks-admin {
-  border: 1px solid #d5dcd1;
+  border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .woo-tasks-prompt {
@@ -2111,13 +2111,13 @@ input[type="range"] {
 
 .woo-tasks-prompt-label,
 .woo-tasks-create-label {
-  color: #5f685d;
+  color: var(--color-text-muted);
   font-size: 0.78rem;
 }
 
 .woo-tasks-prompt-type,
 .woo-tasks-create-hint {
-  color: #7a8577;
+  color: var(--color-text-dim);
   font-weight: 400;
 }
 
@@ -2187,9 +2187,9 @@ input[type="range"] {
   grid-auto-rows: max-content;
   gap: 0.75rem;
   padding: 0.85rem;
-  border: 1px solid #d5dcd1;
+  border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .woo-tasks-detail-header {
@@ -2231,7 +2231,7 @@ input[type="range"] {
 .woo-tasks-detail-waitfor h4,
 .woo-tasks-detail-links h4 {
   margin: 0;
-  color: #566152;
+  color: var(--color-text-muted);
   font-size: 0.78rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -2244,10 +2244,10 @@ input[type="range"] {
 
 .woo-tasks-detail-text {
   padding: 0.65rem;
-  border: 1px solid #e1e6de;
+  border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: #fafbf8;
-  color: #2c352b;
+  background: var(--color-surface-2);
+  color: var(--color-text);
   line-height: 1.4;
 }
 
@@ -2255,7 +2255,7 @@ input[type="range"] {
 .woo-tasks-detail-empty-inline,
 .woo-tasks-admin-empty {
   margin: 0;
-  color: #697366;
+  color: var(--color-text-dim);
   font-size: 0.84rem;
 }
 
@@ -2289,9 +2289,9 @@ input[type="range"] {
   gap: 0.25rem;
   align-items: center;
   padding: 0.45rem;
-  border: 1px solid #e0e6dd;
+  border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: #fafbf8;
+  background: var(--color-surface-2);
 }
 
 .woo-tasks-detail-obligation {
@@ -2299,12 +2299,12 @@ input[type="range"] {
 }
 
 .woo-tasks-detail-obligation.current {
-  border-color: #315f73;
-  background: #f1f8fa;
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
 }
 
 .woo-tasks-detail-obligation.met {
-  color: #546053;
+  color: var(--color-text-muted);
 }
 
 .woo-tasks-detail-obligation-flag {
@@ -2321,7 +2321,7 @@ input[type="range"] {
 .woo-tasks-detail-obligation-role,
 .woo-tasks-detail-obligation-criterion {
   grid-column: 2;
-  color: #677364;
+  color: var(--color-text-dim);
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
@@ -2333,13 +2333,13 @@ input[type="range"] {
 
 .woo-tasks-detail-log-ts,
 .woo-tasks-detail-log-actor {
-  color: #697366;
+  color: var(--color-text-dim);
 }
 
 .woo-tasks-detail-log-key,
 .woo-tasks-detail-log-why {
   grid-column: 3;
-  color: #697366;
+  color: var(--color-text-dim);
   overflow-wrap: anywhere;
 }
 
@@ -2378,9 +2378,9 @@ input[type="range"] {
 .woo-tasks-admin-editor {
   overflow: auto;
   padding: 0.75rem;
-  border: 1px solid #dce2d8;
+  border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #fbfcfa;
+  background: var(--color-surface-2);
 }
 
 .woo-tasks-admin-head {
@@ -2409,9 +2409,9 @@ input[type="range"] {
 }
 
 .woo-tasks-admin-tabs button.active {
-  border-color: #315f73;
-  background: #e8f4f7;
-  color: #254d5f;
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
 }
 
 .woo-tasks-admin-listhead,
@@ -2438,9 +2438,9 @@ input[type="range"] {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  border: 1px solid #e0e6dd;
+  border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .woo-tasks-admin-table {
@@ -2452,7 +2452,7 @@ input[type="range"] {
 .woo-tasks-admin-table th,
 .woo-tasks-admin-table td {
   padding: 0.45rem 0.55rem;
-  border-bottom: 1px solid #edf1ea;
+  border-bottom: 1px solid var(--color-border-subtle);
   text-align: left;
   vertical-align: top;
 }
@@ -2460,8 +2460,8 @@ input[type="range"] {
 .woo-tasks-admin-table th {
   position: sticky;
   top: 0;
-  background: #f7f9f5;
-  color: #566152;
+  background: var(--color-surface-2);
+  color: var(--color-text-muted);
   font-size: 0.74rem;
   text-transform: uppercase;
   z-index: 1;
@@ -2494,7 +2494,7 @@ input[type="range"] {
   min-width: 0;
   display: grid;
   gap: 0.25rem;
-  color: #596356;
+  color: var(--color-text-muted);
   font-size: 0.78rem;
   font-weight: 650;
 }
@@ -2514,39 +2514,39 @@ input[type="range"] {
 
 .woo-tasks-danger-action {
   margin-right: auto;
-  border-color: #ddb8b2;
-  background: #fff5f3;
-  color: #8a3428;
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
 }
 
 .woo-tasks-admin-status {
   margin: 0;
   padding: 0.45rem 0.55rem;
-  border: 1px solid #d7ded4;
+  border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: #f7f9f5;
-  color: #475144;
+  background: var(--color-surface-2);
+  color: var(--color-text);
   font-size: 0.8rem;
   line-height: 1.3;
   overflow-wrap: anywhere;
 }
 
 .woo-tasks-admin-status.pending {
-  border-color: #c8d7df;
-  background: #f1f8fa;
-  color: #315f73;
+  border-color: var(--color-info-border);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
 }
 
 .woo-tasks-admin-status.success {
-  border-color: #b9d6bf;
-  background: #f0f8f1;
-  color: #2d653d;
+  border-color: var(--color-success-border);
+  background: var(--color-success-bg);
+  color: var(--color-success);
 }
 
 .woo-tasks-admin-status.error {
-  border-color: #ddb8b2;
-  background: #fff5f3;
-  color: #8a3428;
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
 }
 
 .presence-list {
@@ -2563,6 +2563,70 @@ input[type="range"] {
 .presence-list span {
   color: var(--color-text-dim);
   font-size: 0.78rem;
+}
+
+/* Unified detail panel: form wrapper, edit-mode inputs, save/cancel row.
+   Used for both new-task creation (data-task-mode="new") and inline edit
+   of an existing task (data-task-mode="edit"). */
+.woo-tasks-detail-form {
+  display: contents;
+}
+
+.woo-tasks-detail-name {
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.woo-tasks-detail-name-input {
+  width: 100%;
+  padding: 0.4rem 0.55rem;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.woo-tasks-detail-edit-toggle {
+  align-self: start;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.78rem;
+}
+
+.woo-tasks-detail-field {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+.woo-tasks-detail-field-label {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.woo-tasks-detail-field-hint {
+  color: var(--color-text-dim);
+  font-weight: 400;
+}
+
+.woo-tasks-detail-field textarea {
+  min-height: 7rem;
+  resize: vertical;
+}
+
+.woo-tasks-detail-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-detail-actions .woo-tasks-primary-action {
+  min-width: 5rem;
+}
+
+[data-tasks-detail][data-task-mode="new"] .woo-tasks-detail-meta,
+[data-tasks-detail][data-task-mode="new"] .woo-tasks-detail-status {
+  /* "draft" status pill stays visible but de-emphasised */
+  color: var(--color-text-dim);
 }
 
 pre {
