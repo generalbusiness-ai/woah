@@ -72,7 +72,7 @@ Merge declarative state from seed into stored:
 | Field | Rule |
 |---|---|
 | `name`, `parent`, `owner`, `anchor`, `location`, `flags`, `propertyDefs`, `verbs`, `eventSchemas` | Take seed if not deeply equal to stored. |
-| `properties[name]`, `propertyVersions[name]` | For each `name` in the seed: if `name` is **dynamic** (HS3) AND stored already has the property/version, skip — receiver is authoritative for this divergence. Otherwise (including the dynamic-but-stored-has-no-entry case, which is fresh-host initialization), gate on version: skip when `stored.propertyVersions[name] ≥ seed.propertyVersions[name]`; else take seed value and version. |
+| `properties[name]`, `propertyVersions[name]` | For each `name` in the seed: if `name` is **dynamic** (HS3) AND stored already has the property/version, skip — receiver is authoritative for this divergence. Otherwise (including the dynamic-but-stored-has-no-entry case, which is fresh-host initialization), gate on version: skip when `stored.propertyVersions[name] ≥ seed.propertyVersions[name]`; else, if values differ (or stored has no entry), take seed value and version together. Version travels with value: if `stored < seed` but the values are already equal, do not bump version alone. `setProp` bumps `propertyVersions[name]` on every call regardless of value identity, so a gateway-side rewrite of the same value would otherwise force every satellite to persist a full snapshot every cold-load even though nothing observable had changed. |
 
 Never participate in merge, on any subject:
 

@@ -617,6 +617,16 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
   const seedProperties = new Map(seed.properties);
   const seedVersions = new Map(seed.propertyVersions);
 
+  // HS2.2 take-seed pass. Only the value gate is authoritative; the
+  // version is bookkeeping that follows the value. If gateway-side code
+  // calls setProp(equal_value), the version bumps locally even though
+  // nothing observable changed — so the seed will arrive with a higher
+  // version but the same value. Without this guard, every satellite
+  // cold-load takes the bumped version and writes a full snapshot, even
+  // though the actual property is unchanged. We now take seed's version
+  // only when we also take seed's value (or stored has no entry yet),
+  // which keeps version monotone with respect to real changes and stops
+  // the no-op-write storm.
   for (const [name, value] of seedProperties) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && (properties.has(name) || versions.has(name))) continue;
     const storedV = Number(versions.get(name) ?? 0);
@@ -624,17 +634,23 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
     if (storedV >= seedV && properties.has(name)) continue;
     if (!valuesEqual(properties.get(name) as WooValue, value as WooValue)) {
       properties.set(name, cloneSerialized(value));
+      versions.set(name, seedV);
       changed = true;
       note(`properties.${name}(take)`);
+    } else if (!properties.has(name)) {
+      properties.set(name, cloneSerialized(value));
+      versions.set(name, seedV);
+      changed = true;
+      note(`properties.${name}(init)`);
     }
   }
   for (const [name, version] of seedVersions) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && versions.has(name)) continue;
-    if (!versions.has(name) || version > Number(versions.get(name) ?? 0)) {
-      versions.set(name, version);
-      changed = true;
-      note(`propertyVersions.${name}(take)`);
-    }
+    if (versions.has(name)) continue;
+    if (seedProperties.has(name)) continue;
+    versions.set(name, version);
+    changed = true;
+    note(`propertyVersions.${name}(init)`);
   }
 
   for (const name of Array.from(properties.keys())) {

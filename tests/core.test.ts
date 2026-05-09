@@ -998,6 +998,40 @@ describe("woo core", () => {
     expect(readAfter?.arg_spec).toEqual(expect.objectContaining({ command: expect.objectContaining({ dobj: "this" }) }));
   });
 
+  it("HS2.2: propertyVersion drift with equal value does NOT drive a merge change", () => {
+    // setProp bumps propertyVersions[name] on every call, even when the
+    // value is unchanged. Gateway-side code that rewrites the same value
+    // (e.g. periodic reconciliation, presence touch, idempotent
+    // catalog repair) makes the gateway's seed arrive with a higher
+    // version than stored — but the same value. The merge previously
+    // took that bumped version, declared changed=true, and burned a
+    // satellite snapshot every cold-load. Version must travel with
+    // value: only bump when value also changes.
+    const gateway = createWorld();
+    const satellite = createWorld();
+
+    // Seed both worlds with an equal property value but bumped seed version.
+    gateway.setProp("$system", "extra_attr", "shared_value");
+    satellite.setProp("$system", "extra_attr", "shared_value");
+    // Bump gateway's version by re-setting the same value (setProp
+    // bumps unconditionally).
+    gateway.setProp("$system", "extra_attr", "shared_value");
+    gateway.setProp("$system", "extra_attr", "shared_value");
+
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+
+    const sysSeed = seed.objects.find((o) => o.id === "$system");
+    const seedV = new Map(sysSeed!.propertyVersions).get("extra_attr") as number;
+    const sysStored = storedSlice!.objects.find((o) => o.id === "$system");
+    const storedV = new Map(sysStored!.propertyVersions).get("extra_attr") as number;
+    expect(seedV).toBeGreaterThan(storedV); // confirms the trap exists
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
   it("HS2.2: verb.version drift alone does NOT drive a merge change", () => {
     // Same shape as the propertyDef.version trap. addVerb / catalog repair
     // bump verb.version on every idempotent reinstall; production
