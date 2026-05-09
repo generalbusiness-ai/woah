@@ -67,6 +67,7 @@ export interface Env {
 }
 
 const WORLD_HOST = "world";
+const REMOTE_ROUTE_SYNC_TTL_MS = 60_000;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
@@ -154,6 +155,12 @@ export class PersistentObjectDO {
   private routeCache = new Map<ObjRef, string>();
   private publishedRoutes = new Map<ObjRef, string>();
   private routesRegistered = false;
+  // Last time we synced routes from a given remote host. Cross-host
+  // `registerRemoteObjectRoutes` is a best-effort accelerator — fetching
+  // a remote's full route list after every cross-host call is wasted when
+  // the satellite's slice has not added objects, which is the common case.
+  // Throttle to one round-trip per host per `REMOTE_ROUTE_SYNC_TTL_MS`.
+  private remoteRouteSyncAt = new Map<string, number>();
   private mcpGateway: McpGateway | null = null;
   // Per-actor cache of `world.state(actor)` keyed by world.mutationVersion().
   // Both /__internal/state and the local-host slice inside aggregateState
@@ -1603,12 +1610,25 @@ export class PersistentObjectDO {
   }
 
   private async registerRemoteObjectRoutes(host: string): Promise<void> {
+    // Throttle the per-host route sync. The remote's slice changes
+    // rarely (catalog installs, host_placement migrations, new actors
+    // created on it); meanwhile every cross-host call lands here and
+    // would otherwise pay a `/__internal/object-routes` round-trip plus
+    // a directory register-objects RPC every single time. Acceleration
+    // is best-effort, so a stale view costs at most one extra
+    // resolve-object lookup.
+    const now = Date.now();
+    const last = this.remoteRouteSyncAt.get(host);
+    if (last !== undefined && now - last < REMOTE_ROUTE_SYNC_TTL_MS) return;
+    this.remoteRouteSyncAt.set(host, now);
     try {
       const routes = await this.forwardInternal<Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>>(host, "/__internal/object-routes", {});
       await this.registerRoutes(routes.filter((route) => route.host === host));
     } catch {
       // The applied frame is already durable on the target host; route
       // registration can be retried by a later state read or call.
+      // Drop the throttle entry so the next call retries.
+      this.remoteRouteSyncAt.delete(host);
     }
   }
 
