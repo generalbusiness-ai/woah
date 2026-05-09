@@ -998,6 +998,26 @@ describe("woo core", () => {
     expect(readAfter?.arg_spec).toEqual(expect.objectContaining({ command: expect.objectContaining({ dobj: "this" }) }));
   });
 
+  it("HS2.2: verb.version drift alone does NOT drive a merge change", () => {
+    // Same shape as the propertyDef.version trap. addVerb / catalog repair
+    // bump verb.version on every idempotent reinstall; production
+    // satellites accumulate this counter past the gateway's authoritative
+    // value and the merge previously replaced them every cold-load.
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    const actorStored = storedSlice!.objects.find((o) => o.id === "$actor");
+    expect(actorStored).toBeDefined();
+    expect(actorStored!.verbs.length).toBeGreaterThan(0);
+    actorStored!.verbs = actorStored!.verbs.map((v) => ({ ...v, version: 99 }));
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
   it("HS2.2: propertyDef.version drift alone does NOT drive a merge change", () => {
     // Catalog repair / schema sync calls defineProperty(); each call bumps
     // PropertyDef.version even when the def is otherwise unchanged. On a

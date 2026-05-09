@@ -399,7 +399,12 @@ function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): R
 /** Drop verb fields whose persistent encoding represents `false` as
  * absence (`verbFlagsJson` + `verbFromSqlRow` only round-trip the boolean
  * verb flags when `=== true`). Drop `slot` because it's a per-host index
- * assigned by `importWorld`, not authoritative across hosts. */
+ * assigned by `importWorld`, not authoritative across hosts. Drop
+ * `version` because catalog repair / addVerb bump it locally on every
+ * idempotent reinstall and the counter accumulates independently across
+ * hosts (same trap as PropertyDef.version). The merge already covers
+ * authoritative content via source_hash and the metadata fields below;
+ * version-only drift is bookkeeping noise, not real divergence. */
 function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
@@ -407,7 +412,7 @@ function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
       if (v === true) out[k] = true;
       continue;
     }
-    if (k === "slot") continue;
+    if (k === "slot" || k === "version") continue;
     out[k] = v;
   }
   return out;
@@ -438,13 +443,13 @@ function verbsDeepEqual(left: VerbDef[], right: VerbDef[]): boolean {
 }
 
 /** Equality over every deployable verb field except source/bytecode/
- * line_map — caller has already established those via `source_hash`.
- * Includes aliases, arg_spec, kind/native, version, calls, perms, owner,
- * and the boolean flags. */
+ * line_map — caller has already established those via `source_hash` —
+ * and except `version`, which is a per-host bump counter (see
+ * `normalizeVerbForCompare`). Includes aliases, arg_spec, kind/native,
+ * calls, perms, owner, and the boolean flags. */
 function verbMetadataEqual(a: VerbDef, b: VerbDef): boolean {
   if (a.perms !== b.perms) return false;
   if (a.owner !== b.owner) return false;
-  if (a.version !== b.version) return false;
   if ((a.direct_callable === true) !== (b.direct_callable === true)) return false;
   if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return false;
   if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return false;
