@@ -704,15 +704,17 @@ class Parser {
     return true;
   }
 
+  // Only syntactic tokens carry their source text in `value`; literal tokens
+  // (string/number/objref/coreref) carry the parsed payload in `value` and
+  // must not collide with the keyword/operator matcher. Without this kind
+  // filter, a string literal `"-"` would be indistinguishable from the unary
+  // `-` operator (the parser would consume the string and then look for an
+  // operand that does not exist), and similar collisions trip operator
+  // strings like `"+"` or keyword strings like `"for"`.
   private checkValue(value: string): boolean {
-    // Restrict value-based matching to keyword identifiers and operator
-    // symbols. Without this, a string literal whose content equals a
-    // keyword or operator (e.g. `"-"`, `"!"`, `"if"`, `"true"`) would be
-    // consumed as if it were that keyword/operator, which produces
-    // baffling "expected expression" errors at parse time.
-    const tok = this.peek();
-    if (tok.kind !== "identifier" && tok.kind !== "symbol") return false;
-    return tok.value === value;
+    const token = this.peek();
+    if (token.kind !== "symbol" && token.kind !== "identifier") return false;
+    return token.value === value;
   }
 
   private expectValue(value: string, message: string): Token {
