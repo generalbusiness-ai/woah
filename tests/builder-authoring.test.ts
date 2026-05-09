@@ -324,6 +324,7 @@ describe("$programmer:@rmproperty (LambdaCore #217 port)", () => {
       [`#${id}.disposable`]
     );
     expect(result.op).toBe("result");
+    if (result.op !== "result") return;
     const text = findTextObservation(result.observations, "$wiz");
     expect(text).toMatch(/Property removed/);
     // Reading the property after removal raises E_PROPNF (no def, no

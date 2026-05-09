@@ -188,6 +188,124 @@ describe("Tier-1/2 chat-parser dispatch (end-to-end)", () => {
     const text = findTextObservation(result.observations, "$wiz");
     expect(text).toMatch(/Property removed/);
   });
+
+  it("dispatches `@verb` to the programmer verb-creation verb", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named pverbtarget", "cmd-pv-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    const result = await runCommand(world, sessionId, `@verb #${newId}:greet`, "cmd-pv");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/^Verb added \(slot \d+\)\.$/);
+  });
+
+  it("dispatches `@args` to the programmer args verb", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named pargstarget", "cmd-pa-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    await runCommand(world, sessionId, `@verb #${newId}:greet`, "cmd-pa-add");
+    const result = await runCommand(world, sessionId, `@args #${newId}:greet this with any`, "cmd-pa");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe("Verb arguments changed.");
+  });
+
+  it("dispatches `@rmverb` to the programmer rmverb verb", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named prmtarget", "cmd-prm-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    await runCommand(world, sessionId, `@verb #${newId}:gone`, "cmd-prm-add");
+    const result = await runCommand(world, sessionId, `@rmverb #${newId}:gone`, "cmd-prm");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/:gone removed\.$/);
+  });
+
+  it("dispatches `@rename` (verb branch) with the to preposition", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named prntarget", "cmd-prn-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    await runCommand(world, sessionId, `@verb #${newId}:before`, "cmd-prn-add");
+    const result = await runCommand(world, sessionId, `@rename #${newId}:before to after`, "cmd-prn");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe("Verb name changed.");
+  });
+
+  it("dispatches `@list` to the programmer list-verb stub", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named plisttarget", "cmd-pls-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    await runCommand(world, sessionId, `@verb #${newId}:show`, "cmd-pls-add");
+    const result = await runCommand(world, sessionId, `@list #${newId}:show`, "cmd-pls");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const lines = (result.observations as any[])
+      .filter((o) => o.type === "text" && o.target === "$wiz")
+      .map((o) => o.text);
+    expect(lines[0]).toMatch(/:show/);
+    expect(lines[1]).toMatch(/^ 1:  /);
+  });
+
+  it("dispatches `@chmod` (verb branch) with absolute perms", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named pcmodtarget", "cmd-pc-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    await runCommand(world, sessionId, `@verb #${newId}:foo`, "cmd-pc-add");
+    const result = await runCommand(world, sessionId, `@chmod #${newId}:foo rxd`, "cmd-pc");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe('Verb permissions set to "rxd".');
+  });
+
+  it("dispatches `@chown` (verb branch) with the to preposition", async () => {
+    const world = createWorld();
+    const sessionId = await mintWizSession(world);
+    await world.directCall("enter", "$wiz", "the_chatroom", "enter", []);
+    const created = await runCommand(world, sessionId, "@create $thing named pcotarget", "cmd-pco-create");
+    expect(created.op).toBe("result");
+    if (created.op !== "result") return;
+    const newId = (created.result as { id: string }).id;
+    await runCommand(world, sessionId, `@verb #${newId}:foo`, "cmd-pco-add");
+    const newPlayer = await runCommand(world, sessionId, "@create $player named alice", "cmd-pco-player");
+    expect(newPlayer.op).toBe("result");
+    if (newPlayer.op !== "result") return;
+    const aliceId = (newPlayer.result as { id: string }).id;
+    const result = await runCommand(world, sessionId, `@chown #${newId}:foo #${aliceId}`, "cmd-pco");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe("Verb owner set.");
+  });
 });
 
 describe("$builder:@set rejects creating new properties", () => {

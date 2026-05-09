@@ -151,7 +151,9 @@ const BUILTINS = new Set([
   "properties", "property_info", "add_property", "delete_property", "set_property_info",
   "clear_property", "is_clear_property",
   // Authoring aggregations.
-  "authoring_inspect", "authoring_search"
+  "authoring_inspect", "authoring_search",
+  // Object identity edits.
+  "set_object_name"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 
@@ -703,7 +705,14 @@ class Parser {
   }
 
   private checkValue(value: string): boolean {
-    return this.peek().value === value;
+    // Restrict value-based matching to keyword identifiers and operator
+    // symbols. Without this, a string literal whose content equals a
+    // keyword or operator (e.g. `"-"`, `"!"`, `"if"`, `"true"`) would be
+    // consumed as if it were that keyword/operator, which produces
+    // baffling "expected expression" errors at parse time.
+    const tok = this.peek();
+    if (tok.kind !== "identifier" && tok.kind !== "symbol") return false;
+    return tok.value === value;
   }
 
   private expectValue(value: string, message: string): Token {

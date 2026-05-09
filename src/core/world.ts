@@ -865,6 +865,21 @@ export class WooWorld {
     this.setProp(objRef, "name", name);
   }
 
+  // Permission-gated wrapper exposed as the `set_object_name` builtin.
+  // Used by catalog verbs (e.g. $root:@rename) that need to mutate an
+  // object's display name from woocode without holding wizard authority
+  // catalog-side. Mirrors the auth shape used by builderSetProperty.
+  setObjectNameForActor(actor: ObjRef, objRef: ObjRef, name: string): void {
+    if (typeof name !== "string" || name.length === 0) {
+      throw wooError("E_INVARG", "set_object_name requires a non-empty string", name);
+    }
+    const obj = this.object(objRef);
+    if (!this.isWizard(actor) && obj.owner !== actor) {
+      throw wooError("E_PERM", `${actor} cannot rename ${objRef}`, { actor, obj: objRef });
+    }
+    this.setObjectName(objRef, name);
+  }
+
   ownVerb(objRef: ObjRef, name: string): VerbDef | null {
     return this.ownVerbNamed(objRef, name);
   }
@@ -1307,8 +1322,22 @@ export class WooWorld {
     }
     const permsRaw = typeof map.perms === "string" ? map.perms : current.perms;
     const parsedPerms = normalizeVerbPerms(permsRaw, directCallable);
+    // Verb rename: `info.name` swaps the slot's primary name. The
+    // verb's source body is not touched, but woocode parsers compare
+    // header names on next install — that is the catalog's problem,
+    // not the substrate's.
+    let nextName = current.name;
+    if (typeof map.name === "string" && map.name !== current.name) {
+      if (map.name.length === 0) throw wooError("E_INVARG", "verb name must be non-empty", map.name);
+      const collision = this.ownVerbExact(objRef, map.name);
+      if (collision && collision.slot !== current.slot) {
+        throw wooError("E_INVARG", `verb already exists: ${objRef}:${map.name}`, { obj: objRef, name: map.name });
+      }
+      nextName = map.name;
+    }
     const next: VerbDef = {
       ...current,
+      name: nextName,
       owner,
       aliases,
       arg_spec: argSpec,

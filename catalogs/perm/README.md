@@ -1,6 +1,6 @@
 ---
 name: perm
-version: 0.1.0
+version: 0.2.0
 spec_version: v1
 license: MIT
 description: LambdaMOO-shaped permission utilities. Provides $perm:controls and the :is_writable_by / :is_readable_by / :is_executable_by convention.

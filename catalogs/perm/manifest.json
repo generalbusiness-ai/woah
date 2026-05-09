@@ -1,6 +1,6 @@
 {
   "name": "perm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "spec_version": "v1",
   "description": "LambdaMOO-shaped permission utilities. The substrate already gives r/w/c property flags + owner, r/x/d verb flags + owner, and wizard bypass via the canBypassPerms check; everything fine-grained lives in woocode. This catalog supplies the small set of helpers that LambdaCore's $perm_utils exposes: :controls(who, what), :requires_perm(who, what, message), and the per-class :is_writable_by(who) / :is_readable_by(who) / :is_executable_by(who) convention used by $note, $block, and other catalog classes.",
   "license": "MIT",
@@ -35,6 +35,14 @@
           "skip_presence_check": true,
           "arg_spec": { "args": ["who", "message_text?"] },
           "source": "verb :requires_wizard(who, message_text) rxd { if (has_flag(who, \"wizard\")) { return true; } let msg = message_text; if (typeof(msg) != \"string\" || !msg) { msg = \"wizard authority required\"; } raise { code: \"E_PERM\", message: msg, value: { who: who } }; }"
+        },
+        {
+          "name": "apply",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["perms", "mods"] },
+          "source": "verb :apply(perms, mods) rxd {\n  // LambdaCore $perm_utils:apply (#42), faithfully ported. Apply a\n  // perm-modification string on top of an existing perm string.\n  // `mods` is one of:\n  //   - absolute perms (no leading +/-/!): returned verbatim, replacing\n  //     `perms` entirely. e.g. apply(\"rxd\", \"rw\") -> \"rw\".\n  //   - a sequence of `+letters`, `-letters`, `!letters` segments:\n  //     `+` adds the listed flag letters, `-`/`!` (equivalent) removes\n  //     them. Letters already present aren't doubled; letters not\n  //     present aren't an error. apply(\"rxd\", \"+w-x\") -> \"rdw\".\n  // Used by @chmod for the `+r-w` form.\n  if (typeof(perms) != \"string\") { perms = \"\"; }\n  if (typeof(mods) != \"string\" || mods == \"\") { return mods; }\n  let first = str_slice(mods, 1, 1);\n  let is_mod = false;\n  if (first == \"+\") { is_mod = true; }\n  if (first == \"-\") { is_mod = true; }\n  if (first == \"!\") { is_mod = true; }\n  if (!is_mod) {\n    return mods;\n  }\n  let i = 1;\n  let n = length(mods);\n  while (i <= n) {\n    let op = str_slice(mods, i, i);\n    let add_mode = false;\n    if (op == \"+\") { add_mode = true; }\n    i = i + 1;\n    while (i <= n) {\n      let ch = str_slice(mods, i, i);\n      if (ch == \"+\") { break; }\n      if (ch == \"-\") { break; }\n      if (ch == \"!\") { break; }\n      if (add_mode) {\n        if (str_index(perms, ch) == 0) { perms = perms + ch; }\n      } else {\n        // Remove every occurrence of `ch` from perms. str_index returns\n        // 1-based positions; loop until none remain.\n        let pos = str_index(perms, ch);\n        while (pos > 0) {\n          let head = \"\";\n          if (pos > 1) { head = str_slice(perms, 1, pos - 1); }\n          let tail = \"\";\n          if (pos < length(perms)) { tail = str_slice(perms, pos + 1); }\n          perms = head + tail;\n          pos = str_index(perms, ch);\n        }\n      }\n      i = i + 1;\n    }\n  }\n  return perms;\n}"
         }
       ]
     }

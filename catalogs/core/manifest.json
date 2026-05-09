@@ -1,6 +1,6 @@
 {
   "name": "core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "spec_version": "v1",
   "description": "LambdaCore-shaped utility packages. Catalog code calls into these helpers — `$command_utils:object_match_failed`, etc. — instead of inlining the same notify-and-bail branches per verb. Each helper class mirrors a sibling LambdaCore object (#219 command_utils, #20 string_utils, #3669 object_utils, …); their parent class `$utils` mirrors LambdaCore #288 (Generic Utilities Package). Initial release ports just the verbs we need from $command_utils; sibling packages and additional verbs land as catalog code reaches for them.",
   "license": "MIT",
@@ -58,7 +58,7 @@
     {
       "local_name": "$code_utils",
       "parent": "$utils",
-      "description": "LambdaCore $code_utils (#153). Initial port carries :parse_propref — the helper that splits a `<obj>.<prop>` token into its parts so command verbs (@property, @set, @rmproperty, @display) don't have to. The rest of LambdaCore $code_utils (verb-introspection helpers like :find_verb_named, :explain_verb_syntax, :short_prep) lands when a woo verb reaches for them.",
+      "description": "LambdaCore $code_utils (#153). Initial port carries :parse_propref / :parse_verbref / :parse_argspec / :toint / :nth_verb_name — the helpers that split <obj>.<prop> and <obj>:<verb> tokens into their parts and translate verb-by-number forms. The rest of LambdaCore $code_utils (find_verb_named, explain_verb_syntax, short_prep, …) lands when a woo verb reaches for it.",
       "properties": [],
       "verbs": [
         {
@@ -68,6 +68,38 @@
           "skip_presence_check": true,
           "arg_spec": { "args": ["string"] },
           "source": "verb :parse_propref(string) rxd {\n  // LambdaCore $code_utils:parse_propref (#153). Splits `<obj>.<prop>`\n  // (or bare `$prop` against `$system`) into [obj_str, prop_str], or\n  // returns false on parse failure. The obj_str is left as-typed so\n  // the caller does its own resolution via $match:match_object.\n  //\n  // Divergence (1): LambdaCore returns `{\"#0\", prop}` for the bare\n  // `$foo` case (treating it as `$system.foo`). woo uses `$system`\n  // verbatim — same intent, woo-shaped corename.\n  if (typeof(string) != \"string\") { return false; }\n  let s = string;\n  let dot = str_index(s, \".\");\n  if (dot > 0) {\n    let object = str_slice(s, 1, dot - 1);\n    let prop = str_slice(s, dot + 1);\n    if (object == \"\" || prop == \"\") { return false; }\n    return [object, prop];\n  }\n  if (str_starts(s, \"$\")) {\n    return [\"$system\", str_slice(s, 2)];\n  }\n  return false;\n}"
+        },
+        {
+          "name": "parse_verbref",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["string"] },
+          "source": "verb :parse_verbref(string) rxd {\n  // LambdaCore $code_utils:parse_verbref (#153). Splits `<obj>:<verb>`\n  // into [obj_str, verb_name], or returns false on parse failure.\n  // Used by @verb / @args / @rmverb / @list / @rename to extract the\n  // pieces; obj_str is handed verbatim to $match:match_object.\n  //\n  // Divergence (1): LambdaCore resolves $-prefixed objects to #N via\n  // properties of #0 and returns tostr(#N). woo's corenames ARE the\n  // ObjRef, so `$wiz:foo` returns [\"$wiz\", \"foo\"] verbatim — the caller\n  // hands that to $match:match_object which already accepts $/# prefixes.\n  if (typeof(string) != \"string\") { return false; }\n  let s = string;\n  let colon = str_index(s, \":\");\n  if (colon == 0) { return false; }\n  let object = str_slice(s, 1, colon - 1);\n  let verbname = str_slice(s, colon + 1);\n  if (object == \"\" || verbname == \"\") { return false; }\n  return [object, verbname];\n}"
+        },
+        {
+          "name": "parse_argspec",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["tokens"] },
+          "source": "verb :parse_argspec(tokens) rxd {\n  // LambdaCore $code_utils:parse_argspec (#153). Parses the leading\n  // dobj/prep/iobj specifier off a list of word tokens and returns\n  // [verb_args, remaining_args] on success or a string error message.\n  // verb_args is one of:\n  //   []                       — no specifier given\n  //   [\"this\",\"none\",\"this\"]   — \"tnt\" shortcut\n  //   [dobj, prep, iobj]       — full spec\n  //\n  // Divergence (1): LambdaCore consults $code_utils._short_preps /\n  // _other_preps / _multi_preps for multi-word prepositions (\"in front\n  // of\", \"on top of\"). The initial port carries only the single-word\n  // prep table from woo's command-parser (src/core/world.ts\n  // PREPOSITIONS); a typed `@verb obj:foo this in front of any` returns\n  // an error and the user can fall back to `in`. Multi-word lookup can\n  // land when a verb here needs it.\n  if (typeof(tokens) != \"list\") { return \"parse_argspec expects a list of tokens\"; }\n  let n = length(tokens);\n  if (n < 1) { return [[], []]; }\n  let ds = tokens[1];\n  let q = str_char(34);\n  if (ds == \"tnt\") {\n    let tnt_rest = [];\n    if (n > 1) { for i in [2..n] { tnt_rest = tnt_rest + [tokens[i]]; } }\n    return [[\"this\", \"none\", \"this\"], tnt_rest];\n  }\n  let is_dobj = false;\n  if (ds == \"this\") { is_dobj = true; }\n  if (ds == \"any\") { is_dobj = true; }\n  if (ds == \"none\") { is_dobj = true; }\n  if (!is_dobj) {\n    return q + ds + q + \" is not a valid direct object specifier.\";\n  }\n  if (n < 2) { return [[ds], []]; }\n  let prep_tok = tokens[2];\n  let verbargs = [];\n  let rest_start = 3;\n  let prep_ok = false;\n  if (prep_tok == \"none\") { prep_ok = true; }\n  if (prep_tok == \"any\") { prep_ok = true; }\n  if (!prep_ok) {\n    let single_preps = [\"with\", \"using\", \"at\", \"to\", \"in\", \"inside\", \"into\", \"on\", \"upon\", \"as\", \"from\", \"over\", \"through\", \"under\", \"underneath\", \"behind\", \"beside\", \"for\", \"about\", \"off\"];\n    for p in single_preps { if (p == prep_tok) { prep_ok = true; } }\n    if (!prep_ok) {\n      return q + prep_tok + q + \" is not a valid preposition.\";\n    }\n  }\n  verbargs = [ds, prep_tok];\n  if (n >= rest_start) {\n    verbargs = verbargs + [tokens[rest_start]];\n    rest_start = rest_start + 1;\n  }\n  let rest = [];\n  if (n >= rest_start) { for i in [rest_start..n] { rest = rest + [tokens[i]]; } }\n  if (length(verbargs) >= 3) {\n    let io = verbargs[3];\n    let is_iobj = false;\n    if (io == \"this\") { is_iobj = true; }\n    if (io == \"any\") { is_iobj = true; }\n    if (io == \"none\") { is_iobj = true; }\n    if (!is_iobj) {\n      return q + io + q + \" is not a valid indirect object specifier.\";\n    }\n  }\n  return [verbargs, rest];\n}"
+        },
+        {
+          "name": "toint",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["s"] },
+          "source": "verb :toint(s) rxd {\n  // Parse-with-failure-detection wrapper around to_int. Returns the\n  // integer if `s` round-trips through to_string(to_int(s)), otherwise\n  // false. Used by @args# / @rmverb# / @list to detect the\n  // verb-by-number variants without try/catch on a plain to_int.\n  // LambdaCore expresses the same idea via tonum/match.\n  if (typeof(s) != \"string\") { return false; }\n  let trimmed = str_trim(s);\n  if (trimmed == \"\") { return false; }\n  let parsed = to_int(trimmed);\n  if (to_string(parsed) != trimmed) { return false; }\n  return parsed;\n}"
+        },
+        {
+          "name": "nth_verb_name",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["obj", "n"] },
+          "source": "verb :nth_verb_name(obj, n) rxd {\n  // 1-indexed Nth own verb name on `obj`, or false if out of range.\n  // Used to translate LambdaCore's verb-by-number form (`@args#1`,\n  // `@rmverb#3`, `@list obj:2`) into a name woo's substrate can\n  // address. verb_info also accepts integers, but consistently\n  // resolving to a name simplifies downstream display and error paths.\n  if (typeof(n) != \"number\") { return false; }\n  let names = verbs(obj);\n  if (n < 1 || n > length(names)) { return false; }\n  return names[n];\n}"
         }
       ]
     }

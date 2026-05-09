@@ -1,6 +1,6 @@
 ---
 name: core
-version: 0.1.0
+version: 0.2.0
 spec_version: v1
 license: MIT
 description: LambdaCore-shaped utility packages — $command_utils today, $string_utils / $object_utils / $list_utils as needed.

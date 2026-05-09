@@ -1,17 +1,26 @@
 {
   "name": "prog",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "spec_version": "v1",
   "description": "Builder and programmer tooling. The same world is the IDE: tools inspect and mutate the live object graph, with no design-time/runtime split. The catalog deliberately preserves LambdaCore's builder/programmer authority split by installing them as player classes. Builder class membership exposes object/data tools. Programmer class membership exposes source/metadata tools, while progbit and wizbit remain the hard authority facts.",
   "license": "MIT",
-  "depends": ["@local:perm", "@local:chat", "@local:core"],
+  "depends": [
+    "@local:perm",
+    "@local:chat",
+    "@local:core"
+  ],
   "classes": [
     {
       "local_name": "$builder",
       "parent": "$player",
       "description": "Builder player class. Actors inheriting from `$builder` expose object creation, reparenting, recycling, data-property setting, and structure-oriented inspection/search as their own MCP tools. Builder class membership is the authoring surface, not programmer authority: these verbs cannot install code, change executable behavior, or adjust source/perms metadata. Engine builtins check the invoking actor and object policy, not the wrapper verb owner.",
       "properties": [
-        { "name": "api_version", "type": "str", "default": "0.1.0", "perms": "r" }
+        {
+          "name": "api_version",
+          "type": "str",
+          "default": "0.1.0",
+          "perms": "r"
+        }
       ],
       "verbs": [
         {
@@ -20,7 +29,9 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"search(query, opts?)\", \"create(parent, opts?)\", \"chparent(id, parent, opts?)\", \"recycle(id, opts?)\", \"set_property(id, name, value, opts?)\"] };\n}"
         },
         {
@@ -29,7 +40,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "opts?"
+            ]
+          },
           "source": "verb :inspect(id, opts) rxd {\n  // Builder surface check: wizard, or descendant of $builder.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // Structure/data view: owner, flags, parent, children, instances, location,\n  // contents, and property summaries. No source output.\n  return authoring_inspect(id, opts, false);\n}"
         },
         {
@@ -38,7 +54,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["query", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "query",
+              "opts?"
+            ]
+          },
           "source": "verb :search(query, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // Bounded actor-scoped search across object names and property channels.\n  // Source channels are reserved for the programmer surface.\n  return authoring_search(query, opts, false);\n}"
         },
         {
@@ -47,7 +68,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["parent", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "parent",
+              "opts?"
+            ]
+          },
           "source": "verb :create(parent, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // Creates an object owned by the invoking actor. There is intentionally no\n  // owner option on the builder surface; creating for another actor is wizard\n  // administration, not delegated building.\n  let result = builder_create_object(parent, opts);\n  observe({ type: \"builder_created\", actor: actor, id: result[\"id\"], parent: parent, ts: now() });\n  return result;\n}"
         },
         {
@@ -56,7 +82,13 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "parent", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "parent",
+              "opts?"
+            ]
+          },
           "source": "verb :chparent(id, parent, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  let result = builder_chparent(id, parent, opts);\n  if (result[\"ok\"] && !result[\"dry_run\"]) {\n    observe({ type: \"builder_chparented\", actor: actor, id: id, parent: parent, ts: now() });\n  }\n  return result;\n}"
         },
         {
@@ -65,7 +97,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "opts?"
+            ]
+          },
           "source": "verb :recycle(id, opts) rxd {\n  // Surface gate. The wrapper is direct_callable for MCP/REST tool use,\n  // which would otherwise expose it to non-builder owners. Mirror the\n  // builder-class requirement that the other $builder verbs (:inspect,\n  // :create, :chparent, :set_property, :recycle_command) enforce, so the\n  // documented surface (catalogs/prog/README.md) holds across every\n  // call path. the_perm below still narrows from \"any builder\" to\n  // \"owner-or-wizard\" — the gate adds a class-membership precondition,\n  // it doesn't replace the perm check.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // The substrate `recycle()` builtin gates on the verb's effective\n  // principal (progr); this wrapper is catalog-owned, so progr is\n  // wizard. Two layers of defense are needed.\n  //\n  // Layer 1 — actor-side authority gate (LambdaCore @recycle pattern):\n  // route through the_perm so the auth rule lives in one place.\n  \"the_perm\":requires_perm(actor, id, \"only the owner or a wizard can recycle this object\");\n  // Layer 2 — strip user-intent wizard opts before forwarding. The\n  // substrate also gates force_reserved on actor (defense in depth at\n  // the substrate layer), but stripping here keeps the smuggle vector\n  // out of the substrate's parser entirely. force_reserved is the\n  // exclusive concern of $wiz:force_recycle.\n  let safe_opts = {};\n  if (typeof(opts) == \"map\") {\n    for k in keys(opts) {\n      if (k != \"force_reserved\") { safe_opts[k] = opts[k]; }\n    }\n  }\n  let result = recycle(id, safe_opts);\n  if (result[\"ok\"] && !result[\"dry_run\"]) {\n    observe({ type: \"builder_recycled\", actor: actor, id: id, ts: now() });\n  }\n  return result;\n}"
         },
         {
@@ -73,10 +110,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@recycle"],
+          "aliases": [
+            "@recycle"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :recycle_command(dobjstr) rxd {\n  // LambdaCore $builder:@recycle (#630), faithfully ported. Divergences\n  // (1)–(2) are called out where they appear; aside from those the verb\n  // is line-for-line equivalent.\n  //\n  // Surface gate. LambdaCore reaches @recycle only via the actor's\n  // parent chain (verb resolution), so a non-builder cannot reach it.\n  // woo's `direct_callable: true` exposes the verb to direct calls\n  // (MCP tools, REST), which would otherwise bypass the chain. Mirror\n  // the gate the other $builder surface verbs (:inspect, :create,\n  // :chparent, :set_property) use.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @recycle <object>\");\n    return null;\n  }\n  // L2 Original: dobj = player:my_match_object(dobjstr).\n  // Divergence (1): woo's matcher is on $match (spec/semantics/match.md\n  // MA1), not on the player; the MA2 resolution rule mirrors LambdaCore's\n  // $string_utils:match_object.\n  let dobj = $match:match_object(dobjstr);\n  // L5-6 Original: $command_utils:object_match_failed.\n  if ($command_utils:object_match_failed(dobj, dobjstr)) {\n    return null;\n  }\n  // L7-8 Self-recycle. Original reads $wiz_utils.suicide_string; woo\n  // doesn't carry that property, so a static line stands in.\n  if (actor == dobj) {\n    tell(actor, \"You can't recycle yourself.\");\n    return null;\n  }\n  // L9-10 Original: !$perm_utils:controls(player, dobj) -> notify(E_PERM).\n  // Divergence (2): woo routes the same owner-or-wizard rule through\n  // the_perm so the auth gate lives in one place; the_perm raises E_PERM\n  // and the chat layer renders it.\n  \"the_perm\":requires_perm(actor, dobj, \"only the owner or a wizard can recycle this object\");\n  // L1 set_task_perms(player) is omitted: woo's substrate authority gates\n  // on `actor` and `progr` directly, and recycle() re-checks RC2 on entry.\n  // L12-17 Capture name, recycle, notify with paste-able id.\n  let name = dobj.name;\n  let result = recycle(dobj, {});\n  if (typeof(result) != \"map\" || !result[\"ok\"]) {\n    tell(actor, \"Recycle failed: \" + to_string(result));\n    return result;\n  }\n  tell(actor, name + \" (#\" + dobj + \") recycled.\");\n  return result;\n}"
         },
@@ -86,7 +134,14 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "name", "value", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "name",
+              "value",
+              "opts?"
+            ]
+          },
           "source": "verb :set_property(id, name, value, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // Ordinary data value setting. This does not change verb source, property\n  // perms, executable metadata, wizard/programmer flags, or ownership.\n  return builder_set_property(id, name, value, opts);\n}"
         },
         {
@@ -94,10 +149,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@cont*ents"],
+          "aliases": [
+            "@cont*ents"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :contents_command(dobjstr) rxd {\n  // LambdaCore $builder:@contents (#630), faithfully ported. Surface\n  // gate added because the verb is direct_callable (see :recycle and\n  // :recycle_command for the same justification).\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // L3-7 Empty dobjstr defaults to the actor's location.\n  let dobj = null;\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    dobj = location(actor);\n    if (dobj == null) {\n      tell(actor, \"Usage: @contents <object>\");\n      return null;\n    }\n  } else {\n    dobj = $match:match_object(dobjstr);\n  }\n  if ($command_utils:object_match_failed(dobj, dobjstr)) {\n    return null;\n  }\n  // L10-16. `name(<paste-able id>) contains:` then names_of(contents).\n  let id_str = dobj;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let contents_list = contents(dobj);\n  if (length(contents_list) > 0) {\n    tell(actor, dobj.name + \"(\" + id_str + \") contains:\");\n    tell(actor, $string_utils:names_of(contents_list));\n  } else {\n    tell(actor, dobj.name + \"(\" + id_str + \") contains nothing.\");\n  }\n  return contents_list;\n}"
         },
@@ -106,10 +172,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@par*ents"],
+          "aliases": [
+            "@par*ents"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :parents_command(dobjstr) rxd {\n  // LambdaCore $builder:@parents (#630), faithfully ported. Lists the\n  // object and its ancestor chain up to $root.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @parents <object>\");\n    return null;\n  }\n  let dobj = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(dobj, dobjstr)) {\n    return null;\n  }\n  // Walk parents() (woo builtin returns the full ancestor chain).\n  let chain = [dobj] + parents(dobj);\n  tell(actor, $string_utils:names_of(chain));\n  return chain;\n}"
         },
@@ -118,10 +195,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@kids"],
+          "aliases": [
+            "@kids"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :kids_command(dobjstr) rxd {\n  // LambdaCore $builder:@kids (#630), faithfully ported. Lists the\n  // direct children of an object.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @kids <object>\");\n    return null;\n  }\n  let thing = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(thing, dobjstr)) {\n    return null;\n  }\n  let kids = children(thing);\n  let id_str = thing;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let n = length(kids);\n  if (n > 0) {\n    let suffix = \"s\";\n    if (n == 1) { suffix = \"\"; }\n    tell(actor, thing.name + \"(\" + id_str + \") has \" + to_string(n) + \" kid\" + suffix + \".\");\n    tell(actor, $string_utils:names_of(kids));\n  } else {\n    tell(actor, thing.name + \"(\" + id_str + \") has no kids.\");\n  }\n  return kids;\n}"
         },
@@ -130,10 +218,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@create"],
+          "aliases": [
+            "@create"
+          ],
           "arg_spec": {
-            "args": ["argstr"],
-            "command": { "dobj": "any", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
           },
           "source": "verb :create_command(argstr) rxd {\n  // LambdaCore $builder:@create (#630), faithfully ported. Parses\n  // `@create <parent> named <name>[,<alias>,...]` (and the `called`\n  // synonym) into a builder_create_object call.\n  //\n  // Surface gate.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  let usage = \"Usage: @create <parent-class> named <name>[,<alias>,...]\";\n  if (typeof(argstr) != \"string\" || argstr == \"\") {\n    tell(actor, usage);\n    return null;\n  }\n  // Locate the keyword. \" called \" is an accepted synonym (LambdaCore L5).\n  let kw = \" named \";\n  let kw_pos = str_index(argstr, kw);\n  if (kw_pos == 0) {\n    kw = \" called \";\n    kw_pos = str_index(argstr, kw);\n  }\n  if (kw_pos == 0) {\n    tell(actor, usage);\n    return null;\n  }\n  let parentstr = str_trim(str_slice(argstr, 1, kw_pos - 1));\n  let namestr = str_trim(str_slice(argstr, kw_pos + length(kw)));\n  if (parentstr == \"\" || namestr == \"\") {\n    tell(actor, usage);\n    return null;\n  }\n  // Resolve parent via $match (handles `#xxx`, `$xxx`, and the standard\n  // tier walk). `$match:match_object` covers LambdaCore's :literal_object\n  // + :my_match_object combo.\n  let parent = $match:match_object(parentstr);\n  if ($command_utils:object_match_failed(parent, parentstr)) {\n    return null;\n  }\n  // Names: comma-split. First = display name; rest = aliases. LambdaCore\n  // also supports `name-and-alias,alias,…` and `name:alias,…` shapes via\n  // $building_utils:set_names — those are deferred until ported here.\n  let names = str_split(namestr, \",\");\n  let trimmed_names = [];\n  for n in names {\n    let t = str_trim(n);\n    if (t != \"\") { trimmed_names = trimmed_names + [t]; }\n  }\n  if (length(trimmed_names) == 0) {\n    tell(actor, usage);\n    return null;\n  }\n  let display_name = trimmed_names[1];\n  let aliases = [];\n  let total = length(trimmed_names);\n  if (total > 1) {\n    for i in [2..total] {\n      aliases = aliases + [trimmed_names[i]];\n    }\n  }\n  let opts = { name: display_name };\n  if (length(aliases) > 0) { opts[\"aliases\"] = aliases; }\n  let result = builder_create_object(parent, opts);\n  if (typeof(result) != \"map\" || !result[\"ok\"]) {\n    tell(actor, \"Create failed: \" + to_string(result));\n    return result;\n  }\n  let new_id = result[\"id\"];\n  let id_str = new_id;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let parent_id_str = parent;\n  if (!str_starts(parent_id_str, \"$\")) { parent_id_str = \"#\" + parent_id_str; }\n  let aka = \"\";\n  if (length(aliases) > 0) { aka = \" (aka \" + str_join(aliases, \", \") + \")\"; }\n  tell(actor, \"You now have \" + display_name + aka + \" with object number \" + id_str + \" and parent \" + parent.name + \" (\" + parent_id_str + \").\");\n  // Move the new object into the actor's inventory, mirroring LambdaCore L42\n  // (`move(object, player)`). builder_create_object doesn't auto-place;\n  // moveto is a substrate builtin that runs the standard move chain.\n  try { moveto(new_id, actor); } except err { /* :accept refused; leave at $nowhere. */ }\n  observe({ type: \"builder_created\", actor: actor, id: new_id, parent: parent, ts: now() });\n  return result;\n}"
         },
@@ -142,10 +241,26 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@set*prop"],
+          "aliases": [
+            "@set*prop"
+          ],
           "arg_spec": {
-            "args": ["dobjstr", "iobjstr"],
-            "command": { "dobj": "string", "prep": ["to", "at"], "iobj": "any", "args_from": ["dobjstr", "iobjstr"] }
+            "args": [
+              "dobjstr",
+              "iobjstr"
+            ],
+            "command": {
+              "dobj": "string",
+              "prep": [
+                "to",
+                "at"
+              ],
+              "iobj": "any",
+              "args_from": [
+                "dobjstr",
+                "iobjstr"
+              ]
+            }
           },
           "source": "verb :set_command(dobjstr, iobjstr) rxd {\n  // LambdaCore $builder:@set (#630), faithfully ported. Parses\n  // `@set <obj>.<prop> to <value>` (and `at` synonym). LambdaCore\n  // L37-39 explicitly checks `has_property(dobj, prop)` before the\n  // assignment so this verb does not silently create properties — the\n  // substrate's builder_set_property already raises E_PROPNF when the\n  // prop isn't defined; we translate that to LambdaCore's wording.\n  //\n  // Surface gate.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  let usage = \"Usage: @set <object>.<property> to <value>\";\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, usage);\n    return null;\n  }\n  let spec = $code_utils:parse_propref(dobjstr);\n  if (typeof(spec) != \"list\") {\n    tell(actor, \"Property \" + dobjstr + \" not found.\");\n    return null;\n  }\n  let obj_str = spec[1];\n  let prop = spec[2];\n  let dobj = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(dobj, obj_str)) {\n    return null;\n  }\n  // Parse the `to <value>` tail. iobjstr may be quoted (\"…\"), an integer,\n  // a float, an objref literal (`#xxx` / `$xxx`), or a bare string;\n  // $string_utils:to_value figures it out. Empty value clears to \"\"\n  // (LambdaCore L21-26).\n  let value = \"\";\n  if (typeof(iobjstr) == \"string\" && str_trim(iobjstr) != \"\") {\n    let parsed = $string_utils:to_value(iobjstr);\n    if (!parsed[1]) {\n      tell(actor, \"Could not parse: \" + iobjstr);\n      return null;\n    }\n    value = parsed[2];\n  }\n  let id_str = dobj;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let result = null;\n  try {\n    result = builder_set_property(dobj, prop, value, {});\n  } except err {\n    if (err[\"code\"] == \"E_PROPNF\") {\n      tell(actor, \"That object does not define that property.\");\n      return err;\n    }\n    tell(actor, \"Unable to set \" + id_str + \".\" + prop + \": \" + err[\"message\"]);\n    return err;\n  }\n  let display = to_string(value);\n  if (typeof(value) == \"string\") {\n    let q = str_char(34);\n    display = q + value + q;\n  }\n  tell(actor, \"Property \" + id_str + \".\" + prop + \" set to \" + display + \".\");\n  return result;\n}"
         }
@@ -156,7 +271,12 @@
       "parent": "$builder",
       "description": "Programmer player class. Actors inheriting from `$programmer` expose source-aware inspection, verb resolution, source listing, source search, verb install with dry-run diagnostics, metadata-only verb edits, property-definition metadata, and traces as their own MCP tools. Programmer class membership exposes the interface; the programmer or wizard flag remains the hard authority check. The surface is source-level; bytecode and VM internals are deliberately absent.",
       "properties": [
-        { "name": "api_version", "type": "str", "default": "0.1.0", "perms": "r" }
+        {
+          "name": "api_version",
+          "type": "str",
+          "default": "0.1.0",
+          "perms": "r"
+        }
       ],
       "verbs": [
         {
@@ -165,7 +285,9 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, api_version: this.api_version, tools: [\"inspect(id, opts?)\", \"resolve_verb(id, descriptor)\", \"list_verb(id, descriptor, opts?)\", \"search(query, opts?)\", \"install_verb(id, descriptor, source, opts?)\", \"set_verb_info(id, descriptor, opts?)\", \"set_property_info(id, name, opts?)\", \"edit_verb(id, descriptor, opts?)\", \"trace(id, descriptor, opts?)\", \"eval(source, opts?)\", \"force_recycle(id, opts?)  [wizard-only]\"] };\n}"
         },
         {
@@ -174,7 +296,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "opts?"
+            ]
+          },
           "source": "verb :inspect(id, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Source-aware call-tree view with read filters: parent/features walk, own\n  // and inherited verbs/properties, slots, impact hints, and optional readable\n  // source summaries. No bytecode.\n  return authoring_inspect(id, opts, true);\n}"
         },
         {
@@ -183,7 +310,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "descriptor"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "descriptor"
+            ]
+          },
           "source": "verb :resolve_verb(id, descriptor) rxd {\n  // Programmer surface check: wizard, or programmer-flagged descendant of\n  // this surface class.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!isa(actor, $programmer)) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!has_flag(actor, \"programmer\")) {\n      raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor };\n    }\n  }\n  let walk = [];\n  let definer = null;\n  if (typeof(descriptor) == \"number\") {\n    let own = verbs(id);\n    let matched = false;\n    if (descriptor >= 1) { if (descriptor <= length(own)) { matched = true; } }\n    walk = walk + [{ id: id, kind: \"slot\", slot: descriptor, matched: matched }];\n    if (!matched) {\n      raise { code: \"E_VERBNF\", message: \"verb slot not found\", value: { obj: id, slot: descriptor, actor: actor } };\n    }\n    definer = id;\n  } else {\n    let chain = [id] + parents(id);\n    for class_ref in chain {\n      if (definer == null) {\n        let class_verbs = verbs(class_ref);\n        let class_match = false;\n        for n in class_verbs { if (n == descriptor) { class_match = true; } }\n        walk = walk + [{ id: class_ref, kind: \"parent\", matched: class_match }];\n        if (class_match) { definer = class_ref; }\n      }\n    }\n    if (definer == null) {\n      raise { code: \"E_VERBNF\", message: \"verb not found\", value: { obj: id, name: descriptor, actor: actor } };\n    }\n  }\n  let info = verb_info(definer, descriptor);\n  let source = verb_code(definer, descriptor);\n  return {\n    name: info[\"name\"],\n    slot: info[\"slot\"],\n    aliases: info[\"aliases\"],\n    definer: definer,\n    owner: info[\"owner\"],\n    perms: info[\"perms\"],\n    arg_spec: info[\"arg_spec\"],\n    version: info[\"version\"],\n    direct_callable: info[\"direct_callable\"],\n    tool_exposed: info[\"tool_exposed\"],\n    readable: true,\n    source: source,\n    line_map: {},\n    walk: walk\n  };\n}"
         },
         {
@@ -192,7 +324,13 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "descriptor", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "descriptor",
+              "opts?"
+            ]
+          },
           "source": "verb :list_verb(id, descriptor, opts) rxd {\n  // Return readable source and metadata for one ordered verb slot. This is\n  // source-level only: no bytecode, opcode, literal-pool, or VM detail.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!isa(actor, $programmer)) {\n      raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } };\n    }\n    if (!has_flag(actor, \"programmer\")) {\n      raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor };\n    }\n  }\n  let include_source = true;\n  if (typeof(opts) == \"map\") { if (has(opts, \"include_source\")) { include_source = opts[\"include_source\"]; } }\n  let walk = [];\n  let definer = null;\n  if (typeof(descriptor) == \"number\") {\n    let own = verbs(id);\n    let matched = false;\n    if (descriptor >= 1) { if (descriptor <= length(own)) { matched = true; } }\n    walk = walk + [{ id: id, kind: \"slot\", slot: descriptor, matched: matched }];\n    if (!matched) {\n      raise { code: \"E_VERBNF\", message: \"verb slot not found\", value: { obj: id, slot: descriptor, actor: actor } };\n    }\n    definer = id;\n  } else {\n    let chain = [id] + parents(id);\n    for class_ref in chain {\n      if (definer == null) {\n        let class_verbs = verbs(class_ref);\n        let class_match = false;\n        for n in class_verbs { if (n == descriptor) { class_match = true; } }\n        walk = walk + [{ id: class_ref, kind: \"parent\", matched: class_match }];\n        if (class_match) { definer = class_ref; }\n      }\n    }\n    if (definer == null) {\n      raise { code: \"E_VERBNF\", message: \"verb not found\", value: { obj: id, name: descriptor, actor: actor } };\n    }\n  }\n  let info = verb_info(definer, descriptor);\n  let result = {\n    name: info[\"name\"],\n    slot: info[\"slot\"],\n    aliases: info[\"aliases\"],\n    definer: definer,\n    owner: info[\"owner\"],\n    perms: info[\"perms\"],\n    arg_spec: info[\"arg_spec\"],\n    version: info[\"version\"],\n    direct_callable: info[\"direct_callable\"],\n    tool_exposed: info[\"tool_exposed\"],\n    readable: true,\n    walk: walk\n  };\n  if (include_source) {\n    result[\"source\"] = verb_code(definer, descriptor);\n    result[\"line_map\"] = {};\n  }\n  return result;\n}"
         },
         {
@@ -201,7 +339,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["query", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "query",
+              "opts?"
+            ]
+          },
           "source": "verb :search(query, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Bounded actor-scoped search. opts.channels may include readable\n  // verb_source; unreadable source is omitted, not summarized.\n  return authoring_search(query, opts, true);\n}"
         },
         {
@@ -210,7 +353,14 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "descriptor", "source", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "descriptor",
+              "source",
+              "opts?"
+            ]
+          },
           "source": "verb :install_verb(id, descriptor, source, opts) rxd {\n  // Programmer surface check.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Validate options. opts.perms is rejected — the source header is canonical.\n  let dry_run = false;\n  let mode = \"upsert\";\n  let expected_version = null;\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"perms\")) {\n      let fail_perms = { ok: false, dry_run: false, slot: 0, version: 0, diagnostics: [{ severity: \"error\", code: \"E_INVARG\", message: \"opts.perms is not accepted; verb source header is canonical\" }] };\n      observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: fail_perms[\"diagnostics\"], dry_run: false, ts: now() });\n      return fail_perms;\n    }\n    if (has(opts, \"dry_run\")) { dry_run = opts[\"dry_run\"]; }\n    if (has(opts, \"mode\")) { mode = opts[\"mode\"]; }\n    if (has(opts, \"expected_version\")) { expected_version = opts[\"expected_version\"]; }\n  }\n  if (mode != \"upsert\" && mode != \"define\" && mode != \"set_code\") {\n    raise { code: \"E_INVARG\", message: \"unknown install mode\", value: mode };\n  }\n  // Discover existing verb (own slot only).\n  let existing = null;\n  let existing_version = null;\n  let existing_slot = 0;\n  try {\n    let info = verb_info(id, descriptor);\n    existing = info;\n    existing_version = info[\"version\"];\n    existing_slot = info[\"slot\"];\n  } except err { existing = null; }\n  if (mode == \"define\" && existing != null) {\n    raise { code: \"E_INVARG\", message: \"verb already exists\", value: { obj: id, descriptor: descriptor } };\n  }\n  if (mode == \"set_code\" && existing == null) {\n    raise { code: \"E_VERBNF\", message: \"verb not found\", value: { obj: id, descriptor: descriptor } };\n  }\n  if (expected_version != null) {\n    if (existing_version != expected_version) {\n      raise { code: \"E_VERSION\", message: \"verb version conflict\", value: { expected: expected_version, actual: existing_version } };\n    }\n  }\n  // Compile (pure, no mutation).\n  let compiled = compile_verb(source);\n  let target_name = descriptor;\n  if (existing != null) { target_name = existing[\"name\"]; }\n  if (compiled[\"ok\"]) {\n    let meta = compiled[\"metadata\"];\n    if (meta != null && has(meta, \"name\")) {\n      let header_name = meta[\"name\"];\n      if (typeof(header_name) == \"string\") {\n        if (typeof(target_name) == \"string\" && header_name != target_name) {\n          let fail_name = { ok: false, dry_run: dry_run, slot: existing_slot, version: existing_version, metadata: meta, diagnostics: [{ severity: \"error\", code: \"E_COMPILE\", message: \"verb header :\" + header_name + \" does not match install target :\" + target_name }] };\n          observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: fail_name[\"diagnostics\"], dry_run: dry_run, ts: now() });\n          return fail_name;\n        }\n      }\n    }\n  }\n  if (!compiled[\"ok\"]) {\n    let fail_compile = { ok: false, dry_run: dry_run, slot: existing_slot, version: existing_version, metadata: compiled[\"metadata\"], diagnostics: compiled[\"diagnostics\"] };\n    observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: compiled[\"diagnostics\"], dry_run: dry_run, ts: now() });\n    return fail_compile;\n  }\n  // Predict the slot/version that the install would land on.\n  let projected_slot = existing_slot;\n  let projected_version = 1;\n  if (existing != null) {\n    projected_version = existing_version + 1;\n  } else {\n    projected_slot = length(verbs(id)) + 1;\n  }\n  if (dry_run) {\n    return { ok: true, dry_run: true, slot: projected_slot, version: projected_version, metadata: compiled[\"metadata\"], diagnostics: [] };\n  }\n  // Apply: create stub if needed, then install code.\n  if (existing == null) {\n    let add_info = { name: target_name };\n    let add_meta = compiled[\"metadata\"];\n    if (add_meta != null) {\n      if (has(add_meta, \"perms\")) { add_info[\"perms\"] = add_meta[\"perms\"]; }\n      if (has(add_meta, \"arg_spec\")) { add_info[\"arg_spec\"] = add_meta[\"arg_spec\"]; }\n    }\n    add_verb(id, add_info);\n  }\n  let errors = set_verb_code(id, target_name, source);\n  if (length(errors) > 0) {\n    // Should not happen — compile_verb already succeeded — but if the\n    // header/name post-validation rejects, roll back the stub.\n    if (existing == null) { try { delete_verb(id, target_name); } except err { } }\n    let diag = [];\n    for msg in errors { diag = diag + [{ severity: \"error\", code: \"E_COMPILE\", message: msg }]; }\n    observe({ type: \"programmer_check_failed\", actor: actor, id: id, verb: descriptor, diagnostics: diag, dry_run: false, ts: now() });\n    return { ok: false, dry_run: false, slot: projected_slot, version: existing_version, metadata: compiled[\"metadata\"], diagnostics: diag };\n  }\n  let info_after = verb_info(id, target_name);\n  observe({ type: \"programmer_installed\", actor: actor, id: id, verb: descriptor, slot: info_after[\"slot\"], version: info_after[\"version\"], ts: now() });\n  return { ok: true, dry_run: false, slot: info_after[\"slot\"], version: info_after[\"version\"], metadata: compiled[\"metadata\"], diagnostics: [] };\n}"
         },
         {
@@ -219,7 +369,13 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "descriptor", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "descriptor",
+              "opts?"
+            ]
+          },
           "source": "verb :set_verb_info(id, descriptor, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Metadata-only edit for aliases, arg spec, exposure flags, and perms.\n  // Permission bits are changed here, not through source install. Does not\n  // reinstall source. opts.dry_run=true validates without mutation.\n  let dry_run = false;\n  let expected_version = null;\n  let info_overrides = {};\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"dry_run\")) { dry_run = opts[\"dry_run\"]; }\n    if (has(opts, \"expected_version\")) { expected_version = opts[\"expected_version\"]; }\n    if (has(opts, \"aliases\")) { info_overrides[\"aliases\"] = opts[\"aliases\"]; }\n    if (has(opts, \"perms\")) { info_overrides[\"perms\"] = opts[\"perms\"]; }\n    if (has(opts, \"direct_callable\")) { info_overrides[\"direct_callable\"] = opts[\"direct_callable\"]; }\n    if (has(opts, \"tool_exposed\")) { info_overrides[\"tool_exposed\"] = opts[\"tool_exposed\"]; }\n    if (has(opts, \"arg_spec\")) { info_overrides[\"arg_spec\"] = opts[\"arg_spec\"]; }\n    if (has(opts, \"owner\")) { info_overrides[\"owner\"] = opts[\"owner\"]; }\n  }\n  let before = verb_info(id, descriptor);\n  if (expected_version != null) {\n    if (before[\"version\"] != expected_version) {\n      raise { code: \"E_VERSION\", message: \"verb version conflict\", value: { expected: expected_version, actual: before[\"version\"] } };\n    }\n  }\n  if (dry_run) {\n    return { ok: true, dry_run: true, id: id, slot: before[\"slot\"], version: before[\"version\"] + 1, before: before, after: before };\n  }\n  let updated = set_verb_info(id, descriptor, info_overrides);\n  let after = verb_info(id, descriptor);\n  observe({ type: \"programmer_verb_info_changed\", actor: actor, id: id, verb: descriptor, slot: updated[\"slot\"], version: updated[\"version\"], ts: now() });\n  return { ok: true, dry_run: false, id: id, slot: updated[\"slot\"], version: updated[\"version\"], before: before, after: after };\n}"
         },
         {
@@ -228,17 +384,31 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "name", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "name",
+              "opts?"
+            ]
+          },
           "source": "verb :set_property_info(id, name, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Define/update property metadata, defaults, perms, and type hints. This is\n  // programmer authority, not the builder value-setting surface.\n  let dry_run = false;\n  let mode = \"upsert\";\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"dry_run\")) { dry_run = opts[\"dry_run\"]; }\n    if (has(opts, \"mode\")) { mode = opts[\"mode\"]; }\n  }\n  if (mode != \"upsert\" && mode != \"define\" && mode != \"update\" && mode != \"delete\") {\n    raise { code: \"E_INVARG\", message: \"unknown property-info mode\", value: mode };\n  }\n  let existing = null;\n  try { existing = property_info(id, name); } except err { existing = null; }\n  // The substrate raises E_PROPNF when looking up a non-defined property; if\n  // the def lives on a parent class, property_info still returns it. For mode\n  // semantics we want to treat \"defined on this object directly\" as the\n  // existence test.\n  let exists_locally = false;\n  if (existing != null) {\n    if (existing[\"defined_on\"] == id) { exists_locally = true; }\n  }\n  if (mode == \"define\" && exists_locally) {\n    raise { code: \"E_INVARG\", message: \"property already exists\", value: { obj: id, property: name } };\n  }\n  if ((mode == \"update\" || mode == \"delete\") && !exists_locally) {\n    raise { code: \"E_PROPNF\", message: \"property not defined on object\", value: { obj: id, property: name } };\n  }\n  if (mode == \"delete\") {\n    let delete_before = existing;\n    if (dry_run) { return { ok: true, dry_run: true, id: id, name: name, deleted: true, before: delete_before }; }\n    set_task_perms(actor);\n    delete_property(id, name);\n    return { ok: true, dry_run: false, id: id, name: name, deleted: true, before: delete_before };\n  }\n  let perms_opt = \"rw\";\n  if (existing != null) { perms_opt = existing[\"perms\"]; }\n  let owner_opt = actor;\n  if (existing != null) { owner_opt = existing[\"owner\"]; }\n  let type_opt = null;\n  if (existing != null) { type_opt = existing[\"type_hint\"]; }\n  let default_value = null;\n  if (typeof(opts) == \"map\") {\n    if (has(opts, \"perms\")) { perms_opt = opts[\"perms\"]; }\n    if (has(opts, \"owner\")) { owner_opt = opts[\"owner\"]; }\n    if (has(opts, \"type_hint\")) { type_opt = opts[\"type_hint\"]; }\n    if (has(opts, \"default\")) { default_value = opts[\"default\"]; }\n  }\n  let info_map = { owner: owner_opt, perms: perms_opt };\n  if (type_opt != null) { info_map[\"type_hint\"] = type_opt; }\n  let before = existing;\n  if (dry_run) {\n    let projected = { name: name, owner: owner_opt, perms: perms_opt, defined_on: id, type_hint: type_opt };\n    return { ok: true, dry_run: true, id: id, name: name, before: before, after: projected };\n  }\n  set_task_perms(actor);\n  if (!exists_locally) {\n    add_property(id, name, default_value, info_map);\n  } else {\n    set_property_info(id, name, info_map);\n  }\n  let after = property_info(id, name);\n  return { ok: true, dry_run: false, id: id, name: name, version: after[\"version\"], before: before, after: after };\n}"
         },
         {
           "name": "edit_verb",
-          "aliases": ["edit"],
+          "aliases": [
+            "edit"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "descriptor", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "descriptor",
+              "opts?"
+            ]
+          },
           "source": "verb :edit_verb(id, descriptor, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Door into this catalog's seeded $verb_editor instance. The editor room\n  // owns the buffer session after this point; the target object stays where it is.\n  return editor_invoke(\"the_verb_editor\", id, descriptor, opts);\n}"
         },
         {
@@ -247,7 +417,13 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "verb_name", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "verb_name",
+              "opts?"
+            ]
+          },
           "source": "verb :trace(id, verb_name, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  // Capture source-span traces for the next N invocations. v1.1.\n  raise { code: \"E_NOT_IMPLEMENTED\", message: \"programmer trace is deferred to v1.1\", value: { id: id, verb_name: verb_name } };\n}"
         },
         {
@@ -257,8 +433,18 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": {
-            "args": ["source", "opts?"],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "args": [
+              "source",
+              "opts?"
+            ],
+            "command": {
+              "dobj": "string",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
           },
           "source": "verb :eval(source, opts) rxd {\n  /* Compile and run a Woo expression or statement block under the calling\n   * programmer's authority. This is a strict superset of `woo_call`: any\n   * verb can be invoked as `;target:verb(arg1, arg2)`, any readable property\n   * read as `;obj.prop`, and arbitrary computation expressed inline. Ideal\n   * for chat-as-CLI use and for programmer agents that need to script the\n   * world without round-tripping through individual MCP tools.\n   *\n   * Args:\n   *   source: Woo source text. Default mode wraps as `return <source>;`,\n   *           so an expression like `the_chatroom:say(\"hi\")` is fine.\n   *           Pass opts.mode=\"stmts\" to run a multi-statement body verbatim.\n   *   opts.mode: \"expr\" (default) | \"stmts\"\n   *   opts.dry_run: true compiles only, returns diagnostics, runs nothing.\n   *\n   * Returns a map on success or compile failure:\n   *   { ok: true,  dry_run, value }                          // success\n   *   { ok: false, dry_run, diagnostics: [{severity,code,message,...}] }  // compile error\n   *\n   * Runtime errors thrown by the body propagate as ordinary errors so the\n   * outer direct-call transaction rolls back state, placement, and parked\n   * tasks. A failed `;create(...) ; return 1/0;` does not leave the created\n   * object behind. (LambdaCore @eval renders the traceback into chat; here\n   * the chat layer renders the propagated error frame.)\n   *\n   * Authority: the wrapped code runs with `progr = caller`, not the catalog\n   * installer that owns this verb, so eval cannot escalate. Gated on\n   * wizard-or-progbit + $programmer ancestry; non-programmers get E_PERM.\n   *\n   * Examples:\n   *   ;1 + 2                                    // -> {ok:true,value:3}\n   *   ;the_chatroom:say(\"hello\")                // call a verb\n   *   ;;let x = 0; for i in [1,2,3] { x = x + i; } return x;   // mode=\"stmts\"\n   */\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let result = programmer_eval(source, opts);\n  if (result[\"ok\"]) {\n    if (result[\"dry_run\"]) {\n      tell(actor, \"(dry_run ok)\");\n    } else {\n      tell(actor, \"=> \" + to_string(result[\"value\"]));\n    }\n  } else {\n    let line = \"compile error\";\n    let diags = result[\"diagnostics\"];\n    if (typeof(diags) == \"list\" && length(diags) > 0) {\n      let d = diags[1];\n      line = \"compile error: \" + d[\"code\"] + \" \" + d[\"message\"];\n    }\n    tell(actor, line);\n  }\n  return result;\n}"
         },
@@ -268,7 +454,12 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["id", "opts?"] },
+          "arg_spec": {
+            "args": [
+              "id",
+              "opts?"
+            ]
+          },
           "source": "verb :force_recycle(id, opts) rxd {\n  // Wizard-only force_recycle. Bypasses most §RC6 reserved-list checks\n  // (universal classes other than $system/$root/$nowhere; live actors,\n  // whose sessions are terminated as part of the call) and the §RC3a\n  // empty-children safety check. Routes through the unified `recycle`\n  // builtin with force_reserved + force.\n  //\n  // The substrate gates RC2 authority on `progr` (the verb's effective\n  // principal), so a wrapper verb running with wizard progr could be\n  // invoked by any actor. We additionally gate on `actor` here so a\n  // non-wizard caller cannot bypass §RC6 by calling this verb. This is\n  // the LambdaCore @recycle convention: substrate trusts progr; the\n  // user-facing wrapper trusts actor. Audited as a force_recycle\n  // wizard_action; emits a wiz_force_recycle observation. Use sparingly —\n  // for irreversible world-teardown and migration only.\n  \"the_perm\":requires_wizard(actor, \"wizard authority required for force_recycle\");\n  let merged = opts;\n  if (typeof(merged) != \"map\") { merged = {}; }\n  merged[\"force_reserved\"] = true;\n  merged[\"force\"] = true;\n  return recycle(id, merged);\n}"
         },
         {
@@ -276,10 +467,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@verbs"],
+          "aliases": [
+            "@verbs"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :verbs_command(dobjstr) rxd {\n  // LambdaCore $prog:@verbs (#217), faithfully ported. Programmer\n  // surface — same gate the rest of $programmer uses.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @verbs <object>\");\n    return null;\n  }\n  let thing = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(thing, dobjstr)) {\n    return null;\n  }\n  // L17 LambdaCore: \";verbs(<id>) => {...}\" — eval-shaped output that the\n  // reader can re-type. Mirror that shape; ids are paste-able per the\n  // woo `#`/`$` convention so `;verbs(#obj_xxx) => …` round-trips.\n  let id_str = thing;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let names = verbs(thing);\n  tell(actor, \";verbs(\" + id_str + \") => \" + to_string(names));\n  return names;\n}"
         },
@@ -288,10 +490,22 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@prop*erties", "@props"],
+          "aliases": [
+            "@prop*erties",
+            "@props"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :properties_command(dobjstr) rxd {\n  // LambdaCore $prog:@properties (#217), faithfully ported. Programmer\n  // surface gate.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @properties <object>\");\n    return null;\n  }\n  let thing = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(thing, dobjstr)) {\n    return null;\n  }\n  // L10 LambdaCore: \";properties(<id>) => {...}\".\n  let id_str = thing;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let names = properties(thing);\n  tell(actor, \";properties(\" + id_str + \") => \" + to_string(names));\n  return names;\n}"
         },
@@ -300,10 +514,21 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@prop*erty"],
+          "aliases": [
+            "@prop*erty"
+          ],
           "arg_spec": {
-            "args": ["argstr"],
-            "command": { "dobj": "any", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
           },
           "source": "verb :property_command(argstr) rxd {\n  // LambdaCore $prog:@property (#217), faithfully ported as far as the\n  // `<obj>.<prop> [<value>]` shape. LambdaCore's full L21-49 parses an\n  // optional `<perms> <owner>` tail via prefix_to_value and player_match\n  // — that level is deferred until $string_utils:prefix_to_value lands.\n  // Until then the verb rejects anything beyond the `value` token so a\n  // typed `@property #x.foo 0 r` doesn't silently store \"0 r\" as the\n  // value with default perms (the partial-port footgun).\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @property <object>.<prop-name> [<init_value>]\";\n  if (typeof(argstr) != \"string\" || str_trim(argstr) == \"\") {\n    tell(actor, usage);\n    return null;\n  }\n  // Tokenize: first token is propref, optional second token is the\n  // value. Anything beyond is unsupported syntax (perms/owner) — emit\n  // an explicit rejection rather than silently absorbing it.\n  let tokens = str_split(str_trim(argstr), \" \");\n  let trimmed_tokens = [];\n  for t in tokens {\n    let s = str_trim(t);\n    if (s != \"\") { trimmed_tokens = trimmed_tokens + [s]; }\n  }\n  if (length(trimmed_tokens) == 0) {\n    tell(actor, usage);\n    return null;\n  }\n  if (length(trimmed_tokens) > 2) {\n    tell(actor, \"Sorry, the <perms> and <owner> tail isn't ported yet — use @property <obj>.<prop> [<value>], then @chmod / @chown.\");\n    return null;\n  }\n  let spec = $code_utils:parse_propref(trimmed_tokens[1]);\n  if (typeof(spec) != \"list\") {\n    tell(actor, usage);\n    return null;\n  }\n  let obj_str = spec[1];\n  let pname = spec[2];\n  let object = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(object, obj_str)) {\n    return null;\n  }\n  let value = 0;\n  if (length(trimmed_tokens) == 2) {\n    let parsed = $string_utils:to_value(trimmed_tokens[2]);\n    if (!parsed[1]) {\n      tell(actor, \"Syntax error in initial value: \" + trimmed_tokens[2]);\n      return null;\n    }\n    value = parsed[2];\n  }\n  // LambdaCore default perms = \"rc\" (readable + clear-on-inherit). Both\n  // the substrate's add_property() and LambdaCore's add_property accept\n  // a {owner, perms} tuple as their info argument.\n  let info = { owner: actor, perms: \"rc\" };\n  try {\n    add_property(object, pname, value, info);\n    tell(actor, \"Property added with value \" + to_string(value) + \".\");\n  } except err {\n    if (err[\"code\"] == \"E_INVARG\") {\n      tell(actor, \"Property \" + obj_str + \".\" + pname + \" already exists.\");\n    } else {\n      tell(actor, err[\"message\"]);\n    }\n    return err;\n  }\n  return { ok: true, id: object, name: pname, value: value };\n}"
         },
@@ -312,12 +537,189 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "aliases": ["@rmprop*erty"],
+          "aliases": [
+            "@rmprop*erty"
+          ],
           "arg_spec": {
-            "args": ["dobjstr"],
-            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
           },
           "source": "verb :rmproperty_command(dobjstr) rxd {\n  // LambdaCore $prog:@rmproperty (#217), faithfully ported.\n  // `@rmproperty <obj>.<name>` — deletes a property defined on <obj>.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @rmproperty <object>.<property>\";\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, usage);\n    return null;\n  }\n  let spec = $code_utils:parse_propref(dobjstr);\n  if (typeof(spec) != \"list\") {\n    tell(actor, usage);\n    return null;\n  }\n  let obj_str = spec[1];\n  let pname = spec[2];\n  let object = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(object, obj_str)) {\n    return null;\n  }\n  try {\n    delete_property(object, pname);\n    tell(actor, \"Property removed.\");\n  } except err {\n    if (err[\"code\"] == \"E_PROPNF\") {\n      tell(actor, \"That object does not define that property.\");\n    } else {\n      tell(actor, err[\"message\"]);\n    }\n    return err;\n  }\n  return { ok: true, id: object, name: pname };\n}"
+        },
+        {
+          "name": "verb_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@verb"
+          ],
+          "arg_spec": {
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
+          },
+          "source": "verb :verb_command(argstr) rxd {\n  // LambdaCore $prog:@verb (#217), faithfully ported. Adds a new verb\n  // to an object. Source body starts as a no-op stub; use @program /\n  // `set_verb_code` to install code afterwards.\n  //\n  // Divergence (1): LambdaCore falls back to player.prog_option(\n  // \"verb_args\") when no argspec is supplied; woo doesn't carry that\n  // option, so the woo default is the LambdaCore L32 fallback —\n  // {\"none\",\"none\",\"none\"}.\n  //\n  // Divergence (2): LambdaCore L42-44 also accepts a trailing\n  // <perms> [<owner>] tail. That requires $string_utils:prefix_to_value\n  // and $string_utils:match_player to be ported; the initial port\n  // rejects extra tokens explicitly so a typed\n  // `@verb obj:foo this none this rxd wiz` doesn't silently lose\n  // perms/owner.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @verb <object>:<verb-name>[,<alias>...] [<dobj> [<prep> [<iobj>]]]\";\n  if (typeof(argstr) != \"string\" || str_trim(argstr) == \"\") {\n    tell(actor, usage);\n    return null;\n  }\n  let raw_tokens = str_split(str_trim(argstr), \" \");\n  let tokens = [];\n  for t in raw_tokens {\n    let s = str_trim(t);\n    if (s != \"\") { tokens = tokens + [s]; }\n  }\n  if (length(tokens) < 1) { tell(actor, usage); return null; }\n  let spec = $code_utils:parse_verbref(tokens[1]);\n  if (typeof(spec) != \"list\") { tell(actor, usage); return null; }\n  let obj_str = spec[1];\n  let verb_def = spec[2];\n  let object = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(object, obj_str)) { return null; }\n  let arg_tokens = [];\n  let ntot = length(tokens);\n  if (ntot > 1) { for i in [2..ntot] { arg_tokens = arg_tokens + [tokens[i]]; } }\n  let parsed = $code_utils:parse_argspec(arg_tokens);\n  if (typeof(parsed) == \"string\") { tell(actor, parsed); return null; }\n  let verbargs = parsed[1];\n  let leftover = parsed[2];\n  if (length(verbargs) == 0) { verbargs = [\"none\", \"none\", \"none\"]; }\n  if (length(leftover) > 0) {\n    tell(actor, \"Sorry, the <perms> and <owner> tail isn't ported yet — use @verb <obj>:<name> [<dobj> <prep> <iobj>], then @chmod / @chown.\");\n    return null;\n  }\n  let names = str_split(verb_def, \",\");\n  let trimmed_names = [];\n  for n in names { let nt = str_trim(n); if (nt != \"\") { trimmed_names = trimmed_names + [nt]; } }\n  if (length(trimmed_names) == 0) { tell(actor, usage); return null; }\n  let main_name = trimmed_names[1];\n  let aliases = [];\n  let nlen = length(trimmed_names);\n  if (nlen > 1) { for i in [2..nlen] { aliases = aliases + [trimmed_names[i]]; } }\n  let default_perms = \"rd\";\n  if (verbargs[1] == \"this\") { if (verbargs[2] == \"none\") { if (verbargs[3] == \"this\") { default_perms = \"rxd\"; } } }\n  let info = { name: main_name, owner: actor, perms: default_perms };\n  if (length(aliases) > 0) { info[\"aliases\"] = aliases; }\n  info[\"arg_spec\"] = { args: [], command: { dobj: verbargs[1], prep: verbargs[2], iobj: verbargs[3] } };\n  let result = null;\n  try {\n    result = add_verb(object, info);\n  } except err {\n    tell(actor, err[\"message\"]);\n    return err;\n  }\n  tell(actor, \"Verb added (slot \" + to_string(result[\"slot\"]) + \").\");\n  return { ok: true, id: object, name: main_name, slot: result[\"slot\"] };\n}"
+        },
+        {
+          "name": "args_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@args"
+          ],
+          "arg_spec": {
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
+          },
+          "source": "verb :args_command(argstr) rxd {\n  // LambdaCore $prog:@args (#217), faithfully ported. Sets the\n  // dobj/prep/iobj specifier on an existing verb. With no spec given,\n  // displays the current spec (LambdaCore L30-31).\n  //\n  // Divergence (1): the LambdaCore @args# variant addresses the verb by\n  // 1-indexed slot. Not exposed as a separate verb; @args accepts\n  // either name or slot via $code_utils:nth_verb_name when needed\n  // (deferred until called for).\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @args <object>:<verb> [<dobj> <prep> <iobj>]\";\n  if (typeof(argstr) != \"string\" || str_trim(argstr) == \"\") { tell(actor, usage); return null; }\n  let raw_tokens = str_split(str_trim(argstr), \" \");\n  let tokens = [];\n  for t in raw_tokens { let s = str_trim(t); if (s != \"\") { tokens = tokens + [s]; } }\n  if (length(tokens) < 1) { tell(actor, usage); return null; }\n  let spec = $code_utils:parse_verbref(tokens[1]);\n  if (typeof(spec) != \"list\") { tell(actor, usage); return null; }\n  let obj_str = spec[1];\n  let vname = spec[2];\n  let object = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(object, obj_str)) { return null; }\n  let info = null;\n  try { info = verb_info(object, vname); } except err {\n    if (err[\"code\"] == \"E_VERBNF\") { tell(actor, \"That object does not have a verb with that name.\"); return err; }\n    tell(actor, err[\"message\"]); return err;\n  }\n  let arg_tokens = [];\n  let ntot = length(tokens);\n  if (ntot > 1) { for i in [2..ntot] { arg_tokens = arg_tokens + [tokens[i]]; } }\n  let parsed = $code_utils:parse_argspec(arg_tokens);\n  if (typeof(parsed) == \"string\") { tell(actor, parsed); return null; }\n  let verbargs = parsed[1];\n  let leftover = parsed[2];\n  if (length(leftover) > 0) {\n    tell(actor, \"Extra tokens: \" + str_join(leftover, \" \"));\n    return null;\n  }\n  if (length(verbargs) == 0) {\n    let cmd = info[\"arg_spec\"][\"command\"];\n    tell(actor, info[\"name\"] + \"  \" + cmd[\"dobj\"] + \"  \" + cmd[\"prep\"] + \"  \" + cmd[\"iobj\"]);\n    return info;\n  }\n  if (length(verbargs) < 3) {\n    tell(actor, \"Argument spec must be three tokens: <dobj> <prep> <iobj>\");\n    return null;\n  }\n  let new_arg_spec = { args: info[\"arg_spec\"][\"args\"], command: { dobj: verbargs[1], prep: verbargs[2], iobj: verbargs[3] } };\n  try {\n    set_verb_info(object, vname, { arg_spec: new_arg_spec });\n    tell(actor, \"Verb arguments changed.\");\n  } except err {\n    tell(actor, err[\"message\"]); return err;\n  }\n  return { ok: true, id: object, name: vname };\n}"
+        },
+        {
+          "name": "rmverb_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@rmverb"
+          ],
+          "arg_spec": {
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
+          },
+          "source": "verb :rmverb_command(argstr) rxd {\n  // LambdaCore $prog:@rmverb (#217), faithfully ported. Deletes the\n  // first own verb whose name matches.\n  //\n  // Divergence (1): LambdaCore L26-31 disambiguates by argspec when a\n  // verb-name appears multiple times on one object. The initial port\n  // rejects an argspec tail explicitly; verb-collision disambiguation\n  // is a separate complexity that lands when a user reaches for it.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @rmverb <object>:<verb>\";\n  if (typeof(argstr) != \"string\" || str_trim(argstr) == \"\") { tell(actor, usage); return null; }\n  let raw_tokens = str_split(str_trim(argstr), \" \");\n  let tokens = [];\n  for t in raw_tokens { let s = str_trim(t); if (s != \"\") { tokens = tokens + [s]; } }\n  if (length(tokens) < 1) { tell(actor, usage); return null; }\n  let spec = $code_utils:parse_verbref(tokens[1]);\n  if (typeof(spec) != \"list\") { tell(actor, usage); return null; }\n  let obj_str = spec[1];\n  let vname = spec[2];\n  let object = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(object, obj_str)) { return null; }\n  if (length(tokens) > 1) {\n    tell(actor, \"Sorry, the <argspec> disambiguation tail isn't ported yet — @rmverb removes the first own verb whose name matches.\");\n    return null;\n  }\n  try {\n    delete_verb(object, vname);\n    tell(actor, \"Verb \" + obj_str + \":\" + vname + \" removed.\");\n  } except err {\n    if (err[\"code\"] == \"E_VERBNF\") { tell(actor, \"That object does not define that verb.\"); return err; }\n    tell(actor, err[\"message\"]); return err;\n  }\n  return { ok: true, id: object, name: vname };\n}"
+        },
+        {
+          "name": "rename_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@rename"
+          ],
+          "arg_spec": {
+            "args": [
+              "dobjstr",
+              "iobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": [
+                "to",
+                "at"
+              ],
+              "iobj": "any",
+              "args_from": [
+                "dobjstr",
+                "iobjstr"
+              ]
+            }
+          },
+          "source": "verb :rename_command(dobjstr, iobjstr) rxd {\n  // LambdaCore $root:@rename (#6, on $player), faithfully ported.\n  // Three branches dispatched on the dobjstr shape:\n  //   <obj>:<verb>   — rename a verb (set_verb_info name)\n  //   <obj>.<prop>   — rename a property (DEFERRED; see below)\n  //   <obj>          — rename an object (set_object_name)\n  //\n  // Divergence (1): woo's set_property_info doesn't support in-place\n  // rename — child objects with override values key by old name and\n  // would need migration. The property branch returns a clear pointer\n  // rather than half-implementing it.\n  //\n  // Divergence (2): LambdaCore's object branch goes through\n  // $building_utils:set_names, which accepts a comma-separated\n  // \"name,alias,...\" form and updates aliases as a side effect. The\n  // initial port handles only the bare new_name; comma forms are\n  // deferred until $building_utils:set_names lands.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @rename <object> to <name>  |  <obj>:<verb> to <name>  |  <obj>.<prop> to <name>\";\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") { tell(actor, usage); return null; }\n  if (typeof(iobjstr) != \"string\" || str_trim(iobjstr) == \"\") { tell(actor, usage); return null; }\n  let new_name = str_trim(iobjstr);\n  let vspec = $code_utils:parse_verbref(dobjstr);\n  if (typeof(vspec) == \"list\") {\n    let v_object = $match:match_object(vspec[1]);\n    if ($command_utils:object_match_failed(v_object, vspec[1])) { return null; }\n    let vname = vspec[2];\n    try {\n      set_verb_info(v_object, vname, { name: new_name });\n      tell(actor, \"Verb name changed.\");\n    } except err {\n      if (err[\"code\"] == \"E_VERBNF\") { tell(actor, \"That object does not define that verb.\"); return err; }\n      tell(actor, err[\"message\"]); return err;\n    }\n    return { ok: true, kind: \"verb\", id: v_object, old: vname, new: new_name };\n  }\n  let pspec = $code_utils:parse_propref(dobjstr);\n  if (typeof(pspec) == \"list\") {\n    tell(actor, \"Sorry, property rename isn't ported yet — use @property to add the new name and @rmproperty to remove the old (children with overrides will need migration).\");\n    return null;\n  }\n  let o_object = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(o_object, dobjstr)) { return null; }\n  if (str_index(new_name, \",\") > 0) {\n    tell(actor, \"Sorry, the comma-separated `name,alias,...` shape isn't ported yet — set object name with @rename, aliases with @set obj.aliases.\");\n    return null;\n  }\n  let old_name = o_object.name;\n  try {\n    set_object_name(o_object, new_name);\n  } except err {\n    tell(actor, err[\"message\"]); return err;\n  }\n  let id_str = o_object;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let q = str_char(34);\n  tell(actor, \"Name of \" + id_str + \" (\" + old_name + \") changed to \" + q + new_name + q + \".\");\n  return { ok: true, kind: \"object\", id: o_object, old: old_name, new: new_name };\n}"
+        },
+        {
+          "name": "list_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@list"
+          ],
+          "arg_spec": {
+            "args": [
+              "dobjstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [
+                "dobjstr"
+              ]
+            }
+          },
+          "source": "verb :list_command(dobjstr) rxd {\n  // LambdaCore $prog:@list (#217), STUB port. The full LambdaCore @list\n  // (line ranges, `with parens`, `without numbers`, `all` to walk the\n  // ancestor chain, argspec disambiguation) is 142 lines of arg-parsing;\n  // the stub just dumps source verbatim with a header line and 1-based\n  // line numbers. Range and option support land when a user reaches\n  // for them.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @list <object>:<verb>\";\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") { tell(actor, usage); return null; }\n  let spec = $code_utils:parse_verbref(dobjstr);\n  if (typeof(spec) != \"list\") { tell(actor, usage); return null; }\n  let obj_str = spec[1];\n  let vname = spec[2];\n  let object = $match:match_object(obj_str);\n  if ($command_utils:object_match_failed(object, obj_str)) { return null; }\n  let info = null;\n  try { info = verb_info(object, vname); } except err {\n    if (err[\"code\"] == \"E_VERBNF\") { tell(actor, \"That object does not define that verb.\"); return err; }\n    tell(actor, err[\"message\"]); return err;\n  }\n  let code = \"\";\n  try { code = verb_code(object, vname); } except err {\n    tell(actor, err[\"message\"]); return err;\n  }\n  let id_str = object;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let cmd = info[\"arg_spec\"][\"command\"];\n  let header = id_str + \":\" + info[\"name\"] + \"   \" + cmd[\"dobj\"] + \"  \" + cmd[\"prep\"] + \"  \" + cmd[\"iobj\"] + \"   \" + info[\"perms\"];\n  tell(actor, header);\n  let lines = str_split(code, \"\\n\");\n  let total = length(lines);\n  if (total > 0) {\n    for i in [1..total] {\n      let prefix = \" \";\n      if (i >= 10) { prefix = \"\"; }\n      tell(actor, prefix + to_string(i) + \":  \" + lines[i]);\n    }\n  }\n  return { ok: true, id: object, name: vname, line_count: total };\n}"
+        },
+        {
+          "name": "chmod_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@chmod"
+          ],
+          "arg_spec": {
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
+          },
+          "source": "verb :chmod_command(argstr) rxd {\n  // LambdaCore $prog:@chmod (#217), faithfully ported. Three shapes\n  // dispatched on the target token:\n  //   <obj>:<verb>   — set verb perms\n  //   <obj>.<prop>   — set property perms\n  //   <obj>          — set object flags (DEFERRED)\n  // <perms> may be absolute (`rxd`) or relative (`+w-x`); see\n  // $perm:apply.\n  //\n  // Divergence (1): woo doesn't carry a uniform per-object r/w/f flag\n  // string; the wizard/programmer/etc. flags are managed via has_flag.\n  // The object branch rejects with a pointer to has_flag rather than\n  // half-implementing.\n  //\n  // Divergence (2): woo's chat-parser splits a command like\n  // \"@chmod #X:foo rxd\" into (dobj=\"#X:foo rxd\", prep=none) when no\n  // preposition is present. The verb takes the whole tail as a single\n  // `argstr` and tokenizes itself; LambdaCore's args[1]/args[2] indexing\n  // works the same way.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  let usage = \"Usage: @chmod <object-or-property-or-verb> <permissions>\";\n  if (typeof(argstr) != \"string\" || str_trim(argstr) == \"\") { tell(actor, usage); return null; }\n  let raw_tokens = str_split(str_trim(argstr), \" \");\n  let tokens = [];\n  for t in raw_tokens { let s = str_trim(t); if (s != \"\") { tokens = tokens + [s]; } }\n  if (length(tokens) != 2) { tell(actor, usage); return null; }\n  let target = tokens[1];\n  let new_perms = tokens[2];\n  let vspec = $code_utils:parse_verbref(target);\n  if (typeof(vspec) == \"list\") {\n    let v_object = $match:match_object(vspec[1]);\n    if ($command_utils:object_match_failed(v_object, vspec[1])) { return null; }\n    let vname = vspec[2];\n    let vinfo = null;\n    try { vinfo = verb_info(v_object, vname); } except err {\n      if (err[\"code\"] == \"E_VERBNF\") { tell(actor, \"That object does not define that verb.\"); return err; }\n      tell(actor, err[\"message\"]); return err;\n    }\n    let v_final = \"the_perm\":apply(vinfo[\"perms\"], new_perms);\n    let vq = str_char(34);\n    try {\n      set_verb_info(v_object, vname, { perms: v_final });\n      tell(actor, \"Verb permissions set to \" + vq + v_final + vq + \".\");\n    } except err {\n      if (err[\"code\"] == \"E_INVARG\") { tell(actor, vq + v_final + vq + \" is not a valid permissions string for a verb.\"); return err; }\n      tell(actor, err[\"message\"]); return err;\n    }\n    return { ok: true, kind: \"verb\", id: v_object, name: vname, perms: v_final };\n  }\n  if (str_index(target, \".\") > 0) {\n    let pspec = $code_utils:parse_propref(target);\n    if (typeof(pspec) == \"list\") {\n      let p_object = $match:match_object(pspec[1]);\n      if ($command_utils:object_match_failed(p_object, pspec[1])) { return null; }\n      let pname = pspec[2];\n      let pinfo = null;\n      try { pinfo = property_info(p_object, pname); } except err {\n        if (err[\"code\"] == \"E_PROPNF\") { tell(actor, \"That object does not have that property.\"); return err; }\n        tell(actor, err[\"message\"]); return err;\n      }\n      let p_final = \"the_perm\":apply(pinfo[\"perms\"], new_perms);\n      let pq = str_char(34);\n      try {\n        set_property_info(p_object, pname, { perms: p_final });\n        tell(actor, \"Property permissions set to \" + pq + p_final + pq + \".\");\n      } except err {\n        if (err[\"code\"] == \"E_INVARG\") { tell(actor, pq + p_final + pq + \" is not a valid permissions string for a property.\"); return err; }\n        tell(actor, err[\"message\"]); return err;\n      }\n      return { ok: true, kind: \"property\", id: p_object, name: pname, perms: p_final };\n    }\n  }\n  let o_object = $match:match_object(target);\n  if ($command_utils:object_match_failed(o_object, target)) { return null; }\n  tell(actor, \"Sorry, object-level @chmod (r/w/f flags) isn't ported — woo manages object flags via has_flag and wizard-only setters.\");\n  return null;\n}"
+        },
+        {
+          "name": "chown_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": [
+            "@chown"
+          ],
+          "arg_spec": {
+            "args": [
+              "argstr"
+            ],
+            "command": {
+              "dobj": "any",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ]
+            }
+          },
+          "source": "verb :chown_command(argstr) rxd {\n  // LambdaCore $wiz:@chown (#218), faithfully ported. Wizard-only —\n  // verb/property owner is the execution authority, so changing it is\n  // a privilege escalation primitive. Three shapes mirror @chmod.\n  //\n  // Divergence (1): LambdaCore's object branch goes through\n  // $wiz_utils:set_owner. woo doesn't expose set_object_owner from\n  // woocode (substrate change needed); the object branch is rejected\n  // with a clear pointer.\n  //\n  // Divergence (2): woo's chat-parser splits a command like\n  // \"@chown #X:foo #Y\" into (dobj=\"#X:foo #Y\", prep=none). The verb\n  // takes the whole tail as a single `argstr` and tokenizes itself.\n  // LambdaCore's `setremove(args, \"to\")` is mirrored by stripping a\n  // leading \"to\" from the second token here.\n  \"the_perm\":requires_wizard(actor, \"wizard authority required for @chown\");\n  let usage = \"Usage: @chown <object-or-property-or-verb> <owner>\";\n  if (typeof(argstr) != \"string\" || str_trim(argstr) == \"\") { tell(actor, usage); return null; }\n  let raw_tokens = str_split(str_trim(argstr), \" \");\n  let tokens = [];\n  for t in raw_tokens { let s = str_trim(t); if (s != \"\") { tokens = tokens + [s]; } }\n  // Strip an optional \"to\" between the target and the owner.\n  let filtered = [];\n  for tk in tokens { if (tk != \"to\") { filtered = filtered + [tk]; } }\n  tokens = filtered;\n  if (length(tokens) != 2) { tell(actor, usage); return null; }\n  let target = tokens[1];\n  let owner_str = tokens[2];\n  let new_owner = $match:match_object(owner_str);\n  if ($command_utils:object_match_failed(new_owner, owner_str)) { return null; }\n  let vspec = $code_utils:parse_verbref(target);\n  if (typeof(vspec) == \"list\") {\n    let v_object = $match:match_object(vspec[1]);\n    if ($command_utils:object_match_failed(v_object, vspec[1])) { return null; }\n    let vname = vspec[2];\n    try {\n      set_verb_info(v_object, vname, { owner: new_owner });\n      tell(actor, \"Verb owner set.\");\n    } except err {\n      if (err[\"code\"] == \"E_VERBNF\") { tell(actor, \"That object does not define that verb.\"); return err; }\n      tell(actor, err[\"message\"]); return err;\n    }\n    return { ok: true, kind: \"verb\", id: v_object, name: vname, owner: new_owner };\n  }\n  if (str_index(target, \".\") > 0) {\n    let pspec = $code_utils:parse_propref(target);\n    if (typeof(pspec) == \"list\") {\n      let p_object = $match:match_object(pspec[1]);\n      if ($command_utils:object_match_failed(p_object, pspec[1])) { return null; }\n      let pname = pspec[2];\n      try {\n        set_property_info(p_object, pname, { owner: new_owner });\n        tell(actor, \"Property owner set.\");\n      } except err {\n        if (err[\"code\"] == \"E_PROPNF\") { tell(actor, \"That object does not have that property.\"); return err; }\n        tell(actor, err[\"message\"]); return err;\n      }\n      return { ok: true, kind: \"property\", id: p_object, name: pname, owner: new_owner };\n    }\n  }\n  tell(actor, \"Sorry, object @chown (changing object owner) isn't ported — needs a wizard-only set_object_owner builtin which is a separate substrate change.\");\n  return null;\n}"
         }
       ]
     },
@@ -326,7 +728,12 @@
       "parent": "$space",
       "description": "Room-like editor base class. It owns per-actor edit sessions and source-buffer lifecycle verbs. Presence, focus, wait, and any conversational behavior come from ordinary room/actor mechanics; the editor adds only view, edit, dry-run, save, pause, abort, and session introspection.",
       "properties": [
-        { "name": "sessions", "type": "map<obj,map>", "default": {}, "perms": "" }
+        {
+          "name": "sessions",
+          "type": "map<obj,map>",
+          "default": {},
+          "perms": ""
+        }
       ],
       "verbs": [
         {
@@ -334,7 +741,9 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look() rxd {\n  return { id: this, title: this.name, description: this.description, tools: [\"what()\", \"view(opts?)\", \"replace(text)\", \"insert(line, text)\", \"delete(start, end?)\", \"dry_run()\", \"save()\", \"pause()\", \"abort()\"] };\n}"
         },
         {
@@ -342,16 +751,24 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :what() rxd {\n  return editor_what();\n}"
         },
         {
           "name": "view",
-          "aliases": ["list"],
+          "aliases": [
+            "list"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["opts?"] },
+          "arg_spec": {
+            "args": [
+              "opts?"
+            ]
+          },
           "source": "verb :view(opts) rxd {\n  return editor_view(opts);\n}"
         },
         {
@@ -359,7 +776,11 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["text"] },
+          "arg_spec": {
+            "args": [
+              "text"
+            ]
+          },
           "source": "verb :replace(text) rxd {\n  return editor_replace(text);\n}"
         },
         {
@@ -367,7 +788,12 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["line", "text"] },
+          "arg_spec": {
+            "args": [
+              "line",
+              "text"
+            ]
+          },
           "source": "verb :insert(line, text) rxd {\n  return editor_insert(line, text);\n}"
         },
         {
@@ -375,7 +801,12 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["start", "end?"] },
+          "arg_spec": {
+            "args": [
+              "start",
+              "end?"
+            ]
+          },
           "source": "verb :delete(start, end) rxd {\n  return editor_delete(start, end);\n}"
         },
         {
@@ -383,7 +814,9 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :dry_run() rxd {\n  return editor_dry_run();\n}"
         },
         {
@@ -391,7 +824,9 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :save() rxd {\n  return editor_save();\n}"
         },
         {
@@ -399,7 +834,9 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :pause() rxd {\n  return editor_pause();\n}"
         },
         {
@@ -407,7 +844,9 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :abort() rxd {\n  return editor_abort();\n}"
         }
       ]
@@ -422,17 +861,101 @@
   ],
   "features": [],
   "schemas": [
-    { "on": "$builder", "type": "builder_created", "shape": { "actor": "obj", "id": "obj", "parent": "obj", "ts": "int" } },
-    { "on": "$builder", "type": "builder_chparented", "shape": { "actor": "obj", "id": "obj", "parent": "obj", "ts": "int" } },
-    { "on": "$builder", "type": "builder_recycled", "shape": { "actor": "obj", "id": "obj", "ts": "int" } },
-    { "on": "$programmer", "type": "programmer_installed", "shape": { "actor": "obj", "id": "obj", "verb": "any", "slot": "int", "version": "int", "ts": "int" } },
-    { "on": "$programmer", "type": "programmer_check_failed", "shape": { "actor": "obj", "id": "obj", "verb": "any", "diagnostics": "list<map>", "dry_run": "bool", "ts": "int" } },
-    { "on": "$programmer", "type": "programmer_verb_info_changed", "shape": { "actor": "obj", "id": "obj", "verb": "any", "slot": "int", "version": "int", "ts": "int" } },
-    { "on": "$generic_editor", "type": "editor_entered", "shape": { "actor": "obj", "editor": "obj", "target": "obj", "slot": "int|null", "ts": "int" } },
-    { "on": "$generic_editor", "type": "editor_saved", "shape": { "actor": "obj", "editor": "obj", "target": "obj", "slot": "int|null", "version": "int|null", "ts": "int" } }
+    {
+      "on": "$builder",
+      "type": "builder_created",
+      "shape": {
+        "actor": "obj",
+        "id": "obj",
+        "parent": "obj",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$builder",
+      "type": "builder_chparented",
+      "shape": {
+        "actor": "obj",
+        "id": "obj",
+        "parent": "obj",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$builder",
+      "type": "builder_recycled",
+      "shape": {
+        "actor": "obj",
+        "id": "obj",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$programmer",
+      "type": "programmer_installed",
+      "shape": {
+        "actor": "obj",
+        "id": "obj",
+        "verb": "any",
+        "slot": "int",
+        "version": "int",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$programmer",
+      "type": "programmer_check_failed",
+      "shape": {
+        "actor": "obj",
+        "id": "obj",
+        "verb": "any",
+        "diagnostics": "list<map>",
+        "dry_run": "bool",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$programmer",
+      "type": "programmer_verb_info_changed",
+      "shape": {
+        "actor": "obj",
+        "id": "obj",
+        "verb": "any",
+        "slot": "int",
+        "version": "int",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$generic_editor",
+      "type": "editor_entered",
+      "shape": {
+        "actor": "obj",
+        "editor": "obj",
+        "target": "obj",
+        "slot": "int|null",
+        "ts": "int"
+      }
+    },
+    {
+      "on": "$generic_editor",
+      "type": "editor_saved",
+      "shape": {
+        "actor": "obj",
+        "editor": "obj",
+        "target": "obj",
+        "slot": "int|null",
+        "version": "int|null",
+        "ts": "int"
+      }
+    }
   ],
   "seed_hooks": [
-    { "kind": "change_parent", "object": "$wiz", "parent": "$programmer" },
+    {
+      "kind": "change_parent",
+      "object": "$wiz",
+      "parent": "$programmer"
+    },
     {
       "kind": "create_instance",
       "class": "$verb_editor",
@@ -440,7 +963,9 @@
       "name": "Verb Editor",
       "description": "A room-like source editor for verb bodies. Actors enter through programmer edit_verb, edit a per-actor buffer, dry-run diagnostics, and save back to the target object without moving the target into the room.",
       "location": "$nowhere",
-      "properties": { "sessions": {} }
+      "properties": {
+        "sessions": {}
+      }
     }
   ]
 }
