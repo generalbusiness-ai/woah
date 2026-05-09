@@ -4001,6 +4001,7 @@ function bindPinboard() {
 
 function bindTasks() {
   mountTasksKanbanComponent();
+  bindSpaceChatPanels();
 }
 
 function mountTasksKanbanComponent() {
@@ -4010,6 +4011,14 @@ function mountTasksKanbanComponent() {
   if (!boardId) return;
   element.subject = boardId;
   element.woo = createChatWooContext(boardId);
+  if (element.dataset.tasksEventsBound !== "true") {
+    element.dataset.tasksEventsBound = "true";
+    element.addEventListener("woo-tasks-rendered", () => {
+      const nextBoardId = tasksSpace();
+      if (nextBoardId) mountToolSpaceChat(element, nextBoardId);
+    });
+  }
+  mountToolSpaceChat(element, boardId);
 }
 
 function bindSpaceChatPanels() {

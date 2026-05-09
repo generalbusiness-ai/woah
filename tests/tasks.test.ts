@@ -49,6 +49,21 @@ describe("tasks catalog", () => {
     expect(world.verbInfo("the_taskboard", "say").definer).toBe("$transparent");
   });
 
+  it("tells entrants when the registry has no policies configured", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:tasks-no-policy");
+    const entered = await world.directCall("enter-tasks", session.actor, "the_taskboard", "enter", []);
+    expect(entered.op).toBe("result");
+    if (entered.op !== "result") return;
+    expect(entered.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "text",
+        target: session.actor,
+        text: "No policies configured. Ask the registry owner to seed one."
+      })
+    ]));
+  });
+
   it("re-attaches $transparent on the_taskboard for an upgraded world that drifted", () => {
     const world = setupWorld();
     // Mimic a world that bootstrapped with the older chat-transparent migration

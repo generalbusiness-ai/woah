@@ -108,7 +108,17 @@
               "thing"
             ]
           },
-          "source": "verb :acceptable(thing) rxd { if (!isa(thing, $task)) { return false; } return thing.registry == this; }"
+          "source": "verb :acceptable(thing) rxd { if (isa(thing, $actor)) { return true; } if (!isa(thing, $task)) { return false; } return thing.registry == this; }"
+        },
+        {
+          "name": "enterfunc",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "thing"
+            ]
+          },
+          "source": "verb :enterfunc(thing) rx { let has_policy = false; for kind, keys in this.policies { has_policy = true; } if (!has_policy && thing == actor) { tell(actor, \"No policies configured. Ask the registry owner to seed one.\"); } return true; }"
         },
         {
           "name": "exitfunc",

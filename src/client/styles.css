@@ -1421,6 +1421,847 @@ input[type="range"] {
   touch-action: none;
 }
 
+.woo-tasks-workspace {
+  height: calc(100dvh - 5.25rem);
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0.8rem;
+  overflow: hidden;
+}
+
+.woo-tasks-workspace.has-space-chat {
+  height: 100%;
+}
+
+.woo-tasks-kanban-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: end;
+  padding: 0.85rem 1rem;
+  border: 1px solid #d5dcd1;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.woo-tasks-titleblock {
+  min-width: 0;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.woo-tasks-kanban-header h2 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 1.05rem;
+}
+
+.woo-tasks-status-nav,
+.woo-tasks-overview-counts {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-status-nav button,
+.woo-tasks-overview-counts button {
+  min-width: 4.7rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  align-items: baseline;
+  padding: 0.35rem 0.5rem;
+  border-color: #ccd6c8;
+  background: #f8faf6;
+  color: #3f4a3d;
+  text-align: left;
+}
+
+.woo-tasks-status-nav button.active,
+.woo-tasks-overview-counts button.active {
+  border-color: #315f73;
+  background: #e8f2f5;
+  color: #173f50;
+}
+
+.woo-tasks-status-nav span,
+.woo-tasks-overview-counts span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.76rem;
+}
+
+.woo-tasks-status-nav strong,
+.woo-tasks-overview-counts strong {
+  font-size: 0.88rem;
+}
+
+.woo-tasks-kanban-toolbar {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  justify-content: end;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-primary-action {
+  border-color: #315f73;
+  background: #315f73;
+  color: #fff;
+}
+
+.woo-tasks-kanban-groupby {
+  display: inline-grid;
+  grid-template-columns: auto minmax(6.5rem, auto);
+  gap: 0.35rem;
+  align-items: center;
+  color: #5f685d;
+  font-size: 0.82rem;
+}
+
+.woo-tasks-workarea {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.8rem;
+  overflow: hidden;
+}
+
+.woo-tasks-workarea:has(.woo-tasks-detail) {
+  grid-template-columns: minmax(0, 1fr) minmax(19rem, 24rem);
+}
+
+.woo-tasks-board {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0.6rem;
+  overflow: hidden;
+}
+
+.woo-tasks-board.has-create,
+.woo-tasks-board.has-admin {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.woo-tasks-kanban-filterbar {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(0, auto) auto auto auto;
+  gap: 0.45rem;
+  align-items: center;
+  padding: 0.55rem;
+  border: 1px solid #d5dcd1;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.woo-tasks-kanban-filterbar input {
+  min-width: 0;
+}
+
+.woo-tasks-filter-chips,
+.woo-tasks-card-labels,
+.woo-tasks-rail-labels {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.woo-tasks-filter-chip {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: center;
+  max-width: 11rem;
+  padding: 0.18rem 0.28rem 0.18rem 0.45rem;
+  border: 1px solid #cbd7c5;
+  border-radius: 999px;
+  background: #f3f7f0;
+  color: #314032;
+  font-size: 0.76rem;
+}
+
+.woo-tasks-filter-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.woo-tasks-filter-chip button {
+  min-width: 1.25rem;
+  padding: 0.02rem 0.25rem;
+  border: 0;
+  background: transparent;
+}
+
+.woo-tasks-filter-count {
+  color: #687365;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.woo-tasks-filter-clear {
+  padding-inline: 0.65rem;
+}
+
+.woo-tasks-kanban {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.woo-tasks-kanban-columns {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(15.5rem, 1fr);
+  gap: 0.7rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 0.2rem;
+}
+
+.woo-tasks-kanban-col {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border: 1px solid #d5dcd1;
+  border-radius: 8px;
+  background: #f7f8f5;
+  overflow: hidden;
+}
+
+.woo-tasks-kanban-col[data-tasks-drop-target="true"] {
+  border-color: #315f73;
+  box-shadow: inset 0 0 0 2px #bdd8e1;
+}
+
+.woo-tasks-kanban-col-header {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.58rem 0.7rem;
+  border-bottom: 1px solid #d5dcd1;
+  background: #fff;
+}
+
+.woo-tasks-kanban-col-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+
+.woo-tasks-kanban-col-count {
+  min-width: 1.6rem;
+  padding: 0.12rem 0.4rem;
+  border-radius: 999px;
+  background: #eef2eb;
+  color: #526050;
+  font-size: 0.78rem;
+  text-align: center;
+}
+
+.woo-tasks-kanban-col-body {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.6rem;
+}
+
+.woo-tasks-kanban-empty-col {
+  padding: 0.75rem;
+  color: #6b7668;
+  font-size: 0.84rem;
+}
+
+.woo-tasks-card {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.65rem;
+  border: 1px solid #d4ddd0;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(43 50 42 / 0.06);
+  cursor: pointer;
+}
+
+.woo-tasks-card:hover {
+  border-color: #aab9a5;
+}
+
+.woo-tasks-card.selected {
+  border-color: #315f73;
+  box-shadow: inset 0 0 0 1px #315f73, 0 1px 2px rgb(43 50 42 / 0.06);
+}
+
+.woo-tasks-card[data-tasks-dragging="true"] {
+  opacity: 0.58;
+}
+
+.woo-tasks-card-header {
+  min-width: 0;
+}
+
+.woo-tasks-card-name {
+  margin: 0;
+  color: #263026;
+  font-size: 0.92rem;
+  line-height: 1.28;
+  overflow-wrap: anywhere;
+}
+
+.woo-tasks-card-meta {
+  display: flex;
+  gap: 0.32rem;
+  align-items: center;
+  flex-wrap: wrap;
+  color: #63705f;
+  font-size: 0.74rem;
+}
+
+.woo-tasks-card-kind,
+.woo-tasks-card-cursor,
+.woo-tasks-card-holder,
+.woo-tasks-card-age,
+.woo-tasks-detail-kind,
+.woo-tasks-detail-status {
+  max-width: 100%;
+  padding: 0.12rem 0.38rem;
+  border-radius: 999px;
+  background: #eef2eb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.woo-tasks-card-cursor {
+  background: #edf2fb;
+  color: #34466c;
+}
+
+.woo-tasks-card-holder {
+  background: #f7efe4;
+  color: #684d24;
+}
+
+.woo-tasks-card-label {
+  max-width: 9rem;
+  padding: 0.14rem 0.42rem;
+  border-radius: 999px;
+  border-color: #cbd7c5;
+  background: #f8fbf5;
+  color: #39463a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.74rem;
+}
+
+.woo-tasks-card-label.active,
+.woo-tasks-card-label:disabled {
+  border-color: #315f73;
+  background: #e8f2f5;
+  color: #173f50;
+  opacity: 1;
+}
+
+.woo-tasks-card-actions,
+.woo-tasks-prompt-actions,
+.woo-tasks-create-actions,
+.woo-tasks-detail-edit-actions {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-card-actions button {
+  min-width: 0;
+  padding: 0.3rem 0.48rem;
+  font-size: 0.76rem;
+}
+
+.woo-tasks-prompt,
+.woo-tasks-create,
+.woo-tasks-admin {
+  border: 1px solid #d5dcd1;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.woo-tasks-prompt {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  cursor: auto;
+}
+
+.woo-tasks-prompt-header {
+  font-weight: 650;
+}
+
+.woo-tasks-prompt-field,
+.woo-tasks-create-field {
+  min-width: 0;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.woo-tasks-prompt-label,
+.woo-tasks-create-label {
+  color: #5f685d;
+  font-size: 0.78rem;
+}
+
+.woo-tasks-prompt-type,
+.woo-tasks-create-hint {
+  color: #7a8577;
+  font-weight: 400;
+}
+
+.woo-tasks-prompt textarea,
+.woo-tasks-create textarea,
+.woo-tasks-detail-edit textarea {
+  min-height: 5.5rem;
+}
+
+.woo-tasks-create {
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  align-items: stretch;
+  padding: 0.85rem;
+  overflow: auto;
+}
+
+.woo-tasks-create-head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.woo-tasks-create-head h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.woo-tasks-create-head button {
+  align-self: center;
+  min-width: 2.15rem;
+  padding-inline: 0.45rem;
+}
+
+.woo-tasks-create-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) minmax(8rem, 12rem) minmax(12rem, 0.8fr);
+  gap: 0.65rem;
+  align-items: end;
+}
+
+.woo-tasks-create-body {
+  min-height: 0;
+}
+
+.woo-tasks-create-body textarea {
+  min-height: 16rem;
+  height: 100%;
+  resize: none;
+}
+
+.woo-tasks-create-actions {
+  align-self: start;
+  justify-content: end;
+}
+
+.woo-tasks-detail {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  grid-auto-rows: max-content;
+  gap: 0.75rem;
+  padding: 0.85rem;
+  border: 1px solid #d5dcd1;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.woo-tasks-detail-header {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: start;
+}
+
+.woo-tasks-detail-header h3 {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 1rem;
+}
+
+.woo-tasks-detail-header > button {
+  min-width: 2rem;
+  padding-inline: 0.4rem;
+}
+
+.woo-tasks-detail-meta,
+.woo-tasks-detail-labels {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-detail-section,
+.woo-tasks-detail-waitfor,
+.woo-tasks-detail-links {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.woo-tasks-detail-section h4,
+.woo-tasks-detail-waitfor h4,
+.woo-tasks-detail-links h4 {
+  margin: 0;
+  color: #566152;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.woo-tasks-detail-text-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+.woo-tasks-detail-text {
+  padding: 0.65rem;
+  border: 1px solid #e1e6de;
+  border-radius: 6px;
+  background: #fafbf8;
+  color: #2c352b;
+  line-height: 1.4;
+}
+
+.woo-tasks-detail-empty,
+.woo-tasks-detail-empty-inline,
+.woo-tasks-admin-empty {
+  margin: 0;
+  color: #697366;
+  font-size: 0.84rem;
+}
+
+.woo-tasks-detail-edit-icon {
+  min-width: 1.75rem;
+  padding: 0.15rem 0.35rem;
+  margin-left: 0.25rem;
+  border-color: transparent;
+  background: transparent;
+}
+
+.woo-tasks-detail-edit {
+  min-width: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.woo-tasks-detail-obligations,
+.woo-tasks-detail-log {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.38rem;
+  list-style: none;
+}
+
+.woo-tasks-detail-obligation,
+.woo-tasks-detail-log-entry {
+  min-width: 0;
+  display: grid;
+  gap: 0.25rem;
+  align-items: center;
+  padding: 0.45rem;
+  border: 1px solid #e0e6dd;
+  border-radius: 6px;
+  background: #fafbf8;
+}
+
+.woo-tasks-detail-obligation {
+  grid-template-columns: 1.4rem minmax(0, 1fr);
+}
+
+.woo-tasks-detail-obligation.current {
+  border-color: #315f73;
+  background: #f1f8fa;
+}
+
+.woo-tasks-detail-obligation.met {
+  color: #546053;
+}
+
+.woo-tasks-detail-obligation-flag {
+  text-align: center;
+}
+
+.woo-tasks-detail-obligation-key,
+.woo-tasks-detail-log-outcome {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 650;
+}
+
+.woo-tasks-detail-obligation-role,
+.woo-tasks-detail-obligation-criterion {
+  grid-column: 2;
+  color: #677364;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.woo-tasks-detail-log-entry {
+  grid-template-columns: minmax(5rem, auto) minmax(4rem, auto) minmax(0, 1fr);
+  font-size: 0.8rem;
+}
+
+.woo-tasks-detail-log-ts,
+.woo-tasks-detail-log-actor {
+  color: #697366;
+}
+
+.woo-tasks-detail-log-key,
+.woo-tasks-detail-log-why {
+  grid-column: 3;
+  color: #697366;
+  overflow-wrap: anywhere;
+}
+
+.woo-tasks-overview-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.woo-tasks-overview-counts button {
+  width: 100%;
+}
+
+.woo-tasks-admin {
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+  gap: 0.75rem;
+  padding: 0.85rem;
+  overflow: hidden;
+}
+
+.woo-tasks-admin-main,
+.woo-tasks-admin-editor {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  gap: 0.55rem;
+  align-content: start;
+}
+
+.woo-tasks-admin-main {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.woo-tasks-admin-editor {
+  overflow: auto;
+  padding: 0.75rem;
+  border: 1px solid #dce2d8;
+  border-radius: 8px;
+  background: #fbfcfa;
+}
+
+.woo-tasks-admin-head {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.65rem;
+  align-items: start;
+}
+
+.woo-tasks-admin-head > button {
+  min-width: 2rem;
+  padding-inline: 0.4rem;
+}
+
+.woo-tasks-admin-tabs {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-admin-tabs button {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.woo-tasks-admin-tabs button.active {
+  border-color: #315f73;
+  background: #e8f4f7;
+  color: #254d5f;
+}
+
+.woo-tasks-admin-listhead,
+.woo-tasks-admin-editor-head {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.65rem;
+  align-items: center;
+}
+
+.woo-tasks-admin-listhead h3,
+.woo-tasks-admin-editor-head h3 {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+.woo-tasks-admin-editor-head button {
+  min-width: 2rem;
+  padding-inline: 0.4rem;
+}
+
+.woo-tasks-admin-tablewrap {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #e0e6dd;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.woo-tasks-admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.woo-tasks-admin-table th,
+.woo-tasks-admin-table td {
+  padding: 0.45rem 0.55rem;
+  border-bottom: 1px solid #edf1ea;
+  text-align: left;
+  vertical-align: top;
+}
+
+.woo-tasks-admin-table th {
+  position: sticky;
+  top: 0;
+  background: #f7f9f5;
+  color: #566152;
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  z-index: 1;
+}
+
+.woo-tasks-admin-table td {
+  max-width: 18rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.woo-tasks-admin-table td:last-child,
+.woo-tasks-admin-table th:last-child {
+  width: 1%;
+  text-align: right;
+}
+
+.woo-tasks-admin-table button {
+  padding: 0.22rem 0.45rem;
+}
+
+.woo-tasks-admin-form {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.woo-tasks-admin-form label {
+  min-width: 0;
+  display: grid;
+  gap: 0.25rem;
+  color: #596356;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.woo-tasks-admin-form input,
+.woo-tasks-admin-form select,
+.woo-tasks-admin-form button {
+  min-width: 0;
+}
+
+.woo-tasks-admin-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.woo-tasks-danger-action {
+  margin-right: auto;
+  border-color: #ddb8b2;
+  background: #fff5f3;
+  color: #8a3428;
+}
+
+.woo-tasks-admin-status {
+  margin: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid #d7ded4;
+  border-radius: 6px;
+  background: #f7f9f5;
+  color: #475144;
+  font-size: 0.8rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.woo-tasks-admin-status.pending {
+  border-color: #c8d7df;
+  background: #f1f8fa;
+  color: #315f73;
+}
+
+.woo-tasks-admin-status.success {
+  border-color: #b9d6bf;
+  background: #f0f8f1;
+  color: #2d653d;
+}
+
+.woo-tasks-admin-status.error {
+  border-color: #ddb8b2;
+  background: #fff5f3;
+  color: #8a3428;
+}
+
 .presence-list {
   display: grid;
   gap: 0.45rem;
@@ -1577,6 +2418,61 @@ textarea {
     grid-template-columns: 1fr;
   }
 
+  .woo-tasks-workspace {
+    height: auto;
+    overflow: visible;
+  }
+
+  .woo-tasks-kanban-header,
+  .woo-tasks-workarea {
+    grid-template-columns: 1fr;
+  }
+
+  .woo-tasks-kanban-toolbar {
+    justify-content: start;
+  }
+
+  .woo-tasks-board {
+    overflow: visible;
+  }
+
+  .woo-tasks-admin {
+    grid-template-columns: 1fr;
+    overflow: visible;
+  }
+
+  .woo-tasks-kanban {
+    min-height: 34rem;
+  }
+
+  .woo-tasks-detail {
+    max-height: none;
+  }
+
+  .woo-tasks-admin {
+    grid-template-columns: 1fr;
+  }
+
+  .woo-tasks-create {
+    min-height: 30rem;
+  }
+
+  .woo-tasks-create-row {
+    grid-template-columns: 1fr;
+  }
+
+  .woo-tasks-create-body textarea {
+    min-height: 14rem;
+  }
+
+  .woo-tasks-kanban-filterbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .woo-tasks-filter-chips {
+    grid-column: 1 / -1;
+  }
+
   .chat-layout {
     grid-template-columns: 1fr;
   }
@@ -1631,6 +2527,38 @@ textarea {
   .filter-strip button {
     padding-inline: 0.2rem;
     font-size: 0.72rem;
+  }
+
+  .woo-tasks-kanban-header {
+    padding: 0.7rem;
+  }
+
+  .woo-tasks-status-nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .woo-tasks-status-nav button,
+  .woo-tasks-overview-counts button {
+    min-width: 0;
+  }
+
+  .woo-tasks-kanban-columns {
+    grid-auto-columns: minmax(82vw, 1fr);
+  }
+
+  .woo-tasks-card-actions button,
+  .woo-tasks-kanban-toolbar button {
+    min-height: 2rem;
+  }
+
+  .woo-tasks-detail-log-entry {
+    grid-template-columns: 1fr;
+  }
+
+  .woo-tasks-detail-log-key,
+  .woo-tasks-detail-log-why {
+    grid-column: auto;
   }
 
   .pitch-dial {

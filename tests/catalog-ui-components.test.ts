@@ -235,13 +235,21 @@ describe("bundled catalog UI components", () => {
       obligations: [{ key: "do:it", role: "doer", criterion: "Done." }],
       policiesMap: { task: ["do:it"] }
     };
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
 
     // Toggle open the admin panel.
     element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
-    const panel = element.querySelector("[data-tasks-admin-form='role']") as HTMLFormElement | null;
+    const panel = element.querySelector(".woo-tasks-admin-main");
     expect(panel).not.toBeNull();
+    expect(element.querySelector<HTMLButtonElement>("[data-tasks-create-open]")).toBeNull();
+    expect(element.querySelector<HTMLButtonElement>(".woo-tasks-admin-head [data-tasks-admin-toggle]")).not.toBeNull();
+    expect(element.querySelector("[data-tasks-filter-text]")).toBeNull();
+    expect(element.querySelector("[data-tasks-col]")).toBeNull();
+    expect(element.querySelector(".woo-tasks-admin-table")).not.toBeNull();
+    expect(element.querySelector("[data-tasks-admin-form='role']")).toBeNull();
 
     // Add a role.
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="role"]')!.click();
     const roleForm = element.querySelector("[data-tasks-admin-form='role']") as HTMLFormElement;
     roleForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = "reviewer";
     roleForm.querySelector<HTMLInputElement>('input[name="description"]')!.value = "Reviews work";
@@ -250,8 +258,11 @@ describe("bundled catalog UI components", () => {
     await flush();
     const setRole = calls.find((c) => c.verb === "set_role");
     expect(setRole?.args).toEqual(["reviewer", { description: "Reviews work", owners: ["guest_a", "guest_b"] }]);
+    expect(element.textContent).toContain('Saved role "reviewer".');
 
     // Add an obligation.
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="obligation"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="obligation"]')!.click();
     const obForm = element.querySelector("[data-tasks-admin-form='obligation']") as HTMLFormElement;
     obForm.querySelector<HTMLInputElement>('input[name="key"]')!.value = "review:approve";
     obForm.querySelector<HTMLSelectElement>('select[name="role"]')!.value = "doer";
@@ -260,8 +271,11 @@ describe("bundled catalog UI components", () => {
     await flush();
     const setOb = calls.find((c) => c.verb === "set_obligation");
     expect(setOb?.args).toEqual(["review:approve", { role: "doer", criterion: "Reviewer approves." }]);
+    expect(element.textContent).toContain('Saved obligation "review:approve".');
 
     // Add a policy.
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="policy"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="policy"]')!.click();
     const polForm = element.querySelector("[data-tasks-admin-form='policy']") as HTMLFormElement;
     polForm.querySelector<HTMLInputElement>('input[name="kind"]')!.value = "review";
     polForm.querySelector<HTMLInputElement>('input[name="keys"]')!.value = "do:it, review:approve";
@@ -269,15 +283,195 @@ describe("bundled catalog UI components", () => {
     await flush();
     const setPol = calls.find((c) => c.verb === "set_policy");
     expect(setPol?.args).toEqual(["review", ["do:it", "review:approve"]]);
+    expect(element.textContent).toContain('Saved policy "review".');
 
-    // Remove buttons fire the matching remove_* verbs with the targeted key.
+    // Remove buttons confirm first, then fire the matching remove_* verbs with the targeted key.
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="role"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-edit="role"][data-key="doer"]')!.click();
+    expect(element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')).not.toBeNull();
+    confirmSpy.mockReturnValueOnce(false);
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')!.click();
+    expect(confirmSpy).toHaveBeenCalledWith('Remove role "doer"?');
+    expect(calls.find((c) => c.verb === "remove_role")).toBeUndefined();
+
+    confirmSpy.mockReturnValue(true);
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="obligation"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-edit="obligation"][data-key="do:it"]')!.click();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="obligation"][data-key="do:it"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="policy"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-edit="policy"][data-key="task"]')!.click();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="policy"][data-key="task"]')!.click();
     await flush();
     expect(calls.find((c) => c.verb === "remove_role")?.args).toEqual(["doer"]);
     expect(calls.find((c) => c.verb === "remove_obligation")?.args).toEqual(["do:it"]);
     expect(calls.find((c) => c.verb === "remove_policy")?.args).toEqual(["task"]);
+    expect(element.textContent).toContain('Removed policy "task".');
+    expect(confirmSpy).toHaveBeenCalledWith('Remove obligation "do:it"?');
+    expect(confirmSpy).toHaveBeenCalledWith('Remove policy "task"?');
+    confirmSpy.mockRestore();
+  });
+
+  it("admin overlay reports failed add/update calls", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    const woo: WooContext = {
+      actor: "$wiz",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: "Taskboard", owner: "$wiz", props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "set_role") throw new Error("not allowed");
+        if (verb === "listing") return [];
+        return null;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "$wiz",
+      actorNames: {},
+      tasks: [],
+      policies: ["task"],
+      isOwner: true,
+      roles: [],
+      obligations: [],
+      policiesMap: {}
+    };
+
+    element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="role"]')!.click();
+    const roleForm = element.querySelector("[data-tasks-admin-form='role']") as HTMLFormElement;
+    roleForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = "reviewer";
+    roleForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await flush();
+
+    const status = element.querySelector(".woo-tasks-admin-status.error");
+    expect(status?.textContent).toContain('Could not save role "reviewer": not allowed');
+  });
+
+  it("preserves create and admin drafts across task refresh renders", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = testWooContext({ guest_1: "Guest 1" });
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    const data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [],
+      policies: ["task", "bug"],
+      isOwner: true,
+      roles: [{ name: "doer", description: "Does", owners: ["guest_1"] }],
+      obligations: [{ key: "do:it", role: "doer", criterion: "Done." }],
+      policiesMap: { task: ["do:it"] }
+    };
+    element.data = data;
+
+    element.querySelector<HTMLButtonElement>("[data-tasks-create-open]")!.click();
+    const create = element.querySelector<HTMLFormElement>("[data-tasks-create]")!;
+    create.querySelector<HTMLSelectElement>('select[name="kind"]')!.value = "bug";
+    create.querySelector<HTMLSelectElement>('select[name="kind"]')!.dispatchEvent(new Event("change", { bubbles: true }));
+    create.querySelector<HTMLInputElement>('input[name="name"]')!.value = "Half typed task";
+    create.querySelector<HTMLInputElement>('input[name="name"]')!.dispatchEvent(new Event("input", { bubbles: true }));
+    create.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!.value = "draft body";
+    create.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!.dispatchEvent(new Event("input", { bubbles: true }));
+    create.querySelector<HTMLInputElement>('input[name="labels"]')!.value = "frontend, urgent";
+    create.querySelector<HTMLInputElement>('input[name="labels"]')!.dispatchEvent(new Event("input", { bubbles: true }));
+
+    // Opening admin closes create, but the create draft should survive reopening.
+    element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
+    expect(element.querySelector("[data-tasks-create]")).toBeNull();
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="role"]')!.click();
+    const roleForm = element.querySelector<HTMLFormElement>("[data-tasks-admin-form='role']")!;
+    roleForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = "reviewer";
+    roleForm.querySelector<HTMLInputElement>('input[name="name"]')!.dispatchEvent(new Event("input", { bubbles: true }));
+
+    // Simulate the polling refresh repainting with fresh data.
+    element.data = data;
+
+    expect(element.querySelector<HTMLInputElement>("[data-tasks-admin-form='role'] input[name='name']")!.value).toBe("reviewer");
+    expect(element.querySelector<HTMLButtonElement>("[data-tasks-create-open]")).toBeNull();
+
+    element.querySelector<HTMLButtonElement>(".woo-tasks-admin-head [data-tasks-admin-toggle]")!.click();
+    expect(element.querySelector("[data-tasks-admin-form='role']")).toBeNull();
+    expect(element.querySelector<HTMLButtonElement>("[data-tasks-create-open]")).not.toBeNull();
+    element.querySelector<HTMLButtonElement>("[data-tasks-create-open]")!.click();
+    const createAfter = element.querySelector<HTMLFormElement>("[data-tasks-create]")!;
+    expect(createAfter.querySelector<HTMLSelectElement>('select[name="kind"]')!.value).toBe("bug");
+    expect(createAfter.querySelector<HTMLInputElement>('input[name="name"]')!.value).toBe("Half typed task");
+    expect(createAfter.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!.value).toBe("draft body");
+    expect(createAfter.querySelector<HTMLInputElement>('input[name="labels"]')!.value).toBe("frontend, urgent");
+  });
+
+  it("defers refresh repaint while a tasks input is focused", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; refresh?: () => Promise<void>; data?: any };
+    const baseData = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [],
+      policies: ["task", "bug"],
+      isOwner: true,
+      roles: [],
+      obligations: [],
+      policiesMap: {}
+    };
+    const listing = [
+      { task: "obj_t_new", name: "Server side update", kind: "task", labels: [], location: "the_taskboard", cursor_role: null, wait_for_count: 0, terminal: false, complete: false, link_count: 0, age_ms: 0, last_change: 0 }
+    ];
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard refreshed" : ref, props: { policies: { task: [] } }, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "listing") return listing;
+        if (verb === "available_actions") return [];
+        return undefined;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    element.setAttribute("refresh-interval-ms", "0");
+    document.body.appendChild(element);
+    element.data = baseData;
+
+    element.querySelector<HTMLButtonElement>("[data-tasks-create-open]")!.click();
+    const nameInput = element.querySelector<HTMLInputElement>("[data-tasks-create] input[name='name']")!;
+    nameInput.focus();
+    nameInput.value = "typing is still here";
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await element.refresh!();
+
+    expect(document.activeElement).toBe(nameInput);
+    expect(element.querySelector<HTMLInputElement>("[data-tasks-create] input[name='name']")).toBe(nameInput);
+    expect(nameInput.value).toBe("typing is still here");
+    expect(element.querySelector("h2")?.textContent).toBe("Taskboard");
+
+    nameInput.blur();
+    await Promise.resolve();
+    expect(element.querySelector("h2")?.textContent).toBe("Taskboard refreshed");
+    expect(element.querySelector<HTMLInputElement>("[data-tasks-create] input[name='name']")?.value).toBe("typing is still here");
   });
 
   it("inline-edits name, body, and labels in the detail panel", async () => {
@@ -489,6 +683,10 @@ describe("bundled catalog UI components", () => {
     openBtn!.click();
     const form = element.querySelector<HTMLFormElement>("[data-tasks-create]");
     expect(form).not.toBeNull();
+    expect(element.querySelector("[data-tasks-filter-text]")).toBeNull();
+    expect(element.querySelector("[data-tasks-col]")).toBeNull();
+    expect(Array.from(form!.querySelectorAll(".woo-tasks-create-row [name]")).map((input) => (input as HTMLInputElement | HTMLSelectElement).name)).toEqual(["name", "kind", "labels"]);
+    expect(form!.querySelector(".woo-tasks-create-body textarea[name='text']")).not.toBeNull();
     const kindSelect = form!.querySelector<HTMLSelectElement>('select[name="kind"]')!;
     expect(Array.from(kindSelect.options).map((opt) => opt.value)).toEqual(["task", "bug"]);
     kindSelect.value = "bug";
@@ -759,6 +957,8 @@ describe("bundled catalog UI components", () => {
     };
 
     expect(element.querySelector("h2")?.textContent).toBe("Taskboard");
+    expect(element.querySelector('[data-space-chat-shell="the_taskboard"]')).not.toBeNull();
+    expect(element.querySelector("[data-tool-space-chat]")).not.toBeNull();
     const colCounts = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((col) => ({
       id: col.dataset.tasksCol,
       count: col.querySelector<HTMLElement>("[data-tasks-col-count]")?.textContent
@@ -766,10 +966,32 @@ describe("bundled catalog UI components", () => {
     expect(colCounts).toEqual([
       { id: "ready", count: "1" },
       { id: "waiting", count: "1" },
+      { id: "in_flight", count: "1" }
+    ]);
+    expect(element.querySelector('[data-tasks-col="done"]')).toBeNull();
+    expect(element.querySelector('[data-tasks-col="dropped"]')).toBeNull();
+
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="done"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="dropped"]')!.click();
+    const allColCounts = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((col) => ({
+      id: col.dataset.tasksCol,
+      count: col.querySelector<HTMLElement>("[data-tasks-col-count]")?.textContent
+    }));
+    expect(allColCounts).toEqual([
+      { id: "ready", count: "1" },
+      { id: "waiting", count: "1" },
       { id: "in_flight", count: "1" },
       { id: "done", count: "1" },
       { id: "dropped", count: "1" }
     ]);
+
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="ready"]')!.click();
+    const toggledCols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(toggledCols).toEqual(["waiting", "in_flight", "done", "dropped"]);
+
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="ready"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="done"]')!.click();
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="dropped"]')!.click();
 
     const readyCard = element.querySelector<HTMLElement>("[data-tasks-col=\"ready\"] [data-tasks-card]");
     expect(readyCard?.dataset.tasksCard).toBe("obj_t_ready");
@@ -810,34 +1032,43 @@ describe("bundled catalog UI components", () => {
       sel.dispatchEvent(new Event("change", { bubbles: true }));
     };
 
-    // default: state grouping; 5 columns
+    // default: state grouping; active columns only
     let cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
-    expect(cols).toEqual(["ready", "waiting", "in_flight", "done", "dropped"]);
+    expect(cols).toEqual(["ready", "waiting", "in_flight"]);
 
     expect(element.querySelector<HTMLSelectElement>("[data-tasks-group-by]")?.value).toBe("state");
 
-    // group by role: distinct cursor roles
+    // status controls toggle visible state columns in state grouping
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="ready"]')!.click();
+    cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(cols).toEqual(["waiting", "in_flight"]);
+
+    // group by role: filtered to the selected states (waiting + in-flight)
     setGroup("role");
     cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
-    expect(cols).toEqual(["doer", "reviewer"]);
+    expect(cols).toEqual(["doer"]);
     const doerCol = element.querySelector<HTMLElement>("[data-tasks-col=\"doer\"]")!;
-    expect(doerCol.querySelectorAll("[data-tasks-card]").length).toBe(2);
+    expect(doerCol.querySelectorAll("[data-tasks-card]").length).toBe(1);
 
-    // group by holder: registry first, then guest_2
+    // group by holder: state toggle remains a task filter
     setGroup("holder");
     cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
-    expect(cols).toEqual(["", "guest_2"]);
-    const inRegCol = element.querySelector<HTMLElement>("[data-tasks-col=\"\"]")!;
-    expect(inRegCol.querySelector(".woo-tasks-kanban-col-name")?.textContent).toBe("in registry");
+    expect(cols).toEqual(["guest_2"]);
     const guest2Col = element.querySelector<HTMLElement>("[data-tasks-col=\"guest_2\"]")!;
     expect(guest2Col.querySelector(".woo-tasks-kanban-col-name")?.textContent).toBe("Guest 2");
 
     // group by kind
     setGroup("kind");
     cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
+    expect(cols).toEqual(["bug"]);
+
+    element.querySelector<HTMLButtonElement>('[data-tasks-status-filter="ready"]')!.click();
+    expect(element.querySelector<HTMLSelectElement>("[data-tasks-group-by]")?.value).toBe("kind");
+    cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
     expect(cols).toEqual(["bug", "task"]);
 
     // when not in state mode, cards lose the draggable attribute even if their actions include claim
+    setGroup("kind");
     element.data = {
       registryId: "the_taskboard",
       registryName: "Taskboard",
