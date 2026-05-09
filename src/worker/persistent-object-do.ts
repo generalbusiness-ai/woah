@@ -1016,17 +1016,27 @@ export class PersistentObjectDO {
   }
 
   private async registerRoutes(routes: Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>): Promise<boolean> {
-    if (routes.length === 0) return true;
+    // Per-frame dedup: skip routes whose (id → host) mapping is already
+    // published by this DO. Without this filter, every session register,
+    // every cross-host call's `registerRemoteObjectRoutes`, and every
+    // single-route adopt path fired a signed RPC even when the directory
+    // would have written zero rows. The directory's `register-objects`
+    // metric showed `routes:1 writes:0` on basically every call — the
+    // round-trip itself was the cost. We still emit when any route is
+    // new or has changed host (e.g. host-placement migration moves an
+    // object), so directory acceleration stays current.
+    const fresh = routes.filter((route) => this.publishedRoutes.get(route.id) !== route.host);
+    if (fresh.length === 0) return true;
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-objects`, {
         method: "POST",
         headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ routes })
+        body: JSON.stringify({ routes: fresh })
       }));
       const response = await this.env.DIRECTORY.get(id).fetch(request);
       if (!response.ok) throw new Error(`Directory register-objects failed: ${response.status}`);
-      for (const route of routes) {
+      for (const route of fresh) {
         this.routeCache.set(route.id, route.host);
         this.publishedRoutes.set(route.id, route.host);
       }
