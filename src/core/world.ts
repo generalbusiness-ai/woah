@@ -1564,6 +1564,7 @@ export class WooWorld {
         defined_on: objRef,
         type_hint: "obj",
         version: 1,
+        value_version: 1,
         has_value: true
       };
     }
@@ -1590,6 +1591,7 @@ export class WooWorld {
           defined_on: objRef,
           type_hint: "str",
           version: 1,
+          value_version: 1,
           has_value: true
         };
       }
@@ -1606,6 +1608,13 @@ export class WooWorld {
           defined_on: current,
           type_hint: def.typeHint ?? null,
           version: def.version,
+          // value_version bumps on every write (per setPropLocal),
+          // independently of the def version. Catalog code uses this
+          // field for optimistic-concurrency checks (e.g. @set's
+          // opts.expected_version): the def version doesn't change
+          // when a value is updated, so it isn't the right key for
+          // stale-write rejection.
+          value_version: this.object(objRef).propertyVersions.get(name) ?? 0,
           has_value: this.object(objRef).properties.has(name)
         };
       }
@@ -1613,13 +1622,15 @@ export class WooWorld {
     }
     const target = this.object(objRef);
     if (target.properties.has(name)) {
+      const valueVersion = target.propertyVersions.get(name) ?? 1;
       return {
         name,
         owner: target.owner,
         perms: "r",
         defined_on: objRef,
         type_hint: null,
-        version: target.propertyVersions.get(name) ?? 1,
+        version: valueVersion,
+        value_version: valueVersion,
         has_value: true
       };
     }

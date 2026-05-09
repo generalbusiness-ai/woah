@@ -155,7 +155,10 @@ const BUILTINS = new Set([
   // Authoring aggregations.
   "authoring_inspect", "authoring_search",
   // Object identity edits.
-  "set_object_name"
+  "set_object_name",
+  // Cross-host detection (catalog authoring surfaces use it to refuse
+  // remote writes with E_CROSS_HOST_WRITE before reaching SET_PROP).
+  "is_remote_object"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 

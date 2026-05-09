@@ -870,6 +870,96 @@ describe("review-cycle 2 conformance fixes", () => {
   });
 });
 
+describe("P1-move review fixes (expected_version + cross-host)", () => {
+  it("$builder:set_property honors opts.expected_version against the value version", async () => {
+    const world = createWorld();
+    const created = await world.directCall(
+      "p1ev-create",
+      "$wiz",
+      "$wiz",
+      "create_command",
+      ["$thing named ev_target"]
+    );
+    if (created.op !== "result") throw new Error("create failed");
+    const id = (created.result as { id: string }).id;
+    await world.directCall("p1ev-addprop", "$wiz", "$wiz", "property_command", [`#${id}.counter 0`]);
+    // First write succeeds with expected_version=1 (substrate inits
+    // value version to 1 on define).
+    const ok = await world.directCall(
+      "p1ev-set-ok",
+      "$wiz",
+      "$builder",
+      "set_property",
+      [id, "counter", 5, { expected_version: 1 }]
+    );
+    expect(ok.op).toBe("result");
+    if (ok.op !== "result") return;
+    expect(ok.result).toMatchObject({ ok: true, name: "counter" });
+    // Second write expecting the now-stale version=1 must reject.
+    const stale = await world.directCall(
+      "p1ev-set-stale",
+      "$wiz",
+      "$builder",
+      "set_property",
+      [id, "counter", 99, { expected_version: 1 }]
+    );
+    expect(stale.op).toBe("error");
+    if (stale.op !== "error") return;
+    expect(stale.error.code).toBe("E_VERSION");
+    const info = world.propertyInfo(id, "counter") as any;
+    expect(info.value_version).toBeGreaterThanOrEqual(2);
+    // Counter remained at 5.
+    expect(world.getProp(id, "counter")).toBe(5);
+  });
+
+  it("$builder:set_property returns the value version (not the def version)", async () => {
+    const world = createWorld();
+    const created = await world.directCall(
+      "p1vv-create",
+      "$wiz",
+      "$wiz",
+      "create_command",
+      ["$thing named vv_target"]
+    );
+    if (created.op !== "result") throw new Error("create failed");
+    const id = (created.result as { id: string }).id;
+    await world.directCall("p1vv-addprop", "$wiz", "$wiz", "property_command", [`#${id}.counter 0`]);
+    const r = await world.directCall(
+      "p1vv-set",
+      "$wiz",
+      "$builder",
+      "set_property",
+      [id, "counter", 7, {}]
+    );
+    expect(r.op).toBe("result");
+    if (r.op !== "result") return;
+    const result = r.result as any;
+    // After one write: value version is 2 (init=1, bump on SET_PROP).
+    // Def version stays at 1 — the catalog returns the value version
+    // because that's the key callers use for optimistic concurrency.
+    expect(result.version).toBe(2);
+    expect(result.info.value_version).toBe(2);
+    expect(result.info.version).toBe(1);
+  });
+
+  it("property_info returns value_version alongside the def version", async () => {
+    const world = createWorld();
+    const created = await world.directCall(
+      "p1pi-create",
+      "$wiz",
+      "$wiz",
+      "create_command",
+      ["$thing named pi_target"]
+    );
+    if (created.op !== "result") throw new Error("create failed");
+    const id = (created.result as { id: string }).id;
+    await world.directCall("p1pi-addprop", "$wiz", "$wiz", "property_command", [`#${id}.counter 0`]);
+    const info = world.propertyInfo(id, "counter") as any;
+    expect(info.version).toBe(1);
+    expect(info.value_version).toBe(1);
+  });
+});
+
 describe("review-cycle 3 conformance fixes", () => {
   it("to_value rejects an unterminated quoted string", async () => {
     const world = createWorld();

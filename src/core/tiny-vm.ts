@@ -164,7 +164,14 @@ export const BUILTIN_NAMES = [
   // Object-level identity edits. set_object_name keeps WooObject.name
   // and the inherited "name" property in lockstep so $root:@rename can
   // do the right thing through one call.
-  "set_object_name"
+  "set_object_name",
+  // Cross-host detection. Returns true if the object lives on another
+  // host (the bridge will route writes/reads). Catalog authoring
+  // surfaces (\$builder:set_property, etc.) refuse cross-host writes
+  // outright because the wrapper-level atomicity guarantees can't
+  // hold across a host boundary; they call this builtin first and
+  // raise E_CROSS_HOST_WRITE before reaching SET_PROP.
+  "is_remote_object"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1236,6 +1243,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "set_object_name expects object and name");
         frame.ctx.world.setObjectNameForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]));
         return null;
+      }
+      case "is_remote_object": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_remote_object expects one object");
+        return await frame.ctx.world.isRemoteObject(assertObj(builtinArgs[0]), frame.ctx.hostMemo);
       }
       default:
         throw wooError("E_INVARG", `unknown builtin: ${name}`);
