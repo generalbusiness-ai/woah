@@ -738,7 +738,7 @@ export class PersistentObjectDO {
       "next_seq", "subscribers", "operators", "last_snapshot_seq", "focus_list",
       "bootstrap_token_used", "wizard_actions", "applied_migrations",
       "catalog_migration_records", "installed_catalogs",
-      "_subscribers_scrubbed_v1"
+      "_subscribers_scrubbed_v1", "api_keys"
     ]);
     const stored = new Map(storedWorld.objects.map((o) => [o.id, o]));
     // Only fields the merge actually compares (HS2.2). children/contents

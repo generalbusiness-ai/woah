@@ -387,7 +387,17 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   // Per-host one-shot scrub marker (set by scrubStaleSubscribersOnce on
   // the receiver's local copy of $space-descendants); the gateway never
   // sees it, so the merge must not propagate-delete it from stored.
-  "_subscribers_scrubbed_v1"
+  "_subscribers_scrubbed_v1",
+  // Gateway-only auth state. Read exclusively by `authApiKey` /
+  // `createApiKeyRecord` / `revokeApiKey` (all on the gateway entry
+  // path); satellites never authenticate independently — they receive
+  // sessions stamped by the gateway. `touchApiKeyLastSeen` rewrites the
+  // map on every API-key auth, so propagating it to satellites turned
+  // every poller's auth call into a satellite snapshot. Treat it as
+  // receiver-authoritative on satellites: first cold-load takes the
+  // gateway's view, subsequent cold-loads skip even if the gateway has
+  // bumped last_seen_at.
+  "api_keys"
 ]);
 
 /** Drop "phantom" boolean fields whose persistent encoding represents

@@ -112,6 +112,7 @@ without subsequent merges stomping receiver-side ledger writes.
 |---|---|---|
 | `next_seq`, `subscribers`, `operators`, `focus_list`, `last_snapshot_seq` | `$space` instances / actors | per-host live state |
 | `bootstrap_token_used`, `wizard_actions`, `applied_migrations`, `catalog_migration_records`, `installed_catalogs` | `$system` | per-host ledger |
+| `api_keys` | `$system` | gateway-only auth state. Read by `authApiKey` / `createApiKeyRecord` / `revokeApiKey`, all of which run on the gateway; satellites never authenticate independently. `touchApiKeyLastSeen` rewrites the map on every API-key auth, so propagating it would make every poller's auth call burn a satellite snapshot. First cold-load takes the gateway's view, subsequent cold-loads skip. |
 | `_subscribers_scrubbed_v1` | `$space` descendants the receiver hosts a local copy of | per-host one-shot scrub marker (host-side scrub of stale subscribers, gated to fire once per object) |
 
 Adding to this set is a behavior change: it stops the gateway from
