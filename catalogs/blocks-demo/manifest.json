@@ -18,8 +18,7 @@
         "aliases": ["weather", "panel", "thermometer"],
         "place": "Mountain View CA",
         "timezone": "America/Los_Angeles",
-        "units": "imperial",
-        "forecast_hours": 12
+        "units": "imperial"
       }
     },
     {

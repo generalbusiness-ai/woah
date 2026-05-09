@@ -249,6 +249,99 @@ describe("woo core", () => {
     expect(remote.getProp("remote_box", "value")).toBe("changed");
   });
 
+  it("re-entrant cross-host dispatch (A→B→A) does not deadlock the host queue", async () => {
+    // Production deadlock: the_deck:look_at($wiz) dispatches look_self
+    // on $wiz (gateway-hosted). The gateway's $wiz:look_self walks
+    // $wiz.contents and dispatches :title on each item. One item is
+    // hosted on the_deck — so the gateway calls back to the_deck for
+    // the title. The_deck's queue is busy with look_at; the title
+    // dispatch queues behind it. Look_at can't progress (waiting on
+    // gateway's response); gateway can't progress (waiting on
+    // the_deck's title response). 30s E_TIMEOUT in prod tail.
+    //
+    // Fix: outbound RPC stamps the active task's chain id; the
+    // receiver's hostDispatch runs the call inline (bypassing the
+    // queue) when the inbound chain id matches its own currentTask.
+    // The fail mode without the fix is a hang — vitest's timeout
+    // turns that into a clear test failure.
+    const { world: home, actor } = authedWorld();
+    const remote = createWorld({ catalogs: false });
+    const worlds = new Map<string, WooWorld>([["home", home], ["remote", remote]]);
+    const routes = new Map<ObjRef, string>([
+      ["remote_obj", "remote"],
+      // home_obj must be routable from remote so the callback dispatch
+      // resolves; without this entry remote.dispatch falls through to
+      // its local table and trips E_OBJNF.
+      ["home_obj", "home"]
+    ]);
+    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setChainOriginPrefix("home");
+    remote.setChainOriginPrefix("remote");
+
+    home.createObject({ id: "home_obj", name: "Home", parent: "$thing", owner: actor });
+    remote.createObject({ id: "remote_obj", name: "Remote", parent: "$thing", owner: "$wiz" });
+
+    // home_obj:home_inner — the callback target. Returns a string.
+    home.addVerb("home_obj", {
+      ...bytecodeVerb(
+        "home_inner",
+        {
+          literals: ["callback-ran"],
+          num_locals: 0,
+          max_stack: 1,
+          version: 1,
+          ops: [["PUSH_LIT", 0], ["RETURN"]]
+        },
+        actor
+      ),
+      direct_callable: true
+    });
+
+    // remote_obj:remote_inner — calls back to home_obj:home_inner
+    // (this is the leg that would self-deadlock against the home queue).
+    remote.addVerb("remote_obj", {
+      ...bytecodeVerb(
+        "remote_inner",
+        {
+          literals: ["home_obj", "home_inner"],
+          num_locals: 0,
+          max_stack: 2,
+          version: 1,
+          ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["CALL_VERB", 0], ["RETURN"]]
+        },
+        "$wiz"
+      )
+    });
+
+    // home_obj:home_outer — the queued entry. Dispatches remote_inner.
+    home.addVerb("home_obj", {
+      ...bytecodeVerb(
+        "home_outer",
+        {
+          literals: ["remote_obj", "remote_inner"],
+          num_locals: 0,
+          max_stack: 2,
+          version: 1,
+          ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["CALL_VERB", 0], ["RETURN"]]
+        },
+        actor
+      ),
+      direct_callable: true
+    });
+
+    // Tight timeout: a hang here means re-entrancy isn't taking
+    // effect. With the fix, this completes in milliseconds.
+    const result = await Promise.race<unknown>([
+      home.directCall(undefined, actor, "home_obj", "home_outer", []),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("re-entrant deadlock")), 4000))
+    ]) as Awaited<ReturnType<typeof home.directCall>>;
+    if (result.op !== "result") {
+      throw new Error(`expected result, got ${result.op}: ${JSON.stringify((result as { error?: unknown }).error)}`);
+    }
+    expect(result.result).toBe("callback-ran");
+  });
+
   it("memoizes repeated remote reads within one host operation", async () => {
     const { world: home, actor } = authedWorld();
     const remote = createWorld({ catalogs: false });
@@ -791,7 +884,7 @@ describe("woo core", () => {
 
     expect(fresh.exportWorld().objectCounter).toBeGreaterThan(stored.exportWorld().objectCounter);
     expect(freshScoped.objectCounter).toBe(storedScoped.objectCounter);
-    expect(mergeHostScopedSeedWithStatus(storedScoped, freshScoped).changed).toBe(false);
+    expect(mergeHostScopedSeedWithStatus(storedScoped, freshScoped, "the_taskspace").changed).toBe(false);
   });
 
   it("treats stored worlds without a host slice as unusable for cluster boot", async () => {
@@ -848,20 +941,20 @@ describe("woo core", () => {
     expect(looked?.look?.contents?.map((item: Record<string, string>) => item.id)).toEqual(expect.arrayContaining(["the_lamp", "the_mug", "the_dubspace"]));
   });
 
-  it("merges fresh host seed into a stale host slice without wiping dynamic room state", async () => {
+  it("preserves receiver-hosted state through merge and additively restores missing receiver-hosted subjects (HS2.1)", async () => {
     const staleWorld = createWorld();
     const session = staleWorld.auth("guest:merge-host-seed");
+    // Receiver-side mutations to the receiver-hosted room.
     staleWorld.object("the_chatroom").name = "Lobby";
     staleWorld.setProp("the_chatroom", "name", "Lobby");
     staleWorld.setProp("the_chatroom", "subscribers", [session.actor]);
     staleWorld.setProp("the_chatroom", "next_seq", 42);
-    staleWorld.object("the_chatroom").contents.delete("the_lamp");
-    staleWorld.object("the_chatroom").contents.delete("the_dubspace");
+    // Missing-from-stored case: receiver lost some hosted objects.
     staleWorld.objects.delete("the_lamp");
-    staleWorld.objects.delete("the_towel");
     staleWorld.objects.delete("the_mug");
     staleWorld.objects.delete("the_dubspace");
-    staleWorld.object("the_deck").contents.delete("the_towel");
+    staleWorld.object("the_chatroom").contents.delete("the_lamp");
+    staleWorld.object("the_chatroom").contents.delete("the_dubspace");
 
     const fresh = createWorld().exportWorld();
     const staleScoped = nonEmptyHostScopedWorld(staleWorld.exportWorld(), "the_chatroom");
@@ -869,44 +962,328 @@ describe("woo core", () => {
     expect(staleScoped).not.toBeNull();
     expect(freshScoped).not.toBeNull();
 
-    const merged = mergeHostScopedSeed(staleScoped!, freshScoped!);
+    const merged = mergeHostScopedSeed(staleScoped!, freshScoped!, "the_chatroom");
     const reloaded = createWorldFromSerialized(merged, { persist: false });
 
-    expect(reloaded.object("the_chatroom").name).toBe("Living Room");
+    // HS2.1 strict receiver-authority: stored fields are NOT overwritten.
+    expect(reloaded.object("the_chatroom").name).toBe("Lobby");
     expect(reloaded.getProp("the_chatroom", "name")).toBe("Lobby");
     expect(reloaded.getProp("the_chatroom", "subscribers")).toEqual([session.actor]);
     expect(reloaded.getProp("the_chatroom", "next_seq")).toBe(42);
+
+    // HS2.1 additive: receiver-hosted subjects missing from stored are
+    // initialized from the seed.
     expect(reloaded.objects.has("the_lamp")).toBe(true);
-    expect(reloaded.object("the_chatroom").contents.has("the_lamp")).toBe(true);
     expect(reloaded.objects.has("the_mug")).toBe(true);
-    expect(reloaded.object("the_chatroom").contents.has("the_mug")).toBe(true);
+    expect(reloaded.objects.has("the_dubspace")).toBe(true);
+    expect(reloaded.object("the_lamp").location).toBe("the_chatroom");
     expect(reloaded.object("the_dubspace").location).toBe("the_chatroom");
-    expect(reloaded.object("the_chatroom").contents.has("the_dubspace")).toBe(true);
   });
 
   it("merges fresh host seed without overwriting authored host-state properties", () => {
     const storedWorld = createWorld();
-    storedWorld.setProp("the_dubspace", "notes", [
+    storedWorld.setProp("the_pinboard", "notes", [
       { id: "n1", text: "keep me", color: "yellow", x: 48, y: 48, w: 180, h: 110, z: 1 }
     ]);
-    storedWorld.setProp("the_dubspace", "next_note_id", 2);
-    storedWorld.setProp("the_dubspace", "next_z", 2);
+    storedWorld.setProp("the_pinboard", "next_note_id", 2);
+    storedWorld.setProp("the_pinboard", "next_z", 2);
 
     const freshWorld = createWorld();
-    const storedScoped = nonEmptyHostScopedWorld(storedWorld.exportWorld(), "the_dubspace");
-    const freshScoped = nonEmptyHostScopedWorld(freshWorld.exportWorld(), "the_dubspace");
+    const storedScoped = nonEmptyHostScopedWorld(storedWorld.exportWorld(), "the_pinboard");
+    const freshScoped = nonEmptyHostScopedWorld(freshWorld.exportWorld(), "the_pinboard");
     expect(storedScoped).not.toBeNull();
     expect(freshScoped).not.toBeNull();
 
-    const merged = mergeHostScopedSeed(storedScoped!, freshScoped!);
+    const merged = mergeHostScopedSeed(storedScoped!, freshScoped!, "the_pinboard");
     const reloaded = createWorldFromSerialized(merged, { persist: false });
 
-    expect(reloaded.getProp("the_dubspace", "notes")).toEqual([
+    expect(reloaded.getProp("the_pinboard", "notes")).toEqual([
       { id: "n1", text: "keep me", color: "yellow", x: 48, y: 48, w: 180, h: 110, z: 1 }
     ]);
-    expect(reloaded.getProp("the_dubspace", "next_note_id")).toBe(2);
-    expect(reloaded.getProp("the_dubspace", "next_z")).toBe(2);
-    expect(reloaded.ownVerb("$dubspace", "add_note")).toBeDefined();
+    expect(reloaded.getProp("the_pinboard", "next_note_id")).toBe(2);
+    expect(reloaded.getProp("the_pinboard", "next_z")).toBe(2);
+    expect(reloaded.ownVerb("$pinboard", "add_note")).toBeDefined();
+  });
+
+  // spec/protocol/host-seeds.md §HS5 idempotency: two consecutive
+  // cold-loads of a quiescent cluster MUST produce zero satellite-side
+  // writes after the first. The cold-load path computes that signal
+  // through `mergeHostScopedSeedWithStatus(...).changed`; if it ever
+  // flips back to true on a second pass, the implementation has lost
+  // the spec's invariant.
+  it("HS5: merge is idempotent — second pass over the same stored+seed reports changed=false", () => {
+    const gateway = createWorld();
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const stored = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_pinboard");
+    expect(stored).not.toBeNull();
+
+    const first = mergeHostScopedSeedWithStatus(stored!, seed, "the_pinboard");
+    const second = mergeHostScopedSeedWithStatus(first.world, seed, "the_pinboard");
+    expect(second.changed).toBe(false);
+  });
+
+  it("HS5: cold-load merge is idempotent across hosts (the_chatroom, the_dubspace, the_pinboard)", () => {
+    const gateway = createWorld();
+    for (const host of ["the_chatroom", "the_dubspace", "the_pinboard"] as const) {
+      const seed = gateway.buildHostSeedForDelivery(host);
+      const stored = nonEmptyHostScopedWorld(gateway.exportWorld(), host);
+      expect(stored, `stored slice for ${host}`).not.toBeNull();
+      const first = mergeHostScopedSeedWithStatus(stored!, seed, host);
+      const second = mergeHostScopedSeedWithStatus(first.world, seed, host);
+      expect(second.changed, `${host} second-pass changed`).toBe(false);
+    }
+  });
+
+  it("HS2.1: receiver-hosted subjects with stored entries are skipped (gateway-side mutations do not stomp receiver state)", () => {
+    const stored = createWorld();
+    stored.object("the_chatroom").name = "Receiver Lobby";
+    const storedSlice = nonEmptyHostScopedWorld(stored.exportWorld(), "the_chatroom");
+    expect(storedSlice).not.toBeNull();
+
+    // Build a divergent seed by mutating the gateway's view.
+    const gateway = createWorld();
+    gateway.object("the_chatroom").name = "Gateway Living Room";
+    const seed = gateway.buildHostSeedForDelivery("the_chatroom");
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_chatroom");
+    const after = merged.world.objects.find((obj) => obj.id === "the_chatroom");
+    expect(after?.name).toBe("Receiver Lobby");
+  });
+
+  it("HS2.2 verbs: an aliases-only catalog update propagates from gateway to satellite (source_hash short-circuit must compare aliases)", () => {
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const stored = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(stored).not.toBeNull();
+
+    // Pick a class verb both worlds share. Mutate aliases on gateway
+    // only — leaving source unchanged so source_hash matches.
+    const noteOnGateway = gateway.object("$note").verbs.find((v) => v.name === "read");
+    expect(noteOnGateway).toBeDefined();
+    if (!noteOnGateway) return;
+    noteOnGateway.aliases = [...(noteOnGateway.aliases ?? []), "rd"];
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(stored!, seed, "the_pinboard");
+    expect(merged.changed).toBe(true);
+    const noteAfter = merged.world.objects.find((o) => o.id === "$note");
+    const readAfter = noteAfter?.verbs.find((v) => v.name === "read");
+    expect(readAfter?.aliases).toContain("rd");
+  });
+
+  it("HS2.2 verbs: an arg_spec-only catalog update propagates (source_hash short-circuit must compare arg_spec)", () => {
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const stored = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(stored).not.toBeNull();
+
+    const noteOnGateway = gateway.object("$note").verbs.find((v) => v.name === "read");
+    expect(noteOnGateway).toBeDefined();
+    if (!noteOnGateway) return;
+    noteOnGateway.arg_spec = { ...noteOnGateway.arg_spec, command: { dobj: "this", prep: ["with"], iobj: "string" } };
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(stored!, seed, "the_pinboard");
+    expect(merged.changed).toBe(true);
+    const noteAfter = merged.world.objects.find((o) => o.id === "$note");
+    const readAfter = noteAfter?.verbs.find((v) => v.name === "read");
+    expect(readAfter?.arg_spec).toEqual(expect.objectContaining({ command: expect.objectContaining({ dobj: "this" }) }));
+  });
+
+  it("setProp is idempotent on equal values — no version bump, no persist", () => {
+    // The host-seed merge depends on propertyVersions[name] tracking
+    // *real* changes. Every gateway-side `setProp(equal_value)` would
+    // otherwise propagate as a forced satellite snapshot every cold-load
+    // (catalog repair, returnGuest cleanup that re-clears already-empty
+    // fields, periodic reconciliation, etc.). Pin the new contract:
+    // value-equal means no bump.
+    const w = createWorld();
+    w.setProp("$system", "extra_attr", { foo: 1, bar: [2, 3] });
+    const v1 = w.object("$system").propertyVersions.get("extra_attr");
+    expect(v1).toBeGreaterThanOrEqual(1);
+    // Re-set the same value (deep-equal but a fresh object reference).
+    w.setProp("$system", "extra_attr", { foo: 1, bar: [2, 3] });
+    expect(w.object("$system").propertyVersions.get("extra_attr")).toBe(v1);
+    // Real change does bump.
+    w.setProp("$system", "extra_attr", { foo: 2, bar: [2, 3] });
+    expect(w.object("$system").propertyVersions.get("extra_attr")).toBe((v1 ?? 0) + 1);
+  });
+
+  it("HS2.2: propertyVersion drift with equal value does NOT drive a merge change", () => {
+    // setProp bumps propertyVersions[name] on every call. Older
+    // gateway-side code (and stored worlds persisted before the
+    // setProp idempotency fix) could rewrite the same value and
+    // produce a seed with a higher version than stored even though
+    // the actual value matched. The merge previously took the bumped
+    // version, declared changed=true, and burned a satellite snapshot
+    // every cold-load. Version must travel with value: only bump when
+    // the value also changes.
+    //
+    // setProp is now idempotent on equal values, so the trap is
+    // simulated by tampering with the seed's propertyVersions
+    // directly — same data shape a pre-fix world would have produced.
+    const gateway = createWorld();
+    const satellite = createWorld();
+    gateway.setProp("$system", "extra_attr", "shared_value");
+    satellite.setProp("$system", "extra_attr", "shared_value");
+
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const sysSeedIdx = seed.objects.findIndex((o) => o.id === "$system");
+    const sysSeed = { ...seed.objects[sysSeedIdx] };
+    sysSeed.propertyVersions = sysSeed.propertyVersions.map(([n, v]) => n === "extra_attr" ? [n, v + 100] as [string, number] : [n, v]);
+    seed.objects[sysSeedIdx] = sysSeed;
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
+  it("HS2.2: verb.version drift alone does NOT drive a merge change", () => {
+    // Same shape as the propertyDef.version trap. addVerb / catalog repair
+    // bump verb.version on every idempotent reinstall; production
+    // satellites accumulate this counter past the gateway's authoritative
+    // value and the merge previously replaced them every cold-load.
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    const actorStored = storedSlice!.objects.find((o) => o.id === "$actor");
+    expect(actorStored).toBeDefined();
+    expect(actorStored!.verbs.length).toBeGreaterThan(0);
+    actorStored!.verbs = actorStored!.verbs.map((v) => ({ ...v, version: 99 }));
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
+  it("HS2.2: propertyDef.version drift alone does NOT drive a merge change", () => {
+    // Catalog repair / schema sync calls defineProperty(); each call bumps
+    // PropertyDef.version even when the def is otherwise unchanged. On a
+    // satellite running cold-load lifecycle, this counter accumulates
+    // independently of the gateway's. Production satellites had stored
+    // versions like $help.description=131 against gateway=30. Including
+    // version in the merge's def comparison made the merge non-idempotent
+    // (replace → next setProp bump → replace again on next cold-load) and
+    // burned a full satellite snapshot every wake. The merge must compare
+    // authoritative def fields only.
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    // $root.description is a seeded propertyDef carried into every host
+    // slice via lineage. Bump its version on stored to simulate accumulated
+    // satellite-side drift; gateway's version stays at the seed default.
+    const rootStored = storedSlice!.objects.find((o) => o.id === "$root");
+    expect(rootStored).toBeDefined();
+    const descIdx = rootStored!.propertyDefs.findIndex((d) => d.name === "description");
+    expect(descIdx).toBeGreaterThanOrEqual(0);
+    rootStored!.propertyDefs[descIdx] = { ...rootStored!.propertyDefs[descIdx], version: 131 };
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
+  it("HS5: buildHostSeedForDelivery cache invalidates when the world is replaced via importWorld", () => {
+    const gateway = createWorld();
+    const before = gateway.buildHostSeedForDelivery("the_chatroom");
+    const original = before.objects.find((o) => o.id === "the_chatroom")?.name;
+    expect(typeof original).toBe("string");
+
+    // Replace the whole world with a serialized snapshot whose
+    // the_chatroom has a mutated name. Without importWorld bumping
+    // the mutationCounter (and clearing the cache), the next
+    // buildHostSeedForDelivery call would return the stale `before`.
+    const swapped = createWorld().exportWorld();
+    const chatroomIdx = swapped.objects.findIndex((o) => o.id === "the_chatroom");
+    swapped.objects[chatroomIdx] = { ...swapped.objects[chatroomIdx], name: "Replaced Chatroom" };
+    gateway.importWorld(swapped);
+
+    const after = gateway.buildHostSeedForDelivery("the_chatroom");
+    expect(after).not.toBe(before);
+    expect(after.objects.find((o) => o.id === "the_chatroom")?.name).toBe("Replaced Chatroom");
+  });
+
+  it("HS2.2 deletions: gateway-removed properties on a foreign-hosted subject are removed from stored", () => {
+    // $thing is gateway-hosted relative to the_pinboard receiver.
+    const stored = createWorld();
+    stored.setProp("$thing", "extra_attr", "from-stored-only");
+    const storedSlice = nonEmptyHostScopedWorld(stored.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    const gateway = createWorld();
+    // gateway has NO extra_attr
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    const thingAfter = merged.world.objects.find((obj) => obj.id === "$thing");
+    const extraAfter = thingAfter?.properties.find(([name]) => name === "extra_attr");
+    expect(extraAfter).toBeUndefined();
+    expect(merged.changed).toBe(true);
+  });
+
+  it("HS2.2 dynamic carve-out: receiver-side ledger writes on $system survive merges (asymmetric)", () => {
+    // $system is gateway-hosted; applied_migrations is a dynamic name.
+    // Receiver writes its own ledger; gateway's seed view should not
+    // overwrite once stored has its own entry.
+    const stored = createWorld();
+    stored.setProp("$system", "applied_migrations", { receiver_only: true });
+    const storedSlice = nonEmptyHostScopedWorld(stored.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    const gateway = createWorld();
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    const sysAfter = merged.world.objects.find((obj) => obj.id === "$system");
+    const ledgerAfter = sysAfter?.properties.find(([name]) => name === "applied_migrations");
+    expect(ledgerAfter?.[1]).toEqual({ receiver_only: true });
+  });
+
+  it("HS4: gateway tombstone with no receiver stub is ignored (cost rule — receiver doesn't track gateway recycles it never knew about)", () => {
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    // Gateway recycles an id the satellite never imported — its slice
+    // has no stub for the_doomed_id. The merge must NOT propagate;
+    // otherwise every satellite would store every gateway-side recycle.
+    gateway.tombstones.add("obj_world_doomed_irrelevant_1");
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    expect(seed.tombstones).toContain("obj_world_doomed_irrelevant_1");
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+    expect(merged.world.tombstones ?? []).not.toContain("obj_world_doomed_irrelevant_1");
+  });
+
+  it("HS4: gateway tombstone with a receiver stub IS propagated and the stub removed", () => {
+    const gateway = createWorld();
+    const satellite = createWorld();
+    // Satellite happens to have a stub for $wiz (gateway-hosted).
+    // Gateway recycles $wiz (in this test we just stuff its id into
+    // tombstones to simulate the post-recycle state without removing
+    // it from gateway's objects, which the test doesn't need).
+    gateway.tombstones.add("$wiz");
+
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+    expect(storedSlice!.objects.some((o) => o.id === "$wiz")).toBe(true); // stub is present
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(true);
+    expect(merged.world.tombstones).toContain("$wiz");
+    expect(merged.world.objects.some((o) => o.id === "$wiz")).toBe(false); // stub removed
+
+    // Idempotent: second pass with same seed produces no change.
+    const second = mergeHostScopedSeedWithStatus(merged.world, seed, "the_pinboard");
+    expect(second.changed).toBe(false);
   });
 
   it("normalizes legacy d permission shorthand while importing worlds", async () => {

@@ -151,7 +151,9 @@ const BUILTINS = new Set([
   "properties", "property_info", "add_property", "delete_property", "set_property_info",
   "clear_property", "is_clear_property",
   // Authoring aggregations.
-  "authoring_inspect", "authoring_search"
+  "authoring_inspect", "authoring_search",
+  // Object identity edits.
+  "set_object_name"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 
@@ -702,8 +704,17 @@ class Parser {
     return true;
   }
 
+  // Only syntactic tokens carry their source text in `value`; literal tokens
+  // (string/number/objref/coreref) carry the parsed payload in `value` and
+  // must not collide with the keyword/operator matcher. Without this kind
+  // filter, a string literal `"-"` would be indistinguishable from the unary
+  // `-` operator (the parser would consume the string and then look for an
+  // operand that does not exist), and similar collisions trip operator
+  // strings like `"+"` or keyword strings like `"for"`.
   private checkValue(value: string): boolean {
-    return this.peek().value === value;
+    const token = this.peek();
+    if (token.kind !== "symbol" && token.kind !== "identifier") return false;
+    return token.value === value;
   }
 
   private expectValue(value: string, message: string): Token {

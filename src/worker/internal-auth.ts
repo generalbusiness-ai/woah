@@ -56,14 +56,24 @@ function requireSecret(env: InternalAuthEnv): string {
 
 function canonical(request: Request, headers: Headers): string {
   const url = new URL(request.url);
-  // Closed list by design: every authority-bearing x-woo-internal-* header
-  // must be added here before any sender or receiver relies on it.
+  // Closed list by design: every authority-bearing or
+  // behavior-bearing x-woo-* header must be added here before any
+  // sender or receiver relies on it. `x-woo-task-chain` belongs in
+  // this list because the receiver bypasses the host queue when its
+  // value matches a running task's chain id (see WooWorld.hostDispatch
+  // re-entrancy short-circuit) — without HMAC binding, an attacker
+  // who could plant the right value would interleave a behavior with
+  // an in-flight one. Internal DO traffic is signed end-to-end so the
+  // practical exposure is low, but we want defense in depth: any
+  // header that influences scheduling is part of the canonical
+  // string.
   const signedHeaders = [
     "x-woo-host-key",
     "x-woo-internal-session",
     "x-woo-internal-actor",
     "x-woo-internal-expires-at",
     "x-woo-internal-token-class",
+    "x-woo-task-chain",
     INTERNAL_TS_HEADER,
     INTERNAL_BODY_SHA_HEADER
   ];

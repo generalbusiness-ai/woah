@@ -124,6 +124,33 @@ plain error rather than a structured diagnostic.
 - Editor rooms use ordinary room dispatch and presence. The editor session
   points at the target object/member; it does not move the target object.
 
+## In-world commands
+
+The `@`-prefixed verbs are the LambdaCore-shaped chat surface. Each is a
+near line-for-line port from LambdaCore #217 / #6 / #218 / #630 with
+divergences documented inline in the verb source. Surface gates mirror
+the MCP-tool gates above.
+
+| Command | Class | Purpose |
+|---|---|---|
+| `@contents [obj]` | `$builder` | Lists `obj`'s contents (or location's if no arg). |
+| `@parents obj` | `$builder` | Lists `obj` plus its ancestor chain to `$root`. |
+| `@kids obj` | `$builder` | Lists direct children of `obj`. |
+| `@create parent named name[,alias…]` | `$builder` | Creates a child of `parent` and places it in inventory. |
+| `@set obj.prop to value` | `$builder` | Sets an existing property's value. Will not auto-create properties. |
+| `@recycle obj` | `$builder` | Destroys `obj` (LambdaCore #630). |
+| `@verbs obj` | `$programmer` | Lists own verb names on `obj`. |
+| `@properties obj` (alias `@props`) | `$programmer` | Lists own property names on `obj`. |
+| `@property obj.name [value]` | `$programmer` | Adds a new property with optional initial value. |
+| `@rmproperty obj.name` (alias `@rmprop`) | `$programmer` | Removes a property defined on `obj`. |
+| `@verb obj:name[,alias…] [dobj [prep [iobj]]]` | `$programmer` | Adds a stub verb to `obj`. |
+| `@args obj:verb [dobj prep iobj]` | `$programmer` | Sets or shows the dobj/prep/iobj specifier. |
+| `@rmverb obj:verb` | `$programmer` | Deletes a verb defined on `obj`. |
+| `@rename obj[:verb] to newname` | `$programmer` | Renames a verb or object (property branch deferred). |
+| `@list obj:verb` | `$programmer` | Dumps verb source with line numbers (stub; full LambdaCore @list deferred). |
+| `@chmod target perms` | `$programmer` | Changes verb or property perms (object branch deferred). Accepts `rxd` or `+r-x`. |
+| `@chown target owner` | `$programmer` | Wizard-only owner change for verb or property (object branch deferred). |
+
 ## Deferred
 
 - `trace` is declared but returns `E_NOT_IMPLEMENTED` until source-span tracing
@@ -131,3 +158,12 @@ plain error rather than a structured diagnostic.
 - Full search indexes are deferred; the first version may use bounded local
   scans.
 - Shared live buffers are deferred; first editor-room sessions are per actor.
+- `@list` ranges, `with parens`/`without numbers` toggles, and `all` to walk
+  the ancestor chain are deferred (the stub dumps source verbatim).
+- `@rename` for properties needs override-migration on descendants; the
+  current port emits a clear pointer.
+- `@chmod` / `@chown` object branches need substrate primitives
+  (`set_object_owner`, uniform per-object flag string); the current ports
+  emit pointers to existing flag-management mechanisms.
+- `@verb` / `@property` `<perms> [<owner>]` trail awaits
+  `$string_utils:prefix_to_value` and `$string_utils:match_player`.

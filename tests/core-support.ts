@@ -207,7 +207,13 @@ export class LocalHostBridge implements HostBridge {
 
   async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
     const remote = this.worldFor(startAt ?? target);
-    return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt);
+    // Propagate the source host's active chain id so the receiver can
+    // detect re-entrant dispatch (A→B→A) and run inline. Mirrors the
+    // worker's forwardInternalRaw `x-woo-task-chain` header. Without
+    // this the test bridge wouldn't exercise the production-path
+    // re-entrancy at all.
+    const chainId = ctx.world.currentTaskChainId() ?? undefined;
+    return await remote.hostDispatch({ ...ctx, world: remote }, target, verbName, args, startAt, chainId);
   }
 
   async moveObject(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {

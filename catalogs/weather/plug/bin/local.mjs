@@ -16,7 +16,6 @@
 //   WOO_APIKEY            required, "apikey:<id>:<secret>" minted from $block:mint_apikey
 //   TOMORROW_IO_API_KEY   required, your tomorrow.io key
 //   BLOCK_ID              required, the weather block's object id
-//   FORECAST_HOURS        optional, default 12
 //   PLUG_INTERVAL_SEC     optional, default 60
 //
 // Run from this dir as: `npm run plug` or `npm run plug:once`.
@@ -38,7 +37,6 @@ function readEnv() {
     console.error(`set them in the shell, or pass --env-file=.env to node/tsx`);
     process.exit(2);
   }
-  if (process.env.FORECAST_HOURS) env.FORECAST_HOURS = process.env.FORECAST_HOURS;
   return env;
 }
 

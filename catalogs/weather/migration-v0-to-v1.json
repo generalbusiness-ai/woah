@@ -1,0 +1,11 @@
+{
+  "from_version": "0.x.x",
+  "to_version": "1.x.x",
+  "spec_version": "v1",
+  "steps": [
+    { "kind": "drop_property", "class": "$weather_block", "name": "forecast" },
+    { "kind": "drop_property", "class": "$weather_block", "name": "history" },
+    { "kind": "drop_property", "class": "$weather_block", "name": "forecast_hours" },
+    { "kind": "drop_verb", "class": "$weather_block", "verb": "set_forecast_hours" }
+  ]
+}

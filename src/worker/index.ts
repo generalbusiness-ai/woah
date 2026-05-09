@@ -269,7 +269,14 @@ async function directoryPost(env: Env, path: string, body: Record<string, unknow
 function cleanInternalHeaders(input: Headers): Headers {
   const headers = new Headers(input);
   for (const name of Array.from(headers.keys())) {
-    if (name.toLowerCase().startsWith("x-woo-internal-") || name.toLowerCase() === "x-woo-host-key") {
+    const lower = name.toLowerCase();
+    if (lower.startsWith("x-woo-internal-") || lower === "x-woo-host-key" || lower === "x-woo-task-chain") {
+      // x-woo-task-chain is behavior-bearing on the receiver (it can
+      // bypass the host queue when matched against the running task's
+      // chain id; see WooWorld.hostDispatch). The gateway mints fresh
+      // chain ids in forwardInternalRaw — public clients have no
+      // legitimate use for the header and it must not survive the
+      // public→internal trust boundary.
       headers.delete(name);
     }
   }

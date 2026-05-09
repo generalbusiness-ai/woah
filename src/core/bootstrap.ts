@@ -1,9 +1,9 @@
 import { compileVerb } from "./authoring";
 import { setPropBytecode, setValueBytecode } from "./fixtures";
 import { installLocalCatalogs } from "./local-catalogs";
-import type { ObjectRepository, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
+import type { ObjectRepository, SeedWorld, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
 import { hashSource } from "./source-hash";
-import type { MetricEvent, ObjRef, TinyBytecode, WooValue } from "./types";
+import type { MetricEvent, ObjRef, TinyBytecode, VerbDef, WooValue } from "./types";
 import { valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
@@ -255,13 +255,13 @@ export function createWorldFromSerialized(
   return world;
 }
 
-export function scopeSerializedWorldToHost(serialized: SerializedWorld, host: ObjRef): SerializedWorld {
+export function scopeSerializedWorldToHost(serialized: SerializedWorld, host: ObjRef): SeedWorld {
   const world = new WooWorld();
   world.importWorld(serialized);
   return world.exportHostScopedWorld(host);
 }
 
-export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRef): SerializedWorld | null {
+export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRef): SeedWorld | null {
   const scoped = scopeSerializedWorldToHost(serialized, host);
   return scoped.objects.length > 0 ? scoped : null;
 }
@@ -269,65 +269,100 @@ export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRe
 export type HostScopedSeedMergeResult = {
   world: SerializedWorld;
   changed: boolean;
+  /** Per-object reasons captured during merge — empty when changed=false.
+   * Each entry names the object id and up to ~8 specific field paths
+   * (e.g. `verbs[name.calls (deep)]`, `propertyDefs.foo(replace)`,
+   * `properties.bar(delete)`) that drove the change. Surfaced via the
+   * `host_seed_merge_diff` diagnostic so cold-load write churn is
+   * traceable to the exact field instead of a generic field-name pointer. */
+  reasons?: Array<{ id: ObjRef; reasons: string[] }>;
 };
 
-export function mergeHostScopedSeed(stored: SerializedWorld, seed: SerializedWorld): SerializedWorld {
-  return mergeHostScopedSeedWithStatus(stored, seed).world;
+export function mergeHostScopedSeed(stored: SerializedWorld, seed: SeedWorld, receiverHost: ObjRef): SerializedWorld {
+  return mergeHostScopedSeedWithStatus(stored, seed, receiverHost).world;
 }
 
-export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: SerializedWorld): HostScopedSeedMergeResult {
-  const merged = cloneSerializedWorld(stored);
-  const objects = new Map(merged.objects.map((obj) => [obj.id, obj]));
-  const seedIds = new Set(seed.objects.map((obj) => obj.id));
+/**
+ * Per spec/protocol/host-seeds.md §HS2–HS4: pure function from
+ * (stored, seed, receiverHost) to a merged slice plus a `changed`
+ * flag. Receiver-hosted subjects are skipped if already in stored
+ * (HS2.1); foreign-hosted subjects merge declarative state only
+ * (HS2.2). Children, contents, and modified are skipped on every
+ * subject. Tombstones for foreign-hosted ids union into stored (HS4).
+ */
+export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: SeedWorld, receiverHost: ObjRef): HostScopedSeedMergeResult {
+  // Two-pass lazy-clone strategy. A clean wake (changed=false) is the
+  // common case, and the original implementation deep-cloned the entire
+  // stored slice up front — wasted work the moment we need to throw the
+  // clone away. Instead we run a probe pass that mutates per-object
+  // clones (cheap), records each one that produced a change, and only
+  // assembles the final SerializedWorld if anything changed.
+  const storedById = new Map<ObjRef, SerializedObject>(stored.objects.map((obj) => [obj.id, obj]));
+  const storedTombstones = new Set(stored.tombstones ?? []);
+  const replacements = new Map<ObjRef, SerializedObject>(); // id → mutated clone
+  const additions: SerializedObject[] = []; // never-seen-before subjects
+  const newTombstones: ObjRef[] = []; // ids to add to stored.tombstones
+  const removeIds = new Set<ObjRef>(); // ids whose stub HS4 retires
+  const reasonLog: Array<{ id: ObjRef; reasons: string[] }> = [];
   let changed = false;
 
   for (const seedObj of seed.objects) {
-    const current = objects.get(seedObj.id);
+    if (storedTombstones.has(seedObj.id)) continue;
+    const current = storedById.get(seedObj.id);
     if (!current) {
-      const next = cloneSerializedObject(seedObj);
-      merged.objects.push(next);
-      objects.set(next.id, next);
+      additions.push(cloneSerializedObject(seedObj));
       changed = true;
+      reasonLog.push({ id: seedObj.id, reasons: ["<add>"] });
       continue;
     }
-    changed = mergeSeedObject(current, seedObj) || changed;
+    if (seed.objectHosts[seedObj.id] === receiverHost) continue;
+    const probe = cloneSerializedObject(current);
+    const objReasons: string[] = [];
+    if (mergeSeedObject(probe, seedObj, objReasons)) {
+      replacements.set(seedObj.id, probe);
+      changed = true;
+      if (objReasons.length > 0) reasonLog.push({ id: seedObj.id, reasons: objReasons });
+    }
   }
 
-  changed = reconcileSeedContainment(objects, seedIds) || changed;
-  const objectCounter = Math.max(merged.objectCounter ?? 1, seed.objectCounter ?? 1);
-  if (merged.objectCounter !== objectCounter) {
-    merged.objectCounter = objectCounter;
-    changed = true;
-  }
-  const parkedTaskCounter = Math.max(merged.parkedTaskCounter ?? 1, seed.parkedTaskCounter ?? 1);
-  if (merged.parkedTaskCounter !== parkedTaskCounter) {
-    merged.parkedTaskCounter = parkedTaskCounter;
-    changed = true;
-  }
-  const sessionCounter = Math.max(merged.sessionCounter ?? 1, seed.sessionCounter ?? 1);
-  if (merged.sessionCounter !== sessionCounter) {
-    merged.sessionCounter = sessionCounter;
-    changed = true;
-  }
-  for (const [space, entries] of seed.logs) {
-    if (!merged.logs.some(([existing]) => existing === space)) {
-      merged.logs.push([space, cloneSerialized(entries)]);
+  // HS4: foreign-hosted tombstones, scoped to ids the receiver has stubs
+  // for (cost rule). gateway.tombstones is gateway-hosted-by-construction
+  // (recycleChecked's E_CROSS_HOST_WRITE guards make all gateway-side
+  // recycles host-local), so every entry is foreign-hosted from any
+  // satellite's view.
+  if (seed.tombstones && seed.tombstones.length > 0) {
+    for (const id of seed.tombstones) {
+      if (storedTombstones.has(id)) continue;
+      if (seed.objectHosts[id] === receiverHost) continue; // forward-compat guard
+      if (!storedById.has(id)) continue; // HS4 cost rule: skip if no stub
+      newTombstones.push(id);
+      removeIds.add(id);
       changed = true;
+      reasonLog.push({ id, reasons: ["<tombstone>"] });
     }
   }
-  for (const snapshot of seed.snapshots) {
-    if (!merged.snapshots.some((existing) => existing.space_id === snapshot.space_id && existing.seq === snapshot.seq)) {
-      merged.snapshots.push(cloneSerialized(snapshot));
-      changed = true;
-    }
+
+  if (!changed) return { world: stored, changed: false, reasons: [] };
+
+  // Materialize the merged slice. One pass over stored.objects, swapping
+  // in replacements / dropping removeIds, then append additions.
+  const mergedObjects: SerializedObject[] = [];
+  for (const obj of stored.objects) {
+    if (removeIds.has(obj.id)) continue;
+    const replacement = replacements.get(obj.id);
+    mergedObjects.push(replacement ?? obj);
   }
-  for (const task of seed.parkedTasks) {
-    if (!merged.parkedTasks.some((existing) => existing.id === task.id)) {
-      merged.parkedTasks.push(cloneSerialized(task));
-      changed = true;
-    }
-  }
-  return { world: merged, changed };
+  for (const add of additions) mergedObjects.push(add);
+
+  const mergedTombstones = newTombstones.length > 0
+    ? [...(stored.tombstones ?? []), ...newTombstones].sort()
+    : stored.tombstones;
+
+  return {
+    world: { ...stored, objects: mergedObjects, tombstones: mergedTombstones },
+    changed: true,
+    reasons: reasonLog
+  };
 }
 
 export function bootstrap(world: WooWorld, options: BootstrapOptions = {}): WooWorld {
@@ -348,143 +383,308 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "wizard_actions",
   "applied_migrations",
   "catalog_migration_records",
-  "installed_catalogs"
+  "installed_catalogs",
+  // Per-host one-shot scrub marker (set by scrubStaleSubscribersOnce on
+  // the receiver's local copy of $space-descendants); the gateway never
+  // sees it, so the merge must not propagate-delete it from stored.
+  "_subscribers_scrubbed_v1",
+  // Gateway-only auth state. Read exclusively by `authApiKey` /
+  // `createApiKeyRecord` / `revokeApiKey` (all on the gateway entry
+  // path); satellites never authenticate independently — they receive
+  // sessions stamped by the gateway. `touchApiKeyLastSeen` rewrites the
+  // map on every API-key auth, so propagating it to satellites turned
+  // every poller's auth call into a satellite snapshot. Treat it as
+  // receiver-authoritative on satellites: first cold-load takes the
+  // gateway's view, subsequent cold-loads skip even if the gateway has
+  // bumped last_seen_at.
+  "api_keys"
 ]);
 
-function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boolean {
+/** Drop "phantom" boolean fields whose persistent encoding represents
+ * `false` as absence. Without this, a round-trip through the CF
+ * repository produces flags like `{wizard:false, programmer:false,
+ * fertile:false}` (`flagsFromSqlInt` always returns explicit booleans)
+ * while a freshly-bootstrapped gateway has plain `{}` — and
+ * `valuesEqual` reports them as different, making the seed merge
+ * non-idempotent. */
+function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): Record<string, true> {
+  if (!flags) return {};
+  const out: Record<string, true> = {};
+  for (const [k, v] of Object.entries(flags)) if (v === true) out[k] = true;
+  return out;
+}
+
+/** Drop verb fields whose persistent encoding represents `false` as
+ * absence (`verbFlagsJson` + `verbFromSqlRow` only round-trip the boolean
+ * verb flags when `=== true`). Drop `slot` because it's a per-host index
+ * assigned by `importWorld`, not authoritative across hosts. Drop
+ * `version` because catalog repair / addVerb bump it locally on every
+ * idempotent reinstall and the counter accumulates independently across
+ * hosts (same trap as PropertyDef.version). Drop `bytecode` and
+ * `line_map` because both are derived from `source` — `source_hash`
+ * already covers source identity, and `bytecode.version` carries the
+ * same drifting counter as the verb-level `version`. The merge covers
+ * authoritative divergence via source_hash and the remaining metadata
+ * (aliases, arg_spec, kind/native, calls, perms, owner, flags). */
+function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
+    if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "pure" || k === "pure_declared") {
+      if (v === true) out[k] = true;
+      continue;
+    }
+    if (k === "slot" || k === "version" || k === "bytecode" || k === "line_map") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function verbsDeepEqual(left: VerbDef[], right: VerbDef[]): boolean {
+  return verbsDiff(left, right) === null;
+}
+
+/** Returns null when the two verb lists are merge-equivalent, otherwise a
+ * short string describing the first concrete divergence. Used both as the
+ * core comparison (`verbsDeepEqual` now wraps this) and as a structured
+ * diagnostic input — when `mergeSeedObject` decides to take seed verbs,
+ * the same string surfaces in `host_seed_merge_diff` so we can see which
+ * field actually drove the change instead of guessing post-hoc. */
+function verbsDiff(left: VerbDef[], right: VerbDef[]): string | null {
+  if (left.length !== right.length) {
+    return `length stored=${left.length} seed=${right.length}`;
+  }
+  const leftByName = new Map(left.map((v) => [v.name, v]));
+  const rightByName = new Map(right.map((v) => [v.name, v]));
+  if (leftByName.size !== rightByName.size) {
+    return `unique-name count stored=${leftByName.size} seed=${rightByName.size}`;
+  }
+  for (const [name, lv] of leftByName) {
+    const rv = rightByName.get(name);
+    if (!rv) return `${name} missing in seed`;
+    if (lv.source_hash && rv.source_hash && lv.source_hash === rv.source_hash) {
+      const meta = verbMetadataDiff(lv, rv);
+      if (meta === null) continue;
+      return `${name}.${meta}`;
+    }
+    const ln = normalizeVerbForCompare(lv);
+    const rn = normalizeVerbForCompare(rv);
+    if (!valuesEqual(ln as WooValue, rn as WooValue)) {
+      const lk = Object.keys(ln);
+      const rk = Object.keys(rn);
+      const allKeys = new Set([...lk, ...rk]);
+      for (const k of allKeys) {
+        if (JSON.stringify(ln[k]) !== JSON.stringify(rn[k])) return `${name}.${k} (deep)`;
+      }
+      return `${name} (deep, key unknown)`;
+    }
+  }
+  return null;
+}
+
+function verbMetadataEqual(a: VerbDef, b: VerbDef): boolean {
+  return verbMetadataDiff(a, b) === null;
+}
+
+/** Returns null when authoritative verb metadata matches, otherwise a
+ * short field-name string identifying the first divergence. Drops `version`
+ * (per-host bump counter; see `normalizeVerbForCompare`); covers
+ * aliases, arg_spec, kind/native, calls, perms, owner, and the boolean
+ * flags. */
+function verbMetadataDiff(a: VerbDef, b: VerbDef): string | null {
+  if (a.perms !== b.perms) return "perms";
+  if (a.owner !== b.owner) return "owner";
+  if ((a.direct_callable === true) !== (b.direct_callable === true)) return "direct_callable";
+  if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return "skip_presence_check";
+  if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return "tool_exposed";
+  if ((a.pure === true) !== (b.pure === true)) return "pure";
+  if ((a.pure_declared === true) !== (b.pure_declared === true)) return "pure_declared";
+  if (a.kind !== b.kind) return "kind";
+  if (a.kind === "native" && b.kind === "native" && a.native !== b.native) return "native";
+  if (!arraysShallowEqualStrings(a.aliases ?? [], b.aliases ?? [])) return "aliases";
+  if (!valuesEqual((a.arg_spec ?? {}) as WooValue, (b.arg_spec ?? {}) as WooValue)) return "arg_spec";
+  const aCalls = Array.isArray(a.calls) ? a.calls : null;
+  const bCalls = Array.isArray(b.calls) ? b.calls : null;
+  if ((aCalls === null) !== (bCalls === null)) return "calls (one missing)";
+  if (aCalls && bCalls && !valuesEqual(aCalls as unknown as WooValue, bCalls as unknown as WooValue)) return "calls";
+  return null;
+}
+
+function arraysShallowEqualStrings(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Compare two propertyDef rows on the authoritative fields only.
+ * Excludes `version`, which is a per-host bump counter that accumulates on
+ * every defineProperty() call (idempotent or not) and drifts independently
+ * across hosts even when the catalog state is identical. Including it made
+ * the seed merge non-idempotent on production satellites whose stored defs
+ * had bumped past the gateway's authoritative version. */
+function propertyDefEqualIgnoringVersion(
+  a: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue },
+  b: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue }
+): boolean {
+  if (a.name !== b.name) return false;
+  if (a.owner !== b.owner) return false;
+  if (a.perms !== b.perms) return false;
+  if ((a.typeHint ?? null) !== (b.typeHint ?? null)) return false;
+  if (!valuesEqual(a.defaultValue, b.defaultValue)) return false;
+  return true;
+}
+
+/**
+ * Merge a single foreign-hosted subject's declarative state from seed
+ * into stored. Per spec/protocol/host-seeds.md §HS2.2.
+ *
+ * Skipped on every subject: `children`, `contents`, `modified`,
+ * `created`, `id`. Those are derived/clock fields; cross-host views
+ * disagree on them by construction.
+ *
+ * Deletions: properties/propertyVersions/propertyDefs in stored but
+ * absent from seed are removed (except dynamic-property names, which
+ * the receiver writes locally).
+ */
+function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reasons?: string[]): boolean {
   let changed = false;
+  const note = (r: string): void => { if (reasons && reasons.length < 8) reasons.push(r); };
   if (current.name !== seed.name) {
     current.name = seed.name;
     changed = true;
+    note("name");
   }
   if (current.parent !== seed.parent) {
     current.parent = seed.parent;
     changed = true;
+    note("parent");
   }
   if (current.owner !== seed.owner) {
     current.owner = seed.owner;
     changed = true;
+    note("owner");
   }
-  if (!current.location && current.location !== seed.location) {
+  if (current.location !== seed.location) {
     current.location = seed.location;
     changed = true;
+    note("location");
   }
   if (current.anchor !== seed.anchor) {
     current.anchor = seed.anchor;
     changed = true;
+    note("anchor");
   }
-  if (!valuesEqual(current.flags as WooValue, seed.flags as WooValue)) {
+  if (!valuesEqual(normalizeFlagsForCompare(current.flags) as WooValue, normalizeFlagsForCompare(seed.flags) as WooValue)) {
     current.flags = cloneSerialized(seed.flags);
     changed = true;
+    note("flags");
   }
-  const modified = Math.max(current.modified ?? 0, seed.modified ?? 0);
-  if (current.modified !== modified) {
-    current.modified = modified;
-    changed = true;
-  }
-  if (!valuesEqual(current.propertyDefs as unknown as WooValue, seed.propertyDefs as unknown as WooValue)) {
-    current.propertyDefs = cloneSerialized(seed.propertyDefs);
-    changed = true;
-  }
-  if (!valuesEqual(current.verbs as unknown as WooValue, seed.verbs as unknown as WooValue)) {
+  const verbsReason = verbsDiff(current.verbs, seed.verbs);
+  if (verbsReason !== null) {
     current.verbs = cloneSerialized(seed.verbs);
     changed = true;
+    note(`verbs[${verbsReason}]`);
   }
   if (!valuesEqual(current.eventSchemas as unknown as WooValue, seed.eventSchemas as unknown as WooValue)) {
     current.eventSchemas = cloneSerialized(seed.eventSchemas);
     changed = true;
+    note("eventSchemas");
   }
-  const children = mergeUnique(current.children, seed.children);
-  if (!arraysEqual(current.children, children)) {
-    current.children = children;
+
+  // propertyDefs: merge seed entries, then delete stored-only entries.
+  // Compare excluding `version` — that field bumps on every defineProperty()
+  // call and accumulates locally on satellites (catalog repair, schema
+  // sync) without changing what's authoritative (name/owner/perms/typeHint/
+  // defaultValue). Including version made the merge non-idempotent: stored
+  // versions kept growing past the gateway's, every cold-load triggered a
+  // replace, the replace took seed's lower version, and the next satellite
+  // write bumped it again. Spec HS2.2 calls for declarative-state merge
+  // here, not bookkeeping reconciliation.
+  const seedDefs = new Map(seed.propertyDefs.map((def) => [def.name, def]));
+  const currentDefs = new Map(current.propertyDefs.map((def) => [def.name, def]));
+  let defsChanged = false;
+  for (const [name, def] of seedDefs) {
+    const cur = currentDefs.get(name);
+    if (!cur || !propertyDefEqualIgnoringVersion(cur, def)) {
+      currentDefs.set(name, def);
+      defsChanged = true;
+      note(cur ? `propertyDefs.${name}(replace)` : `propertyDefs.${name}(add)`);
+    }
+  }
+  for (const name of Array.from(currentDefs.keys())) {
+    if (!seedDefs.has(name)) {
+      currentDefs.delete(name);
+      defsChanged = true;
+      note(`propertyDefs.${name}(delete)`);
+    }
+  }
+  if (defsChanged) {
+    current.propertyDefs = Array.from(currentDefs.values()).map((def) => cloneSerialized(def));
     changed = true;
   }
 
   const properties = new Map(current.properties);
   const versions = new Map(current.propertyVersions);
+  const seedProperties = new Map(seed.properties);
   const seedVersions = new Map(seed.propertyVersions);
-  for (const [name, value] of seed.properties) {
-    if (name === "features" && properties.has(name) && Array.isArray(properties.get(name)) && Array.isArray(value)) {
-      const merged = mergeUnique(properties.get(name) as string[], value.map(String));
-      if (!valuesEqual(properties.get(name) as WooValue, merged as WooValue)) {
-        properties.set(name, merged);
-        changed = true;
-      }
-      continue;
-    }
-    if (name === "features_version" && properties.has(name)) {
-      const currentVersion = Number(properties.get(name) ?? 0);
-      const seedVersion = Number(value ?? 0);
-      const nextVersion = Math.max(Number.isFinite(currentVersion) ? currentVersion : 0, Number.isFinite(seedVersion) ? seedVersion : 0);
-      if (properties.get(name) !== nextVersion) {
-        properties.set(name, nextVersion);
-        changed = true;
-      }
-      continue;
-    }
-    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && properties.has(name)) continue;
-    if (properties.has(name) && Number(versions.get(name) ?? 0) >= Number(seedVersions.get(name) ?? 0)) continue;
+
+  // HS2.2 take-seed pass. Only the value gate is authoritative; the
+  // version is bookkeeping that follows the value. If gateway-side code
+  // calls setProp(equal_value), the version bumps locally even though
+  // nothing observable changed — so the seed will arrive with a higher
+  // version but the same value. Without this guard, every satellite
+  // cold-load takes the bumped version and writes a full snapshot, even
+  // though the actual property is unchanged. We now take seed's version
+  // only when we also take seed's value (or stored has no entry yet),
+  // which keeps version monotone with respect to real changes and stops
+  // the no-op-write storm.
+  for (const [name, value] of seedProperties) {
+    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && (properties.has(name) || versions.has(name))) continue;
+    const storedV = Number(versions.get(name) ?? 0);
+    const seedV = Number(seedVersions.get(name) ?? 0);
+    if (storedV >= seedV && properties.has(name)) continue;
     if (!valuesEqual(properties.get(name) as WooValue, value as WooValue)) {
       properties.set(name, cloneSerialized(value));
+      versions.set(name, seedV);
       changed = true;
+      note(`properties.${name}(take)`);
+    } else if (!properties.has(name)) {
+      properties.set(name, cloneSerialized(value));
+      versions.set(name, seedV);
+      changed = true;
+      note(`properties.${name}(init)`);
     }
   }
-  for (const [name, version] of seed.propertyVersions) {
+  for (const [name, version] of seedVersions) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && versions.has(name)) continue;
-    if (!versions.has(name) || version > Number(versions.get(name) ?? 0)) {
-      versions.set(name, version);
-      changed = true;
-    }
+    if (versions.has(name)) continue;
+    if (seedProperties.has(name)) continue;
+    versions.set(name, version);
+    changed = true;
+    note(`propertyVersions.${name}(init)`);
   }
+
+  for (const name of Array.from(properties.keys())) {
+    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
+    if (seedProperties.has(name)) continue;
+    properties.delete(name);
+    changed = true;
+    note(`properties.${name}(delete)`);
+  }
+  for (const name of Array.from(versions.keys())) {
+    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
+    if (seedProperties.has(name) || seedVersions.has(name)) continue;
+    versions.delete(name);
+    changed = true;
+    note(`propertyVersions.${name}(delete)`);
+  }
+
   if (changed) {
     current.properties = Array.from(properties.entries());
     current.propertyVersions = Array.from(versions.entries());
   }
+
+  // Children/contents/modified explicitly NOT merged (HS2.2 skip-list).
   return changed;
-}
-
-function reconcileSeedContainment(objects: Map<ObjRef, SerializedObject>, seedIds: Set<ObjRef>): boolean {
-  let changed = false;
-  for (const container of objects.values()) {
-    const contents = container.contents.filter((id) => !seedIds.has(id) || objects.get(id)?.location === container.id);
-    if (!arraysEqual(container.contents, contents)) {
-      container.contents = contents;
-      changed = true;
-    }
-  }
-  for (const obj of objects.values()) {
-    if (!seedIds.has(obj.id) || !obj.location) continue;
-    const container = objects.get(obj.location);
-    if (container && !container.contents.includes(obj.id)) {
-      container.contents.push(obj.id);
-      changed = true;
-    }
-  }
-
-  for (const parent of objects.values()) {
-    const children = parent.children.filter((id) => !seedIds.has(id) || objects.get(id)?.parent === parent.id);
-    if (!arraysEqual(parent.children, children)) {
-      parent.children = children;
-      changed = true;
-    }
-  }
-  for (const obj of objects.values()) {
-    if (!seedIds.has(obj.id) || !obj.parent) continue;
-    const parent = objects.get(obj.parent);
-    if (parent && !parent.children.includes(obj.id)) {
-      parent.children.push(obj.id);
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-function mergeUnique<T>(left: readonly T[], right: readonly T[]): T[] {
-  return Array.from(new Set([...left, ...right]));
-}
-
-function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
-  return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function cloneSerializedWorld(value: SerializedWorld): SerializedWorld {
@@ -519,7 +719,18 @@ function seedUniversal(world: WooWorld): void {
   reparentSeed(world, "$space", "$sequenced_log");
 
   for (const id of ["$root", "$actor", "$player", "$sequenced_log", "$space", "$thing", "$catalog", "$catalog_registry"]) {
-    define(world, id, "name", "", "str", "r");
+    // Seed the `name` property with the WooObject.name attribute (rather
+    // than ""), so woocode `obj.name` reads the actual seed name on every
+    // descendant. createAuthoredObject already follows this mirroring rule
+    // ("WooObject.name is the display/core metadata; the inherited `name`
+    // property is the source-level slot read by woocode"); without this
+    // seed value, $wiz / $thing / $room / … return "" for `obj.name`
+    // even though the substrate carries the real name on the attribute.
+    // The defaultValue is propagated to descendants via inheritance, so
+    // setting it on the ancestors above is enough — we don't need to
+    // mirror onto every individual object.
+    const seedName = world.object(id).name ?? "";
+    define(world, id, "name", seedName, "str", "r");
     define(world, id, "description", "", "str", "r");
     define(world, id, "aliases", [], "list<str>", "r");
   }

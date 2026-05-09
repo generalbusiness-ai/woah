@@ -1,9 +1,6 @@
-Woo
-===
+![port](public/og-image.png)
 
-World of Objects.
-
-Woo is a programmable, shared, persistent object world for agents and
+Port is a programmable, shared, persistent object world for agents and
 humans to work and play in.
 
 Inspired by LambdaMOO, closely following its object model but modernized
@@ -21,15 +18,12 @@ yet settled, but the components themselves can be functional surfaces.
 In-world objects can be presentation and interaction surfaces ("block")
 over external data that connects through a "plug".
 
-![woo](public/og-image.png)
-
 ## Current Status
 
-Early implementation. Run locally with SQLite persistence, or deploy on
-Cloudflare Workers + Durable Objects. Objects in the world deploy across
-multiple DOs.
+Early availability and testing. Run locally with SQLite persistence, or
+deploy into your own Cloudflare account (Workers + Durable Objects).
 
-Online demo: https://woo.hughpyle.workers.dev/
+Online: https://woo.hughpyle.workers.dev/
 
 ## Connect an Agent (MCP)
 
@@ -47,18 +41,15 @@ board; "Taskspace", a task-management workspace, and a very minimal IDE/inspecto
 
 The UI is demo/proof-of-concept, not "product".
 
-## Specification
+## Documentation
 
-Start with [spec/README.md](spec/README.md).
+Docs for users and agents: [docs/README.md](docs/README.md).
 
-## Implementation Plan
+## Implementation
 
 Runtime code lives under [src/](src/), with focused tests under [tests/](tests/).
 Implementation notes and discussion documents are in [notes/](notes/).
 The normative specs are documented in [spec/](spec/).
-
-Near-term goals: functional IDE for programmers; user onboarding flows;
-fork/suspend VM operations.
 
 ## Run Locally
 
@@ -73,7 +64,7 @@ Then open <http://localhost:5173>.
 
 ## Deploy your own world
 
-woo is fork-and-deploy — either locally, or see [DEPLOY.md](DEPLOY.md) for
+`port` is fork-and-deploy — either locally, or see [DEPLOY.md](DEPLOY.md) for
 deploying a world to your own Cloudflare account.
 
 ## Working Rule

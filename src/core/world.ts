@@ -23,7 +23,7 @@ import {
   type WooValue,
   wooError
 } from "./types";
-import type { ObjectRepository, ParkedTaskRecord, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
+import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -372,6 +372,10 @@ export class WooWorld {
   // writes, deletes, accepted log rows). It may over-invalidate after rollback;
   // callers only depend on equality meaning "safe cache hit."
   private mutationCounter = 0;
+  /** Per-host cache for buildHostSeedForDelivery. Keyed by host; valid
+   * while `version === mutationCounter`. Any mutation invalidates all
+   * entries (cheap: just a counter compare on lookup). */
+  private hostSeedCache: Map<ObjRef, { version: number; seed: SeedWorld }> = new Map();
   private callDepth = 0;
   private guestFreePool = new Set<ObjRef>();
   private objectRepository: ObjectRepository | null;
@@ -385,8 +389,15 @@ export class WooWorld {
   // newly-enqueued task can log who it's blocked behind. `hostTaskQueueDepth`
   // is the count of tasks waiting for the current to settle.
   private hostTaskCounter = 0;
-  private currentHostTask: { id: number; label: string; startedAt: number } | null = null;
+  private currentHostTask: { id: number; label: string; startedAt: number; chainId: string } | null = null;
   private hostTaskQueueDepth = 0;
+  // Counter feeding chain ids for tasks that originate on this host.
+  // Combined with `chainOriginPrefix` to make chain ids globally unique
+  // even across processes (so a chain id surfaced in headers is never
+  // ambiguous with a same-numbered chain on a different host). Re-entrant
+  // dispatch keys off chain id equality (see `hostDispatch`).
+  private chainCounter = 0;
+  private chainOriginPrefix: string | null = null;
   private metricsHook: ((event: MetricEvent) => void) | null = null;
   // O(1) presence lookup. `session_subscribers` is authoritative for live
   // sessions; `subscribers` remains a compatibility actor projection for
@@ -442,6 +453,23 @@ export class WooWorld {
 
   setHostBridge(bridge: HostBridge | null): void {
     this.hostBridge = bridge;
+  }
+
+  /** Identify chain ids originating on this host. The PO DO sets this to
+   * the host key during construction; standalone (memory/sqlite) worlds
+   * fall back to "host" — those modes never share chains across hosts so
+   * collision is impossible there. */
+  setChainOriginPrefix(prefix: string): void {
+    this.chainOriginPrefix = prefix;
+  }
+
+  /** Chain id of the host task currently executing inside the host queue
+   * (or null when the queue is idle). Outbound cross-host RPC code reads
+   * this to stamp `x-woo-task-chain`; inbound RPC handlers compare it to
+   * the incoming chain id to detect re-entrancy (`hostDispatch` runs
+   * inline when the chain ids match). */
+  currentTaskChainId(): string | null {
+    return this.currentHostTask?.chainId ?? null;
   }
 
   // Install a metrics sink. Hosts pipe MetricEvent records to a structured log
@@ -684,20 +712,37 @@ export class WooWorld {
   }
 
   setProp(objRef: ObjRef, name: string, value: WooValue): void {
-    this.setPropLocal(objRef, name, value);
-    this.persistProperty(objRef, name);
-    this.persist();
+    if (this.setPropLocal(objRef, name, value)) {
+      this.persistProperty(objRef, name);
+      this.persist();
+    }
   }
 
-  private setPropLocal(objRef: ObjRef, name: string, value: WooValue): void {
+  /** Returns true iff the in-memory state actually changed. setProp now
+   * skips both the version bump and the persist when the new value
+   * equals the current one — `setProp(equal_value)` is a no-op rather
+   * than a counter increment. propertyVersions is read by the host-seed
+   * merge to detect cross-host divergence; bumping it on a no-op
+   * fanned out to a full satellite snapshot every cold-load whenever
+   * gateway-side code idempotently re-set the same value (catalog
+   * repair, returnGuest cleanup that re-clears already-empty fields,
+   * etc.). The optimistic-version locks for compile-and-install use
+   * propertyDefs.version (separate counter), so this change does not
+   * affect that contract. */
+  private setPropLocal(objRef: ObjRef, name: string, value: WooValue): boolean {
     this.assertOrdinaryPropertyName(name);
     const obj = this.object(objRef);
+    const before = obj.properties.get(name);
+    if (obj.properties.has(name) && valuesEqual(before as WooValue, value)) {
+      return false;
+    }
     obj.properties.set(name, cloneValue(value));
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
     obj.modified = Date.now();
     if (name === "subscribers" || name === "session_subscribers") {
       this.invalidatePresenceIndex();
     }
+    return true;
   }
 
   // Drop the in-memory presence index. The next read rebuilds it. Call
@@ -781,6 +826,15 @@ export class WooWorld {
     const obj = this.object(objRef);
     if (name === "owner") return obj.owner;
     if (obj.properties.has(name)) return cloneValue(obj.properties.get(name)!);
+    // The `name` attribute is the substrate's authoritative display label
+    // (see createObject, examine output, objectDisplayNameAsync). When no
+    // explicit property has been set, surface the attribute to woocode
+    // readers like `dobj.name` so they don't see the inherited "" default
+    // for seed objects ($wiz, $root, $thing, …) that carry only an
+    // attribute, not a property value. createAuthoredObject mirrors them
+    // intentionally for builder-created objects; this fallback covers the
+    // bootstrap path that doesn't.
+    if (name === "name") return obj.name;
     let parent = obj.parent;
     while (parent) {
       const ancestor = this.object(parent);
@@ -833,6 +887,21 @@ export class WooWorld {
     obj.modified = Date.now();
     this.persistObject(objRef);
     this.setProp(objRef, "name", name);
+  }
+
+  // Permission-gated wrapper exposed as the `set_object_name` builtin.
+  // Used by catalog verbs (e.g. $root:@rename) that need to mutate an
+  // object's display name from woocode without holding wizard authority
+  // catalog-side. Mirrors the auth shape used by builderSetProperty.
+  setObjectNameForActor(actor: ObjRef, objRef: ObjRef, name: string): void {
+    if (typeof name !== "string" || name.length === 0) {
+      throw wooError("E_INVARG", "set_object_name requires a non-empty string", name);
+    }
+    const obj = this.object(objRef);
+    if (!this.isWizard(actor) && obj.owner !== actor) {
+      throw wooError("E_PERM", `${actor} cannot rename ${objRef}`, { actor, obj: objRef });
+    }
+    this.setObjectName(objRef, name);
   }
 
   ownVerb(objRef: ObjRef, name: string): VerbDef | null {
@@ -1277,8 +1346,22 @@ export class WooWorld {
     }
     const permsRaw = typeof map.perms === "string" ? map.perms : current.perms;
     const parsedPerms = normalizeVerbPerms(permsRaw, directCallable);
+    // Verb rename: `info.name` swaps the slot's primary name. The
+    // verb's source body is not touched, but woocode parsers compare
+    // header names on next install — that is the catalog's problem,
+    // not the substrate's.
+    let nextName = current.name;
+    if (typeof map.name === "string" && map.name !== current.name) {
+      if (map.name.length === 0) throw wooError("E_INVARG", "verb name must be non-empty", map.name);
+      const collision = this.ownVerbExact(objRef, map.name);
+      if (collision && collision.slot !== current.slot) {
+        throw wooError("E_INVARG", `verb already exists: ${objRef}:${map.name}`, { obj: objRef, name: map.name });
+      }
+      nextName = map.name;
+    }
     const next: VerbDef = {
       ...current,
+      name: nextName,
       owner,
       aliases,
       arg_spec: argSpec,
@@ -1483,6 +1566,33 @@ export class WooWorld {
         version: 1,
         has_value: true
       };
+    }
+    // The `name` attribute is the substrate's display label (see getProp's
+    // matching fallback). When neither this object nor any ancestor has an
+    // explicit `name` property def, synthesize property info backed by
+    // the attribute so canReadProperty doesn't reject the lookup.
+    // Without this, $system.name (no def in parent chain) raises E_PROPNF
+    // through canReadProperty before getProp's attribute fallback runs.
+    {
+      const obj = this.object(objRef);
+      let walker: ObjRef | null = objRef;
+      let hasDef = false;
+      while (walker) {
+        const ancestor = this.object(walker);
+        if (ancestor.propertyDefs.has(name)) { hasDef = true; break; }
+        walker = ancestor.parent;
+      }
+      if (!hasDef && name === "name") {
+        return {
+          name,
+          owner: obj.owner,
+          perms: "r",
+          defined_on: objRef,
+          type_hint: "str",
+          version: 1,
+          has_value: true
+        };
+      }
     }
     let current: ObjRef | null = objRef;
     while (current) {
@@ -2106,8 +2216,14 @@ export class WooWorld {
     return frame;
   }
 
-  private async enqueueHostTask<T>(fn: () => Promise<T>, label: string = "task"): Promise<T> {
+  private async enqueueHostTask<T>(fn: () => Promise<T>, label: string = "task", chainId?: string): Promise<T> {
     const id = ++this.hostTaskCounter;
+    // Inherit chain id from the inbound RPC when one was provided, else
+    // mint a fresh one for this task. Once running, the task's outbound
+    // cross-host RPCs propagate this id so callbacks from downstream
+    // hosts can be detected and run inline (re-entrant dispatch — see
+    // `hostDispatch`).
+    const taskChainId = chainId ?? this.mintChainId();
     this.hostTaskQueueDepth += 1;
     const queueDepth = this.hostTaskQueueDepth;
     this.recordMetric({ kind: "host_task_enqueue", id, label, queue_depth: queueDepth });
@@ -2130,7 +2246,7 @@ export class WooWorld {
     const enqueuedAt = Date.now();
     const run = this.hostQueue.then(async () => {
       const startedAt = Date.now();
-      this.currentHostTask = { id, label, startedAt };
+      this.currentHostTask = { id, label, startedAt, chainId: taskChainId };
       this.hostTaskQueueDepth -= 1;
       this.recordMetric({ kind: "host_task_start", id, label, queued_ms: startedAt - enqueuedAt });
       // 3-second watchdog. Wedged tasks stay in this loop indefinitely until
@@ -2166,7 +2282,7 @@ export class WooWorld {
       // don't poison subsequent tasks. The old code had the same shape via
       // `then(fn, fn)`; this just keeps the diagnostic wrapping consistent.
       const startedAt = Date.now();
-      this.currentHostTask = { id, label, startedAt };
+      this.currentHostTask = { id, label, startedAt, chainId: taskChainId };
       this.hostTaskQueueDepth -= 1;
       this.recordMetric({ kind: "host_task_start", id, label, queued_ms: startedAt - enqueuedAt });
       try {
@@ -2590,8 +2706,29 @@ export class WooWorld {
     }
   }
 
-  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
-    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt), `dispatch:${target}:${verbName}`);
+  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string): Promise<WooValue> {
+    // Re-entrancy: if the inbound caller is part of the chain we are
+    // already running on this host, run inline (bypass the queue).
+    // Without this, A → B → A (a verb that dispatches to a remote which
+    // calls back to us) would self-deadlock: the callback from B queues
+    // behind the original A task, but A is awaiting B's response. This
+    // mirrors normal nested verb-dispatch semantics — the callback is
+    // logically part of the originating verb, not a new behavior.
+    if (chainId && this.currentHostTask?.chainId === chainId) {
+      return await this.dispatch(ctx, target, verbName, args, startAt);
+    }
+    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt), `dispatch:${target}:${verbName}`, chainId);
+  }
+
+  private mintChainId(): string {
+    // Prefix identifies the origin host (useful in tail logs); the
+    // random suffix prevents a downstream host from spoofing a chain id
+    // it didn't receive. The receiver only runs inline when the
+    // incoming chain id matches its own currentHostTask — a guessable
+    // counter would be a small but real window for cross-task
+    // interleaving, so we use a 64-bit hex random instead.
+    this.chainCounter += 1;
+    return `${this.chainOriginPrefix ?? "host"}:${this.chainCounter}:${randomHex(8)}`;
   }
 
   async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {
@@ -3321,9 +3458,14 @@ export class WooWorld {
       throw wooError("E_VERSION", "property value version conflict", { expected: expectedVersion, actual: currentVersion });
     }
     if (!exists) {
-      this.assertCanBuildOwnedObject(actor, objRef);
-      this.defineProperty(objRef, { name, defaultValue: null, owner: actor, perms: "rw", typeHint: typeHintForValue(value) });
-    } else if (!this.canWriteProperty(actor, objRef, name)) {
+      // The builder surface is documented as "ordinary data value setting"
+      // — no metadata changes (catalogs/prog/README.md). Defining a brand-
+      // new property is metadata, not value, so reject. Property creation
+      // is a programmer-class operation: $programmer:@property (or the
+      // add_property builtin from a programmer-owned verb).
+      throw wooError("E_PROPNF", `property not found: ${name}`, { obj: objRef, property: name });
+    }
+    if (!this.canWriteProperty(actor, objRef, name)) {
       throw wooError("E_PERM", `${actor} cannot write ${objRef}.${name}`, { actor, obj: objRef, property: name });
     }
     this.setProp(objRef, name, value);
@@ -5062,8 +5204,26 @@ export class WooWorld {
     };
   }
 
-  exportHostScopedWorld(host: ObjRef): SerializedWorld {
+  /**
+   * Round-trippable host slice. Returns SeedWorld shape (a
+   * SerializedWorld slice plus the `objectHosts` routing map required
+   * by spec/protocol/host-seeds.md §HS1).
+   *
+   * This export preserves logs, snapshots, parked tasks, and counters
+   * relevant to the slice — it doubles as a satellite's self-slicing
+   * primitive, which must round-trip losslessly. To produce a seed for
+   * delivery to a foreign host (the HS1 contract: no logs/snapshots/
+   * parkedTasks/sessions; tombstones scoped to foreign-hosted ids;
+   * counters neutralized), call `buildHostSeedForDelivery` instead.
+   */
+  exportHostScopedWorld(host: ObjRef): SeedWorld {
     const scope = this.hostScope(host);
+    // Reuse hostScope's routing map instead of re-walking objectRoutes()
+    // — for ~600 objects this saves a full pass + Map allocation per export.
+    const objectHosts: Record<ObjRef, ObjRef> = {};
+    for (const id of scope.objects) {
+      objectHosts[id] = scope.hostByObject.get(id) ?? DEFAULT_OBJECT_HOST;
+    }
     const parkedTasks = Array.from(this.parkedTasks.values())
       .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
       .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord);
@@ -5071,7 +5231,6 @@ export class WooWorld {
       version: 1,
       objectCounter: nextScopedObjectCounter(scope.objects),
       parkedTaskCounter: nextScopedParkedTaskCounter(parkedTasks),
-      // Sessions are not exported, so this seed contributes nothing about session allocation.
       sessionCounter: 1,
       objects: Array.from(scope.objects)
         .sort()
@@ -5084,11 +5243,48 @@ export class WooWorld {
         .filter((snapshot) => scope.hostedSpaces.has(snapshot.space_id))
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
       parkedTasks,
-      tombstones: Array.from(this.tombstones).sort()
+      tombstones: Array.from(this.tombstones).sort(),
+      objectHosts
     };
   }
 
+  /**
+   * Per spec/protocol/host-seeds.md §HS1: build the seed delivered to
+   * a satellite. Strips logs/snapshots/parkedTasks (gateway is not
+   * authoritative for them on the receiver), neutralizes
+   * gateway-global counters.
+   *
+   * Cache: when many satellites cold-load in succession the gateway
+   * may rebuild the same per-host slice repeatedly. Memoize on
+   * (host, mutationVersion); any mutation bumps the version and
+   * invalidates all cached seeds. Worst-case: one rebuild per host
+   * per mutation, vs. one rebuild per host per cold-load.
+   */
+  buildHostSeedForDelivery(host: ObjRef): SeedWorld {
+    const version = this.mutationCounter;
+    const cached = this.hostSeedCache.get(host);
+    if (cached && cached.version === version) return cached.seed;
+    const slice = this.exportHostScopedWorld(host);
+    const seed: SeedWorld = {
+      ...slice,
+      objectCounter: nextScopedObjectCounter(slice.objects.map((obj) => obj.id)),
+      parkedTaskCounter: 1,
+      sessionCounter: 1,
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: slice.tombstones ?? []
+    };
+    this.hostSeedCache.set(host, { version, seed });
+    return seed;
+  }
+
   importWorld(serialized: SerializedWorld): void {
+    // importWorld replaces every cell of the world. Any caller-visible
+    // cache derived from prior state must be invalidated, including
+    // the host-seed memoization keyed on mutationCounter.
+    this.bumpMutationVersion();
+    this.hostSeedCache.clear();
     this.withPersistencePaused(() => {
       this.objects.clear();
       this.sessions.clear();
@@ -5168,9 +5364,10 @@ export class WooWorld {
     return serialized;
   }
 
-  private hostScope(host: ObjRef): { objects: Set<ObjRef>; hostedObjects: Set<ObjRef>; hostedSpaces: Set<ObjRef> } {
+  private hostScope(host: ObjRef): { objects: Set<ObjRef>; hostedObjects: Set<ObjRef>; hostedSpaces: Set<ObjRef>; hostByObject: Map<ObjRef, string> } {
     const allRoutes = this.objectRoutes();
     const routeByObject = new Map(allRoutes.map((route) => [route.id, route] as const));
+    const hostByObject = new Map<ObjRef, string>(allRoutes.map((route) => [route.id, route.host] as const));
     const routes = allRoutes.filter((route) => route.host === host);
     const hosted = new Set(routes.map((route) => route.id));
     const hostedSpaces = new Set<ObjRef>();
@@ -5230,7 +5427,7 @@ export class WooWorld {
       if (scanRefs) this.scanObjectRefs(obj, add);
     }
 
-    return { objects, hostedObjects: hosted, hostedSpaces };
+    return { objects, hostedObjects: hosted, hostedSpaces, hostByObject };
   }
 
   private canCarryFeaturesIfKnown(objRef: ObjRef): boolean {
@@ -8336,6 +8533,20 @@ export class WooWorld {
     const lower = wanted.toLowerCase();
     if (lower === "me") return { status: "ok", value: actor };
     if (lower === "here" && location) return { status: "ok", value: location };
+
+    // Per match.md §MA2 steps 1–2: literal id syntax resolves before any
+    // candidate walk. `#xxx` is a direct objref (the lexer strips the `#`
+    // for DSL literals; surface this for chat input too). `$xxx` is a
+    // corename — woo stores corenames as the id itself, so the prefix is
+    // the id. Either form resolves to the underlying object iff it's a
+    // known id.
+    if (wanted.startsWith("#") && wanted.length > 1) {
+      const candidate = wanted.slice(1);
+      if (this.objects.has(candidate)) return { status: "ok", value: candidate };
+    }
+    if (wanted.startsWith("$") && this.objects.has(wanted)) {
+      return { status: "ok", value: wanted };
+    }
 
     // Per match.md §MA2 the resolver buckets candidates by source so the
     // tiebreaker can prefer carried-by-actor over present-in-location, then

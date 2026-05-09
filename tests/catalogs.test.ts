@@ -1390,7 +1390,7 @@ describe("local catalogs", () => {
     const repairedScoped = nonEmptyHostScopedWorld(staleGateway.exportWorld(), "the_pinboard");
     expect(repairedScoped).not.toBeNull();
 
-    const host = createWorldFromSerialized(mergeHostScopedSeed(staleScoped!, repairedScoped!), { persist: false });
+    const host = createWorldFromSerialized(mergeHostScopedSeed(staleScoped!, repairedScoped!, "the_pinboard"), { persist: false });
     expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("contents(this)");
   });
 
@@ -3249,8 +3249,9 @@ describe("local catalogs", () => {
       expect(world.getProp("the_weather", "place")).toBe("Mountain View CA");
       expect(world.getProp("the_weather", "timezone")).toBe("America/Los_Angeles");
       expect(world.getProp("the_weather", "units")).toBe("imperial");
-      expect(world.getProp("the_weather", "forecast_hours")).toBe(12);
-      world.setProp("the_weather", "current", { kind: "scalar", value: 72, unit: "°F", label: "current_temperature", observed_at: "2026-05-06T16:01:00Z", observed_at_text: "May 6, 2026, 9:01 AM PDT", observed_timezone: "America/Los_Angeles" });
+      // v1 dropped forecast_hours; the window is now fixed at ±7 days.
+      expect(() => world.getProp("the_weather", "forecast_hours")).toThrow(/forecast_hours/);
+      world.setProp("the_weather", "current", { temperature: 72, temperature_unit: "°F", humidity: 60, weather_code: 1000, observed_at: Date.parse("2026-05-06T16:01:00Z"), observed_at_text: "May 6, 2026, 9:01 AM PDT", observed_timezone: "America/Los_Angeles" });
       world.setProp("the_weather", "last_pushed_at", 1778073000000);
       const weatherLook = await world.directCall("blocks-weather-look", "$wiz", "the_weather", "look_self", []);
       expect(weatherLook.op).toBe("result");
@@ -3646,15 +3647,241 @@ describe("local catalogs", () => {
       expect(entry?.title).not.toContain("abcdefghij");
     });
 
+    it("local-catalog boot applies the bundled v0→v1 weather migration to an existing v0 install", () => {
+      const world = createWorld({ catalogs: false });
+
+      // Synthetic v0 install: same catalog name but the older surface
+      // (forecast_hours property + set_forecast_hours verb). After
+      // installLocalCatalogs runs, the v1 schema is in place AND the
+      // dead surface is gone — without running the catalog-version
+      // migration, the schema-sync alone leaves the stale verbs/props
+      // behind.
+      const v0: RuntimeCatalogManifest = {
+        name: "weather",
+        version: "0.2.0",
+        spec_version: "v1",
+        classes: [
+          {
+            local_name: "$weather_block",
+            parent: "$thing",
+            properties: [
+              { name: "place", type: "str", default: "" },
+              { name: "current", type: "map", default: {} },
+              { name: "forecast", type: "map", default: {} },
+              { name: "history", type: "map", default: {} },
+              { name: "forecast_hours", type: "int", default: 12 }
+            ],
+            verbs: [
+              {
+                name: "set_forecast_hours",
+                perms: "rx",
+                arg_spec: { args: ["hours"] },
+                source: "verb :set_forecast_hours(hours) rx { return hours; }"
+              }
+            ]
+          }
+        ]
+      };
+      installCatalogManifest(world, v0, { tap: "@local", alias: "weather" });
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeDefined();
+
+      installLocalCatalogs(world, ["weather"]);
+
+      // Stale verb and props are gone…
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
+      expect(world.object("$weather_block").propertyDefs.has("forecast")).toBe(false);
+      expect(world.object("$weather_block").propertyDefs.has("history")).toBe(false);
+      expect(world.object("$weather_block").propertyDefs.has("forecast_hours")).toBe(false);
+      // …and the registry version reflects v1 (any v1.x.x lands here).
+      const installed = world.propOrNull("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
+      const weather = installed.find((r) => r.alias === "weather");
+      expect(String(weather?.version)).toMatch(/^1\.\d+\.\d+$/);
+
+      // Re-running is idempotent.
+      installLocalCatalogs(world, ["weather"]);
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
+    });
+
+    it("$weather_block migration v0 → v1 drops forecast/history/forecast_hours and set_forecast_hours", async () => {
+      const world = createWorld({ catalogs: false });
+
+      // Synthetic v0 surface — the props and verb the v1 manifest retired.
+      const v0: RuntimeCatalogManifest = {
+        name: "weather",
+        version: "0.2.0",
+        spec_version: "v1",
+        classes: [
+          {
+            local_name: "$weather_block",
+            parent: "$thing",
+            properties: [
+              { name: "place", type: "str", default: "" },
+              { name: "current", type: "map", default: {} },
+              { name: "forecast", type: "map", default: {} },
+              { name: "history", type: "map", default: {} },
+              { name: "forecast_hours", type: "int", default: 12 }
+            ],
+            verbs: [
+              {
+                name: "set_forecast_hours",
+                perms: "rx",
+                arg_spec: { args: ["hours"] },
+                source: "verb :set_forecast_hours(hours) rx { return hours; }"
+              }
+            ]
+          }
+        ],
+        seed_hooks: [
+          {
+            kind: "create_instance",
+            class: "$weather_block",
+            as: "weather_demo_block",
+            properties: { forecast_hours: 24, forecast: { kind: "series" } }
+          }
+        ]
+      };
+      installCatalogManifest(world, v0, { tap: "@local", alias: "weather" });
+      expect(world.getProp("weather_demo_block", "forecast_hours")).toBe(24);
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeDefined();
+
+      const migration = JSON.parse(
+        readFileSync(join(root, "weather", "migration-v0-to-v1.json"), "utf8")
+      ) as { from_version: string; to_version: string; spec_version: string; steps: unknown[] };
+
+      // Minimal v1 shell — assertion is on the migration's drop_property /
+      // drop_verb steps, not on a full v1 reinstall (the seed/verb surface
+      // is exercised by the "installs cleanly" test above).
+      const v1: RuntimeCatalogManifest = {
+        name: "weather",
+        version: "1.0.0",
+        spec_version: "v1",
+        classes: [{ local_name: "$weather_block", parent: "$thing", properties: [{ name: "current", type: "map", default: {} }] }]
+      };
+      const record = updateCatalogManifest(world, v1, {
+        tap: "@local",
+        alias: "weather",
+        acceptMajor: true,
+        migration: migration as NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"]
+      });
+
+      expect(record.migration_state).toMatchObject({
+        status: "completed",
+        completed_steps: expect.arrayContaining([
+          "1:drop_property:$weather_block.forecast",
+          "2:drop_property:$weather_block.history",
+          "3:drop_property:$weather_block.forecast_hours",
+          "4:drop_verb:$weather_block:set_forecast_hours"
+        ])
+      });
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
+      expect(world.propOrNull("weather_demo_block", "forecast")).toBeNull();
+      expect(world.propOrNull("weather_demo_block", "history")).toBeNull();
+      expect(world.propOrNull("weather_demo_block", "forecast_hours")).toBeNull();
+    });
+
+    it("$weather_block:ask answers today/tomorrow/yesterday/weekday/M-D from current.local_date and daily[]", async () => {
+      const world = createWorld({ catalogs: false });
+      // Reuse blocks-demo's seed graph so we get the_weather pre-anchored in
+      // the_chatroom under a $conversational space — that gives us :command_plan
+      // for the routing check below without setting up the world by hand.
+      installLocalCatalogs(world, ["blocks-demo"]);
+      const blockId = "the_weather";
+      const roomId = "the_chatroom";
+
+      // Pin "today" to 2026-05-09 (Saturday) so weekday assertions are
+      // deterministic. The plug stamps current.local_date at push time so
+      // woocode can resolve "today" without IANA TZ math in the VM.
+      world.setProp(blockId, "place", "Seattle");
+      world.setProp(blockId, "current", {
+        temperature: 14, temperature_unit: "°C",
+        observed_at: Date.parse("2026-05-09T18:00:00Z"),
+        observed_at_text: "May 9, 2026, 11:00 AM PDT",
+        observed_timezone: "America/Los_Angeles",
+        local_date: "2026-05-09"
+      });
+      // ±7-day window centered on today. Each entry carries a 3-letter
+      // weekday for catalog-side weekday matching; precip exercises the
+      // optional " precip ..." tail in :format_day_line.
+      const days: Array<{ date: string; weekday: string; min: number; max: number; precip: number }> = [
+        { date: "2026-05-02", weekday: "sat", min:  9, max: 17, precip: 0 },
+        { date: "2026-05-03", weekday: "sun", min: 10, max: 18, precip: 0 },
+        { date: "2026-05-04", weekday: "mon", min: 11, max: 19, precip: 1.2 },
+        { date: "2026-05-05", weekday: "tue", min: 12, max: 20, precip: 0 },
+        { date: "2026-05-06", weekday: "wed", min: 12, max: 21, precip: 0 },
+        { date: "2026-05-07", weekday: "thu", min: 13, max: 22, precip: 0 },
+        { date: "2026-05-08", weekday: "fri", min: 13, max: 21, precip: 0 },
+        { date: "2026-05-09", weekday: "sat", min: 14, max: 22, precip: 0 },   // today
+        { date: "2026-05-10", weekday: "sun", min: 15, max: 23, precip: 0 },   // tomorrow
+        { date: "2026-05-11", weekday: "mon", min: 14, max: 22, precip: 0 },
+        { date: "2026-05-12", weekday: "tue", min: 16, max: 24, precip: 0 },
+        { date: "2026-05-13", weekday: "wed", min: 17, max: 25, precip: 0 },
+        { date: "2026-05-14", weekday: "thu", min: 18, max: 26, precip: 0 },
+        { date: "2026-05-15", weekday: "fri", min: 17, max: 25, precip: 0 },
+        { date: "2026-05-16", weekday: "sat", min: 16, max: 24, precip: 0 }
+      ];
+      world.setProp(blockId, "daily", days.map((d) => ({
+        date: d.date, weekday: d.weekday,
+        temperature: { min: d.min, max: d.max, mean: (d.min + d.max) / 2, unit: "°C" },
+        humidity: { min: 50, max: 80, mean: 65 },
+        precip_total: d.precip, precip_unit: "mm",
+        weather_code: 1000
+      })));
+
+      const ask = async (label: string, query: string) => {
+        const r = await world.directCall(label, "$wiz", blockId, "ask", [query]);
+        if (r.op !== "result") throw new Error(`${label} failed: ${JSON.stringify(r)}`);
+        return String(r.result);
+      };
+
+      // today / tomorrow / yesterday: index-based, against current.local_date.
+      expect(await ask("ask-today", "today")).toBe("Weather today (2026-05-09) in Seattle: 14°C to 22°C");
+      expect(await ask("ask-empty", "")).toBe("Weather today (2026-05-09) in Seattle: 14°C to 22°C");
+      expect(await ask("ask-tomorrow", "tomorrow")).toBe("Weather tomorrow (2026-05-10) in Seattle: 15°C to 23°C");
+      expect(await ask("ask-yesterday", "yesterday")).toBe("Weather yesterday (2026-05-08) in Seattle: 13°C to 21°C");
+
+      // Weekday: prefer the upcoming match; "thursday" (today is Sat) → 2026-05-14.
+      expect(await ask("ask-thu", "thursday")).toBe("Weather thu (2026-05-14) in Seattle: 18°C to 26°C");
+      // Short form and case-insensitive variants.
+      expect(await ask("ask-thu-short", "Thu")).toBe("Weather thu (2026-05-14) in Seattle: 18°C to 26°C");
+      expect(await ask("ask-thurs", "thurs")).toBe("Weather thu (2026-05-14) in Seattle: 18°C to 26°C");
+      // No upcoming match this week → past match. (none in fixture, "monday"
+      // last week 2026-05-04 is in past; today is Sat so "mon" upcoming is 5/11.)
+      expect(await ask("ask-mon", "monday")).toBe("Weather mon (2026-05-11) in Seattle: 14°C to 22°C");
+
+      // Precip is reported only when the day has any.
+      expect(await ask("ask-mon-past", "5/4")).toBe("Weather mon (2026-05-04) in Seattle: 11°C to 19°C, precip 1.2mm");
+
+      // M/D and M-D forms resolve against current.local_date's year.
+      expect(await ask("ask-md-slash", "5/12")).toBe("Weather tue (2026-05-12) in Seattle: 16°C to 24°C");
+      expect(await ask("ask-md-dash", "5-12")).toBe("Weather tue (2026-05-12) in Seattle: 16°C to 24°C");
+      // Full ISO is accepted too.
+      expect(await ask("ask-iso", "2026-05-13")).toBe("Weather wed (2026-05-13) in Seattle: 17°C to 25°C");
+
+      // Out-of-window date: helpful explanation, not a stack trace.
+      expect(await ask("ask-far", "1/1")).toMatch(/No data for 2026-01-01.*Seattle/);
+      // Nonsense input: a usage hint listing the accepted forms.
+      expect(await ask("ask-huh", "soon-ish?")).toMatch(/I don't understand "soon-ish\?".*today.*thursday.*5\/12/);
+
+      // Command-route plumbing: "ask weather thursday" must reach $weather_block:ask
+      // via dobj_prefix_rest = "thursday" (the pattern uses dobj:"this", prep:"none").
+      // $wiz can match objects without co-location, which keeps the test focused
+      // on the pattern wiring rather than visibility setup.
+      const askCmd = await world.directCall("ask-weather-cmd", "$wiz", roomId, "command_plan", ["ask weather thursday"]);
+      if (askCmd.op !== "result") throw new Error(`command_plan failed: ${JSON.stringify(askCmd)}`);
+      expect(askCmd.result).toMatchObject({ ok: true, target: blockId, verb: "ask", args: ["thursday"] });
+    });
+
     it("$weather_block installs cleanly and ships the configured tier lists", async () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["weather"]);
       expect(world.object("$weather_block").flags.fertile).toBe(true);
-      expect(world.getProp("$weather_block", "writable_owner")).toEqual(["place", "timezone", "units", "forecast_hours"]);
-      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "forecast", "history", "config_state"]);
+      // v1 surface: forecast/history/forecast_hours dropped, daily/timeseries added.
+      expect(world.getProp("$weather_block", "writable_owner")).toEqual(["place", "timezone", "units"]);
+      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"]);
       expect(world.ownVerbExact("$weather_block", "set_location")).toMatchObject({ direct_callable: true, tool_exposed: true });
       expect(world.ownVerbExact("$weather_block", "set_units")).toMatchObject({ direct_callable: true, tool_exposed: true });
-      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toMatchObject({ direct_callable: true, tool_exposed: true });
+      // set_forecast_hours was retired with the forecast_hours property.
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
       // An instance inherits the tier lists.
       const blockId = "obj_test_weather_block";
       const roomId = "obj_test_weather_room";
@@ -3664,16 +3891,15 @@ describe("local catalogs", () => {
       world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz" });
       world.createObject({ id: blockId, name: blockId, parent: "$weather_block", owner, location: roomId });
       expect(world.object(blockId).flags.fertile).not.toBe(true);
-      expect(world.getProp(blockId, "writable_owner")).toEqual(["place", "timezone", "units", "forecast_hours"]);
-      expect(world.getProp(blockId, "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "forecast", "history", "config_state"]);
+      expect(world.getProp(blockId, "writable_owner")).toEqual(["place", "timezone", "units"]);
+      expect(world.getProp(blockId, "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"]);
       // Default config matches the manifest.
       expect(world.getProp(blockId, "place")).toBe("");
       expect(world.getProp(blockId, "timezone")).toBe("");
       expect(world.getProp(blockId, "units")).toBe("metric");
-      expect(world.getProp(blockId, "forecast_hours")).toBe(12);
       expect(world.getProp(blockId, "config_state")).toMatchObject({ status: "unconfigured" });
-      // summary_props defaults to ["current"] via the seed_hook on the class.
-      expect(world.getProp("$weather_block", "summary_props")).toEqual(["current"]);
+      // summary_props defaults to ["current", "daily"] via the seed_hook on the class.
+      expect(world.getProp("$weather_block", "summary_props")).toEqual(["current", "daily"]);
 
       world.setProp(blockId, "last_error", "old weather error");
       const locationSet = await world.directCall("weather-owner-set-location", owner, blockId, "set_location", ["Mountain View CA", "Pacific"]);
@@ -3701,11 +3927,7 @@ describe("local catalogs", () => {
       if (unitsDenied.op === "error") expect(unitsDenied.error.code).toBe("E_PERM");
       expect(world.getProp(blockId, "units")).toBe("metric");
 
-      const hoursSet = await world.directCall("weather-wiz-set-hours", "$wiz", blockId, "set_forecast_hours", [24]);
-      expect(hoursSet.op).toBe("result");
-      expect(world.getProp(blockId, "forecast_hours")).toBe(24);
-
-      world.setProp(blockId, "current", { kind: "scalar", value: 58.62, unit: "°F", label: "current_temperature", observed_at: "2026-05-06T16:01:00Z", observed_at_text: "May 6, 2026, 9:01 AM PDT" });
+      world.setProp(blockId, "current", { temperature: 58.62, temperature_unit: "°F", humidity: 60, weather_code: 1000, observed_at: Date.parse("2026-05-06T16:01:00Z"), observed_at_text: "May 6, 2026, 9:01 AM PDT" });
       world.setProp(blockId, "place", "Mountain View, CA");
       world.setProp(blockId, "config_state", { status: "confirmed", place: "Mountain View, CA", timezone: "America/Los_Angeles" });
       const townLook = await world.directCall("weather-town-state-look", "$wiz", blockId, "look_self", []);

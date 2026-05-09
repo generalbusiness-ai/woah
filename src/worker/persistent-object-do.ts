@@ -43,7 +43,7 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
 import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { CFObjectRepository } from "./cf-repository";
@@ -67,6 +67,7 @@ export interface Env {
 }
 
 const WORLD_HOST = "world";
+const REMOTE_ROUTE_SYNC_TTL_MS = 60_000;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
@@ -154,6 +155,12 @@ export class PersistentObjectDO {
   private routeCache = new Map<ObjRef, string>();
   private publishedRoutes = new Map<ObjRef, string>();
   private routesRegistered = false;
+  // Last time we synced routes from a given remote host. Cross-host
+  // `registerRemoteObjectRoutes` is a best-effort accelerator — fetching
+  // a remote's full route list after every cross-host call is wasted when
+  // the satellite's slice has not added objects, which is the common case.
+  // Throttle to one round-trip per host per `REMOTE_ROUTE_SYNC_TTL_MS`.
+  private remoteRouteSyncAt = new Map<string, number>();
   private mcpGateway: McpGateway | null = null;
   // Per-actor cache of `world.state(actor)` keyed by world.mutationVersion().
   // Both /__internal/state and the local-host slice inside aggregateState
@@ -617,7 +624,24 @@ export class PersistentObjectDO {
     if (coldInitStart !== null) {
       world.recordMetric({ kind: "init", phase: "world", ms: Date.now() - coldInitStart });
     }
-    if (hostKey === WORLD_HOST) await this.registerObjectRoutes(world);
+    if (hostKey === WORLD_HOST) {
+      await this.registerObjectRoutes(world);
+    } else {
+      // Satellite cold-load: prime `routeCache` from the local slice so
+      // `resolveObjectHostForWorld` can answer locally without firing a
+      // resolve-object RPC. Do NOT touch `publishedRoutes` — that map
+      // means "this DO has successfully published this route to the
+      // Directory." Marking entries published-without-publishing means
+      // any later call that goes through registerRoutes() (which skips
+      // anything in publishedRoutes per the dedup filter) cannot repair
+      // a missing or stale Directory entry. We rely on the gateway
+      // having registered satellite routes during its own cold-load and
+      // catalog install, but if that contract ever drifts, the
+      // satellite still has a path to repair via adoptLocalObjectRoute.
+      for (const route of world.objectRoutes()) {
+        this.routeCache.set(route.id, route.host);
+      }
+    }
     return world;
   }
 
@@ -630,28 +654,53 @@ export class PersistentObjectDO {
     if (!stored) {
       await this.guardColdLoadAgainstInheritedTombstone(hostKey);
     }
-    let scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
-    if (stored && !scoped) {
-      console.warn("woo.cluster_seed_fallback", {
-        host: hostKey,
-        reason: "stored_world_missing_host_slice",
-        stored_objects: stored.objects.length,
-        stored_logs: stored.logs.length,
-        stored_tasks: stored.parkedTasks.length
-      });
+    // Trust the on-disk slice when it carries the post-migration host
+    // marker (the host's own object has host_placement="self"). Re-scoping
+    // via nonEmptyHostScopedWorld imports-then-re-exports through the
+    // satellite's local hostScope(), which reaches catalog-supplied class
+    // objects via addCatalogSupportFor — and that helper depends on
+    // installed_catalogs, a per-host dynamic property the gateway never
+    // propagates. Result: the gateway's seed contains class objects (e.g.
+    // $cockatoo, $horoscope_note) that the satellite can't reach in its
+    // own scope walk, so every cold-load merge re-added them and the next
+    // load dropped them again. We only re-scope when stored predates the
+    // 2026-04-30 catalog-placement migration (no host_placement marker on
+    // any object in the slice) — that's the original recovery path.
+    let scoped: SerializedWorld | null;
+    if (stored && storedSliceIsHostScoped(stored, hostKey)) {
+      scoped = stored;
+    } else {
+      scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
+      if (stored && !scoped) {
+        console.warn("woo.cluster_seed_fallback", {
+          host: hostKey,
+          reason: "stored_world_missing_host_slice",
+          stored_objects: stored.objects.length,
+          stored_logs: stored.logs.length,
+          stored_tasks: stored.parkedTasks.length
+        });
+      }
     }
-    let freshSeed: SerializedWorld | null = null;
+    let freshSeed: SeedWorld | null = null;
     try {
-      freshSeed = nonEmptyHostScopedWorld(await this.fetchHostSeed(hostKey), hostKey);
+      // Use the gateway's seed verbatim — re-scoping via
+      // nonEmptyHostScopedWorld would import-then-re-export, which
+      // recomputes objectHosts from the fresh world's anchor chain
+      // and discards any gateway-supplied routing metadata (per
+      // spec/protocol/host-seeds.md §HS1, objectHosts is the only
+      // routing input the merge needs and must come from the
+      // gateway's batched directory view).
+      const fetched = await this.fetchHostSeed(hostKey);
+      freshSeed = fetched.objects.length > 0 ? fetched : null;
     } catch (err) {
       if (!scoped) throw err;
       console.warn("woo.cluster_seed_refresh_failed", { host: hostKey, error: normalizeError(err) });
     }
     let seedMergeChanged = false;
     if (scoped && freshSeed) {
-      const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed);
+      const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed, hostKey);
       if (merged.changed) {
-        this.logHostSeedMergeDiff(hostKey, "load", scoped, freshSeed);
+        this.logHostSeedMergeDiff(hostKey, "load", scoped, freshSeed, merged.reasons);
       }
       scoped = merged.world;
       seedMergeChanged = merged.changed;
@@ -659,14 +708,12 @@ export class PersistentObjectDO {
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
     const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook, persist: stored === null });
-    // Run local catalog schema/data migration plans on this host's actual
-    // slice. The gateway cannot convert state it does not own.
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
     if (freshSeed) {
       const exported = world.exportWorld();
-      const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed);
+      const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed, hostKey);
       if (seeded.changed) {
-        this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed);
+        this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed, seeded.reasons);
         world.importWorld(seeded.world);
         seedMergeChanged = true;
       }
@@ -704,15 +751,25 @@ export class PersistentObjectDO {
     hostKey: ObjRef,
     phase: "load" | "post_lifecycle",
     storedWorld: SerializedWorld,
-    seedWorld: SerializedWorld
+    seedWorld: SerializedWorld,
+    reasons: Array<{ id: ObjRef; reasons: string[] }> | undefined
   ): void {
+    // Mirror the merge's DYNAMIC_HOST_SEED_PROPERTIES so the diagnostic
+    // reports the same set of property names the merge ignores. Any name
+    // here is receiver-authoritative on a satellite's local copy of a
+    // foreign-hosted object — drift on these is by design.
     const DYNAMIC = new Set([
       "next_seq", "subscribers", "operators", "last_snapshot_seq", "focus_list",
       "bootstrap_token_used", "wizard_actions", "applied_migrations",
-      "catalog_migration_records", "installed_catalogs"
+      "catalog_migration_records", "installed_catalogs",
+      "_subscribers_scrubbed_v1", "api_keys"
     ]);
     const stored = new Map(storedWorld.objects.map((o) => [o.id, o]));
-    const fields = ["modified", "verbs", "propertyDefs", "propertyVersions", "properties", "flags", "children", "contents", "eventSchemas", "name", "parent", "owner", "anchor"] as const;
+    // Only fields the merge actually compares (HS2.2). children/contents
+    // are derived from parent/location pointers; modified is a local clock;
+    // they don't drive changed=true and were creating diagnostic noise that
+    // pushed real drivers past the MAX cap.
+    const fields = ["verbs", "propertyDefs", "propertyVersions", "properties", "flags", "eventSchemas", "name", "parent", "owner", "anchor"] as const;
     const diffs: Array<{ id: string; field: string; detail?: string }> = [];
     const MAX = 12;
     for (const seedObj of seedWorld.objects) {
@@ -734,6 +791,23 @@ export class PersistentObjectDO {
           for (const n of names) {
             if (DYNAMIC.has(n)) continue;
             if (JSON.stringify(aMap.get(n)) === JSON.stringify(bMap.get(n))) continue;
+            // HS2.2 version gate: skip propertyVersions where stored ≥ seed,
+            // and skip the matching `properties` entry too (the merge
+            // wouldn't take seed's value either). These are local drift the
+            // merge is content to leave alone — logging them just buried
+            // the real driver.
+            if (f === "propertyVersions") {
+              const sv = Number(aMap.get(n) ?? 0);
+              const dv = Number(bMap.get(n) ?? 0);
+              if (sv >= dv && aMap.has(n)) continue;
+            }
+            if (f === "properties") {
+              const sv = Number((cur as unknown as { propertyVersions: Array<[string, number]> }).propertyVersions
+                .find(([k]) => k === n)?.[1] ?? 0);
+              const dv = Number((seedObj as unknown as { propertyVersions: Array<[string, number]> }).propertyVersions
+                .find(([k]) => k === n)?.[1] ?? 0);
+              if (sv >= dv && aMap.has(n)) continue;
+            }
             diffs.push({
               id: seedObj.id,
               field: `${f}.${n}`,
@@ -747,23 +821,95 @@ export class PersistentObjectDO {
           if (!recorded && JSON.stringify(a) !== JSON.stringify(b) && diffs.length < MAX) {
             diffs.push({ id: seedObj.id, field: `${f} (only DYNAMIC props differ)` });
           }
+        } else if (f === "verbs") {
+          // Per-verb diff so the driver isn't hidden behind a generic
+          // "verbs" pointer. Reports the first concrete divergence per
+          // mismatched verb: source_hash mismatch (real source drift),
+          // missing on one side, or a specific metadata field
+          // (aliases / arg_spec / perms / owner / kind / calls / flags).
+          // Drops `version`, `slot`, `bytecode`, and `line_map`
+          // (matching normalizeVerbForCompare).
+          const skip = new Set(["version", "slot", "bytecode", "line_map"]);
+          const flagFields = new Set(["direct_callable", "skip_presence_check", "tool_exposed", "pure", "pure_declared"]);
+          const aVerbs = new Map(((a as Array<Record<string, unknown>>) ?? []).map((v) => [String(v.name), v]));
+          const bVerbs = new Map(((b as Array<Record<string, unknown>>) ?? []).map((v) => [String(v.name), v]));
+          const verbNames = new Set<string>([...aVerbs.keys(), ...bVerbs.keys()]);
+          let recorded = false;
+          for (const vn of verbNames) {
+            if (diffs.length >= MAX) break;
+            const av = aVerbs.get(vn);
+            const bv = bVerbs.get(vn);
+            if (!av || !bv) {
+              diffs.push({ id: seedObj.id, field: `verbs.${vn}`, detail: !av ? "stored only" : "seed only" });
+              recorded = true;
+              continue;
+            }
+            // source_hash matches → only inspect non-derived metadata.
+            const hashesMatch = av.source_hash && bv.source_hash && av.source_hash === bv.source_hash;
+            const keys = new Set<string>([...Object.keys(av), ...Object.keys(bv)]);
+            for (const k of keys) {
+              if (skip.has(k)) continue;
+              if (hashesMatch && (k === "source" || k === "source_hash")) continue;
+              if (flagFields.has(k)) {
+                if ((av[k] === true) === (bv[k] === true)) continue;
+              } else {
+                if (JSON.stringify(av[k]) === JSON.stringify(bv[k])) continue;
+              }
+              diffs.push({ id: seedObj.id, field: `verbs.${vn}.${k}` });
+              recorded = true;
+              break;
+            }
+            if (diffs.length >= MAX) break;
+          }
+          if (!recorded && diffs.length < MAX) {
+            diffs.push({ id: seedObj.id, field: `verbs (only ignored fields differ)` });
+          }
+        } else if (f === "propertyDefs") {
+          // Authoritative def fields only — match the merge's
+          // propertyDefEqualIgnoringVersion semantics so cosmetic version
+          // drift doesn't appear as a diff.
+          const aDefs = new Map(((a as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown }>) ?? []).map((d) => [d.name, d]));
+          const bDefs = new Map(((b as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown }>) ?? []).map((d) => [d.name, d]));
+          const names = new Set<string>([...aDefs.keys(), ...bDefs.keys()]);
+          let recorded = false;
+          for (const n of names) {
+            const ad = aDefs.get(n);
+            const bd = bDefs.get(n);
+            if (ad && bd && ad.owner === bd.owner && ad.perms === bd.perms && (ad.typeHint ?? null) === (bd.typeHint ?? null) && JSON.stringify(ad.defaultValue) === JSON.stringify(bd.defaultValue)) continue;
+            if (!ad && !bd) continue;
+            diffs.push({ id: seedObj.id, field: `propertyDefs.${n}`, detail: ad && bd ? "shape changed" : ad ? "stored only" : "seed only" });
+            recorded = true;
+            if (diffs.length >= MAX) break;
+          }
+          if (!recorded && diffs.length < MAX) {
+            diffs.push({ id: seedObj.id, field: `propertyDefs (only version differs — ignored by merge)` });
+          }
         } else {
           diffs.push({ id: seedObj.id, field: f });
         }
       }
     }
+    // The merge itself records WHICH field on which object drove the
+    // change (mergeSeedObject's reasons sink). Surface those alongside
+    // the older field-shape diff: the reasons are authoritative ("this
+    // is exactly what triggered changed=true"), the diff is exploratory
+    // ("here's the broader shape of the disagreement"). When the two
+    // disagree the reasons are right.
+    const reasonsTrimmed = (reasons ?? []).slice(0, 12).map((r) => ({ id: r.id, reasons: r.reasons.slice(0, 4) }));
     console.log("woo.host_seed_merge_diff", JSON.stringify({
       host: hostKey,
       phase,
       stored_objects: storedWorld.objects.length,
       seed_objects: seedWorld.objects.length,
+      reasons: reasonsTrimmed,
+      reason_count: (reasons ?? []).length,
       diffs: diffs.slice(0, MAX),
       truncated: diffs.length > MAX,
       ts: Date.now()
     }));
   }
 
-  private async fetchHostSeed(hostKey: ObjRef): Promise<SerializedWorld> {
+  private async fetchHostSeed(hostKey: ObjRef): Promise<SeedWorld> {
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     try {
@@ -781,7 +927,8 @@ export class PersistentObjectDO {
         throw wooError("E_STORAGE", `failed to load host seed for ${hostKey}`, body as WooValue);
       }
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "ok", objects: Array.isArray((body as { objects?: unknown }).objects) ? ((body as { objects: unknown[] }).objects.length) : undefined }, hostKey);
-      return body as SerializedWorld;
+      if (!isSeedWorld(body)) throw wooError("E_STORAGE", `host-seed response missing SeedWorld.objectHosts (spec §HS1)`, hostKey);
+      return body;
     } catch (err) {
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) }, hostKey);
       throw err;
@@ -804,7 +951,7 @@ export class PersistentObjectDO {
       }
     }
     for (const host of hosts) {
-      const seed = world.exportHostScopedWorld(host as ObjRef);
+      const seed = world.buildHostSeedForDelivery(host as ObjRef);
       if (seed.objects.length === 0) {
         skipped.push({ host, reason: "empty_seed" });
         continue;
@@ -824,11 +971,12 @@ export class PersistentObjectDO {
     return { ok: errors.length === 0, hosts: hosts.length, refreshed, skipped, errors };
   }
 
-  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SerializedWorld): Record<string, unknown> {
-    const scopedSeed = nonEmptyHostScopedWorld(seed, hostKey);
-    if (!scopedSeed) throw wooError("E_OBJNF", `host seed does not contain ${hostKey}`, hostKey);
+  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SeedWorld): Record<string, unknown> {
+    // Use the gateway's seed verbatim — re-scoping would discard the
+    // gateway-supplied objectHosts metadata (see spec §HS1).
+    if (seed.objects.length === 0) throw wooError("E_OBJNF", `host seed does not contain ${hostKey}`, hostKey);
     const current = world.exportWorld();
-    const merged = mergeHostScopedSeedWithStatus(current, scopedSeed);
+    const merged = mergeHostScopedSeedWithStatus(current, seed, hostKey);
     if (merged.changed) {
       world.importWorld(merged.world);
       world.persistFullSnapshot("host_seed_apply");
@@ -892,17 +1040,27 @@ export class PersistentObjectDO {
   }
 
   private async registerRoutes(routes: Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>): Promise<boolean> {
-    if (routes.length === 0) return true;
+    // Per-frame dedup: skip routes whose (id → host) mapping is already
+    // published by this DO. Without this filter, every session register,
+    // every cross-host call's `registerRemoteObjectRoutes`, and every
+    // single-route adopt path fired a signed RPC even when the directory
+    // would have written zero rows. The directory's `register-objects`
+    // metric showed `routes:1 writes:0` on basically every call — the
+    // round-trip itself was the cost. We still emit when any route is
+    // new or has changed host (e.g. host-placement migration moves an
+    // object), so directory acceleration stays current.
+    const fresh = routes.filter((route) => this.publishedRoutes.get(route.id) !== route.host);
+    if (fresh.length === 0) return true;
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-objects`, {
         method: "POST",
         headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ routes })
+        body: JSON.stringify({ routes: fresh })
       }));
       const response = await this.env.DIRECTORY.get(id).fetch(request);
       if (!response.ok) throw new Error(`Directory register-objects failed: ${response.status}`);
-      for (const route of routes) {
+      for (const route of fresh) {
         this.routeCache.set(route.id, route.host);
         this.publishedRoutes.set(route.id, route.host);
       }
@@ -1411,6 +1569,7 @@ export class PersistentObjectDO {
     };
     world.setHostBridge(bridge);
     world.setMetricsHook((event) => this.emitMetric(event, localHost));
+    world.setChainOriginPrefix(localHost);
   }
 
   // Sample high-rate metric kinds so a noisy gateway doesn't blow up the log
@@ -1469,12 +1628,31 @@ export class PersistentObjectDO {
   }
 
   private async registerRemoteObjectRoutes(host: string): Promise<void> {
+    // Throttle the per-host route sync. The remote's slice changes
+    // rarely (catalog installs, host_placement migrations, new actors
+    // created on it); meanwhile every cross-host call lands here and
+    // would otherwise pay a `/__internal/object-routes` round-trip plus
+    // a directory register-objects RPC every single time. Acceleration
+    // is best-effort, so a stale view costs at most one extra
+    // resolve-object lookup.
+    const now = Date.now();
+    const last = this.remoteRouteSyncAt.get(host);
+    if (last !== undefined && now - last < REMOTE_ROUTE_SYNC_TTL_MS) return;
+    this.remoteRouteSyncAt.set(host, now);
     try {
       const routes = await this.forwardInternal<Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>>(host, "/__internal/object-routes", {});
-      await this.registerRoutes(routes.filter((route) => route.host === host));
+      const ok = await this.registerRoutes(routes.filter((route) => route.host === host));
+      // registerRoutes returns false when the directory publish itself
+      // failed (non-OK status, transport error). Drop the throttle entry
+      // so the next caller retries instead of suppressing for the full
+      // TTL — directory acceleration is best-effort but the comment
+      // promised retry on failure, and forgetting to honor that
+      // contract turned a transient publish failure into a 60s blackout.
+      if (!ok) this.remoteRouteSyncAt.delete(host);
     } catch {
-      // The applied frame is already durable on the target host; route
-      // registration can be retried by a later state read or call.
+      // Fetch threw (transport, timeout, etc.). Same retry semantics as
+      // a failed publish — drop the throttle entry.
+      this.remoteRouteSyncAt.delete(host);
     }
   }
 
@@ -1636,7 +1814,7 @@ export class PersistentObjectDO {
       if (request.method === "POST" && pathname === "/__internal/host-seed") {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
-        return jsonResponse(world.exportHostScopedWorld(host));
+        return jsonResponse(world.buildHostSeedForDelivery(host));
       }
 
       if (request.method === "POST" && pathname === "/__internal/apply-host-seed") {
@@ -1644,7 +1822,7 @@ export class PersistentObjectDO {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "apply-host-seed requires host");
         if (host !== hostKey) throw wooError("E_INVARG", `host mismatch: ${host} != ${hostKey}`);
-        if (!isSerializedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires serialized seed");
+        if (!isSeedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires a SeedWorld with objectHosts (spec §HS1)");
         return jsonResponse(this.applyHostSeed(world, host, body.seed));
       }
 
@@ -1857,6 +2035,16 @@ export class PersistentObjectDO {
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-dispatch") {
+        // Re-entrancy: if this inbound call is part of the chain we are
+        // currently awaiting on the queue (typical for A→B→A dispatch
+        // shapes), forward the chain id to hostDispatch. It runs inline
+        // when the id matches currentTaskChainId, bypassing the
+        // serial host queue. Without this the inbound queues behind
+        // the A task that is still awaiting B's response → 30s
+        // E_TIMEOUT, plus everything else queued behind A blocks too
+        // (observed in prod tail as host_task_blocked storms during a
+        // single look_at).
+        const inboundChainId = request.headers.get("x-woo-task-chain") ?? undefined;
         const rawCtx = body.ctx && typeof body.ctx === "object" && !Array.isArray(body.ctx)
           ? body.ctx as Record<string, unknown>
           : {};
@@ -1909,7 +2097,7 @@ export class PersistentObjectDO {
           },
           deferHostEffect: (effect) => deferredHostEffects.push(effect)
         };
-        const result = await world.hostDispatch(ctx, target, verb, args, startAt);
+        const result = await world.hostDispatch(ctx, target, verb, args, startAt, inboundChainId);
         // Compute audience here using this DO's authoritative subscribers; the
         // gateway's local view of a self-hosted space is stale and would
         // mis-filter the WS/MCP fan-out. Returned to the caller so the
@@ -2478,12 +2666,23 @@ export class PersistentObjectDO {
 
   private async forwardInternalRaw<T>(host: string, path: string, bodyStr: string, options: { timeoutMs?: number }): Promise<T> {
     const id = this.env.WOO.idFromName(host);
+    // Stamp the active task chain id on every outbound RPC. The receiver
+    // uses it to detect re-entrancy: if a callback arrives while the
+    // caller is still awaiting (typical for A→B→A dispatch chains),
+    // matching ids let the callback run inline instead of queueing
+    // behind the caller's stuck task. Reads from the world's
+    // currentHostTask, set by enqueueHostTask. Null when no task is
+    // active (cold-load directory chatter, postflight probes, etc.) —
+    // treated as a fresh chain at the receiver.
+    const chainId = this.world?.currentTaskChainId() ?? null;
+    const baseHeaders: Record<string, string> = {
+      "content-type": "application/json; charset=utf-8",
+      "x-woo-host-key": host
+    };
+    if (chainId !== null) baseHeaders["x-woo-task-chain"] = chainId;
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "x-woo-host-key": host
-      },
+      headers: baseHeaders,
       body: bodyStr
     }));
     const startedAt = Date.now();
@@ -2746,6 +2945,39 @@ function isSerializedWorld(value: unknown): value is SerializedWorld {
     Array.isArray(candidate.logs) &&
     Array.isArray(candidate.snapshots) &&
     Array.isArray(candidate.parkedTasks);
+}
+
+/** A SeedWorld must validate as a SerializedWorld AND carry an
+ * `objectHosts` map with an entry for every `objects[i].id`, per
+ * spec/protocol/host-seeds.md §HS1. Missing entries would be treated
+ * as foreign-hosted by the merge and could overwrite receiver-
+ * authoritative state, so coverage is enforced at the boundary. */
+/** A satellite's on-disk slice is "host-scoped" once it carries the
+ * 2026-04-30 catalog-placement marker — i.e. the host's own object has a
+ * host_placement="self" property recorded. Pre-migration stored worlds
+ * lack it; those need the recovery re-scope path. The gateway slice
+ * (hostKey === WORLD_HOST) is always treated as host-scoped: its
+ * authoritative full universe is the source of every host's seed and
+ * never needs trimming. */
+function storedSliceIsHostScoped(stored: SerializedWorld, hostKey: ObjRef): boolean {
+  if (hostKey === WORLD_HOST) return true;
+  const hostObj = stored.objects.find((obj) => obj.id === hostKey);
+  if (!hostObj) return false;
+  for (const [name, value] of hostObj.properties) {
+    if (name === "host_placement" && value === "self") return true;
+  }
+  return false;
+}
+
+function isSeedWorld(value: unknown): value is SeedWorld {
+  if (!isSerializedWorld(value)) return false;
+  const candidate = value as Partial<Record<"objectHosts", unknown>>;
+  if (candidate.objectHosts === null || typeof candidate.objectHosts !== "object" || Array.isArray(candidate.objectHosts)) return false;
+  const objectHosts = candidate.objectHosts as Record<string, unknown>;
+  for (const obj of (value as SerializedWorld).objects) {
+    if (typeof objectHosts[obj.id] !== "string" || (objectHosts[obj.id] as string).length === 0) return false;
+  }
+  return true;
 }
 
 function uniqueRoutes(routes: Array<{ id: string; host: string; anchor: string | null }>): Array<{ id: string; host: string; anchor: string | null }> {

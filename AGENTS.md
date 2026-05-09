@@ -1,6 +1,14 @@
-# AGENTS.md
+# Agent Instructions
 
-woo is an object database substrate plus application superstructure.
+Design documents (including historical drafts) are in `notes/` and `spec/`.  User documents are in `docs/`.
+
+## Quality
+
+- Be observant.  Check everything that you see in prompts and context.  Unexpected or unexplained behavior might be a bug.  Bugs must be investigated.  Investigations must identify the actual cause.
+- Investigate thoroughly until the actual behavior is confirmed.  We have instrumentation and debug logging.  If those are not sufficient for debugging, then they must be improved.  Don't write new code until you have exhaused all other options.  When replacing old code, clean up thoroughly.
+- Take ownership now.  When there is a problem, it must be skillfully resolved.  There are no "pre-existing issues".  The cavalry will not arrive.  Track and fix problems when they are observed.  "Bigger changes" must never be deferred.  Do hard things carefully.
+- Take care now.  Code is not ready until it has been reviewed for security, performance, consistency and correctness.  Code is not ready until it has been thoroughly tested.  Features require tests that exercise the feature in full, and that will fail if the user-visible behavior breaks.  Code is not ready until the user docs are accurate.
+- Comments are required.  Explain to the next reader, to make their work easier.
 
 ## Spec is the source of truth
 
@@ -33,6 +41,13 @@ under `catalogs/`, installed through the same path that any third-party
 catalog uses. All user-visible behavior lives here.
 
 Spec:  `spec/discovery/catalogs.md`
+
+## Big-World discipline
+
+This is a distributed system.  There will be millions of nodes, and any one
+cannot be expected to have knowledge of all the others.  Global enumeration
+must be avoided.  Synchronous dependencies must be avoided.  Singletons with
+special roles are OK as long as scaling and performance are considered.
 
 ## Layering discipline
 

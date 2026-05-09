@@ -145,7 +145,11 @@ export const BUILTIN_NAMES = [
   // object's verb/property surface and a bounded text search). The
   // catalog $programmer / $builder verbs run their own surface check
   // and then call these for the data.
-  "authoring_inspect", "authoring_search"
+  "authoring_inspect", "authoring_search",
+  // Object-level identity edits. set_object_name keeps WooObject.name
+  // and the inherited "name" property in lockstep so $root:@rename can
+  // do the right thing through one call.
+  "set_object_name"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1234,6 +1238,11 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 3) throw wooError("E_INVARG", "authoring_search expects query, opts, and include_source flag");
         const includeSource = builtinArgs[2] === true;
         return frame.ctx.world.authoringSearchFor(frame.ctx.actor, assertString(builtinArgs[0]), builtinArgs[1] ?? null, includeSource) as unknown as WooValue;
+      }
+      case "set_object_name": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "set_object_name expects object and name");
+        frame.ctx.world.setObjectNameForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]));
+        return null;
       }
       default:
         throw wooError("E_INVARG", `unknown builtin: ${name}`);

@@ -29,8 +29,7 @@ const env: WeatherPlugEnv = {
   WOO_BASE_URL: "https://woo.example",
   WOO_APIKEY: "apikey:abc:def",
   TOMORROW_IO_API_KEY: "tomorrow-secret",
-  BLOCK_ID: "the_weather_block",
-  FORECAST_HOURS: "1"
+  BLOCK_ID: "the_weather_block"
 };
 
 describe("runLoggedWeatherTick", () => {
@@ -54,9 +53,11 @@ describe("runLoggedWeatherTick", () => {
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
       () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
-      () => ({ status: 200, body: { value: 1 } }),
-      () => ({ status: 200, body: { data: { time: "t", values: { temperature: 70 } } } }),
-      () => ({ status: 200, body: { timelines: { hourly: [{ time: "t1", values: { temperature: 71 } }] } } }),
+      () => ({ status: 200, body: { value: {} } }),     // prior timeseries (cold start)
+      () => ({ status: 200, body: { value: [] } }),     // prior daily (cold start)
+      () => ({ status: 200, body: { data: { time: "2026-05-05T18:00:00Z", values: { temperature: 70 } } } }),
+      () => ({ status: 200, body: { timelines: { hourly: [], daily: [] } } }),
+      () => ({ status: 200, body: { timelines: { hourly: [], daily: [] } } }),
       () => ({ status: 200, body: { result: { ok: true }, observations: [] } })
     ]);
 
@@ -117,7 +118,14 @@ describe("runLoggedWeatherTick", () => {
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
       () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
-      () => ({ status: 200, body: { value: 1 } }),
+      () => ({ status: 200, body: { value: {} } }),
+      () => ({ status: 200, body: { value: [] } }),
+      ({ url }) => url.includes("api.tomorrow.io")
+        ? { status: 429, body: { code: 429001, message: "rate limit" }, headers: { "Retry-After": "60" } }
+        : { status: 200, body: {} },
+      ({ url }) => url.includes("api.tomorrow.io")
+        ? { status: 429, body: { code: 429001, message: "rate limit" }, headers: { "Retry-After": "60" } }
+        : { status: 200, body: {} },
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 429, body: { code: 429001, message: "rate limit" }, headers: { "Retry-After": "60" } }
         : { status: 200, body: {} },
@@ -138,7 +146,14 @@ describe("runLoggedWeatherTick", () => {
       () => ({ status: 200, body: { value: "Mountain View, CA" } }),
       () => ({ status: 200, body: { value: "imperial" } }),
       () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
-      () => ({ status: 200, body: { value: 1 } }),
+      () => ({ status: 200, body: { value: {} } }),
+      () => ({ status: 200, body: { value: [] } }),
+      ({ url }) => url.includes("api.tomorrow.io")
+        ? { status: 401, body: { error: "bad key" } }
+        : { status: 200, body: {} },
+      ({ url }) => url.includes("api.tomorrow.io")
+        ? { status: 401, body: { error: "bad key" } }
+        : { status: 200, body: {} },
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 401, body: { error: "bad key" } }
         : { status: 200, body: {} },

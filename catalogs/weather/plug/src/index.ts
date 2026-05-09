@@ -2,26 +2,34 @@
 //
 // Cron-triggered. Each tick:
 //   1. Authenticate to woo with the actor-bound apikey for the weather block.
-//   2. Read the block's owner-set `place` property.
-//   3. Fetch tomorrow.io for that place.
-//   4. Push current/forecast/last_pushed_at via :set_properties.
+//   2. Read the block's owner-set `place`, `units`, `timezone` properties.
+//   3. Fetch tomorrow.io (realtime + forecast 1h+1d + history 1h+1d).
+//   4. Push the {current, daily, timeseries, last_pushed_at, last_error,
+//      config_state} bundle via :set_properties in a single call.
 //
 // Disconnects between ticks. The block keeps last-set values across plug
 // downtime; the SPA renders "stale, last seen ..." from `last_pushed_at` and
 // the block-side freshness window.
 
 import { WooClient, WooError } from "./woo-client";
-import { fetchWeather, TomorrowIoError, type TomorrowUnits, type WeatherSnapshot } from "./tomorrow-io";
+import {
+  fetchWeather,
+  formatLocalDate,
+  mergeDaily,
+  mergeTimeseries,
+  TomorrowIoError,
+  type TomorrowUnits,
+  type WeatherCurrent,
+  type WeatherDailyEntry,
+  type WeatherSnapshot,
+  type WeatherTimeseries
+} from "./tomorrow-io";
 
 export interface WeatherPlugEnv {
   WOO_BASE_URL: string;
   WOO_APIKEY: string;
   TOMORROW_IO_API_KEY: string;
   BLOCK_ID: string;
-  /** Optional override for the block's forecast_hours when the block has
-   * not been configured by an owner. The block's writable_owner value
-   * always wins when present. */
-  FORECAST_HOURS?: string;
   /** Required for the manual POST trigger. Caller must send
    * `Authorization: Bearer <TRIGGER_SECRET>`. Without it, anyone with the
    * Worker URL could burn tomorrow.io quota and force block writes. The
@@ -123,9 +131,8 @@ export async function runWeatherTick(
   }
 
   // Owner-set knobs ride writable_owner on the block. The plug honors them
-  // verbatim — falling back to env (deploy-time) only when the block hasn't
-  // been configured. This is the "config props are owner-writable" half of
-  // the $block contract.
+  // verbatim — this is the "config props are owner-writable" half of the
+  // $block contract.
   const unitsRaw = await client.getProperty(env.BLOCK_ID, "units");
   const units: TomorrowUnits = unitsRaw === "imperial" ? "imperial" : "metric";
   const timezoneRaw = await getOptionalProperty(client, env.BLOCK_ID, "timezone");
@@ -135,17 +142,23 @@ export async function runWeatherTick(
     await writeConfigError(client, env.BLOCK_ID, "E_BAD_TIMEZONE", message, { place, timezone: timezoneRaw });
     throw new WeatherConfigError("E_BAD_TIMEZONE", message, 400, { place, timezone: timezoneRaw });
   }
-  const forecastHoursRaw = await client.getProperty(env.BLOCK_ID, "forecast_hours");
-  const forecastHours = pickForecastHours(forecastHoursRaw, env.FORECAST_HOURS);
   const tomorrowPlace = normalizeTomorrowLocation(place);
+
+  // Read what the plug has previously written so we can accumulate past
+  // observations beyond tomorrow.io's free-tier window (24 h hourly /
+  // 2 d daily). Cold start: both come back as `{}` / `[]` defaults; the
+  // merge functions handle that. The cost is two extra woo REST calls
+  // per tick — no tomorrow.io quota impact.
+  const priorTimeseries = coerceTimeseries(await getOptionalProperty(client, env.BLOCK_ID, "timeseries"));
+  const priorDaily = coerceDaily(await getOptionalProperty(client, env.BLOCK_ID, "daily"));
 
   let snapshot: WeatherSnapshot;
   try {
     snapshot = await fetchWeather({
       apiKey: env.TOMORROW_IO_API_KEY,
       place: tomorrowPlace,
+      timezone,
       units,
-      forecastHours,
       fetchImpl
     });
   } catch (err) {
@@ -158,10 +171,16 @@ export async function runWeatherTick(
     throw err;
   }
 
+  const mergedTimeseries = mergeTimeseries(priorTimeseries, snapshot.timeseries);
+  const mergedDaily = mergeDaily(priorDaily, snapshot.daily, snapshot.fetched_at, timezone);
+
+  // Single-bundle write so a reader never observes a torn snapshot
+  // (e.g. a fresh `current` paired with a stale `daily`).
   await client.directCall(env.BLOCK_ID, "set_properties", [
     {
       current: withLocalObservationTime(snapshot.current, timezone),
-      forecast: snapshot.forecast,
+      daily: mergedDaily,
+      timeseries: mergedTimeseries,
       last_pushed_at: snapshot.fetched_at,
       last_error: null,
       config_state: {
@@ -175,6 +194,20 @@ export async function runWeatherTick(
   ]);
 
   return { block: env.BLOCK_ID, place, fetched_at: snapshot.fetched_at };
+}
+
+// Light shape guards at the woo-REST boundary. The block defaults
+// `timeseries` to `{}` and `daily` to `[]`, so a cold-start tick sees
+// "empty but not null" — coerce to `null` so the merge code can take
+// the simple "no prior" branch.
+function coerceTimeseries(raw: unknown): WeatherTimeseries | null {
+  if (!raw || typeof raw !== "object") return null;
+  const v = raw as Record<string, unknown>;
+  if (typeof v.t0 !== "number" || typeof v.step !== "number" || !v.fields) return null;
+  return raw as WeatherTimeseries;
+}
+function coerceDaily(raw: unknown): WeatherDailyEntry[] | null {
+  return Array.isArray(raw) && raw.length > 0 ? raw as WeatherDailyEntry[] : null;
 }
 
 export function normalizeTomorrowLocation(place: string): string {
@@ -202,18 +235,25 @@ export function normalizeTimezone(value: unknown): string | null {
   }
 }
 
-export function withLocalObservationTime(current: WeatherSnapshot["current"], timezone: string | null): WeatherSnapshot["current"] {
+export function withLocalObservationTime(current: WeatherCurrent, timezone: string | null): WeatherCurrent {
+  // local_date stamps the calendar date (in the configured timezone) at the
+  // moment of observation, so woocode verbs can resolve "today" by string
+  // equality against daily[*].date — the VM has no Intl/TZ math, so this
+  // lookup must be done by the plug at push time.
+  const localDate = timezone && Number.isFinite(current.observed_at)
+    ? formatLocalDate(current.observed_at, timezone)
+    : undefined;
   return {
     ...current,
     observed_at_text: formatObservedAt(current.observed_at, timezone),
-    observed_timezone: timezone ?? "UTC"
+    observed_timezone: timezone ?? "UTC",
+    ...(localDate ? { local_date: localDate } : {})
   };
 }
 
-export function formatObservedAt(observedAt: string, timezone: string | null): string {
-  const at = Date.parse(observedAt);
-  if (!Number.isFinite(at)) return observedAt || "an unknown time";
-  if (!timezone) return formatUtcMinute(at);
+export function formatObservedAt(observedAt: number, timezone: string | null): string {
+  if (!Number.isFinite(observedAt)) return "an unknown time";
+  if (!timezone) return formatUtcMinute(observedAt);
   try {
     return new Intl.DateTimeFormat("en-US", {
       timeZone: timezone,
@@ -223,24 +263,15 @@ export function formatObservedAt(observedAt: string, timezone: string | null): s
       hour: "numeric",
       minute: "2-digit",
       timeZoneName: "short"
-    }).format(new Date(at));
+    }).format(new Date(observedAt));
   } catch {
-    return formatUtcMinute(at);
+    return formatUtcMinute(observedAt);
   }
 }
 
 function formatUtcMinute(at: number): string {
   const iso = new Date(at).toISOString();
   return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
-}
-
-function pickForecastHours(blockValue: unknown, envValue: string | undefined): number | undefined {
-  if (typeof blockValue === "number" && Number.isFinite(blockValue) && blockValue > 0) return Math.floor(blockValue);
-  if (envValue !== undefined && envValue !== "") {
-    const parsed = Number(envValue);
-    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
-  }
-  return undefined;
 }
 
 // Single line of JSON to console — CF Workers' Logs tab parses it

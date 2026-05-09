@@ -1,9 +1,26 @@
 # Recycling objects
 
-`recycle()` destroys an object. It is a builtin — call it directly
-through `eval`.
+For routine cleanup, type `@recycle <name>` in chat. For programmatic
+control or stuck objects, drop into `eval` and call `recycle()` directly.
 
-## Routine recycle
+## `@recycle <name>` (chat command)
+
+```
+@recycle book
+```
+
+Resolves the noun via the standard matcher (inventory first, then the
+current room — see `spec/semantics/match.md` §MA2), refuses self-recycle,
+checks owner-or-wizard authority, and on success replies with
+`book (#obj_xxx) recycled.` The verb is the LambdaCore `$builder:@recycle`
+(#630) port; see `catalogs/prog/manifest.json` for the source and
+divergence notes.
+
+`@recycle` lives on `$builder`, and `$wiz` inherits via `$wiz isa
+$programmer isa $builder isa $player` after the prog catalog installs.
+Any builder-or-wizard actor reaches it through normal verb lookup.
+
+## `recycle()` builtin via `eval`
 
 ```
 ;recycle($the_thing)
@@ -38,8 +55,11 @@ All options are passed in the second-arg map. All are optional.
 ## Catalog wrappers
 
 Two woocode wrappers exist on top of the builtin. Prefer them when one
-applies — they centralize the permission check and emit audit
-observations.
+applies — they centralize the permission check, emit audit
+observations, and surface as ordinary tools on actors that inherit
+from `$builder` / `$programmer`. See
+[../designing/builder-and-programmer.md](../designing/builder-and-programmer.md)
+for how the surface attaches to actors and the related chat commands.
 
 - **`$builder:recycle(id, opts)`** — owner-or-wizard. Strips
   `force_reserved` before forwarding (so a non-wizard can never reach

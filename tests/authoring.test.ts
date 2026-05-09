@@ -47,6 +47,44 @@ describe("authoring", () => {
     expect(compiled.ok).toBe(false);
   });
 
+  // String literals whose parsed text happens to match an operator or keyword
+  // must not be confused for that token by the parser. Before the fix,
+  // `matchValue("-")` would match a string token whose value was `"-"`,
+  // causing the parser to consume the string as a unary-minus operator and
+  // then look for an operand that didn't exist. Same hazard for `"!"`,
+  // `"+"` (no current unary +, but matchValue is used in parseTerm), and
+  // for keyword-shaped strings like `"for"` / `"in"`.
+  it("treats single-character operator strings as ordinary string literals", () => {
+    const cases: Array<[string, string]> = [
+      ["dash", `verb :t() rx { let x = "-"; return x; }`],
+      ["bang", `verb :t() rx { let x = "!"; return x; }`],
+      ["plus", `verb :t() rx { let x = "+"; return x; }`],
+      ["star", `verb :t() rx { let x = "*"; return x; }`],
+      ["slash", `verb :t() rx { let x = "/"; return x; }`],
+      ["dotdot", `verb :t() rx { let x = ".."; return x; }`],
+      ["eqeq", `verb :t() rx { let x = "=="; return x; }`],
+      ["dash-arg", `verb :t() rx { return str_split("a-b", "-"); }`],
+      ["dash-binop", `verb :t() rx { return "a" + "-" + "b"; }`]
+    ];
+    for (const [name, src] of cases) {
+      const compiled = compileVerb(src);
+      expect(compiled.ok, `${name}: ${JSON.stringify(compiled.diagnostics)}`).toBe(true);
+    }
+  });
+
+  it("treats keyword-shaped strings as ordinary string literals", () => {
+    const cases: Array<[string, string]> = [
+      ["for", `verb :t() rx { let x = "for"; return x; }`],
+      ["in", `verb :t() rx { let x = "in"; return x; }`],
+      ["if", `verb :t() rx { let x = "if"; return x; }`],
+      ["return", `verb :t() rx { let x = "return"; return x; }`]
+    ];
+    for (const [name, src] of cases) {
+      const compiled = compileVerb(src);
+      expect(compiled.ok, `${name}: ${JSON.stringify(compiled.diagnostics)}`).toBe(true);
+    }
+  });
+
   it("lets a programmer build an object, install behavior, and keep private state filtered", async () => {
     const world = createWorld();
     const builder = world.auth("guest:builder");

@@ -28,11 +28,13 @@ A **seed** is a `SerializedWorld` slice plus:
   single batched view at export time (not by per-id RPC). The merge
   reads this to dispatch HS2.1 vs HS2.2; it is the only routing input
   the merge needs.
-- `tombstones: Set<ObjRef>` — gateway-side recycles, scoped to
-  foreign-hosted ids reachable from the seed's subjects (the only
-  tombstones the receiver may need to act on). Receiver-hosted
-  recycles do not appear; the gateway's full global tombstone history
-  does not appear.
+- `tombstones: Set<ObjRef>` — the gateway's tombstone set, delivered
+  as-is. The gateway's tombstone set contains only ids it
+  authoritatively recycled. Recycle is host-local (an attempt to
+  recycle a remote-hosted object raises `E_CROSS_HOST_WRITE`), so
+  `gateway.tombstones` is gateway-hosted-by-construction — foreign to
+  every satellite receiver. The receiver does not require per-id host
+  metadata to act on these.
 
 The seed MUST NOT carry sessions, logs, snapshots, parked tasks, or
 gateway-global allocation counters. Each is per-host or per-host-spaces
@@ -45,13 +47,23 @@ the cluster MUST NOT force a satellite snapshot.
 
 ## HS2. Per-subject merge
 
-For each subject `S` in `seed.objects`, dispatch on `seed.objectHosts[S]`:
+If `S ∈ stored.tombstones`, the merge skips `S` entirely (it has been
+authoritatively retired locally; resurrecting it from the seed would
+break HS4 idempotency).
+
+Otherwise, for each subject `S` in `seed.objects`, dispatch on
+`seed.objectHosts[S]`:
 
 ### HS2.1 `S` is receiver-hosted
 
-Skip the subject entirely. Receiver's stored copy is authoritative;
-nothing in the seed about `S` can supersede the receiver's local
-writes.
+If `stored.objects[S]` exists: skip — receiver's local writes are
+authoritative for every field. Nothing in the seed about `S` may
+supersede them.
+
+If `stored.objects[S]` does not exist: take the seed entry as-is
+(initialization). Counts as changed. This admits "satellite lost a
+hosted object and gateway still has the stub" recoveries; once any
+local stored copy exists, subsequent merges leave it alone.
 
 ### HS2.2 `S` is foreign-hosted
 
@@ -60,7 +72,7 @@ Merge declarative state from seed into stored:
 | Field | Rule |
 |---|---|
 | `name`, `parent`, `owner`, `anchor`, `location`, `flags`, `propertyDefs`, `verbs`, `eventSchemas` | Take seed if not deeply equal to stored. |
-| `properties[name]`, `propertyVersions[name]` | For each `name` in the seed: if `name` is **dynamic** (HS3) AND stored already has the property/version, skip — receiver is authoritative for this divergence. Otherwise (including the dynamic-but-stored-has-no-entry case, which is fresh-host initialization), gate on version: skip when `stored.propertyVersions[name] ≥ seed.propertyVersions[name]`; else take seed value and version. |
+| `properties[name]`, `propertyVersions[name]` | For each `name` in the seed: if `name` is **dynamic** (HS3) AND stored already has the property/version, skip — receiver is authoritative for this divergence. Otherwise (including the dynamic-but-stored-has-no-entry case, which is fresh-host initialization), gate on version: skip when `stored.propertyVersions[name] ≥ seed.propertyVersions[name]`; else, if values differ (or stored has no entry), take seed value and version together. Version travels with value: if `stored < seed` but the values are already equal, do not bump version alone. `setProp` bumps `propertyVersions[name]` on every call regardless of value identity, so a gateway-side rewrite of the same value would otherwise force every satellite to persist a full snapshot every cold-load even though nothing observable had changed. |
 
 Never participate in merge, on any subject:
 
@@ -100,6 +112,8 @@ without subsequent merges stomping receiver-side ledger writes.
 |---|---|---|
 | `next_seq`, `subscribers`, `operators`, `focus_list`, `last_snapshot_seq` | `$space` instances / actors | per-host live state |
 | `bootstrap_token_used`, `wizard_actions`, `applied_migrations`, `catalog_migration_records`, `installed_catalogs` | `$system` | per-host ledger |
+| `api_keys` | `$system` | gateway-only auth state. Read by `authApiKey` / `createApiKeyRecord` / `revokeApiKey`, all of which run on the gateway; satellites never authenticate independently. `touchApiKeyLastSeen` rewrites the map on every API-key auth, so propagating it would make every poller's auth call burn a satellite snapshot. First cold-load takes the gateway's view, subsequent cold-loads skip. |
+| `_subscribers_scrubbed_v1` | `$space` descendants the receiver hosts a local copy of | per-host one-shot scrub marker (host-side scrub of stale subscribers, gated to fire once per object) |
 
 Adding to this set is a behavior change: it stops the gateway from
 correcting receiver drift on that name. The bar is "the receiver's
@@ -113,8 +127,16 @@ By the HS1 seed contract, every id in `seed.tombstones` is
 foreign-hosted. For each `T`:
 
 - If `T ∈ stored.tombstones`: no change.
-- Else: add `T` to `stored.tombstones`; if `stored.objects[T]` exists
-  (the receiver had a stub), remove it. Counts as changed.
+- If `stored.objects[T]` does not exist (the receiver never imported a
+  stub for `T`): no change. The directory's `inherited_tombstone`
+  catalog is the cross-host authority for liveness; the satellite does
+  not need a local record of every gateway-side recycle that doesn't
+  affect its slice. Without this scoping, every new gateway-side
+  recycle would force a write on every satellite — restoring an
+  `O(global tombstones)` per-host wake cost that the rest of the merge
+  was designed to avoid.
+- Else (receiver has a stub for `T`): add `T` to `stored.tombstones`;
+  remove `stored.objects[T]`. Counts as changed.
 
 The receiver's own tombstones are NEVER removed by the merge.
 
