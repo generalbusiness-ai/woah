@@ -614,8 +614,14 @@ async function logout() {
   // prefs, etc.) so the next login starts clean. Keep `woo.username` so the
   // form pre-fills.
   clearAccountScopedStorage();
-  // Reload to drop module-level state (framework caches, pending maps, audio,
-  // chatHistory) without needing to enumerate every field.
+  // Reset the URL so the next session doesn't reopen the previous user's
+  // object path. Reload to drop module-level state (framework caches, pending
+  // maps, audio, chatHistory) without needing to enumerate every field.
+  try {
+    history.replaceState({}, "", "/");
+  } catch {
+    // ignore
+  }
   location.reload();
 }
 
