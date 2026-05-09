@@ -12,10 +12,14 @@ This is the outside-world half of the weather block. The catalog half (the
 Cron-triggered hourly. Each tick:
 
 1. POSTs to `/api/auth` with the actor-bound apikey for the weather block.
-2. GETs the block's owner-set config (`place`, `timezone`, `units`, and `forecast_hours`).
-3. Fetches tomorrow.io realtime + hourly-forecast endpoints.
-4. POSTs `:set_properties` with `current` (scalar shape), `forecast` (series
-   shape), `last_pushed_at`, and `config_state`.
+2. GETs the block's owner-set config (`place`, `timezone`, `units`).
+3. Fetches three tomorrow.io endpoints in parallel: `weather/realtime`,
+   `weather/forecast` (1h+1d timesteps), and `weather/history/recent`
+   (1h+1d timesteps).
+4. POSTs `:set_properties` with `current` (flat scalar bundle), `daily`
+   (per-day rollup array), `timeseries` (column-major ±7d hourly chart
+   payload), `last_pushed_at`, `last_error`, and `config_state` — all in
+   a single bundle so a reader never sees a torn snapshot.
 5. Disconnects.
 
 If the block has no `place` configured, has an invalid timezone, or
@@ -37,16 +41,19 @@ block owner whether the latest location/timezone has been confirmed.
 
 ## Tomorrow.io free-plan budget
 
-Each tick costs **2 API calls** (realtime + forecast). Free-plan caps:
+Each tick costs **3 API calls** (realtime + forecast + history/recent),
+issued in parallel. Free-plan caps:
 
 | Limit | Per-block cost | Notes |
 |---|---|---|
-| 25 calls / hour | 2 / 25 | One or two blocks per key fits |
-| 500 calls / day | 48 / 500 | A dozen blocks per key hits the daily cap |
-| 3 calls / second | 2 (sequential) | Plug never fans out, so this is irrelevant |
+| 25 calls / hour | 3 / 25 | ~6 blocks per key on hourly cron |
+| 500 calls / day | 72 / 500 | ~5 blocks per key on hourly cron |
+| 3 calls / second | 3 (parallel) | Right at the burst cap; no headroom for retries within a tick |
 
-Production demo: one weather block in the living room runs at ~10% of the
-hourly free-plan budget and ~10% of the daily budget. Plenty of headroom.
+Production demo: one weather block in the living room runs at ~12% of the
+hourly free-plan budget and ~14% of the daily budget. Drop the cron to
+every 3-4 hours, or shard keys per block, to host more blocks behind one
+key.
 
 ## Setup
 
@@ -81,10 +88,9 @@ mismatched, or revoked. Use the full `apikey:<id>:<secret>` token;
 `apikey:<secret>` is not the documented token form.
 
 Deployment-specific public values live in `wrangler.toml` under `[vars]`:
-`WOO_BASE_URL`, `BLOCK_ID`, and optional `FORECAST_HOURS`. The repo bootstrap
-script updates those public vars. Secrets still go through
-`wrangler secret put`. If provisioning manually, set the secrets before
-deploy:
+`WOO_BASE_URL` and `BLOCK_ID`. The repo bootstrap script updates those public
+vars. Secrets still go through `wrangler secret put`. If provisioning manually,
+set the secrets before deploy:
 
 ```bash
 wrangler secret put WOO_APIKEY

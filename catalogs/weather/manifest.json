@@ -1,8 +1,8 @@
 {
   "name": "weather",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "spec_version": "v1",
-  "description": "Weather block class — a $block subclass that displays current conditions, a forecast, and recent history for a configured place. Owner sets `place`, `units`, and `forecast_hours`; an external plug Worker (catalogs/weather/plug) fetches tomorrow.io on a schedule and pushes data via apikey-bound session.",
+  "description": "Weather block class — a $block subclass that displays current conditions, a 14-day daily rollup, and a column-major hourly time-series payload for chart UIs. Owner sets `place`, `timezone`, and `units`; an external plug Worker (catalogs/weather/plug) fetches tomorrow.io on a schedule and pushes the bundle via apikey-bound session.",
   "license": "MIT",
   "depends": ["@local:block"],
   "ui": {
@@ -24,6 +24,15 @@
           "include": ["subject"]
         },
         "requires": ["current", "config_state", "place", "last_error"]
+      },
+      {
+        "id": "weather.chart",
+        "module": "weather-ui",
+        "tag": "woo-weather-chart",
+        "surface": "weather-chart-popup",
+        "subject": "$weather_block",
+        "neighborhood": { "include": ["subject"] },
+        "requires": ["current", "daily", "timeseries", "place", "timezone", "config_state"]
       }
     ]
   },
@@ -32,18 +41,17 @@
       "local_name": "$weather_block",
       "parent": "$block",
       "flags": { "fertile": true },
-      "description": "A weather display block. The owner configures `place` (a town name or zip code), `timezone` (IANA timezone for local display), `units` (\"metric\" or \"imperial\"), and `forecast_hours` (how many hours of forecast to surface). The plug sends `place` to the upstream API as configured and pushes `current` as a scalar shape (headline temperature plus source weather code), `forecast` as a series with hourly detail, and `history` as a series. `last_pushed_at` and `last_error` ride the standard $block writable_self surface so :look surfaces freshness.",
+      "description": "A weather display block. The owner configures `place` (a town name or zip code), `timezone` (IANA timezone for local display), and `units` (\"metric\" or \"imperial\"). The plug sends `place` to the upstream API as configured and pushes three internally-consistent props in one bundle: `current` (small flat map with the headline temperature, humidity, weather code, and observed-time strings — read by chat verbs and the badge), `daily` (14 entries spanning the past week through the next week, each carrying min/max/mean rollups per metric — read by chat verbs that summarize the week), and `timeseries` (a column-major ±7-day hourly payload sized for chart UIs, with one homogeneous array per field — read by the detail chart, never by chat verbs). `last_pushed_at` and `last_error` ride the standard $block writable_self surface so :look surfaces freshness.",
       "properties": [
         { "name": "place", "type": "str", "default": "", "perms": "r" },
         { "name": "timezone", "type": "str", "default": "", "perms": "r" },
         { "name": "units", "type": "str", "default": "metric", "perms": "r" },
-        { "name": "forecast_hours", "type": "int", "default": 12, "perms": "r" },
         { "name": "current", "type": "map", "default": {}, "perms": "r" },
-        { "name": "forecast", "type": "map", "default": {}, "perms": "r" },
-        { "name": "history", "type": "map", "default": {}, "perms": "r" },
+        { "name": "daily", "type": "list<map>", "default": [], "perms": "r" },
+        { "name": "timeseries", "type": "map", "default": {}, "perms": "r" },
         { "name": "config_state", "type": "map", "default": { "status": "unconfigured", "message": "owner has not configured location and timezone" }, "perms": "r" },
-        { "name": "writable_owner", "type": "list<str>", "default": ["place", "timezone", "units", "forecast_hours"], "perms": "r" },
-        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error", "current", "forecast", "history", "config_state"], "perms": "r" }
+        { "name": "writable_owner", "type": "list<str>", "default": ["place", "timezone", "units"], "perms": "r" },
+        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"], "perms": "r" }
       ],
       "verbs": [
         {
@@ -52,7 +60,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :weather_line() rxd { let current = this.current; let place = this:display_location(); let config = this.config_state; if (typeof(config) == \"map\" && has(config, \"status\") && config[\"status\"] == \"error\") { return \"Weather for \" + place + \": error\"; } if (typeof(current) == \"map\" && has(current, \"value\")) { let unit = \"\"; if (has(current, \"unit\") && current[\"unit\"]) { unit = current[\"unit\"]; } return \"Temperature in \" + place + \": \" + to_string(current[\"value\"]) + unit; } return \"Weather for \" + place + \": no current reading yet\"; }"
+          "source": "verb :weather_line() rxd { let current = this.current; let place = this:display_location(); let config = this.config_state; if (typeof(config) == \"map\" && has(config, \"status\") && config[\"status\"] == \"error\") { return \"Weather for \" + place + \": error\"; } if (typeof(current) == \"map\" && has(current, \"temperature\")) { let unit = \"\"; if (has(current, \"temperature_unit\") && current[\"temperature_unit\"]) { unit = current[\"temperature_unit\"]; } return \"Temperature in \" + place + \": \" + to_string(current[\"temperature\"]) + unit; } return \"Weather for \" + place + \": no current reading yet\"; }"
         },
         {
           "name": "display_location",
@@ -68,7 +76,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :current_time_text() rxd { let current = this.current; if (typeof(current) == \"map\") { if (has(current, \"observed_at_text\") && typeof(current[\"observed_at_text\"]) == \"string\" && current[\"observed_at_text\"]) { return current[\"observed_at_text\"]; } if (has(current, \"observed_at\") && typeof(current[\"observed_at\"]) == \"string\") { let observed = current[\"observed_at\"]; if (length(observed) >= 16) { return str_slice(observed, 1, 10) + \" \" + str_slice(observed, 12, 16) + \" UTC\"; } if (observed) { return observed; } } } return \"an unknown time\"; }"
+          "source": "verb :current_time_text() rxd { let current = this.current; if (typeof(current) == \"map\" && has(current, \"observed_at_text\") && typeof(current[\"observed_at_text\"]) == \"string\" && current[\"observed_at_text\"]) { return current[\"observed_at_text\"]; } return \"an unknown time\"; }"
         },
         {
           "name": "assert_configurable",
@@ -97,15 +105,6 @@
           "source": "verb :set_units(units) rx { this:assert_configurable(); let value = str_lower(str_trim(to_string(units))); if (!(value in [\"metric\", \"imperial\"])) { raise { code: \"E_INVARG\", message: \"units must be metric or imperial\", value: units }; } return this:set_property(\"units\", value); }"
         },
         {
-          "name": "set_forecast_hours",
-          "perms": "rx",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "tool_exposed": true,
-          "arg_spec": { "args": ["hours"] },
-          "source": "verb :set_forecast_hours(hours) rx { this:assert_configurable(); let value = hours; if (typeof(value) == \"string\") { value = to_int(str_trim(value)); } if (typeof(value) != \"number\") { raise { code: \"E_TYPE\", message: \"forecast hours must be numeric\", value: hours }; } value = round(value); if (value < 1 || value > 168) { raise { code: \"E_RANGE\", message: \"forecast hours must be between 1 and 168\", value: value }; } return this:set_property(\"forecast_hours\", value); }"
-        },
-        {
           "name": "title",
           "perms": "rxd",
           "direct_callable": true,
@@ -114,12 +113,20 @@
           "source": "verb :title() rxd { return this:weather_line(); }"
         },
         {
+          "name": "open",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [], "command": { "dobj": "this", "prep": "none", "iobj": "none", "args_from": [] } },
+          "source": "verb :open() rxd { observe({ type: \"weather_open\", _audience_override: [actor], block: this }); return { ok: true, block: this }; }"
+        },
+        {
           "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
           "arg_spec": { "args": [] },
-          "source": "verb :look_self() rxd { let current = this.current; let place = this:display_location(); let line = this:weather_line(); let updated = this.last_pushed_at; let time = this:current_time_text(); let config = this.config_state; let config_error = null; if (typeof(config) == \"map\" && has(config, \"status\") && config[\"status\"] == \"error\") { if (has(config, \"message\") && typeof(config[\"message\"]) == \"string\" && config[\"message\"]) { config_error = config[\"message\"]; } else { config_error = \"the weather plug reported a configuration error\"; } } let text = \"The weather panel shows no current reading for \" + place + \".\"; if (typeof(current) == \"map\" && has(current, \"value\")) { let unit = \"\"; if (has(current, \"unit\") && current[\"unit\"]) { unit = current[\"unit\"]; } text = \"The weather panel shows that the temperature in \" + place + \" was \" + to_string(current[\"value\"]) + unit + \" at \" + time + \".\"; } if (config_error) { text = \"Weather status: error for \" + place + \". \" + config_error + \".\"; if (typeof(current) == \"map\" && has(current, \"value\")) { let error_unit = \"\"; if (has(current, \"unit\") && current[\"unit\"]) { error_unit = current[\"unit\"]; } text = text + \" Last successful reading: \" + to_string(current[\"value\"]) + error_unit + \" at \" + time + \".\"; } } else { if (typeof(config) == \"map\" && has(config, \"status\") && config[\"status\"] == \"pending\") { text = text + \" Waiting for the weather plug to confirm the new location and timezone.\"; } if (this.last_error) { text = text + \" Weather status: error. \" + to_string(this.last_error) + \".\"; } } return { id: this, title: line, description: text, current: current, forecast: this.forecast, history: this.history, config_state: config, last_pushed_at: updated, last_updated: time, last_updated_text: time, last_error: this.last_error, location: location(this) }; }"
+          "source": "verb :look_self() rxd { let current = this.current; let place = this:display_location(); let line = this:weather_line(); let updated = this.last_pushed_at; let time = this:current_time_text(); let config = this.config_state; let config_error = null; if (typeof(config) == \"map\" && has(config, \"status\") && config[\"status\"] == \"error\") { if (has(config, \"message\") && typeof(config[\"message\"]) == \"string\" && config[\"message\"]) { config_error = config[\"message\"]; } else { config_error = \"the weather plug reported a configuration error\"; } } let text = \"The weather panel shows no current reading for \" + place + \".\"; if (typeof(current) == \"map\" && has(current, \"temperature\")) { let unit = \"\"; if (has(current, \"temperature_unit\") && current[\"temperature_unit\"]) { unit = current[\"temperature_unit\"]; } text = \"The weather panel shows that the temperature in \" + place + \" was \" + to_string(current[\"temperature\"]) + unit + \" at \" + time + \".\"; } if (config_error) { text = \"Weather status: error for \" + place + \". \" + config_error + \".\"; if (typeof(current) == \"map\" && has(current, \"temperature\")) { let error_unit = \"\"; if (has(current, \"temperature_unit\") && current[\"temperature_unit\"]) { error_unit = current[\"temperature_unit\"]; } text = text + \" Last successful reading: \" + to_string(current[\"temperature\"]) + error_unit + \" at \" + time + \".\"; } } else { if (typeof(config) == \"map\" && has(config, \"status\") && config[\"status\"] == \"pending\") { text = text + \" Waiting for the weather plug to confirm the new location and timezone.\"; } if (this.last_error) { text = text + \" Weather status: error. \" + to_string(this.last_error) + \".\"; } } return { id: this, title: line, description: text, current: current, daily: this.daily, config_state: config, last_pushed_at: updated, last_updated: time, last_updated_text: time, last_error: this.last_error, location: location(this) }; }"
         }
       ]
     },
@@ -128,7 +135,7 @@
       "parent": "$root",
       "description": "Metadata holder for the weather catalog: keeps the default summary_props list separate from the live class so plug installers and UI introspection can read it without colliding with subclass overrides.",
       "properties": [
-        { "name": "summary_props", "type": "list<str>", "default": ["current"], "perms": "r" }
+        { "name": "summary_props", "type": "list<str>", "default": ["current", "daily"], "perms": "r" }
       ]
     }
   ],
@@ -137,7 +144,7 @@
       "kind": "set_property",
       "object": "$weather_block",
       "property": "summary_props",
-      "value": ["current"],
+      "value": ["current", "daily"],
       "mode": "set"
     }
   ]

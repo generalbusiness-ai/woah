@@ -3417,8 +3417,9 @@ describe("local catalogs", () => {
       expect(world.getProp("the_weather", "place")).toBe("Mountain View CA");
       expect(world.getProp("the_weather", "timezone")).toBe("America/Los_Angeles");
       expect(world.getProp("the_weather", "units")).toBe("imperial");
-      expect(world.getProp("the_weather", "forecast_hours")).toBe(12);
-      world.setProp("the_weather", "current", { kind: "scalar", value: 72, unit: "°F", label: "current_temperature", observed_at: "2026-05-06T16:01:00Z", observed_at_text: "May 6, 2026, 9:01 AM PDT", observed_timezone: "America/Los_Angeles" });
+      // v0.2 dropped forecast_hours; the window is now fixed at ±7 days.
+      expect(() => world.getProp("the_weather", "forecast_hours")).toThrow(/forecast_hours/);
+      world.setProp("the_weather", "current", { temperature: 72, temperature_unit: "°F", humidity: 60, weather_code: 1000, observed_at: Date.parse("2026-05-06T16:01:00Z"), observed_at_text: "May 6, 2026, 9:01 AM PDT", observed_timezone: "America/Los_Angeles" });
       world.setProp("the_weather", "last_pushed_at", 1778073000000);
       const weatherLook = await world.directCall("blocks-weather-look", "$wiz", "the_weather", "look_self", []);
       expect(weatherLook.op).toBe("result");
@@ -3749,11 +3750,13 @@ describe("local catalogs", () => {
       const world = createWorld({ catalogs: false });
       installLocalCatalogs(world, ["weather"]);
       expect(world.object("$weather_block").flags.fertile).toBe(true);
-      expect(world.getProp("$weather_block", "writable_owner")).toEqual(["place", "timezone", "units", "forecast_hours"]);
-      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "forecast", "history", "config_state"]);
+      // v0.2 surface: forecast/history/forecast_hours dropped, daily/timeseries added.
+      expect(world.getProp("$weather_block", "writable_owner")).toEqual(["place", "timezone", "units"]);
+      expect(world.getProp("$weather_block", "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"]);
       expect(world.ownVerbExact("$weather_block", "set_location")).toMatchObject({ direct_callable: true, tool_exposed: true });
       expect(world.ownVerbExact("$weather_block", "set_units")).toMatchObject({ direct_callable: true, tool_exposed: true });
-      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toMatchObject({ direct_callable: true, tool_exposed: true });
+      // set_forecast_hours was retired with the forecast_hours property.
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
       // An instance inherits the tier lists.
       const blockId = "obj_test_weather_block";
       const roomId = "obj_test_weather_room";
@@ -3763,16 +3766,15 @@ describe("local catalogs", () => {
       world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz" });
       world.createObject({ id: blockId, name: blockId, parent: "$weather_block", owner, location: roomId });
       expect(world.object(blockId).flags.fertile).not.toBe(true);
-      expect(world.getProp(blockId, "writable_owner")).toEqual(["place", "timezone", "units", "forecast_hours"]);
-      expect(world.getProp(blockId, "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "forecast", "history", "config_state"]);
+      expect(world.getProp(blockId, "writable_owner")).toEqual(["place", "timezone", "units"]);
+      expect(world.getProp(blockId, "writable_self")).toEqual(["last_pushed_at", "last_error", "current", "daily", "timeseries", "config_state"]);
       // Default config matches the manifest.
       expect(world.getProp(blockId, "place")).toBe("");
       expect(world.getProp(blockId, "timezone")).toBe("");
       expect(world.getProp(blockId, "units")).toBe("metric");
-      expect(world.getProp(blockId, "forecast_hours")).toBe(12);
       expect(world.getProp(blockId, "config_state")).toMatchObject({ status: "unconfigured" });
-      // summary_props defaults to ["current"] via the seed_hook on the class.
-      expect(world.getProp("$weather_block", "summary_props")).toEqual(["current"]);
+      // summary_props defaults to ["current", "daily"] via the seed_hook on the class.
+      expect(world.getProp("$weather_block", "summary_props")).toEqual(["current", "daily"]);
 
       world.setProp(blockId, "last_error", "old weather error");
       const locationSet = await world.directCall("weather-owner-set-location", owner, blockId, "set_location", ["Mountain View CA", "Pacific"]);
@@ -3800,11 +3802,7 @@ describe("local catalogs", () => {
       if (unitsDenied.op === "error") expect(unitsDenied.error.code).toBe("E_PERM");
       expect(world.getProp(blockId, "units")).toBe("metric");
 
-      const hoursSet = await world.directCall("weather-wiz-set-hours", "$wiz", blockId, "set_forecast_hours", [24]);
-      expect(hoursSet.op).toBe("result");
-      expect(world.getProp(blockId, "forecast_hours")).toBe(24);
-
-      world.setProp(blockId, "current", { kind: "scalar", value: 58.62, unit: "°F", label: "current_temperature", observed_at: "2026-05-06T16:01:00Z", observed_at_text: "May 6, 2026, 9:01 AM PDT" });
+      world.setProp(blockId, "current", { temperature: 58.62, temperature_unit: "°F", humidity: 60, weather_code: 1000, observed_at: Date.parse("2026-05-06T16:01:00Z"), observed_at_text: "May 6, 2026, 9:01 AM PDT" });
       world.setProp(blockId, "place", "Mountain View, CA");
       world.setProp(blockId, "config_state", { status: "confirmed", place: "Mountain View, CA", timezone: "America/Los_Angeles" });
       const townLook = await world.directCall("weather-town-state-look", "$wiz", blockId, "look_self", []);

@@ -606,6 +606,222 @@ woo-chat-space {
   color: var(--color-danger);
 }
 
+woo-weather-badge {
+  display: inline-flex;
+  cursor: pointer;
+}
+
+woo-weather-badge:hover .weather-badge,
+woo-weather-badge:focus-within .weather-badge {
+  border-color: var(--color-accent);
+}
+
+woo-weather-badge:focus-within .weather-badge {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Detail overlay — themed to the surrounding cyan/dark-blue palette
+   rather than the pinboard-note yellow. Native <dialog>'s top-layer
+   lifts it above the chat; the SVG charts inside are hand-rolled. */
+.weather-chart-dialog {
+  border: none;
+  background: transparent;
+  padding: 0;
+  max-width: min(960px, 92vw);
+  width: min(960px, 92vw);
+  color: var(--color-text);
+}
+
+.weather-chart-dialog::backdrop {
+  background: rgba(0, 8, 14, 0.62);
+  backdrop-filter: blur(3px);
+}
+
+.weather-chart-card {
+  position: relative;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 10px;
+  box-shadow: 0 22px 44px rgba(0, 0, 0, 0.55);
+  padding: 1rem 1.2rem 1.2rem;
+  font-family: inherit;
+}
+
+.weather-chart-close {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  width: 1.8rem;
+  height: 1.8rem;
+  border: none;
+  background: transparent;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: 50%;
+}
+.weather-chart-close:hover { background: var(--color-accent-soft); color: var(--color-accent); }
+
+.weather-chart-headline {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.6rem;
+  /* Reserve room for the absolute-positioned .weather-chart-close at
+     top-right (1.8rem wide + 0.4rem inset) so the "as of ..." text
+     pinned by margin-left:auto doesn't collide with the button. */
+  padding-right: 2.4rem;
+}
+.weather-chart-headline-place { font-weight: 600; font-size: 1.1rem; color: var(--color-text); }
+.weather-chart-headline-temp  { font-size: 1.4rem; font-weight: 600; color: var(--color-accent); }
+.weather-chart-headline-observed { font-size: 0.85rem; color: var(--color-text-muted); margin-left: auto; }
+
+/* Strip uses inline grid-template-columns + padding-* set by the
+   component to match the chart panels' data area: same N columns, same
+   left/right indent. Don't override those here. */
+.weather-chart-daily-strip {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0.6rem 0 0.8rem;
+}
+.weather-chart-day {
+  text-align: center;
+  padding: 0.4rem 0.2rem;
+  border-radius: 6px;
+  background: var(--color-surface-3);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  font-size: 0.78rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  /* Cards must keep the strip aligned with the chart's day-columns
+     even when condition text would otherwise wrap. min-width:0 lets
+     the grid track shrink; inner lines below clip with ellipsis. */
+  min-width: 0;
+  min-height: 6.0rem;
+  overflow: hidden;
+}
+.weather-chart-day.is-today {
+  background: var(--color-accent-soft);
+  border-color: var(--color-accent);
+  color: var(--color-text);
+}
+.weather-chart-day.is-empty {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--color-border);
+  color: var(--color-text-faint);
+}
+.weather-chart-day.is-empty .weather-chart-day-icon { color: var(--color-text-faint); }
+.weather-chart-day-date {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.weather-chart-day-icon { font-size: 1.4rem; line-height: 1; color: var(--color-accent); }
+.weather-chart-day-condition {
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.weather-chart-day-temps {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.weather-chart-day-temps .hi { font-weight: 600; }
+.weather-chart-day-temps .lo { color: var(--color-text-muted); }
+.weather-chart-day-precip {
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.weather-chart-daily-empty { padding: 1rem; text-align: center; color: var(--color-text-muted); }
+
+.weather-chart-panel {
+  margin-top: 0.6rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.4rem 0.4rem 0.5rem;
+}
+.weather-chart-panel-empty { background: var(--color-surface-3); }
+.weather-chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  font-size: 11px;
+  font-family: var(--font-sans, system-ui, sans-serif);
+}
+
+/* Past-half tint and gridlines need to work on the dark surface — use
+   subtle white overlays rather than rgba(0,0,0,...) which vanishes here.
+   Now-line gets the cyan accent for clear visual separation. */
+.weather-chart-past {
+  fill: rgba(255, 255, 255, 0.04);
+}
+.weather-chart-day-grid {
+  stroke: rgba(255, 255, 255, 0.42);
+  stroke-width: 1.2;
+  stroke-dasharray: 4 4;
+}
+.weather-chart-now {
+  stroke: var(--color-accent);
+  stroke-width: 1.8;
+  opacity: 0.95;
+}
+.weather-chart-ytick {
+  fill: var(--color-text-muted);
+}
+.weather-chart-empty {
+  fill: var(--color-text-muted);
+}
+
+/* Series colours tuned for contrast against the dark cyan-tinted panel. */
+.weather-line-temp     { stroke: #ff6a5e; stroke-width: 1.6; }
+.weather-line-feels    { stroke: #f3a35e; stroke-width: 1.4; stroke-dasharray: 4 3; }
+.weather-line-dew      { stroke: #6dc99a; stroke-width: 1.4; }
+.weather-line-cloud    { stroke: #b0c4cf; stroke-width: 1.4; }
+.weather-line-humidity { stroke: #6dc99a; stroke-width: 1.2; opacity: 0.85; stroke-dasharray: 3 3; }
+.weather-line-precipp  { stroke: #5fb3ff; stroke-width: 1.4; }
+.weather-area-precip   { fill: rgba(95, 179, 255, 0.30); stroke: none; }
+
+.weather-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 0.9rem;
+  margin-top: 0.3rem;
+  font-size: 0.74rem;
+  color: var(--color-text-muted);
+  padding: 0 0.3rem;
+}
+.weather-chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.weather-chart-legend-swatch {
+  width: 14px;
+  height: 3px;
+  display: inline-block;
+}
+.weather-chart-legend-swatch.weather-line-temp     { background: #ff6a5e; }
+.weather-chart-legend-swatch.weather-line-feels    { background: repeating-linear-gradient(90deg, #f3a35e 0 4px, transparent 4px 7px); }
+.weather-chart-legend-swatch.weather-line-dew      { background: #6dc99a; }
+.weather-chart-legend-swatch.weather-line-cloud    { background: #b0c4cf; }
+.weather-chart-legend-swatch.weather-line-humidity { background: repeating-linear-gradient(90deg, #6dc99a 0 3px, transparent 3px 6px); }
+.weather-chart-legend-swatch.weather-line-precipp  { background: #5fb3ff; }
+.weather-chart-legend-swatch.weather-area-precip   { background: rgba(95, 179, 255, 0.45); height: 8px; }
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));

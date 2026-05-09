@@ -3,10 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
-# Hourly push. Each tick makes 2 tomorrow.io calls (realtime + forecast).
-# Tomorrow.io free plan: 25 calls/hour, 500 calls/day. So one block uses
-# 2 of 25 hourly and 48 of 500 daily — comfortable for one or two blocks per
-# API key, tight for a dozen. Bump to weekly cron or a paid plan if scaling.
+# Hourly push. Each tick makes 3 tomorrow.io calls (realtime + forecast +
+# history/recent), issued in parallel. Tomorrow.io free plan: 25 calls/hour,
+# 500 calls/day. So one block uses 3 of 25 hourly and 72 of 500 daily —
+# comfortable for one block per API key, ~6 blocks per key on hourly cron.
+# Drop the cron or shard keys per block to scale further.
 [triggers]
 crons = ["0 * * * *"]
 
@@ -15,7 +16,6 @@ crons = ["0 * * * *"]
 #   WOO_APIKEY            - secret. apikey:<id>:<secret> minted via :mint_apikey
 #   TOMORROW_IO_API_KEY   - secret. https://app.tomorrow.io/development/keys
 #   BLOCK_ID              - public var, e.g. the_weather
-#   FORECAST_HOURS        - optional public fallback; block.forecast_hours wins when valid
 #
 # Provisioning:
 #   wrangler secret put WOO_APIKEY
@@ -25,4 +25,3 @@ crons = ["0 * * * *"]
 # Public routing/config values. Secrets still go through `wrangler secret put`.
 WOO_BASE_URL = "https://woo.hughpyle.workers.dev"
 BLOCK_ID = "the_weather"
-FORECAST_HOURS = "12"
