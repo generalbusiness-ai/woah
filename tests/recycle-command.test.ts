@@ -189,6 +189,35 @@ describe("$builder:@recycle (LambdaCore #630 port)", () => {
     expect(world.objects.has("obj_guest_owned")).toBe(true);
   });
 
+  it("rejects a non-builder owner via the $builder:recycle MCP wrapper too", async () => {
+    // Same surface gate also guards the MCP-tool wrapper :recycle(id, opts).
+    // Without the gate, a non-builder owner could call the wrapper directly
+    // and pass the_perm's owner-or-wizard check, bypassing the documented
+    // builder-class surface.
+    const world = createWorld();
+    const guest = world.auth("guest:non-builder-mcp-recycle");
+    expect(world.isDescendantOf(guest.actor, "$builder")).toBe(false);
+    world.createObject({
+      id: "obj_guest_mcp_owned",
+      name: "trinket",
+      parent: "$thing",
+      owner: guest.actor,
+      location: guest.actor
+    });
+    const denied = await world.directCall(
+      "recycle-mcp-deny-owner",
+      guest.actor,
+      "$builder",
+      "recycle",
+      ["obj_guest_mcp_owned", {}]
+    );
+    expect(denied.op).toBe("error");
+    if (denied.op !== "error") return;
+    expect(denied.error.code).toBe("E_PERM");
+    expect(denied.error.message).toMatch(/builder class surface required/);
+    expect(world.objects.has("obj_guest_mcp_owned")).toBe(true);
+  });
+
   it("the parser does not surface @recycle to a non-builder", async () => {
     // A guest who isn't a builder shouldn't reach @recycle through
     // command dispatch — the verb only lives on $builder, so a player
