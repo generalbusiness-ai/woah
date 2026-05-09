@@ -95,8 +95,6 @@ export class WooChatSpaceElement extends HTMLElement {
     this.innerHTML = `
       <section class="toolbar">
         ${this.renderRoomTitle(room)}
-        <button data-chat-leave>Leave</button>
-        <button data-chat-look>Look</button>
       </section>
       <section class="chat-layout">
         <div class="panel chat-panel">
@@ -141,8 +139,6 @@ export class WooChatSpaceElement extends HTMLElement {
 
   private bind() {
     this.querySelector<HTMLButtonElement>("[data-chat-enter]")?.addEventListener("click", () => this.dispatch("enter"));
-    this.querySelector<HTMLButtonElement>("[data-chat-leave]")?.addEventListener("click", () => this.dispatch("leave"));
-    this.querySelector<HTMLButtonElement>("[data-chat-look]")?.addEventListener("click", () => this.dispatch("look"));
     const input = this.querySelector<HTMLInputElement>("[data-chat-input]");
     input?.addEventListener("input", () => this.dispatch("draft", { value: input.value }));
     input?.addEventListener("keydown", (event) => {
@@ -181,6 +177,7 @@ export class WooSpaceChatPanelElement extends HTMLElement {
     draft: "",
     height: 280
   };
+  private collapsed = false;
 
   set data(value: SpaceChatPanelData) {
     this.model = value;
@@ -206,26 +203,43 @@ export class WooSpaceChatPanelElement extends HTMLElement {
     const space = this.model.space || this.subject || this.dataset.spaceChatSpace || "";
     const spaceName = this.model.spaceName || this.woo?.observe(space)?.name || space;
     this.dataset.spaceChatSpace = space;
-    this.style.height = `${Math.round(this.model.height)}px`;
-    this.innerHTML = `
-      <div class="space-chat-resizer" data-space-chat-resizer role="separator" aria-orientation="horizontal" aria-label="Resize space chat"></div>
+    this.classList.toggle("is-collapsed", this.collapsed);
+    if (this.collapsed) this.style.removeProperty("height");
+    else this.style.height = `${Math.round(this.model.height)}px`;
+    const toggleLabel = this.collapsed ? "Expand chat" : "Collapse chat";
+    const toggleGlyph = this.collapsed ? "&#9650;" : "&#9660;";
+    const head = `
       <div class="space-chat-head">
         <h2>Chat</h2>
         <span>${escapeHtml(spaceName)}</span>
+        <button type="button" class="space-chat-toggle" data-space-chat-toggle aria-label="${toggleLabel}" title="${toggleLabel}" aria-expanded="${this.collapsed ? "false" : "true"}">${toggleGlyph}</button>
       </div>
-      <div class="chat-feed space-chat-feed" data-space-chat-feed aria-live="polite">
-        ${this.model.lines.map((line) => renderChatLineHtml(line, (id) => this.actorLabel(id))).join("") || `<div class="chat-empty">No chat events yet.</div>`}
-      </div>
-      <form class="chat-form space-chat-form" data-space-chat-form data-space-chat-space="${escapeHtml(space)}">
-        <input data-space-chat-input data-space-chat-space="${escapeHtml(space)}" autocomplete="off" placeholder="say something, /me waves, look, drop note" value="${escapeHtml(this.model.draft)}" />
-        <button>Send</button>
-      </form>
     `;
+    if (this.collapsed) {
+      this.innerHTML = head;
+    } else {
+      this.innerHTML = `
+        <div class="space-chat-resizer" data-space-chat-resizer role="separator" aria-orientation="horizontal" aria-label="Resize space chat"></div>
+        ${head}
+        <div class="chat-feed space-chat-feed" data-space-chat-feed aria-live="polite">
+          ${this.model.lines.map((line) => renderChatLineHtml(line, (id) => this.actorLabel(id))).join("") || `<div class="chat-empty">No chat events yet.</div>`}
+        </div>
+        <form class="chat-form space-chat-form" data-space-chat-form data-space-chat-space="${escapeHtml(space)}">
+          <input data-space-chat-input data-space-chat-space="${escapeHtml(space)}" autocomplete="off" placeholder="say something, /me waves, look, drop note" value="${escapeHtml(this.model.draft)}" />
+          <button>Send</button>
+        </form>
+      `;
+    }
     this.bind();
   }
 
   private bind() {
     const space = this.model.space || this.subject || this.dataset.spaceChatSpace || "";
+    this.querySelector<HTMLButtonElement>("[data-space-chat-toggle]")?.addEventListener("click", () => {
+      this.collapsed = !this.collapsed;
+      this.render();
+    });
+    if (this.collapsed) return;
     const input = this.querySelector<HTMLInputElement>("[data-space-chat-input]");
     input?.addEventListener("input", () => this.dispatch("draft", { space, value: input.value }));
     input?.addEventListener("keydown", (event) => {

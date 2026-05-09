@@ -99,7 +99,7 @@ export class WooPinboardBoardElement extends HTMLElement {
     const toolbar = `
       <section class="toolbar pinboard-toolbar">
         <h1>${escapeHtml(this.model.boardName || "Pinboard")}</h1>
-        ${this.model.inBoard ? `<button data-pinboard-leave>Leave</button>` : `<button data-pinboard-enter ${this.model.canSend ? "" : "disabled"}>Enter</button>`}
+        ${this.model.inBoard ? "" : `<button data-pinboard-enter ${this.model.canSend ? "" : "disabled"}>Enter</button>`}
       </section>
     `;
     const layout = `
@@ -215,7 +215,6 @@ export class WooPinboardBoardElement extends HTMLElement {
 
   private bind(): void {
     this.querySelector<HTMLButtonElement>("[data-pinboard-enter]")?.addEventListener("click", () => this.dispatch("enter"));
-    this.querySelector<HTMLButtonElement>("[data-pinboard-leave]")?.addEventListener("click", () => this.dispatch("leave"));
     this.querySelector<HTMLFormElement>("[data-pinboard-create]")?.addEventListener("submit", (event) => {
       event.preventDefault();
       const text = this.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]")?.value ?? "";
