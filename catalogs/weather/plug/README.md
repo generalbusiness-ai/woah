@@ -16,10 +16,14 @@ Cron-triggered hourly. Each tick:
 3. Fetches three tomorrow.io endpoints in parallel: `weather/realtime`,
    `weather/forecast` (1h+1d timesteps), and `weather/history/recent`
    (1h+1d timesteps).
-4. POSTs `:set_properties` with `current` (flat scalar bundle), `daily`
-   (per-day rollup array), `timeseries` (column-major ±7d hourly chart
-   payload), `last_pushed_at`, `last_error`, and `config_state` — all in
-   a single bundle so a reader never sees a torn snapshot.
+4. POSTs `:set_properties` with `current` (flat scalar bundle, including
+   `local_date` — the calendar date in the configured timezone at
+   observation time, used by the block's chat verbs to resolve "today"),
+   `daily` (per-day rollup array, each entry stamped with a 3-letter
+   `weekday` for matching "thursday" without TZ math in the VM),
+   `timeseries` (column-major ±7d hourly chart payload), `last_pushed_at`,
+   `last_error`, and `config_state` — all in a single bundle so a reader
+   never sees a torn snapshot.
 5. Disconnects.
 
 If the block has no `place` configured, has an invalid timezone, or

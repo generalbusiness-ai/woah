@@ -14,6 +14,7 @@
 import { WooClient, WooError } from "./woo-client";
 import {
   fetchWeather,
+  formatLocalDate,
   mergeDaily,
   mergeTimeseries,
   TomorrowIoError,
@@ -235,10 +236,18 @@ export function normalizeTimezone(value: unknown): string | null {
 }
 
 export function withLocalObservationTime(current: WeatherCurrent, timezone: string | null): WeatherCurrent {
+  // local_date stamps the calendar date (in the configured timezone) at the
+  // moment of observation, so woocode verbs can resolve "today" by string
+  // equality against daily[*].date — the VM has no Intl/TZ math, so this
+  // lookup must be done by the plug at push time.
+  const localDate = timezone && Number.isFinite(current.observed_at)
+    ? formatLocalDate(current.observed_at, timezone)
+    : undefined;
   return {
     ...current,
     observed_at_text: formatObservedAt(current.observed_at, timezone),
-    observed_timezone: timezone ?? "UTC"
+    observed_timezone: timezone ?? "UTC",
+    ...(localDate ? { local_date: localDate } : {})
   };
 }
 

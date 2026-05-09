@@ -61,10 +61,23 @@ export type WeatherCurrent = {
   observed_at: number;
   observed_at_text?: string;
   observed_timezone?: string;
+  /**
+   * YYYY-MM-DD in the configured timezone, stamped at observation time by the
+   * index layer (timezone is not known to `buildCurrent`). Lets woocode verbs
+   * resolve "today" against `daily[*].date` without doing IANA TZ math in the
+   * VM, which has no Intl access.
+   */
+  local_date?: string;
 };
 
 export type WeatherDailyEntry = {
   date: string;       // YYYY-MM-DD in the configured timezone
+  /**
+   * Lowercase 3-letter weekday ("mon".."sun") for the local calendar date
+   * above. Computed from `date` deterministically so woocode verbs can match
+   * "thursday" / "thu" without computing weekdays in pure DSL.
+   */
+  weekday: string;
   temperature: { min: number | null; max: number | null; mean: number | null; unit: string };
   humidity: { min: number | null; max: number | null; mean: number | null };
   precip_total: number | null;
@@ -236,6 +249,7 @@ export function buildDaily(forecast: any, history: any, units: TomorrowUnits, ti
       const v = byDate.get(date) ?? {};
       return {
         date,
+        weekday: weekdayFromDate(date),
         temperature: {
           min:  numberOrNull(v.temperatureMin),
           max:  numberOrNull(v.temperatureMax),
@@ -311,11 +325,11 @@ export function mergeDaily(prev: WeatherDailyEntry[] | null | undefined, next: W
   const byDate = new Map<string, WeatherDailyEntry>();
   if (Array.isArray(prev)) {
     for (const e of prev) {
-      if (e && typeof e.date === "string") byDate.set(e.date, e);
+      if (e && typeof e.date === "string") byDate.set(e.date, normalizeDailyEntry(e));
     }
   }
   for (const e of next) {
-    if (e && typeof e.date === "string") byDate.set(e.date, e);
+    if (e && typeof e.date === "string") byDate.set(e.date, normalizeDailyEntry(e));
   }
   // YYYY-MM-DD strings sort the same lexically as chronologically.
   const minDate = formatLocalDate(anchor - 7 * DAY_MS, timezone);
@@ -323,6 +337,17 @@ export function mergeDaily(prev: WeatherDailyEntry[] | null | undefined, next: W
   return Array.from(byDate.values())
     .filter((e) => e.date >= minDate && e.date <= maxDate)
     .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+}
+
+// Backfill weekday on entries minted by older plug versions (pre-1.1) that
+// the block has been carrying forward across ticks. Without this,
+// $weather_block:ask "thursday" would silently miss any prev-side entry that
+// the upstream API no longer covers, until the next forecast/history fetch
+// happens to overwrite it. Cheap to do at every merge — `weekdayFromDate`
+// is a single Date parse, and the entry shape is otherwise unchanged.
+function normalizeDailyEntry(entry: WeatherDailyEntry): WeatherDailyEntry {
+  if (typeof entry.weekday === "string" && entry.weekday) return entry;
+  return { ...entry, weekday: weekdayFromDate(entry.date) };
 }
 
 // Tomorrow.io's response shape varies between endpoints and SDK versions:
@@ -357,7 +382,10 @@ function bucketDate(entry: any, timezone: string): string | null {
   return formatLocalDate(ts, timezone);
 }
 
-function formatLocalDate(ts: number, timezone: string): string {
+// Exported so index.ts can stamp current.local_date with the same formatter
+// that buckets daily[*].date — guarantees "today" matches a daily entry by
+// string equality.
+export function formatLocalDate(ts: number, timezone: string): string {
   // en-CA emits ISO YYYY-MM-DD across V8 / SpiderMonkey / Workers.
   try {
     return new Intl.DateTimeFormat("en-CA", {
@@ -367,6 +395,19 @@ function formatLocalDate(ts: number, timezone: string): string {
   } catch {
     return new Date(ts).toISOString().slice(0, 10);
   }
+}
+
+// "YYYY-MM-DD" → "mon".."sun". Parsing as UTC midnight and reading getUTCDay
+// is correct here because the input is already a calendar date in the block's
+// timezone — we just need to know which weekday that calendar date falls on,
+// not anything about wall-clock time. Returns "" for malformed input so a
+// faulty entry can't crash the build.
+const WEEKDAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+export function weekdayFromDate(date: string): string {
+  if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "";
+  const d = new Date(`${date}T00:00:00Z`);
+  const i = d.getUTCDay();
+  return Number.isFinite(i) && i >= 0 && i <= 6 ? WEEKDAY_NAMES[i] : "";
 }
 
 function numberOrNull(value: unknown): number | null {

@@ -3791,10 +3791,10 @@ describe("local catalogs", () => {
       expect(world.object("$weather_block").propertyDefs.has("forecast")).toBe(false);
       expect(world.object("$weather_block").propertyDefs.has("history")).toBe(false);
       expect(world.object("$weather_block").propertyDefs.has("forecast_hours")).toBe(false);
-      // …and the registry version reflects v1.
+      // …and the registry version reflects v1 (any v1.x.x lands here).
       const installed = world.propOrNull("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
       const weather = installed.find((r) => r.alias === "weather");
-      expect(weather?.version).toBe("1.0.0");
+      expect(String(weather?.version)).toMatch(/^1\.\d+\.\d+$/);
 
       // Re-running is idempotent.
       installLocalCatalogs(world, ["weather"]);
@@ -3876,6 +3876,98 @@ describe("local catalogs", () => {
       expect(world.propOrNull("weather_demo_block", "forecast")).toBeNull();
       expect(world.propOrNull("weather_demo_block", "history")).toBeNull();
       expect(world.propOrNull("weather_demo_block", "forecast_hours")).toBeNull();
+    });
+
+    it("$weather_block:ask answers today/tomorrow/yesterday/weekday/M-D from current.local_date and daily[]", async () => {
+      const world = createWorld({ catalogs: false });
+      // Reuse blocks-demo's seed graph so we get the_weather pre-anchored in
+      // the_chatroom under a $conversational space — that gives us :command_plan
+      // for the routing check below without setting up the world by hand.
+      installLocalCatalogs(world, ["blocks-demo"]);
+      const blockId = "the_weather";
+      const roomId = "the_chatroom";
+
+      // Pin "today" to 2026-05-09 (Saturday) so weekday assertions are
+      // deterministic. The plug stamps current.local_date at push time so
+      // woocode can resolve "today" without IANA TZ math in the VM.
+      world.setProp(blockId, "place", "Seattle");
+      world.setProp(blockId, "current", {
+        temperature: 14, temperature_unit: "°C",
+        observed_at: Date.parse("2026-05-09T18:00:00Z"),
+        observed_at_text: "May 9, 2026, 11:00 AM PDT",
+        observed_timezone: "America/Los_Angeles",
+        local_date: "2026-05-09"
+      });
+      // ±7-day window centered on today. Each entry carries a 3-letter
+      // weekday for catalog-side weekday matching; precip exercises the
+      // optional " precip ..." tail in :format_day_line.
+      const days: Array<{ date: string; weekday: string; min: number; max: number; precip: number }> = [
+        { date: "2026-05-02", weekday: "sat", min:  9, max: 17, precip: 0 },
+        { date: "2026-05-03", weekday: "sun", min: 10, max: 18, precip: 0 },
+        { date: "2026-05-04", weekday: "mon", min: 11, max: 19, precip: 1.2 },
+        { date: "2026-05-05", weekday: "tue", min: 12, max: 20, precip: 0 },
+        { date: "2026-05-06", weekday: "wed", min: 12, max: 21, precip: 0 },
+        { date: "2026-05-07", weekday: "thu", min: 13, max: 22, precip: 0 },
+        { date: "2026-05-08", weekday: "fri", min: 13, max: 21, precip: 0 },
+        { date: "2026-05-09", weekday: "sat", min: 14, max: 22, precip: 0 },   // today
+        { date: "2026-05-10", weekday: "sun", min: 15, max: 23, precip: 0 },   // tomorrow
+        { date: "2026-05-11", weekday: "mon", min: 14, max: 22, precip: 0 },
+        { date: "2026-05-12", weekday: "tue", min: 16, max: 24, precip: 0 },
+        { date: "2026-05-13", weekday: "wed", min: 17, max: 25, precip: 0 },
+        { date: "2026-05-14", weekday: "thu", min: 18, max: 26, precip: 0 },
+        { date: "2026-05-15", weekday: "fri", min: 17, max: 25, precip: 0 },
+        { date: "2026-05-16", weekday: "sat", min: 16, max: 24, precip: 0 }
+      ];
+      world.setProp(blockId, "daily", days.map((d) => ({
+        date: d.date, weekday: d.weekday,
+        temperature: { min: d.min, max: d.max, mean: (d.min + d.max) / 2, unit: "°C" },
+        humidity: { min: 50, max: 80, mean: 65 },
+        precip_total: d.precip, precip_unit: "mm",
+        weather_code: 1000
+      })));
+
+      const ask = async (label: string, query: string) => {
+        const r = await world.directCall(label, "$wiz", blockId, "ask", [query]);
+        if (r.op !== "result") throw new Error(`${label} failed: ${JSON.stringify(r)}`);
+        return String(r.result);
+      };
+
+      // today / tomorrow / yesterday: index-based, against current.local_date.
+      expect(await ask("ask-today", "today")).toBe("Weather today (2026-05-09) in Seattle: 14°C to 22°C");
+      expect(await ask("ask-empty", "")).toBe("Weather today (2026-05-09) in Seattle: 14°C to 22°C");
+      expect(await ask("ask-tomorrow", "tomorrow")).toBe("Weather tomorrow (2026-05-10) in Seattle: 15°C to 23°C");
+      expect(await ask("ask-yesterday", "yesterday")).toBe("Weather yesterday (2026-05-08) in Seattle: 13°C to 21°C");
+
+      // Weekday: prefer the upcoming match; "thursday" (today is Sat) → 2026-05-14.
+      expect(await ask("ask-thu", "thursday")).toBe("Weather thu (2026-05-14) in Seattle: 18°C to 26°C");
+      // Short form and case-insensitive variants.
+      expect(await ask("ask-thu-short", "Thu")).toBe("Weather thu (2026-05-14) in Seattle: 18°C to 26°C");
+      expect(await ask("ask-thurs", "thurs")).toBe("Weather thu (2026-05-14) in Seattle: 18°C to 26°C");
+      // No upcoming match this week → past match. (none in fixture, "monday"
+      // last week 2026-05-04 is in past; today is Sat so "mon" upcoming is 5/11.)
+      expect(await ask("ask-mon", "monday")).toBe("Weather mon (2026-05-11) in Seattle: 14°C to 22°C");
+
+      // Precip is reported only when the day has any.
+      expect(await ask("ask-mon-past", "5/4")).toBe("Weather mon (2026-05-04) in Seattle: 11°C to 19°C, precip 1.2mm");
+
+      // M/D and M-D forms resolve against current.local_date's year.
+      expect(await ask("ask-md-slash", "5/12")).toBe("Weather tue (2026-05-12) in Seattle: 16°C to 24°C");
+      expect(await ask("ask-md-dash", "5-12")).toBe("Weather tue (2026-05-12) in Seattle: 16°C to 24°C");
+      // Full ISO is accepted too.
+      expect(await ask("ask-iso", "2026-05-13")).toBe("Weather wed (2026-05-13) in Seattle: 17°C to 25°C");
+
+      // Out-of-window date: helpful explanation, not a stack trace.
+      expect(await ask("ask-far", "1/1")).toMatch(/No data for 2026-01-01.*Seattle/);
+      // Nonsense input: a usage hint listing the accepted forms.
+      expect(await ask("ask-huh", "soon-ish?")).toMatch(/I don't understand "soon-ish\?".*today.*thursday.*5\/12/);
+
+      // Command-route plumbing: "ask weather thursday" must reach $weather_block:ask
+      // via dobj_prefix_rest = "thursday" (the pattern uses dobj:"this", prep:"none").
+      // $wiz can match objects without co-location, which keeps the test focused
+      // on the pattern wiring rather than visibility setup.
+      const askCmd = await world.directCall("ask-weather-cmd", "$wiz", roomId, "command_plan", ["ask weather thursday"]);
+      if (askCmd.op !== "result") throw new Error(`command_plan failed: ${JSON.stringify(askCmd)}`);
+      expect(askCmd.result).toMatchObject({ ok: true, target: blockId, verb: "ask", args: ["thursday"] });
     });
 
     it("$weather_block installs cleanly and ships the configured tier lists", async () => {

@@ -30,9 +30,9 @@ display location.
 
 ### `current` — scalar bundle (~80 bytes)
 
-Read by chat verbs (`weather_line`, `look_self`) and the title badge.
-Flat keys, one read per verb, no JSON traversal in woocode beyond a
-`has(...)` check.
+Read by chat verbs (`weather_line`, `look_self`, `ask`) and the title
+badge. Flat keys, one read per verb, no JSON traversal in woocode beyond
+a `has(...)` check.
 
 ```jsonc
 {
@@ -41,9 +41,17 @@ Flat keys, one read per verb, no JSON traversal in woocode beyond a
   "humidity":         71,
   "weather_code":     1000,
   "observed_at":      1715260800000,            // ms epoch (UTC)
-  "observed_at_text": "May 9, 10:00 AM EDT"     // plug renders, verb returns as-is
+  "observed_at_text": "May 9, 10:00 AM EDT",    // plug renders, verb returns as-is
+  "local_date":       "2026-05-09"              // YYYY-MM-DD in `timezone` at observed_at
 }
 ```
+
+`local_date` is stamped by the plug at push time so woocode `:ask` can
+resolve "today" by string equality against `daily[*].date` without
+running IANA timezone or DST math in the VM (the substrate has no Intl
+access). It tracks `observed_at` in the configured timezone, not the
+reader's wall clock — close enough at hourly cadence, but worth
+remembering when the data is stale.
 
 ### `daily` — per-day rollup array (~1 KB, 14 entries)
 
@@ -54,6 +62,7 @@ that summarize the week never have to iterate the hourly chart payload.
 ```jsonc
 [
   { "date":         "2026-05-03",
+    "weekday":      "sun",                      // 3-letter lowercase, computed from `date`
     "temperature":  { "min": 55.1, "max": 72.0, "mean": 64.2, "unit": "°F" },
     "humidity":     { "min": 48,   "max": 81,   "mean": 67 },
     "precip_total": 0.05,
@@ -62,6 +71,11 @@ that summarize the week never have to iterate the hourly chart payload.
   // ...
 ]
 ```
+
+`weekday` lets `:ask thursday` match by string without computing a day
+of the week in pure DSL. Plug-side derivation: parse `date` as UTC
+midnight, read getUTCDay (the input is already a calendar date in the
+configured timezone, so the weekday is well-defined).
 
 ### `timeseries` — column-major chart payload (~16 KB, 336 hourly samples × 7 fields)
 
@@ -125,6 +139,41 @@ Sized for ±7 days hourly across 7 fields:
 | **Total**      | **~17 KB** — about 6 % of the 256 KB per-property ceiling |
 
 Plenty of headroom: doubling the field count to 14 still lands ~30 KB.
+
+## Chat verbs
+
+`:weather_line` and `:look_self` are the always-on quick reads —
+"temperature in <place>: 14°C" for the badge and the room title.
+
+`:ask(query)` answers "ask weather <when>" in chat. Accepted queries:
+
+| query              | resolves to                             |
+|--------------------|-----------------------------------------|
+| `today`, `now`     | `daily[]` entry whose `date` matches `current.local_date` |
+| `tomorrow`         | one day after `current.local_date`      |
+| `yesterday`        | one day before `current.local_date`     |
+| `monday`..`sunday` | upcoming match in `daily[]` (falls back to past match if none) |
+| `mon`..`sun`       | same as the full names                  |
+| `M/D`, `M-D`       | `<year-of-local_date>-MM-DD` in `daily[]` (tries year ±1 if not found, for rollover) |
+| `YYYY-MM-DD`       | exact `daily[]` entry                   |
+| empty / blank      | same as `today`                         |
+
+The verb returns one line, e.g. `Weather thu (2026-05-14) in Seattle: 18°C to 26°C`,
+and `tell()`s the same line to the asker so it lands in chat. The line
+includes precipitation (`, precip 1.2mm`) only when `daily[i].precip_total > 0`.
+
+Command pattern: `dobj: "this", prep: "none", iobj: "none", args_from: ["dobj_prefix_rest"]`.
+This routes "ask weather thursday" to the block via `dobj_prefix` (longest
+prefix of the argstr that matches an object), with the remainder
+("thursday") passed as the verb's `query` argument. Helpers
+(`:resolve_day`, `:find_date_index`, `:normalize_weekday`, `:parse_md`,
+`:zpad2`, `:format_day_line`) are all `direct_callable` so chat-style
+override or composition is straightforward — none are tool-exposed.
+
+The verb uses no IANA timezone math: it only walks `daily[]` (which is
+already keyed by local calendar date) and matches strings. The plug is
+responsible for keeping `current.local_date` and `daily[*].weekday` in
+sync with the configured timezone.
 
 ## Owner-writable config
 

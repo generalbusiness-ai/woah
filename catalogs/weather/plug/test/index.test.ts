@@ -137,6 +137,9 @@ describe("runWeatherTick", () => {
     });
 
     // current — flat scalar bundle. ms-epoch observed_at, plug-rendered text.
+    // local_date is the calendar date in the configured timezone at the moment
+    // of observation; woocode :ask uses it to resolve "today" against
+    // daily[*].date without doing IANA TZ math in the VM.
     expect(props.current).toMatchObject({
       temperature: 72.4,
       temperature_unit: "°F",
@@ -144,7 +147,8 @@ describe("runWeatherTick", () => {
       weather_code: 1000,
       observed_at: Date.parse("2026-05-05T18:00:00Z"),
       observed_at_text: "May 5, 2026, 11:00 AM PDT",
-      observed_timezone: "America/Los_Angeles"
+      observed_timezone: "America/Los_Angeles",
+      local_date: "2026-05-05"
     });
 
     // daily — date-keyed rollups, ordered ascending. Both endpoints

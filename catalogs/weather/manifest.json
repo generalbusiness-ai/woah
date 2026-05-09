@@ -1,8 +1,8 @@
 {
   "name": "weather",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "spec_version": "v1",
-  "description": "Weather block class — a $block subclass that displays current conditions, a 14-day daily rollup, and a column-major hourly time-series payload for chart UIs. Owner sets `place`, `timezone`, and `units`; an external plug Worker (catalogs/weather/plug) fetches tomorrow.io on a schedule and pushes the bundle via apikey-bound session.",
+  "description": "Weather block class — a $block subclass that displays current conditions, a 14-day daily rollup, and a column-major hourly time-series payload for chart UIs. Owner sets `place`, `timezone`, and `units`; an external plug Worker (catalogs/weather/plug) fetches tomorrow.io on a schedule and pushes the bundle via apikey-bound session. Adds an `:ask` chat verb (\"ask weather today/tomorrow/yesterday/<weekday>/<M-D>\") backed by `current.local_date` and `daily[*].weekday` stamped by the plug.",
   "license": "MIT",
   "depends": ["@local:block"],
   "ui": {
@@ -119,6 +119,62 @@
           "skip_presence_check": true,
           "arg_spec": { "args": [], "command": { "dobj": "this", "prep": "none", "iobj": "none", "args_from": [] } },
           "source": "verb :open() rxd { observe({ type: \"weather_open\", _audience_override: [actor], block: this }); return { ok: true, block: this }; }"
+        },
+        {
+          "name": "ask",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["query"], "command": { "dobj": "this", "prep": "none", "iobj": "none", "args_from": ["dobj_prefix_rest"] } },
+          "source": "verb :ask(query) rxd { let q = \"\"; if (typeof(query) == \"string\") { q = query; } let result = this:resolve_day(q); let line = \"\"; if (typeof(result) == \"string\") { line = result; } else { line = this:format_day_line(result[\"entry\"], result[\"label\"]); } tell(actor, line); return line; }"
+        },
+        {
+          "name": "resolve_day",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["query"] },
+          "source": "verb :resolve_day(query) rxd { let daily = this.daily; if (typeof(daily) != \"list\" || length(daily) == 0) { return \"No weather data yet for \" + this:display_location() + \".\"; } let q = \"\"; if (typeof(query) == \"string\") { q = str_lower(str_trim(query)); } if (q == \"\") { q = \"today\"; } let current = this.current; let today = \"\"; if (typeof(current) == \"map\" && has(current, \"local_date\") && typeof(current[\"local_date\"]) == \"string\") { today = current[\"local_date\"]; } let today_idx = 0; if (today != \"\") { today_idx = this:find_date_index(today); } let n = length(daily); if (q == \"today\" || q == \"now\" || q == \"tonight\") { if (today_idx >= 1) { return { entry: daily[today_idx], label: \"today\" }; } return \"No weather data for today in \" + this:display_location() + \".\"; } if (q == \"tomorrow\") { if (today_idx >= 1 && today_idx + 1 <= n) { return { entry: daily[today_idx + 1], label: \"tomorrow\" }; } return \"No weather data for tomorrow in \" + this:display_location() + \".\"; } if (q == \"yesterday\") { if (today_idx >= 2) { return { entry: daily[today_idx - 1], label: \"yesterday\" }; } return \"No weather data for yesterday in \" + this:display_location() + \".\"; } let weekday = this:normalize_weekday(q); if (weekday != \"\") { let pick = 0; let start = today_idx; if (start < 1) { start = 1; } for i in [start..n] { let e = daily[i]; if (typeof(e) == \"map\" && has(e, \"weekday\") && e[\"weekday\"] == weekday) { pick = i; break; } } if (pick == 0 && today_idx >= 2) { for j in [1..(today_idx - 1)] { let e2 = daily[j]; if (typeof(e2) == \"map\" && has(e2, \"weekday\") && e2[\"weekday\"] == weekday) { pick = j; } } } if (pick >= 1) { let lab = weekday; if (pick == today_idx) { lab = \"today\"; } else if (pick == today_idx + 1) { lab = \"tomorrow\"; } else if (pick == today_idx - 1) { lab = \"yesterday\"; } return { entry: daily[pick], label: lab }; } return \"No data for \" + q + \" in the +/-7-day window for \" + this:display_location() + \".\"; } let date = this:parse_md(q, today); if (typeof(date) == \"string\" && date != \"\") { let idx = this:find_date_index(date); if (idx == 0 && length(date) == 10) { let y = to_int(str_slice(date, 1, 4)); let rest = str_slice(date, 5); let alt1 = to_string(y - 1) + rest; let alt2 = to_string(y + 1) + rest; let try1 = this:find_date_index(alt1); if (try1 >= 1) { idx = try1; date = alt1; } else { let try2 = this:find_date_index(alt2); if (try2 >= 1) { idx = try2; date = alt2; } } } if (idx >= 1) { let entry2 = daily[idx]; let lab2 = date; if (idx == today_idx) { lab2 = \"today\"; } else if (idx == today_idx + 1) { lab2 = \"tomorrow\"; } else if (idx == today_idx - 1) { lab2 = \"yesterday\"; } else if (typeof(entry2) == \"map\" && has(entry2, \"weekday\") && typeof(entry2[\"weekday\"]) == \"string\" && entry2[\"weekday\"] != \"\") { lab2 = entry2[\"weekday\"]; } return { entry: entry2, label: lab2 }; } return \"No data for \" + date + \" in the +/-7-day window for \" + this:display_location() + \".\"; } return \"I don't understand \" + str_char(34) + query + str_char(34) + \". Try today, tomorrow, yesterday, a weekday like \" + str_char(34) + \"thursday\" + str_char(34) + \", or a date like \" + str_char(34) + \"5/12\" + str_char(34) + \".\"; }"
+        },
+        {
+          "name": "find_date_index",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["date"] },
+          "source": "verb :find_date_index(date) rxd { if (typeof(date) != \"string\" || date == \"\") { return 0; } let daily = this.daily; if (typeof(daily) != \"list\") { return 0; } let n = length(daily); for i in [1..n] { let e = daily[i]; if (typeof(e) == \"map\" && has(e, \"date\") && e[\"date\"] == date) { return i; } } return 0; }"
+        },
+        {
+          "name": "normalize_weekday",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["name"] },
+          "source": "verb :normalize_weekday(name) rxd { if (typeof(name) != \"string\") { return \"\"; } let s = str_lower(str_trim(name)); if (s == \"mon\" || s == \"monday\") { return \"mon\"; } if (s == \"tue\" || s == \"tues\" || s == \"tuesday\") { return \"tue\"; } if (s == \"wed\" || s == \"weds\" || s == \"wednesday\") { return \"wed\"; } if (s == \"thu\" || s == \"thur\" || s == \"thurs\" || s == \"thursday\") { return \"thu\"; } if (s == \"fri\" || s == \"friday\") { return \"fri\"; } if (s == \"sat\" || s == \"saturday\") { return \"sat\"; } if (s == \"sun\" || s == \"sunday\") { return \"sun\"; } return \"\"; }"
+        },
+        {
+          "name": "parse_md",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["text", "today"] },
+          "source": "verb :parse_md(text, today) rxd { if (typeof(text) != \"string\" || text == \"\") { return \"\"; } let s = str_trim(text); if (s == \"\") { return \"\"; } let parts = str_split(s, \"/\"); if (length(parts) == 1) { parts = str_split(s, \"-\"); } if (length(parts) == 3) { let y = parts[1]; let m = parts[2]; let d = parts[3]; if (length(y) == 4) { return y + \"-\" + this:zpad2(to_int(m)) + \"-\" + this:zpad2(to_int(d)); } return \"\"; } if (length(parts) != 2) { return \"\"; } let mm = to_int(parts[1]); let dd = to_int(parts[2]); if (mm < 1 || mm > 12 || dd < 1 || dd > 31) { return \"\"; } let year = \"\"; if (typeof(today) == \"string\" && length(today) >= 4) { year = str_slice(today, 1, 4); } if (year == \"\") { return \"\"; } return year + \"-\" + this:zpad2(mm) + \"-\" + this:zpad2(dd); }"
+        },
+        {
+          "name": "zpad2",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["n"] },
+          "source": "verb :zpad2(n) rxd { let s = to_string(to_int(n)); if (length(s) < 2) { s = \"0\" + s; } return s; }"
+        },
+        {
+          "name": "format_day_line",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["entry", "label"] },
+          "source": "verb :format_day_line(entry, label) rxd { let place = this:display_location(); let lab = \"that day\"; if (typeof(label) == \"string\" && label != \"\") { lab = label; } let temp = null; if (typeof(entry) == \"map\" && has(entry, \"temperature\")) { temp = entry[\"temperature\"]; } let unit = \"\"; if (typeof(temp) == \"map\" && has(temp, \"unit\") && typeof(temp[\"unit\"]) == \"string\") { unit = temp[\"unit\"]; } let mn = \"\"; let mx = \"\"; if (typeof(temp) == \"map\" && has(temp, \"min\") && temp[\"min\"] != null) { mn = to_string(temp[\"min\"]) + unit; } if (typeof(temp) == \"map\" && has(temp, \"max\") && temp[\"max\"] != null) { mx = to_string(temp[\"max\"]) + unit; } let body = \"no temperature data\"; if (mn != \"\" && mx != \"\") { body = mn + \" to \" + mx; } else if (mx != \"\") { body = \"high \" + mx; } else if (mn != \"\") { body = \"low \" + mn; } let precip = \"\"; if (typeof(entry) == \"map\" && has(entry, \"precip_total\") && entry[\"precip_total\"] != null && entry[\"precip_total\"] > 0) { let pu = \"\"; if (has(entry, \"precip_unit\") && typeof(entry[\"precip_unit\"]) == \"string\") { pu = entry[\"precip_unit\"]; } precip = \", precip \" + to_string(entry[\"precip_total\"]) + pu; } let date_part = \"\"; if (typeof(entry) == \"map\" && has(entry, \"date\") && typeof(entry[\"date\"]) == \"string\") { date_part = \" (\" + entry[\"date\"] + \")\"; } return \"Weather \" + lab + date_part + \" in \" + place + \": \" + body + precip; }"
         },
         {
           "name": "look_self",

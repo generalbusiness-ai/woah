@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCurrent, buildDaily, buildTimeseries, fetchWeather, mergeDaily, mergeTimeseries, type WeatherDailyEntry, type WeatherTimeseries } from "../src/tomorrow-io";
+import { buildCurrent, buildDaily, buildTimeseries, fetchWeather, mergeDaily, mergeTimeseries, weekdayFromDate, type WeatherDailyEntry, type WeatherTimeseries } from "../src/tomorrow-io";
 
 const HOUR_MS = 3_600_000;
 
@@ -154,6 +154,9 @@ describe("buildDaily", () => {
       precip_total: 0.0,
       weather_code: 1000
     });
+    // Each entry carries a 3-letter weekday so woocode :ask can match
+    // "thursday" without doing date math in the VM. 2026-05-04 was a Monday.
+    expect(daily.map((d) => d.weekday)).toEqual(["mon", "tue", "wed"]);
   });
 
   it("uses metric precip unit and accepts the temperatureMean alias", () => {
@@ -165,7 +168,8 @@ describe("buildDaily", () => {
     );
     expect(daily[0]).toMatchObject({
       temperature: { min: 10, max: 22, mean: 16, unit: "°C" },
-      precip_unit: "mm"
+      precip_unit: "mm",
+      weekday: "tue"
     });
   });
 
@@ -258,6 +262,7 @@ describe("mergeDaily", () => {
   function entry(date: string, mean: number): WeatherDailyEntry {
     return {
       date,
+      weekday: weekdayFromDate(date),
       temperature: { min: mean - 5, max: mean + 5, mean, unit: "°F" },
       humidity: { min: 60, max: 80, mean: 70 },
       precip_total: 0,
@@ -299,6 +304,36 @@ describe("mergeDaily", () => {
     ];
     const merged = mergeDaily(prev, [], anchor, tz);
     expect(merged.map((e) => e.date)).toEqual(["2026-05-02", "2026-05-09"]);
+  });
+
+  // Pre-1.1 plug versions wrote daily entries without `weekday`. Those
+  // entries can ride forward across many ticks (prev-side dates outside the
+  // API window are kept as-is). $weather_block:ask uses `weekday` to match
+  // "thursday" by string equality, so any retained entry must be backfilled
+  // — otherwise "ask weather thursday" silently misses days the API stopped
+  // covering. mergeDaily normalizes both prev and next on the way in.
+  it("backfills weekday on legacy prev entries that pre-date the v1.1 schema", () => {
+    const anchor = Date.parse("2026-05-09T18:00Z");
+    // Cast through unknown to simulate a v1.0 entry shape that does NOT
+    // have `weekday`. (The TS type guarantees the field for v1.1 builders,
+    // but stored data from older deployments has no such guarantee.)
+    const legacy = {
+      date: "2026-05-08",
+      temperature: { min: 60, max: 70, mean: 65, unit: "°F" },
+      humidity: { min: 60, max: 80, mean: 70 },
+      precip_total: 0,
+      precip_unit: "in",
+      weather_code: 1000
+    } as unknown as WeatherDailyEntry;
+    const merged = mergeDaily([legacy], [], anchor, tz);
+    expect(merged).toHaveLength(1);
+    // 2026-05-08 was a Friday.
+    expect(merged[0].weekday).toBe("fri");
+    // The rest of the entry shape is preserved.
+    expect(merged[0]).toMatchObject({
+      date: "2026-05-08",
+      temperature: { min: 60, max: 70, mean: 65, unit: "°F" }
+    });
   });
 });
 

@@ -1,6 +1,6 @@
 {
   "from_version": "0.x.x",
-  "to_version": "1.0.0",
+  "to_version": "1.x.x",
   "spec_version": "v1",
   "steps": [
     { "kind": "drop_property", "class": "$weather_block", "name": "forecast" },

@@ -1,9 +1,9 @@
 ---
 name: weather
-version: 1.0.0
+version: 1.1.0
 spec_version: v1
 license: MIT
-description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes a flat current scalar, a 14-entry per-day rollup, and a column-major hourly time-series spanning the past week through the next week.
+description: Weather block class — a $block subclass driven by an external plug that fetches tomorrow.io and pushes a flat current scalar, a 14-entry per-day rollup, and a column-major hourly time-series spanning the past week through the next week. v1.1 adds an `:ask` chat verb backed by `current.local_date` and `daily[*].weekday`.
 keywords:
   - block
   - weather
@@ -59,8 +59,8 @@ so a reader never sees a torn snapshot:
 
 | Name | Shape | Notes |
 |---|---|---|
-| `current` | small flat map | `temperature`, `temperature_unit`, `humidity`, `weather_code`, `observed_at` (ms epoch), `observed_at_text` (plug-rendered timezone-aware string). Read by chat verbs and the badge. |
-| `daily` | list of small maps (~14) | One entry per covered day, ordered ascending by `date` (YYYY-MM-DD in the configured timezone). Each carries pre-computed min/max/mean per metric and `precip_total`. Read by chat verbs that summarize the week. |
+| `current` | small flat map | `temperature`, `temperature_unit`, `humidity`, `weather_code`, `observed_at` (ms epoch), `observed_at_text` (plug-rendered timezone-aware string), `local_date` (YYYY-MM-DD in the configured timezone, used by `:ask` to resolve "today"). Read by chat verbs and the badge. |
+| `daily` | list of small maps (~14) | One entry per covered day, ordered ascending by `date` (YYYY-MM-DD in the configured timezone). Each carries `weekday` (3-letter lowercase, e.g. `"thu"`), pre-computed min/max/mean per metric, and `precip_total`. Read by chat verbs that summarize the week. |
 | `timeseries` | column-major map | `anchor`, `t0`, `step`, `units`, `fields[name].{unit,agg,values}`. ~336 hourly samples spanning ±7 days, one homogeneous array per metric for d3. Read only by the chart UI. |
 | `last_pushed_at` | int | Inherited from `$block`; epoch ms of last plug push. |
 | `last_error` | str/null | Inherited from `$block`; most recent fetch failure. |
@@ -76,6 +76,32 @@ timestamp and the block's `timezone`; `:look_self()` does not show the raw
 `last_pushed_at` epoch. The look return also exposes `daily` for verbs
 that need a per-day summary; `timeseries` is intentionally projected
 separately and is not in the look return.
+
+## Chat: `ask weather <when>`
+
+`:ask` answers a one-line summary for a date the user names in chat:
+
+```text
+> ask weather today
+Weather today (2026-05-09) in Seattle: 14°C to 22°C
+> ask weather tomorrow
+Weather tomorrow (2026-05-10) in Seattle: 15°C to 23°C
+> ask weather thursday
+Weather thu (2026-05-14) in Seattle: 18°C to 26°C
+> ask weather 5/12
+Weather tue (2026-05-12) in Seattle: 16°C to 24°C
+```
+
+Accepted forms: `today` / `now`, `tomorrow`, `yesterday`, weekday names
+(full or 3-letter, case-insensitive), `M/D` / `M-D` (resolved against
+`current.local_date`'s year, with a one-year roll-over fallback for the
+December/January boundary), and `YYYY-MM-DD`. Out-of-window queries get
+a polite "no data" message; unrecognised input gets a usage hint listing
+the accepted forms.
+
+Resolution is pure string matching against `current.local_date` and
+`daily[*].date` / `daily[*].weekday` — the plug stamps both at push
+time, so the verb runs without any IANA timezone math in the VM.
 
 ## UI
 
