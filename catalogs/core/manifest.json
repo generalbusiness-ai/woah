@@ -44,6 +44,30 @@
           "skip_presence_check": true,
           "arg_spec": { "args": ["objects"] },
           "source": "verb :names_of(objects) rxd {\n  // LambdaCore $string_utils:names_of (#20). Renders a list of objects\n  // as `name1(#id1)   name2(#id2)` — three-space separator, paste-able\n  // ids per the woo `#`/`$` convention so a reader can copy any single\n  // identifier back into eval. LambdaCore emits `name(#123)` directly\n  // because every id starts with `#`; woo prefixes `#` for ULIDs and\n  // leaves corenames (`$wiz`) bare.\n  if (typeof(objects) != \"list\") {\n    return \"\";\n  }\n  let line = \"\";\n  for item in objects {\n    if (typeof(item) == \"string\" && valid(item)) {\n      let s = item;\n      if (!str_starts(s, \"$\")) { s = \"#\" + s; }\n      line = line + item.name + \"(\" + s + \")   \";\n    }\n  }\n  return str_trim(line);\n}"
+        },
+        {
+          "name": "to_value",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["s"] },
+          "source": "verb :to_value(s) rxd {\n  // LambdaCore $string_utils:to_value (#20). Best-effort parse of a\n  // user-typed value: returns [ok, value] so callers can detect parse\n  // failure without try/catch. Used by @set / @property for the\n  // `to <value>' tail.\n  //\n  // Initial port covers strings (quoted or bare), integers, and\n  // floats — the cases @set <obj>.<prop> to <value> hits in practice.\n  // Lists, maps, and objref literals (#xxx, $xxx) are deferred until\n  // a caller needs them; the LambdaCore version supports many more\n  // shapes via $code_utils, but the bare branches above cover the\n  // first-day use cases.\n  if (typeof(s) != \"string\") { return [false, \"not a string\"]; }\n  let trimmed = str_trim(s);\n  let n = length(trimmed);\n  if (n == 0) { return [true, \"\"]; }\n  // Quoted string: strip a matched pair of double quotes.\n  let quote = str_char(34);\n  if (n >= 2 && str_slice(trimmed, 1, 1) == quote && str_slice(trimmed, n, n) == quote) {\n    return [true, str_slice(trimmed, 2, n - 1)];\n  }\n  // Integer (round-trips through to_string).\n  let as_int = to_int(trimmed);\n  if (to_string(as_int) == trimmed) { return [true, as_int]; }\n  // Float (round-trips through to_string).\n  let as_float = to_float(trimmed);\n  if (to_string(as_float) == trimmed) { return [true, as_float]; }\n  // Fall back to the bare string.\n  return [true, trimmed];\n}"
+        }
+      ]
+    },
+    {
+      "local_name": "$code_utils",
+      "parent": "$utils",
+      "description": "LambdaCore $code_utils (#153). Initial port carries :parse_propref — the helper that splits a `<obj>.<prop>` token into its parts so command verbs (@property, @set, @rmproperty, @display) don't have to. The rest of LambdaCore $code_utils (verb-introspection helpers like :find_verb_named, :explain_verb_syntax, :short_prep) lands when a woo verb reaches for them.",
+      "properties": [],
+      "verbs": [
+        {
+          "name": "parse_propref",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["string"] },
+          "source": "verb :parse_propref(string) rxd {\n  // LambdaCore $code_utils:parse_propref (#153). Splits `<obj>.<prop>`\n  // (or bare `$prop` against `$system`) into [obj_str, prop_str], or\n  // returns false on parse failure. The obj_str is left as-typed so\n  // the caller does its own resolution via $match:match_object.\n  //\n  // Divergence (1): LambdaCore returns `{\"#0\", prop}` for the bare\n  // `$foo` case (treating it as `$system.foo`). woo uses `$system`\n  // verbatim — same intent, woo-shaped corename.\n  if (typeof(string) != \"string\") { return false; }\n  let s = string;\n  let dot = str_index(s, \".\");\n  if (dot > 0) {\n    let object = str_slice(s, 1, dot - 1);\n    let prop = str_slice(s, dot + 1);\n    if (object == \"\" || prop == \"\") { return false; }\n    return [object, prop];\n  }\n  if (str_starts(s, \"$\")) {\n    return [\"$system\", str_slice(s, 2)];\n  }\n  return false;\n}"
         }
       ]
     }
