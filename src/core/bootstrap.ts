@@ -719,7 +719,18 @@ function seedUniversal(world: WooWorld): void {
   reparentSeed(world, "$space", "$sequenced_log");
 
   for (const id of ["$root", "$actor", "$player", "$sequenced_log", "$space", "$thing", "$catalog", "$catalog_registry"]) {
-    define(world, id, "name", "", "str", "r");
+    // Seed the `name` property with the WooObject.name attribute (rather
+    // than ""), so woocode `obj.name` reads the actual seed name on every
+    // descendant. createAuthoredObject already follows this mirroring rule
+    // ("WooObject.name is the display/core metadata; the inherited `name`
+    // property is the source-level slot read by woocode"); without this
+    // seed value, $wiz / $thing / $room / … return "" for `obj.name`
+    // even though the substrate carries the real name on the attribute.
+    // The defaultValue is propagated to descendants via inheritance, so
+    // setting it on the ancestors above is enough — we don't need to
+    // mirror onto every individual object.
+    const seedName = world.object(id).name ?? "";
+    define(world, id, "name", seedName, "str", "r");
     define(world, id, "description", "", "str", "r");
     define(world, id, "aliases", [], "list<str>", "r");
   }

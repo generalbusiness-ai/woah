@@ -88,6 +88,42 @@
           "tool_exposed": true,
           "arg_spec": { "args": ["id", "name", "value", "opts?"] },
           "source": "verb :set_property(id, name, value, opts) rxd {\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // Ordinary data value setting. This does not change verb source, property\n  // perms, executable metadata, wizard/programmer flags, or ownership.\n  return builder_set_property(id, name, value, opts);\n}"
+        },
+        {
+          "name": "contents_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": ["@cont*ents"],
+          "arg_spec": {
+            "args": ["dobjstr"],
+            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+          },
+          "source": "verb :contents_command(dobjstr) rxd {\n  // LambdaCore $builder:@contents (#630), faithfully ported. Surface\n  // gate added because the verb is direct_callable (see :recycle and\n  // :recycle_command for the same justification).\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  // L3-7 Empty dobjstr defaults to the actor's location.\n  let dobj = null;\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    dobj = location(actor);\n    if (dobj == null) {\n      tell(actor, \"Usage: @contents <object>\");\n      return null;\n    }\n  } else {\n    dobj = $match:match_object(dobjstr);\n  }\n  if ($command_utils:object_match_failed(dobj, dobjstr)) {\n    return null;\n  }\n  // L10-16. `name(<paste-able id>) contains:` then names_of(contents).\n  let id_str = dobj;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let contents_list = contents(dobj);\n  if (length(contents_list) > 0) {\n    tell(actor, dobj.name + \"(\" + id_str + \") contains:\");\n    tell(actor, $string_utils:names_of(contents_list));\n  } else {\n    tell(actor, dobj.name + \"(\" + id_str + \") contains nothing.\");\n  }\n  return contents_list;\n}"
+        },
+        {
+          "name": "parents_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": ["@par*ents"],
+          "arg_spec": {
+            "args": ["dobjstr"],
+            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+          },
+          "source": "verb :parents_command(dobjstr) rxd {\n  // LambdaCore $builder:@parents (#630), faithfully ported. Lists the\n  // object and its ancestor chain up to $root.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @parents <object>\");\n    return null;\n  }\n  let dobj = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(dobj, dobjstr)) {\n    return null;\n  }\n  // Walk parents() (woo builtin returns the full ancestor chain).\n  let chain = [dobj] + parents(dobj);\n  tell(actor, $string_utils:names_of(chain));\n  return chain;\n}"
+        },
+        {
+          "name": "kids_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": ["@kids"],
+          "arg_spec": {
+            "args": ["dobjstr"],
+            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+          },
+          "source": "verb :kids_command(dobjstr) rxd {\n  // LambdaCore $builder:@kids (#630), faithfully ported. Lists the\n  // direct children of an object.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $builder) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n    if (!isa(actor, $builder)) { raise { code: \"E_PERM\", message: \"builder class surface required\", value: { actor: actor, surface: $builder } }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @kids <object>\");\n    return null;\n  }\n  let thing = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(thing, dobjstr)) {\n    return null;\n  }\n  let kids = children(thing);\n  let id_str = thing;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let n = length(kids);\n  if (n > 0) {\n    let suffix = \"s\";\n    if (n == 1) { suffix = \"\"; }\n    tell(actor, thing.name + \"(\" + id_str + \") has \" + to_string(n) + \" kid\" + suffix + \".\");\n    tell(actor, $string_utils:names_of(kids));\n  } else {\n    tell(actor, thing.name + \"(\" + id_str + \") has no kids.\");\n  }\n  return kids;\n}"
         }
       ]
     },
@@ -210,6 +246,30 @@
           "tool_exposed": true,
           "arg_spec": { "args": ["id", "opts?"] },
           "source": "verb :force_recycle(id, opts) rxd {\n  // Wizard-only force_recycle. Bypasses most §RC6 reserved-list checks\n  // (universal classes other than $system/$root/$nowhere; live actors,\n  // whose sessions are terminated as part of the call) and the §RC3a\n  // empty-children safety check. Routes through the unified `recycle`\n  // builtin with force_reserved + force.\n  //\n  // The substrate gates RC2 authority on `progr` (the verb's effective\n  // principal), so a wrapper verb running with wizard progr could be\n  // invoked by any actor. We additionally gate on `actor` here so a\n  // non-wizard caller cannot bypass §RC6 by calling this verb. This is\n  // the LambdaCore @recycle convention: substrate trusts progr; the\n  // user-facing wrapper trusts actor. Audited as a force_recycle\n  // wizard_action; emits a wiz_force_recycle observation. Use sparingly —\n  // for irreversible world-teardown and migration only.\n  \"the_perm\":requires_wizard(actor, \"wizard authority required for force_recycle\");\n  let merged = opts;\n  if (typeof(merged) != \"map\") { merged = {}; }\n  merged[\"force_reserved\"] = true;\n  merged[\"force\"] = true;\n  return recycle(id, merged);\n}"
+        },
+        {
+          "name": "verbs_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": ["@verbs"],
+          "arg_spec": {
+            "args": ["dobjstr"],
+            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+          },
+          "source": "verb :verbs_command(dobjstr) rxd {\n  // LambdaCore $prog:@verbs (#217), faithfully ported. Programmer\n  // surface — same gate the rest of $programmer uses.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @verbs <object>\");\n    return null;\n  }\n  let thing = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(thing, dobjstr)) {\n    return null;\n  }\n  // L17 LambdaCore: \";verbs(<id>) => {...}\" — eval-shaped output that the\n  // reader can re-type. Mirror that shape; ids are paste-able per the\n  // woo `#`/`$` convention so `;verbs(#obj_xxx) => …` round-trips.\n  let id_str = thing;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let names = verbs(thing);\n  tell(actor, \";verbs(\" + id_str + \") => \" + to_string(names));\n  return names;\n}"
+        },
+        {
+          "name": "properties_command",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "aliases": ["@prop*erties", "@props"],
+          "arg_spec": {
+            "args": ["dobjstr"],
+            "command": { "dobj": "any", "prep": "none", "iobj": "none", "args_from": ["dobjstr"] }
+          },
+          "source": "verb :properties_command(dobjstr) rxd {\n  // LambdaCore $prog:@properties (#217), faithfully ported. Programmer\n  // surface gate.\n  if (!has_flag(actor, \"wizard\")) {\n    if (actor == $programmer) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!isa(actor, $programmer)) { raise { code: \"E_PERM\", message: \"programmer class surface required\", value: { actor: actor, surface: $programmer } }; }\n    if (!has_flag(actor, \"programmer\")) { raise { code: \"E_PERM\", message: \"programmer flag required\", value: actor }; }\n  }\n  if (typeof(dobjstr) != \"string\" || dobjstr == \"\") {\n    tell(actor, \"Usage: @properties <object>\");\n    return null;\n  }\n  let thing = $match:match_object(dobjstr);\n  if ($command_utils:object_match_failed(thing, dobjstr)) {\n    return null;\n  }\n  // L10 LambdaCore: \";properties(<id>) => {...}\".\n  let id_str = thing;\n  if (!str_starts(id_str, \"$\")) { id_str = \"#\" + id_str; }\n  let names = properties(thing);\n  tell(actor, \";properties(\" + id_str + \") => \" + to_string(names));\n  return names;\n}"
         }
       ]
     },

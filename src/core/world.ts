@@ -802,6 +802,15 @@ export class WooWorld {
     const obj = this.object(objRef);
     if (name === "owner") return obj.owner;
     if (obj.properties.has(name)) return cloneValue(obj.properties.get(name)!);
+    // The `name` attribute is the substrate's authoritative display label
+    // (see createObject, examine output, objectDisplayNameAsync). When no
+    // explicit property has been set, surface the attribute to woocode
+    // readers like `dobj.name` so they don't see the inherited "" default
+    // for seed objects ($wiz, $root, $thing, …) that carry only an
+    // attribute, not a property value. createAuthoredObject mirrors them
+    // intentionally for builder-created objects; this fallback covers the
+    // bootstrap path that doesn't.
+    if (name === "name") return obj.name;
     let parent = obj.parent;
     while (parent) {
       const ancestor = this.object(parent);
@@ -1504,6 +1513,33 @@ export class WooWorld {
         version: 1,
         has_value: true
       };
+    }
+    // The `name` attribute is the substrate's display label (see getProp's
+    // matching fallback). When neither this object nor any ancestor has an
+    // explicit `name` property def, synthesize property info backed by
+    // the attribute so canReadProperty doesn't reject the lookup.
+    // Without this, $system.name (no def in parent chain) raises E_PROPNF
+    // through canReadProperty before getProp's attribute fallback runs.
+    {
+      const obj = this.object(objRef);
+      let walker: ObjRef | null = objRef;
+      let hasDef = false;
+      while (walker) {
+        const ancestor = this.object(walker);
+        if (ancestor.propertyDefs.has(name)) { hasDef = true; break; }
+        walker = ancestor.parent;
+      }
+      if (!hasDef && name === "name") {
+        return {
+          name,
+          owner: obj.owner,
+          perms: "r",
+          defined_on: objRef,
+          type_hint: "str",
+          version: 1,
+          has_value: true
+        };
+      }
     }
     let current: ObjRef | null = objRef;
     while (current) {
@@ -8412,6 +8448,20 @@ export class WooWorld {
     const lower = wanted.toLowerCase();
     if (lower === "me") return { status: "ok", value: actor };
     if (lower === "here" && location) return { status: "ok", value: location };
+
+    // Per match.md §MA2 steps 1–2: literal id syntax resolves before any
+    // candidate walk. `#xxx` is a direct objref (the lexer strips the `#`
+    // for DSL literals; surface this for chat input too). `$xxx` is a
+    // corename — woo stores corenames as the id itself, so the prefix is
+    // the id. Either form resolves to the underlying object iff it's a
+    // known id.
+    if (wanted.startsWith("#") && wanted.length > 1) {
+      const candidate = wanted.slice(1);
+      if (this.objects.has(candidate)) return { status: "ok", value: candidate };
+    }
+    if (wanted.startsWith("$") && this.objects.has(wanted)) {
+      return { status: "ok", value: wanted };
+    }
 
     // Per match.md §MA2 the resolver buckets candidates by source so the
     // tiebreaker can prefer carried-by-actor over present-in-location, then
