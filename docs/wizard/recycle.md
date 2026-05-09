@@ -55,8 +55,11 @@ All options are passed in the second-arg map. All are optional.
 ## Catalog wrappers
 
 Two woocode wrappers exist on top of the builtin. Prefer them when one
-applies — they centralize the permission check and emit audit
-observations.
+applies — they centralize the permission check, emit audit
+observations, and surface as ordinary tools on actors that inherit
+from `$builder` / `$programmer`. See
+[../designing/builder-and-programmer.md](../designing/builder-and-programmer.md)
+for how the surface attaches to actors and the related chat commands.
 
 - **`$builder:recycle(id, opts)`** — owner-or-wizard. Strips
   `force_reserved` before forwarding (so a non-wizard can never reach

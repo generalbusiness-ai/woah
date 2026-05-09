@@ -4,6 +4,11 @@ Operations that require wizard authority — that is, your actor has the
 wizard flag set. Check with `;has_flag(actor, "wizard")`; if it returns
 `false`, none of these will work for you.
 
+This section is for **privileged** operations only. For ordinary
+authoring (creating objects, programming verbs, packaging catalogs),
+see [`../designing/`](../designing/). For day-to-day usage of a
+running world, see [`../using/`](../using/).
+
 ## Pages
 
 - **[recycle.md](recycle.md)** — destroying objects (routine and forced).
