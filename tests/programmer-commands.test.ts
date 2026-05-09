@@ -478,6 +478,197 @@ describe("$programmer:@chown (LambdaCore $wiz #218 port)", () => {
   });
 });
 
+describe("review-cycle conformance fixes", () => {
+  it("@list works on verbs with only positional args (no command shape)", async () => {
+    // $programmer:inspect is a typical direct-callable MCP-tool verb:
+    // arg_spec.args=["id","opts?"], no arg_spec.command. Pre-fix this
+    // E_KEYNF'd on info["arg_spec"]["command"]; the renderer now falls
+    // back to "(arg1, arg2)" for direct-callable verbs.
+    const world = createWorld();
+    const result = await world.directCall(
+      "list-noncmd",
+      "$wiz",
+      "$wiz",
+      "list_command",
+      ["$programmer:inspect"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const lines = findAllTextObservations(result.observations, "$wiz");
+    expect(lines[0]).toMatch(/\$programmer:inspect/);
+    // Header has parenthesized args list, not "this  none  this".
+    expect(lines[0]).toMatch(/\(id, opts\?\)/);
+  });
+
+  it("@args display works on verbs with only positional args (no command shape)", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "args-noncmd",
+      "$wiz",
+      "$wiz",
+      "args_command",
+      ["$programmer:inspect"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/^inspect\s+\(id, opts\?\)$/);
+  });
+
+  it("@args mutation refuses non-command verbs with a clear pointer", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "args-mutate-noncmd",
+      "$wiz",
+      "$wiz",
+      "args_command",
+      ["$programmer:inspect this with any"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/direct-callable only/);
+  });
+
+  it("@verb pads partial argspecs to length 3 with `none` (LambdaCore L32)", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "padspec");
+    // Single token: only dobj given; LambdaCore pads prep/iobj to "none".
+    const result = await world.directCall(
+      "verb-pad-1",
+      "$wiz",
+      "$wiz",
+      "verb_command",
+      [`#${id}:foo this`]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const info = world.verbInfoForActor("$wiz", id, "foo") as any;
+    expect(info.arg_spec.command).toEqual({ dobj: "this", prep: "none", iobj: "none" });
+  });
+
+  it("@verb pads two-token argspecs to length 3 with `none`", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "padspec2");
+    // Two tokens (LambdaCore allows `<dobj> <prep>` form, padding iobj).
+    const result = await world.directCall(
+      "verb-pad-2",
+      "$wiz",
+      "$wiz",
+      "verb_command",
+      [`#${id}:foo this none`]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const info = world.verbInfoForActor("$wiz", id, "foo") as any;
+    expect(info.arg_spec.command).toEqual({ dobj: "this", prep: "none", iobj: "none" });
+  });
+
+  it("@property accepts a quoted multiword value", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "qval");
+    const result = await world.directCall(
+      "prop-quoted",
+      "$wiz",
+      "$wiz",
+      "property_command",
+      [`#${id}.title "hello world"`]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(world.getProp(id, "title")).toBe("hello world");
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/^Property added with value /);
+  });
+
+  it("@property accepts a single-word quoted value (round-trips through $string_utils:to_value)", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "qval2");
+    const result = await world.directCall(
+      "prop-quoted2",
+      "$wiz",
+      "$wiz",
+      "property_command",
+      [`#${id}.tag "alpha"`]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(world.getProp(id, "tag")).toBe("alpha");
+  });
+
+  it("@property rejects an unterminated quoted value", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "qval3");
+    const result = await world.directCall(
+      "prop-bad-quote",
+      "$wiz",
+      "$wiz",
+      "property_command",
+      [`#${id}.broken "open and never close`]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/Unterminated quoted value/);
+  });
+
+  it("@rename rejects a name with whitespace", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "renameval");
+    const result = await world.directCall(
+      "rename-bad",
+      "$wiz",
+      "$wiz",
+      "rename_command",
+      [`#${id}`, "two words"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/cannot contain whitespace/);
+    // Old name preserved.
+    expect(world.getProp(id, "name")).toBe("renameval");
+  });
+
+  it("@rename rejects an over-long name", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "renamelong");
+    const long = "x".repeat(65);
+    const result = await world.directCall(
+      "rename-long",
+      "$wiz",
+      "$wiz",
+      "rename_command",
+      [`#${id}`, long]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toMatch(/Name too long/);
+  });
+
+  it("@chown rejects a non-player owner", async () => {
+    const world = createWorld();
+    const id = await createTestObject(world, "chowntarget");
+    await world.directCall("verb-add", "$wiz", "$wiz", "verb_command", [`#${id}:foo`]);
+    // Try to chown to $thing — not a player.
+    const result = await world.directCall(
+      "chown-nonplayer",
+      "$wiz",
+      "$wiz",
+      "chown_command",
+      [`#${id}:foo $thing`]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe("Owner must be a player object.");
+    // Owner unchanged.
+    const info = world.verbInfoForActor("$wiz", id, "foo");
+    expect(info.owner).toBe("$wiz");
+  });
+});
+
 describe("$perm_utils:apply (LambdaCore #42 port)", () => {
   it("returns the absolute mods string verbatim when not prefixed with +/-/!", async () => {
     const world = createWorld();
