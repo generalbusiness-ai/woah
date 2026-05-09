@@ -1,4 +1,4 @@
-# woo — specification
+# Port — specification
 
 Programmable persistent objects, single-parent inheritance, modernized types, structured event messaging. A globally distributed successor to LambdaMOO. Cross-operator federation is reserved for v2.
 
@@ -11,13 +11,13 @@ Programmable persistent objects, single-parent inheritance, modernized types, st
 
 ## 1. Vision
 
-**woo** is a multi-user, persistent, programmable world. It is a modern successor to LambdaMOO: it preserves the expressive object/verb/room/player model while reconsidering the architecture, interfaces, safety model, and social expectations for a contemporary networked environment. Every object is independently addressable and stateful. Users (human or agent) connect over websockets, inhabit a player object, and interact by emitting events and invoking verbs on other objects. Objects can be edited and reprogrammed at runtime by sufficiently privileged users; all code is sandboxed in a custom bytecode VM with tick metering and per-task memory caps.
+**Port** is a multi-user, persistent, programmable world. It is a modern successor to LambdaMOO: it preserves the expressive object/verb/room/player model while reconsidering the architecture, interfaces, safety model, and social expectations for a contemporary networked environment. Every object is independently addressable and stateful. Users (human or agent) connect over websockets, inhabit a player object, and interact by emitting events and invoking verbs on other objects. Objects can be edited and reprogrammed at runtime by sufficiently privileged users; all code is sandboxed in a custom bytecode VM with tick metering and per-task memory caps.
 
 The system is **globally distributed** in the production profile. Every object is its own actor, hosted at the edge, with no single process or node carrying the whole world. v1 runs within one vendor's namespace per deployment. Cross-operator federation (the broader sense of "decentralized") is designed but deferred to v2.
 
 ## 1.1 Deployment modes
 
-Woo has three runtime modes:
+Port has three runtime modes:
 
 - **In-memory (development/testing only).** Fast boot, no persistence guarantees, and no required cross-environment promotion workflow.
 - **Local SQLite (testing and small self-contained deployments).** Durable process-local storage, simpler operations, and single-environment lifecycle.
@@ -36,7 +36,7 @@ The specification should be clear enough that independent implementations can be
 | Term | Meaning |
 |---|---|
 | **Object** | A persistent, individually addressable entity. Holds properties, verbs, location, parent, owner. |
-| **Persistent object** | Server-hosted; one persistent host per woo object. Identifier prefix `#`. |
+| **Persistent object** | Server-hosted; one persistent host per Port object. Identifier prefix `#`. |
 | **Transient object** | Client-hosted (typically browser); lifetime bounded by the connection. Identifier prefix `~`. |
 | **Verb** | Callable code attached to an object. Dispatched by name through the standard lookup rule: parent chain, then feature lookup where applicable. |
 | **Property** | Named slot on an object. *Defined* on an ancestor (with default + perms); *value* per object. |
@@ -64,7 +64,7 @@ The spec is split into layers. Implementation references in semantics and protoc
 
 Language and runtime foundations: object/verb/value semantics and execution behavior independent of host implementation.
 
-- [core.md](spec/semantics/core.md) — woo-core: objects, messages, spaces, actors, observations
+- [core.md](spec/semantics/core.md) — Port core: objects, messages, spaces, actors, observations
 - [values.md](spec/semantics/values.md) — value contract, equality, canonical serialization (V1–V11)
 - [objects.md](spec/semantics/objects.md) — object model, identity, verb dispatch, properties (§4, §5, §9, §10)
 - [sequenced-log.md](spec/semantics/sequenced-log.md) — `$sequenced_log` primitive: atomic seq allocation, durable append-only log (SL1–SL10)
@@ -141,7 +141,7 @@ Diagnostics and verification surfaces for runtime behavior, testing, and operato
 
 ### Authoring
 
-Tools and in-world interfaces for making Woo programmable by people and agents.
+Tools and in-world interfaces for making Port programmable by people and agents.
 
 - [minimal-ide.md](spec/authoring/minimal-ide.md) — first Web IDE and authoring primitives (A1–A11)
 - [editor-rooms.md](spec/authoring/editor-rooms.md) — LambdaCore-style editor rooms for collaborative in-world authoring (E1–E8)

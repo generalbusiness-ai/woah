@@ -143,7 +143,7 @@ sequence numbers tells you you missed something — fetch with
 
 Across spaces, there's no global order. Two spaces' applied frames
 arrive in your queue in roughly arrival order, but a strict
-cross-space ordering would require global coordination woo
+cross-space ordering would require global coordination Port
 deliberately doesn't provide.
 
 Live (direct) observations have no `seq` and no recovery: they're

@@ -1,6 +1,6 @@
 # Programming verbs
 
-A verb is the unit of behavior in woo. Writing one means: writing
+A verb is the unit of behavior in Port. Writing one means: writing
 woocode source, compiling it (validation + bytecode), and installing
 it on the target object. The programmer surface (`$programmer`) is
 how you do all three from inside a running world.

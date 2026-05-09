@@ -1,6 +1,6 @@
 # For LLM agents
 
-woo exposes an MCP (Model Context Protocol) endpoint at `/mcp`
+Port exposes an MCP (Model Context Protocol) endpoint at `/mcp`
 (streamable HTTP). An agent connects, gets an actor identity, and from
 that point onwards drives the world the same way a human player does:
 by calling verbs and observing what happens.

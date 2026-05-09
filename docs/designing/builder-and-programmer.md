@@ -1,6 +1,6 @@
 # Builder and programmer
 
-woo's authoring surface is split into two roles, ported directly from
+Port's authoring surface is split into two roles, ported directly from
 LambdaCore: **builder** (shape the object graph and data) and
 **programmer** (author executable behavior). Both are ordinary player
 classes, not special harness objects. An actor whose parent chain

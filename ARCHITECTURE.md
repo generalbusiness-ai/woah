@@ -1,4 +1,4 @@
-# woo — architecture
+# Port — architecture
 
 Strong layering rules. **Read this before adding to core or worker code.**
 The spec proper lives under `spec/`; this file is the operating-instruction
@@ -124,7 +124,7 @@ chat draft) lives in the client. World state mutates only through verbs.
 ### `catalogs/*`
 
 The world. Each catalog is a manifest plus its own design doc. Classes,
-verbs, properties, schemas, and seed_hooks. Verbs are written in Woo source
+verbs, properties, schemas, and seed_hooks. Verbs are written in woocode
 (compiled by `src/core/dsl-compiler.ts` to Tiny VM bytecode). Catalogs
 declare dependencies on each other (`@local:chat`) and resolve through the
 same install path that a federated tap would.

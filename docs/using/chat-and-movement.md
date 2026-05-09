@@ -53,7 +53,7 @@ woo_call("$here", "who", [])
 ```
 
 If you want a wider sweep ("who is online anywhere"), there isn't a
-universal answer — woo is intentionally local. You'd need a per-world
+universal answer — Port is intentionally local. You'd need a per-world
 directory verb if that catalog provides one.
 
 ## Speaking

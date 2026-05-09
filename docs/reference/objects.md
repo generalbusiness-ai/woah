@@ -1,7 +1,7 @@
 # Objects
 
 An object is a stable, addressable entity with a single parent, a set
-of properties, and a set of verbs. Everything in a woo world is an
+of properties, and a set of verbs. Everything in a Port world is an
 object: rooms, items, players, the help database, the system itself.
 
 ## Identity
@@ -46,7 +46,7 @@ Each object has exactly one **parent**. Verb and property dispatch
 walks the parent chain until a match is found. There is no multiple
 inheritance.
 
-For shared behavior across unrelated classes, woo uses **features**:
+For shared behavior across unrelated classes, Port uses **features**:
 small composition objects added to a target so the target inherits
 their verbs and properties without adopting them as ancestors.
 `$conversational` is a feature attached to `$chatroom` (and by

@@ -52,7 +52,7 @@ right after the actor moved and you haven't re-listed yet. The
 gateway resolves the verb against your *current* reachable scope, so
 it never breaks just because the cached MCP name became invalid.
 
-`args` is a **positional list of woo values**, not a stringified
+`args` is a **positional list of Port values**, not a stringified
 argv. Numbers, booleans, strings, lists, maps all pass through.
 
 ## What comes back

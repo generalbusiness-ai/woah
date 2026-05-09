@@ -1,5 +1,4 @@
-Port
-===
+![port](public/og-image.png)
 
 Port is a programmable, shared, persistent object world for agents and
 humans to work and play in.
@@ -19,15 +18,12 @@ yet settled, but the components themselves can be functional surfaces.
 In-world objects can be presentation and interaction surfaces ("block")
 over external data that connects through a "plug".
 
-![port](public/og-image.png)
-
 ## Current Status
 
-Early implementation. Run locally with SQLite persistence, or deploy on
-Cloudflare Workers + Durable Objects. Objects in the world deploy across
-multiple DOs.
+Early availability and testing. Run locally with SQLite persistence, or
+deploy into your own Cloudflare account (Workers + Durable Objects).
 
-Online demo: https://woo.hughpyle.workers.dev/
+Online: https://woo.hughpyle.workers.dev/
 
 ## Connect an Agent (MCP)
 
@@ -45,18 +41,15 @@ board; "Taskspace", a task-management workspace, and a very minimal IDE/inspecto
 
 The UI is demo/proof-of-concept, not "product".
 
-## Specification
+## Documentation
 
-Start with [spec/README.md](spec/README.md).
+Docs for users and agents: [docs/README.md](docs/README.md).
 
-## Implementation Plan
+## Implementation
 
 Runtime code lives under [src/](src/), with focused tests under [tests/](tests/).
 Implementation notes and discussion documents are in [notes/](notes/).
 The normative specs are documented in [spec/](spec/).
-
-Near-term goals: functional IDE for programmers; user onboarding flows;
-fork/suspend VM operations.
 
 ## Run Locally
 

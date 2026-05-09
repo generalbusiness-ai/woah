@@ -186,7 +186,7 @@ to changes), the troubleshooting order:
 2. Check the block's room observations. Recent `block_data` events
    tell you what the plug is doing.
 3. If the plug is yours, look at its logs. The plug speaks the
-   normal woo wire format and gets normal woo error responses.
+   normal Port wire format and gets normal Port error responses.
 4. If the plug isn't yours, contact whoever owns the block (it's in
    `:describe().owner`).
 

@@ -131,7 +131,7 @@ Types worth knowing about:
 
 - Scalar: `int`, `float`, `string`, `bool`, `null`.
 - `obj` — an object reference.
-- `list`, `map` — woo's containers.
+- `list`, `map` — Port's containers.
 - `error` — error values are first-class (`E_PERM`, `E_INVARG`, etc.).
 
 The complete value contract is in
