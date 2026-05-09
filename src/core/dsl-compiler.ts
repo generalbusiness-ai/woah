@@ -142,7 +142,16 @@ const BUILTINS = new Set([
   "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace", "programmer_eval",
-  "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort"
+  "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
+  // Read-only authoring primitives (LambdaMOO-shape introspection).
+  "parents", "children", "valid", "verbs", "verb_info", "verb_code",
+  // Verb mutation primitives + pure compile_verb.
+  "add_verb", "delete_verb", "set_verb_info", "set_verb_code", "compile_verb",
+  // Property primitives.
+  "properties", "property_info", "add_property", "delete_property", "set_property_info",
+  "clear_property", "is_clear_property",
+  // Authoring aggregations.
+  "authoring_inspect", "authoring_search"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 

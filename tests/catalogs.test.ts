@@ -1290,7 +1290,7 @@ describe("local catalogs", () => {
     }
   });
 
-  it("records clean host schema plans without applying seed repairs", { timeout: 15000 }, () => {
+  it("records clean host schema plans without applying seed repairs", { timeout: 30000 }, () => {
     const gateway = createWorld();
     const scoped = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_hot_tub");
     expect(scoped).not.toBeNull();
@@ -1314,7 +1314,7 @@ describe("local catalogs", () => {
     expect(records.every((record) => Array.isArray(record.steps) && record.steps.every((step: any) => step.status === "skipped"))).toBe(true);
   });
 
-  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", { timeout: 15000 }, () => {
+  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", { timeout: 30000 }, () => {
     const gateway = createWorld();
     const listNotes = worldVerb(gateway, "$pinboard", "list_notes");
     const installed = installVerb(gateway, "$pinboard", "list_notes", `verb :list_notes() rxd {

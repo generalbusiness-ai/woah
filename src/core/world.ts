@@ -1091,6 +1091,353 @@ export class WooWorld {
     return Array.from(names).sort();
   }
 
+  // Own-only verb names on this object (no inheritance, no features).
+  // Mirrors LambdaMOO's `verbs(obj)` which lists only verbs defined
+  // directly on `obj`. Returns slot-order names.
+  ownVerbNames(objRef: ObjRef): string[] {
+    return this.object(objRef).verbs.map((verb) => verb.name);
+  }
+
+  // Ancestor chain starting from the immediate parent up through the root.
+  // Excludes `obj` itself. Empty list for objects with no parent ($system).
+  parents(objRef: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    let current = this.object(objRef).parent;
+    while (current) {
+      out.push(current);
+      const parent = this.objects.get(current)?.parent ?? null;
+      current = parent;
+    }
+    return out;
+  }
+
+  childrenOf(objRef: ObjRef): ObjRef[] {
+    return Array.from(this.object(objRef).children);
+  }
+
+  // True iff `obj` denotes a live, non-recycled object reference.
+  valid(objRef: ObjRef): boolean {
+    return this.objects.has(objRef);
+  }
+
+  // Resolve a verb by name (with optional `*`/`@` aliases) or 1-based slot
+  // index, restricted to verbs defined directly on `objRef`. Raises
+  // E_VERBNF when not found. LambdaMOO `verb_info(obj, desc)`.
+  ownVerbResolve(objRef: ObjRef, descriptor: WooValue): VerbDef {
+    const obj = this.object(objRef);
+    if (typeof descriptor === "number") {
+      if (!Number.isInteger(descriptor) || descriptor < 1 || descriptor > obj.verbs.length) {
+        throw wooError("E_VERBNF", `verb slot out of range: ${descriptor}`, descriptor);
+      }
+      return obj.verbs[descriptor - 1];
+    }
+    if (typeof descriptor !== "string") {
+      throw wooError("E_TYPE", "verb descriptor must be a name string or 1-based slot integer", descriptor);
+    }
+    const found = this.ownVerbExact(objRef, descriptor);
+    if (!found) throw wooError("E_VERBNF", `${objRef} has no verb named ${descriptor}`, { obj: objRef, descriptor });
+    return found;
+  }
+
+  // Read-only verb info for caller-perms `actor`. Mirrors LambdaMOO's
+  // `verb_info(obj, desc)` but extends the returned map to include woo
+  // verb fields (arg_spec, version, direct_callable, tool_exposed,
+  // source_hash, slot). Permission: actor must be able to read the verb
+  // (verb owner, "r" perm, or wizard).
+  verbInfoForActor(actor: ObjRef, objRef: ObjRef, descriptor: WooValue): Record<string, WooValue> {
+    const verb = this.ownVerbResolve(objRef, descriptor);
+    if (!this.canReadVerb(actor, verb)) {
+      throw wooError("E_PERM", `${actor} cannot read verb ${objRef}:${verb.name}`, { actor, obj: objRef, verb: verb.name });
+    }
+    return {
+      definer: objRef,
+      slot: verb.slot ?? 0,
+      name: verb.name,
+      aliases: verb.aliases,
+      owner: verb.owner,
+      perms: verb.perms,
+      arg_spec: verb.arg_spec as WooValue,
+      version: verb.version,
+      direct_callable: verb.direct_callable === true,
+      tool_exposed: verb.tool_exposed === true,
+      source_hash: verb.source_hash ?? ""
+    };
+  }
+
+  // Verb source for caller-perms `actor`. Returns the source string as
+  // stored. Mirrors LambdaMOO's `verb_code(obj, desc)`. Permission: same
+  // as verb_info — actor must be able to read the verb.
+  verbCodeForActor(actor: ObjRef, objRef: ObjRef, descriptor: WooValue): string {
+    const verb = this.ownVerbResolve(objRef, descriptor);
+    if (!this.canReadVerb(actor, verb)) {
+      throw wooError("E_PERM", `${actor} cannot read verb ${objRef}:${verb.name}`, { actor, obj: objRef, verb: verb.name });
+    }
+    return typeof verb.source === "string" ? verb.source : "";
+  }
+
+  // LambdaMOO `add_verb(obj, info, args)`. Creates a new verb slot on
+  // `objRef` with a no-op body. Raises E_INVARG if a verb of the same name
+  // already exists on `objRef` (own slot — inherited verbs are fine).
+  // Permission: wizard, or `actor` is a programmer who owns `objRef`.
+  // `info` is a map: { name, owner?, perms?, aliases?, arg_spec?,
+  // direct_callable?, tool_exposed? }. Source begins empty; use
+  // set_verb_code to install code.
+  addVerbForActor(actor: ObjRef, objRef: ObjRef, info: WooValue): Record<string, WooValue> {
+    this.assertCanAuthorObject(actor, objRef);
+    const map = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, WooValue> : null;
+    if (!map) throw wooError("E_INVARG", "add_verb expects info map", info);
+    const name = typeof map.name === "string" && map.name.length > 0 ? map.name : null;
+    if (!name) throw wooError("E_INVARG", "add_verb info.name must be a non-empty string", info);
+    if (this.ownVerbExact(objRef, name)) {
+      throw wooError("E_INVARG", `verb already exists: ${objRef}:${name}`, { obj: objRef, name });
+    }
+    const owner = typeof map.owner === "string" ? map.owner : actor;
+    if (!this.objects.has(owner)) throw wooError("E_INVARG", `verb owner does not exist: ${owner}`, owner);
+    // Verb owner is the verb's execution authority (`progr`). A non-wizard
+    // creator may only own verbs they create; otherwise a programmer who
+    // owns an object could install a verb on it owned by `$wiz` and run
+    // wizard-progr code via dispatch. Mirrors definePropertyChecked.
+    if (owner !== actor && !this.isWizard(actor)) {
+      throw wooError("E_PERM", `${actor} cannot create verbs owned by ${owner}`, { actor, owner, obj: objRef, verb: name });
+    }
+    const aliases = Array.isArray(map.aliases) ? map.aliases.map((a) => String(a)) : [];
+    const argSpec = map.arg_spec && typeof map.arg_spec === "object" && !Array.isArray(map.arg_spec)
+      ? (map.arg_spec as Record<string, WooValue>) : {};
+    const directCallable = map.direct_callable === true;
+    const toolExposed = map.tool_exposed === true;
+    const permsRaw = typeof map.perms === "string" ? map.perms : "rx";
+    const parsedPerms = normalizeVerbPerms(permsRaw, directCallable);
+    const stub = "verb :" + name + "() " + parsedPerms.perms + " { return null; }";
+    const compiled = compileVerb(stub);
+    if (!compiled.ok || !compiled.bytecode) {
+      throw wooError("E_INTERNAL", "add_verb stub failed to compile", { obj: objRef, name });
+    }
+    // Stub verbs start at version 0 so an `add_verb` + `set_verb_code`
+    // pair counts as a single install (final version 1) — matching what
+    // a single-step install used to record. set_verb_code bumps to
+    // `current.version + 1`, so the first real code edit lands at v1.
+    const verb: VerbDef = {
+      kind: "bytecode",
+      name,
+      aliases,
+      owner,
+      perms: parsedPerms.perms,
+      arg_spec: argSpec,
+      source: stub,
+      source_hash: compiled.source_hash ?? hashSource(stub),
+      bytecode: { ...compiled.bytecode, version: 0 },
+      version: 0,
+      line_map: compiled.line_map ?? {},
+      direct_callable: parsedPerms.directCallable,
+      tool_exposed: toolExposed
+    };
+    this.addVerb(objRef, verb, { append: true });
+    const installed = this.ownVerbExact(objRef, name);
+    return { slot: installed?.slot ?? 0, version: installed?.version ?? 0 };
+  }
+
+  // LambdaMOO `delete_verb(obj, desc)`. Removes a verb slot from
+  // `objRef`. Permission: wizard, or `actor` is a programmer who owns
+  // `objRef`. Inherited verbs cannot be removed via this surface.
+  deleteVerbForActor(actor: ObjRef, objRef: ObjRef, descriptor: WooValue): void {
+    this.assertCanAuthorObject(actor, objRef);
+    const verb = this.ownVerbResolve(objRef, descriptor);
+    if (!this.removeVerb(objRef, verb.name)) {
+      throw wooError("E_VERBNF", `verb not found: ${objRef}:${verb.name}`, { obj: objRef, verb: verb.name });
+    }
+  }
+
+  // LambdaMOO `set_verb_info(obj, desc, info)`. Updates owner / perms /
+  // names / arg_spec / direct_callable / tool_exposed on an existing
+  // verb. Source/bytecode are not touched. Permission: wizard, or
+  // actor is the verb's owner — verb ownership is the verb's execution
+  // authority (`progr`), so editing a verb you don't own would let you
+  // run arbitrary code under another principal. Bumps verb version.
+  setVerbInfoForActor(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, info: WooValue): Record<string, WooValue> {
+    const map = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, WooValue> : null;
+    if (!map) throw wooError("E_INVARG", "set_verb_info expects info map", info);
+    const current = this.ownVerbResolve(objRef, descriptor);
+    if (current.kind !== "bytecode") throw wooError("E_INVARG", "set_verb_info only updates bytecode verbs", { obj: objRef, verb: current.name });
+    if (!this.isWizard(actor) && current.owner !== actor) {
+      throw wooError("E_PERM", `${actor} cannot edit verb ${objRef}:${current.name} owned by ${current.owner}`, { actor, obj: objRef, verb: current.name, owner: current.owner });
+    }
+    const aliases = Array.isArray(map.aliases) ? map.aliases.map((a) => String(a)) : current.aliases;
+    const argSpec = "arg_spec" in map && map.arg_spec && typeof map.arg_spec === "object" && !Array.isArray(map.arg_spec)
+      ? (map.arg_spec as Record<string, WooValue>) : current.arg_spec;
+    const directCallable = "direct_callable" in map ? map.direct_callable === true : current.direct_callable === true;
+    const toolExposed = "tool_exposed" in map ? map.tool_exposed === true : current.tool_exposed === true;
+    const owner = typeof map.owner === "string" ? map.owner : current.owner;
+    if (!this.objects.has(owner)) throw wooError("E_INVARG", `verb owner does not exist: ${owner}`, owner);
+    // Verb owner is the verb's execution authority. A non-wizard editor
+    // may only retain the existing owner or set themselves; otherwise
+    // they could escalate by chowning a verb on an object they own to
+    // `$wiz`. Mirrors definePropertyChecked / addVerbForActor.
+    if (owner !== current.owner && owner !== actor && !this.isWizard(actor)) {
+      throw wooError("E_PERM", `${actor} cannot change verb owner to ${owner}`, { actor, owner, obj: objRef, verb: current.name });
+    }
+    const permsRaw = typeof map.perms === "string" ? map.perms : current.perms;
+    const parsedPerms = normalizeVerbPerms(permsRaw, directCallable);
+    const next: VerbDef = {
+      ...current,
+      owner,
+      aliases,
+      arg_spec: argSpec,
+      perms: parsedPerms.perms,
+      direct_callable: parsedPerms.directCallable,
+      tool_exposed: toolExposed,
+      version: current.version + 1
+    };
+    this.addVerb(objRef, next, { slot: current.slot });
+    return { slot: next.slot ?? 0, version: next.version };
+  }
+
+  // LambdaMOO `set_verb_code(obj, desc, code)`. Compiles and replaces
+  // source on an existing verb. Returns a list of compile error messages
+  // (empty = success). Permission: wizard, or actor is the verb's
+  // owner — the verb's owner is dispatch's `progr`, so editing a verb
+  // you don't own would let you smuggle arbitrary code in under that
+  // principal's authority. Bumps verb version on success.
+  setVerbCodeForActor(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, source: string): WooValue {
+    const current = this.ownVerbResolve(objRef, descriptor);
+    if (current.kind !== "bytecode") throw wooError("E_INVARG", "set_verb_code only updates bytecode verbs", { obj: objRef, verb: current.name });
+    if (!this.isWizard(actor) && current.owner !== actor) {
+      throw wooError("E_PERM", `${actor} cannot edit verb ${objRef}:${current.name} owned by ${current.owner}`, { actor, obj: objRef, verb: current.name, owner: current.owner });
+    }
+    const compiled = compileVerb(source);
+    if (!compiled.ok || !compiled.bytecode) {
+      return compiled.diagnostics.map((d) => d.message ?? d.code ?? "compile error") as unknown as WooValue;
+    }
+    if (compiled.metadata?.name && compiled.metadata.name !== current.name) {
+      return [`verb header :${compiled.metadata.name} does not match install target :${current.name}`] as unknown as WooValue;
+    }
+    const version = current.version + 1;
+    const finalBytecode = { ...compiled.bytecode, version };
+    const parsedPerms = normalizeVerbPerms(
+      compiled.metadata?.perms ?? current.perms,
+      compiled.metadata?.perms ? false : current.direct_callable === true
+    );
+    const pure = combineVerbPurity(analyzeBytecodePurity(finalBytecode), undefined, `${objRef}:${current.name}`);
+    const next: VerbDef = {
+      ...current,
+      perms: parsedPerms.perms,
+      arg_spec: compiled.metadata?.arg_spec ?? current.arg_spec,
+      direct_callable: parsedPerms.directCallable,
+      pure: pure || undefined,
+      calls: compiled.metadata?.calls,
+      source,
+      source_hash: compiled.source_hash ?? hashSource(source),
+      bytecode: finalBytecode,
+      version,
+      line_map: compiled.line_map ?? {}
+    };
+    this.addVerb(objRef, next, { slot: current.slot });
+    propagateVerbPurity(this);
+    return [] as unknown as WooValue;
+  }
+
+  // Own-only property names defined directly on `objRef` (no inheritance).
+  // Mirrors LambdaMOO's `properties(obj)`. Sorted for stability.
+  ownPropertyNames(objRef: ObjRef): string[] {
+    return Array.from(this.object(objRef).propertyDefs.keys()).sort();
+  }
+
+  // LambdaMOO `add_property(obj, name, value, info)`. Defines a new
+  // property on `objRef`. info = { owner?, perms?, type_hint? }; owner
+  // defaults to `actor`. Permission: wizard, or actor owns the object
+  // and is creating a property owned by themselves (matches the
+  // existing definePropertyChecked rules).
+  async addPropertyForActor(actor: ObjRef, objRef: ObjRef, name: string, value: WooValue, info: WooValue): Promise<void> {
+    const map = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, WooValue> : null;
+    const owner = typeof map?.owner === "string" ? map.owner : actor;
+    const perms = typeof map?.perms === "string" ? map.perms : "rw";
+    const typeHint = typeof map?.type_hint === "string" ? map.type_hint : typeHintForValue(value);
+    await this.definePropertyChecked(actor, objRef, {
+      name,
+      defaultValue: value,
+      owner,
+      perms,
+      typeHint
+    });
+  }
+
+  // LambdaMOO `delete_property(obj, name)`. Removes a property
+  // definition from `objRef`. Permission: wizard, owner of the object,
+  // or owner of the property.
+  async deletePropertyForActor(actor: ObjRef, objRef: ObjRef, name: string): Promise<void> {
+    await this.undefinePropertyChecked(actor, objRef, name);
+  }
+
+  // LambdaMOO `set_property_info(obj, name, info)`. Updates owner /
+  // perms / type_hint on a property's definition (the class where it
+  // was defined). Permission rules per setPropertyInfoChecked.
+  async setPropertyInfoForActor(actor: ObjRef, objRef: ObjRef, name: string, info: WooValue): Promise<void> {
+    const map = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, WooValue> : null;
+    if (!map) throw wooError("E_INVARG", "set_property_info expects info map", info);
+    await this.setPropertyInfoChecked(actor, objRef, name, map);
+  }
+
+  // LambdaMOO `is_clear_property(obj, name)`. Returns true iff the
+  // property is currently inherited (no local value override) — i.e.,
+  // reads on `obj` would resolve to a parent's default value. Raises
+  // E_PROPNF if the property is not defined anywhere on the chain.
+  isClearProperty(objRef: ObjRef, name: string): boolean {
+    this.propertyInfo(objRef, name);
+    return !this.object(objRef).properties.has(name);
+  }
+
+  // LambdaMOO `clear_property(obj, name)`. Removes the local value
+  // override for `name` on `objRef`, so reads revert to the inherited
+  // default from the property's definition. Raises E_PROPNF if the
+  // property is not defined anywhere on the chain. Already-clear
+  // properties succeed as a no-op (idempotent). Permission: wizard,
+  // owner of the property, or "w" perm.
+  clearPropertyForActor(actor: ObjRef, objRef: ObjRef, name: string): void {
+    // propertyInfo raises E_PROPNF if the property isn't defined on the chain.
+    this.propertyInfo(objRef, name);
+    if (!this.canWriteProperty(actor, objRef, name)) {
+      throw wooError("E_PERM", `${actor} cannot clear ${objRef}.${name}`, { actor, obj: objRef, property: name });
+    }
+    const obj = this.object(objRef);
+    if (!obj.properties.has(name)) return;
+    obj.properties.delete(name);
+    obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
+    obj.modified = Date.now();
+    this.persistObject(objRef);
+    this.persist();
+  }
+
+  // Authoring inspection / search aggregations. Surface-check is done
+  // at the catalog layer; these helpers do not enforce builder /
+  // programmer authority. `includeSource` gates whether verb source
+  // is included in the result.
+  authoringInspectFor(actor: ObjRef, objRef: ObjRef, opts: WooValue, includeSource: boolean): WooValue {
+    return this.authoringInspect(actor, objRef, opts, { includeSourceAllowed: includeSource, requireProgrammer: false });
+  }
+
+  authoringSearchFor(actor: ObjRef, query: string, opts: WooValue, includeSource: boolean): WooValue {
+    return this.authoringSearch(actor, query, opts, { includeSourceAllowed: includeSource });
+  }
+
+  // Pure compile pass — no permissions, no mutation. Returns the same
+  // shape catalog dry-run paths use. Used by editor preview.
+  compileVerbForCheck(source: string): Record<string, WooValue> {
+    const compiled = compileVerb(source);
+    if (!compiled.ok || !compiled.bytecode) {
+      return {
+        ok: false,
+        diagnostics: compiled.diagnostics as unknown as WooValue,
+        metadata: (compiled.metadata ?? null) as WooValue
+      };
+    }
+    return {
+      ok: true,
+      diagnostics: [] as WooValue,
+      source_hash: compiled.source_hash ?? hashSource(source),
+      line_map: (compiled.line_map ?? {}) as WooValue,
+      metadata: (compiled.metadata ?? null) as WooValue
+    };
+  }
+
   schemas(objRef: ObjRef): WooValue[] {
     const names = new Set<string>();
     this.collectSchemaNames(objRef, names);

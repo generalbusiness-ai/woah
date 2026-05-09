@@ -41,14 +41,63 @@ convert values explicitly before joining.
 ### 19.4 Object
 
 `create(parent, owner_or_options?)`, `recycle(obj)`, `chparent(obj, new_parent)`,
-`has_flag(obj, name)`,
-`compile_verb(obj, name, source, options)`,
-`set_verb_code(obj, descriptor, source, expected_version, options)`,
-`set_verb_info(obj, descriptor, expected_version, info)`, `verb_info`, `verb_args`,
-`define_property(obj, name, default, perms, expected_version, type_hint)`,  
-`set_property_info(obj, name, expected_version, info)`,  
-`delete_property(obj, name, expected_version)`, `property_info`, `properties(obj)`, `verbs(obj)`,  
+`has_flag(obj, name)`, `parents(obj)`, `children(obj)`, `valid(obj)`,
+`compile_verb(source)`,
+`add_verb(obj, info)`, `delete_verb(obj, descriptor)`,
+`set_verb_code(obj, descriptor, source)`, `set_verb_info(obj, descriptor, info)`,
+`verb_info(obj, descriptor)`, `verb_code(obj, descriptor)`, `verbs(obj)`,
+`add_property(obj, name, value, info)`, `delete_property(obj, name)`,
+`set_property_info(obj, name, info)`, `clear_property(obj, name)`,
+`is_clear_property(obj, name)`, `property_info(obj, name)`, `properties(obj)`,
 `move(obj, new_location)`.
+
+#### 19.4.1 LambdaMOO alignment of authoring primitives
+
+The verb / property surface follows LambdaMOO shapes where possible, with
+deliberate woo extensions. The differences:
+
+- **`parents(obj)`** returns the full ancestor chain as a list (Stunt-style),
+  not just the immediate parent. Single inheritance, but the result is always
+  list-shaped so callers can walk uniformly.
+- **`verb_info(obj, descriptor)`** returns an *extended* map with
+  `{definer, slot, name, aliases, owner, perms, arg_spec, version,
+  direct_callable, tool_exposed, source_hash}`. LambdaMOO's
+  `{owner, perms, names}` is folded in (woo splits `name` + `aliases` rather
+  than encoding them as a single space-separated string), and
+  woo-specific verb fields (`arg_spec`, `direct_callable`, `tool_exposed`,
+  `version`, `source_hash`) appear alongside. There is no separate
+  `verb_args` / `verb_meta` primitive — woo combines info+args into one map.
+- **`add_verb(obj, info)`** and **`set_verb_info(obj, descriptor, info)`**
+  take a single `info` map covering both LambdaMOO's `info` (owner, perms,
+  names) and `args` (arg_spec). `name` in info is required for `add_verb`
+  and ignored for `set_verb_info` (the descriptor selects the verb).
+- **`verb_code(obj, descriptor)`** returns the source as a single string,
+  not a list of lines (LambdaMOO returns lines). woo stores source as a
+  single string at rest; callers split on `"\n"` if they need lines.
+- **`set_verb_code(obj, descriptor, source)`** takes a single source string
+  and returns a list of compile-error message strings (empty list on success),
+  matching LambdaMOO's contract.
+- **`property_info(obj, name)`** returns an *extended* map
+  `{name, owner, perms, defined_on, type_hint, version, has_value}`.
+  LambdaMOO's `{owner, perms}` is folded in; `defined_on` records which
+  class in the chain owns the propertyDef, `type_hint` carries woo's type
+  annotation, and `version` is the optimistic-locking counter.
+- **`add_property(obj, name, value, info)`** takes `info = {owner?, perms?,
+  type_hint?}`. The `type_hint` is woo-specific.
+- **The `d` perms bit** is repurposed in woo from LambdaMOO's "debug" bit
+  to a shorthand for `direct_callable: true`. See
+  [permissions.md §11.2](permissions.md#112-verb-perms). Passing `"rxd"`
+  in `perms` at install time normalizes to `perms: "rx", direct_callable:
+  true` in storage.
+
+The following LambdaMOO primitives are intentionally NOT exposed:
+
+- `players()`, `max_object()` — these enable enumeration of the world by
+  any caller. World-walks should require wizard authority.
+- `verb_args(obj, descriptor)`, `set_verb_args(obj, descriptor, args)` —
+  folded into `verb_info` / `set_verb_info`.
+- `disassemble(obj, descriptor)` — debug-only; woo's bytecode is not
+  human-readable in the same way.
 
 `is_a(obj, parent_obj)` is a host-transparent ancestry predicate for valid
 object references. If `obj` is owned by another host, the runtime asks that host

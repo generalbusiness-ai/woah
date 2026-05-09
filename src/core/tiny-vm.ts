@@ -123,7 +123,29 @@ export const BUILTIN_NAMES = [
   // indices, and persisted bytecode encodes builtins by index. Mid-list inserts
   // would shift every later index and misdispatch already-stored verbs.
   "str_split",
-  "programmer_eval"
+  "programmer_eval",
+  // Read-only authoring primitives. Mirror LambdaMOO's introspection surface
+  // so catalog code (e.g. $programmer) can walk classes and read verb metadata
+  // without going through a TS-side surface method.
+  "parents", "children", "valid", "verbs", "verb_info", "verb_code",
+  // Mutating verb primitives (LambdaMOO add_verb / delete_verb /
+  // set_verb_info / set_verb_code) plus a pure compile_verb for editor
+  // preview. Permission: wizard or programmer-owns-obj for mutations.
+  "add_verb", "delete_verb", "set_verb_info", "set_verb_code", "compile_verb",
+  // Property primitives (LambdaMOO properties / property_info /
+  // add_property / delete_property / set_property_info). Mutations
+  // gated by canBypassPerms / property-def-owner / "c" perm matching
+  // the existing definePropertyChecked / setPropertyInfoChecked.
+  "properties", "property_info", "add_property", "delete_property", "set_property_info",
+  // Inherited-override management (LambdaMOO clear_property /
+  // is_clear_property). `clear_property` removes a local override so
+  // the property reverts to the inherited default.
+  "clear_property", "is_clear_property",
+  // Authoring aggregations (substrate-level introspection over an
+  // object's verb/property surface and a bounded text search). The
+  // catalog $programmer / $builder verbs run their own surface check
+  // and then call these for the data.
+  "authoring_inspect", "authoring_search"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1126,6 +1148,93 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "editor_abort":
         if (builtinArgs.length !== 0) throw wooError("E_INVARG", "editor_abort expects no arguments");
         return await frame.ctx.world.editorAbort(frame.ctx, frame.ctx.thisObj);
+      case "parents": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "parents expects one object");
+        return frame.ctx.world.parents(assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "children": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "children expects one object");
+        return frame.ctx.world.childrenOf(assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "valid": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "valid expects one object");
+        return frame.ctx.world.valid(assertObj(builtinArgs[0]));
+      }
+      case "verbs": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "verbs expects one object");
+        return frame.ctx.world.ownVerbNames(assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "verb_info": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "verb_info expects object and verb descriptor");
+        return frame.ctx.world.verbInfoForActor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1]) as unknown as WooValue;
+      }
+      case "verb_code": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "verb_code expects object and verb descriptor");
+        return frame.ctx.world.verbCodeForActor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1]);
+      }
+      case "add_verb": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "add_verb expects object and info map");
+        return frame.ctx.world.addVerbForActor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1]) as unknown as WooValue;
+      }
+      case "delete_verb": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "delete_verb expects object and verb descriptor");
+        frame.ctx.world.deleteVerbForActor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1]);
+        return null;
+      }
+      case "set_verb_info": {
+        if (builtinArgs.length !== 3) throw wooError("E_INVARG", "set_verb_info expects object, descriptor, and info map");
+        return frame.ctx.world.setVerbInfoForActor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], builtinArgs[2]) as unknown as WooValue;
+      }
+      case "set_verb_code": {
+        if (builtinArgs.length !== 3) throw wooError("E_INVARG", "set_verb_code expects object, descriptor, and source string");
+        return frame.ctx.world.setVerbCodeForActor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], assertString(builtinArgs[2]));
+      }
+      case "compile_verb": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "compile_verb expects source string");
+        return frame.ctx.world.compileVerbForCheck(assertString(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "properties": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "properties expects one object");
+        return frame.ctx.world.ownPropertyNames(assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "property_info": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "property_info expects object and property name");
+        return frame.ctx.world.propertyInfo(assertObj(builtinArgs[0]), assertString(builtinArgs[1])) as unknown as WooValue;
+      }
+      case "add_property": {
+        if (builtinArgs.length !== 4) throw wooError("E_INVARG", "add_property expects object, name, value, and info map");
+        await frame.ctx.world.addPropertyForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]), builtinArgs[2], builtinArgs[3]);
+        return null;
+      }
+      case "delete_property": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "delete_property expects object and property name");
+        await frame.ctx.world.deletePropertyForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]));
+        return null;
+      }
+      case "set_property_info": {
+        if (builtinArgs.length !== 3) throw wooError("E_INVARG", "set_property_info expects object, name, and info map");
+        await frame.ctx.world.setPropertyInfoForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]), builtinArgs[2]);
+        return null;
+      }
+      case "clear_property": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "clear_property expects object and property name");
+        frame.ctx.world.clearPropertyForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]));
+        return null;
+      }
+      case "is_clear_property": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "is_clear_property expects object and property name");
+        return frame.ctx.world.isClearProperty(assertObj(builtinArgs[0]), assertString(builtinArgs[1]));
+      }
+      case "authoring_inspect": {
+        if (builtinArgs.length !== 3) throw wooError("E_INVARG", "authoring_inspect expects object, opts, and include_source flag");
+        const includeSource = builtinArgs[2] === true;
+        return frame.ctx.world.authoringInspectFor(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, includeSource) as unknown as WooValue;
+      }
+      case "authoring_search": {
+        if (builtinArgs.length !== 3) throw wooError("E_INVARG", "authoring_search expects query, opts, and include_source flag");
+        const includeSource = builtinArgs[2] === true;
+        return frame.ctx.world.authoringSearchFor(frame.ctx.actor, assertString(builtinArgs[0]), builtinArgs[1] ?? null, includeSource) as unknown as WooValue;
+      }
       default:
         throw wooError("E_INVARG", `unknown builtin: ${name}`);
     }

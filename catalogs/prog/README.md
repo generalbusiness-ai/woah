@@ -1,6 +1,6 @@
 ---
 name: prog
-version: 0.2.0
+version: 0.2.2
 spec_version: v1
 license: MIT
 description: Builder and programmer tooling for in-world authoring.
