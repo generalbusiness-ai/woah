@@ -727,6 +727,149 @@ describe("$perm_utils:apply (LambdaCore #42 port)", () => {
   });
 });
 
+describe("review-cycle 2 conformance fixes", () => {
+  it("parse_propref returns false for an unknown $xxx corename", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "ppref-bogus",
+      "$wiz",
+      "$code_utils",
+      "parse_propref",
+      ["$bogus.foo"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toBe(false);
+  });
+
+  it("parse_verbref returns false for an unknown $xxx corename", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "pvref-bogus",
+      "$wiz",
+      "$code_utils",
+      "parse_verbref",
+      ["$bogus:verb"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toBe(false);
+  });
+
+  it("parse_propref still resolves a valid $xxx corename", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "ppref-ok",
+      "$wiz",
+      "$code_utils",
+      "parse_propref",
+      ["$thing.name"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toEqual(["$thing", "name"]);
+  });
+
+  it("to_value rejects an empty string with [false, 'empty value']", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "tov-empty",
+      "$wiz",
+      "$string_utils",
+      "to_value",
+      [""]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toEqual([false, "empty value"]);
+  });
+
+  it("to_value still accepts bare unquoted text as a string (Woo extension)", async () => {
+    // Bare text is a documented Woo extension over LambdaCore — the
+    // chat-driven authoring flow lets `@property obj.tag hello` store
+    // "hello" rather than erroring. The divergence is captured in the
+    // verb's source comment.
+    const world = createWorld();
+    const result = await world.directCall(
+      "tov-bare",
+      "$wiz",
+      "$string_utils",
+      "to_value",
+      ["hello"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toEqual([true, "hello"]);
+  });
+
+  it("toint accepts a leading + sign", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "toint-plus",
+      "$wiz",
+      "$code_utils",
+      "toint",
+      ["+5"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toBe(5);
+  });
+
+  it("$string_utils:names_of is no longer direct-callable", async () => {
+    // Removing direct_callable narrows the surface: the verb is
+    // reachable through ordinary verb dispatch (caller_perms applies
+    // when reading `item.name`), but a direct MCP/REST call now fails.
+    const world = createWorld();
+    const result = await world.directCall(
+      "names-direct",
+      "$wiz",
+      "$string_utils",
+      "names_of",
+      [["$thing"]]
+    );
+    expect(result.op).toBe("error");
+    if (result.op !== "error") return;
+    // Substrate raises E_DIRECT_DENIED when a non-direct-callable verb
+    // is reached via directCall — even for wizards. The verb is still
+    // reachable through verb dispatch from another verb.
+    expect(result.error.code).toBe("E_DIRECT_DENIED");
+  });
+
+  it("object_match_failed says '<id> does not exist' for a #-prefixed failed match", async () => {
+    // LambdaCore L4-5: a `#`-prefixed input that doesn't resolve gets
+    // a more specific error than the generic "I see no … here." line.
+    const world = createWorld();
+    const result = await world.directCall(
+      "omf-hash",
+      "$wiz",
+      "$command_utils",
+      "object_match_failed",
+      ["$failed_match", "#obj_missing"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toBe(true);
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe("#obj_missing does not exist.");
+  });
+
+  it("object_match_failed still uses the standard wording for a non-# failed match", async () => {
+    const world = createWorld();
+    const result = await world.directCall(
+      "omf-name",
+      "$wiz",
+      "$command_utils",
+      "object_match_failed",
+      ["$failed_match", "ghost"]
+    );
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    const text = findTextObservation(result.observations, "$wiz");
+    expect(text).toBe('I see no "ghost" here.');
+  });
+});
+
 describe("$code_utils helpers (LambdaCore #153)", () => {
   it("parse_verbref splits obj:verb correctly", async () => {
     const world = createWorld();

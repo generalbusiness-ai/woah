@@ -236,6 +236,9 @@ describe("$programmer:@properties (LambdaCore #217 port)", () => {
 });
 
 describe("$string_utils:names_of", () => {
+  // names_of is no longer direct_callable (review-cycle 2). Tests use
+  // forceDirect to reach it directly under wizard authority; ordinary
+  // verb dispatch from another verb is the supported call path.
   it("renders objects as 'name(#id)' triple-spaced", async () => {
     const world = createWorld();
     world.createObject({ id: "obj_alpha", name: "alpha", parent: "$thing", owner: "$wiz" });
@@ -247,7 +250,8 @@ describe("$string_utils:names_of", () => {
       "$wiz",
       "$string_utils",
       "names_of",
-      [["obj_alpha", "obj_beta"]]
+      [["obj_alpha", "obj_beta"]],
+      { forceDirect: true, forceReason: "test harness reaches a non-direct-callable helper" }
     );
     expect(result.op).toBe("result");
     if (result.op !== "result") return;
@@ -263,7 +267,8 @@ describe("$string_utils:names_of", () => {
       "$wiz",
       "$string_utils",
       "names_of",
-      [["obj_alpha2", "not_a_real_obj", "$wiz"]]
+      [["obj_alpha2", "not_a_real_obj", "$wiz"]],
+      { forceDirect: true, forceReason: "test harness reaches a non-direct-callable helper" }
     );
     expect(result.op).toBe("result");
     if (result.op !== "result") return;
