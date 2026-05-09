@@ -389,8 +389,15 @@ export class WooWorld {
   // newly-enqueued task can log who it's blocked behind. `hostTaskQueueDepth`
   // is the count of tasks waiting for the current to settle.
   private hostTaskCounter = 0;
-  private currentHostTask: { id: number; label: string; startedAt: number } | null = null;
+  private currentHostTask: { id: number; label: string; startedAt: number; chainId: string } | null = null;
   private hostTaskQueueDepth = 0;
+  // Counter feeding chain ids for tasks that originate on this host.
+  // Combined with `chainOriginPrefix` to make chain ids globally unique
+  // even across processes (so a chain id surfaced in headers is never
+  // ambiguous with a same-numbered chain on a different host). Re-entrant
+  // dispatch keys off chain id equality (see `hostDispatch`).
+  private chainCounter = 0;
+  private chainOriginPrefix: string | null = null;
   private metricsHook: ((event: MetricEvent) => void) | null = null;
   // O(1) presence lookup. `session_subscribers` is authoritative for live
   // sessions; `subscribers` remains a compatibility actor projection for
@@ -446,6 +453,23 @@ export class WooWorld {
 
   setHostBridge(bridge: HostBridge | null): void {
     this.hostBridge = bridge;
+  }
+
+  /** Identify chain ids originating on this host. The PO DO sets this to
+   * the host key during construction; standalone (memory/sqlite) worlds
+   * fall back to "host" — those modes never share chains across hosts so
+   * collision is impossible there. */
+  setChainOriginPrefix(prefix: string): void {
+    this.chainOriginPrefix = prefix;
+  }
+
+  /** Chain id of the host task currently executing inside the host queue
+   * (or null when the queue is idle). Outbound cross-host RPC code reads
+   * this to stamp `x-woo-task-chain`; inbound RPC handlers compare it to
+   * the incoming chain id to detect re-entrancy (`hostDispatch` runs
+   * inline when the chain ids match). */
+  currentTaskChainId(): string | null {
+    return this.currentHostTask?.chainId ?? null;
   }
 
   // Install a metrics sink. Hosts pipe MetricEvent records to a structured log
@@ -2192,8 +2216,14 @@ export class WooWorld {
     return frame;
   }
 
-  private async enqueueHostTask<T>(fn: () => Promise<T>, label: string = "task"): Promise<T> {
+  private async enqueueHostTask<T>(fn: () => Promise<T>, label: string = "task", chainId?: string): Promise<T> {
     const id = ++this.hostTaskCounter;
+    // Inherit chain id from the inbound RPC when one was provided, else
+    // mint a fresh one for this task. Once running, the task's outbound
+    // cross-host RPCs propagate this id so callbacks from downstream
+    // hosts can be detected and run inline (re-entrant dispatch — see
+    // `hostDispatch`).
+    const taskChainId = chainId ?? this.mintChainId();
     this.hostTaskQueueDepth += 1;
     const queueDepth = this.hostTaskQueueDepth;
     this.recordMetric({ kind: "host_task_enqueue", id, label, queue_depth: queueDepth });
@@ -2216,7 +2246,7 @@ export class WooWorld {
     const enqueuedAt = Date.now();
     const run = this.hostQueue.then(async () => {
       const startedAt = Date.now();
-      this.currentHostTask = { id, label, startedAt };
+      this.currentHostTask = { id, label, startedAt, chainId: taskChainId };
       this.hostTaskQueueDepth -= 1;
       this.recordMetric({ kind: "host_task_start", id, label, queued_ms: startedAt - enqueuedAt });
       // 3-second watchdog. Wedged tasks stay in this loop indefinitely until
@@ -2252,7 +2282,7 @@ export class WooWorld {
       // don't poison subsequent tasks. The old code had the same shape via
       // `then(fn, fn)`; this just keeps the diagnostic wrapping consistent.
       const startedAt = Date.now();
-      this.currentHostTask = { id, label, startedAt };
+      this.currentHostTask = { id, label, startedAt, chainId: taskChainId };
       this.hostTaskQueueDepth -= 1;
       this.recordMetric({ kind: "host_task_start", id, label, queued_ms: startedAt - enqueuedAt });
       try {
@@ -2676,8 +2706,29 @@ export class WooWorld {
     }
   }
 
-  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null): Promise<WooValue> {
-    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt), `dispatch:${target}:${verbName}`);
+  async hostDispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, chainId?: string): Promise<WooValue> {
+    // Re-entrancy: if the inbound caller is part of the chain we are
+    // already running on this host, run inline (bypass the queue).
+    // Without this, A → B → A (a verb that dispatches to a remote which
+    // calls back to us) would self-deadlock: the callback from B queues
+    // behind the original A task, but A is awaiting B's response. This
+    // mirrors normal nested verb-dispatch semantics — the callback is
+    // logically part of the originating verb, not a new behavior.
+    if (chainId && this.currentHostTask?.chainId === chainId) {
+      return await this.dispatch(ctx, target, verbName, args, startAt);
+    }
+    return await this.enqueueHostTask(() => this.dispatch(ctx, target, verbName, args, startAt), `dispatch:${target}:${verbName}`, chainId);
+  }
+
+  private mintChainId(): string {
+    // Prefix identifies the origin host (useful in tail logs); the
+    // random suffix prevents a downstream host from spoofing a chain id
+    // it didn't receive. The receiver only runs inline when the
+    // incoming chain id matches its own currentHostTask — a guessable
+    // counter would be a small but real window for cross-task
+    // interleaving, so we use a 64-bit hex random instead.
+    this.chainCounter += 1;
+    return `${this.chainOriginPrefix ?? "host"}:${this.chainCounter}:${randomHex(8)}`;
   }
 
   async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {

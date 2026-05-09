@@ -147,6 +147,28 @@ Examples:
 - OK: behavior schedules a later message (`FORK`, alarm, or sequenced message)
   and returns. The later turn is a new request, not a reentrant wait.
 
+#### 3.5.2.1 Re-entrant chain dispatch
+
+A `dispatch`-route RPC that returns to a host already running the chain (the
+`A → B → A` shape: e.g. the_deck:look_at($wiz) on the_deck dispatches
+look_self on $wiz hosted on world; world's look_self walks $wiz.contents and
+dispatches :title on an item hosted back on the_deck) does not deadlock.
+Outbound RPCs stamp the originating task's chain id; when an inbound
+`dispatch` arrives whose chain id matches the receiver's currently-running
+task, the receiver runs the verb inline against the existing activation
+rather than enqueueing a new task behind itself. This is the cross-host
+equivalent of "extend the current activation stack" (§3.5.2 first bullet).
+
+Constraints:
+
+- Applies to `dispatch` route class. `owner_mutation` keeps the acyclic rule
+  (§3.5.5) — re-entrancy must not let two authoritative writes interleave on
+  the same owner.
+- Recursive depth is bounded by `MAX_CALL_DEPTH`; an infinite mutual-callback
+  loop bottoms out at `E_CALL_DEPTH`, not at the cross-host RPC timeout.
+- The chain id is an opaque transport hint, not part of woocode-visible
+  state; the structured `host_chain` cycle reasoning (§3.5.6) is unchanged.
+
 #### 3.5.3 Route classes
 
 Host RPC routes must be classified so implementers know which routes can be

@@ -250,6 +250,99 @@ describe("woo core", () => {
     expect(remote.getProp("remote_box", "value")).toBe("changed");
   });
 
+  it("re-entrant cross-host dispatch (A→B→A) does not deadlock the host queue", async () => {
+    // Production deadlock: the_deck:look_at($wiz) dispatches look_self
+    // on $wiz (gateway-hosted). The gateway's $wiz:look_self walks
+    // $wiz.contents and dispatches :title on each item. One item is
+    // hosted on the_deck — so the gateway calls back to the_deck for
+    // the title. The_deck's queue is busy with look_at; the title
+    // dispatch queues behind it. Look_at can't progress (waiting on
+    // gateway's response); gateway can't progress (waiting on
+    // the_deck's title response). 30s E_TIMEOUT in prod tail.
+    //
+    // Fix: outbound RPC stamps the active task's chain id; the
+    // receiver's hostDispatch runs the call inline (bypassing the
+    // queue) when the inbound chain id matches its own currentTask.
+    // The fail mode without the fix is a hang — vitest's timeout
+    // turns that into a clear test failure.
+    const { world: home, actor } = authedWorld();
+    const remote = createWorld({ catalogs: false });
+    const worlds = new Map<string, WooWorld>([["home", home], ["remote", remote]]);
+    const routes = new Map<ObjRef, string>([
+      ["remote_obj", "remote"],
+      // home_obj must be routable from remote so the callback dispatch
+      // resolves; without this entry remote.dispatch falls through to
+      // its local table and trips E_OBJNF.
+      ["home_obj", "home"]
+    ]);
+    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setChainOriginPrefix("home");
+    remote.setChainOriginPrefix("remote");
+
+    home.createObject({ id: "home_obj", name: "Home", parent: "$thing", owner: actor });
+    remote.createObject({ id: "remote_obj", name: "Remote", parent: "$thing", owner: "$wiz" });
+
+    // home_obj:home_inner — the callback target. Returns a string.
+    home.addVerb("home_obj", {
+      ...bytecodeVerb(
+        "home_inner",
+        {
+          literals: ["callback-ran"],
+          num_locals: 0,
+          max_stack: 1,
+          version: 1,
+          ops: [["PUSH_LIT", 0], ["RETURN"]]
+        },
+        actor
+      ),
+      direct_callable: true
+    });
+
+    // remote_obj:remote_inner — calls back to home_obj:home_inner
+    // (this is the leg that would self-deadlock against the home queue).
+    remote.addVerb("remote_obj", {
+      ...bytecodeVerb(
+        "remote_inner",
+        {
+          literals: ["home_obj", "home_inner"],
+          num_locals: 0,
+          max_stack: 2,
+          version: 1,
+          ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["CALL_VERB", 0], ["RETURN"]]
+        },
+        "$wiz"
+      )
+    });
+
+    // home_obj:home_outer — the queued entry. Dispatches remote_inner.
+    home.addVerb("home_obj", {
+      ...bytecodeVerb(
+        "home_outer",
+        {
+          literals: ["remote_obj", "remote_inner"],
+          num_locals: 0,
+          max_stack: 2,
+          version: 1,
+          ops: [["PUSH_LIT", 0], ["PUSH_LIT", 1], ["CALL_VERB", 0], ["RETURN"]]
+        },
+        actor
+      ),
+      direct_callable: true
+    });
+
+    // Tight timeout: a hang here means re-entrancy isn't taking
+    // effect. With the fix, this completes in milliseconds.
+    const result = await Promise.race<unknown>([
+      home.directCall(undefined, actor, "home_obj", "home_outer", []),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("re-entrant deadlock")), 4000))
+    ]) as Awaited<ReturnType<typeof home.directCall>>;
+    if (result.op !== "result") {
+      throw new Error(`expected result, got ${result.op}: ${JSON.stringify((result as { error?: unknown }).error)}`);
+    }
+    expect(result.result).toBe("callback-ran");
+  });
+
   it("memoizes repeated remote reads within one host operation", async () => {
     const { world: home, actor } = authedWorld();
     const remote = createWorld({ catalogs: false });

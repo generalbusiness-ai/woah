@@ -1569,6 +1569,7 @@ export class PersistentObjectDO {
     };
     world.setHostBridge(bridge);
     world.setMetricsHook((event) => this.emitMetric(event, localHost));
+    world.setChainOriginPrefix(localHost);
   }
 
   // Sample high-rate metric kinds so a noisy gateway doesn't blow up the log
@@ -2034,6 +2035,16 @@ export class PersistentObjectDO {
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-dispatch") {
+        // Re-entrancy: if this inbound call is part of the chain we are
+        // currently awaiting on the queue (typical for A→B→A dispatch
+        // shapes), forward the chain id to hostDispatch. It runs inline
+        // when the id matches currentTaskChainId, bypassing the
+        // serial host queue. Without this the inbound queues behind
+        // the A task that is still awaiting B's response → 30s
+        // E_TIMEOUT, plus everything else queued behind A blocks too
+        // (observed in prod tail as host_task_blocked storms during a
+        // single look_at).
+        const inboundChainId = request.headers.get("x-woo-task-chain") ?? undefined;
         const rawCtx = body.ctx && typeof body.ctx === "object" && !Array.isArray(body.ctx)
           ? body.ctx as Record<string, unknown>
           : {};
@@ -2086,7 +2097,7 @@ export class PersistentObjectDO {
           },
           deferHostEffect: (effect) => deferredHostEffects.push(effect)
         };
-        const result = await world.hostDispatch(ctx, target, verb, args, startAt);
+        const result = await world.hostDispatch(ctx, target, verb, args, startAt, inboundChainId);
         // Compute audience here using this DO's authoritative subscribers; the
         // gateway's local view of a self-hosted space is stale and would
         // mis-filter the WS/MCP fan-out. Returned to the caller so the
@@ -2655,12 +2666,23 @@ export class PersistentObjectDO {
 
   private async forwardInternalRaw<T>(host: string, path: string, bodyStr: string, options: { timeoutMs?: number }): Promise<T> {
     const id = this.env.WOO.idFromName(host);
+    // Stamp the active task chain id on every outbound RPC. The receiver
+    // uses it to detect re-entrancy: if a callback arrives while the
+    // caller is still awaiting (typical for A→B→A dispatch chains),
+    // matching ids let the callback run inline instead of queueing
+    // behind the caller's stuck task. Reads from the world's
+    // currentHostTask, set by enqueueHostTask. Null when no task is
+    // active (cold-load directory chatter, postflight probes, etc.) —
+    // treated as a fresh chain at the receiver.
+    const chainId = this.world?.currentTaskChainId() ?? null;
+    const baseHeaders: Record<string, string> = {
+      "content-type": "application/json; charset=utf-8",
+      "x-woo-host-key": host
+    };
+    if (chainId !== null) baseHeaders["x-woo-task-chain"] = chainId;
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "x-woo-host-key": host
-      },
+      headers: baseHeaders,
       body: bodyStr
     }));
     const startedAt = Date.now();
