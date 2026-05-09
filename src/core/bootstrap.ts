@@ -471,6 +471,24 @@ function arraysShallowEqualStrings(a: readonly string[], b: readonly string[]): 
   return true;
 }
 
+/** Compare two propertyDef rows on the authoritative fields only.
+ * Excludes `version`, which is a per-host bump counter that accumulates on
+ * every defineProperty() call (idempotent or not) and drifts independently
+ * across hosts even when the catalog state is identical. Including it made
+ * the seed merge non-idempotent on production satellites whose stored defs
+ * had bumped past the gateway's authoritative version. */
+function propertyDefEqualIgnoringVersion(
+  a: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue },
+  b: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue }
+): boolean {
+  if (a.name !== b.name) return false;
+  if (a.owner !== b.owner) return false;
+  if (a.perms !== b.perms) return false;
+  if ((a.typeHint ?? null) !== (b.typeHint ?? null)) return false;
+  if (!valuesEqual(a.defaultValue, b.defaultValue)) return false;
+  return true;
+}
+
 /**
  * Merge a single foreign-hosted subject's declarative state from seed
  * into stored. Per spec/protocol/host-seeds.md §HS2.2.
@@ -519,12 +537,20 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
   }
 
   // propertyDefs: merge seed entries, then delete stored-only entries.
+  // Compare excluding `version` — that field bumps on every defineProperty()
+  // call and accumulates locally on satellites (catalog repair, schema
+  // sync) without changing what's authoritative (name/owner/perms/typeHint/
+  // defaultValue). Including version made the merge non-idempotent: stored
+  // versions kept growing past the gateway's, every cold-load triggered a
+  // replace, the replace took seed's lower version, and the next satellite
+  // write bumped it again. Spec HS2.2 calls for declarative-state merge
+  // here, not bookkeeping reconciliation.
   const seedDefs = new Map(seed.propertyDefs.map((def) => [def.name, def]));
   const currentDefs = new Map(current.propertyDefs.map((def) => [def.name, def]));
   let defsChanged = false;
   for (const [name, def] of seedDefs) {
     const cur = currentDefs.get(name);
-    if (!cur || !valuesEqual(cur as unknown as WooValue, def as unknown as WooValue)) {
+    if (!cur || !propertyDefEqualIgnoringVersion(cur, def)) {
       currentDefs.set(name, def);
       defsChanged = true;
     }

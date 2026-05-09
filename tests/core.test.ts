@@ -998,6 +998,35 @@ describe("woo core", () => {
     expect(readAfter?.arg_spec).toEqual(expect.objectContaining({ command: expect.objectContaining({ dobj: "this" }) }));
   });
 
+  it("HS2.2: propertyDef.version drift alone does NOT drive a merge change", () => {
+    // Catalog repair / schema sync calls defineProperty(); each call bumps
+    // PropertyDef.version even when the def is otherwise unchanged. On a
+    // satellite running cold-load lifecycle, this counter accumulates
+    // independently of the gateway's. Production satellites had stored
+    // versions like $help.description=131 against gateway=30. Including
+    // version in the merge's def comparison made the merge non-idempotent
+    // (replace → next setProp bump → replace again on next cold-load) and
+    // burned a full satellite snapshot every wake. The merge must compare
+    // authoritative def fields only.
+    const gateway = createWorld();
+    const satellite = createWorld();
+    const storedSlice = nonEmptyHostScopedWorld(satellite.exportWorld(), "the_pinboard");
+    expect(storedSlice).not.toBeNull();
+
+    // $root.description is a seeded propertyDef carried into every host
+    // slice via lineage. Bump its version on stored to simulate accumulated
+    // satellite-side drift; gateway's version stays at the seed default.
+    const rootStored = storedSlice!.objects.find((o) => o.id === "$root");
+    expect(rootStored).toBeDefined();
+    const descIdx = rootStored!.propertyDefs.findIndex((d) => d.name === "description");
+    expect(descIdx).toBeGreaterThanOrEqual(0);
+    rootStored!.propertyDefs[descIdx] = { ...rootStored!.propertyDefs[descIdx], version: 131 };
+
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
   it("HS5: buildHostSeedForDelivery cache invalidates when the world is replaced via importWorld", () => {
     const gateway = createWorld();
     const before = gateway.buildHostSeedForDelivery("the_chatroom");

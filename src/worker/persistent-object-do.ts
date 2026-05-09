@@ -630,15 +630,32 @@ export class PersistentObjectDO {
     if (!stored) {
       await this.guardColdLoadAgainstInheritedTombstone(hostKey);
     }
-    let scoped: SerializedWorld | null = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
-    if (stored && !scoped) {
-      console.warn("woo.cluster_seed_fallback", {
-        host: hostKey,
-        reason: "stored_world_missing_host_slice",
-        stored_objects: stored.objects.length,
-        stored_logs: stored.logs.length,
-        stored_tasks: stored.parkedTasks.length
-      });
+    // Trust the on-disk slice when it carries the post-migration host
+    // marker (the host's own object has host_placement="self"). Re-scoping
+    // via nonEmptyHostScopedWorld imports-then-re-exports through the
+    // satellite's local hostScope(), which reaches catalog-supplied class
+    // objects via addCatalogSupportFor — and that helper depends on
+    // installed_catalogs, a per-host dynamic property the gateway never
+    // propagates. Result: the gateway's seed contains class objects (e.g.
+    // $cockatoo, $horoscope_note) that the satellite can't reach in its
+    // own scope walk, so every cold-load merge re-added them and the next
+    // load dropped them again. We only re-scope when stored predates the
+    // 2026-04-30 catalog-placement migration (no host_placement marker on
+    // any object in the slice) — that's the original recovery path.
+    let scoped: SerializedWorld | null;
+    if (stored && storedSliceIsHostScoped(stored, hostKey)) {
+      scoped = stored;
+    } else {
+      scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
+      if (stored && !scoped) {
+        console.warn("woo.cluster_seed_fallback", {
+          host: hostKey,
+          reason: "stored_world_missing_host_slice",
+          stored_objects: stored.objects.length,
+          stored_logs: stored.logs.length,
+          stored_tasks: stored.parkedTasks.length
+        });
+      }
     }
     let freshSeed: SeedWorld | null = null;
     try {
@@ -714,13 +731,22 @@ export class PersistentObjectDO {
     storedWorld: SerializedWorld,
     seedWorld: SerializedWorld
   ): void {
+    // Mirror the merge's DYNAMIC_HOST_SEED_PROPERTIES so the diagnostic
+    // reports the same set of property names the merge ignores. Any name
+    // here is receiver-authoritative on a satellite's local copy of a
+    // foreign-hosted object — drift on these is by design.
     const DYNAMIC = new Set([
       "next_seq", "subscribers", "operators", "last_snapshot_seq", "focus_list",
       "bootstrap_token_used", "wizard_actions", "applied_migrations",
-      "catalog_migration_records", "installed_catalogs"
+      "catalog_migration_records", "installed_catalogs",
+      "_subscribers_scrubbed_v1"
     ]);
     const stored = new Map(storedWorld.objects.map((o) => [o.id, o]));
-    const fields = ["modified", "verbs", "propertyDefs", "propertyVersions", "properties", "flags", "children", "contents", "eventSchemas", "name", "parent", "owner", "anchor"] as const;
+    // Only fields the merge actually compares (HS2.2). children/contents
+    // are derived from parent/location pointers; modified is a local clock;
+    // they don't drive changed=true and were creating diagnostic noise that
+    // pushed real drivers past the MAX cap.
+    const fields = ["verbs", "propertyDefs", "propertyVersions", "properties", "flags", "eventSchemas", "name", "parent", "owner", "anchor"] as const;
     const diffs: Array<{ id: string; field: string; detail?: string }> = [];
     const MAX = 12;
     for (const seedObj of seedWorld.objects) {
@@ -742,6 +768,23 @@ export class PersistentObjectDO {
           for (const n of names) {
             if (DYNAMIC.has(n)) continue;
             if (JSON.stringify(aMap.get(n)) === JSON.stringify(bMap.get(n))) continue;
+            // HS2.2 version gate: skip propertyVersions where stored ≥ seed,
+            // and skip the matching `properties` entry too (the merge
+            // wouldn't take seed's value either). These are local drift the
+            // merge is content to leave alone — logging them just buried
+            // the real driver.
+            if (f === "propertyVersions") {
+              const sv = Number(aMap.get(n) ?? 0);
+              const dv = Number(bMap.get(n) ?? 0);
+              if (sv >= dv && aMap.has(n)) continue;
+            }
+            if (f === "properties") {
+              const sv = Number((cur as unknown as { propertyVersions: Array<[string, number]> }).propertyVersions
+                .find(([k]) => k === n)?.[1] ?? 0);
+              const dv = Number((seedObj as unknown as { propertyVersions: Array<[string, number]> }).propertyVersions
+                .find(([k]) => k === n)?.[1] ?? 0);
+              if (sv >= dv && aMap.has(n)) continue;
+            }
             diffs.push({
               id: seedObj.id,
               field: `${f}.${n}`,
@@ -754,6 +797,26 @@ export class PersistentObjectDO {
           }
           if (!recorded && JSON.stringify(a) !== JSON.stringify(b) && diffs.length < MAX) {
             diffs.push({ id: seedObj.id, field: `${f} (only DYNAMIC props differ)` });
+          }
+        } else if (f === "propertyDefs") {
+          // Authoritative def fields only — match the merge's
+          // propertyDefEqualIgnoringVersion semantics so cosmetic version
+          // drift doesn't appear as a diff.
+          const aDefs = new Map(((a as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown }>) ?? []).map((d) => [d.name, d]));
+          const bDefs = new Map(((b as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown }>) ?? []).map((d) => [d.name, d]));
+          const names = new Set<string>([...aDefs.keys(), ...bDefs.keys()]);
+          let recorded = false;
+          for (const n of names) {
+            const ad = aDefs.get(n);
+            const bd = bDefs.get(n);
+            if (ad && bd && ad.owner === bd.owner && ad.perms === bd.perms && (ad.typeHint ?? null) === (bd.typeHint ?? null) && JSON.stringify(ad.defaultValue) === JSON.stringify(bd.defaultValue)) continue;
+            if (!ad && !bd) continue;
+            diffs.push({ id: seedObj.id, field: `propertyDefs.${n}`, detail: ad && bd ? "shape changed" : ad ? "stored only" : "seed only" });
+            recorded = true;
+            if (diffs.length >= MAX) break;
+          }
+          if (!recorded && diffs.length < MAX) {
+            diffs.push({ id: seedObj.id, field: `propertyDefs (only version differs — ignored by merge)` });
           }
         } else {
           diffs.push({ id: seedObj.id, field: f });
@@ -2763,6 +2826,23 @@ function isSerializedWorld(value: unknown): value is SerializedWorld {
  * spec/protocol/host-seeds.md §HS1. Missing entries would be treated
  * as foreign-hosted by the merge and could overwrite receiver-
  * authoritative state, so coverage is enforced at the boundary. */
+/** A satellite's on-disk slice is "host-scoped" once it carries the
+ * 2026-04-30 catalog-placement marker — i.e. the host's own object has a
+ * host_placement="self" property recorded. Pre-migration stored worlds
+ * lack it; those need the recovery re-scope path. The gateway slice
+ * (hostKey === WORLD_HOST) is always treated as host-scoped: its
+ * authoritative full universe is the source of every host's seed and
+ * never needs trimming. */
+function storedSliceIsHostScoped(stored: SerializedWorld, hostKey: ObjRef): boolean {
+  if (hostKey === WORLD_HOST) return true;
+  const hostObj = stored.objects.find((obj) => obj.id === hostKey);
+  if (!hostObj) return false;
+  for (const [name, value] of hostObj.properties) {
+    if (name === "host_placement" && value === "self") return true;
+  }
+  return false;
+}
+
 function isSeedWorld(value: unknown): value is SeedWorld {
   if (!isSerializedWorld(value)) return false;
   const candidate = value as Partial<Record<"objectHosts", unknown>>;
