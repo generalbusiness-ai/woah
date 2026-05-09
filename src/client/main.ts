@@ -2194,6 +2194,15 @@ function render() {
   }
   const focus = captureRenderFocus();
   const app = document.querySelector<HTMLDivElement>("#app")!;
+  // Detach the tasks kanban element before we replace #app.innerHTML so it
+  // survives the rerender. The kanban carries lots of ephemeral UI state
+  // (adminOpen, adminEditing, createOpen, openDetail, draft inputs, focus)
+  // that has no other home — without this, every applied-frame trigger
+  // closes the admin panel, drops a half-typed task, etc.
+  const preservedTasksKanban = state.tab === "tasks"
+    ? app.querySelector<HTMLElement>("[data-tasks-board]")
+    : null;
+  if (preservedTasksKanban) preservedTasksKanban.remove();
   app.innerHTML = `
     <div class="shell ${state.observationsCollapsed ? "observations-collapsed" : ""}">
       <aside class="nav">
@@ -2219,6 +2228,10 @@ function render() {
     </div>
   `;
 
+  if (preservedTasksKanban) {
+    const placeholder = app.querySelector<HTMLElement>("[data-tasks-board]");
+    if (placeholder) placeholder.replaceWith(preservedTasksKanban);
+  }
   bindCommon();
   if (state.tab === "chat") mountChatComponent();
   if (state.tab === "dubspace") bindDubspace();
