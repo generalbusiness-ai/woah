@@ -3746,6 +3746,61 @@ describe("local catalogs", () => {
       expect(entry?.title).not.toContain("abcdefghij");
     });
 
+    it("local-catalog boot applies the bundled v0→v1 weather migration to an existing v0 install", () => {
+      const world = createWorld({ catalogs: false });
+
+      // Synthetic v0 install: same catalog name but the older surface
+      // (forecast_hours property + set_forecast_hours verb). After
+      // installLocalCatalogs runs, the v1 schema is in place AND the
+      // dead surface is gone — without running the catalog-version
+      // migration, the schema-sync alone leaves the stale verbs/props
+      // behind.
+      const v0: RuntimeCatalogManifest = {
+        name: "weather",
+        version: "0.2.0",
+        spec_version: "v1",
+        classes: [
+          {
+            local_name: "$weather_block",
+            parent: "$thing",
+            properties: [
+              { name: "place", type: "str", default: "" },
+              { name: "current", type: "map", default: {} },
+              { name: "forecast", type: "map", default: {} },
+              { name: "history", type: "map", default: {} },
+              { name: "forecast_hours", type: "int", default: 12 }
+            ],
+            verbs: [
+              {
+                name: "set_forecast_hours",
+                perms: "rx",
+                arg_spec: { args: ["hours"] },
+                source: "verb :set_forecast_hours(hours) rx { return hours; }"
+              }
+            ]
+          }
+        ]
+      };
+      installCatalogManifest(world, v0, { tap: "@local", alias: "weather" });
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeDefined();
+
+      installLocalCatalogs(world, ["weather"]);
+
+      // Stale verb and props are gone…
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
+      expect(world.object("$weather_block").propertyDefs.has("forecast")).toBe(false);
+      expect(world.object("$weather_block").propertyDefs.has("history")).toBe(false);
+      expect(world.object("$weather_block").propertyDefs.has("forecast_hours")).toBe(false);
+      // …and the registry version reflects v1.
+      const installed = world.propOrNull("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
+      const weather = installed.find((r) => r.alias === "weather");
+      expect(weather?.version).toBe("1.0.0");
+
+      // Re-running is idempotent.
+      installLocalCatalogs(world, ["weather"]);
+      expect(world.ownVerbExact("$weather_block", "set_forecast_hours")).toBeNull();
+    });
+
     it("$weather_block migration v0 → v1 drops forecast/history/forecast_hours and set_forecast_hours", async () => {
       const world = createWorld({ catalogs: false });
 

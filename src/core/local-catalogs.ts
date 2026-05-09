@@ -4,9 +4,11 @@ import {
   catalogManifestStatus,
   installCatalogManifest,
   planCatalogSchemaMigration,
+  updateCatalogManifest,
   verifyCatalogSchemaPlan,
   type CatalogManifest,
   type CatalogManifestStatus,
+  type CatalogMigrationManifest,
   type CatalogSchemaPlanApplyResult,
   type CatalogSchemaPlanScope
 } from "./catalog-installer";
@@ -21,6 +23,7 @@ export type LocalCatalogStatus = CatalogManifestStatus & {
 };
 
 const LOCAL_CATALOGS = new Map(BUNDLED_CATALOGS.map((entry) => [entry.manifest.name, entry.manifest] as const));
+const LOCAL_CATALOG_MIGRATIONS = new Map(BUNDLED_CATALOGS.map((entry) => [entry.manifest.name, entry.migrations] as const));
 const LOCAL_CATALOG_SOURCE_MIGRATION = "2026-04-30-source-catalog-verbs";
 const LOCAL_CATALOG_PLACEMENT_MIGRATION = "2026-04-30-catalog-placement-metadata";
 const LOCAL_CATALOG_CHAT_COCKATOO_MIGRATION = "2026-04-30-chat-cockatoo";
@@ -163,6 +166,13 @@ export function installLocalCatalogs(world: WooWorld, names: readonly string[] =
   // catalogs are compatibility repair, not fresh auto-install policy.
   const repairNames = localMigrationCatalogNames(world, requested);
   installMissingLocalCatalogDependencies(world, repairNames);
+  // Apply bundled catalog-version migrations BEFORE the schema sync.
+  // The schema sync only reconciles forward (ensure_object / ensure_property_def
+  // / ensure_verb) — it doesn't drop stale verbs or properties from a
+  // previous major. Without this step, an existing world keeps the old
+  // surface (e.g. v0 forecast_hours) but flips its registry to the new
+  // version, which is the worst of both worlds.
+  runLocalCatalogVersionMigrations(world, repairNames);
   const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
   runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered);
 }
@@ -853,6 +863,89 @@ function runTaskspaceNoteShapeMigration(world: WooWorld, names: readonly string[
   });
   if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION);
+}
+
+// Apply bundled catalog migrations whose version range matches the
+// drift between an installed local catalog and its current bundled
+// manifest. We hand off to updateCatalogManifest with acceptMajor: true
+// so the migration's drop_property / drop_verb / etc. steps run, and
+// the catalog registry record is updated to the new version atomically
+// with the cleanup. Idempotent: when there's no drift, no migration is
+// found, or the matching one was already applied, this is a no-op.
+function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[]): void {
+  for (const name of names) {
+    if (!localCatalogInstalled(world, name)) continue;
+    const manifest = LOCAL_CATALOGS.get(name);
+    const migrations = LOCAL_CATALOG_MIGRATIONS.get(name) ?? [];
+    if (!manifest || migrations.length === 0) continue;
+    const currentVersion = installedLocalCatalogVersion(world, name);
+    if (!currentVersion || currentVersion === manifest.version) continue;
+    if (!isVersionLessThan(currentVersion, manifest.version)) continue;
+    const migration = pickMatchingMigration(migrations, currentVersion, manifest.version);
+    if (!migration) continue;
+    try {
+      updateCatalogManifest(world, manifest, {
+        tap: "@local",
+        alias: name,
+        actor: "$wiz",
+        allowImplementationHints: true,
+        acceptMajor: true,
+        migration
+      });
+    } catch (err) {
+      console.warn("woo.local_catalog_version_migration_failed", { catalog: name, from: currentVersion, to: manifest.version, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+}
+
+function installedLocalCatalogVersion(world: WooWorld, name: string): string | null {
+  if (!world.objects.has("$catalog_registry")) return null;
+  const raw = world.propOrNull("$catalog_registry", "installed_catalogs");
+  if (!Array.isArray(raw)) return null;
+  for (const record of raw) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+    const item = record as Record<string, WooValue>;
+    if (item.tap !== "@local") continue;
+    if (item.alias !== name && item.catalog !== name) continue;
+    return typeof item.version === "string" ? item.version : null;
+  }
+  return null;
+}
+
+function pickMatchingMigration(
+  migrations: readonly CatalogMigrationManifest[],
+  fromVersion: string,
+  toVersion: string
+): CatalogMigrationManifest | null {
+  // Pick the migration whose declared range covers (fromVersion ->
+  // toVersion). Patterns may use "x" as a wildcard (e.g. "0.x.x"); the
+  // catalog-installer's validateCatalogMigration enforces the exact
+  // semantics, so we replicate the wildcard match here.
+  for (const migration of migrations) {
+    if (versionPatternMatches(migration.from_version, fromVersion) && versionPatternMatches(migration.to_version, toVersion)) {
+      return migration;
+    }
+  }
+  return null;
+}
+
+function versionPatternMatches(pattern: string, version: string): boolean {
+  const patternParts = pattern.split(".");
+  const versionParts = version.split(/[+-]/)[0].split(".");
+  if (patternParts.length !== 3 || versionParts.length !== 3) return pattern === version;
+  return patternParts.every((part, index) => part === "x" || part === versionParts[index]);
+}
+
+function isVersionLessThan(a: string, b: string): boolean {
+  const partsA = a.split(/[+-]/)[0].split(".").map((n) => Number(n) || 0);
+  const partsB = b.split(/[+-]/)[0].split(".").map((n) => Number(n) || 0);
+  for (let i = 0; i < 3; i++) {
+    const x = partsA[i] ?? 0;
+    const y = partsB[i] ?? 0;
+    if (x < y) return true;
+    if (x > y) return false;
+  }
+  return false;
 }
 
 function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>): void {
