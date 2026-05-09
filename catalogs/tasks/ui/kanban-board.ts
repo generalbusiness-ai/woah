@@ -95,6 +95,7 @@ export type KanbanData = {
 
 type StateColumnId = "ready" | "waiting" | "in_flight" | "done" | "dropped";
 type CreateDraft = { kind: string; name: string; text: string; labels: string };
+type AdminPanelMode = "view" | "edit" | "new";
 type AdminDrafts = {
   role: { name: string; description: string; owners: string };
   obligation: { key: string; role: string; criterion: string };
@@ -102,7 +103,7 @@ type AdminDrafts = {
 };
 type AdminSection = keyof AdminDrafts;
 type AdminStatus = { state: "idle" | "pending" | "success" | "error"; message: string };
-type AdminEditing = { section: AdminSection; key: string | null };
+type AdminEditing = { section: AdminSection; key: string | null; mode: AdminPanelMode };
 
 export type GroupBy = "state" | "role" | "holder" | "kind";
 
@@ -675,11 +676,6 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.querySelector<HTMLInputElement>("[data-tasks-detail-form] input[name=\"name\"]")?.focus();
       return;
     }
-    if (target.closest<HTMLButtonElement>("[data-tasks-seed-policy]")) {
-      event.preventDefault();
-      void this.seedMinimalPolicy();
-      return;
-    }
     if (target.closest<HTMLButtonElement>("[data-tasks-detail-close]")) {
       event.preventDefault();
       this.openDetail = null;
@@ -739,7 +735,18 @@ export class WooTasksKanbanElement extends HTMLElement {
       const section = adminNew.dataset.tasksAdminNew;
       if (section === "role" || section === "obligation" || section === "policy") {
         this.adminSection = section;
-        this.prepareAdminEditor(section, null);
+        this.prepareAdminEditor(section, null, "new");
+      }
+      return;
+    }
+    const adminRow = target.closest<HTMLTableRowElement>("[data-tasks-admin-row]");
+    if (adminRow) {
+      event.preventDefault();
+      const section = adminRow.dataset.tasksAdminSection as AdminSection | "";
+      const key = adminRow.dataset.key ?? "";
+      if (section === "role" || section === "obligation" || section === "policy") {
+        this.adminSection = section;
+        this.prepareAdminEditor(section, key || null, "view");
       }
       return;
     }
@@ -750,7 +757,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       const key = adminEdit.dataset.key ?? "";
       if ((section === "role" || section === "obligation" || section === "policy") && key) {
         this.adminSection = section;
-        this.prepareAdminEditor(section, key);
+        this.prepareAdminEditor(section, key, "edit");
       }
       return;
     }
@@ -920,7 +927,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     }
   }
 
-  private prepareAdminEditor(section: AdminSection, key: string | null): void {
+  private prepareAdminEditor(section: AdminSection, key: string | null, mode: AdminPanelMode): void {
     if (section === "role") {
       const role = key ? this.model.roles.find((entry) => entry.name === key) : null;
       this.adminDrafts.role = role
@@ -937,7 +944,7 @@ export class WooTasksKanbanElement extends HTMLElement {
         ? { kind: key, keys: keys.join(", ") }
         : { kind: "", keys: "" };
     }
-    this.adminEditing = { section, key };
+    this.adminEditing = { section, key, mode };
     this.render();
     const first = this.querySelector<HTMLInputElement | HTMLSelectElement>("[data-tasks-admin-form] input, [data-tasks-admin-form] select");
     first?.focus();
@@ -1017,13 +1024,13 @@ export class WooTasksKanbanElement extends HTMLElement {
       if (!name) return;
       // Optimistic patch + reset draft to "new" mode so the form's ready for
       // the next entry while the server confirms in the background.
-      const wasNew = this.adminEditing?.section === "role" && this.adminEditing.key === null;
+      const wasNew = this.adminEditing?.section === "role" && this.adminEditing.mode === "new";
       const existingIdx = this.model.roles.findIndex((r) => r.name === name);
       if (existingIdx >= 0) this.model.roles[existingIdx] = { name, description, owners };
       else this.model.roles.push({ name, description, owners });
       if (wasNew) this.adminDrafts.role = { name: "", description: "", owners: "" };
       else this.adminDrafts.role = { name, description, owners: ownersRaw };
-      if (this.adminEditing?.section === "role") this.adminEditing = { section: "role", key: name };
+      if (this.adminEditing?.section === "role") this.adminEditing = { section: "role", key: name, mode: "edit" };
       this.setAdminStatus("role", "success", `Saved role "${name}".`);
       try {
         await woo.directCall(subject, "set_role", [name, { description, owners }]);
@@ -1039,13 +1046,13 @@ export class WooTasksKanbanElement extends HTMLElement {
       const criterion = (form.querySelector<HTMLInputElement>('input[name="criterion"]')?.value ?? "").trim();
       this.adminDrafts.obligation = { key, role, criterion };
       if (!key || !role || !criterion) return;
-      const wasNew = this.adminEditing?.section === "obligation" && this.adminEditing.key === null;
+      const wasNew = this.adminEditing?.section === "obligation" && this.adminEditing.mode === "new";
       const existingIdx = this.model.obligations.findIndex((o) => o.key === key);
       if (existingIdx >= 0) this.model.obligations[existingIdx] = { key, role, criterion };
       else this.model.obligations.push({ key, role, criterion });
       if (wasNew) this.adminDrafts.obligation = { key: "", role: this.model.roles[0]?.name ?? "", criterion: "" };
       else this.adminDrafts.obligation = { key, role, criterion };
-      if (this.adminEditing?.section === "obligation") this.adminEditing = { section: "obligation", key };
+      if (this.adminEditing?.section === "obligation") this.adminEditing = { section: "obligation", key, mode: "edit" };
       this.setAdminStatus("obligation", "success", `Saved obligation "${key}".`);
       try {
         await woo.directCall(subject, "set_obligation", [key, { role, criterion }]);
@@ -1061,12 +1068,12 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.adminDrafts.policy = { kind: policyKind, keys: keysRaw };
       const keys = keysRaw.split(",").map((s) => s.trim()).filter(Boolean);
       if (!policyKind || keys.length === 0) return;
-      const wasNew = this.adminEditing?.section === "policy" && this.adminEditing.key === null;
+      const wasNew = this.adminEditing?.section === "policy" && this.adminEditing.mode === "new";
       this.model.policiesMap[policyKind] = keys;
       if (!this.model.policies.includes(policyKind)) this.model.policies = [...this.model.policies, policyKind];
       if (wasNew) this.adminDrafts.policy = { kind: "", keys: "" };
       else this.adminDrafts.policy = { kind: policyKind, keys: keysRaw };
-      if (this.adminEditing?.section === "policy") this.adminEditing = { section: "policy", key: policyKind };
+      if (this.adminEditing?.section === "policy") this.adminEditing = { section: "policy", key: policyKind, mode: "edit" };
       this.setAdminStatus("policy", "success", `Saved policy "${policyKind}".`);
       try {
         await woo.directCall(subject, "set_policy", [policyKind, keys]);
@@ -1111,18 +1118,6 @@ export class WooTasksKanbanElement extends HTMLElement {
       await woo.directCall(subject, verb, [key]);
     } catch (err) {
       this.setAdminStatus(section, "error", `Could not remove ${kind} "${key}": ${errorMessage(err)}`);
-    }
-    void this.refresh();
-  }
-
-  private async seedMinimalPolicy(): Promise<void> {
-    const woo = this.woo;
-    const subject = this.subject ?? this.model.registryId;
-    if (!woo || !subject || !woo.actor) return;
-    try {
-      await woo.directCall(subject, "seed_minimal_policy", [woo.actor]);
-    } catch {
-      // Non-owner / non-wizard will see E_PERM; surface lands in the next refresh.
     }
     void this.refresh();
   }
@@ -1548,22 +1543,8 @@ export class WooTasksKanbanElement extends HTMLElement {
   }
 
   private renderHeader(registryName: string): string {
-    const { policies, isOwner } = this.model;
-    const havePolicies = policies.length > 0;
+    const { isOwner } = this.model;
     const buttons: string[] = [];
-    if (!havePolicies && isOwner) {
-      buttons.push(`<button type="button" data-tasks-seed-policy title="Install a doer/do:it/task fixture so create_task has a kind to bind to">Seed minimal policy</button>`);
-    }
-    const groupOptions = GROUP_BY_ORDER.map((key) => {
-      const selected = this.groupBy === key ? " selected" : "";
-      return `<option value="${escapeHtml(key)}"${selected}>${escapeHtml(GROUP_BY_LABELS[key])}</option>`;
-    }).join("");
-    buttons.push(`
-      <label class="woo-tasks-kanban-groupby">
-        Group by
-        <select data-tasks-group-by aria-label="Group tasks by">${groupOptions}</select>
-      </label>
-    `);
     if (isOwner && !this.adminOpen) {
       buttons.push(`<button type="button" data-tasks-admin-toggle aria-expanded="false">⚙ Admin</button>`);
     }
@@ -1590,6 +1571,10 @@ export class WooTasksKanbanElement extends HTMLElement {
   private renderFilterBar(visibleCount = this.filteredTasks().length): string {
     const labels = Array.from(this.filterLabels);
     const canCreate = this.model.policies.length > 0 && !this.openDetail?.isNew;
+    const groupOptions = GROUP_BY_ORDER.map((key) => {
+      const selected = this.groupBy === key ? " selected" : "";
+      return `<option value="${escapeHtml(key)}"${selected}>${escapeHtml(GROUP_BY_LABELS[key])}</option>`;
+    }).join("");
     const chips = labels.map((label) => `
       <span class="woo-tasks-filter-chip" data-tasks-filter-chip>
         <span class="woo-tasks-filter-chip-label">${escapeHtml(label)}</span>
@@ -1603,6 +1588,10 @@ export class WooTasksKanbanElement extends HTMLElement {
     return `
       <div class="woo-tasks-kanban-filterbar">
         <input type="search" data-tasks-filter-text placeholder="Search tasks…" value="${escapeHtml(this.filterText)}" autocomplete="off">
+        <label class="woo-tasks-kanban-groupby">
+          Group by
+          <select data-tasks-group-by aria-label="Group tasks by">${groupOptions}</select>
+        </label>
         <div class="woo-tasks-filter-chips" data-tasks-filter-chips>${chips}</div>
         <span class="woo-tasks-filter-count">${visibleCount} / ${this.model.tasks.length}</span>
         ${clear}
@@ -1625,37 +1614,34 @@ export class WooTasksKanbanElement extends HTMLElement {
       ? roles.length === 0
         ? `<p class="woo-tasks-admin-empty">No roles.</p>`
         : `<table class="woo-tasks-admin-table">
-            <thead><tr><th>Name</th><th>Description</th><th>Owners</th><th></th></tr></thead>
+            <thead><tr><th>Name</th><th>Description</th><th>Owners</th></tr></thead>
             <tbody>${roles.map((r) => `
-              <tr>
+              <tr data-tasks-admin-row data-tasks-admin-section="role" data-key="${escapeHtml(r.name)}">
                 <td>${escapeHtml(r.name)}</td>
                 <td>${escapeHtml(r.description || "—")}</td>
                 <td>${escapeHtml(r.owners.join(", ") || "(no owners)")}</td>
-                <td><button type="button" data-tasks-admin-edit="role" data-key="${escapeHtml(r.name)}">Edit</button></td>
               </tr>`).join("")}</tbody>
           </table>`
       : section === "obligation"
         ? obligations.length === 0
           ? `<p class="woo-tasks-admin-empty">No obligations.</p>`
           : `<table class="woo-tasks-admin-table">
-              <thead><tr><th>Key</th><th>Role</th><th>Criterion</th><th></th></tr></thead>
+              <thead><tr><th>Key</th><th>Role</th><th>Criterion</th></tr></thead>
               <tbody>${obligations.map((o) => `
-                <tr>
+                <tr data-tasks-admin-row data-tasks-admin-section="obligation" data-key="${escapeHtml(o.key)}">
                   <td>${escapeHtml(o.key)}</td>
                   <td>${escapeHtml(o.role || "—")}</td>
                   <td>${escapeHtml(o.criterion || "—")}</td>
-                  <td><button type="button" data-tasks-admin-edit="obligation" data-key="${escapeHtml(o.key)}">Edit</button></td>
                 </tr>`).join("")}</tbody>
             </table>`
         : Object.keys(policiesMap).length === 0
           ? `<p class="woo-tasks-admin-empty">No policies.</p>`
           : `<table class="woo-tasks-admin-table">
-              <thead><tr><th>Task kind</th><th>Obligation order</th><th></th></tr></thead>
+              <thead><tr><th>Task kind</th><th>Obligation order</th></tr></thead>
               <tbody>${Object.entries(policiesMap).map(([kind, keys]) => `
-                <tr>
+                <tr data-tasks-admin-row data-tasks-admin-section="policy" data-key="${escapeHtml(kind)}">
                   <td>${escapeHtml(kind)}</td>
                   <td>${escapeHtml(keys.join(" → ") || "(empty)")}</td>
-                  <td><button type="button" data-tasks-admin-edit="policy" data-key="${escapeHtml(kind)}">Edit</button></td>
                 </tr>`).join("")}</tbody>
             </table>`;
     return `
@@ -1687,12 +1673,45 @@ export class WooTasksKanbanElement extends HTMLElement {
   private renderAdminEditor(roleNames: string[], obligationKeys: string[]): string {
     const editing = this.adminEditing;
     if (!editing) return "";
-    const title = editing.key ? `Edit ${editing.section}` : `New ${editing.section}`;
+    const title = editing.key
+      ? editing.mode === "view"
+        ? `View ${editing.section}`
+        : `Edit ${editing.section}`
+      : `New ${editing.section}`;
     const remove = editing.key
       ? `<button type="button" class="woo-tasks-danger-action" data-tasks-admin-remove="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Remove</button>`
       : "";
-    const body = editing.section === "role"
-      ? `<form class="woo-tasks-admin-form" data-tasks-admin-form="role">
+    const body = editing.mode === "view"
+      ? editing.section === "role"
+        ? `<section class="woo-tasks-admin-view">
+            <label class="woo-tasks-admin-view-field"><span>Name</span><strong>${escapeHtml(this.adminDrafts.role.name || "—")}</strong></label>
+            <label class="woo-tasks-admin-view-field"><span>Description</span><p>${escapeHtml(this.adminDrafts.role.description || "—")}</p></label>
+            <label class="woo-tasks-admin-view-field"><span>Owners</span><p>${escapeHtml(this.adminDrafts.role.owners || "—")}</p></label>
+            <div class="woo-tasks-admin-form-actions">
+              <button type="button" data-tasks-admin-edit="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Edit</button>
+              ${remove}
+            </div>
+          </section>`
+        : editing.section === "obligation"
+          ? `<section class="woo-tasks-admin-view">
+              <label class="woo-tasks-admin-view-field"><span>Key</span><strong>${escapeHtml(this.adminDrafts.obligation.key || "—")}</strong></label>
+              <label class="woo-tasks-admin-view-field"><span>Role</span><p>${escapeHtml(this.adminDrafts.obligation.role || "—")}</p></label>
+              <label class="woo-tasks-admin-view-field"><span>Criterion</span><p>${escapeHtml(this.adminDrafts.obligation.criterion || "—")}</p></label>
+              <div class="woo-tasks-admin-form-actions">
+                <button type="button" data-tasks-admin-edit="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Edit</button>
+                ${remove}
+              </div>
+            </section>`
+          : `<section class="woo-tasks-admin-view">
+              <label class="woo-tasks-admin-view-field"><span>Task kind</span><strong>${escapeHtml(this.adminDrafts.policy.kind || "—")}</strong></label>
+              <label class="woo-tasks-admin-view-field"><span>Obligation order</span><p>${escapeHtml(this.adminDrafts.policy.keys || "—")}</p></label>
+              <div class="woo-tasks-admin-form-actions">
+                <button type="button" data-tasks-admin-edit="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Edit</button>
+                ${remove}
+              </div>
+            </section>`
+      : editing.section === "role"
+        ? `<form class="woo-tasks-admin-form" data-tasks-admin-form="role">
           <label>Name<input type="text" name="name" value="${escapeHtml(this.adminDrafts.role.name)}" required autocomplete="off"></label>
           <label>Description<input type="text" name="description" value="${escapeHtml(this.adminDrafts.role.description)}" autocomplete="off"></label>
           <label>Owners<input type="text" name="owners" value="${escapeHtml(this.adminDrafts.role.owners)}" autocomplete="off"></label>
@@ -1702,8 +1721,8 @@ export class WooTasksKanbanElement extends HTMLElement {
             <button type="submit">Add / update</button>
           </div>
         </form>`
-      : editing.section === "obligation"
-        ? `<form class="woo-tasks-admin-form" data-tasks-admin-form="obligation">
+        : editing.section === "obligation"
+          ? `<form class="woo-tasks-admin-form" data-tasks-admin-form="obligation">
             <label>Key<input type="text" name="key" value="${escapeHtml(this.adminDrafts.obligation.key)}" required autocomplete="off"></label>
             <label>Role<select name="role" required>${roleNames.length === 0 ? `<option value="" disabled selected>no roles yet</option>` : roleNames.map((n) => `<option value="${escapeHtml(n)}"${n === (this.adminDrafts.obligation.role || roleNames[0] || "") ? " selected" : ""}>${escapeHtml(n)}</option>`).join("")}</select></label>
             <label>Criterion<input type="text" name="criterion" value="${escapeHtml(this.adminDrafts.obligation.criterion)}" required autocomplete="off"></label>
@@ -1713,7 +1732,7 @@ export class WooTasksKanbanElement extends HTMLElement {
               <button type="submit"${roleNames.length === 0 ? " disabled" : ""}>Add / update</button>
             </div>
           </form>`
-        : `<form class="woo-tasks-admin-form" data-tasks-admin-form="policy">
+          : `<form class="woo-tasks-admin-form" data-tasks-admin-form="policy">
             <label>Task kind<input type="text" name="kind" value="${escapeHtml(this.adminDrafts.policy.kind)}" required autocomplete="off"></label>
             <label>Obligation order<input type="text" name="keys" placeholder="${obligationKeys.length ? `e.g. ${escapeHtml(obligationKeys.join(", "))}` : ""}" value="${escapeHtml(this.adminDrafts.policy.keys)}" required autocomplete="off"></label>
             <div class="woo-tasks-admin-form-actions">
@@ -1721,7 +1740,7 @@ export class WooTasksKanbanElement extends HTMLElement {
               <button type="button" data-tasks-admin-edit-cancel>Cancel</button>
               <button type="submit"${obligationKeys.length === 0 ? " disabled" : ""}>Add / update</button>
             </div>
-          </form>`;
+            </form>`;
     return `
       <aside class="woo-tasks-admin-editor">
         <div class="woo-tasks-admin-editor-head">

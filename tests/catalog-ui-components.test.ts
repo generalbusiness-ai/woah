@@ -686,27 +686,11 @@ describe("bundled catalog UI components", () => {
     expect(create?.args).toEqual(["bug", "Refactor verb dispatch", "details", ["frontend", "urgent"], null]);
   });
 
-  it("offers seed_minimal_policy when no policies and the actor is owner", async () => {
+  it("offers no in-UI bootstrap when no policies — wizards run :seed_minimal_policy from chat", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
-    const calls: { target: string; verb: string; args: unknown[] }[] = [];
-    const woo: WooContext = {
-      actor: "$wiz",
-      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
-      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
-      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
-      directCall: async (target, verb, args = []) => {
-        calls.push({ target, verb, args });
-        if (verb === "listing") return [];
-        if (verb === "seed_minimal_policy") return true;
-        return undefined;
-      },
-      send: async () => undefined,
-      call: async () => undefined,
-      emit: () => true
-    };
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
-    element.woo = woo;
+    element.woo = testWooContext({});
     element.subject = "the_taskboard";
     element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
@@ -720,13 +704,11 @@ describe("bundled catalog UI components", () => {
       isOwner: true
     };
 
+    // No policies -> no "+ New task" entry-point and no in-UI seed button.
+    // The wizard reaches :seed_minimal_policy through chat (e.g. via
+    // `;the_taskboard:seed_minimal_policy($wiz)`) instead.
     expect(element.querySelector("[data-tasks-create-open]")).toBeNull();
-    const seedBtn = element.querySelector<HTMLButtonElement>("[data-tasks-seed-policy]");
-    expect(seedBtn).not.toBeNull();
-    seedBtn!.click();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(calls.find((c) => c.verb === "seed_minimal_policy")?.args).toEqual(["$wiz"]);
+    expect(element.querySelector("[data-tasks-seed-policy]")).toBeNull();
   });
 
   it("drags a Ready card into In flight to dispatch claim", async () => {
