@@ -1,9 +1,9 @@
 import { compileVerb } from "./authoring";
 import { setPropBytecode, setValueBytecode } from "./fixtures";
 import { installLocalCatalogs } from "./local-catalogs";
-import type { ObjectRepository, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
+import type { ObjectRepository, SeedWorld, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
 import { hashSource } from "./source-hash";
-import type { MetricEvent, ObjRef, TinyBytecode, WooValue } from "./types";
+import type { MetricEvent, ObjRef, TinyBytecode, VerbDef, WooValue } from "./types";
 import { valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
@@ -255,13 +255,13 @@ export function createWorldFromSerialized(
   return world;
 }
 
-export function scopeSerializedWorldToHost(serialized: SerializedWorld, host: ObjRef): SerializedWorld {
+export function scopeSerializedWorldToHost(serialized: SerializedWorld, host: ObjRef): SeedWorld {
   const world = new WooWorld();
   world.importWorld(serialized);
   return world.exportHostScopedWorld(host);
 }
 
-export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRef): SerializedWorld | null {
+export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRef): SeedWorld | null {
   const scoped = scopeSerializedWorldToHost(serialized, host);
   return scoped.objects.length > 0 ? scoped : null;
 }
@@ -271,63 +271,90 @@ export type HostScopedSeedMergeResult = {
   changed: boolean;
 };
 
-export function mergeHostScopedSeed(stored: SerializedWorld, seed: SerializedWorld): SerializedWorld {
-  return mergeHostScopedSeedWithStatus(stored, seed).world;
+export function mergeHostScopedSeed(stored: SerializedWorld, seed: SeedWorld, receiverHost: ObjRef): SerializedWorld {
+  return mergeHostScopedSeedWithStatus(stored, seed, receiverHost).world;
 }
 
-export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: SerializedWorld): HostScopedSeedMergeResult {
-  const merged = cloneSerializedWorld(stored);
-  const objects = new Map(merged.objects.map((obj) => [obj.id, obj]));
-  const seedIds = new Set(seed.objects.map((obj) => obj.id));
+/**
+ * Per spec/protocol/host-seeds.md §HS2–HS4: pure function from
+ * (stored, seed, receiverHost) to a merged slice plus a `changed`
+ * flag. Receiver-hosted subjects are skipped if already in stored
+ * (HS2.1); foreign-hosted subjects merge declarative state only
+ * (HS2.2). Children, contents, and modified are skipped on every
+ * subject. Tombstones for foreign-hosted ids union into stored (HS4).
+ */
+export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: SeedWorld, receiverHost: ObjRef): HostScopedSeedMergeResult {
+  // Two-pass lazy-clone strategy. A clean wake (changed=false) is the
+  // common case, and the original implementation deep-cloned the entire
+  // stored slice up front — wasted work the moment we need to throw the
+  // clone away. Instead we run a probe pass that mutates per-object
+  // clones (cheap), records each one that produced a change, and only
+  // assembles the final SerializedWorld if anything changed.
+  const storedById = new Map<ObjRef, SerializedObject>(stored.objects.map((obj) => [obj.id, obj]));
+  const storedTombstones = new Set(stored.tombstones ?? []);
+  const replacements = new Map<ObjRef, SerializedObject>(); // id → mutated clone
+  const additions: SerializedObject[] = []; // never-seen-before subjects
+  const newTombstones: ObjRef[] = []; // ids to add to stored.tombstones
+  const removeIds = new Set<ObjRef>(); // ids whose stub HS4 retires
   let changed = false;
 
   for (const seedObj of seed.objects) {
-    const current = objects.get(seedObj.id);
+    // HS2 prerequisite: never re-add an id the receiver has tombstoned.
+    if (storedTombstones.has(seedObj.id)) continue;
+    const current = storedById.get(seedObj.id);
     if (!current) {
-      const next = cloneSerializedObject(seedObj);
-      merged.objects.push(next);
-      objects.set(next.id, next);
+      // HS2.1 additive case OR HS2.2 first-time delivery.
+      additions.push(cloneSerializedObject(seedObj));
       changed = true;
       continue;
     }
-    changed = mergeSeedObject(current, seedObj) || changed;
+    if (seed.objectHosts[seedObj.id] === receiverHost) continue; // HS2.1 skip-existing
+    // HS2.2: probe-merge on a shallow clone so we don't mutate stored.
+    // mergeSeedObject deep-clones individual fields it actually replaces;
+    // we only need to clone the wrapper plus mutable map/array fields.
+    const probe = cloneSerializedObject(current);
+    if (mergeSeedObject(probe, seedObj)) {
+      replacements.set(seedObj.id, probe);
+      changed = true;
+    }
   }
 
-  changed = reconcileSeedContainment(objects, seedIds) || changed;
-  const objectCounter = Math.max(merged.objectCounter ?? 1, seed.objectCounter ?? 1);
-  if (merged.objectCounter !== objectCounter) {
-    merged.objectCounter = objectCounter;
-    changed = true;
-  }
-  const parkedTaskCounter = Math.max(merged.parkedTaskCounter ?? 1, seed.parkedTaskCounter ?? 1);
-  if (merged.parkedTaskCounter !== parkedTaskCounter) {
-    merged.parkedTaskCounter = parkedTaskCounter;
-    changed = true;
-  }
-  const sessionCounter = Math.max(merged.sessionCounter ?? 1, seed.sessionCounter ?? 1);
-  if (merged.sessionCounter !== sessionCounter) {
-    merged.sessionCounter = sessionCounter;
-    changed = true;
-  }
-  for (const [space, entries] of seed.logs) {
-    if (!merged.logs.some(([existing]) => existing === space)) {
-      merged.logs.push([space, cloneSerialized(entries)]);
+  // HS4: foreign-hosted tombstones, scoped to ids the receiver has stubs
+  // for (cost rule). gateway.tombstones is gateway-hosted-by-construction
+  // (recycleChecked's E_CROSS_HOST_WRITE guards make all gateway-side
+  // recycles host-local), so every entry is foreign-hosted from any
+  // satellite's view.
+  if (seed.tombstones && seed.tombstones.length > 0) {
+    for (const id of seed.tombstones) {
+      if (storedTombstones.has(id)) continue;
+      if (seed.objectHosts[id] === receiverHost) continue; // forward-compat guard
+      if (!storedById.has(id)) continue; // HS4 cost rule: skip if no stub
+      newTombstones.push(id);
+      removeIds.add(id);
       changed = true;
     }
   }
-  for (const snapshot of seed.snapshots) {
-    if (!merged.snapshots.some((existing) => existing.space_id === snapshot.space_id && existing.seq === snapshot.seq)) {
-      merged.snapshots.push(cloneSerialized(snapshot));
-      changed = true;
-    }
+
+  if (!changed) return { world: stored, changed: false };
+
+  // Materialize the merged slice. One pass over stored.objects, swapping
+  // in replacements / dropping removeIds, then append additions.
+  const mergedObjects: SerializedObject[] = [];
+  for (const obj of stored.objects) {
+    if (removeIds.has(obj.id)) continue;
+    const replacement = replacements.get(obj.id);
+    mergedObjects.push(replacement ?? obj);
   }
-  for (const task of seed.parkedTasks) {
-    if (!merged.parkedTasks.some((existing) => existing.id === task.id)) {
-      merged.parkedTasks.push(cloneSerialized(task));
-      changed = true;
-    }
-  }
-  return { world: merged, changed };
+  for (const add of additions) mergedObjects.push(add);
+
+  const mergedTombstones = newTombstones.length > 0
+    ? [...(stored.tombstones ?? []), ...newTombstones].sort()
+    : stored.tombstones;
+
+  return {
+    world: { ...stored, objects: mergedObjects, tombstones: mergedTombstones },
+    changed: true
+  };
 }
 
 export function bootstrap(world: WooWorld, options: BootstrapOptions = {}): WooWorld {
@@ -348,9 +375,114 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "wizard_actions",
   "applied_migrations",
   "catalog_migration_records",
-  "installed_catalogs"
+  "installed_catalogs",
+  // Per-host one-shot scrub marker (set by scrubStaleSubscribersOnce on
+  // the receiver's local copy of $space-descendants); the gateway never
+  // sees it, so the merge must not propagate-delete it from stored.
+  "_subscribers_scrubbed_v1"
 ]);
 
+/** Drop "phantom" boolean fields whose persistent encoding represents
+ * `false` as absence. Without this, a round-trip through the CF
+ * repository produces flags like `{wizard:false, programmer:false,
+ * fertile:false}` (`flagsFromSqlInt` always returns explicit booleans)
+ * while a freshly-bootstrapped gateway has plain `{}` — and
+ * `valuesEqual` reports them as different, making the seed merge
+ * non-idempotent. */
+function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): Record<string, true> {
+  if (!flags) return {};
+  const out: Record<string, true> = {};
+  for (const [k, v] of Object.entries(flags)) if (v === true) out[k] = true;
+  return out;
+}
+
+/** Drop verb fields whose persistent encoding represents `false` as
+ * absence (`verbFlagsJson` + `verbFromSqlRow` only round-trip the boolean
+ * verb flags when `=== true`). Drop `slot` because it's a per-host index
+ * assigned by `importWorld`, not authoritative across hosts. */
+function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
+    if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "pure" || k === "pure_declared") {
+      if (v === true) out[k] = true;
+      continue;
+    }
+    if (k === "slot") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function verbsDeepEqual(left: VerbDef[], right: VerbDef[]): boolean {
+  if (left.length !== right.length) return false;
+  const leftByName = new Map(left.map((v) => [v.name, v]));
+  const rightByName = new Map(right.map((v) => [v.name, v]));
+  if (leftByName.size !== rightByName.size) return false;
+  for (const [name, lv] of leftByName) {
+    const rv = rightByName.get(name);
+    if (!rv) return false;
+    // source_hash fast path: matching hashes mean source/bytecode/
+    // line_map are equal (the hash is over source). We still need to
+    // compare every other deployable verb field — aliases, arg_spec,
+    // kind/native, version, calls — because catalog repair updates
+    // those independently of source (see catalog-installer.ts) and
+    // they're user-visible (aliases drive verb resolution; arg_spec
+    // drives command planning). The fast path saves walking
+    // line_map/bytecode/source — which is the bulk by volume.
+    if (lv.source_hash && rv.source_hash && lv.source_hash === rv.source_hash) {
+      if (verbMetadataEqual(lv, rv)) continue;
+    }
+    if (!valuesEqual(normalizeVerbForCompare(lv) as WooValue, normalizeVerbForCompare(rv) as WooValue)) return false;
+  }
+  return true;
+}
+
+/** Equality over every deployable verb field except source/bytecode/
+ * line_map — caller has already established those via `source_hash`.
+ * Includes aliases, arg_spec, kind/native, version, calls, perms, owner,
+ * and the boolean flags. */
+function verbMetadataEqual(a: VerbDef, b: VerbDef): boolean {
+  if (a.perms !== b.perms) return false;
+  if (a.owner !== b.owner) return false;
+  if (a.version !== b.version) return false;
+  if ((a.direct_callable === true) !== (b.direct_callable === true)) return false;
+  if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return false;
+  if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return false;
+  if ((a.pure === true) !== (b.pure === true)) return false;
+  if ((a.pure_declared === true) !== (b.pure_declared === true)) return false;
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "native" && b.kind === "native" && a.native !== b.native) return false;
+  if (!arraysShallowEqualStrings(a.aliases ?? [], b.aliases ?? [])) return false;
+  if (!valuesEqual((a.arg_spec ?? {}) as WooValue, (b.arg_spec ?? {}) as WooValue)) return false;
+  // `calls` is the verb's static call graph — affects the purity
+  // analyzer's transitively-pure recomputation. Catalog installs may
+  // emit different `calls` arrays even when source_hash matches if the
+  // analyzer was rerun against a different host's catalog graph.
+  const aCalls = Array.isArray(a.calls) ? a.calls : null;
+  const bCalls = Array.isArray(b.calls) ? b.calls : null;
+  if ((aCalls === null) !== (bCalls === null)) return false;
+  if (aCalls && bCalls && !valuesEqual(aCalls as unknown as WooValue, bCalls as unknown as WooValue)) return false;
+  return true;
+}
+
+function arraysShallowEqualStrings(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Merge a single foreign-hosted subject's declarative state from seed
+ * into stored. Per spec/protocol/host-seeds.md §HS2.2.
+ *
+ * Skipped on every subject: `children`, `contents`, `modified`,
+ * `created`, `id`. Those are derived/clock fields; cross-host views
+ * disagree on them by construction.
+ *
+ * Deletions: properties/propertyVersions/propertyDefs in stored but
+ * absent from seed are removed (except dynamic-property names, which
+ * the receiver writes locally).
+ */
 function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boolean {
   let changed = false;
   if (current.name !== seed.name) {
@@ -365,7 +497,7 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
     current.owner = seed.owner;
     changed = true;
   }
-  if (!current.location && current.location !== seed.location) {
+  if (current.location !== seed.location) {
     current.location = seed.location;
     changed = true;
   }
@@ -373,20 +505,11 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
     current.anchor = seed.anchor;
     changed = true;
   }
-  if (!valuesEqual(current.flags as WooValue, seed.flags as WooValue)) {
+  if (!valuesEqual(normalizeFlagsForCompare(current.flags) as WooValue, normalizeFlagsForCompare(seed.flags) as WooValue)) {
     current.flags = cloneSerialized(seed.flags);
     changed = true;
   }
-  const modified = Math.max(current.modified ?? 0, seed.modified ?? 0);
-  if (current.modified !== modified) {
-    current.modified = modified;
-    changed = true;
-  }
-  if (!valuesEqual(current.propertyDefs as unknown as WooValue, seed.propertyDefs as unknown as WooValue)) {
-    current.propertyDefs = cloneSerialized(seed.propertyDefs);
-    changed = true;
-  }
-  if (!valuesEqual(current.verbs as unknown as WooValue, seed.verbs as unknown as WooValue)) {
+  if (!verbsDeepEqual(current.verbs, seed.verbs)) {
     current.verbs = cloneSerialized(seed.verbs);
     changed = true;
   }
@@ -394,97 +517,76 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
     current.eventSchemas = cloneSerialized(seed.eventSchemas);
     changed = true;
   }
-  const children = mergeUnique(current.children, seed.children);
-  if (!arraysEqual(current.children, children)) {
-    current.children = children;
+
+  // propertyDefs: merge seed entries, then delete stored-only entries.
+  const seedDefs = new Map(seed.propertyDefs.map((def) => [def.name, def]));
+  const currentDefs = new Map(current.propertyDefs.map((def) => [def.name, def]));
+  let defsChanged = false;
+  for (const [name, def] of seedDefs) {
+    const cur = currentDefs.get(name);
+    if (!cur || !valuesEqual(cur as unknown as WooValue, def as unknown as WooValue)) {
+      currentDefs.set(name, def);
+      defsChanged = true;
+    }
+  }
+  for (const name of Array.from(currentDefs.keys())) {
+    if (!seedDefs.has(name)) {
+      currentDefs.delete(name);
+      defsChanged = true;
+    }
+  }
+  if (defsChanged) {
+    current.propertyDefs = Array.from(currentDefs.values()).map((def) => cloneSerialized(def));
     changed = true;
   }
 
   const properties = new Map(current.properties);
   const versions = new Map(current.propertyVersions);
+  const seedProperties = new Map(seed.properties);
   const seedVersions = new Map(seed.propertyVersions);
-  for (const [name, value] of seed.properties) {
-    if (name === "features" && properties.has(name) && Array.isArray(properties.get(name)) && Array.isArray(value)) {
-      const merged = mergeUnique(properties.get(name) as string[], value.map(String));
-      if (!valuesEqual(properties.get(name) as WooValue, merged as WooValue)) {
-        properties.set(name, merged);
-        changed = true;
-      }
-      continue;
-    }
-    if (name === "features_version" && properties.has(name)) {
-      const currentVersion = Number(properties.get(name) ?? 0);
-      const seedVersion = Number(value ?? 0);
-      const nextVersion = Math.max(Number.isFinite(currentVersion) ? currentVersion : 0, Number.isFinite(seedVersion) ? seedVersion : 0);
-      if (properties.get(name) !== nextVersion) {
-        properties.set(name, nextVersion);
-        changed = true;
-      }
-      continue;
-    }
-    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && properties.has(name)) continue;
-    if (properties.has(name) && Number(versions.get(name) ?? 0) >= Number(seedVersions.get(name) ?? 0)) continue;
+
+  for (const [name, value] of seedProperties) {
+    // HS2.2 dynamic carve-out: skip only when stored already has it.
+    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && (properties.has(name) || versions.has(name))) continue;
+    // HS2.2 version gate (uniform — applies whether stored has the
+    // property or not): skip when stored ≥ seed.
+    const storedV = Number(versions.get(name) ?? 0);
+    const seedV = Number(seedVersions.get(name) ?? 0);
+    if (storedV >= seedV && properties.has(name)) continue;
     if (!valuesEqual(properties.get(name) as WooValue, value as WooValue)) {
       properties.set(name, cloneSerialized(value));
       changed = true;
     }
   }
-  for (const [name, version] of seed.propertyVersions) {
+  for (const [name, version] of seedVersions) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && versions.has(name)) continue;
     if (!versions.has(name) || version > Number(versions.get(name) ?? 0)) {
       versions.set(name, version);
       changed = true;
     }
   }
+
+  // HS3.3 deletions: properties / versions in stored but not in seed.
+  for (const name of Array.from(properties.keys())) {
+    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
+    if (seedProperties.has(name)) continue;
+    properties.delete(name);
+    changed = true;
+  }
+  for (const name of Array.from(versions.keys())) {
+    if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
+    if (seedProperties.has(name) || seedVersions.has(name)) continue;
+    versions.delete(name);
+    changed = true;
+  }
+
   if (changed) {
     current.properties = Array.from(properties.entries());
     current.propertyVersions = Array.from(versions.entries());
   }
+
+  // Children/contents/modified explicitly NOT merged (HS2.2 skip-list).
   return changed;
-}
-
-function reconcileSeedContainment(objects: Map<ObjRef, SerializedObject>, seedIds: Set<ObjRef>): boolean {
-  let changed = false;
-  for (const container of objects.values()) {
-    const contents = container.contents.filter((id) => !seedIds.has(id) || objects.get(id)?.location === container.id);
-    if (!arraysEqual(container.contents, contents)) {
-      container.contents = contents;
-      changed = true;
-    }
-  }
-  for (const obj of objects.values()) {
-    if (!seedIds.has(obj.id) || !obj.location) continue;
-    const container = objects.get(obj.location);
-    if (container && !container.contents.includes(obj.id)) {
-      container.contents.push(obj.id);
-      changed = true;
-    }
-  }
-
-  for (const parent of objects.values()) {
-    const children = parent.children.filter((id) => !seedIds.has(id) || objects.get(id)?.parent === parent.id);
-    if (!arraysEqual(parent.children, children)) {
-      parent.children = children;
-      changed = true;
-    }
-  }
-  for (const obj of objects.values()) {
-    if (!seedIds.has(obj.id) || !obj.parent) continue;
-    const parent = objects.get(obj.parent);
-    if (parent && !parent.children.includes(obj.id)) {
-      parent.children.push(obj.id);
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-function mergeUnique<T>(left: readonly T[], right: readonly T[]): T[] {
-  return Array.from(new Set([...left, ...right]));
-}
-
-function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
-  return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function cloneSerializedWorld(value: SerializedWorld): SerializedWorld {

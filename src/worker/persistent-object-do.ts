@@ -43,7 +43,7 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
 import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { CFObjectRepository } from "./cf-repository";
@@ -630,7 +630,7 @@ export class PersistentObjectDO {
     if (!stored) {
       await this.guardColdLoadAgainstInheritedTombstone(hostKey);
     }
-    let scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
+    let scoped: SerializedWorld | null = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
     if (stored && !scoped) {
       console.warn("woo.cluster_seed_fallback", {
         host: hostKey,
@@ -640,16 +640,24 @@ export class PersistentObjectDO {
         stored_tasks: stored.parkedTasks.length
       });
     }
-    let freshSeed: SerializedWorld | null = null;
+    let freshSeed: SeedWorld | null = null;
     try {
-      freshSeed = nonEmptyHostScopedWorld(await this.fetchHostSeed(hostKey), hostKey);
+      // Use the gateway's seed verbatim — re-scoping via
+      // nonEmptyHostScopedWorld would import-then-re-export, which
+      // recomputes objectHosts from the fresh world's anchor chain
+      // and discards any gateway-supplied routing metadata (per
+      // spec/protocol/host-seeds.md §HS1, objectHosts is the only
+      // routing input the merge needs and must come from the
+      // gateway's batched directory view).
+      const fetched = await this.fetchHostSeed(hostKey);
+      freshSeed = fetched.objects.length > 0 ? fetched : null;
     } catch (err) {
       if (!scoped) throw err;
       console.warn("woo.cluster_seed_refresh_failed", { host: hostKey, error: normalizeError(err) });
     }
     let seedMergeChanged = false;
     if (scoped && freshSeed) {
-      const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed);
+      const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed, hostKey);
       if (merged.changed) {
         this.logHostSeedMergeDiff(hostKey, "load", scoped, freshSeed);
       }
@@ -664,7 +672,7 @@ export class PersistentObjectDO {
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
     if (freshSeed) {
       const exported = world.exportWorld();
-      const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed);
+      const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed, hostKey);
       if (seeded.changed) {
         this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed);
         world.importWorld(seeded.world);
@@ -763,7 +771,7 @@ export class PersistentObjectDO {
     }));
   }
 
-  private async fetchHostSeed(hostKey: ObjRef): Promise<SerializedWorld> {
+  private async fetchHostSeed(hostKey: ObjRef): Promise<SeedWorld> {
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     try {
@@ -781,7 +789,8 @@ export class PersistentObjectDO {
         throw wooError("E_STORAGE", `failed to load host seed for ${hostKey}`, body as WooValue);
       }
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "ok", objects: Array.isArray((body as { objects?: unknown }).objects) ? ((body as { objects: unknown[] }).objects.length) : undefined }, hostKey);
-      return body as SerializedWorld;
+      if (!isSeedWorld(body)) throw wooError("E_STORAGE", `host-seed response missing SeedWorld.objectHosts (spec §HS1)`, hostKey);
+      return body;
     } catch (err) {
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) }, hostKey);
       throw err;
@@ -804,7 +813,7 @@ export class PersistentObjectDO {
       }
     }
     for (const host of hosts) {
-      const seed = world.exportHostScopedWorld(host as ObjRef);
+      const seed = world.buildHostSeedForDelivery(host as ObjRef);
       if (seed.objects.length === 0) {
         skipped.push({ host, reason: "empty_seed" });
         continue;
@@ -824,11 +833,12 @@ export class PersistentObjectDO {
     return { ok: errors.length === 0, hosts: hosts.length, refreshed, skipped, errors };
   }
 
-  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SerializedWorld): Record<string, unknown> {
-    const scopedSeed = nonEmptyHostScopedWorld(seed, hostKey);
-    if (!scopedSeed) throw wooError("E_OBJNF", `host seed does not contain ${hostKey}`, hostKey);
+  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SeedWorld): Record<string, unknown> {
+    // Use the gateway's seed verbatim — re-scoping would discard the
+    // gateway-supplied objectHosts metadata (see spec §HS1).
+    if (seed.objects.length === 0) throw wooError("E_OBJNF", `host seed does not contain ${hostKey}`, hostKey);
     const current = world.exportWorld();
-    const merged = mergeHostScopedSeedWithStatus(current, scopedSeed);
+    const merged = mergeHostScopedSeedWithStatus(current, seed, hostKey);
     if (merged.changed) {
       world.importWorld(merged.world);
       world.persistFullSnapshot("host_seed_apply");
@@ -1636,7 +1646,7 @@ export class PersistentObjectDO {
       if (request.method === "POST" && pathname === "/__internal/host-seed") {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
-        return jsonResponse(world.exportHostScopedWorld(host));
+        return jsonResponse(world.buildHostSeedForDelivery(host));
       }
 
       if (request.method === "POST" && pathname === "/__internal/apply-host-seed") {
@@ -1644,7 +1654,7 @@ export class PersistentObjectDO {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "apply-host-seed requires host");
         if (host !== hostKey) throw wooError("E_INVARG", `host mismatch: ${host} != ${hostKey}`);
-        if (!isSerializedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires serialized seed");
+        if (!isSeedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires a SeedWorld with objectHosts (spec §HS1)");
         return jsonResponse(this.applyHostSeed(world, host, body.seed));
       }
 
@@ -2746,6 +2756,22 @@ function isSerializedWorld(value: unknown): value is SerializedWorld {
     Array.isArray(candidate.logs) &&
     Array.isArray(candidate.snapshots) &&
     Array.isArray(candidate.parkedTasks);
+}
+
+/** A SeedWorld must validate as a SerializedWorld AND carry an
+ * `objectHosts` map with an entry for every `objects[i].id`, per
+ * spec/protocol/host-seeds.md §HS1. Missing entries would be treated
+ * as foreign-hosted by the merge and could overwrite receiver-
+ * authoritative state, so coverage is enforced at the boundary. */
+function isSeedWorld(value: unknown): value is SeedWorld {
+  if (!isSerializedWorld(value)) return false;
+  const candidate = value as Partial<Record<"objectHosts", unknown>>;
+  if (candidate.objectHosts === null || typeof candidate.objectHosts !== "object" || Array.isArray(candidate.objectHosts)) return false;
+  const objectHosts = candidate.objectHosts as Record<string, unknown>;
+  for (const obj of (value as SerializedWorld).objects) {
+    if (typeof objectHosts[obj.id] !== "string" || (objectHosts[obj.id] as string).length === 0) return false;
+  }
+  return true;
 }
 
 function uniqueRoutes(routes: Array<{ id: string; host: string; anchor: string | null }>): Array<{ id: string; host: string; anchor: string | null }> {

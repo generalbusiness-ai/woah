@@ -23,7 +23,7 @@ import {
   type WooValue,
   wooError
 } from "./types";
-import type { ObjectRepository, ParkedTaskRecord, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
+import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -372,6 +372,10 @@ export class WooWorld {
   // writes, deletes, accepted log rows). It may over-invalidate after rollback;
   // callers only depend on equality meaning "safe cache hit."
   private mutationCounter = 0;
+  /** Per-host cache for buildHostSeedForDelivery. Keyed by host; valid
+   * while `version === mutationCounter`. Any mutation invalidates all
+   * entries (cheap: just a counter compare on lookup). */
+  private hostSeedCache: Map<ObjRef, { version: number; seed: SeedWorld }> = new Map();
   private callDepth = 0;
   private guestFreePool = new Set<ObjRef>();
   private objectRepository: ObjectRepository | null;
@@ -5062,8 +5066,26 @@ export class WooWorld {
     };
   }
 
-  exportHostScopedWorld(host: ObjRef): SerializedWorld {
+  /**
+   * Round-trippable host slice. Returns SeedWorld shape (a
+   * SerializedWorld slice plus the `objectHosts` routing map required
+   * by spec/protocol/host-seeds.md §HS1).
+   *
+   * This export preserves logs, snapshots, parked tasks, and counters
+   * relevant to the slice — it doubles as a satellite's self-slicing
+   * primitive, which must round-trip losslessly. To produce a seed for
+   * delivery to a foreign host (the HS1 contract: no logs/snapshots/
+   * parkedTasks/sessions; tombstones scoped to foreign-hosted ids;
+   * counters neutralized), call `buildHostSeedForDelivery` instead.
+   */
+  exportHostScopedWorld(host: ObjRef): SeedWorld {
     const scope = this.hostScope(host);
+    // Reuse hostScope's routing map instead of re-walking objectRoutes()
+    // — for ~600 objects this saves a full pass + Map allocation per export.
+    const objectHosts: Record<ObjRef, ObjRef> = {};
+    for (const id of scope.objects) {
+      objectHosts[id] = scope.hostByObject.get(id) ?? DEFAULT_OBJECT_HOST;
+    }
     const parkedTasks = Array.from(this.parkedTasks.values())
       .filter((task) => this.taskBelongsToHostScope(task, scope.hostedSpaces, scope.objects))
       .map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord);
@@ -5071,7 +5093,6 @@ export class WooWorld {
       version: 1,
       objectCounter: nextScopedObjectCounter(scope.objects),
       parkedTaskCounter: nextScopedParkedTaskCounter(parkedTasks),
-      // Sessions are not exported, so this seed contributes nothing about session allocation.
       sessionCounter: 1,
       objects: Array.from(scope.objects)
         .sort()
@@ -5084,11 +5105,48 @@ export class WooWorld {
         .filter((snapshot) => scope.hostedSpaces.has(snapshot.space_id))
         .map((snapshot) => cloneValue(snapshot as unknown as WooValue) as unknown as SpaceSnapshotRecord),
       parkedTasks,
-      tombstones: Array.from(this.tombstones).sort()
+      tombstones: Array.from(this.tombstones).sort(),
+      objectHosts
     };
   }
 
+  /**
+   * Per spec/protocol/host-seeds.md §HS1: build the seed delivered to
+   * a satellite. Strips logs/snapshots/parkedTasks (gateway is not
+   * authoritative for them on the receiver), neutralizes
+   * gateway-global counters.
+   *
+   * Cache: when many satellites cold-load in succession the gateway
+   * may rebuild the same per-host slice repeatedly. Memoize on
+   * (host, mutationVersion); any mutation bumps the version and
+   * invalidates all cached seeds. Worst-case: one rebuild per host
+   * per mutation, vs. one rebuild per host per cold-load.
+   */
+  buildHostSeedForDelivery(host: ObjRef): SeedWorld {
+    const version = this.mutationCounter;
+    const cached = this.hostSeedCache.get(host);
+    if (cached && cached.version === version) return cached.seed;
+    const slice = this.exportHostScopedWorld(host);
+    const seed: SeedWorld = {
+      ...slice,
+      objectCounter: nextScopedObjectCounter(slice.objects.map((obj) => obj.id)),
+      parkedTaskCounter: 1,
+      sessionCounter: 1,
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: slice.tombstones ?? []
+    };
+    this.hostSeedCache.set(host, { version, seed });
+    return seed;
+  }
+
   importWorld(serialized: SerializedWorld): void {
+    // importWorld replaces every cell of the world. Any caller-visible
+    // cache derived from prior state must be invalidated, including
+    // the host-seed memoization keyed on mutationCounter.
+    this.bumpMutationVersion();
+    this.hostSeedCache.clear();
     this.withPersistencePaused(() => {
       this.objects.clear();
       this.sessions.clear();
@@ -5168,9 +5226,10 @@ export class WooWorld {
     return serialized;
   }
 
-  private hostScope(host: ObjRef): { objects: Set<ObjRef>; hostedObjects: Set<ObjRef>; hostedSpaces: Set<ObjRef> } {
+  private hostScope(host: ObjRef): { objects: Set<ObjRef>; hostedObjects: Set<ObjRef>; hostedSpaces: Set<ObjRef>; hostByObject: Map<ObjRef, string> } {
     const allRoutes = this.objectRoutes();
     const routeByObject = new Map(allRoutes.map((route) => [route.id, route] as const));
+    const hostByObject = new Map<ObjRef, string>(allRoutes.map((route) => [route.id, route.host] as const));
     const routes = allRoutes.filter((route) => route.host === host);
     const hosted = new Set(routes.map((route) => route.id));
     const hostedSpaces = new Set<ObjRef>();
@@ -5230,7 +5289,7 @@ export class WooWorld {
       if (scanRefs) this.scanObjectRefs(obj, add);
     }
 
-    return { objects, hostedObjects: hosted, hostedSpaces };
+    return { objects, hostedObjects: hosted, hostedSpaces, hostByObject };
   }
 
   private canCarryFeaturesIfKnown(objRef: ObjRef): boolean {

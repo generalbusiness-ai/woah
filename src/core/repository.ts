@@ -73,6 +73,16 @@ export type SerializedWorld = {
   tombstones?: ObjRef[];
 };
 
+/** Host-scoped seed delivered to a satellite for cold-load or refresh.
+ * Per spec/protocol/host-seeds.md §HS1: a SerializedWorld slice plus the
+ * authoritative host for every subject in the slice. The merge dispatches
+ * receiver-vs-foreign-hosted by reading objectHosts; it is the only routing
+ * input the merge needs, so it MUST be populated from the gateway's batched
+ * directory view at export time, never by per-id RPC at merge time. */
+export type SeedWorld = SerializedWorld & {
+  objectHosts: Record<ObjRef, ObjRef>;
+};
+
 export interface WorldRepository {
   load(): SerializedWorld | null;
   save(world: SerializedWorld): void;

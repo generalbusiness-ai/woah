@@ -1418,7 +1418,7 @@ describe("local catalogs", () => {
     const repairedScoped = nonEmptyHostScopedWorld(staleGateway.exportWorld(), "the_pinboard");
     expect(repairedScoped).not.toBeNull();
 
-    const host = createWorldFromSerialized(mergeHostScopedSeed(staleScoped!, repairedScoped!), { persist: false });
+    const host = createWorldFromSerialized(mergeHostScopedSeed(staleScoped!, repairedScoped!, "the_pinboard"), { persist: false });
     expect(worldVerb(host, "$pinboard", "list_notes").source).toContain("contents(this)");
   });
 
