@@ -88,7 +88,7 @@ describe("$builder:@recycle (LambdaCore #630 port)", () => {
     expect(result.op).toBe("result");
     if (result.op !== "result") return;
     const text = findTextObservation(result.observations, "$wiz");
-    expect(text).toMatch(/I see no 'ghost' here/);
+    expect(text).toMatch(/I see no "ghost" here/);
   });
 
   it("notifies on $ambiguous_match without recycling either candidate", async () => {
@@ -105,7 +105,7 @@ describe("$builder:@recycle (LambdaCore #630 port)", () => {
     expect(result.op).toBe("result");
     if (result.op !== "result") return;
     const text = findTextObservation(result.observations, "$wiz");
-    expect(text).toMatch(/I don't know which 'twin' you mean/);
+    expect(text).toMatch(/I don't know which "twin" you mean/);
     expect(world.objects.has("obj_ambig_a")).toBe(true);
     expect(world.objects.has("obj_ambig_b")).toBe(true);
   });

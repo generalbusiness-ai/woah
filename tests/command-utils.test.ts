@@ -59,7 +59,7 @@ describe("$command_utils:object_match_failed (LambdaCore #219 port)", () => {
     expect(result.op).toBe("result");
     if (result.op !== "result") return;
     expect(result.result).toBe(true);
-    expect(findTextObservation(result.observations, "$wiz")).toMatch(/I see no 'ghost' here\./);
+    expect(findTextObservation(result.observations, "$wiz")).toMatch(/I see no "ghost" here\./);
   });
 
   it("notifies on $ambiguous_match with LambdaCore wording", async () => {
@@ -69,7 +69,39 @@ describe("$command_utils:object_match_failed (LambdaCore #219 port)", () => {
     if (result.op !== "result") return;
     expect(result.result).toBe(true);
     expect(findTextObservation(result.observations, "$wiz")).toMatch(
-      /I don't know which 'twin' you mean\./
+      /I don't know which "twin" you mean\./
+    );
+  });
+
+  it("notifies on a recycled (now-invalid) object ref and returns true", async () => {
+    // LambdaCore's last `elseif (!valid(match_result))` branch: when the
+    // match returned an objref whose target was recycled or never
+    // existed, the helper tells the actor "<id> does not exist." and
+    // returns true so the caller bails. Without this branch, catalog
+    // code that takes paste-back ids would proceed with a phantom.
+    const world = createWorld();
+    world.createObject({
+      id: "obj_recycle_then_lookup",
+      name: "doomed",
+      parent: "$thing",
+      owner: "$wiz",
+      location: "$wiz"
+    });
+    expect(world.valid("obj_recycle_then_lookup")).toBe(true);
+    await world.directCall(
+      "kill-doomed",
+      "$wiz",
+      "$builder",
+      "recycle",
+      ["obj_recycle_then_lookup", {}]
+    );
+    expect(world.valid("obj_recycle_then_lookup")).toBe(false);
+    const result = await callObjectMatchFailed(world, "obj_recycle_then_lookup", "doomed");
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+    expect(result.result).toBe(true);
+    expect(findTextObservation(result.observations, "$wiz")).toMatch(
+      /obj_recycle_then_lookup does not exist\./
     );
   });
 });
