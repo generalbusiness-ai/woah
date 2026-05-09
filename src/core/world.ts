@@ -7698,13 +7698,13 @@ export class WooWorld {
     const obviousVerbs = this.obviousCommandSyntaxes(target, name);
     const ownerName = this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : "a recycled player";
     const lines = [
-      `${obj.name} (${target}) is owned by ${ownerName} (${owner}).`,
+      `${obj.name} (${this.formatPasteableObjRef(target)}) is owned by ${ownerName} (${this.formatPasteableObjRef(owner)}).`,
       `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
       description
     ];
     if (contentRows.length > 0) {
       lines.push("Contents:");
-      for (const item of contentRows) lines.push(`  ${item.name} (${item.id})`);
+      for (const item of contentRows) lines.push(`  ${item.name} (${this.formatPasteableObjRef(item.id)})`);
     }
     if (obviousVerbs.length > 0) {
       lines.push("Obvious verbs:");
@@ -7795,13 +7795,13 @@ export class WooWorld {
     })));
     const ownerName = owner && this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : null;
     const lines = [
-      owner ? `${name} (${target}) is owned by ${ownerName ?? owner} (${owner}).` : `${name} (${target}) is on a remote host.`,
+      owner ? `${name} (${this.formatPasteableObjRef(target)}) is owned by ${ownerName ?? owner} (${this.formatPasteableObjRef(owner)}).` : `${name} (${this.formatPasteableObjRef(target)}) is on a remote host.`,
       `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
       description
     ];
     if (contentRows.length > 0) {
       lines.push("Contents:");
-      for (const item of contentRows) lines.push(`  ${item.name} (${item.id})`);
+      for (const item of contentRows) lines.push(`  ${item.name} (${this.formatPasteableObjRef(item.id)})`);
     }
     const rewrittenObviousVerbs = obviousVerbs.map((syntax) => this.rewriteObviousSyntaxObjectName(syntax, name, matchedName));
     if (rewrittenObviousVerbs.length > 0) {
@@ -7947,6 +7947,13 @@ export class WooWorld {
   // Cross-host-aware display name. The local stub of a remote object
   // (created by ensureInternalActor on cross-host /__internal/remote-dispatch)
   // carries `name = id` rather than the authoritative display name, so we
+  // Render an id in eval-pasteable form: corenames keep their `$` prefix,
+  // ULID-shape ids gain a `#` so they tokenize as objref literals (see
+  // dsl-compiler.ts ref()).
+  private formatPasteableObjRef(id: ObjRef): string {
+    return id.startsWith("$") ? id : `#${id}`;
+  }
+
   // always RPC to the owning host when the object is remote — even when a
   // stub happens to be present locally.
   private async objectDisplayNameAsync(progr: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<string> {
@@ -8330,19 +8337,34 @@ export class WooWorld {
     if (lower === "me") return { status: "ok", value: actor };
     if (lower === "here" && location) return { status: "ok", value: location };
 
-    const candidates: ObjRef[] = [];
-    const add = (id: unknown): void => {
-      if (typeof id === "string" && !candidates.includes(id)) candidates.push(id);
+    // Per match.md §MA2 the resolver buckets candidates by source so the
+    // tiebreaker can prefer carried-by-actor over present-in-location, then
+    // exact over prefix. The candidate list is also de-duplicated: if the
+    // same id appears in both inventory and location (an unusual but legal
+    // state), the carrying source wins.
+    const candidates: Array<{ id: ObjRef; carrying: boolean }> = [];
+    const seen = new Map<ObjRef, number>();
+    const add = (id: unknown, carrying: boolean): void => {
+      if (typeof id !== "string") return;
+      const idx = seen.get(id);
+      if (idx === undefined) {
+        seen.set(id, candidates.length);
+        candidates.push({ id, carrying });
+        return;
+      }
+      // Promote a duplicate to carrying if a later add discovers the actor
+      // is holding it.
+      if (carrying && !candidates[idx].carrying) candidates[idx] = { id, carrying: true };
     };
-    add(actor);
+    add(actor, false);
     if (location) {
-      add(location);
-      for (const id of await this.objectContents(location, ctx.hostMemo)) add(id);
+      add(location, false);
+      for (const id of await this.objectContents(location, ctx.hostMemo)) add(id, false);
       const present = await this.propOrNullForActorAsync(ctx.progr, location, "subscribers", ctx.hostMemo);
-      if (Array.isArray(present)) for (const id of present) add(id);
+      if (Array.isArray(present)) for (const id of present) add(id, false);
     }
     try {
-      for (const id of await this.objectContents(actor, ctx.hostMemo)) add(id);
+      for (const id of await this.objectContents(actor, ctx.hostMemo)) add(id, true);
     } catch {
       // Actor inventory is part of local matching, but a missing/stale actor stub
       // should not make room command parsing fail.
@@ -8350,29 +8372,61 @@ export class WooWorld {
     return await this.matchObjectInCandidatesAsync(ctx, wanted, candidates);
   }
 
-  private async matchObjectInCandidatesAsync(ctx: CallContext, name: string, candidates: ObjRef[]): Promise<ObjectMatch> {
+  private async matchObjectInCandidatesAsync(
+    ctx: CallContext,
+    name: string,
+    candidates: Array<{ id: ObjRef; carrying: boolean }> | ObjRef[]
+  ): Promise<ObjectMatch> {
     const wanted = name.trim();
     if (!wanted) return this.matchSentinel("failed");
     const lower = wanted.toLowerCase();
-    const exact: ObjRef[] = [];
-    const alias: ObjRef[] = [];
-    const prefix: ObjRef[] = [];
-    const contains: ObjRef[] = [];
-    const remoteSummaries = await this.objectSummariesForLook(ctx, candidates);
+    // Accept both the source-tagged and the legacy bare-id call shape so
+    // direct-call sites that already provide a flat list continue to work;
+    // those candidates count as the location tier.
+    const tagged: Array<{ id: ObjRef; carrying: boolean }> = candidates.map((c) =>
+      typeof c === "string" ? { id: c, carrying: false } : c
+    );
+    const ids = tagged.map((c) => c.id);
+    const tierOf = new Map<ObjRef, boolean>(tagged.map((c) => [c.id, c.carrying]));
+    // Per match.md §MA2:
+    //   Tier A: carrying & exact   (name OR alias)
+    //   Tier B: location & exact
+    //   Tier C: carrying & prefix
+    //   Tier D: location & prefix
+    //   Tier E: carrying & body   (substring — woo extension)
+    //   Tier F: location & body
+    // Walk in order; first non-empty tier wins (1 → return; >1 → ambiguous).
+    const carryingExact: ObjRef[] = [];
+    const locationExact: ObjRef[] = [];
+    const carryingPrefix: ObjRef[] = [];
+    const locationPrefix: ObjRef[] = [];
+    const carryingBody: ObjRef[] = [];
+    const locationBody: ObjRef[] = [];
+    const remoteSummaries = await this.objectSummariesForLook(ctx, ids);
     // Per-candidate name/alias enrichment is independent — fan it out in
     // parallel. With ~10 candidates and per-candidate verb dispatches
     // (titleForLook, $note text), the serial form was the dominant cost of
     // an unhandled chat utterance like "well this is fun".
-    const enriched = await Promise.all(candidates.map((id) => this.enrichMatchCandidate(ctx, id, remoteSummaries.summaries.get(id) ?? null)));
+    const enriched = await Promise.all(ids.map((id) => this.enrichMatchCandidate(ctx, id, remoteSummaries.summaries.get(id) ?? null)));
     for (const { id, names, aliases } of enriched) {
+      const carrying = tierOf.get(id) === true;
       const nameValues = names.filter(Boolean).map((item) => String(item).toLowerCase());
       const aliasValues = aliases.map((item) => item.toLowerCase());
-      if (nameValues.includes(lower)) exact.push(id);
-      else if (aliasValues.includes(lower)) alias.push(id);
-      else if (wanted.length >= 2 && [...nameValues, ...aliasValues].some((item) => item.startsWith(lower))) prefix.push(id);
-      else if (wanted.length >= 2 && [...nameValues, ...aliasValues].some((item) => item.includes(lower))) contains.push(id);
+      const allValues = [...nameValues, ...aliasValues];
+      if (allValues.includes(lower)) {
+        (carrying ? carryingExact : locationExact).push(id);
+      } else if (wanted.length >= 2 && allValues.some((item) => item.startsWith(lower))) {
+        (carrying ? carryingPrefix : locationPrefix).push(id);
+      } else if (wanted.length >= 2 && allValues.some((item) => item.includes(lower))) {
+        (carrying ? carryingBody : locationBody).push(id);
+      }
     }
-    return this.resolveObjectMatch(exact.length > 0 ? exact : alias.length > 0 ? alias : prefix.length > 0 ? prefix : contains);
+    if (carryingExact.length > 0) return this.resolveObjectMatch(carryingExact);
+    if (locationExact.length > 0) return this.resolveObjectMatch(locationExact);
+    if (carryingPrefix.length > 0) return this.resolveObjectMatch(carryingPrefix);
+    if (locationPrefix.length > 0) return this.resolveObjectMatch(locationPrefix);
+    if (carryingBody.length > 0) return this.resolveObjectMatch(carryingBody);
+    return this.resolveObjectMatch(locationBody);
   }
 
   private async enrichMatchCandidate(ctx: CallContext, id: ObjRef, summary: HostObjectSummary | null): Promise<{ id: ObjRef; names: string[]; aliases: string[] }> {

@@ -42,11 +42,13 @@ Sentinels are seeded at boot; their identity is stable across reboots so user co
 
 1. **Direct objref.** If `name` starts with `#` and parses as a ULID, look it up in the Directory. If found and visible to the caller, return it.
 2. **Corename.** If `name` starts with `$`, resolve via `$system.<name>`. If found, return it.
-3. **Location search.** Walk `location.contents`, even when `location` lives on another host. For each candidate `c`:
-   - If `c.name == name` (case-insensitive), it's an exact match.
-   - Else if any of `c.aliases` matches `name` per [objects.md §9.1](objects.md#91-lookup) alias grammar, it's an alias match.
-   - Else if `c.name` starts with `name` (case-insensitive) and `name` is at least 2 characters, it's a prefix match.
-4. **Carrying-actor search.** Walk `actor.contents` (things the actor holds). Same matching as step 3.
+3. **Carrying-actor search.** Walk `actor.contents` (things the actor holds).
+4. **Location search.** Walk `location.contents`, even when `location` lives on another host.
+
+Within either search, a candidate `c` is classified by:
+- **Exact** if `c.name == name` (case-insensitive) **or** any of `c.aliases` (or any keyword contributed by `:match_names`, see §MA6) matches `name` per [objects.md §9.1](objects.md#91-lookup) alias grammar.
+- **Prefix** if any of those strings starts with `name` (case-insensitive) and `name` is at least 2 characters.
+- **Body** if any of those strings contains `name` as a substring (case-insensitive) and `name` is at least 2 characters.
 
 Matching is scoped, not local-only. A command parser running on an actor's home
 host must still resolve objects in the actor's current room when that room is
@@ -55,12 +57,32 @@ object whose storage host differs from the room. Remote lookup uses read-class
 host RPCs for `contents`, display `name`, and `aliases`; it does not dispatch
 object behavior.
 
-Resolution:
-- If exactly one exact match → return it.
-- If exact matches are 0 and exactly one alias match → return it.
-- If alias matches are 0 and exactly one prefix match → return it.
-- If multiple candidates at the highest-priority tier → `$ambiguous_match`.
-- If no candidates at any tier → `$failed_match`.
+Resolution walks six tiers in order, returning at the first non-empty tier.
+The first four tiers mirror LambdaCore's `$string_utils:match_object` so that
+a destructive verb like `@recycle book` resolves to the book the actor is
+holding rather than a same-named book on a shelf in the room. The trailing
+two **body** tiers are a deliberate woo extension to LambdaCore: a `$note`
+attaches its readable lines via `:match_names` (§MA6), and an unspecific
+noun phrase like `read objects` should still resolve when the only
+distinguishing keyword appears inside the note's name or body — but only
+after every cleaner match-source has been exhausted.
+
+| Tier | Source | Match |
+|------|--------|-------|
+| A    | `actor.contents` | exact |
+| B    | `location.contents` | exact |
+| C    | `actor.contents` | prefix |
+| D    | `location.contents` | prefix |
+| E    | `actor.contents` | body |
+| F    | `location.contents` | body |
+
+Within a tier:
+- 0 candidates → continue to the next tier.
+- 1 candidate → return it.
+- 2 or more candidates → `$ambiguous_match`.
+
+If all tiers are empty → `$failed_match`. Aliases are folded into every tier;
+there is no separate alias tier.
 
 The "me" and "here" pseudo-names resolve to `actor` and `actor.location` respectively. These are conventions, not runtime-bound; `here` still resolves when the current location is remote and absent from the caller's local object map.
 

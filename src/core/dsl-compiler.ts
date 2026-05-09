@@ -299,7 +299,13 @@ class Lexer {
     let value = this.advance();
     while (!this.atEnd() && /[A-Za-z0-9_.-]/.test(this.peek())) value += this.advance();
     if (value.length === 1) throw this.error(`invalid ${kind}`, start);
-    this.push(kind, value, start, value);
+    // Coreref ids are stored with the leading `$` ($wiz, $root, ...).
+    // Objref ids are stored without the leading `#`, so strip it here so
+    // `#obj_xxx` literals evaluate to the actual ObjRef. This mirrors the
+    // matcher convention in spec/semantics/match.md §MA2 and lets `examine`
+    // output round-trip through eval.
+    const literal = kind === "objref" ? value.slice(1) : value;
+    this.push(kind, value, start, literal);
   }
 
   private symbol(): void {
