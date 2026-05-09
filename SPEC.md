@@ -91,6 +91,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 Host-facing interfaces for runtime execution, transport, and client bootstrap across local and edge hosts.
 
 - [hosts.md](spec/protocol/hosts.md) — three host classes, task migration, trust boundaries (§3)
+- [host-seeds.md](spec/protocol/host-seeds.md) — host-seed contents and the per-subject merge rule for cross-host reconciliation (HS1–HS5, **draft**)
 - [wire.md](spec/protocol/wire.md) — JSON WebSocket message format (§17)
 - [rest.md](spec/protocol/rest.md) — HTTP+SSE REST API; six endpoints; `$me` (R1–R11)
 - [mcp.md](spec/protocol/mcp.md) — Model Context Protocol surface for LLM agents; dynamic per-location tools (M1–M8)
