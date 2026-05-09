@@ -402,9 +402,12 @@ function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): R
  * assigned by `importWorld`, not authoritative across hosts. Drop
  * `version` because catalog repair / addVerb bump it locally on every
  * idempotent reinstall and the counter accumulates independently across
- * hosts (same trap as PropertyDef.version). The merge already covers
- * authoritative content via source_hash and the metadata fields below;
- * version-only drift is bookkeeping noise, not real divergence. */
+ * hosts (same trap as PropertyDef.version). Drop `bytecode` and
+ * `line_map` because both are derived from `source` — `source_hash`
+ * already covers source identity, and `bytecode.version` carries the
+ * same drifting counter as the verb-level `version`. The merge covers
+ * authoritative divergence via source_hash and the remaining metadata
+ * (aliases, arg_spec, kind/native, calls, perms, owner, flags). */
 function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
@@ -412,7 +415,7 @@ function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
       if (v === true) out[k] = true;
       continue;
     }
-    if (k === "slot" || k === "version") continue;
+    if (k === "slot" || k === "version" || k === "bytecode" || k === "line_map") continue;
     out[k] = v;
   }
   return out;

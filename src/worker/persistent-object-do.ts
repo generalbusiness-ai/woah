@@ -798,6 +798,49 @@ export class PersistentObjectDO {
           if (!recorded && JSON.stringify(a) !== JSON.stringify(b) && diffs.length < MAX) {
             diffs.push({ id: seedObj.id, field: `${f} (only DYNAMIC props differ)` });
           }
+        } else if (f === "verbs") {
+          // Per-verb diff so the driver isn't hidden behind a generic
+          // "verbs" pointer. Reports the first concrete divergence per
+          // mismatched verb: source_hash mismatch (real source drift),
+          // missing on one side, or a specific metadata field
+          // (aliases / arg_spec / perms / owner / kind / calls / flags).
+          // Drops `version`, `slot`, `bytecode`, and `line_map`
+          // (matching normalizeVerbForCompare).
+          const skip = new Set(["version", "slot", "bytecode", "line_map"]);
+          const flagFields = new Set(["direct_callable", "skip_presence_check", "tool_exposed", "pure", "pure_declared"]);
+          const aVerbs = new Map(((a as Array<Record<string, unknown>>) ?? []).map((v) => [String(v.name), v]));
+          const bVerbs = new Map(((b as Array<Record<string, unknown>>) ?? []).map((v) => [String(v.name), v]));
+          const verbNames = new Set<string>([...aVerbs.keys(), ...bVerbs.keys()]);
+          let recorded = false;
+          for (const vn of verbNames) {
+            if (diffs.length >= MAX) break;
+            const av = aVerbs.get(vn);
+            const bv = bVerbs.get(vn);
+            if (!av || !bv) {
+              diffs.push({ id: seedObj.id, field: `verbs.${vn}`, detail: !av ? "stored only" : "seed only" });
+              recorded = true;
+              continue;
+            }
+            // source_hash matches → only inspect non-derived metadata.
+            const hashesMatch = av.source_hash && bv.source_hash && av.source_hash === bv.source_hash;
+            const keys = new Set<string>([...Object.keys(av), ...Object.keys(bv)]);
+            for (const k of keys) {
+              if (skip.has(k)) continue;
+              if (hashesMatch && (k === "source" || k === "source_hash")) continue;
+              if (flagFields.has(k)) {
+                if ((av[k] === true) === (bv[k] === true)) continue;
+              } else {
+                if (JSON.stringify(av[k]) === JSON.stringify(bv[k])) continue;
+              }
+              diffs.push({ id: seedObj.id, field: `verbs.${vn}.${k}` });
+              recorded = true;
+              break;
+            }
+            if (diffs.length >= MAX) break;
+          }
+          if (!recorded && diffs.length < MAX) {
+            diffs.push({ id: seedObj.id, field: `verbs (only ignored fields differ)` });
+          }
         } else if (f === "propertyDefs") {
           // Authoritative def fields only — match the merge's
           // propertyDefEqualIgnoringVersion semantics so cosmetic version
