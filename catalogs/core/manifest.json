@@ -1,0 +1,35 @@
+{
+  "name": "core",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "LambdaCore-shaped utility packages. Catalog code calls into these helpers — `$command_utils:object_match_failed`, etc. — instead of inlining the same notify-and-bail branches per verb. Each helper class mirrors a sibling LambdaCore object (#219 command_utils, #20 string_utils, #3669 object_utils, …); their parent class `$utils` mirrors LambdaCore #288 (Generic Utilities Package). Initial release ports just the verbs we need from $command_utils; sibling packages and additional verbs land as catalog code reaches for them.",
+  "license": "MIT",
+  "depends": ["@local:chat"],
+  "classes": [
+    {
+      "local_name": "$utils",
+      "parent": "$thing",
+      "description": "Marker base for utility singletons — mirrors LambdaCore #288 (Generic Utilities Package). Doesn't carry behavior; subclasses are the actual helper objects ($command_utils, future $string_utils / $object_utils / etc.). Wizard-owned and read-only by convention.",
+      "properties": [
+        { "name": "help_msg", "type": "str|list<str>", "default": "", "perms": "r" }
+      ],
+      "verbs": []
+    },
+    {
+      "local_name": "$command_utils",
+      "parent": "$utils",
+      "description": "LambdaCore $command_utils (#219). Helpers that command verbs lean on so the same notify-and-bail branches don't get inlined into every verb body. Initial port carries only :object_match_failed; the rest of the LambdaCore surface (`:player_match_failed`, `:do_huh`, `:read`, `:yes_or_no`, `:running_out_of_time`, `:explain_syntax`, …) lands as woo verbs need them.",
+      "properties": [],
+      "verbs": [
+        {
+          "name": "object_match_failed",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["match_result", "string"] },
+          "source": "verb :object_match_failed(match_result, string) rxd {\n  // LambdaCore $command_utils:object_match_failed (#219), faithfully\n  // ported. Returns true iff the match was bad (and a message was told\n  // to the actor); returns 0 (false) when match_result is a real object\n  // the caller can proceed with.\n  //\n  // Divergence from LambdaCore (1): the original picks notify vs tell\n  // based on `$perm_utils:controls(caller_perms(), player)`; woo's chat\n  // surface is uniform — `tell(actor, …)` is the one durable-line API,\n  // and `actor` is the calling player by substrate convention. So the\n  // tell-vs-notify branch collapses to `tell(actor, …)`.\n  //\n  // Divergence (2): the original has a special-case for `string` that\n  // begins with `#` (a literal objref like `#-1`) so the message reads\n  // \"#-1 does not exist.\" instead of \"I don't know which `#-1' you\n  // mean.\". woo's matcher returns `#`-prefixed ids only for paste-back\n  // (and the lexer strips `#` to turn them into ObjRef literals — see\n  // dsl-compiler.ts ref()), so the special-case isn't reachable from\n  // ordinary command parsing. The branch is omitted; if a future caller\n  // passes `#xxx` strings, add it back.\n  if (match_result == $nothing) {\n    tell(actor, \"You must give the name of some object.\");\n    return true;\n  }\n  if (match_result == $failed_match) {\n    tell(actor, \"I see no '\" + string + \"' here.\");\n    return true;\n  }\n  if (match_result == $ambiguous_match) {\n    tell(actor, \"I don't know which '\" + string + \"' you mean.\");\n    return true;\n  }\n  return false;\n}"
+        }
+      ]
+    }
+  ]
+}

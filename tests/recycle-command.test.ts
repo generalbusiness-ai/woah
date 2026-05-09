@@ -88,7 +88,7 @@ describe("$builder:@recycle (LambdaCore #630 port)", () => {
     expect(result.op).toBe("result");
     if (result.op !== "result") return;
     const text = findTextObservation(result.observations, "$wiz");
-    expect(text).toMatch(/I don't see 'ghost' here/);
+    expect(text).toMatch(/I see no 'ghost' here/);
   });
 
   it("notifies on $ambiguous_match without recycling either candidate", async () => {
