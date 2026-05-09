@@ -158,4 +158,67 @@ describe("$builder:@recycle (LambdaCore #630 port)", () => {
       throw new Error(`unexpected frame: ${result.op}`);
     }
   });
+
+  it("rejects a non-builder owner via direct call (builder surface gate)", async () => {
+    // The verb is direct_callable, so an owner who isn't a $builder
+    // descendant could otherwise bypass the documented builder-class
+    // surface (catalogs/prog/README.md). The surface gate raises E_PERM
+    // before any matcher work happens.
+    const world = createWorld();
+    const guest = world.auth("guest:non-builder-recycle");
+    expect(world.isDescendantOf(guest.actor, "$builder")).toBe(false);
+    world.createObject({
+      id: "obj_guest_owned",
+      name: "trinket",
+      parent: "$thing",
+      owner: guest.actor,
+      location: guest.actor
+    });
+    world.setProp("obj_guest_owned", "name", "trinket");
+    const denied = await world.directCall(
+      "recycle-deny-owner",
+      guest.actor,
+      "$builder",
+      "recycle_command",
+      ["trinket"]
+    );
+    expect(denied.op).toBe("error");
+    if (denied.op !== "error") return;
+    expect(denied.error.code).toBe("E_PERM");
+    expect(denied.error.message).toMatch(/builder class surface required/);
+    expect(world.objects.has("obj_guest_owned")).toBe(true);
+  });
+
+  it("the parser does not surface @recycle to a non-builder", async () => {
+    // A guest who isn't a builder shouldn't reach @recycle through
+    // command dispatch — the verb only lives on $builder, so a player
+    // not in that parent chain gets the standard "I don't understand"
+    // huh, never the verb body's surface raise.
+    const world = createWorld();
+    const guest = world.auth("guest:non-builder-parser");
+    expect(world.isDescendantOf(guest.actor, "$builder")).toBe(false);
+    world.createObject({
+      id: "obj_guest_parser_owned",
+      name: "trinket",
+      parent: "$thing",
+      owner: guest.actor,
+      location: guest.actor
+    });
+    world.setProp("obj_guest_parser_owned", "name", "trinket");
+    await world.directCall("guest-enter", guest.actor, "the_chatroom", "enter", []);
+    const result = await world.command(
+      "@recycle-parser-deny",
+      guest.id,
+      "the_chatroom",
+      "@recycle trinket"
+    );
+    expect(world.objects.has("obj_guest_parser_owned")).toBe(true);
+    // Either a planner huh or an explicit no-route — but never a successful
+    // recycle observation. Assert by absence: no "recycled." text to the
+    // guest, and no recycle observation in the frame.
+    if (result.op === "result" || result.op === "applied") {
+      const text = findTextObservation(result.observations, guest.actor) ?? "";
+      expect(text).not.toMatch(/recycled\./);
+    }
+  });
 });
