@@ -359,6 +359,79 @@ describe("authoring", () => {
     expect(world.object(programmer.actor).location).toBe("$nowhere");
   });
 
+  it("rejects non-wizard programmer attempting to set or chparent verb owner to another principal", async () => {
+    const world = createWorld();
+    const programmer = world.auth("guest:owner-attack");
+    const actorObj = world.object(programmer.actor);
+    actorObj.owner = programmer.actor;
+    actorObj.flags.programmer = true;
+    world.chparentAuthoredObject("$wiz", programmer.actor, "$programmer");
+
+    const baseCreated = await world.directCall("attack-base", programmer.actor, programmer.actor, "create", ["$thing", { name: "Attack Base" }]);
+    expect(baseCreated.op).toBe("result");
+    const base = (baseCreated.op === "result" ? (baseCreated.result as Record<string, string>).id : "");
+
+    // Install a benign verb the attacker owns.
+    const installed = await world.directCall("attack-install", programmer.actor, programmer.actor, "install_verb", [base, "doit", `verb :doit() rx {
+  return 1;
+}`, {}]);
+    expect(installed.op).toBe("result");
+    expect(world.ownVerb(base, "doit")?.owner).toBe(programmer.actor);
+
+    // Attempt to chown the verb to $wiz via :set_verb_info opts.owner.
+    const escalated = await world.directCall("attack-chown", programmer.actor, programmer.actor, "set_verb_info", [base, "doit", { owner: "$wiz" }]);
+    expect(escalated.op).toBe("error");
+    if (escalated.op === "error") expect(escalated.error.code).toBe("E_PERM");
+    expect(world.ownVerb(base, "doit")?.owner).toBe(programmer.actor);
+
+    // Direct call on the substrate primitive must also reject.
+    expect(() => world.setVerbInfoForActor(programmer.actor, base, "doit", { owner: "$wiz" })).toThrow(expect.objectContaining({ code: "E_PERM" }));
+
+    // add_verb with a non-self owner must also reject for non-wizards.
+    expect(() => world.addVerbForActor(programmer.actor, base, { name: "trap", owner: "$wiz", perms: "rxd" })).toThrow(expect.objectContaining({ code: "E_PERM" }));
+    expect(world.ownVerb(base, "trap")).toBeNull();
+
+    // Foreign-owned verb on an object the programmer owns must be uneditable.
+    // Wizard installs `:guard` owned by $wiz on the programmer's base.
+    world.addVerb(base, {
+      kind: "bytecode",
+      name: "guard",
+      aliases: [],
+      owner: "$wiz",
+      perms: "rx",
+      arg_spec: {},
+      source: `verb :guard() rx {
+  return task_perms();
+}`,
+      source_hash: "",
+      bytecode: { ops: [["BUILTIN", "task_perms", 0], ["RETURN"]], literals: [], num_locals: 0, max_stack: 1, version: 1 },
+      version: 1,
+      line_map: {},
+      direct_callable: false
+    });
+
+    // set_verb_code on the foreign verb must reject — without this gate, the
+    // attacker could replace the body and have it dispatch as $wiz.
+    expect(() => world.setVerbCodeForActor(programmer.actor, base, "guard", `verb :guard() rx { return 1; }`)).toThrow(expect.objectContaining({ code: "E_PERM" }));
+    // Source is unchanged.
+    expect(world.ownVerb(base, "guard")?.source).toContain("return task_perms()");
+
+    // set_verb_info must also reject — perms / aliases / direct_callable
+    // changes on a foreign-owned verb still let the verb survive with
+    // its foreign progr.
+    expect(() => world.setVerbInfoForActor(programmer.actor, base, "guard", { perms: "rxd" })).toThrow(expect.objectContaining({ code: "E_PERM" }));
+    expect(world.ownVerb(base, "guard")?.direct_callable).toBe(false);
+
+    // Catalog path also rejects; install_verb internally calls set_verb_code
+    // which now gates on verb owner.
+    const catalogAttack = await world.directCall("attack-catalog", programmer.actor, programmer.actor, "install_verb", [base, "guard", `verb :guard() rx {
+  return 1;
+}`, {}]);
+    expect(catalogAttack.op).toBe("error");
+    if (catalogAttack.op === "error") expect(catalogAttack.error.code).toBe("E_PERM");
+    expect(world.ownVerb(base, "guard")?.source).toContain("return task_perms()");
+  });
+
   it("compiles string interpolation and dynamic index get/set", async () => {
     const { world, session, actor } = authedWorld();
     const source = `verb :index_and_interp(name, value) rx {

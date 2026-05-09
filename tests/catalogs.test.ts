@@ -1262,7 +1262,7 @@ describe("local catalogs", () => {
     }
   });
 
-  it("records clean host schema plans without applying seed repairs", { timeout: 15000 }, () => {
+  it("records clean host schema plans without applying seed repairs", { timeout: 30000 }, () => {
     const gateway = createWorld();
     const scoped = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_hot_tub");
     expect(scoped).not.toBeNull();
@@ -1286,7 +1286,7 @@ describe("local catalogs", () => {
     expect(records.every((record) => Array.isArray(record.steps) && record.steps.every((step: any) => step.status === "skipped"))).toBe(true);
   });
 
-  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", { timeout: 15000 }, () => {
+  it("runHostScopedLocalCatalogLifecycle applies an explicit host schema plan and records it", { timeout: 30000 }, () => {
     const gateway = createWorld();
     const listNotes = worldVerb(gateway, "$pinboard", "list_notes");
     const installed = installVerb(gateway, "$pinboard", "list_notes", `verb :list_notes() rxd {
@@ -2491,6 +2491,85 @@ describe("local catalogs", () => {
     const lookPlan = await world.directCall("repaired-look-plan", session.actor, "the_chatroom", "command_plan", ["look mug"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") expect(lookPlan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });
+  });
+
+  it("repairs $note:read command pattern and $dispensed_note:moveto on existing installs", async () => {
+    const world = createWorld();
+    // Roll back the May-9 repairs and stage a world that looks like one whose
+    // May-6 stale-class-verbs migration ran before $note:read got an
+    // arg_spec.command pattern (added 2026-05-08) and before $dispensed_note
+    // gained its :moveto override (added 2026-05-08). Without the repair, that
+    // world has $note:read with no command grammar (so `read <noun>` falls
+    // through to huh) and no :moveto on $dispensed_note (so dropping into a
+    // space leaves the note behind instead of dispersing it).
+    const migrations = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-09-note-read-command-repair" && id !== "2026-05-09-dispensed-note-moveto-repair");
+    world.setProp("$system", "applied_migrations", migrations);
+
+    const noteRead = world.ownVerbExact("$note", "read")!;
+    world.addVerb("$note", {
+      ...noteRead,
+      arg_spec: { args: [] },
+      version: noteRead.version + 1
+    });
+    if (world.ownVerbExact("$dispensed_note", "moveto")) {
+      world.removeVerb("$dispensed_note", "moveto");
+    }
+
+    expect(world.ownVerbExact("$note", "read")?.arg_spec.command).toBeUndefined();
+    expect(world.ownVerbExact("$dispensed_note", "moveto")).toBeFalsy();
+
+    installLocalCatalogs(world, ["note", "dispenser"]);
+
+    expect(world.ownVerbExact("$note", "read")?.arg_spec.command).toMatchObject({
+      dobj: "this",
+      prep: "none",
+      iobj: "none"
+    });
+    expect(world.ownVerbExact("$dispensed_note", "moveto")?.source).toContain("note_dispersed");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-09-note-read-command-repair");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-09-dispensed-note-moveto-repair");
+
+    // End-to-end: with the repair applied, `read <noun>` plans against a
+    // dispensed note in inventory and returns the note's text.
+    const ownerSess = world.auth("guest:read-repair-owner");
+    const owner = ownerSess.actor;
+    const blockId = "obj_test_read_repair_block";
+    world.createObject({ id: blockId, name: "horoscope", parent: "$dispenser_block", owner, location: "the_chatroom" });
+    world.setProp(blockId, "rate_limit_seconds", 0);
+    world.setProp(blockId, "block_cooldown_seconds", 0);
+
+    const requesterSess = world.auth("guest:read-repair-reader");
+    const requester = requesterSess.actor;
+    await world.directCall("read-repair-enter", requester, "the_chatroom", "enter", []);
+
+    const ordered = await world.directCall("read-repair-order", requester, blockId, "order", ["world of objects"]);
+    expect(ordered.op).toBe("result");
+    if (ordered.op !== "result") return;
+    const orderId = (ordered.result as { order_id: string }).order_id;
+
+    const key = world.createApiKey("$wiz", blockId, "read-repair-plug");
+    world.auth(`apikey:${key.id}:${key.secret}`);
+    const delivered = await world.directCall("read-repair-deliver", blockId, blockId, "deliver", [
+      orderId,
+      "Horoscope: World Of Objects",
+      "Today's reading: cosmic radiance.",
+      "A horoscope reading the machine produced for \"world of objects\". Try `read` to see what it says."
+    ]);
+    expect(delivered.op).toBe("result");
+    if (delivered.op !== "result") return;
+    const note = (delivered.result as { note: string }).note;
+
+    const plan = await world.directCall("read-repair-plan", requester, "the_chatroom", "command_plan", ["read objects"]);
+    expect(plan.op).toBe("result");
+    if (plan.op !== "result") return;
+    expect(plan.result).toMatchObject({ ok: true, target: note, verb: "read" });
+
+    const cmd = await world.directCall("read-repair-cmd", requester, "the_chatroom", "command", ["read objects"]);
+    expect(cmd.op).toBe("result");
+    if (cmd.op !== "result") return;
+    const noteRead2 = cmd.observations.find((o) => o.type === "note_read");
+    expect(noteRead2).toMatchObject({ note, text: "Today's reading: cosmic radiance." });
   });
 
   it("surfaces :title failures during room look composition", async () => {

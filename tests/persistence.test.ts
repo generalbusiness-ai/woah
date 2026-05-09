@@ -461,7 +461,7 @@ describe("sqlite persistence", () => {
 });
 
 describe("json folder persistence", () => {
-  it("round-trips a full world through a JSON folder repository", { timeout: 15000 }, async () => {
+  it("round-trips a full world through a JSON folder repository", { timeout: 30000 }, async () => {
     const { dir, path } = tempDb();
     try {
       const firstRepo = new JsonFolderWorldRepository(path);

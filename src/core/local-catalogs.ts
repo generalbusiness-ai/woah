@@ -69,6 +69,12 @@ const LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-note-stale-cl
 const LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-pinboard-stale-class-verbs";
 const LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-dispenser-stale-class-verbs";
 const LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION = "2026-05-08-tasks-transparent-feature";
+// Re-reconcile note + dispenser class verbs after May-8 manifest changes that
+// the May-6 stale-class-verbs migrations missed: $note:read got an arg_spec
+// .command pattern (so `read <noun>` parses), and $dispensed_note gained a
+// :moveto override that disperses the note when dropped into a $space.
+const LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION = "2026-05-09-note-read-command-repair";
+const LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION = "2026-05-09-dispensed-note-moveto-repair";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -117,7 +123,13 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DROP_PRESENCE_IN_PROPERTY_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_ROOM_EXITS_RESTORE_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_ROOM_LEAVE_FILTER_MIGRATION, only: "chat" },
-  { id: LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION, only: "tasks" }
+  { id: LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION, only: "tasks" },
+  { id: LOCAL_CATALOG_NOTE_TEXT_STRING_SHAPE_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, only: "pinboard" },
+  { id: LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, only: "dispenser" },
+  { id: LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, only: "note" },
+  { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -342,6 +354,8 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runTasksTransparentFeatureMigration(world, names);
+  run(LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
+  run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   return covered;
 }
 

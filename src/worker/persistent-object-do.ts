@@ -650,6 +650,9 @@ export class PersistentObjectDO {
     let seedMergeChanged = false;
     if (scoped && freshSeed) {
       const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed);
+      if (merged.changed) {
+        this.logHostSeedMergeDiff(hostKey, "load", scoped, freshSeed);
+      }
       scoped = merged.world;
       seedMergeChanged = merged.changed;
     }
@@ -660,8 +663,10 @@ export class PersistentObjectDO {
     // slice. The gateway cannot convert state it does not own.
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
     if (freshSeed) {
-      const seeded = mergeHostScopedSeedWithStatus(world.exportWorld(), freshSeed);
+      const exported = world.exportWorld();
+      const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed);
       if (seeded.changed) {
+        this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed);
         world.importWorld(seeded.world);
         seedMergeChanged = true;
       }
@@ -688,6 +693,74 @@ export class PersistentObjectDO {
       }
       try { world.setProp(id, "_subscribers_scrubbed_v1", true); } catch { /* read-only */ }
     }
+  }
+
+  // Diagnostic for the cold-load write-treadmill: when the cold-load seed
+  // merge declares `changed: true` we re-do a manual diff and log the first
+  // few (object, field) pairs so we can identify which class/instance is
+  // drifting between gateway state and on-disk slice. Cheap, single-shot per
+  // cold-load. Remove once the source is identified.
+  private logHostSeedMergeDiff(
+    hostKey: ObjRef,
+    phase: "load" | "post_lifecycle",
+    storedWorld: SerializedWorld,
+    seedWorld: SerializedWorld
+  ): void {
+    const DYNAMIC = new Set([
+      "next_seq", "subscribers", "operators", "last_snapshot_seq", "focus_list",
+      "bootstrap_token_used", "wizard_actions", "applied_migrations",
+      "catalog_migration_records", "installed_catalogs"
+    ]);
+    const stored = new Map(storedWorld.objects.map((o) => [o.id, o]));
+    const fields = ["modified", "verbs", "propertyDefs", "propertyVersions", "properties", "flags", "children", "contents", "eventSchemas", "name", "parent", "owner", "anchor"] as const;
+    const diffs: Array<{ id: string; field: string; detail?: string }> = [];
+    const MAX = 12;
+    for (const seedObj of seedWorld.objects) {
+      const cur = stored.get(seedObj.id);
+      if (!cur) {
+        if (diffs.length < MAX) diffs.push({ id: seedObj.id, field: "<missing-in-stored>" });
+        continue;
+      }
+      for (const f of fields) {
+        if (diffs.length >= MAX) break;
+        const a = (cur as unknown as Record<string, unknown>)[f];
+        const b = (seedObj as unknown as Record<string, unknown>)[f];
+        if (JSON.stringify(a) === JSON.stringify(b)) continue;
+        if (f === "properties" || f === "propertyVersions") {
+          const aMap = new Map((a as Array<[string, unknown]>) ?? []);
+          const bMap = new Map((b as Array<[string, unknown]>) ?? []);
+          const names = new Set<string>([...aMap.keys(), ...bMap.keys()]);
+          let recorded = false;
+          for (const n of names) {
+            if (DYNAMIC.has(n)) continue;
+            if (JSON.stringify(aMap.get(n)) === JSON.stringify(bMap.get(n))) continue;
+            diffs.push({
+              id: seedObj.id,
+              field: `${f}.${n}`,
+              detail: f === "propertyVersions"
+                ? `stored=${aMap.get(n) ?? "∅"} seed=${bMap.get(n) ?? "∅"}`
+                : `stored_has=${aMap.has(n)} seed_has=${bMap.has(n)}`
+            });
+            recorded = true;
+            if (diffs.length >= MAX) break;
+          }
+          if (!recorded && JSON.stringify(a) !== JSON.stringify(b) && diffs.length < MAX) {
+            diffs.push({ id: seedObj.id, field: `${f} (only DYNAMIC props differ)` });
+          }
+        } else {
+          diffs.push({ id: seedObj.id, field: f });
+        }
+      }
+    }
+    console.log("woo.host_seed_merge_diff", JSON.stringify({
+      host: hostKey,
+      phase,
+      stored_objects: storedWorld.objects.length,
+      seed_objects: seedWorld.objects.length,
+      diffs: diffs.slice(0, MAX),
+      truncated: diffs.length > MAX,
+      ts: Date.now()
+    }));
   }
 
   private async fetchHostSeed(hostKey: ObjRef): Promise<SerializedWorld> {

@@ -20,6 +20,8 @@ const IMPURE_BUILTIN_NAMES: ReadonlySet<string> = new Set([
   "programmer_eval",
   "editor_invoke", "editor_replace", "editor_insert", "editor_delete",
   "editor_save", "editor_pause", "editor_abort",
+  "add_verb", "delete_verb", "set_verb_info", "set_verb_code",
+  "add_property", "delete_property", "set_property_info", "clear_property",
   // dispatch/execute_command_plan call into other verbs whose purity we
   // can't classify from this verb's bytecode alone — conservatively impure.
   "dispatch", "execute_command_plan"
@@ -949,5 +951,25 @@ const VALID_BUILTINS = new Set([
   "editor_dry_run",
   "editor_save",
   "editor_pause",
-  "editor_abort"
+  "editor_abort",
+  "parents",
+  "children",
+  "valid",
+  "verbs",
+  "verb_info",
+  "verb_code",
+  "add_verb",
+  "delete_verb",
+  "set_verb_info",
+  "set_verb_code",
+  "compile_verb",
+  "properties",
+  "property_info",
+  "add_property",
+  "delete_property",
+  "set_property_info",
+  "clear_property",
+  "is_clear_property",
+  "authoring_inspect",
+  "authoring_search"
 ]);

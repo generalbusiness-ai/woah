@@ -603,8 +603,14 @@ async function logout() {
   // prefs, etc.) so the next login starts clean. Keep `woo.username` so the
   // form pre-fills.
   clearAccountScopedStorage();
-  // Reload to drop module-level state (framework caches, pending maps, audio,
-  // chatHistory) without needing to enumerate every field.
+  // Reset the URL so the next session doesn't reopen the previous user's
+  // object path. Reload to drop module-level state (framework caches, pending
+  // maps, audio, chatHistory) without needing to enumerate every field.
+  try {
+    history.replaceState({}, "", "/");
+  } catch {
+    // ignore
+  }
   location.reload();
 }
 
@@ -2206,13 +2212,13 @@ function render() {
   app.innerHTML = `
     <div class="shell ${state.observationsCollapsed ? "observations-collapsed" : ""}">
       <aside class="nav">
-        <div class="brand">Woo</div>
-        <div class="actor">${escapeHtml(state.actor ?? "connecting...")}</div>
+        <div class="brand">${escapeHtml(state.actor ? actorLabel(state.actor) : "connecting...")}</div>
+        <div class="actor">${escapeHtml(state.actor ?? "")}</div>
         ${navButton("chat", "Chat")}
         ${navButton("dubspace", "Dubspace")}
         ${navButton("pinboard", "Pinboard")}
         ${navButton("tasks", "Tasks")}
-        ${navButton("ide", "IDE")}
+        ${navButton("ide", "Inspector")}
         <a class="github-link" href="https://github.com/hughpyle/woo" target="_blank" rel="noopener noreferrer" aria-label="woo on GitHub" title="woo on GitHub">
           <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
@@ -2249,7 +2255,10 @@ function renderLogin() {
   app.innerHTML = `
     <div class="login-shell">
       <form class="login-card" data-login-form autocomplete="on">
-        <h1 class="login-brand">world of objects</h1>
+        <div class="login-brand">
+          <h1 class="login-brand-name">woo</h1>
+          <p class="login-brand-tagline">World of Objects</p>
+        </div>
         <button type="button" class="login-guest" data-login-guest ${pending ? "disabled" : ""}>
           ${pending ? "Connecting..." : "Continue as guest"}
         </button>
@@ -2495,7 +2504,6 @@ function bindDubspaceComponentEvents(element: WooElement) {
   if (element.dataset.dubspaceEventsBound === "true") return;
   element.dataset.dubspaceEventsBound = "true";
   element.addEventListener("woo-dubspace-enter", enterDubspace);
-  element.addEventListener("woo-dubspace-leave", () => leaveDubspace());
   element.addEventListener("woo-dubspace-audio", async () => {
     audio ??= new DubAudio();
     if (state.audioOn) {
@@ -3314,14 +3322,6 @@ function setCurrentChatRoom(room: string) {
   syncUrlFromCurrentState("replace");
 }
 
-function applyChatLeaveResult(leftRoom: string, result: any) {
-  applyScopedMoveResult(result);
-  const nextRoom = typeof result?.room === "string" ? result.room : "";
-  if (leftRoom && nextRoom && leftRoom !== nextRoom) pushChatSeparator(leftRoom, false);
-  if (nextRoom) setCurrentChatRoom(nextRoom);
-  setChatPresent(result);
-}
-
 function renderChat() {
   const tag = chatFrameComponentTag();
   if (!tag) return `<section class="panel"><p class="empty-state">No chat UI is registered for this room.</p></section>`;
@@ -3439,15 +3439,6 @@ function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData })
   if (element.dataset.chatEventsBound === "true") return;
   element.dataset.chatEventsBound = "true";
   element.addEventListener("woo-chat-enter", enterChat);
-  element.addEventListener("woo-chat-leave", () => {
-    const room = chatRoom();
-    if (!room) return;
-    direct(room, "leave", [], (result) => {
-      applyChatLeaveResult(room, result);
-      if (state.tab === "chat") render();
-    }, receiveChatError);
-  });
-  element.addEventListener("woo-chat-look", refreshChatLook);
   element.addEventListener("woo-chat-draft", (event) => {
     const value = String((event as CustomEvent<{ value?: unknown }>).detail?.value ?? "");
     state.chatDraft = value;
@@ -3659,12 +3650,6 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
   }
   void originalText;
   void result;
-}
-
-function refreshChatLook() {
-  const room = activeChatRoom();
-  if (!room) return;
-  direct(room, "look", [], applyLookResult, receiveChatError);
 }
 
 function applyLookResult(result: any) {
@@ -3944,11 +3929,6 @@ function bindPinboardComponentEvents(element: WooElement) {
   if (element.dataset.pinboardEventsBound === "true") return;
   element.dataset.pinboardEventsBound = "true";
   element.addEventListener("woo-pinboard-enter", enterPinboard);
-  element.addEventListener("woo-pinboard-leave", () => {
-    leavePinboard(() => {
-      setTab("chat", { mode: "push", leaveCurrent: false });
-    });
-  });
   element.addEventListener("woo-pinboard-create", (event) => {
     const detail = (event as CustomEvent<{ text?: unknown; color?: unknown }>).detail ?? {};
     const text = String(detail.text ?? state.pinboardNewText).trim();
@@ -4675,7 +4655,7 @@ function renderIde() {
     : "";
   return `
     <section class="toolbar">
-      <h1>IDE</h1>
+      <h1>Inspector</h1>
       <select data-object-select>${objects.map((id) => `<option value="${escapeHtml(id)}" ${id === state.selectedObject ? "selected" : ""}>${escapeHtml(id)}</option>`).join("")}</select>
       <button data-refresh-object>Inspect</button>
     </section>

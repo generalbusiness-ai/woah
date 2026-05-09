@@ -98,7 +98,6 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
     this.innerHTML = `
       <section class="toolbar dubspace-toolbar">
         <h1>${escapeHtml(data.spaceName || "Dubspace")}</h1>
-        <button data-dubspace-leave>Leave</button>
         <button class="${data.audioOn ? "active" : ""}" data-audio aria-pressed="${data.audioOn}">Audio ${data.audioOn ? "On" : "Off"}</button>
         <button data-save-scene>Save Scene</button>
         <button data-recall-scene>Recall Scene</button>
@@ -191,7 +190,6 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
 
   private bind(): void {
     this.querySelector<HTMLButtonElement>("[data-dubspace-enter]")?.addEventListener("click", () => this.dispatch("enter"));
-    this.querySelector<HTMLButtonElement>("[data-dubspace-leave]")?.addEventListener("click", () => this.dispatch("leave"));
     this.querySelector<HTMLButtonElement>("[data-audio]")?.addEventListener("click", () => this.dispatch("audio"));
     this.querySelectorAll<HTMLButtonElement>("[data-loop]").forEach((button) => {
       button.addEventListener("click", () => this.dispatch("loop", { slot: button.dataset.loop ?? "", playing: button.dataset.playing === "true" }));

@@ -142,7 +142,16 @@ const BUILTINS = new Set([
   "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
   "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
   "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace", "programmer_eval",
-  "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort"
+  "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
+  // Read-only authoring primitives (LambdaMOO-shape introspection).
+  "parents", "children", "valid", "verbs", "verb_info", "verb_code",
+  // Verb mutation primitives + pure compile_verb.
+  "add_verb", "delete_verb", "set_verb_info", "set_verb_code", "compile_verb",
+  // Property primitives.
+  "properties", "property_info", "add_property", "delete_property", "set_property_info",
+  "clear_property", "is_clear_property",
+  // Authoring aggregations.
+  "authoring_inspect", "authoring_search"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 
@@ -290,7 +299,13 @@ class Lexer {
     let value = this.advance();
     while (!this.atEnd() && /[A-Za-z0-9_.-]/.test(this.peek())) value += this.advance();
     if (value.length === 1) throw this.error(`invalid ${kind}`, start);
-    this.push(kind, value, start, value);
+    // Coreref ids are stored with the leading `$` ($wiz, $root, ...).
+    // Objref ids are stored without the leading `#`, so strip it here so
+    // `#obj_xxx` literals evaluate to the actual ObjRef. This mirrors the
+    // matcher convention in spec/semantics/match.md §MA2 and lets `examine`
+    // output round-trip through eval.
+    const literal = kind === "objref" ? value.slice(1) : value;
+    this.push(kind, value, start, literal);
   }
 
   private symbol(): void {
