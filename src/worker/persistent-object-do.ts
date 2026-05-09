@@ -624,7 +624,23 @@ export class PersistentObjectDO {
     if (coldInitStart !== null) {
       world.recordMetric({ kind: "init", phase: "world", ms: Date.now() - coldInitStart });
     }
-    if (hostKey === WORLD_HOST) await this.registerObjectRoutes(world);
+    if (hostKey === WORLD_HOST) {
+      await this.registerObjectRoutes(world);
+    } else {
+      // Satellite cold-load: populate publishedRoutes from the local
+      // slice without firing register-objects RPCs. The gateway
+      // registers routes during its own cold-load and during catalog
+      // install; satellites trust the gateway's registrations and only
+      // need the in-memory cache so adoptLocalObjectRoute /
+      // registerRoutes can short-circuit. Without this, every routed
+      // verb call after wake fired a 1-route RPC even though the
+      // directory already knew the route — observed as ~17 single
+      // register-objects calls per walkaround on every satellite.
+      for (const route of world.objectRoutes()) {
+        this.publishedRoutes.set(route.id, route.host);
+        this.routeCache.set(route.id, route.host);
+      }
+    }
     return world;
   }
 
