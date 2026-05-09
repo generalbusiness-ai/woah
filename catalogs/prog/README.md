@@ -69,42 +69,94 @@ itself. The normal `tool_exposed` mechanism lists each inherited surface.
 
 The catalog ships once these are in place:
 
-1. **Engine builtins**, with authority checked against the invoking actor and
-   the wrapper verb's definer, not the wrapper verb's `progr`. When this catalog
-   is installed by `$wiz`, `progr` is `$wiz` for every wrapper call; using it as
-   authority would be a privilege escalation bug. The core builtin does not
-   hardcode `$builder` or `$programmer`; it requires the actor to inherit the
-   class that actually defined the wrapper verb.
+1. **Substrate primitives plus catalog wrappers.** The wrapper verbs in
+   `$builder` and `$programmer` enforce surface-class authority against the
+   invoking actor (not the wrapper verb's `progr`, which is `$wiz` because
+   the catalog is wizard-installed — using it as authority would be a
+   privilege escalation bug). After the P1 layering pass, most wrappers
+   reach the substrate through lower-level primitives rather than through
+   builder/programmer-shaped builtins.
 
-   Builder builtins:
+   Engine builtins that survive in core (universal substrate primitives,
+   not wrapper-shaped):
 
-   - `builder_create_object(parent, opts)`
-   - `builder_chparent(id, parent, opts)` — `opts.dry_run=true` is the
-     LambdaCore `@check-chparent` shape
-   - `recycle(id, opts)` — universal builtin. RC2 (wizard or owner of `id`)
-     gates authority on the calling `progr`. `opts.dry_run=true` returns the
-     impact set without mutation; `opts.force=true` bypasses the §RC3a
-     empty-children safety check; `opts.force_reserved=true` (wizard only)
-     bypasses the §RC6 reserved-list and terminates live actor sessions.
-   - `builder_set_property(id, name, value, opts)` — ordinary data value only
-   - `builder_inspect(id, opts)` — no source output
-   - `builder_search(query, opts)` — object/property channels only
+   - `create(parent, opts?)` — substrate object creation; auth via
+     `assertCanCreateObject` (programmer flag required)
+   - `chparent(obj, parent)` — substrate parent change; same auth tier
+   - `recycle(id, opts?)` — universal RC2-gated recycle (wizard or owner
+     of `id`); `opts.dry_run=true` returns the impact set without mutation;
+     `opts.force=true` bypasses the §RC3a empty-children safety check;
+     `opts.force_reserved=true` (wizard only) bypasses the §RC6 reserved-list
+     and terminates live actor sessions
+   - `verbs(obj)` / `verb_info(obj, descriptor)` / `verb_code(obj, descriptor)` —
+     read-only LambdaMOO-shape verb introspection
+   - `add_verb(obj, info)` / `delete_verb(obj, descriptor)` /
+     `set_verb_info(obj, descriptor, info)` /
+     `set_verb_code(obj, descriptor, source)` — verb mutation primitives
+   - `compile_verb(source)` — pure compile for editor preview
+   - `properties(obj)` / `property_info(obj, name)` — property
+     introspection; `property_info` returns both the def `version` and the
+     per-write `value_version` so callers can do optimistic-concurrency
+     checks on writes
+   - `add_property` / `delete_property` / `set_property_info` /
+     `clear_property` / `is_clear_property` — property mutation primitives
+   - `authoring_inspect(obj, opts, includeSource)` /
+     `authoring_search(query, opts, includeSource)` — bounded
+     introspection/search aggregations the catalog drives
+   - `set_object_name(obj, name)` — keeps `WooObject.name` and the
+     inherited `name` property in lockstep
+   - `is_remote_object(obj)` — async cross-host detector; the catalog
+     uses it to refuse cross-host writes with `E_CROSS_HOST_WRITE` before
+     any subsequent property/verb call
 
-   Programmer builtins:
+   Engine builtins still in core for layering reasons (woocode-ward in time):
 
-   - `programmer_inspect(id, opts)` — source-aware, read-filtered
-   - `programmer_resolve_verb(id, descriptor)`
-   - `programmer_list_verb(id, descriptor, opts)` — readable source and
-     metadata for one slot; no bytecode
-   - `programmer_search(query, opts)` — may include readable source
-   - `programmer_install_verb(id, descriptor, source, opts)` — refuses
-     `opts.perms`; source header is canonical; `opts.dry_run=true` validates
-     the exact install without mutation
-   - `programmer_set_verb_info(id, descriptor, opts)` — metadata-only edit for
-     aliases, arg spec, direct/tool exposure, and permission bits
-   - `programmer_set_property_info(id, name, opts)`
-   - `edit_verb(id, descriptor, opts)` — door into `the_verb_editor`
-   - `programmer_trace(id, verb, opts)` — v1.1
+   - `builder_create_object(parent, opts)` — bypasses
+     `assertCanCreateObject`'s programmer-flag requirement so builder-class
+     actors without a programmer flag can still build. Moving this to
+     woocode requires a substrate auth relaxation; tracked separately.
+   - `builder_chparent(id, parent, opts)` — same auth-bypass story;
+     `opts.dry_run=true` is the LambdaCore `@check-chparent` shape.
+   - `programmer_eval(source, opts)` — needs a substrate-level
+     `CallContext` rewrite (`progr = caller`) plus `withBehaviorSavepoint`
+     for full rollback on runtime error. The `progr` swap is the real
+     substrate work; the wrapper around it is small and woocode-able once
+     a `dispatch_as(actor, code)` primitive exists.
+   - `editor_invoke` / `editor_view` / `editor_what` / `editor_replace` /
+     `editor_insert` / `editor_delete` / `editor_dry_run` / `editor_save` /
+     `editor_pause` / `editor_abort` — editor-room session machinery that
+     operates on the editor's `sessions` map property. All ten are
+     candidates to move to woocode (P4 in the layering plan); held in
+     core for now.
+
+   Behavior moved out of core into catalog Woo source (was native
+   builtins before P1; tombstoned in `BUILTIN_NAMES` to keep numeric
+   indices stable per spec/semantics/builtins.md §19):
+
+   - `builder_set_property` — `$builder:set_property` and `$builder:@set`
+     now reach the substrate through `is_remote_object` →
+     `property_info` → actor-side `canWriteProperty` mirror → `SET_PROP`
+     opcode (`obj.(name) = value`). The four guarantees the old builtin
+     enforced (cross-host refusal, no auto-create, opts.expected_version,
+     actor-side write-perm) are inline in the catalog source.
+   - `builder_inspect` / `builder_search` / `programmer_inspect` /
+     `programmer_search` — the catalog calls `authoring_inspect` /
+     `authoring_search` directly with the `includeSource` flag controlled
+     by the calling surface.
+   - `programmer_resolve_verb` / `programmer_list_verb` — the catalog
+     `:resolve_verb` / `:list_verb` verbs walk the parent chain inline
+     and call `verb_info` + `verb_code` for the data.
+   - `programmer_install_verb` — `$programmer:install_verb` calls
+     `compile_verb` + `add_verb` + `set_verb_code` directly. The full
+     dry-run / mode (upsert / define / set_code) / opts.perms-rejection
+     pipeline is inline in the catalog source.
+   - `programmer_set_verb_info` — `$programmer:set_verb_info` wraps the
+     `set_verb_info` builtin with the same dry-run + version-check shell.
+   - `programmer_set_property_info` — `$programmer:set_property_info`
+     drives the `add_property` / `delete_property` / `set_property_info`
+     primitives with the upsert / define / update / delete mode logic.
+   - `programmer_trace` — `$programmer:trace` raises `E_NOT_IMPLEMENTED`
+     directly until v1.1 wires source-span tracing.
 
 2. **LambdaCore-aligned command semantics**:
    - public wrappers behave like LambdaCore's task-permission helpers: the
@@ -235,9 +287,11 @@ LambdaCore also treats source install as a two-step workflow: define the verb's
 metadata (`@verb`) and then install code (`@program`). Verbs are addressed by
 name for convenience or by 1-based verb number when duplicate names/arg specs
 make a name ambiguous. MCP can present a single `install_verb` tool for the
-common case, but the engine builtin still needs separate modes for define-only,
-set-code-only, and upsert so agents do not accidentally rewrite metadata when
-they meant only to reprogram a body. Metadata-only edits live behind
+common case, but the catalog `$programmer:install_verb` verb still carries
+separate modes for define-only, set-code-only, and upsert so agents do not
+accidentally rewrite metadata when they meant only to reprogram a body — the
+mode logic is woocode driving the underlying `compile_verb` / `add_verb` /
+`set_verb_code` substrate primitives. Metadata-only edits live behind
 `set_verb_info`, so `@args` and `@chmod`-style operations do not require a
 source reinstall.
 
@@ -247,7 +301,12 @@ The actor object is always in MCP reachability. Agents do not focus a separate
 tool object; they inherit the tools. Reparent an actor to `$builder` to expose
 builder verbs. Reparent an actor to `$programmer` to expose programmer verbs.
 Granting the `programmer` flag is a separate act: without it, the programmer
-verbs are visible but source-authoring builtins return `E_PERM`.
+verbs are visible but the source-authoring substrate primitives they call
+(`add_verb`, `set_verb_code`, `add_property`, `delete_property`, etc.) return
+`E_PERM` because `assertCanAuthorObject` requires programmer authority. The
+catalog wrapper's surface gate also rejects non-programmer-flagged actors
+explicitly so the error surfaces at the catalog layer rather than as a
+substrate failure.
 
 ## Editor Rooms
 
