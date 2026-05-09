@@ -676,7 +676,7 @@ export class PersistentObjectDO {
     if (scoped && freshSeed) {
       const merged = mergeHostScopedSeedWithStatus(scoped, freshSeed, hostKey);
       if (merged.changed) {
-        this.logHostSeedMergeDiff(hostKey, "load", scoped, freshSeed);
+        this.logHostSeedMergeDiff(hostKey, "load", scoped, freshSeed, merged.reasons);
       }
       scoped = merged.world;
       seedMergeChanged = merged.changed;
@@ -684,14 +684,12 @@ export class PersistentObjectDO {
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
     const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook, persist: stored === null });
-    // Run local catalog schema/data migration plans on this host's actual
-    // slice. The gateway cannot convert state it does not own.
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
     if (freshSeed) {
       const exported = world.exportWorld();
       const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed, hostKey);
       if (seeded.changed) {
-        this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed);
+        this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed, seeded.reasons);
         world.importWorld(seeded.world);
         seedMergeChanged = true;
       }
@@ -729,7 +727,8 @@ export class PersistentObjectDO {
     hostKey: ObjRef,
     phase: "load" | "post_lifecycle",
     storedWorld: SerializedWorld,
-    seedWorld: SerializedWorld
+    seedWorld: SerializedWorld,
+    reasons: Array<{ id: ObjRef; reasons: string[] }> | undefined
   ): void {
     // Mirror the merge's DYNAMIC_HOST_SEED_PROPERTIES so the diagnostic
     // reports the same set of property names the merge ignores. Any name
@@ -866,11 +865,20 @@ export class PersistentObjectDO {
         }
       }
     }
+    // The merge itself records WHICH field on which object drove the
+    // change (mergeSeedObject's reasons sink). Surface those alongside
+    // the older field-shape diff: the reasons are authoritative ("this
+    // is exactly what triggered changed=true"), the diff is exploratory
+    // ("here's the broader shape of the disagreement"). When the two
+    // disagree the reasons are right.
+    const reasonsTrimmed = (reasons ?? []).slice(0, 12).map((r) => ({ id: r.id, reasons: r.reasons.slice(0, 4) }));
     console.log("woo.host_seed_merge_diff", JSON.stringify({
       host: hostKey,
       phase,
       stored_objects: storedWorld.objects.length,
       seed_objects: seedWorld.objects.length,
+      reasons: reasonsTrimmed,
+      reason_count: (reasons ?? []).length,
       diffs: diffs.slice(0, MAX),
       truncated: diffs.length > MAX,
       ts: Date.now()

@@ -269,6 +269,13 @@ export function nonEmptyHostScopedWorld(serialized: SerializedWorld, host: ObjRe
 export type HostScopedSeedMergeResult = {
   world: SerializedWorld;
   changed: boolean;
+  /** Per-object reasons captured during merge — empty when changed=false.
+   * Each entry names the object id and up to ~8 specific field paths
+   * (e.g. `verbs[name.calls (deep)]`, `propertyDefs.foo(replace)`,
+   * `properties.bar(delete)`) that drove the change. Surfaced via the
+   * `host_seed_merge_diff` diagnostic so cold-load write churn is
+   * traceable to the exact field instead of a generic field-name pointer. */
+  reasons?: Array<{ id: ObjRef; reasons: string[] }>;
 };
 
 export function mergeHostScopedSeed(stored: SerializedWorld, seed: SeedWorld, receiverHost: ObjRef): SerializedWorld {
@@ -296,26 +303,25 @@ export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: See
   const additions: SerializedObject[] = []; // never-seen-before subjects
   const newTombstones: ObjRef[] = []; // ids to add to stored.tombstones
   const removeIds = new Set<ObjRef>(); // ids whose stub HS4 retires
+  const reasonLog: Array<{ id: ObjRef; reasons: string[] }> = [];
   let changed = false;
 
   for (const seedObj of seed.objects) {
-    // HS2 prerequisite: never re-add an id the receiver has tombstoned.
     if (storedTombstones.has(seedObj.id)) continue;
     const current = storedById.get(seedObj.id);
     if (!current) {
-      // HS2.1 additive case OR HS2.2 first-time delivery.
       additions.push(cloneSerializedObject(seedObj));
       changed = true;
+      reasonLog.push({ id: seedObj.id, reasons: ["<add>"] });
       continue;
     }
-    if (seed.objectHosts[seedObj.id] === receiverHost) continue; // HS2.1 skip-existing
-    // HS2.2: probe-merge on a shallow clone so we don't mutate stored.
-    // mergeSeedObject deep-clones individual fields it actually replaces;
-    // we only need to clone the wrapper plus mutable map/array fields.
+    if (seed.objectHosts[seedObj.id] === receiverHost) continue;
     const probe = cloneSerializedObject(current);
-    if (mergeSeedObject(probe, seedObj)) {
+    const objReasons: string[] = [];
+    if (mergeSeedObject(probe, seedObj, objReasons)) {
       replacements.set(seedObj.id, probe);
       changed = true;
+      if (objReasons.length > 0) reasonLog.push({ id: seedObj.id, reasons: objReasons });
     }
   }
 
@@ -332,10 +338,11 @@ export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: See
       newTombstones.push(id);
       removeIds.add(id);
       changed = true;
+      reasonLog.push({ id, reasons: ["<tombstone>"] });
     }
   }
 
-  if (!changed) return { world: stored, changed: false };
+  if (!changed) return { world: stored, changed: false, reasons: [] };
 
   // Materialize the merged slice. One pass over stored.objects, swapping
   // in replacements / dropping removeIds, then append additions.
@@ -353,7 +360,8 @@ export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: See
 
   return {
     world: { ...stored, objects: mergedObjects, tombstones: mergedTombstones },
-    changed: true
+    changed: true,
+    reasons: reasonLog
   };
 }
 
@@ -422,55 +430,73 @@ function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
 }
 
 function verbsDeepEqual(left: VerbDef[], right: VerbDef[]): boolean {
-  if (left.length !== right.length) return false;
-  const leftByName = new Map(left.map((v) => [v.name, v]));
-  const rightByName = new Map(right.map((v) => [v.name, v]));
-  if (leftByName.size !== rightByName.size) return false;
-  for (const [name, lv] of leftByName) {
-    const rv = rightByName.get(name);
-    if (!rv) return false;
-    // source_hash fast path: matching hashes mean source/bytecode/
-    // line_map are equal (the hash is over source). We still need to
-    // compare every other deployable verb field — aliases, arg_spec,
-    // kind/native, version, calls — because catalog repair updates
-    // those independently of source (see catalog-installer.ts) and
-    // they're user-visible (aliases drive verb resolution; arg_spec
-    // drives command planning). The fast path saves walking
-    // line_map/bytecode/source — which is the bulk by volume.
-    if (lv.source_hash && rv.source_hash && lv.source_hash === rv.source_hash) {
-      if (verbMetadataEqual(lv, rv)) continue;
-    }
-    if (!valuesEqual(normalizeVerbForCompare(lv) as WooValue, normalizeVerbForCompare(rv) as WooValue)) return false;
-  }
-  return true;
+  return verbsDiff(left, right) === null;
 }
 
-/** Equality over every deployable verb field except source/bytecode/
- * line_map — caller has already established those via `source_hash` —
- * and except `version`, which is a per-host bump counter (see
- * `normalizeVerbForCompare`). Includes aliases, arg_spec, kind/native,
- * calls, perms, owner, and the boolean flags. */
+/** Returns null when the two verb lists are merge-equivalent, otherwise a
+ * short string describing the first concrete divergence. Used both as the
+ * core comparison (`verbsDeepEqual` now wraps this) and as a structured
+ * diagnostic input — when `mergeSeedObject` decides to take seed verbs,
+ * the same string surfaces in `host_seed_merge_diff` so we can see which
+ * field actually drove the change instead of guessing post-hoc. */
+function verbsDiff(left: VerbDef[], right: VerbDef[]): string | null {
+  if (left.length !== right.length) {
+    return `length stored=${left.length} seed=${right.length}`;
+  }
+  const leftByName = new Map(left.map((v) => [v.name, v]));
+  const rightByName = new Map(right.map((v) => [v.name, v]));
+  if (leftByName.size !== rightByName.size) {
+    return `unique-name count stored=${leftByName.size} seed=${rightByName.size}`;
+  }
+  for (const [name, lv] of leftByName) {
+    const rv = rightByName.get(name);
+    if (!rv) return `${name} missing in seed`;
+    if (lv.source_hash && rv.source_hash && lv.source_hash === rv.source_hash) {
+      const meta = verbMetadataDiff(lv, rv);
+      if (meta === null) continue;
+      return `${name}.${meta}`;
+    }
+    const ln = normalizeVerbForCompare(lv);
+    const rn = normalizeVerbForCompare(rv);
+    if (!valuesEqual(ln as WooValue, rn as WooValue)) {
+      const lk = Object.keys(ln);
+      const rk = Object.keys(rn);
+      const allKeys = new Set([...lk, ...rk]);
+      for (const k of allKeys) {
+        if (JSON.stringify(ln[k]) !== JSON.stringify(rn[k])) return `${name}.${k} (deep)`;
+      }
+      return `${name} (deep, key unknown)`;
+    }
+  }
+  return null;
+}
+
 function verbMetadataEqual(a: VerbDef, b: VerbDef): boolean {
-  if (a.perms !== b.perms) return false;
-  if (a.owner !== b.owner) return false;
-  if ((a.direct_callable === true) !== (b.direct_callable === true)) return false;
-  if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return false;
-  if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return false;
-  if ((a.pure === true) !== (b.pure === true)) return false;
-  if ((a.pure_declared === true) !== (b.pure_declared === true)) return false;
-  if (a.kind !== b.kind) return false;
-  if (a.kind === "native" && b.kind === "native" && a.native !== b.native) return false;
-  if (!arraysShallowEqualStrings(a.aliases ?? [], b.aliases ?? [])) return false;
-  if (!valuesEqual((a.arg_spec ?? {}) as WooValue, (b.arg_spec ?? {}) as WooValue)) return false;
-  // `calls` is the verb's static call graph — affects the purity
-  // analyzer's transitively-pure recomputation. Catalog installs may
-  // emit different `calls` arrays even when source_hash matches if the
-  // analyzer was rerun against a different host's catalog graph.
+  return verbMetadataDiff(a, b) === null;
+}
+
+/** Returns null when authoritative verb metadata matches, otherwise a
+ * short field-name string identifying the first divergence. Drops `version`
+ * (per-host bump counter; see `normalizeVerbForCompare`); covers
+ * aliases, arg_spec, kind/native, calls, perms, owner, and the boolean
+ * flags. */
+function verbMetadataDiff(a: VerbDef, b: VerbDef): string | null {
+  if (a.perms !== b.perms) return "perms";
+  if (a.owner !== b.owner) return "owner";
+  if ((a.direct_callable === true) !== (b.direct_callable === true)) return "direct_callable";
+  if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return "skip_presence_check";
+  if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return "tool_exposed";
+  if ((a.pure === true) !== (b.pure === true)) return "pure";
+  if ((a.pure_declared === true) !== (b.pure_declared === true)) return "pure_declared";
+  if (a.kind !== b.kind) return "kind";
+  if (a.kind === "native" && b.kind === "native" && a.native !== b.native) return "native";
+  if (!arraysShallowEqualStrings(a.aliases ?? [], b.aliases ?? [])) return "aliases";
+  if (!valuesEqual((a.arg_spec ?? {}) as WooValue, (b.arg_spec ?? {}) as WooValue)) return "arg_spec";
   const aCalls = Array.isArray(a.calls) ? a.calls : null;
   const bCalls = Array.isArray(b.calls) ? b.calls : null;
-  if ((aCalls === null) !== (bCalls === null)) return false;
-  if (aCalls && bCalls && !valuesEqual(aCalls as unknown as WooValue, bCalls as unknown as WooValue)) return false;
-  return true;
+  if ((aCalls === null) !== (bCalls === null)) return "calls (one missing)";
+  if (aCalls && bCalls && !valuesEqual(aCalls as unknown as WooValue, bCalls as unknown as WooValue)) return "calls";
+  return null;
 }
 
 function arraysShallowEqualStrings(a: readonly string[], b: readonly string[]): boolean {
@@ -509,39 +535,49 @@ function propertyDefEqualIgnoringVersion(
  * absent from seed are removed (except dynamic-property names, which
  * the receiver writes locally).
  */
-function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boolean {
+function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reasons?: string[]): boolean {
   let changed = false;
+  const note = (r: string): void => { if (reasons && reasons.length < 8) reasons.push(r); };
   if (current.name !== seed.name) {
     current.name = seed.name;
     changed = true;
+    note("name");
   }
   if (current.parent !== seed.parent) {
     current.parent = seed.parent;
     changed = true;
+    note("parent");
   }
   if (current.owner !== seed.owner) {
     current.owner = seed.owner;
     changed = true;
+    note("owner");
   }
   if (current.location !== seed.location) {
     current.location = seed.location;
     changed = true;
+    note("location");
   }
   if (current.anchor !== seed.anchor) {
     current.anchor = seed.anchor;
     changed = true;
+    note("anchor");
   }
   if (!valuesEqual(normalizeFlagsForCompare(current.flags) as WooValue, normalizeFlagsForCompare(seed.flags) as WooValue)) {
     current.flags = cloneSerialized(seed.flags);
     changed = true;
+    note("flags");
   }
-  if (!verbsDeepEqual(current.verbs, seed.verbs)) {
+  const verbsReason = verbsDiff(current.verbs, seed.verbs);
+  if (verbsReason !== null) {
     current.verbs = cloneSerialized(seed.verbs);
     changed = true;
+    note(`verbs[${verbsReason}]`);
   }
   if (!valuesEqual(current.eventSchemas as unknown as WooValue, seed.eventSchemas as unknown as WooValue)) {
     current.eventSchemas = cloneSerialized(seed.eventSchemas);
     changed = true;
+    note("eventSchemas");
   }
 
   // propertyDefs: merge seed entries, then delete stored-only entries.
@@ -561,12 +597,14 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
     if (!cur || !propertyDefEqualIgnoringVersion(cur, def)) {
       currentDefs.set(name, def);
       defsChanged = true;
+      note(cur ? `propertyDefs.${name}(replace)` : `propertyDefs.${name}(add)`);
     }
   }
   for (const name of Array.from(currentDefs.keys())) {
     if (!seedDefs.has(name)) {
       currentDefs.delete(name);
       defsChanged = true;
+      note(`propertyDefs.${name}(delete)`);
     }
   }
   if (defsChanged) {
@@ -580,16 +618,14 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
   const seedVersions = new Map(seed.propertyVersions);
 
   for (const [name, value] of seedProperties) {
-    // HS2.2 dynamic carve-out: skip only when stored already has it.
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name) && (properties.has(name) || versions.has(name))) continue;
-    // HS2.2 version gate (uniform — applies whether stored has the
-    // property or not): skip when stored ≥ seed.
     const storedV = Number(versions.get(name) ?? 0);
     const seedV = Number(seedVersions.get(name) ?? 0);
     if (storedV >= seedV && properties.has(name)) continue;
     if (!valuesEqual(properties.get(name) as WooValue, value as WooValue)) {
       properties.set(name, cloneSerialized(value));
       changed = true;
+      note(`properties.${name}(take)`);
     }
   }
   for (const [name, version] of seedVersions) {
@@ -597,21 +633,23 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject): boo
     if (!versions.has(name) || version > Number(versions.get(name) ?? 0)) {
       versions.set(name, version);
       changed = true;
+      note(`propertyVersions.${name}(take)`);
     }
   }
 
-  // HS3.3 deletions: properties / versions in stored but not in seed.
   for (const name of Array.from(properties.keys())) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
     if (seedProperties.has(name)) continue;
     properties.delete(name);
     changed = true;
+    note(`properties.${name}(delete)`);
   }
   for (const name of Array.from(versions.keys())) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
     if (seedProperties.has(name) || seedVersions.has(name)) continue;
     versions.delete(name);
     changed = true;
+    note(`propertyVersions.${name}(delete)`);
   }
 
   if (changed) {
