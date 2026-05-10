@@ -132,6 +132,65 @@ describe("local catalogs", () => {
     expect(world.ownVerb("$pinboard", "leave")?.kind).toBe("bytecode");
   });
 
+  it("seeds a south exit from the_deck to the_taskboard with a Santa's workshop hint", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    // The deck description hints at the destination so the user knows
+    // what's south before they walk there.
+    const deckDescription = world.getProp("the_deck", "description");
+    expect(typeof deckDescription).toBe("string");
+    expect(String(deckDescription)).toMatch(/Santa's workshop/i);
+    expect(String(deckDescription)).toMatch(/south/i);
+
+    // The exits map gains a `south` slot pointing at the new exit object.
+    const exits = world.getProp("the_deck", "exits");
+    expect(exits).toMatchObject({ south: "exit_deck_south" });
+
+    // The exit object lives at the deck and routes to the_taskboard. The
+    // taskboard's name itself doesn't change — only the deck's flavour
+    // copy renames it as "Santa's workshop".
+    expect(world.object("exit_deck_south").parent).toBe("$exit");
+    expect(world.getProp("exit_deck_south", "source")).toBe("the_deck");
+    expect(world.getProp("exit_deck_south", "dest")).toBe("the_taskboard");
+    const aliases = world.getProp("exit_deck_south", "aliases");
+    expect(Array.isArray(aliases)).toBe(true);
+    expect(aliases as string[]).toEqual(expect.arrayContaining(["south", "s", "santa's workshop", "workshop"]));
+    expect(world.getProp("the_taskboard", "name")).toBe("Taskboard");
+  });
+
+  it("wires the_taskboard back to the deck via an `out` exit on $room", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    // $task_registry must inherit $room so a host catalog can wire exits
+    // — this is what makes the `out` verb resolve via the parent chain.
+    expect(world.object("$task_registry").parent).toBe("$room");
+    expect(world.isDescendantOf("the_taskboard", "$room")).toBe(true);
+
+    // demoworld set the_taskboard.exits to point `out` at the new exit
+    // object back to the_deck.
+    const exits = world.getProp("the_taskboard", "exits");
+    expect(exits).toMatchObject({ out: "exit_taskboard_out" });
+
+    expect(world.object("exit_taskboard_out").parent).toBe("$exit");
+    expect(world.getProp("exit_taskboard_out", "source")).toBe("the_taskboard");
+    expect(world.getProp("exit_taskboard_out", "dest")).toBe("the_deck");
+    const aliases = world.getProp("exit_taskboard_out", "aliases");
+    expect(Array.isArray(aliases)).toBe(true);
+    expect(aliases as string[]).toEqual(expect.arrayContaining(["out", "back", "north", "n"]));
+
+    // `match_exit` is inherited from $room and must resolve `out` against
+    // the taskboard's exits map. This is what `:out` (also inherited)
+    // depends on at runtime.
+    const matched = await world.directCall("match_exit", "$wiz", "the_taskboard", "match_exit", ["out"], {
+      forceDirect: true,
+      forceReason: "test"
+    });
+    expect((matched as { op: string; result?: unknown }).op).toBe("result");
+    expect((matched as { op: string; result?: unknown }).result).toBe("exit_taskboard_out");
+  });
+
   it("installs the help database and routes player help through it", async () => {
     const world = createWorld();
 
@@ -464,6 +523,18 @@ describe("local catalogs", () => {
       alias: "chat",
       allowImplementationHints: false
     });
+    // demoworld now depends on tasks (for the deck → Santa's workshop south
+    // exit); tasks itself depends on note. Install both before demoworld.
+    installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "note",
+      allowImplementationHints: false
+    });
+    installCatalogManifest(world, readManifest("tasks") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "tasks",
+      allowImplementationHints: false
+    });
     installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
       tap: "github:example/woo-test",
       alias: "demoworld",
@@ -535,6 +606,18 @@ describe("local catalogs", () => {
     installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
       tap: "github:example/woo-test",
       alias: "chat",
+      allowImplementationHints: false
+    });
+    // demoworld → tasks → note dependency chain (the deck has a Santa's
+    // workshop south exit pointing at the_taskboard).
+    installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "note",
+      allowImplementationHints: false
+    });
+    installCatalogManifest(world, readManifest("tasks") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "tasks",
       allowImplementationHints: false
     });
     installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
@@ -754,14 +837,21 @@ describe("local catalogs", () => {
       alias: "chat",
       allowImplementationHints: false
     });
-    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "demoworld",
-      allowImplementationHints: false
-    });
+    // demoworld → tasks → note: tasks must install before demoworld so the
+    // deck's south exit can resolve `tasks:the_taskboard`.
     installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
       tap: "github:example/woo-test",
       alias: "note",
+      allowImplementationHints: false
+    });
+    installCatalogManifest(world, readManifest("tasks") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "tasks",
+      allowImplementationHints: false
+    });
+    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: "demoworld",
       allowImplementationHints: false
     });
     installCatalogManifest(world, readManifest("pinboard") as unknown as RuntimeCatalogManifest, {
@@ -2440,6 +2530,34 @@ describe("local catalogs", () => {
     await world.directCall("enter", session.actor, "the_chatroom", "enter", []);
     const squawk = await world.directCall("squawk", session.actor, "the_cockatoo", "squawk", []);
     expect(squawk.op).toBe("result");
+  });
+
+  it("reparents $task_registry from $space onto $room for worlds installed before the change", { timeout: 30000 }, async () => {
+    const world = createWorld();
+    // The default boot already installs tasks with parent: $room, so put
+    // it back to $space to simulate an older world. This is the same
+    // shape the chparentAuthoredObject path should be able to walk
+    // forward.
+    world.chparentAuthoredObject("$wiz", "$task_registry", "$space");
+    expect(world.object("$task_registry").parent).toBe("$space");
+    // Drop the marker for our migration so it actually runs again. Keep
+    // the rest of the ledger intact so we don't accidentally re-run
+    // unrelated migrations and shadow the assertion.
+    const ledger = (world.getProp("$system", "applied_migrations") as string[]) ?? [];
+    const filtered = ledger.filter((id) => id !== "2026-05-09-task-registry-room-parent");
+    world.setProp("$system", "applied_migrations", filtered);
+
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    expect(world.object("$task_registry").parent).toBe("$room");
+    expect(world.isDescendantOf("the_taskboard", "$room")).toBe(true);
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-09-task-registry-room-parent");
+
+    // Re-running is a no-op (idempotent): the parent is already $room
+    // and the marker is set, so a second install pass should leave both
+    // alone.
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+    expect(world.object("$task_registry").parent).toBe("$room");
   });
 
   it("migrates stale local catalog native verbs to current catalog implementations", { timeout: 30000 }, async () => {

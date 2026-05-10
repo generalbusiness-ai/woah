@@ -5,7 +5,8 @@
   "license": "MIT",
   "description": "First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and provides the mount-point rooms that bundled demo apps (dubspace, pinboard) use.",
   "depends": [
-    "@local:chat"
+    "@local:chat",
+    "@local:tasks"
   ],
   "keywords": [
     "demo",
@@ -280,7 +281,7 @@
       "class": "$chatroom",
       "as": "the_deck",
       "name": "Deck",
-      "description": "A wooden deck behind the house, facing south across the pool toward the gardens. The living room is west through the glass door, and a large hot tub waits at the east end.",
+      "description": "A wooden deck behind the house, facing south across the pool toward the gardens. The living room is west through the glass door, and a large hot tub waits at the east end. A path leads south through the garden — locals say it ends at Santa's workshop.",
       "properties": {
         "next_seq": 1,
         "subscribers": [],
@@ -292,7 +293,8 @@
         ],
         "exits": {
           "west": "exit_deck_west",
-          "east": "exit_deck_east"
+          "east": "exit_deck_east",
+          "south": "exit_deck_south"
         }
       }
     },
@@ -410,6 +412,64 @@
         "oleave_msg": "heads toward the hot tub.",
         "oarrive_msg": "has arrived."
       }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_deck_south",
+      "name": "south",
+      "description": "A garden path leading south, toward what locals call Santa's workshop.",
+      "anchor": "the_deck",
+      "properties": {
+        "aliases": [
+          "south",
+          "s",
+          "santa",
+          "santa's",
+          "santa's workshop",
+          "workshop",
+          "garden",
+          "garden path"
+        ],
+        "source": "the_deck",
+        "dest": "tasks:the_taskboard",
+        "leave_msg": "You follow the garden path south.",
+        "oleave_msg": "heads south down the garden path.",
+        "oarrive_msg": "arrives at the workshop."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_taskboard_out",
+      "name": "out",
+      "description": "The garden path heading north, back toward the deck.",
+      "anchor": "tasks:the_taskboard",
+      "properties": {
+        "aliases": [
+          "out",
+          "back",
+          "north",
+          "n",
+          "deck",
+          "garden",
+          "garden path"
+        ],
+        "source": "tasks:the_taskboard",
+        "dest": "the_deck",
+        "leave_msg": "You walk back up the garden path.",
+        "oleave_msg": "heads back up the garden path.",
+        "oarrive_msg": "arrives back on the deck."
+      }
+    },
+    {
+      "kind": "set_property",
+      "object": "tasks:the_taskboard",
+      "property": "exits",
+      "value": {
+        "out": "exit_taskboard_out"
+      },
+      "mode": "set"
     },
     {
       "kind": "create_instance",

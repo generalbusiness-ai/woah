@@ -91,6 +91,14 @@ const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer
 // recoverable via this path, but on a freshly-deployed worktree all
 // existing tasks live at their registry.
 const LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION = "2026-05-09-tasks-tracked-backfill";
+// $task_registry was originally rooted on $space; reparent onto $room so
+// registries inherit the chat catalog's exits/match_exit/out/go machinery
+// and a host catalog can wire a return exit (e.g. demoworld's `out` from
+// the_taskboard back to the deck) without duplicating verbs. The schema
+// sync's ensure_object step normally reparents on next install, but
+// recording an explicit migration keeps the change auditable and runs
+// before the sync-driven path.
+const LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION = "2026-05-09-task-registry-room-parent";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -147,7 +155,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, only: "note" },
   { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
-  { id: LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION, only: "tasks" }
+  { id: LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION, only: "tasks" },
+  { id: LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION, only: "tasks" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -383,6 +392,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runWizProgrammerParentMigration(world, names);
   runTasksTrackedBackfillMigration(world, names);
+  runTaskRegistryRoomParentMigration(world, names);
   return covered;
 }
 
@@ -588,6 +598,41 @@ function runWizProgrammerParentMigration(world: WooWorld, names: readonly string
   // ordinary inheritance chain.
   world.chparentAuthoredObject("$wiz", "$wiz", "$programmer");
   markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION);
+}
+
+// Reparent the $task_registry CLASS from $space onto $room so registries
+// pick up the chat catalog's exits map, :match_exit, :go, :out, and the
+// directional verbs through normal inheritance. Existing instances
+// (e.g. the_taskboard) follow because they delegate to the class.
+// Idempotent: noops when the chain already reaches $room, when the
+// expected ancestors are missing, or when the tasks catalog isn't in
+// scope.
+function runTaskRegistryRoomParentMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION)) return;
+  if (!names.includes("tasks") || !localCatalogInstalled(world, "tasks")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION);
+    return;
+  }
+  if (!world.objects.has("$task_registry") || !world.objects.has("$room")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION);
+    return;
+  }
+  if (world.object("$task_registry").parent === "$room") {
+    markMigrationApplied(world, LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION);
+    return;
+  }
+  // Cycle-guard: $room must not already inherit from $task_registry. The
+  // bundled hierarchy makes this impossible, but the check matches the
+  // ensure_object reparent path's defensive contract.
+  if (world.isDescendantOf("$room", "$task_registry")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION);
+    return;
+  }
+  // chparentAuthoredObject runs the same gates as a wizard would: $wiz
+  // owns $task_registry (the catalog installer authors classes as $wiz),
+  // so $wiz can author the parent change.
+  world.chparentAuthoredObject("$wiz", "$task_registry", "$room");
+  markMigrationApplied(world, LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION);
 }
 
 // Backfill `_tracked_tasks` on every $task_registry instance from the

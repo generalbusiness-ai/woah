@@ -59,11 +59,11 @@
   "classes": [
     {
       "local_name": "$task_registry",
-      "parent": "$space",
+      "parent": "$room",
       "flags": {
         "fertile": true
       },
-      "description": "A space that mints and coordinates $task children. Authors policy (roles, obligations, policies) through admin verbs and the kanban / admin UI. Tasks colocate with the registry in v1 (one DO per registry).",
+      "description": "A room that mints and coordinates $task children. Inherits $room (exits, look-with-exit-listing, announce machinery) so a registry can sit in a navigable layout — e.g. a host catalog can wire an `out` exit back to wherever the registry is mounted. Authors policy (roles, obligations, policies) through admin verbs and the kanban / admin UI. Tasks colocate with the registry in v1 (one DO per registry).",
       "properties": [
         {
           "name": "roles",
