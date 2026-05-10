@@ -106,6 +106,10 @@ const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   return base;
 }`;
 
+const ROOT_TITLE_SOURCE = `verb :title() rxd {
+  return this.name;
+}`;
+
 const ROOT_SET_DESCRIPTION_SOURCE = `verb :set_description(desc) rxd {
   if (typeof(desc) != "string") {
     raise { code: "E_TYPE", message: "set_description requires a string", value: desc };
@@ -787,7 +791,7 @@ function seedUniversal(world: WooWorld): void {
   bytecode(world, "$root", "set_value", setValueBytecode, "verb :set_value(value) r { ... }", { perms: "r" });
   bytecode(world, "$root", "set_prop", setPropBytecode, "verb :set_prop(name, value) r { ... }", { perms: "r" });
   native(world, "$root", "describe", "describe", "verb :describe() rxd { ... }", { directCallable: true });
-  native(world, "$root", "title", "default_title", "verb :title() rxd { return this.name; }", { directCallable: true });
+  sourceVerb(world, "$root", "title", ROOT_TITLE_SOURCE, { directCallable: true });
   native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
     directCallable: true,

@@ -780,7 +780,7 @@ describe("woo core", () => {
     const actor = session.actor;
     world.createObject({ id: "sealed_sign", name: "Sealed Sign", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
     world.addVerb("sealed_sign", {
-      ...nativeVerb("poke", "default_title", "$wiz"),
+      ...nativeVerb("poke", "describe", "$wiz"),
       perms: "r",
       direct_callable: true
     });

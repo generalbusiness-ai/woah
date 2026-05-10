@@ -7209,10 +7209,6 @@ export class WooWorld {
 
   private registerNativeHandlers(): void {
     this.nativeHandlers.set("describe", (ctx) => this.describeForActor(ctx.thisObj, ctx.actor));
-    this.nativeHandlers.set("default_title", (ctx) => {
-      const title = this.propOrNull(ctx.thisObj, "name");
-      return typeof title === "string" && title.length > 0 ? title : this.object(ctx.thisObj).name;
-    });
     this.nativeHandlers.set("default_look_self", (ctx) => this.defaultLookSelf(ctx));
     this.nativeHandlers.set("player_on_disfunc", () => true);
     this.nativeHandlers.set("player_moveto", async (ctx, args) => {
