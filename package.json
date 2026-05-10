@@ -16,7 +16,7 @@
     "plugs:bootstrap": "node scripts/bootstrap-demo-plugs.mjs",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",
     "pretest": "npm run catalog:index && npm run guard:object-names && npm run guard:catalog-migrations",
-    "test": "vitest run tests",
+    "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "pretypecheck": "npm run catalog:index && npm run guard:object-names && npm run guard:catalog-migrations",
