@@ -272,6 +272,12 @@ A catalog manifest MAY include a top-level `ui` object.
         "module": "pinboard-ui",
         "types": ["note_added", "note_edited", "pin_moved", "pin_resized"]
       }
+    ],
+    "chat_formatters": [
+      {
+        "module": "pinboard-ui",
+        "types": ["pinboard_entered", "pinboard_left", "pinboard_activity"]
+      }
     ]
   }
 }
@@ -291,6 +297,56 @@ registration for the listed types. Each entry has:
 
 The type list is an install-time and preload hint. The module's registration
 hook is still the normative source of handler behavior.
+
+`ui.chat_formatters[]` declares which modules contribute chat-display
+formatting for observations the catalog emits. Same shape as
+`observation_handlers`: each entry names a module and the observation
+types it formats. The host uses the type list at install time to decide
+whether an observation is chat-eligible (so it can route the event to
+the chat panel before invoking any code) and dispatches the formatter
+when rendering the line.
+
+The formatter contract:
+
+```ts
+type ChatFormatterContext = {
+  // Resolve a subject id to its display label.
+  label(id: string | undefined): string;
+  // The viewing actor's id (or undefined). Lets formatters distinguish
+  // doer-vs-bystander views (e.g. note_read shows the body to the
+  // reader and a short line to others).
+  viewer: string | undefined;
+};
+
+type ChatFormatterResult = {
+  kind?: string;     // ChatLine.kind for rendering
+  text?: string;     // override for the rendered line
+  actor?: string;
+  style?: string;
+  reason?: string;
+};
+
+type ChatFormatter = {
+  types: readonly string[];
+  format: (
+    observation: Record<string, unknown>,
+    ctx: ChatFormatterContext
+  ) => ChatFormatterResult | undefined;
+};
+```
+
+Returning `undefined` means "this observation is not a chat line right
+now"; the host drops it. Returning `{}` accepts the line with no
+overrides, so kind defaults to the observation type and text falls back
+to `observation.text`. Frame-level routing (presence updates,
+self-suppression of doer-broadcasts) keys on `observation.type`, not on
+the formatter-supplied `kind` — so a formatter changing `kind` for
+display does not affect routing.
+
+When multiple catalogs claim the same type, registration order wins;
+registration order is install order, which matches manifest dependency
+order. Override semantics are intentionally not part of this contract;
+if a use case appears, an explicit priority field can be added later.
 
 ---
 
@@ -345,6 +401,23 @@ export function registerWooObservationHandlers(
 `WooObservationHandler` is defined in [UCM20](#ucm20-observation-handlers-and-projection).
 The host calls this hook before dispatching observations for component frames
 that depend on the module, and MAY call it earlier during module preload.
+
+A module MAY also export chat-formatter registration:
+
+```ts
+type ChatFormatterRegistry = {
+  formatter(entry: ChatFormatter): void;
+};
+
+export function registerWooChatFormatters(
+  registry: ChatFormatterRegistry
+): void;
+```
+
+`ChatFormatter` is defined in UCM6 alongside the `chat_formatters`
+manifest declaration. The host calls this hook at module load time so
+chat-eligibility lookups for the declared types resolve as soon as
+observations begin to flow.
 
 ---
 

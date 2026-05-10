@@ -5,6 +5,21 @@
   "description": "Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The verb appends to a persistent queue, returns a ticket synchronously, and lets the plug drain the queue on its own cadence; :deliver(order_id, name, text, description) creates a note with the producer-supplied name (inventory listing label), markdown text (capped at 262144 characters; what `read` returns), and optional cosmetic description (one-line look-at flavour, may be omitted/empty), and moves it into the requester's inventory. Subclass for concrete dispenser kinds (horoscope, recipe-of-the-day, ...).",
   "license": "MIT",
   "depends": ["@local:block", "@local:note"],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "dispenser-chat",
+        "entry": "ui/dispenser-chat.ts"
+      }
+    ],
+    "chat_formatters": [
+      {
+        "module": "dispenser-chat",
+        "types": ["note_dispersed"]
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$dispensed_note",

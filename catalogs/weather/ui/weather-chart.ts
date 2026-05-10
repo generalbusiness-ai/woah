@@ -212,7 +212,7 @@ export function temperaturePanelSvg(ts: Timeseries | undefined): string {
   const grid = gridAndAnchor(ts, xScale, TEMP_PANEL_HEIGHT, domain);
   const legend = legendHtml(present.map((f) => ({ label: f.label, cls: f.cls })));
 
-  return `<div class="weather-chart-panel">`
+  return `<div class="card card--pre weather-chart-panel">`
     + `<svg viewBox="0 0 ${PANEL_WIDTH} ${TEMP_PANEL_HEIGHT}" preserveAspectRatio="none" class="weather-chart-svg">`
     + grid + yAxis + lines
     + `</svg>${legend}</div>`;
@@ -258,7 +258,7 @@ export function precipPanelSvg(ts: Timeseries | undefined): string {
   const grid = gridAndAnchor(ts, xScale, PRECIP_PANEL_HEIGHT, domain);
   const legend = legendHtml([...intensityLegend, ...present.map((f) => ({ label: f.label, cls: f.cls }))]);
 
-  return `<div class="weather-chart-panel">`
+  return `<div class="card card--pre weather-chart-panel">`
     + `<svg viewBox="0 0 ${PANEL_WIDTH} ${PRECIP_PANEL_HEIGHT}" preserveAspectRatio="none" class="weather-chart-svg">`
     + (area ? `<path class="weather-area-precip" d="${area}" />` : "")
     + grid + yAxis + lines
@@ -432,7 +432,7 @@ function legendHtml(entries: Array<{ label: string; cls: string }>): string {
 }
 
 function emptyPanelSvg(height: number, message: string): string {
-  return `<div class="weather-chart-panel weather-chart-panel-empty">`
+  return `<div class="card card--pre weather-chart-panel weather-chart-panel-empty">`
     + `<svg viewBox="0 0 ${PANEL_WIDTH} ${height}" class="weather-chart-svg" preserveAspectRatio="none">`
     + `<text class="weather-chart-empty" x="${PANEL_WIDTH / 2}" y="${height / 2}" text-anchor="middle" dominant-baseline="middle">${escapeHtml(message)}</text>`
     + `</svg></div>`;
@@ -539,8 +539,8 @@ export class WooWeatherChartElement extends HTMLElement {
     const strip = dailyStripHtml(daily ?? [], todayDate);
     const tempPanel = temperaturePanelSvg(timeseries);
     const precipPanel = precipPanelSvg(timeseries);
-    this.dialog.innerHTML = `<div class="weather-chart-card">`
-      + `<button type="button" class="weather-chart-close" aria-label="Close" data-weather-close>×</button>`
+    this.dialog.innerHTML = `<div class="card card--raised weather-chart-card">`
+      + `<button type="button" class="icon-button weather-chart-close" aria-label="Close" data-weather-close>×</button>`
       + headline
       + strip
       + tempPanel

@@ -12,6 +12,31 @@
     "first-light",
     "world"
   ],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "demoworld-chat",
+        "entry": "ui/demoworld-chat.ts"
+      }
+    ],
+    "chat_formatters": [
+      {
+        "module": "demoworld-chat",
+        "types": [
+          "cockatoo_squawk",
+          "cockatoo_muffled",
+          "cockatoo_taught",
+          "cockatoo_gagged",
+          "cockatoo_ungagged",
+          "cockatoo_fed",
+          "cockatoo_pluck",
+          "cockatoo_shake",
+          "cockatoo_seen"
+        ]
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$cockatoo",

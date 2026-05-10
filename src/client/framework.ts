@@ -144,12 +144,18 @@ export type UiObservationHandlerDecl = {
   types: string[];
 };
 
+export type UiChatFormatterDecl = {
+  module: string;
+  types: string[];
+};
+
 export type CatalogUiManifest = {
   abi: string;
   modules?: UiModuleDecl[];
   components?: UiComponentDecl[];
   frames?: UiFrameDecl[];
   observation_handlers?: UiObservationHandlerDecl[];
+  chat_formatters?: UiChatFormatterDecl[];
 };
 
 export type CatalogUiPackage = {
@@ -180,6 +186,7 @@ type CustomElementRegistryLike = {
 type ModuleExports = {
   registerWooComponents?: (registry: WooComponentRegistry) => void;
   registerWooObservationHandlers?: (registry: ObservationRegistry) => void;
+  registerWooChatFormatters?: (registry: ChatFormatterRegistry) => void;
 };
 
 export type WooComponentRegistry = {
@@ -308,6 +315,7 @@ export class CatalogUiRegistry {
     moduleId: string,
     url: string,
     observations: ObservationRegistry,
+    chatFormatters: ChatFormatterRegistry,
     importModule: (url: string) => Promise<ModuleExports> = (href) => import(/* @vite-ignore */ href) as Promise<ModuleExports>
   ): Promise<void> {
     const key = `${alias}:${moduleId}`;
@@ -318,10 +326,11 @@ export class CatalogUiRegistry {
     const mod = await importModule(url);
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
+    mod.registerWooChatFormatters?.(chatFormatters);
     this.loadedModules.add(key);
   }
 
-  registerModuleExports(alias: string, moduleId: string, mod: ModuleExports, observations: ObservationRegistry): void {
+  registerModuleExports(alias: string, moduleId: string, mod: ModuleExports, observations: ObservationRegistry, chatFormatters: ChatFormatterRegistry): void {
     const key = `${alias}:${moduleId}`;
     if (this.loadedModules.has(key)) return;
     const pkg = this.catalogs.get(alias);
@@ -329,6 +338,7 @@ export class CatalogUiRegistry {
     if (!(pkg.ui.modules ?? []).some((module) => module.id === moduleId)) throw new Error(`unknown UI module ${moduleId} for ${alias}`);
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
+    mod.registerWooChatFormatters?.(chatFormatters);
     this.loadedModules.add(key);
   }
 
@@ -652,6 +662,69 @@ export class ObservationRegistry {
   }
 }
 
+export type ChatFormatterContext = {
+  // Resolve a subject id to its display label. Replaces the inline
+  // `actorLabel(id)` calls each catalog would otherwise have to copy.
+  label(id: string | undefined): string;
+  // The viewing actor's id, or undefined if the client has no actor yet.
+  // Lets formatters distinguish doer-vs-bystander views (e.g. `note_read`
+  // shows the body to the reader and a short line to others) without
+  // pushing that branch back into the frame.
+  viewer: string | undefined;
+};
+
+export type ChatFormatterResult = {
+  // ChatLine.kind. If omitted, the frame uses the observation type
+  // for the rendered line.
+  kind?: string;
+  // Override for ChatLine.text. If omitted, the frame falls back to
+  // observation.text (when present); if neither is set the line is
+  // dropped from the feed.
+  text?: string;
+  // Optional overrides for fields the frame would otherwise read straight
+  // off the observation. Used sparingly — most catalogs only set kind/text.
+  actor?: string;
+  style?: string;
+  reason?: string;
+};
+
+export type ChatFormatter = {
+  types: readonly string[];
+  format: (observation: Record<string, unknown>, ctx: ChatFormatterContext) => ChatFormatterResult | undefined;
+};
+
+export class ChatFormatterRegistry {
+  private byType = new Map<string, ChatFormatter[]>();
+
+  formatter(entry: ChatFormatter): void {
+    for (const type of entry.types) {
+      const list = this.byType.get(type);
+      if (list) list.push(entry);
+      else this.byType.set(type, [entry]);
+    }
+  }
+
+  isChatType(type: string): boolean {
+    return this.byType.has(String(type ?? ""));
+  }
+
+  // Walks formatters for the given type in registration order; returns
+  // the first non-undefined result. Registration order = catalog install
+  // order = manifest dependency order, so the catalog defining the
+  // emitting verb naturally wins. Override semantics are intentionally
+  // not supported here; if a use case appears, add an explicit priority.
+  format(observation: Record<string, unknown>, ctx: ChatFormatterContext): ChatFormatterResult | undefined {
+    const type = String(observation?.type ?? "");
+    const list = this.byType.get(type);
+    if (!list) return undefined;
+    for (const entry of list) {
+      const result = entry.format(observation, ctx);
+      if (result) return result;
+    }
+    return undefined;
+  }
+}
+
 export class FrameStateStore {
   private frames = new Map<string, FrameStateRecord>();
   private overlays: OverlayFrame[] = [];
@@ -706,6 +779,7 @@ export class FrameStateStore {
 export class WooClientFramework {
   readonly projection = new ClientProjection();
   readonly observations = new ObservationRegistry(this.projection);
+  readonly chatFormatters = new ChatFormatterRegistry();
   readonly frames = new FrameStateStore();
   readonly catalogUi = new CatalogUiRegistry();
 

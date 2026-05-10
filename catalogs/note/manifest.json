@@ -5,6 +5,21 @@
   "description": "Generic note: a portable text-bearing thing. Notes are first-class movable objects so they can travel between rooms, actor inventories, bulletin boards, and other containers without losing identity. A note has three slots: name (listing identity), description (cosmetic look-at flavour, optional), and text (markdown content; capped at 262144 characters). Subclass for richer behaviors (pinboard pins, dispensed notes, tasks); the base shape is text plus readers/writers permissions.",
   "license": "MIT",
   "depends": ["@local:chat"],
+  "ui": {
+    "abi": "woo-ui/v1",
+    "modules": [
+      {
+        "id": "note-chat",
+        "entry": "ui/note-chat.ts"
+      }
+    ],
+    "chat_formatters": [
+      {
+        "module": "note-chat",
+        "types": ["note_read"]
+      }
+    ]
+  },
   "classes": [
     {
       "local_name": "$note",

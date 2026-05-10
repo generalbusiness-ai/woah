@@ -47,6 +47,30 @@
           "main": [{ "component": "chat.space", "subject": "this" }]
         }
       }
+    ],
+    "chat_formatters": [
+      {
+        "module": "chat-ui",
+        "types": [
+          "said",
+          "said_to",
+          "said_as",
+          "emoted",
+          "posed",
+          "quoted",
+          "self_pointed",
+          "told",
+          "text",
+          "entered",
+          "left",
+          "looked",
+          "who",
+          "huh",
+          "blocked_exit",
+          "taken",
+          "dropped"
+        ]
+      }
     ]
   },
   "classes": [
