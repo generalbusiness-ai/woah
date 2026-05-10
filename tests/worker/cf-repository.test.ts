@@ -10,6 +10,10 @@ import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
 
+// These are production-shape Worker integration tests; under full-suite CPU
+// contention they legitimately exceed Vitest's default 30s per-test timeout.
+vi.setConfig({ testTimeout: 120_000 });
+
 class FakeSqlCursor {
   constructor(private readonly rows: Record<string, unknown>[]) {}
 
