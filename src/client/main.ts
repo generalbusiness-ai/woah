@@ -3192,7 +3192,11 @@ function markNestedSpaceDeparture(space: string) {
 }
 
 function currentTabHasChatPanel(): boolean {
-  return ["chat", "dubspace", "pinboard"].includes(state.tab);
+  // Tabs whose layout embeds a `.space-chat-shell` and therefore needs
+  // a live repaint when chat lines arrive. Tasks renders chat alongside
+  // the kanban board via the shared `space-chat-mini` component, same
+  // shape as dubspace/pinboard.
+  return ["chat", "dubspace", "pinboard", "tasks"].includes(state.tab);
 }
 
 function loadChatHistory(): string[] {

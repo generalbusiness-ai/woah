@@ -1374,6 +1374,37 @@ describe("local catalogs", () => {
     }));
   });
 
+  it("runHostScopedDataMigrations backfills _tracked_tasks on host-owned task registries", () => {
+    // The_taskboard is host_placement:"self", so its tasks live on its
+    // own DO. Older deploys ran :create_task before _tracked_tasks
+    // existed and the gateway-only backfill couldn't see them. This
+    // simulates the host's cold init: a task is sitting on the registry
+    // but the list is still empty.
+    const world = createWorld();
+    expect(world.isDescendantOf("the_taskboard", "$task_registry")).toBe(true);
+
+    // Mark the gateway-side ledger entry as already applied so we
+    // exercise the host-scoped path, not the gateway re-run.
+    const ledger = (world.getProp("$system", "applied_migrations") as string[]) ?? [];
+    if (!ledger.includes("2026-05-09-tasks-tracked-backfill")) ledger.push("2026-05-09-tasks-tracked-backfill");
+    world.setProp("$system", "applied_migrations", ledger);
+
+    // Plant a $task on the registry by hand: live data the gateway
+    // never saw. _tracked_tasks stays empty to mimic the legacy state.
+    world.createObject({ id: "the_legacy_task", name: "legacy", parent: "$task", owner: "$wiz", location: "the_taskboard" });
+    world.setProp("the_legacy_task", "registry", "the_taskboard");
+    world.setProp("the_taskboard", "_tracked_tasks", []);
+
+    runHostScopedDataMigrations(world, "the_taskboard");
+
+    expect(world.getProp("the_taskboard", "_tracked_tasks")).toEqual(["the_legacy_task"]);
+
+    // Idempotent: a second run leaves the list alone (no duplicates,
+    // no spurious writes).
+    runHostScopedDataMigrations(world, "the_taskboard");
+    expect(world.getProp("the_taskboard", "_tracked_tasks")).toEqual(["the_legacy_task"]);
+  });
+
   it("preserves live runtime properties across host-scoped schema plans", { timeout: 30000 }, () => {
     // Host schema plans reconcile class/seed metadata but seed-hook properties
     // remain initial values. They must not overwrite live state such as

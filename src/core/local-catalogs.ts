@@ -642,16 +642,15 @@ function runTaskRegistryRoomParentMigration(world: WooWorld, names: readonly str
 // would return nothing — including for tasks still sitting at the
 // registry. Idempotent: only writes when the existing list is missing or
 // empty.
-function runTasksTrackedBackfillMigration(world: WooWorld, names: readonly string[]): void {
-  if (migrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION)) return;
-  if (!names.includes("tasks") || !localCatalogInstalled(world, "tasks")) {
-    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
-    return;
-  }
-  if (!world.objects.has("$task_registry") || !world.objects.has("$task")) {
-    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
-    return;
-  }
+// Pure walk: for every $task_registry instance whose `_tracked_tasks` is
+// missing or empty, populate it from the $task instances on this slice
+// whose `registry` ref points at it. Caller is responsible for any
+// idempotency ledger; the walk itself is naturally idempotent — once
+// `_tracked_tasks` is non-empty for a given registry, subsequent passes
+// skip it. Self-hosted taskboards (host_placement: "self") need this on
+// the OWNING host slice, not the gateway, because the data lives there.
+function backfillTaskRegistryTrackedTasks(world: WooWorld): void {
+  if (!world.objects.has("$task_registry") || !world.objects.has("$task")) return;
   for (const id of Array.from(world.objects.keys())) {
     if (id === "$task_registry") continue;
     if (!world.isDescendantOf(id, "$task_registry")) continue;
@@ -668,6 +667,19 @@ function runTasksTrackedBackfillMigration(world: WooWorld, names: readonly strin
     if (tracked.length === 0 && Array.isArray(existing) && existing.length === 0) continue;
     world.setProp(id, "_tracked_tasks", tracked as WooValue);
   }
+}
+
+// Gateway-side migration entry. Host-scoped slices call
+// backfillTaskRegistryTrackedTasks directly via runHostScopedDataMigrations
+// because their data isn't visible from the gateway when the registry is
+// host_placement: "self".
+function runTasksTrackedBackfillMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION)) return;
+  if (!names.includes("tasks") || !localCatalogInstalled(world, "tasks")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
+    return;
+  }
+  backfillTaskRegistryTrackedTasks(world);
   markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
 }
 
@@ -1323,6 +1335,13 @@ export function runHostScopedDataMigrations(world: WooWorld, host = "host"): voi
   // Repair horoscope-note instances orphaned when $horoscope_note was
   // recycled. Per-host walk; idempotent.
   migrateHoroscopeNoteParentOrphans(world);
+  // Backfill `_tracked_tasks` on host-owned $task_registry instances
+  // (host_placement: "self"). Without this, $task_registry:listing
+  // returns empty on already-deployed self-hosted taskboards because
+  // the gateway-only ledgered migration can't see the host's data.
+  // backfillTaskRegistryTrackedTasks is naturally idempotent — once the
+  // list is populated, subsequent calls skip the registry.
+  backfillTaskRegistryTrackedTasks(world);
 }
 
 // Walk every object on this host slice whose parent ref is the literal

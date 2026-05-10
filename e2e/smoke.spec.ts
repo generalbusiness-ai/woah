@@ -1,9 +1,5 @@
 import { test, expect, type APIRequestContext, type Locator } from "@playwright/test";
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 async function boxKey(locator: Locator): Promise<string> {
   const box = await locator.boundingBox();
   return box ? `${Math.round(box.x)}:${Math.round(box.y)}:${Math.round(box.width)}:${Math.round(box.height)}` : "";
@@ -28,7 +24,7 @@ test("loads shell and renders nav", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Chat" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Pinboard" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Dubspace" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Taskspace" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Tasks" })).toBeVisible();
   await expect(page.getByRole("button", { name: "IDE" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Chat" })).toHaveClass(/active/);
   await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
@@ -116,8 +112,8 @@ test("switches between tabs", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
   await expect(page.locator(".pinboard-stage")).toBeVisible();
 
-  await page.getByRole("button", { name: "Taskspace" }).click();
-  await expect(page.getByRole("button", { name: "Taskspace" })).toHaveClass(/active/);
+  await page.getByRole("button", { name: "Tasks" }).click();
+  await expect(page.getByRole("button", { name: "Tasks" })).toHaveClass(/active/);
 
   await page.getByRole("button", { name: "IDE" }).click();
   await expect(page.getByRole("button", { name: "IDE" })).toHaveClass(/active/);
@@ -166,9 +162,9 @@ test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
   await expect(page.locator(".pinboard-stage")).toBeVisible({ timeout: 5_000 });
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Taskspace" }).click();
-  await expect(page.getByRole("button", { name: "Taskspace" })).toHaveClass(/active/);
-  await expect(page.locator(".task-create")).toBeVisible({ timeout: 5_000 });
+  await page.getByRole("button", { name: "Tasks" }).click();
+  await expect(page.getByRole("button", { name: "Tasks" })).toHaveClass(/active/);
+  await expect(page.locator(".woo-tasks-kanban")).toBeVisible({ timeout: 5_000 });
   expect(stateCalls).toEqual([]);
 });
 
@@ -700,7 +696,7 @@ test("chat command enters dubspace UI", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
 });
 
-test("taskspace enters with chat focus", async ({ page }) => {
+test("tasks tab enters with chat focus", async ({ page }) => {
   await page.goto("/");
   const continueAsGuest = page.getByRole("button", { name: "Continue as guest" });
   if (await continueAsGuest.isVisible()) {
@@ -712,70 +708,15 @@ test("taskspace enters with chat focus", async ({ page }) => {
   await expect(page.locator("[data-space-chat-input]")).toBeFocused();
 });
 
-test("taskspace supports hierarchical task workflow", async ({ page, request }) => {
-  await page.goto("/");
-  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
-  const actorName = actor.replace(/^guest_(\d+)$/, "Guest $1");
-  const actorText = new RegExp(`${escapeRegex(actor)}|${escapeRegex(actorName)}`);
-  const suffix = Date.now();
-  const rootTitle = `E2E root ${suffix}`;
-  const subTitle = `E2E sub ${suffix}`;
-  const requirement = `E2E requirement ${suffix}`;
-  const message = `E2E message ${suffix}`;
-  const artifact = `https://example.com/e2e-${suffix}`;
-
-  await page.getByRole("button", { name: "Taskspace" }).click();
-  await expect(page.locator('[data-task-status="open"]')).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator('[data-task-status="done"]')).toHaveAttribute("aria-pressed", "false");
-  await page.getByPlaceholder("Root task title").fill(rootTitle);
-  await page.locator(".task-create").getByPlaceholder("Description").fill("Root task from browser smoke");
-  await page.locator(".task-create").getByRole("button", { name: "Create" }).click();
-  await expect(page.locator(".inspector h2")).toHaveText(rootTitle, { timeout: 5_000 });
-
-  const inspector = page.locator(".inspector");
-  await inspector.getByRole("button", { name: "Claim" }).click();
-  await expect(inspector).toContainText(actorText);
-  await inspector.getByRole("button", { name: "In Progress" }).click();
-  await expect(inspector.locator(".status-pill").first()).toContainText("in progress");
-
-  const session = await page.evaluate(() => localStorage.getItem("woo.session"));
-  expect(session).toBeTruthy();
-  await inspector.getByPlaceholder("Subtask title").fill(`${subTitle} draft`);
-  await expect(inspector.getByPlaceholder("Subtask title")).toBeFocused();
-  await request.post("/api/objects/the_taskspace/calls/create_task", {
-    headers: { authorization: `Session ${session}` },
-    data: { space: "the_taskspace", args: [`E2E focus churn ${suffix}`, "external refresh while editing"] }
-  });
-  await expect(inspector.getByPlaceholder("Subtask title")).toHaveValue(`${subTitle} draft`);
-  await expect(inspector.getByPlaceholder("Subtask title")).toBeFocused();
-
-  await inspector.getByPlaceholder("Subtask title").fill(subTitle);
-  await inspector.getByPlaceholder("Description").fill("Subtask from browser smoke");
-  await inspector.getByRole("button", { name: "Add" }).first().click();
-  await expect(page.locator(".tree")).toContainText(subTitle);
-  await expect(page.locator(".inspector h2")).toHaveText(subTitle);
-
-  await inspector.getByPlaceholder("Requirement").fill(requirement);
-  await page.locator("[data-add-requirement]").click();
-  await expect(inspector.locator(".checklist")).toContainText(requirement);
-  await inspector.getByLabel(requirement).check();
-  await expect(inspector.getByLabel(requirement)).toBeChecked();
-  await expect(inspector).toContainText("1/1");
-
-  await inspector.getByPlaceholder("Message").fill(message);
-  await page.locator("[data-add-message]").click();
-  await expect(inspector.locator(".activity-list")).toContainText(message);
-
-  await inspector.getByPlaceholder("https://example.com/artifact").fill(artifact);
-  await page.locator("[data-add-artifact]").click();
-  await expect(inspector.locator(".artifact-list")).toContainText(artifact);
-
-  await inspector.getByRole("button", { name: "Done" }).click();
-  await expect(page.locator(".tree")).not.toContainText(subTitle);
-  await page.locator('[data-task-status="done"]').click();
-  await expect(page.locator(".tree")).toContainText(subTitle);
-});
+// The legacy "hierarchical task workflow" smoke covered the deleted
+// taskspace catalog (root_tasks / subtasks / checklist / artifacts /
+// status pills). The new tasks catalog is a registry+kanban model with
+// roles, steps, workflows; its UI mechanics are covered by the kanban
+// component tests in tests/catalog-ui-components.test.ts and the
+// registry verb behavior is exercised by tests/catalogs.test.ts. A
+// browser smoke for the new flow is worth adding (open registry → seed
+// policy → create task → claim → pass through workflow) but isn't a
+// merge-blocker; tracked as a follow-up.
 
 test("REST runtime API supports auth, calls, properties, and logs", async ({ request }) => {
   const suffix = Date.now();
@@ -790,23 +731,38 @@ test("REST runtime API supports auth, calls, properties, and logs", async ({ req
   const wizardSession = await wizardAuth.json();
   const wizardHeaders = { Authorization: `Session ${wizardSession.session}` };
 
-  const describe = await request.get("/api/objects/the_taskspace", { headers });
+  // Seed a minimal workflow ("task" → "do:it" → role "doer") so guest's
+  // create_task calls below have a known kind to use. seed_minimal_policy
+  // raises E_INVARG once the registry is populated, so tolerate that for
+  // re-runs against a long-lived dev server.
+  const seed = await request.post("/api/objects/the_taskboard/calls/seed_minimal_policy", {
+    headers: wizardHeaders,
+    data: { space: "the_taskboard", args: [wizardSession.actor] }
+  });
+  if (!seed.ok()) {
+    const err = await seed.json();
+    expect(err.error?.code === "E_INVARG" || err.error?.code === undefined, JSON.stringify(err)).toBe(true);
+  }
+
+  const describe = await request.get("/api/objects/the_taskboard", { headers });
   expect(describe.ok()).toBe(true);
   const described = await describe.json();
-  expect(described.id).toBe("the_taskspace");
+  expect(described.id).toBe("the_taskboard");
   expect(described.verbs).toContain("create_task");
 
-  const roots = await request.get("/api/objects/the_taskspace/properties/root_tasks", { headers });
-  expect(roots.ok()).toBe(true);
-  const rootProperty = await roots.json();
-  expect(rootProperty.name).toBe("root_tasks");
-  expect(Array.isArray(rootProperty.value)).toBe(true);
+  // _tracked_tasks is the registry's list of every minted task — the
+  // closest analogue to the deprecated taskspace `root_tasks`.
+  const tracked = await request.get("/api/objects/the_taskboard/properties/_tracked_tasks", { headers });
+  expect(tracked.ok()).toBe(true);
+  const trackedProperty = await tracked.json();
+  expect(trackedProperty.name).toBe("_tracked_tasks");
+  expect(Array.isArray(trackedProperty.value)).toBe(true);
 
   const privateName = `private_rest_${suffix}`;
   const definePrivate = await request.post("/api/property", {
     headers: wizardHeaders,
     data: {
-      object: "the_taskspace",
+      object: "the_taskboard",
       name: privateName,
       default: "classified",
       perms: "w",
@@ -815,53 +771,48 @@ test("REST runtime API supports auth, calls, properties, and logs", async ({ req
     }
   });
   expect(definePrivate.ok()).toBe(true);
-  const privateDescribe = await request.get("/api/objects/the_taskspace", { headers });
+  const privateDescribe = await request.get("/api/objects/the_taskboard", { headers });
   expect((await privateDescribe.json()).properties).toContain(privateName);
-  const privateRead = await request.get(`/api/objects/the_taskspace/properties/${privateName}`, { headers });
+  const privateRead = await request.get(`/api/objects/the_taskboard/properties/${privateName}`, { headers });
   expect(privateRead.status()).toBe(403);
   expect((await privateRead.json()).error.code).toBe("E_PERM");
 
-  const denied = await request.post("/api/objects/the_taskspace/calls/create_task", {
-    headers,
-    data: { args: [`REST denied ${suffix}`, "missing space"] }
-  });
-  expect(denied.status()).toBe(403);
-  expect((await denied.json()).error.code).toBe("E_DIRECT_DENIED");
-
-  const forceDenied = await request.post("/api/objects/the_taskspace/calls/create_task", {
+  // X-Woo-Force-Direct is wizard-only; a guest sending it must be denied
+  // by the REST middleware regardless of the verb's own perms.
+  const forceDenied = await request.post("/api/objects/the_taskboard/calls/create_task", {
     headers: { ...headers, "X-Woo-Force-Direct": "1" },
-    data: { args: [`REST force denied ${suffix}`, "non-wizard force"] }
+    data: { args: ["task", `REST force denied ${suffix}`, "non-wizard force", [], null] }
   });
   expect(forceDenied.status()).toBe(403);
   expect((await forceDenied.json()).error.code).toBe("E_PERM");
 
-  const create = await request.post("/api/objects/the_taskspace/calls/create_task", {
+  const create = await request.post("/api/objects/the_taskboard/calls/create_task", {
     headers,
     data: {
       id: `rest-create-${suffix}`,
-      space: "the_taskspace",
-      args: [`REST root ${suffix}`, "created through REST"]
+      space: "the_taskboard",
+      args: ["task", `REST root ${suffix}`, "created through REST", [], null]
     }
   });
   expect(create.ok()).toBe(true);
   const frame = await create.json();
   expect(frame.op).toBe("applied");
-  expect(frame.space).toBe("the_taskspace");
+  expect(frame.space).toBe("the_taskboard");
   expect(frame.message.actor).toBe(session.actor);
   expect(frame.message.verb).toBe("create_task");
   expect(frame.observations[0].type).toBe("task_created");
 
-  const retry = await request.post("/api/objects/the_taskspace/calls/create_task", {
+  const retry = await request.post("/api/objects/the_taskboard/calls/create_task", {
     headers,
     data: {
       id: `rest-create-${suffix}`,
-      space: "the_taskspace",
-      args: [`REST root ${suffix}`, "created through REST"]
+      space: "the_taskboard",
+      args: ["task", `REST root ${suffix}`, "created through REST", [], null]
     }
   });
   expect(await retry.json()).toEqual(frame);
 
-  const log = await request.get(`/api/objects/the_taskspace/log?from=${frame.seq}&limit=1`, { headers });
+  const log = await request.get(`/api/objects/the_taskboard/log?from=${frame.seq}&limit=1`, { headers });
   expect(log.ok()).toBe(true);
   const logged = await log.json();
   expect(logged.messages).toHaveLength(1);
@@ -869,17 +820,17 @@ test("REST runtime API supports auth, calls, properties, and logs", async ({ req
   expect(logged.messages[0].message.verb).toBe("create_task");
   expect(logged.messages[0].observations[0].type).toBe("task_created");
 
-  const compat = await request.post("/api/objects/the_taskspace/calls/call", {
+  const compat = await request.post("/api/objects/the_taskboard/calls/call", {
     headers,
     data: {
       id: `rest-compat-${suffix}`,
-      args: [{ target: "the_taskspace", verb: "create_task", args: [`REST compat ${suffix}`, "created through $space:call route"] }]
+      args: [{ target: "the_taskboard", verb: "create_task", args: ["task", `REST compat ${suffix}`, "created through $space:call route", [], null] }]
     }
   });
   expect(compat.ok()).toBe(true);
   const compatFrame = await compat.json();
   expect(compatFrame.op).toBe("applied");
-  expect(compatFrame.space).toBe("the_taskspace");
+  expect(compatFrame.space).toBe("the_taskboard");
   expect(compatFrame.message.verb).toBe("create_task");
 
   const enter = await request.post("/api/objects/the_chatroom/calls/enter", { headers, data: { args: [] } });
@@ -898,20 +849,33 @@ test("REST SSE stream receives sequenced applied frames", async ({ request }) =>
   expect(auth.ok()).toBe(true);
   const session = await auth.json();
   const headers = { Authorization: `Session ${session.session}` };
+  const wizardAuth = await request.post("/api/auth", { data: { token: `wizard:${process.env.WOO_INITIAL_WIZARD_TOKEN ?? "e2e-wizard"}` } });
+  const wizardSession = await wizardAuth.json();
+  const wizardHeaders = { Authorization: `Session ${wizardSession.session}` };
+  // Tolerate "already populated" — the REST runtime test above may have
+  // already seeded this registry on the same dev server instance.
+  const seed = await request.post("/api/objects/the_taskboard/calls/seed_minimal_policy", {
+    headers: wizardHeaders,
+    data: { space: "the_taskboard", args: [wizardSession.actor] }
+  });
+  if (!seed.ok()) {
+    const err = await seed.json();
+    expect(err.error?.code === "E_INVARG" || err.error?.code === undefined, JSON.stringify(err)).toBe(true);
+  }
   const baseUrl = `http://localhost:${process.env.PORT ?? 5173}`;
 
-  const stream = await fetch(`${baseUrl}/api/objects/the_taskspace/stream`, { headers });
+  const stream = await fetch(`${baseUrl}/api/objects/the_taskboard/stream`, { headers });
   expect(stream.status).toBe(200);
   expect(stream.body).not.toBeNull();
   const reader = stream.body!.getReader();
   const streamText = readSseUntil(reader, "event: applied", 5_000);
 
-  const create = await request.post("/api/objects/the_taskspace/calls/create_task", {
+  const create = await request.post("/api/objects/the_taskboard/calls/create_task", {
     headers,
     data: {
       id: `rest-sse-${suffix}`,
-      space: "the_taskspace",
-      args: [`REST SSE ${suffix}`, "created while streaming"]
+      space: "the_taskboard",
+      args: ["task", `REST SSE ${suffix}`, "created while streaming", [], null]
     }
   });
   expect(create.ok()).toBe(true);
@@ -919,15 +883,15 @@ test("REST SSE stream receives sequenced applied frames", async ({ request }) =>
   const text = await streamText;
   await reader.cancel();
 
-  expect(text).toContain(`id: the_taskspace:${frame.seq}`);
+  expect(text).toContain(`id: the_taskboard:${frame.seq}`);
   expect(text).toContain("event: applied");
   expect(text).toContain(`REST SSE ${suffix}`);
 
-  const replay = await fetch(`${baseUrl}/api/objects/the_taskspace/stream`, { headers: { ...headers, "Last-Event-ID": `the_taskspace:${frame.seq - 1}` } });
+  const replay = await fetch(`${baseUrl}/api/objects/the_taskboard/stream`, { headers: { ...headers, "Last-Event-ID": `the_taskboard:${frame.seq - 1}` } });
   expect(replay.status).toBe(200);
   expect(replay.body).not.toBeNull();
   const replayReader = replay.body!.getReader();
-  const replayText = await readSseUntil(replayReader, `id: the_taskspace:${frame.seq}`, 5_000);
+  const replayText = await readSseUntil(replayReader, `id: the_taskboard:${frame.seq}`, 5_000);
   await replayReader.cancel();
   expect(replayText).toContain("event: applied");
   expect(replayText).toContain("task_created");

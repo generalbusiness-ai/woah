@@ -29,28 +29,27 @@ function testWooContext(names: Record<string, string> = {}): WooContext {
 
 describe("bundled catalog UI components", () => {
   it("keeps the chat-shell-enabled layouts vertically consistent across tools", () => {
+    // Chat-shell sizing now goes through the shared `.split.has-space-chat`
+    // primitive (used by dubspace + pinboard via `.split.split--side-fixed`)
+    // and the tasks workspace's own `.woo-tasks-workspace.has-space-chat`
+    // rule. Both must resolve to `height: 100%` so the layout fills the
+    // grid row that `.space-chat-shell` reserves for it.
     const css = readFileSync(resolve(process.cwd(), "src/client/styles.css"), "utf8");
-    const pinboardMatch = css.match(/\.pinboard-layout\.has-space-chat\s*\{([\s\S]*?)\}/);
-    const dubspaceMatch = css.match(/\.dubspace-layout\.has-space-chat\s*\{([\s\S]*?)\}/);
+    const splitMatch = css.match(/\.split\.has-space-chat\s*\{([\s\S]*?)\}/);
     const tasksMatch = css.match(/\.woo-tasks-workspace\.has-space-chat\s*\{([\s\S]*?)\}/);
 
-    expect(pinboardMatch, "pinboard has-space-chat rule present").not.toBeNull();
-    expect(dubspaceMatch, "dubspace has-space-chat rule present").not.toBeNull();
+    expect(splitMatch, "split has-space-chat primitive present").not.toBeNull();
     expect(tasksMatch, "tasks has-space-chat rule present").not.toBeNull();
 
-    const pinboardBlock = pinboardMatch?.[1] ?? "";
-    const dubspaceBlock = dubspaceMatch?.[1] ?? "";
+    const splitBlock = splitMatch?.[1] ?? "";
     const tasksBlock = tasksMatch?.[1] ?? "";
 
-    expect(pinboardBlock).toMatch(/height:\s*100%/);
-    expect(dubspaceBlock).toMatch(/height:\s*100%/);
+    expect(splitBlock).toMatch(/height:\s*100%/);
     expect(tasksBlock).toMatch(/height:\s*100%/);
 
-    const pinboardPanelMatch = pinboardBlock.match(/height:\s*([^;]+);/);
-    const dubspacePanelMatch = dubspaceBlock.match(/height:\s*([^;]+);/);
+    const splitPanelMatch = splitBlock.match(/height:\s*([^;]+);/);
     const tasksPanelMatch = tasksBlock.match(/height:\s*([^;]+);/);
-    expect(pinboardPanelMatch?.[1]).toBe("100%");
-    expect(dubspacePanelMatch?.[1]).toBe("100%");
+    expect(splitPanelMatch?.[1]).toBe("100%");
     expect(tasksPanelMatch?.[1]).toBe("100%");
   });
 
