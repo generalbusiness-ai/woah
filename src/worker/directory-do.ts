@@ -102,16 +102,24 @@ export class DirectoryDO {
 
       if (request.method === "POST" && url.pathname === "/register-session") {
         const body = await readJson(request);
-        this.registerSession({
-          session_id: String(body.session_id ?? ""),
-          actor: String(body.actor ?? "") as ObjRef,
-          expires_at: Number(body.expires_at ?? 0),
-          token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
-          current_location: typeof body.current_location === "string" ? body.current_location as ObjRef : null,
-          apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
-          updated_at: Date.now()
-        });
-        return json({ ok: true });
+        const startedAt = Date.now();
+        let wrote = false;
+        try {
+          wrote = this.registerSession({
+            session_id: String(body.session_id ?? ""),
+            actor: String(body.actor ?? "") as ObjRef,
+            expires_at: Number(body.expires_at ?? 0),
+            token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
+            current_location: typeof body.current_location === "string" ? body.current_location as ObjRef : null,
+            apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
+            updated_at: Date.now()
+          });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "ok", writes: wrote ? 1 : 0 });
+        } catch (err) {
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) });
+          throw err;
+        }
+        return json({ ok: true, wrote });
       }
 
       if (request.method === "POST" && url.pathname === "/unregister-session") {
@@ -229,8 +237,27 @@ export class DirectoryDO {
     return { id, host, anchor: null, updated_at: Date.now() };
   }
 
-  private registerSession(session: SessionRoute): void {
-    if (!session.session_id || !session.actor || !Number.isFinite(session.expires_at)) return;
+  private registerSession(session: SessionRoute): boolean {
+    if (!session.session_id || !session.actor || !Number.isFinite(session.expires_at)) return false;
+    // Mirror registerObject's dedup: SELECT-then-skip when every persisted
+    // column matches. Without this, callers like the worker entry's
+    // registerSessionLocationFromCall (re-run on every successful call POST)
+    // and the per-cron auth path turn into a row write per RPC even when
+    // nothing changed — observed at ~488 row writes/hour on an idle
+    // singleton. Compare every column except updated_at; an unchanged row
+    // is a no-op.
+    const existing = firstRow(this.state.storage.sql.exec(
+      "SELECT actor, expires_at, token_class, current_location, apikey_id FROM session_route WHERE session_id = ?",
+      session.session_id
+    ));
+    if (existing
+      && String(existing.actor) === session.actor
+      && Number(existing.expires_at) === session.expires_at
+      && String(existing.token_class) === session.token_class
+      && (existing.current_location === null ? null : String(existing.current_location)) === session.current_location
+      && (existing.apikey_id === null ? null : String(existing.apikey_id)) === session.apikey_id) {
+      return false;
+    }
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO session_route(session_id, actor, expires_at, token_class, current_location, apikey_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
@@ -241,6 +268,7 @@ export class DirectoryDO {
       session.apikey_id,
       Date.now()
     );
+    return true;
   }
 
   private unregisterSession(sessionId: string): void {

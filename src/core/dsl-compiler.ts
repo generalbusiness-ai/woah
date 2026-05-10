@@ -139,9 +139,11 @@ const BUILTINS = new Set([
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
-  "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
-  "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace", "programmer_eval",
+  // builder_create_object and builder_chparent stay native. The other
+  // builder_*/programmer_* surface builtins were removed (see
+  // tiny-vm.ts BUILTIN_NAMES tombstones); their logic lives in
+  // catalogs/prog/manifest.json now.
+  "builder_create_object", "builder_chparent", "programmer_eval",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   // Read-only authoring primitives (LambdaMOO-shape introspection).
   "parents", "children", "valid", "verbs", "verb_info", "verb_code",
@@ -153,7 +155,10 @@ const BUILTINS = new Set([
   // Authoring aggregations.
   "authoring_inspect", "authoring_search",
   // Object identity edits.
-  "set_object_name"
+  "set_object_name",
+  // Cross-host detection (catalog authoring surfaces use it to refuse
+  // remote writes with E_CROSS_HOST_WRITE before reaching SET_PROP).
+  "is_remote_object"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 

@@ -1,4 +1,9 @@
-import { escapeHtml, type WooComponentRegistry, type WooContext } from "../../../src/client/framework";
+import {
+  escapeHtml,
+  type ObservationRegistry,
+  type WooComponentRegistry,
+  type WooContext
+} from "../../../src/client/framework";
 
 export type DubspaceControlMap = Record<string, { id?: string; name?: string; props?: Record<string, unknown> }>;
 
@@ -295,4 +300,81 @@ function loopPitch(freq: number): { freq: number; semitone: number; note: string
 
 export function registerWooComponents(registry: WooComponentRegistry): void {
   registry.defineTag("woo-dubspace-workspace", WooDubspaceWorkspaceElement);
+}
+
+export function registerWooObservationHandlers(registry: ObservationRegistry): void {
+  registry.observation({
+    types: ["loop_started"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const slot = String(envelope.observation.slot ?? "");
+      if (slot) draft.patchObjectProps(slot, { playing: true });
+    }
+  });
+  registry.observation({
+    types: ["loop_stopped"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const slot = String(envelope.observation.slot ?? "");
+      if (slot) draft.patchObjectProps(slot, { playing: false });
+    }
+  });
+  registry.observation({
+    types: ["tempo_changed"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const target = String(obs.target ?? "");
+      const bpm = Number(obs.bpm);
+      if (target && Number.isFinite(bpm)) draft.patchObjectProps(target, { bpm });
+    }
+  });
+  registry.observation({
+    types: ["transport_started"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const target = String(obs.target ?? "");
+      if (!target) return;
+      const props: Record<string, unknown> = { playing: true };
+      const startedAt = Number(obs.started_at);
+      const bpm = Number(obs.bpm);
+      if (Number.isFinite(startedAt)) props.started_at = startedAt;
+      if (Number.isFinite(bpm)) props.bpm = bpm;
+      draft.patchObjectProps(target, props);
+    }
+  });
+  registry.observation({
+    types: ["transport_stopped"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const target = String(envelope.observation.target ?? "");
+      if (target) draft.patchObjectProps(target, { playing: false });
+    }
+  });
+  registry.observation({
+    types: ["drum_step_changed"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const obs = envelope.observation;
+      const target = String(obs.target ?? "");
+      const pattern = obs.pattern;
+      // Dubspace 0.2.4 made the full pattern snapshot the observation
+      // contract; older logs that only carry voice/step/enabled cannot be
+      // safely reconstructed inside a deterministic reducer.
+      if (target && pattern && typeof pattern === "object" && !Array.isArray(pattern)) draft.patchObjectProps(target, { pattern });
+    }
+  });
+  registry.observation({
+    types: ["scene_recalled"],
+    route: "both",
+    reduce: (draft, envelope) => {
+      const controls = envelope.observation.controls;
+      if (!controls || typeof controls !== "object" || Array.isArray(controls)) return;
+      for (const [target, props] of Object.entries(controls)) {
+        if (!props || typeof props !== "object" || Array.isArray(props)) continue;
+        draft.patchObjectProps(target, props as Record<string, unknown>);
+      }
+    }
+  });
 }

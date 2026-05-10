@@ -1275,6 +1275,31 @@ export function runHostScopedDataMigrations(world: WooWorld, host = "host"): voi
   // owns. Both paths gate on value shape and skip when there's nothing
   // to do.
   migrateNoteTextStringShapeData(world);
+  // Repair horoscope-note instances orphaned when $horoscope_note was
+  // recycled. Per-host walk; idempotent.
+  migrateHoroscopeNoteParentOrphans(world);
+}
+
+// Walk every object on this host slice whose parent ref is the literal
+// string "$horoscope_note" and rewrite parent to "$dispensed_note". The
+// $horoscope_note class object was recycled on 2026-05-09 while still
+// having live instance descendants on satellite hosts; each instance
+// retained the tombstoned parent ref, which broke verb dispatch through
+// the inheritance chain.
+//
+// Uses migrationSetObjectParent so the rewrite is local and tolerates
+// both endpoints being absent: $horoscope_note is tombstoned, and
+// $dispensed_note is typically gateway-owned and may not have a stub on
+// every satellite. The dispatch-time substrate also tolerates dangling
+// parent refs now (see WooWorld.parentWalkLookup) — the migration just
+// closes the leak so cleanup metrics stop firing.
+function migrateHoroscopeNoteParentOrphans(world: WooWorld): void {
+  for (const id of Array.from(world.objects.keys())) {
+    const obj = world.objects.get(id);
+    if (!obj) continue;
+    if (obj.parent !== "$horoscope_note") continue;
+    world.migrationSetObjectParent(id, "$dispensed_note");
+  }
 }
 
 function runPinboardNotesToPinsMigration(world: WooWorld, names: readonly string[], id: string): void {

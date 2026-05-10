@@ -61,6 +61,16 @@ export class WooClient {
     return this.session;
   }
 
+  /** Hydrate this client with a session minted by an earlier `authenticate()`
+   * call (typically from a previous cron tick on the same warm CF isolate).
+   * Skips the `/api/auth` round-trip and the `register-session` write the
+   * worker entry emits on each fresh auth, so steady-state cron traffic
+   * doesn't churn `session_route`. The caller must check `session.expiresAt`
+   * against the current time before adopting; this method does not validate. */
+  adoptSession(session: WooSession): void {
+    this.session = session;
+  }
+
   async getProperty(target: string, name: string): Promise<unknown> {
     this.requireSession();
     const path = `/api/objects/${encodeURIComponent(target)}/properties/${encodeURIComponent(name)}`;

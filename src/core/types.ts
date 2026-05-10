@@ -257,7 +257,7 @@ export type MetricEvent =
   | { kind: "direct_call"; target: ObjRef; verb: string; audience: ObjRef | null; observations: number; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
   | { kind: "init"; phase: "world" | "mcp_gateway"; ms: number }
-  | { kind: "startup_storage"; phase: "cf_repository_migrate" | "cf_repository_load" | "cf_repository_save" | "host_seed_fetch" | "directory_schema" | "directory_register_objects" | "directory_inherit_tombstones"; ms: number; status: "ok" | "error"; objects?: number; properties?: number; sessions?: number; logs?: number; snapshots?: number; tasks?: number; routes?: number; writes?: number; statements?: number; stored?: boolean; error?: string; count?: number; inserted?: number; routes_removed?: number; batch_seq?: number; final?: boolean }
+  | { kind: "startup_storage"; phase: "cf_repository_migrate" | "cf_repository_load" | "cf_repository_save" | "host_seed_fetch" | "directory_schema" | "directory_register_objects" | "directory_register_session" | "directory_inherit_tombstones"; ms: number; status: "ok" | "error"; objects?: number; properties?: number; sessions?: number; logs?: number; snapshots?: number; tasks?: number; routes?: number; writes?: number; statements?: number; stored?: boolean; error?: string; count?: number; inserted?: number; routes_removed?: number; batch_seq?: number; final?: boolean }
   | { kind: "state_projection"; ms: number; objects: number; remote_hosts: number }
   | { kind: "host_schema_sync"; host: string; planned: number; skipped: number; ms: number }
   // Diagnostic events for the host-task serialization queue (world.ts
@@ -281,7 +281,14 @@ export type MetricEvent =
   // for a remote pure verb (forwardInternalReadChecked, 2.5s timeout), and
   // "mutating" for a remote impure verb (forwardInternalChecked, no
   // timeout). Critical for diagnosing wedges that previously left no trail.
-  | { kind: "dispatch_resolved"; target: ObjRef; verb: string; host: string; path: "local" | "read" | "mutating"; pure: boolean };
+  | { kind: "dispatch_resolved"; target: ObjRef; verb: string; host: string; path: "local" | "read" | "mutating"; pure: boolean }
+  // Emitted when a parent-chain walk hits a missing intermediate. The parent
+  // ref on `start` (or one of its ancestors) points at `missing`, which has
+  // no entry in the local objects map. Treated as end-of-chain by the walk
+  // (so dispatch keeps working) and surfaced here so the orphan can be
+  // repaired via a host-scoped data migration. `tombstoned` distinguishes
+  // a recycled-out-from-under-it ancestor from a never-present id.
+  | { kind: "dangling_parent_ref"; start: ObjRef; missing: ObjRef; tombstoned: boolean };
 
 export type SequencedMessage = {
   space: ObjRef;

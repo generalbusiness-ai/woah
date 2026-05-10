@@ -1,7 +1,9 @@
 // Horoscope vending-machine plug Worker.
 //
 // Cron-triggered every minute. Each tick:
-//   1. Authenticate to woo with the actor-bound apikey for the block.
+//   1. Reuse a cached woo session if one is still warm in this isolate
+//      and not within REAUTH_MARGIN_MS of expiry, otherwise authenticate
+//      to woo with the actor-bound apikey for the block.
 //   2. Read the block's `system_prompt` config.
 //   3. Drain the queue: call :next_pending, run Workers AI, call :deliver,
 //      repeat until the queue is empty or MAX_ORDERS_PER_TICK is reached.
@@ -18,7 +20,7 @@
 // `mcp-client.ts` for the long-lived MCP-attached variant kept for the
 // day we want event-driven (`woo_wait`) drain instead of cron polling.
 
-import { WooClient, WooError } from "./woo-client";
+import { WooClient, WooError, type WooSession } from "./woo-client";
 import { generateHoroscope, type HoroscopeAi } from "./horoscope";
 
 export interface HoroscopePlugEnv {
@@ -41,6 +43,41 @@ type PendingOrder = {
   request: string;
   ts: number;
 };
+
+// Re-authenticate at least this long before the cached session would expire.
+// woo issues 24h sessions for credential-class tokens (apikey/bearer); a one
+// hour margin keeps us comfortably away from the boundary even if a cron
+// tick is delayed or a single tick runs long.
+const REAUTH_MARGIN_MS = 60 * 60 * 1000;
+
+export type SessionCache = {
+  get(): WooSession | null;
+  set(session: WooSession | null): void;
+};
+
+// Module-scope singleton cache. CF Workers reuse isolates between
+// invocations when traffic is steady, so a `let` at module scope survives
+// from one cron tick to the next as long as the isolate stays warm. Cold
+// starts (eviction, redeploy, load shedding) reset us back to null and the
+// next tick falls through to a fresh authenticate(). Tests pass their own
+// SessionCache via `deps.sessionCache` to avoid leaking warm state across
+// test cases — see test/index.test.ts.
+let _moduleScopeSession: WooSession | null = null;
+const moduleScopeSessionCache: SessionCache = {
+  get: () => _moduleScopeSession,
+  set: (session) => { _moduleScopeSession = session; }
+};
+
+/** Build a fresh in-memory SessionCache. Useful for tests so each case
+ * starts from a known empty state, and for callers that want explicit
+ * control over the cache lifetime. */
+export function createSessionCache(): SessionCache {
+  let cached: WooSession | null = null;
+  return {
+    get: () => cached,
+    set: (session) => { cached = session; }
+  };
+}
 
 export default {
   async scheduled(_event: ScheduledEvent, env: HoroscopePlugEnv, ctx: ExecutionContext): Promise<void> {
@@ -102,7 +139,7 @@ export type HoroscopeTriggerLabel = "cron" | "fetch";
 export async function runLoggedHoroscopeTick(
   env: HoroscopePlugEnv,
   trigger: HoroscopeTriggerLabel,
-  deps: { fetchImpl?: typeof fetch; now?: () => number } = {}
+  deps: { fetchImpl?: typeof fetch; now?: () => number; sessionCache?: SessionCache } = {}
 ): Promise<HoroscopeTickResult> {
   const now = deps.now ?? Date.now;
   const start = now();
@@ -115,6 +152,7 @@ export async function runLoggedHoroscopeTick(
       block: result.block,
       delivered: result.delivered,
       errors: result.errors.length,
+      auth: result.authMode,
       duration_ms: now() - start
     });
     return result;
@@ -134,19 +172,48 @@ export type HoroscopeTickResult = {
   block: string;
   delivered: number;
   errors: Array<{ order_id: string; message: string }>;
+  /** "warm" when the session cache hit and we skipped /api/auth, "cold"
+   * when we authenticated. Surfaced in the `tick_ok` log so dashboards can
+   * compute a cache hit rate from `wrangler tail`. */
+  authMode: "warm" | "cold";
 };
 
 export async function runHoroscopeTick(
   env: HoroscopePlugEnv,
-  deps: { fetchImpl?: typeof fetch; now?: () => number } = {}
+  deps: { fetchImpl?: typeof fetch; now?: () => number; sessionCache?: SessionCache } = {}
 ): Promise<HoroscopeTickResult> {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now = deps.now ?? Date.now;
+  const sessionCache = deps.sessionCache ?? moduleScopeSessionCache;
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
-  await client.authenticate(env.WOO_APIKEY);
+
+  // Warm-path reuse: an apikey-class session minted on a prior tick is
+  // still good for ~24h. Skipping /api/auth here is the whole point of
+  // the cache — each fresh authenticate() spends a /api/auth round trip
+  // AND triggers a directory `register-session` write. Re-auth only when
+  // we'd otherwise be running into the expiry boundary mid-tick.
+  const cached = sessionCache.get();
+  let authMode: "warm" | "cold";
+  if (cached && cached.expiresAt !== null && cached.expiresAt - now() > REAUTH_MARGIN_MS) {
+    client.adoptSession(cached);
+    authMode = "warm";
+  } else {
+    const fresh = await client.authenticate(env.WOO_APIKEY);
+    sessionCache.set(fresh);
+    authMode = "cold";
+  }
 
   const maxOrdersPerTick = numEnv(env.MAX_ORDERS_PER_TICK, 10);
   const maxTokens = numEnv(env.MAX_TOKENS, 350);
+
+  // Anything from here on that throws E_NOSESSION must invalidate the
+  // session cache before bubbling up — otherwise the next tick adopts the
+  // same dead session and fails identically. The deliver inner-catch does
+  // its own invalidation; this outer catch covers getProperty,
+  // next_pending, and the closing set_properties heartbeat (all of which
+  // currently propagate). Any non-E_NOSESSION error is rethrown unchanged
+  // and surfaces as `tick_error` upstream.
+  try {
 
   // Read system_prompt once per tick. Owners change it rarely; the cost of
   // a one-tick lag is bounded.
@@ -223,7 +290,12 @@ export async function runHoroscopeTick(
       });
       // E_NOSESSION → re-auth issue, every subsequent call will hit the
       // same wall this tick. Stop and let the next tick re-authenticate.
-      if (err instanceof WooError && err.code === "E_NOSESSION") break;
+      // Invalidate the warm-session cache so the next tick goes cold
+      // rather than re-adopting the same rejected session and looping.
+      if (err instanceof WooError && err.code === "E_NOSESSION") {
+        sessionCache.set(null);
+        break;
+      }
       // Permanent verb-side rejections (bad args, perm, missing verb)
       // mean retrying with the same data will keep failing. Cancel so the
       // queue drains; the user gets nothing for this order, but at least
@@ -277,7 +349,12 @@ export async function runHoroscopeTick(
     }
   ]);
 
-  return { block: env.BLOCK_ID, delivered, errors };
+  return { block: env.BLOCK_ID, delivered, errors, authMode };
+
+  } catch (err) {
+    if (err instanceof WooError && err.code === "E_NOSESSION") sessionCache.set(null);
+    throw err;
+  }
 }
 
 // Verb-side rejections that won't change on retry. Anything outside this

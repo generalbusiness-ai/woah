@@ -40,6 +40,27 @@
           "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
         }
       }
+    ],
+    "observation_handlers": [
+      {
+        "module": "pinboard-ui",
+        "types": [
+          "pin_moved",
+          "note_moved",
+          "pin_resized",
+          "note_resized",
+          "pin_recolored",
+          "note_color_changed",
+          "note_edited",
+          "note_writers_changed",
+          "note_added",
+          "pin_removed",
+          "note_deleted",
+          "pinboard_entered",
+          "pinboard_left",
+          "notes_cleared"
+        ]
+      }
     ]
   },
   "classes": [

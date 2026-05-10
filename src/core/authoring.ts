@@ -928,19 +928,11 @@ const VALID_BUILTINS = new Set([
   "primary_session",
   "is_connected",
   "idle_seconds",
+  // builder_create_object and builder_chparent stay native; see
+  // tiny-vm.ts BUILTIN_NAMES for the removal note on the other
+  // builder_*/programmer_* surface builtins.
   "builder_create_object",
   "builder_chparent",
-  "builder_set_property",
-  "builder_inspect",
-  "builder_search",
-  "programmer_inspect",
-  "programmer_resolve_verb",
-  "programmer_list_verb",
-  "programmer_search",
-  "programmer_install_verb",
-  "programmer_set_verb_info",
-  "programmer_set_property_info",
-  "programmer_trace",
   "programmer_eval",
   "editor_invoke",
   "editor_what",
@@ -972,5 +964,6 @@ const VALID_BUILTINS = new Set([
   "is_clear_property",
   "authoring_inspect",
   "authoring_search",
-  "set_object_name"
+  "set_object_name",
+  "is_remote_object"
 ]);

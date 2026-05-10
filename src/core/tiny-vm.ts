@@ -113,9 +113,24 @@ export const BUILTIN_NAMES = [
   "caller_perms", "set_task_perms", "set_presence", "observe_to_space", "tell",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "builder_create_object", "builder_chparent", "builder_set_property", "builder_inspect", "builder_search",
-  "programmer_inspect", "programmer_resolve_verb", "programmer_list_verb", "programmer_search", "programmer_install_verb",
-  "programmer_set_verb_info", "programmer_set_property_info", "programmer_trace",
+  // builder_create_object and builder_chparent stay native: both bypass
+  // the substrate's programmer-flag check in assertCanCreateObject so
+  // builder-class actors (no programmer flag) can build. Moving them
+  // to woocode requires loosening create()/chparent() builtin auth,
+  // which is a separate substrate change.
+  "builder_create_object", "builder_chparent",
+  // Tombstones — these used to be substrate builtins; their behavior
+  // moved into the catalog ($builder:set_property inlined the
+  // existence-probe + SET_PROP path; the rest were dead code in core,
+  // bypassed by catalog verbs that called authoring_inspect /
+  // authoring_search / verb_info / verb_code / set_verb_info /
+  // set_property_info / add_property / delete_property directly).
+  // Names retained to keep BUILTIN_NAMES indices stable per
+  // spec/semantics/builtins.md §19. Calls with these names raise the
+  // default "unknown builtin" via the dispatcher's fallthrough.
+  "_dead_builder_set_property", "_dead_builder_inspect", "_dead_builder_search",
+  "_dead_programmer_inspect", "_dead_programmer_resolve_verb", "_dead_programmer_list_verb", "_dead_programmer_search", "_dead_programmer_install_verb",
+  "_dead_programmer_set_verb_info", "_dead_programmer_set_property_info", "_dead_programmer_trace",
   "editor_invoke", "editor_what", "editor_view", "editor_replace", "editor_insert", "editor_delete", "editor_dry_run", "editor_save", "editor_pause", "editor_abort",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "dispatch", "execute_command_plan", "str_join", "collect_prop",
   "to_int", "to_float",
@@ -149,7 +164,14 @@ export const BUILTIN_NAMES = [
   // Object-level identity edits. set_object_name keeps WooObject.name
   // and the inherited "name" property in lockstep so $root:@rename can
   // do the right thing through one call.
-  "set_object_name"
+  "set_object_name",
+  // Cross-host detection. Returns true if the object lives on another
+  // host (the bridge will route writes/reads). Catalog authoring
+  // surfaces (\$builder:set_property, etc.) refuse cross-host writes
+  // outright because the wrapper-level atomicity guarantees can't
+  // hold across a host boundary; they call this builtin first and
+  // raise E_CROSS_HOST_WRITE before reaching SET_PROP.
+  "is_remote_object"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1086,42 +1108,20 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "recycle":
         if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "recycle expects object and optional opts");
         return await frame.ctx.world.recycleChecked(frame.ctx.progr, frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx);
-      case "builder_set_property":
-        if (builtinArgs.length < 3 || builtinArgs.length > 4) throw wooError("E_INVARG", "builder_set_property expects object, name, value, and optional opts");
-        return await frame.ctx.world.builderSetProperty(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]), builtinArgs[2], builtinArgs[3] ?? null, frame.ctx.definer);
-      case "builder_inspect":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_inspect expects object and optional opts");
-        return frame.ctx.world.builderInspect(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
-      case "builder_search":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_search expects query and optional opts");
-        return frame.ctx.world.builderSearch(frame.ctx.actor, assertString(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
-      case "programmer_inspect":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "programmer_inspect expects object and optional opts");
-        return frame.ctx.world.programmerInspect(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
-      case "programmer_resolve_verb":
-        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "programmer_resolve_verb expects object and verb descriptor");
-        return frame.ctx.world.programmerResolveVerb(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], frame.ctx.definer);
-      case "programmer_list_verb":
-        if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "programmer_list_verb expects object, descriptor, and optional opts");
-        return frame.ctx.world.programmerListVerb(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], builtinArgs[2] ?? null, frame.ctx.definer);
-      case "programmer_search":
-        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "programmer_search expects query and optional opts");
-        return frame.ctx.world.programmerSearch(frame.ctx.actor, assertString(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
-      case "programmer_install_verb":
-        if (builtinArgs.length < 3 || builtinArgs.length > 4) throw wooError("E_INVARG", "programmer_install_verb expects object, descriptor, source, and optional opts");
-        return await frame.ctx.world.programmerInstallVerb(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], assertString(builtinArgs[2]), builtinArgs[3] ?? null, frame.ctx.definer);
+      // builder_set_property / builder_inspect / builder_search /
+      // programmer_inspect / programmer_resolve_verb /
+      // programmer_list_verb / programmer_search /
+      // programmer_install_verb / programmer_set_verb_info /
+      // programmer_set_property_info / programmer_trace — removed.
+      // The dispatcher's default branch returns "unknown builtin" for
+      // any persisted bytecode that still references these. Callers
+      // moved into woocode in catalogs/prog/manifest.json or were
+      // already inlining the equivalent logic via authoring_inspect /
+      // authoring_search / verb_info / verb_code / set_verb_info /
+      // set_property_info / add_property / delete_property.
       case "programmer_eval":
         if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "programmer_eval expects source and optional opts");
         return await frame.ctx.world.programmerEval(frame.ctx, assertString(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
-      case "programmer_set_verb_info":
-        if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "programmer_set_verb_info expects object, descriptor, and optional opts");
-        return await frame.ctx.world.programmerSetVerbInfo(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], builtinArgs[2] ?? null, frame.ctx.definer);
-      case "programmer_set_property_info":
-        if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "programmer_set_property_info expects object, name, and optional opts");
-        return await frame.ctx.world.programmerSetPropertyInfo(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]), builtinArgs[2] ?? null, frame.ctx.definer);
-      case "programmer_trace":
-        if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "programmer_trace expects object, descriptor, and optional opts");
-        return frame.ctx.world.programmerTrace(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1], builtinArgs[2] ?? null, frame.ctx.definer);
       case "editor_invoke":
         if (builtinArgs.length < 3 || builtinArgs.length > 4) throw wooError("E_INVARG", "editor_invoke expects editor, target, descriptor, and optional opts");
         return await frame.ctx.world.editorInvoke(frame.ctx, assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), builtinArgs[2], builtinArgs[3] ?? null, frame.ctx.definer);
@@ -1243,6 +1243,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "set_object_name expects object and name");
         frame.ctx.world.setObjectNameForActor(frame.ctx.actor, assertObj(builtinArgs[0]), assertString(builtinArgs[1]));
         return null;
+      }
+      case "is_remote_object": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_remote_object expects one object");
+        return await frame.ctx.world.isRemoteObject(assertObj(builtinArgs[0]), frame.ctx.hostMemo);
       }
       default:
         throw wooError("E_INVARG", `unknown builtin: ${name}`);

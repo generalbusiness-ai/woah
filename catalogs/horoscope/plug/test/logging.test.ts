@@ -87,7 +87,7 @@ describe("runLoggedHoroscopeTick", () => {
     const now = () => (tick += 100);
 
     const result = await runLoggedHoroscopeTick(env, "cron", { fetchImpl, now });
-    expect(result).toEqual({ block: "the_horoscope_block", delivered: 2, errors: [] });
+    expect(result).toEqual({ block: "the_horoscope_block", delivered: 2, errors: [], authMode: "cold" });
 
     const events = lines.map((l) => l.event);
     expect(events).toEqual(["tick_start", "order_delivered", "order_delivered", "tick_ok"]);

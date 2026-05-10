@@ -524,7 +524,7 @@ Required event types (cardinality budget per DO):
 
 Cost: one AE write per call is fine at v1 traffic levels; budget revisits at scale.
 
-Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch, Directory schema setup, and Directory object-route registration.
+Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch, Directory schema setup, Directory object-route registration (`directory_register_objects`), and Directory session-route registration (`directory_register_session`). Both Directory register phases include a `writes` count distinguishing diff-deduped no-ops (`writes: 0`) from actual row writes; downstream metric consumers can monitor that ratio to confirm dedup is healthy.
 
 ### R10.2 Structured logs
 

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { horoscopeNoteName, runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
+import { createSessionCache, horoscopeNoteName, runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
 import type { HoroscopeAi } from "../src/horoscope";
+import type { WooSession } from "../src/woo-client";
 
 type Call = { url: string; method: string; body?: unknown };
 type Reply = { status: number; body: unknown; headers?: Record<string, string> };
@@ -70,7 +71,7 @@ describe("runHoroscopeTick", () => {
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
-    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 2, errors: [] });
+    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 2, errors: [], authMode: "cold" });
 
     expect(ai.run).toHaveBeenCalledTimes(2);
     const aiCall0 = ai.run.mock.calls[0][1] as { messages: Array<{ role: string; content: string }>; max_tokens: number };
@@ -136,7 +137,7 @@ describe("runHoroscopeTick", () => {
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
-    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 1, errors: [] });
+    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 1, errors: [], authMode: "cold" });
     // The plug now calls :deliver with a non-empty placeholder string instead
     // of leaving the order at the queue head where it would block every
     // following request.
@@ -172,7 +173,7 @@ describe("runHoroscopeTick", () => {
     ]);
 
     const result = await runHoroscopeTick(env, { fetchImpl });
-    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 0, errors: [] });
+    expect(result).toEqual({ block: env.BLOCK_ID, delivered: 0, errors: [], authMode: "cold" });
     expect(ai.run).not.toHaveBeenCalled();
   });
 
@@ -193,6 +194,141 @@ describe("runHoroscopeTick", () => {
     expect(result.delivered).toBe(1);
     const aiCall = ai.run.mock.calls[0][1] as { messages: Array<{ role: string; content: string }> };
     expect(aiCall.messages[0].content).toMatch(/horoscope/i);
+  });
+});
+
+describe("runHoroscopeTick session cache", () => {
+  const T_NOW = 1_700_000_000_000;
+  const farFuture = (): WooSession => ({
+    actor: "the_horoscope_block",
+    session: "sess_warm",
+    // 23h ahead — well above the 1h REAUTH_MARGIN_MS gate.
+    expiresAt: T_NOW + 23 * 60 * 60 * 1000,
+    tokenClass: "apikey"
+  });
+
+  it("warm cache hits skip /api/auth and reuse the cached session header", async () => {
+    const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+    const sessionCache = createSessionCache();
+    sessionCache.set(farFuture());
+
+    // No authReply: a warm hit must not POST to /api/auth.
+    const { fetchImpl, calls } = makeFetch([
+      () => propertyReply("p"),
+      () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => callReply({ ok: true }),
+      () => callReply(null),
+      () => callReply({ ok: true })
+    ]);
+
+    const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
+    // authMode === "warm" + delivered:1 (which requires an authenticated
+    // call into :next_pending and :deliver) + the absence of /api/auth in
+    // the request log is the three-way proof that the cached session was
+    // actually used. WooClient throws E_NOSESSION before issuing any
+    // request when no session is set, so completing the tick proves the
+    // adopted session reached the wire.
+    expect(result.authMode).toBe("warm");
+    expect(result.delivered).toBe(1);
+    expect(calls.find((c) => c.url === "https://woo.example/api/auth")).toBeUndefined();
+    expect(calls[0].url).toBe("https://woo.example/api/objects/the_horoscope_block/properties/system_prompt");
+  });
+
+  it("re-authenticates when the cached session is within REAUTH_MARGIN_MS of expiry", async () => {
+    const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+    const sessionCache = createSessionCache();
+    sessionCache.set({
+      actor: "the_horoscope_block",
+      session: "sess_stale",
+      // 30 min ahead — inside the 1h margin, so we must re-auth.
+      expiresAt: T_NOW + 30 * 60 * 1000,
+      tokenClass: "apikey"
+    });
+
+    const { fetchImpl, calls } = makeFetch([
+      authReply,
+      () => propertyReply("p"),
+      () => callReply(null),
+      () => callReply({ ok: true })
+    ]);
+
+    const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
+    expect(result.authMode).toBe("cold");
+    expect(calls[0].url).toBe("https://woo.example/api/auth");
+  });
+
+  it("re-authenticates when the cached session has unknown expiresAt", async () => {
+    const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+    const sessionCache = createSessionCache();
+    sessionCache.set({ ...farFuture(), expiresAt: null });
+
+    const { fetchImpl, calls } = makeFetch([
+      authReply,
+      () => propertyReply("p"),
+      () => callReply(null),
+      () => callReply({ ok: true })
+    ]);
+
+    const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
+    expect(result.authMode).toBe("cold");
+    expect(calls[0].url).toBe("https://woo.example/api/auth");
+  });
+
+  it("populates the cache after a cold auth so the next tick can warm-hit", async () => {
+    const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+    const sessionCache = createSessionCache();
+    expect(sessionCache.get()).toBeNull();
+
+    const futureExpiry = T_NOW + 24 * 60 * 60 * 1000;
+    const { fetchImpl } = makeFetch([
+      () => ({ status: 200, body: { actor: "the_horoscope_block", session: "sess_minted", expires_at: futureExpiry, token_class: "apikey" } }),
+      () => propertyReply("p"),
+      () => callReply(null),
+      () => callReply({ ok: true })
+    ]);
+
+    const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
+    expect(result.authMode).toBe("cold");
+
+    const cached = sessionCache.get();
+    expect(cached).toMatchObject({ session: "sess_minted", expiresAt: futureExpiry, tokenClass: "apikey" });
+  });
+
+  it("invalidates the cache when /api/objects/.../properties returns E_NOSESSION", async () => {
+    const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+    const sessionCache = createSessionCache();
+    sessionCache.set(farFuture());
+
+    const { fetchImpl } = makeFetch([
+      () => ({ status: 401, body: { error: { code: "E_NOSESSION", message: "session expired" } } })
+    ]);
+
+    await expect(runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW })).rejects.toMatchObject({ code: "E_NOSESSION" });
+    expect(sessionCache.get()).toBeNull();
+  });
+
+  it("invalidates the cache when the deliver call returns E_NOSESSION", async () => {
+    const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
+    const env = makeEnv(ai);
+    const sessionCache = createSessionCache();
+    sessionCache.set(farFuture());
+
+    const { fetchImpl } = makeFetch([
+      () => propertyReply("p"),
+      () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => ({ status: 401, body: { error: { code: "E_NOSESSION", message: "session expired" } } }),
+      () => callReply({ ok: true }) // heartbeat at the end
+    ]);
+
+    const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
+    expect(result.delivered).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(sessionCache.get()).toBeNull();
   });
 });
 

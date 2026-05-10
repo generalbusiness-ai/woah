@@ -11,7 +11,13 @@ components) lives elsewhere in `catalogs/horoscope/`.
 
 Cron-triggered every minute. Each tick:
 
-1. POSTs to `/api/auth` with the actor-bound apikey for the block.
+1. Reuses a cached woo session if one is still warm in this CF isolate
+   (apikey-class sessions are valid for 24h; the plug re-authenticates
+   only when the cached session is within 1h of expiry, or when the
+   isolate cold-started). Otherwise POSTs to `/api/auth` with the
+   actor-bound apikey for the block. The `tick_ok` log line carries
+   `auth: "warm" | "cold"` so the cache hit rate is greppable from
+   `wrangler tail`.
 2. GETs the block's `system_prompt` (one property read).
 3. Loops up to `MAX_ORDERS_PER_TICK`:
    - POSTs `:next_pending` — if `null`, exits the loop.

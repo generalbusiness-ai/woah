@@ -62,7 +62,6 @@
 
   /* chat-only tints */
   --color-chat-told-bg: rgba(95, 166, 224, 0.10);
-  --color-chat-error-bg: rgba(240, 98, 98, 0.12);
   --color-chat-input-text: #d6dde0;
 
   /* pinboard */
@@ -166,7 +165,6 @@
   --color-nav-border: #d0d7cd;
 
   --color-chat-told-bg: #eef4f7;
-  --color-chat-error-bg: #fff2ef;
   --color-chat-input-text: #4a554a;
 
   --color-board: #e5d5b6;
@@ -1405,11 +1403,6 @@ input[type="range"] {
 .chat-line.error {
   grid-template-columns: 4.2rem minmax(0, 1fr);
   color: var(--color-text-muted);
-}
-
-.chat-line.error {
-  background: var(--color-chat-error-bg);
-  color: var(--color-danger);
 }
 
 .chat-line.told {

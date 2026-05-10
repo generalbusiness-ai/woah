@@ -1,7 +1,29 @@
+// @vitest-environment jsdom
+// jsdom is needed because the imported catalog UI modules define
+// HTMLElement-extending custom-element classes alongside their observation
+// reducers. The reducers themselves are DOM-free.
 import { describe, expect, it } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
-import { CatalogUiRegistry, createWooClientFramework, ProjectionFieldFiller } from "../src/client/framework";
+import { registerWooObservationHandlers as registerDubspaceObservationHandlers } from "../catalogs/dubspace/ui/dubspace-workspace";
+import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
+import {
+  CatalogUiRegistry,
+  createWooClientFramework as createBareWooClientFramework,
+  ProjectionFieldFiller
+} from "../src/client/framework";
+
+// The framework constructor registers only catalog-agnostic observation
+// reducers; pinboard and dubspace ship their own handlers via their UI
+// modules. Tests that exercise those reductions opt in with this wrapper
+// so each instance gets the bundled-catalog behavior the production client
+// installs through CatalogUiRegistry.registerModuleExports.
+function createWooClientFramework() {
+  const ui = createBareWooClientFramework();
+  registerDubspaceObservationHandlers(ui.observations);
+  registerPinboardObservationHandlers(ui.observations);
+  return ui;
+}
 
 describe("client UI framework projection", () => {
   it("keeps optimistic pinboard placement across stale world refreshes until applied confirmation", () => {

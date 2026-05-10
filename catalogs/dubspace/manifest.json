@@ -39,6 +39,20 @@
           "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
         }
       }
+    ],
+    "observation_handlers": [
+      {
+        "module": "dubspace-ui",
+        "types": [
+          "loop_started",
+          "loop_stopped",
+          "tempo_changed",
+          "transport_started",
+          "transport_stopped",
+          "drum_step_changed",
+          "scene_recalled"
+        ]
+      }
     ]
   },
   "classes": [

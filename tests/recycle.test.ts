@@ -721,4 +721,118 @@ describe("recycle", () => {
       expect(errObs[0]).toMatchObject({ obj: inst, code: "E_INVARG" });
     }
   });
+
+  describe("dangling parent refs after orphaning a class", () => {
+    // Reproduces the 2026-05-09 incident: a class object was recycled while
+    // descendants on a remote host still pointed at it. The remote
+    // descendants' parent ULID became a tombstone. Before the substrate
+    // tolerated this, every parent-chain walk on those descendants threw
+    // E_OBJNF, breaking unrelated dispatch on any caller that touched the
+    // orphaned instance. The fix is the parentWalkLookup helper —
+    // a missing intermediate is treated as end-of-chain so
+    // inheritsFrom returns false / verb resolution returns E_VERBNF /
+    // property reads fall through to defaults, all of which callers handle.
+    it("inheritsFrom returns false for an instance whose parent was recycled (no E_OBJNF)", async () => {
+      const world = createWorld();
+      const { actor } = builderActor(world);
+      const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
+      world.object(klass).flags.fertile = true;
+      const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
+
+      // Force-recycle the class while the instance still points at it.
+      // The substrate normally would graft inst up to $thing, but in the
+      // distributed-host failure mode the remote inst's parent ref doesn't
+      // get updated. Simulate that by snapshotting the parent ref we want
+      // dangling, then recycling with force, then re-pointing inst at the
+      // tombstoned id.
+      await recycleVia(world, actor, klass, { force: true });
+      world.object(inst).parent = klass;
+
+      // inheritsFrom must NOT throw. It returns false because the chain
+      // can't reach the queried ancestor through a tombstoned intermediate.
+      expect(() => world.isDescendantOf(inst, "$root")).not.toThrow();
+      expect(world.isDescendantOf(inst, "$root")).toBe(false);
+      expect(world.isDescendantOf(inst, "$thing")).toBe(false);
+      // And inst is still its own descendant (zero-step case).
+      expect(world.isDescendantOf(inst, inst)).toBe(true);
+    });
+
+    it("getProp falls through to E_PROPNF (not E_OBJNF) for a dangling parent chain", async () => {
+      const world = createWorld();
+      const { actor } = builderActor(world);
+      const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
+      world.object(klass).flags.fertile = true;
+      const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
+      await recycleVia(world, actor, klass, { force: true });
+      world.object(inst).parent = klass;
+
+      // Property lookup walks the (broken) chain and surfaces a clean
+      // "property not defined" rather than blowing up on the tombstone.
+      try {
+        world.getProp(inst, "nonexistent_prop");
+        throw new Error("expected E_PROPNF");
+      } catch (err) {
+        expect(isErrorValue(err) ? err.code : null).toBe("E_PROPNF");
+      }
+    });
+
+    it("resolveVerbFrom returns E_VERBNF (not E_OBJNF) for a dangling parent chain", () => {
+      const world = createWorld();
+      const { actor } = builderActor(world);
+      const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
+      world.object(klass).flags.fertile = true;
+      const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
+
+      // Recycle the class without going through the user-callable surface
+      // (its pre-flight guards descendants). For the test we splice the
+      // tombstone in by hand to model the cross-host failure mode.
+      world.objects.delete(klass);
+      world.tombstones.add(klass);
+      world.object(inst).parent = klass;
+
+      // No verb 'doesnotexist' anywhere; the walk stops at the tombstone
+      // and surfaces E_VERBNF, not E_OBJNF.
+      try {
+        world.resolveVerb(inst, "doesnotexist");
+        throw new Error("expected E_VERBNF");
+      } catch (err) {
+        expect(isErrorValue(err) ? err.code : null).toBe("E_VERBNF");
+      }
+    });
+
+    it("migrationSetObjectParent repairs an orphaned instance to a known-good ancestor", () => {
+      const world = createWorld();
+      const { actor } = builderActor(world);
+      const klass = world.createAuthoredObject(actor, { parent: "$thing", name: "Klass" });
+      world.object(klass).flags.fertile = true;
+      const inst = world.createAuthoredObject(actor, { parent: klass, name: "Inst" });
+
+      // Splice in a tombstoned-class state.
+      world.objects.delete(klass);
+      world.tombstones.add(klass);
+      world.object(inst).parent = klass;
+
+      // Repair: rewrite parent to $thing. Idempotent: a second call returns false.
+      expect(world.migrationSetObjectParent(inst, "$thing")).toBe(true);
+      expect(world.object(inst).parent).toBe("$thing");
+      expect(world.object("$thing").children.has(inst)).toBe(true);
+      expect(world.migrationSetObjectParent(inst, "$thing")).toBe(false);
+
+      // Inheritance now reaches the root again.
+      expect(world.isDescendantOf(inst, "$thing")).toBe(true);
+      expect(world.isDescendantOf(inst, "$root")).toBe(true);
+    });
+
+    it("migrationSetObjectParent tolerates missing endpoints (cross-host repair shape)", () => {
+      const world = createWorld();
+      const { actor } = builderActor(world);
+      const inst = world.createAuthoredObject(actor, { parent: "$thing", name: "Inst" });
+
+      // Old parent: a never-present id (simulates a remote-class tombstone the
+      // local host has no stub for). New parent: also absent locally.
+      world.object(inst).parent = "$absent_old";
+      expect(() => world.migrationSetObjectParent(inst, "$absent_new")).not.toThrow();
+      expect(world.object(inst).parent).toBe("$absent_new");
+    });
+  });
 });

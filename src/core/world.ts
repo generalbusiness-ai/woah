@@ -580,6 +580,36 @@ export class WooWorld {
   }
 
   /**
+   * Parent-chain walk helper: return the WooObject at `current` along a
+   * walk that started at `startRef`, or `null` when `current` is missing
+   * (recycled, tombstoned, or never present on this host slice). Records
+   * a `dangling_parent_ref` metric so the leak is visible.
+   *
+   * Callers that walk the parent chain (verb resolution, property
+   * inheritance, ancestry enumeration, etc.) MUST use this helper rather
+   * than `this.object(current)`. A single dangling intermediate ref —
+   * e.g. an instance whose ancestor class was recycled out from under it
+   * — would otherwise throw E_OBJNF and break unrelated dispatch on any
+   * caller that touched the broken instance. Treating dangling
+   * intermediates as end-of-chain degrades the failure to E_VERBNF /
+   * E_PROPNF / `inheritsFrom == false`, which callers already handle.
+   *
+   * Repair belongs in a host-scoped data migration; this helper is the
+   * runtime safety net.
+   */
+  private parentWalkLookup(startRef: ObjRef, current: ObjRef): WooObject | null {
+    const obj = this.objects.get(current);
+    if (obj) return obj;
+    this.recordMetric({
+      kind: "dangling_parent_ref",
+      start: startRef,
+      missing: current,
+      tombstoned: this.tombstones.has(current)
+    });
+    return null;
+  }
+
+  /**
    * Synchronous local tombstone lookup. Use isRecycledChecked for the
    * host-transparent version. Returns true for ULIDs tombstoned on this
    * host; for ULIDs owned by a remote host, this returns the local view
@@ -837,7 +867,8 @@ export class WooWorld {
     if (name === "name") return obj.name;
     let parent = obj.parent;
     while (parent) {
-      const ancestor = this.object(parent);
+      const ancestor = this.parentWalkLookup(objRef, parent);
+      if (!ancestor) break;
       const def = ancestor.propertyDefs.get(name);
       if (def) return cloneValue(def.defaultValue);
       parent = ancestor.parent;
@@ -889,6 +920,49 @@ export class WooWorld {
     this.setProp(objRef, "name", name);
   }
 
+  /**
+   * Migration-only parent rewrite. Sets `obj.parent = newParent` for an
+   * object on this host slice and persists. Updates the children-set
+   * cache only on whichever endpoints are local: tolerates a
+   * tombstoned/missing old parent and a remote/missing new parent so
+   * the call is safe even when neither end of the rewrite has a local
+   * stub. Skips permission and cycle checks — caller must ensure those
+   * (typically a host-scoped data migration with system authority).
+   *
+   * Returns true when a rewrite happened, false when `objRef` isn't on
+   * this host or already has the requested parent (so reruns are safe).
+   *
+   * Use cases:
+   *   - Repairing dangling parent refs after a class object was
+   *     recycled out from under instances on a different host
+   *     (e.g. the 2026-05-09 $horoscope_note repair).
+   *   - Ditto for any future class-removal that wants to graft live
+   *     instances up to a known-good ancestor without requiring
+   *     cross-cluster coordination.
+   *
+   * For ordinary @chparent / catalog-migration `change_parent` use
+   * builderChparent or chparentAuthoredObject, which enforce auth and
+   * cycle checks and require both endpoints to be locally reachable.
+   */
+  migrationSetObjectParent(objRef: ObjRef, newParent: ObjRef): boolean {
+    const obj = this.objects.get(objRef);
+    if (!obj) return false;
+    if (obj.parent === newParent) return false;
+    if (obj.parent && this.objects.has(obj.parent)) {
+      this.object(obj.parent).children.delete(objRef);
+      this.persistObject(obj.parent);
+    }
+    obj.parent = newParent;
+    if (this.objects.has(newParent)) {
+      this.object(newParent).children.add(objRef);
+      this.persistObject(newParent);
+    }
+    obj.modified = Date.now();
+    this.persistObject(objRef);
+    this.persist();
+    return true;
+  }
+
   // Permission-gated wrapper exposed as the `set_object_name` builtin.
   // Used by catalog verbs (e.g. $root:@rename) that need to mutate an
   // object's display name from woocode without holding wizard authority
@@ -934,6 +1008,14 @@ export class WooWorld {
   }
 
   resolveVerb(objRef: ObjRef, name: string): ResolvedVerb {
+    // Dispatching to a recycled/tombstoned target must raise E_OBJNF, not
+    // fall through to E_VERBNF. The parent-chain walk inside
+    // resolveVerbFrom tolerates missing *intermediate* ancestors (so
+    // dispatch keeps working when one of the target's ancestor classes
+    // is gone) — this start-object check preserves the
+    // "no stale-dispatch window" guarantee that tests/recycle.test.ts
+    // relies on for callers that hold the target ULID after recycle.
+    if (!this.objects.has(objRef)) throw wooError("E_OBJNF", `object not found: ${objRef}`, objRef);
     const parentMatch = this.resolveVerbFrom(objRef, name, false);
     if (parentMatch) return parentMatch;
     if (this.canCarryFeatures(objRef)) {
@@ -951,7 +1033,8 @@ export class WooWorld {
   resolveVerbFrom(startRef: ObjRef | null, name: string, required = true): ResolvedVerb | null {
     let current: ObjRef | null = startRef;
     while (current) {
-      const obj = this.object(current);
+      const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
+      if (!obj) break;
       const verb = this.ownVerbNamed(current, name);
       if (verb) return { definer: current, verb };
       current = obj.parent;
@@ -998,7 +1081,8 @@ export class WooWorld {
     const names = new Set<string>();
     let current: ObjRef | null = objRef;
     while (current) {
-      const obj = this.object(current);
+      const obj: WooObject | null = current === objRef ? this.object(current) : this.parentWalkLookup(objRef, current);
+      if (!obj) break;
       for (const name of obj.propertyDefs.keys()) names.add(name);
       for (const name of obj.properties.keys()) names.add(name);
       current = obj.parent;
@@ -1564,6 +1648,7 @@ export class WooWorld {
         defined_on: objRef,
         type_hint: "obj",
         version: 1,
+        value_version: 1,
         has_value: true
       };
     }
@@ -1578,7 +1663,8 @@ export class WooWorld {
       let walker: ObjRef | null = objRef;
       let hasDef = false;
       while (walker) {
-        const ancestor = this.object(walker);
+        const ancestor: WooObject | null = walker === objRef ? obj : this.parentWalkLookup(objRef, walker);
+        if (!ancestor) break;
         if (ancestor.propertyDefs.has(name)) { hasDef = true; break; }
         walker = ancestor.parent;
       }
@@ -1590,13 +1676,15 @@ export class WooWorld {
           defined_on: objRef,
           type_hint: "str",
           version: 1,
+          value_version: 1,
           has_value: true
         };
       }
     }
     let current: ObjRef | null = objRef;
     while (current) {
-      const obj = this.object(current);
+      const obj: WooObject | null = current === objRef ? this.object(current) : this.parentWalkLookup(objRef, current);
+      if (!obj) break;
       const def = obj.propertyDefs.get(name);
       if (def) {
         return {
@@ -1606,6 +1694,13 @@ export class WooWorld {
           defined_on: current,
           type_hint: def.typeHint ?? null,
           version: def.version,
+          // value_version bumps on every write (per setPropLocal),
+          // independently of the def version. Catalog code uses this
+          // field for optimistic-concurrency checks (e.g. @set's
+          // opts.expected_version): the def version doesn't change
+          // when a value is updated, so it isn't the right key for
+          // stale-write rejection.
+          value_version: this.object(objRef).propertyVersions.get(name) ?? 0,
           has_value: this.object(objRef).properties.has(name)
         };
       }
@@ -1613,13 +1708,15 @@ export class WooWorld {
     }
     const target = this.object(objRef);
     if (target.properties.has(name)) {
+      const valueVersion = target.propertyVersions.get(name) ?? 1;
       return {
         name,
         owner: target.owner,
         perms: "r",
         defined_on: objRef,
         type_hint: null,
-        version: target.propertyVersions.get(name) ?? 1,
+        version: valueVersion,
+        value_version: valueVersion,
         has_value: true
       };
     }
@@ -3046,7 +3143,9 @@ export class WooWorld {
     while (current && !seen.has(current)) {
       ancestors.push(current);
       seen.add(current);
-      current = this.object(current).parent;
+      const obj = this.parentWalkLookup(objRef, current);
+      if (!obj) break;
+      current = obj.parent;
     }
     return ancestors.reverse();
   }
@@ -3438,92 +3537,27 @@ export class WooWorld {
     return out.sort();
   }
 
-  async builderSetProperty(actor: ObjRef, objRef: ObjRef, name: string, value: WooValue, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
-    this.assertBuilderActor(actor, surfaceClass);
-    const options = progOptions(opts);
-    if (await this.remoteHostForObject(objRef)) {
-      throw wooError("E_CROSS_HOST_WRITE", `cross-host property writes are not atomic: ${objRef}.${name}`, { actor, obj: objRef, property: name });
-    }
-    const target = this.object(objRef);
-    const expectedVersion = optionNullableInt(options, "expected_version");
-    const currentVersion = target.propertyVersions.get(name) ?? null;
-    let exists = true;
-    try {
-      this.propertyInfo(objRef, name);
-    } catch (err) {
-      if (!isErrorValue(err) || err.code !== "E_PROPNF") throw err;
-      exists = false;
-    }
-    if (expectedVersion !== null && currentVersion !== expectedVersion) {
-      throw wooError("E_VERSION", "property value version conflict", { expected: expectedVersion, actual: currentVersion });
-    }
-    if (!exists) {
-      // The builder surface is documented as "ordinary data value setting"
-      // — no metadata changes (catalogs/prog/README.md). Defining a brand-
-      // new property is metadata, not value, so reject. Property creation
-      // is a programmer-class operation: $programmer:@property (or the
-      // add_property builtin from a programmer-owned verb).
-      throw wooError("E_PROPNF", `property not found: ${name}`, { obj: objRef, property: name });
-    }
-    if (!this.canWriteProperty(actor, objRef, name)) {
-      throw wooError("E_PERM", `${actor} cannot write ${objRef}.${name}`, { actor, obj: objRef, property: name });
-    }
-    this.setProp(objRef, name, value);
-    return {
-      ok: true,
-      id: objRef,
-      name,
-      version: target.propertyVersions.get(name) ?? 0,
-      info: this.propertyInfo(objRef, name) as WooValue
-    };
-  }
+  // builderSetProperty / builderInspect / builderSearch /
+  // programmerResolveVerb / programmerListVerb / programmerInspect /
+  // programmerSearch — removed. The catalog inlines the equivalent
+  // logic via authoring_inspect / authoring_search / verb_info /
+  // verb_code / property_info + SET_PROP. See the BUILTIN_NAMES
+  // tombstone block in tiny-vm.ts for the persisted-bytecode story.
 
-  builderInspect(actor: ObjRef, objRef: ObjRef, opts: WooValue, surfaceClass: ObjRef): WooValue {
-    this.assertBuilderActor(actor, surfaceClass);
-    return this.authoringInspect(actor, objRef, opts, { includeSourceAllowed: false, requireProgrammer: false });
-  }
-
-  builderSearch(actor: ObjRef, query: string, opts: WooValue, surfaceClass: ObjRef): WooValue {
-    this.assertBuilderActor(actor, surfaceClass);
-    return this.authoringSearch(actor, query, opts, { includeSourceAllowed: false });
-  }
-
-  programmerResolveVerb(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, surfaceClass: ObjRef): WooValue {
-    this.assertProgrammerActor(actor, surfaceClass);
-    const walk: Record<string, WooValue>[] = [];
-    const resolved =
-      typeof descriptor === "number"
-        ? this.resolveVerbSlotWithWalk(actor, objRef, descriptor, walk)
-        : this.resolveVerbWithWalk(actor, objRef, assertVerbNameDescriptor(descriptor), walk);
-    return {
-      ...this.verbSummaryForActor(actor, resolved.definer, resolved.verb, { includeSource: true }),
-      walk: walk as unknown as WooValue
-    };
-  }
-
-  programmerListVerb(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, opts: WooValue, surfaceClass: ObjRef): WooValue {
-    this.assertProgrammerActor(actor, surfaceClass);
-    const options = progOptions(opts);
-    const includeSource = optionBool(options, "include_source", true);
-    const walk: Record<string, WooValue>[] = [];
-    const resolved =
-      typeof descriptor === "number"
-        ? this.resolveVerbSlotWithWalk(actor, objRef, descriptor, walk)
-        : this.resolveVerbWithWalk(actor, objRef, assertVerbNameDescriptor(descriptor), walk);
-    return {
-      ...this.verbSummaryForActor(actor, resolved.definer, resolved.verb, { includeSource }),
-      walk: walk as unknown as WooValue
-    };
-  }
-
-  programmerInspect(actor: ObjRef, objRef: ObjRef, opts: WooValue, surfaceClass: ObjRef): WooValue {
-    return this.authoringInspect(actor, objRef, opts, { includeSourceAllowed: true, requireProgrammer: true, programmerSurface: surfaceClass });
-  }
-
-  programmerSearch(actor: ObjRef, query: string, opts: WooValue, surfaceClass: ObjRef): WooValue {
-    this.assertProgrammerActor(actor, surfaceClass);
-    return this.authoringSearch(actor, query, opts, { includeSourceAllowed: true });
-  }
+  // programmerSetVerbInfo, programmerSetPropertyInfo, programmerTrace —
+  // removed as substrate builtins. The catalog ($programmer:set_verb_info,
+  // :set_property_info, :trace) reaches the substrate through verb_info /
+  // set_verb_info / set_property_info / add_property / delete_property /
+  // property_info builtins, which cover every step those methods did.
+  //
+  // programmerInstallVerb and programmerListVerb were demoted from
+  // catalog-callable builtins (they were never wired through
+  // BUILTIN_NAMES anyway — the catalog $programmer:install_verb verb
+  // inlines the same pipeline). They survive as substrate-internal
+  // helpers because the editor session machinery (editorInvoke /
+  // editorDryRun / editorSave) still calls them. The leading
+  // assertProgrammerActor stays so a future callsite can't bypass the
+  // surface gate.
 
   async programmerInstallVerb(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
     this.assertProgrammerActor(actor, surfaceClass);
@@ -3574,9 +3608,6 @@ export class WooWorld {
     });
     if (dryRun) return summary;
     const finalBytecode = { ...compiled.bytecode, version };
-    // Re-classify on every install — analyzer drives purity, manifest-style
-    // claims aren't available on this surface, and a `pure` flag set by an
-    // earlier install must NOT carry over silently when the source changes.
     const pure = combineVerbPurity(analyzeBytecodePurity(finalBytecode), undefined, `${objRef}:${selected.name}`);
     this.addVerb(objRef, {
       kind: "bytecode",
@@ -3596,119 +3627,36 @@ export class WooWorld {
       version,
       line_map: compiled.line_map ?? {}
     }, { append: selected.append, slot: selected.current ? selected.slot : undefined });
-    // Run propagation so a transitively-pure new verb (and any callers that
-    // depend on it) get their flag updated to match the call graph.
     propagateVerbPurity(this);
     return summary;
   }
 
-  async programmerSetVerbInfo(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
+  programmerListVerb(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, opts: WooValue, surfaceClass: ObjRef): WooValue {
     this.assertProgrammerActor(actor, surfaceClass);
-    if (await this.remoteHostForObject(objRef)) {
-      throw wooError("E_CROSS_HOST_WRITE", `cross-host verb metadata writes are not atomic: ${objRef}`, { actor, obj: objRef });
-    }
-    this.assertCanAuthorObject(actor, objRef);
     const options = progOptions(opts);
-    const dryRun = optionBool(options, "dry_run", false);
-    const expectedVersion = optionNullableInt(options, "expected_version");
-    const selected = this.selectOwnVerbSlot(objRef, descriptor);
-    const current = selected.verb;
-    if (expectedVersion !== null && current.version !== expectedVersion) {
-      throw wooError("E_VERSION", "verb version conflict", { expected: expectedVersion, actual: current.version });
-    }
-    // Permission bits are metadata edits, deliberately separate from source install.
-    const directCallable = optionMaybeBool(options, "direct_callable") ?? current.direct_callable === true;
-    const perms = optionMaybeString(options, "perms") ?? current.perms;
-    const parsedPerms = normalizeVerbPerms(perms, directCallable);
-    const next: VerbDef = {
-      ...current,
-      aliases: hasOption(options, "aliases") ? optionStringList(options, "aliases", []) : current.aliases,
-      arg_spec: hasOption(options, "arg_spec") ? assertMap(options.arg_spec) : current.arg_spec,
-      perms: parsedPerms.perms,
-      direct_callable: parsedPerms.directCallable,
-      skip_presence_check: optionMaybeBool(options, "skip_presence_check") ?? current.skip_presence_check,
-      tool_exposed: optionMaybeBool(options, "tool_exposed") ?? current.tool_exposed,
-      version: current.version + 1
-    } as VerbDef;
-    const result = {
-      ok: true,
-      dry_run: dryRun,
-      id: objRef,
-      slot: selected.slot,
-      version: next.version,
-      before: this.verbSummaryForActor(actor, objRef, current, { includeSource: false }) as WooValue,
-      after: this.verbSummaryForActor(actor, objRef, next, { includeSource: false }) as WooValue
+    const includeSource = optionBool(options, "include_source", true);
+    const walk: Record<string, WooValue>[] = [];
+    const resolved =
+      typeof descriptor === "number"
+        ? this.resolveVerbSlotWithWalk(actor, objRef, descriptor, walk)
+        : this.resolveVerbWithWalk(actor, objRef, assertVerbNameDescriptor(descriptor), walk);
+    return {
+      ...this.verbSummaryForActor(actor, resolved.definer, resolved.verb, { includeSource }),
+      walk: walk as unknown as WooValue
     };
-    if (dryRun) return result;
-    this.addVerb(objRef, next, { slot: selected.slot });
-    return result;
   }
 
-  async programmerSetPropertyInfo(actor: ObjRef, objRef: ObjRef, name: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
+  programmerResolveVerb(actor: ObjRef, objRef: ObjRef, descriptor: WooValue, surfaceClass: ObjRef): WooValue {
     this.assertProgrammerActor(actor, surfaceClass);
-    this.assertOrdinaryPropertyName(name);
-    if (await this.remoteHostForObject(objRef)) {
-      throw wooError("E_CROSS_HOST_WRITE", `cross-host property metadata writes are not atomic: ${objRef}.${name}`, { actor, obj: objRef, property: name });
-    }
-    this.assertCanAuthorObject(actor, objRef);
-    const options = progOptions(opts);
-    const dryRun = optionBool(options, "dry_run", false);
-    const mode = optionString(options, "mode", "upsert");
-    if (!["upsert", "define", "update", "delete"].includes(mode)) throw wooError("E_INVARG", `unknown property-info mode: ${mode}`, mode);
-    const expectedVersion = optionNullableInt(options, "expected_version");
-    const obj = this.object(objRef);
-    const current = obj.propertyDefs.get(name) ?? null;
-    if (mode === "define" && current) throw wooError("E_INVARG", `property already exists: ${objRef}.${name}`, { obj: objRef, property: name });
-    if ((mode === "update" || mode === "delete") && !current) throw wooError("E_PROPNF", `property not defined on ${objRef}: ${name}`, { obj: objRef, property: name });
-    if (expectedVersion !== null && (current?.version ?? null) !== expectedVersion) {
-      throw wooError("E_VERSION", "property definition version conflict", { expected: expectedVersion, actual: current?.version ?? null });
-    }
-    const before = current ? propertyDefSummary(current, objRef) : null;
-    if (mode === "delete") {
-      const result = { ok: true, dry_run: dryRun, id: objRef, name, deleted: true, before: before as WooValue };
-      if (dryRun) return result;
-      obj.propertyDefs.delete(name);
-      obj.properties.delete(name);
-      obj.propertyVersions.delete(name);
-      obj.modified = Date.now();
-      this.persistObject(objRef);
-      this.persist();
-      return result;
-    }
-    const owner = optionMaybeString(options, "owner") ?? current?.owner ?? actor;
-    if (owner !== actor && !this.isWizard(actor)) throw wooError("E_PERM", `${actor} cannot create property ${objRef}.${name} owned by ${owner}`, { actor, obj: objRef, property: name, owner });
-    const next: PropertyDef = {
-      name,
-      owner,
-      perms: optionMaybeString(options, "perms") ?? current?.perms ?? "rw",
-      typeHint: optionMaybeString(options, "type_hint") ?? current?.typeHint,
-      defaultValue: hasOption(options, "default") ? cloneValue(options.default) : cloneValue(current?.defaultValue ?? null),
-      version: (current?.version ?? 0) + 1
+    const walk: Record<string, WooValue>[] = [];
+    const resolved =
+      typeof descriptor === "number"
+        ? this.resolveVerbSlotWithWalk(actor, objRef, descriptor, walk)
+        : this.resolveVerbWithWalk(actor, objRef, assertVerbNameDescriptor(descriptor), walk);
+    return {
+      ...this.verbSummaryForActor(actor, resolved.definer, resolved.verb, { includeSource: true }),
+      walk: walk as unknown as WooValue
     };
-    const result = {
-      ok: true,
-      dry_run: dryRun,
-      id: objRef,
-      name,
-      version: next.version,
-      before: before as WooValue,
-      after: propertyDefSummary(next, objRef) as WooValue
-    };
-    if (dryRun) return result;
-    obj.propertyDefs.set(name, next);
-    if (!obj.properties.has(name)) {
-      obj.properties.set(name, cloneValue(next.defaultValue));
-      obj.propertyVersions.set(name, 1);
-    }
-    obj.modified = Date.now();
-    this.persistObject(objRef);
-    this.persist();
-    return result;
-  }
-
-  programmerTrace(actor: ObjRef, _objRef: ObjRef, _descriptor: WooValue, _opts: WooValue, surfaceClass: ObjRef): WooValue {
-    this.assertProgrammerActor(actor, surfaceClass);
-    throw wooError("E_NOT_IMPLEMENTED", "programmer trace is deferred to v1.1");
   }
 
   async programmerEval(ctx: CallContext, source: string, opts: WooValue, surfaceClass: ObjRef): Promise<WooValue> {
@@ -3927,7 +3875,11 @@ export class WooWorld {
     const parentChain: Record<string, WooValue>[] = [];
     let current: ObjRef | null = objRef;
     while (current) {
-      const item = this.object(current);
+      const item: WooObject | null = current === objRef ? this.object(current) : this.parentWalkLookup(objRef, current);
+      if (!item) {
+        parentChain.push({ id: current, name: "<missing>", missing: true });
+        break;
+      }
       parentChain.push({
         id: current,
         name: item.name,
@@ -4068,7 +4020,8 @@ export class WooWorld {
   private editorSessionPropertyInfo(editorRef: ObjRef): PropertyDef | null {
     let current: ObjRef | null = editorRef;
     while (current) {
-      const obj = this.object(current);
+      const obj: WooObject | null = current === editorRef ? this.object(current) : this.parentWalkLookup(editorRef, current);
+      if (!obj) break;
       const def = obj.propertyDefs.get("sessions");
       if (def) return def.perms === "" ? def : null;
       current = obj.parent;
@@ -4173,7 +4126,9 @@ export class WooWorld {
       const match = this.ownVerbNamed(current, name);
       walk.push({ id: current, kind: "parent", matched: match !== null });
       if (match) return { definer: current, verb: match };
-      current = this.object(current).parent;
+      const obj = this.parentWalkLookup(objRef, current);
+      if (!obj) break;
+      current = obj.parent;
     }
     if (this.canCarryFeatures(objRef)) {
       for (const feature of this.featureList(objRef)) {
@@ -4182,7 +4137,9 @@ export class WooWorld {
           const match = this.ownVerbNamed(featureCurrent, name);
           walk.push({ id: featureCurrent, kind: "feature", feature, matched: match !== null });
           if (match) return { definer: featureCurrent, verb: match };
-          featureCurrent = this.object(featureCurrent).parent;
+          const obj = this.parentWalkLookup(feature, featureCurrent);
+          if (!obj) break;
+          featureCurrent = obj.parent;
         }
       }
     }
@@ -4280,7 +4237,8 @@ export class WooWorld {
     const summaries: Record<string, WooValue>[] = [];
     let current = this.object(objRef).parent;
     while (current) {
-      const obj = this.object(current);
+      const obj = this.parentWalkLookup(objRef, current);
+      if (!obj) break;
       for (const verb of obj.verbs) {
         if (shadowed.has(verb.name)) continue;
         summaries.push(this.verbSummaryForActor(actor, current, verb, { includeSource }));
@@ -4292,7 +4250,8 @@ export class WooWorld {
       for (const feature of this.featureList(objRef)) {
         let featureCurrent: ObjRef | null = feature;
         while (featureCurrent) {
-          const obj = this.object(featureCurrent);
+          const obj = this.parentWalkLookup(feature, featureCurrent);
+          if (!obj) break;
           for (const verb of obj.verbs) {
             if (shadowed.has(verb.name)) continue;
             summaries.push({ ...this.verbSummaryForActor(actor, featureCurrent, verb, { includeSource }), feature });
@@ -4316,7 +4275,8 @@ export class WooWorld {
     const summaries: Record<string, WooValue>[] = [];
     let current = this.object(objRef).parent;
     while (current) {
-      const obj = this.object(current);
+      const obj = this.parentWalkLookup(objRef, current);
+      if (!obj) break;
       for (const name of obj.propertyDefs.keys()) {
         if (seen.has(name)) continue;
         seen.add(name);
@@ -6229,7 +6189,8 @@ export class WooWorld {
   private collectVerbNames(startRef: ObjRef | null, names: Set<string>): void {
     let current: ObjRef | null = startRef;
     while (current) {
-      const obj = this.object(current);
+      const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
+      if (!obj) break;
       for (const verb of obj.verbs) names.add(verb.name);
       current = obj.parent;
     }
@@ -6238,7 +6199,8 @@ export class WooWorld {
   private collectSchemaNames(startRef: ObjRef | null, names: Set<string>): void {
     let current: ObjRef | null = startRef;
     while (current) {
-      const obj = this.object(current);
+      const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
+      if (!obj) break;
       for (const name of obj.eventSchemas.keys()) names.add(name);
       current = obj.parent;
     }
@@ -6539,7 +6501,9 @@ export class WooWorld {
     let current: ObjRef | null = objRef;
     while (current) {
       if (current === ancestorRef) return true;
-      current = this.object(current).parent;
+      const obj = this.parentWalkLookup(objRef, current);
+      if (!obj) return false;
+      current = obj.parent;
     }
     return false;
   }
@@ -8347,9 +8311,11 @@ export class WooWorld {
     const out: CommandVerbSummary[] = [];
     const seen = new Set<string>();
     const collectFrom = (start: ObjRef | null) => {
-      let current = start;
+      if (!start) return;
+      let current: ObjRef | null = start;
       while (current) {
-        const obj = this.object(current);
+        const obj: WooObject | null = current === start ? this.object(current) : this.parentWalkLookup(start, current);
+        if (!obj) break;
         for (const verb of obj.verbs) {
           if (!verbNameMatches(verb, name)) continue;
           const key = `${current}:${verb.slot ?? verb.name}`;

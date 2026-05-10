@@ -2268,8 +2268,8 @@ function renderLogin() {
     <div class="login-shell">
       <form class="login-card" data-login-form autocomplete="on">
         <div class="login-brand">
-          <h1 class="login-brand-name">woo</h1>
-          <p class="login-brand-tagline">World of Objects</p>
+          <h1 class="login-brand-name">Port</h1>
+          <p class="login-brand-tagline">Coordination Space</p>
         </div>
         <button type="button" class="login-guest" data-login-guest ${pending ? "disabled" : ""}>
           ${pending ? "Connecting..." : "Continue as guest"}
@@ -2763,13 +2763,14 @@ function renderStepRow(voice: string, label: string, row: boolean[]) {
 function enterChat() {
   const room = activeChatRoom();
   if (!room || !canSendDirect()) return;
+  const onError = chatErrorHandler(room);
   direct(room, "enter", [], (result) => {
     applyScopedMoveResult(result);
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result?.look_deferred === true) direct(room, "look", [], applyLookResult, receiveChatError);
+    if (!scopedProjectionEnabled && result?.look_deferred === true) direct(room, "look", [], applyLookResult, onError);
     if (state.tab === "chat") render();
-  }, receiveChatError);
+  }, onError);
 }
 
 function isChatObservation(observation: any) {
@@ -3141,12 +3142,20 @@ function applyScopedChatObservation(observation: any) {
   ui.ingestSnapshot("here", roomSnapshotObjects(state.scopedProjection.here));
 }
 
-function receiveChatError(error: any) {
+function receiveChatError(error: any, source?: string) {
   pushChatLine({
     kind: "error",
+    source,
     text: chatErrorText(error),
     ts: Date.now()
   });
+}
+
+// Returns an error handler that tags the resulting chat line with `source`
+// so it is filtered to the originating space's feed (chatLinesForSpace).
+// Without a source, an error line shows in every space the user visits next.
+function chatErrorHandler(source: string): (error: any) => void {
+  return (error) => receiveChatError(error, source);
 }
 
 function receiveAppliedFrameErrors(frame: any, observations: any[]) {
@@ -3600,9 +3609,10 @@ function sendChatInput(space: string, text: string) {
   if (!space) return;
   // Local-only echo so the feed reads as a transcript; never emitted server-side.
   pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
+  const onError = chatErrorHandler(space);
   ensureSpacePresence(space, () => {
-    command(space, text, undefined, receiveChatError);
-  }, receiveChatError);
+    command(space, text, undefined, onError);
+  }, onError);
 }
 
 type ChatCommandUiAction = { verb: string; target: string };
@@ -3676,7 +3686,7 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     const room = result.room;
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result.look_deferred === true) direct(room, "look", [], applyLookResult, receiveChatError);
+    if (!scopedProjectionEnabled && result.look_deferred === true) direct(room, "look", [], applyLookResult, chatErrorHandler(room));
     if (!scopedProjectionEnabled) void refresh();
     else render();
     return;
@@ -3684,7 +3694,7 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
   if (verb === "enter") {
     if (target) setCurrentChatRoom(target);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result?.look_deferred === true && target) direct(target, "look", [], applyLookResult, receiveChatError);
+    if (!scopedProjectionEnabled && result?.look_deferred === true && target) direct(target, "look", [], applyLookResult, chatErrorHandler(target));
     if (!scopedProjectionEnabled) void refresh();
     else render();
     return;
