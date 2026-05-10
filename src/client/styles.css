@@ -550,6 +550,10 @@ woo-chat-space {
   align-items: center;
   gap: 0.65rem;
   margin-bottom: 1rem;
+  /* Buttons in toolbars (e.g. Inspector "Inspect", Dubspace "Audio") set
+     the row height ~34px. Force the same min-height on toolbars without
+     buttons so all page headers align across tools. */
+  min-height: 2.125rem;
 }
 
 .toolbar h1 {
@@ -1482,14 +1486,6 @@ input[type="range"] {
   overflow: hidden;
 }
 
-.pinboard-toolbar {
-  min-height: 2.125rem;
-}
-
-.tasks-space-chat-shell {
-  margin-top: 3.125rem;
-}
-
 .space-chat-shell {
   height: calc(100dvh - 5.25rem);
   min-height: 0;
@@ -1954,30 +1950,9 @@ input[type="range"] {
   height: 100%;
 }
 
-.woo-tasks-kanban-header {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 1rem;
-  align-items: end;
-  padding: 0.85rem 1rem;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  background: var(--color-surface);
-}
-
-.woo-tasks-titleblock {
-  min-width: 0;
-  display: grid;
-  gap: 0.55rem;
-}
-
-.woo-tasks-kanban-header h2 {
-  margin: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 1.05rem;
-}
+/* Tasks header uses the shared `.toolbar` layout — no kanban-specific
+   overrides. `.toolbar h1 { margin-right: auto }` already pushes any
+   trailing button (e.g. ⚙ Admin) to the right. */
 
 .woo-tasks-status-nav,
 .woo-tasks-overview-counts {
@@ -2022,14 +1997,6 @@ input[type="range"] {
   font-size: 0.88rem;
 }
 
-.woo-tasks-kanban-toolbar {
-  display: flex;
-  gap: 0.45rem;
-  align-items: center;
-  justify-content: end;
-  flex-wrap: wrap;
-}
-
 .woo-tasks-primary-action {
   border-color: var(--color-accent);
   background: var(--color-accent);
@@ -2072,9 +2039,9 @@ input[type="range"] {
   overflow: hidden;
 }
 
-.woo-tasks-workarea:has(.woo-tasks-detail) {
-  grid-template-columns: minmax(0, 1fr) minmax(19rem, 24rem);
-}
+/* Detail and admin-editor render as overlaid modals (see
+   .woo-tasks-modal-backdrop), so the workarea no longer needs a
+   side-panel column when one is open. */
 
 .woo-tasks-board {
   min-width: 0;
@@ -2093,7 +2060,8 @@ input[type="range"] {
 .woo-tasks-kanban-filterbar {
   display: grid;
   grid-template-columns: minmax(12rem, 1.25fr) minmax(9rem, 0.9fr) minmax(0, 1fr) auto auto auto;
-  gap: 0.45rem;
+  row-gap: 0.45rem;
+  column-gap: 0.45rem;
   align-items: center;
   padding: 0.55rem;
   border: 1px solid var(--color-border);
@@ -2103,6 +2071,12 @@ input[type="range"] {
 
 .woo-tasks-kanban-filterbar input {
   min-width: 0;
+}
+
+/* Status-filter lozenges live as a full-width row at the top of the filter
+   bar, since they apply only to the kanban (not to the registry header). */
+.woo-tasks-kanban-filterbar > .woo-tasks-status-nav {
+  grid-column: 1 / -1;
 }
 
 .woo-tasks-filter-chips,
@@ -2140,12 +2114,6 @@ input[type="range"] {
   padding: 0.02rem 0.25rem;
   border: 0;
   background: transparent;
-}
-
-.woo-tasks-filter-count {
-  color: var(--color-text-dim);
-  font-size: 0.78rem;
-  white-space: nowrap;
 }
 
 .woo-tasks-filter-clear {
@@ -2319,7 +2287,6 @@ input[type="range"] {
   opacity: 1;
 }
 
-.woo-tasks-card-actions,
 .woo-tasks-prompt-actions,
 .woo-tasks-create-actions,
 .woo-tasks-detail-edit-actions {
@@ -2327,12 +2294,6 @@ input[type="range"] {
   gap: 0.35rem;
   align-items: center;
   flex-wrap: wrap;
-}
-
-.woo-tasks-card-actions button {
-  min-width: 0;
-  padding: 0.3rem 0.48rem;
-  font-size: 0.76rem;
 }
 
 .woo-tasks-prompt,
@@ -2352,6 +2313,13 @@ input[type="range"] {
 
 .woo-tasks-prompt-header {
   font-weight: 650;
+}
+
+.woo-tasks-prompt-help {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
 }
 
 .woo-tasks-prompt-field,
@@ -2432,6 +2400,24 @@ input[type="range"] {
   justify-content: end;
 }
 
+/* Modal overlay used by both the task detail dialog and the admin
+   role/obligation/policy editor. Click on the backdrop closes the modal;
+   the inner .woo-tasks-modal centers the dialog and stops the click. */
+.woo-tasks-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.woo-tasks-modal {
+  width: min(36rem, 100%);
+  max-height: calc(100dvh - 3rem);
+}
+
 .woo-tasks-detail {
   min-height: 0;
   overflow: auto;
@@ -2442,6 +2428,15 @@ input[type="range"] {
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--color-surface);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.woo-tasks-detail-task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding-top: 0.25rem;
+  border-top: 1px solid var(--color-border);
 }
 
 .woo-tasks-detail-header {
@@ -2632,7 +2627,8 @@ input[type="range"] {
   padding: 0.75rem;
   border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: var(--color-surface-2);
+  background: var(--color-surface);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
 }
 
 .woo-tasks-admin-head {
@@ -2679,6 +2675,35 @@ input[type="range"] {
 .woo-tasks-admin-editor-head h3 {
   margin: 0;
   font-size: 0.92rem;
+}
+
+/* Mental-model copy: small, dim, non-interactive prose that explains
+   what the user is looking at. Used under each admin section heading,
+   inside form modals, and as a step-list summary in the task detail
+   dialog. */
+.woo-tasks-admin-section-help,
+.woo-tasks-admin-form-help,
+.woo-tasks-detail-section-help {
+  margin: 0 0 0.4rem;
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.woo-tasks-form-hint {
+  display: inline-block;
+  margin-left: 0.35rem;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  font-weight: 400;
+}
+
+.woo-tasks-form-hint code {
+  padding: 0 0.18rem;
+  border-radius: 3px;
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  font-size: 0.95em;
 }
 
 .woo-tasks-admin-editor-head button {
@@ -3052,13 +3077,8 @@ textarea {
     overflow: visible;
   }
 
-  .woo-tasks-kanban-header,
   .woo-tasks-workarea {
     grid-template-columns: 1fr;
-  }
-
-  .woo-tasks-kanban-toolbar {
-    justify-content: start;
   }
 
   .woo-tasks-board {
@@ -3158,10 +3178,6 @@ textarea {
     font-size: 0.72rem;
   }
 
-  .woo-tasks-kanban-header {
-    padding: 0.7rem;
-  }
-
   .woo-tasks-status-nav {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3174,11 +3190,6 @@ textarea {
 
   .woo-tasks-kanban-columns {
     grid-auto-columns: minmax(82vw, 1fr);
-  }
-
-  .woo-tasks-card-actions button,
-  .woo-tasks-kanban-toolbar button {
-    min-height: 2rem;
   }
 
   .woo-tasks-detail-log-entry {

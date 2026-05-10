@@ -6,6 +6,7 @@ import { createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHo
 import { applyCatalogSchemaPlan, installCatalogManifest, planCatalogSchemaMigration, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
 import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations, runHostScopedLocalCatalogLifecycle } from "../src/core/local-catalogs";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, VerbDef, WooValue } from "../src/core/types";
+import { McpHost } from "../src/mcp/host";
 
 type CatalogManifest = {
   name: string;
@@ -680,6 +681,19 @@ describe("local catalogs", () => {
     }
     expect(world.object(taskRef).location).toBe(session.actor);
 
+    // After claim, the task no longer lives at the registry (location =
+    // actor). `:listing` must still return it — the kanban relies on the
+    // listing to find in-flight tasks. Backed by `_tracked_tasks` rather
+    // than `contents(this)`.
+    const listingClaimed = await world.directCall("listing", session.actor, "the_taskboard", "listing", [], { forceDirect: true, forceReason: "test" });
+    expect(listingClaimed.op).toBe("result");
+    if (listingClaimed.op === "result") {
+      const rows = listingClaimed.result as Array<Record<string, unknown>>;
+      const row = rows.find((r) => r.task === taskRef);
+      expect(row, `expected listing to include claimed task: ${JSON.stringify(rows)}`).toBeDefined();
+      expect(row?.location).toBe(session.actor);
+    }
+
     const passed = await world.directCall("pass", session.actor, taskRef, "pass", [{ note: "done" }], { forceDirect: true, forceReason: "test" });
     expect(passed.op).toBe("result");
     if (passed.op === "result") {
@@ -689,6 +703,47 @@ describe("local catalogs", () => {
       expect(types).toContain("task_released");
     }
     expect(world.object(taskRef).location).toBe("the_taskboard");
+
+    // MCP surface: every user-facing task verb's source carries a doc
+    // comment that the host extracts as the tool description. The same
+    // text is what the kanban UI shows in tooltips — single source of
+    // truth, no duplication. Set up: enter the registry (to reach
+    // registry-side verbs) and create a fresh task that the actor then
+    // claims, so the task-side verbs are reachable too.
+    const enter = await world.directCall(undefined, session.actor, "the_taskboard", "enter", [], { forceDirect: true, forceReason: "test" });
+    expect(enter.op).toBe("result");
+    const fresh = await world.directCall("create", session.actor, "the_taskboard", "create_task", ["task", "MCP doc check", "", [], null], { forceDirect: true, forceReason: "test" });
+    expect(fresh.op).toBe("result");
+    const freshRef = fresh.op === "result" ? String(fresh.result) : "";
+    const reclaim = await world.directCall(undefined, session.actor, freshRef, "claim", [], { forceDirect: true, forceReason: "test" });
+    expect(reclaim.op).toBe("result");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+    const tools = await host.enumerateTools(session.actor);
+    const lookup = (object: string, verb: string) => tools.find((t) => t.object === object && t.verb === verb);
+    const claimTool = lookup(freshRef, "claim");
+    expect(claimTool, `claim tool missing: ${tools.map((t) => `${t.object}:${t.verb}`).join(",")}`).toBeDefined();
+    expect(claimTool!.description).toMatch(/Take responsibility for delivering this task/);
+    expect(claimTool!.description).toMatch(/the current step is waiting on you/);
+    const passTool = lookup(freshRef, "pass");
+    expect(passTool!.description).toMatch(/Record the current step as done/);
+    const dropTool = lookup(freshRef, "drop_terminal");
+    expect(dropTool!.description).toMatch(/Mark the task final/);
+    const yieldTool = lookup(freshRef, "yield");
+    expect(yieldTool!.description).toMatch(/Add a new task linked to this one/);
+    // Registry-side verbs — claim_task / listing / set_role / set_obligation / set_policy.
+    const listingTool = lookup("the_taskboard", "listing");
+    expect(listingTool!.description).toMatch(/List every task this registry has minted/);
+    const createTool = lookup("the_taskboard", "create_task");
+    expect(createTool!.description).toMatch(/Create a new task on this registry/);
+    expect(createTool!.description).toMatch(/Pick a workflow by name/);
+    const setRoleTool = lookup("the_taskboard", "set_role");
+    expect(setRoleTool!.description).toMatch(/A role groups people who can claim and finish/);
+    const setObTool = lookup("the_taskboard", "set_obligation");
+    expect(setObTool!.description).toMatch(/A step is a named gate/);
+    expect(setObTool!.description).toMatch(/conditions of satisfaction/i);
+    const setPolicyTool = lookup("the_taskboard", "set_policy");
+    expect(setPolicyTool!.description).toMatch(/A workflow is the ordered list of steps/);
   });
 
   it("installs pinboard from source and keeps notes as board-contained pin objects", async () => {

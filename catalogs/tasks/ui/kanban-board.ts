@@ -1,4 +1,5 @@
-import { escapeHtml, type WooComponentRegistry, type WooContext } from "../../../src/client/framework";
+import { escapeHtml, type ObservationRegistry, type WooComponentRegistry, type WooContext } from "../../../src/client/framework";
+import tasksManifest from "../manifest.json";
 
 export type KanbanActionArg = {
   name: string;
@@ -107,16 +108,67 @@ type AdminEditing = { section: AdminSection; key: string | null; mode: AdminPane
 
 export type GroupBy = "state" | "role" | "holder" | "kind";
 
-const DRAG_VERB_BY_TRANSITION: Partial<Record<`${StateColumnId}->${StateColumnId}`, string>> = {
-  "ready->in_flight": "claim",
-  "in_flight->ready": "release",
-  "in_flight->dropped": "drop_terminal"
+// User-facing button labels for each task action verb. The catalog's
+// :available_actions returns its own `label`, but those words are
+// ambiguous in everyday English: "pass" reads as either "approve" or
+// "skip", "yield"/"spawn" suggests biology more than work-tracking. The
+// override below is purely UI shorthand. Verbs not in this map fall
+// back to action.label verbatim.
+const ACTION_LABEL: Record<string, string> = {
+  claim: "Claim",
+  pass: "Mark step done",
+  reject: "Reopen previous step",
+  wait: "Mark blocked",
+  yield: "Add related task",
+  handoff: "Hand off",
+  release: "Put back on board",
+  drop_terminal: "Cancel task"
 };
 
+// Verb help text — the OUTCOME a click produces — is the single source of
+// truth in the catalog manifest's verb-source doc-comments. The MCP host
+// reads the same comments via `extractFirstParagraph`, so MCP clients see
+// the same text the UI puts in tooltips. Built once at module load.
+const VERB_DOC_BY_NAME: Record<string, string> = (() => {
+  const out: Record<string, string> = {};
+  for (const cls of (tasksManifest as { classes?: Array<{ verbs?: Array<{ name?: string; source?: string }> }> }).classes ?? []) {
+    for (const verb of cls.verbs ?? []) {
+      if (typeof verb.name !== "string" || typeof verb.source !== "string") continue;
+      const doc = extractVerbDoc(verb.source);
+      if (doc) out[verb.name] = doc;
+    }
+  }
+  return out;
+})();
+
+// Mirrors src/mcp/host.ts:extractFirstParagraph — keep the two in sync so
+// the UI tooltip and the MCP description always match. First /* ... */
+// block (paragraph), else first // line, else empty.
+function extractVerbDoc(source: string): string {
+  const block = /\/\*([\s\S]*?)\*\//.exec(source);
+  if (block) {
+    const text = block[1].split(/\n\s*\n/)[0].replace(/^\s*\*?\s?/gm, "").replace(/\s+/g, " ").trim();
+    if (text) return text;
+  }
+  const line = /^\s*\/\/\s?(.*)$/m.exec(source);
+  if (line) return line[1].trim();
+  return "";
+}
+
+function actionPresentation(verb: string, fallbackLabel: string): { label: string; help: string } {
+  return {
+    label: ACTION_LABEL[verb] ?? fallbackLabel,
+    help: VERB_DOC_BY_NAME[verb] ?? ""
+  };
+}
+
+// Internal column ids stay (`waiting`, `in_flight`) — the labels are
+// re-shaped for clarity. "Blocked" matches the "Mark blocked" action;
+// "Active" reads more directly than aviation-flavoured "In flight".
 const STATE_COLUMN_LABELS: Record<StateColumnId, string> = {
   ready: "Ready",
-  waiting: "Waiting",
-  in_flight: "In flight",
+  waiting: "Blocked",
+  in_flight: "Active",
   done: "Done",
   dropped: "Dropped"
 };
@@ -127,8 +179,15 @@ const DEFAULT_VISIBLE_STATE_COLUMNS: StateColumnId[] = ["ready", "waiting", "in_
 const GROUP_BY_LABELS: Record<GroupBy, string> = {
   state: "State",
   role: "Role",
-  holder: "Holder",
-  kind: "Kind"
+  // Internal type stays "holder"; the label drops the passive noun. "Person"
+  // reads as a neutral category in the group-by dropdown without implying
+  // who-did-what-to-whom.
+  holder: "Person",
+  // Internal field stays `kind` (catalog property name), but in the UI a
+  // task's "kind" is just the name of the workflow it follows — calling
+  // it "Kind" elsewhere and "Workflow" in the admin was the same concept
+  // wearing two hats. Standardise on "Workflow" everywhere user-facing.
+  kind: "Workflow"
 };
 
 const GROUP_BY_ORDER: GroupBy[] = ["state", "role", "holder", "kind"];
@@ -407,11 +466,51 @@ function readActionRow(row: unknown): KanbanAction | null {
   };
 }
 
-const DEFAULT_REFRESH_INTERVAL_MS = 3000;
+// Window-level fan-out: registerWooObservationHandlers below dispatches this
+// event whenever any task-mutation observation lands; mounted kanbans listen
+// and refresh. Cheaper than wiring per-element subscriptions through the
+// framework's projection layer when the kanban already has its own
+// directCall-driven refresh.
+const TASKS_REFRESH_EVENT = "woo-tasks-refresh";
+
+const TASK_OBSERVATION_TYPES = [
+  "task_created",
+  "task_claimed",
+  "task_released",
+  "task_moved",
+  "task_passed",
+  "task_rejected",
+  "task_waited",
+  "task_yielded",
+  "task_dropped",
+  "task_returned_home",
+  "task_renamed",
+  "task_relabeled",
+  "obligation_orphaned",
+  "registry_role_changed",
+  "registry_obligation_changed",
+  "registry_policy_changed"
+];
 
 export class WooTasksKanbanElement extends HTMLElement {
-  woo?: WooContext;
-  subject?: string;
+  // `woo` and `subject` are accessor pairs: main.ts wires the element by
+  // setting both after innerHTML inserts it (so connectedCallback has
+  // already fired). Without these triggers the kanban would render its
+  // empty `model` placeholder on first paint and only recover when an
+  // observation arrived. With them, the late assignment kicks the same
+  // refresh path the polling timer used to drive every 3s.
+  private _woo?: WooContext;
+  private _subject?: string;
+  get woo(): WooContext | undefined { return this._woo; }
+  set woo(value: WooContext | undefined) {
+    this._woo = value;
+    if (this.isConnected && value) this.scheduleRefresh();
+  }
+  get subject(): string | undefined { return this._subject; }
+  set subject(value: string | undefined) {
+    this._subject = value;
+    if (this.isConnected && this._woo && value) this.scheduleRefresh();
+  }
   private model: KanbanData = {
     registryId: "",
     registryName: "Tasks",
@@ -425,9 +524,9 @@ export class WooTasksKanbanElement extends HTMLElement {
     policiesMap: {}
   };
   private boundClick = false;
-  private boundDrag = false;
   private boundSubmit = false;
-  private pollHandle: ReturnType<typeof setInterval> | null = null;
+  private refreshing = false;
+  private refreshQueued = false;
   private openPrompt: { taskId: string; verb: string } | null = null;
   private adminOpen = false;
   private adminSection: AdminSection = "role";
@@ -475,13 +574,6 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.addEventListener("click", this.handleClick);
       this.boundClick = true;
     }
-    if (!this.boundDrag) {
-      this.addEventListener("dragstart", this.handleDragStart);
-      this.addEventListener("dragover", this.handleDragOver);
-      this.addEventListener("drop", this.handleDrop);
-      this.addEventListener("dragend", this.handleDragEnd);
-      this.boundDrag = true;
-    }
     if (!this.boundSubmit) {
       this.addEventListener("submit", this.handleSubmit);
       this.boundSubmit = true;
@@ -498,21 +590,19 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.addEventListener("focusout", this.handleFocusOut);
       this.boundFocus = true;
     }
-    if (this.woo) void this.refresh();
-    this.startPolling();
+    if (this.woo) this.scheduleRefresh();
+    if (typeof window !== "undefined") {
+      window.addEventListener(TASKS_REFRESH_EVENT, this.handleTasksRefresh);
+    }
+    if (typeof document !== "undefined") {
+      document.addEventListener("keydown", this.handleKeydown);
+    }
   }
 
   disconnectedCallback(): void {
     if (this.boundClick) {
       this.removeEventListener("click", this.handleClick);
       this.boundClick = false;
-    }
-    if (this.boundDrag) {
-      this.removeEventListener("dragstart", this.handleDragStart);
-      this.removeEventListener("dragover", this.handleDragOver);
-      this.removeEventListener("drop", this.handleDrop);
-      this.removeEventListener("dragend", this.handleDragEnd);
-      this.boundDrag = false;
     }
     if (this.boundSubmit) {
       this.removeEventListener("submit", this.handleSubmit);
@@ -530,40 +620,62 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.removeEventListener("focusout", this.handleFocusOut);
       this.boundFocus = false;
     }
-    this.stopPolling();
-  }
-
-  private startPolling(): void {
-    this.stopPolling();
-    const intervalMs = this.pollIntervalMs();
-    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
-    this.pollHandle = setInterval(() => {
-      if (this.isConnected && this.woo) void this.refresh();
-    }, intervalMs);
-  }
-
-  private stopPolling(): void {
-    if (this.pollHandle !== null) {
-      clearInterval(this.pollHandle);
-      this.pollHandle = null;
+    if (typeof window !== "undefined") {
+      window.removeEventListener(TASKS_REFRESH_EVENT, this.handleTasksRefresh);
+    }
+    if (typeof document !== "undefined") {
+      document.removeEventListener("keydown", this.handleKeydown);
     }
   }
 
-  private pollIntervalMs(): number {
-    const attr = this.getAttribute("refresh-interval-ms");
-    if (attr !== null) {
-      const parsed = Number(attr);
-      if (Number.isFinite(parsed)) return parsed;
+  // Close whichever modal is open: task detail dialog, or admin
+  // role/obligation/policy editor. Used by Escape, backdrop click, and the ×
+  // button. The detail panel and admin editor are mutually exclusive.
+  private closeModal(): void {
+    if (this.openDetail) {
+      this.openDetail = null;
+      this.detailDraft = null;
+      this.render();
+      return;
     }
-    return DEFAULT_REFRESH_INTERVAL_MS;
+    if (this.adminEditing) {
+      this.adminEditing = null;
+      this.render();
+    }
   }
 
-  static get observedAttributes(): string[] {
-    return ["refresh-interval-ms"];
-  }
+  private handleKeydown = (event: KeyboardEvent): void => {
+    if (event.key !== "Escape") return;
+    if (!this.isConnected) return;
+    if (!this.openDetail && !this.adminEditing) return;
+    event.preventDefault();
+    this.closeModal();
+  };
 
-  attributeChangedCallback(name: string): void {
-    if (name === "refresh-interval-ms" && this.isConnected) this.startPolling();
+  private handleTasksRefresh = (): void => {
+    if (!this.isConnected || !this.woo) return;
+    this.scheduleRefresh();
+  };
+
+  // Coalesce bursts of observations: at most one refresh in flight at a time;
+  // if more arrive while one is running, do exactly one more pass after it
+  // settles. A burst of N task_passed/task_claimed observations from a single
+  // applied frame produces 2 directCall sweeps total, not N.
+  private scheduleRefresh(): void {
+    if (this.refreshing) {
+      this.refreshQueued = true;
+      return;
+    }
+    this.refreshing = true;
+    void this.refresh().finally(() => {
+      this.refreshing = false;
+      if (this.refreshQueued && this.isConnected && this.woo) {
+        this.refreshQueued = false;
+        this.scheduleRefresh();
+      } else {
+        this.refreshQueued = false;
+      }
+    });
   }
 
   async refresh(): Promise<void> {
@@ -678,9 +790,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     }
     if (target.closest<HTMLButtonElement>("[data-tasks-detail-close]")) {
       event.preventDefault();
-      this.openDetail = null;
-      this.detailDraft = null;
-      this.render();
+      this.closeModal();
       return;
     }
     if (target.closest<HTMLButtonElement>("[data-tasks-detail-edit-toggle]")) {
@@ -819,10 +929,16 @@ export class WooTasksKanbanElement extends HTMLElement {
       this.render();
       return;
     }
+    if (target.closest("[data-tasks-modal-backdrop]") && !target.closest(".woo-tasks-modal")) {
+      // Backdrop click outside the modal closes it.
+      event.preventDefault();
+      this.closeModal();
+      return;
+    }
     const button = target.closest<HTMLButtonElement>("[data-tasks-action]");
     if (!button) {
       const card = target.closest<HTMLElement>("[data-tasks-card]");
-      if (card && !target.closest("[data-tasks-card-actions]") && !target.closest("[data-tasks-prompt]")) {
+      if (card && !target.closest("[data-tasks-prompt]")) {
         const taskId = card.dataset.tasksCard ?? "";
         if (taskId) {
           event.preventDefault();
@@ -892,13 +1008,21 @@ export class WooTasksKanbanElement extends HTMLElement {
   };
 
   private shouldDeferRenderForFocus(): boolean {
+    // Render-defer only kicks in for tasks-owned form fields where stomping
+    // mid-keystroke would lose draft state (admin form, detail form, prompt
+    // form, filter input). Earlier this had a broad fall-through for ANY
+    // input/textarea/select inside the kanban — but the embedded chat
+    // panel renders its composer input INSIDE this element, so the chat
+    // input's auto-focus on tab entry left the post-mount refresh
+    // permanently deferred until the user clicked elsewhere. Tasks looked
+    // empty until the first stray click.
     const active = this.ownerDocument.activeElement;
     if (!(active instanceof HTMLElement) || !this.contains(active)) return false;
     if (active.closest("[data-tasks-prompt]")) return true;
     if (active.closest("[data-tasks-detail-form]")) return true;
     if (active.closest("[data-tasks-admin-form]")) return true;
     if (active.matches("[data-tasks-filter-text]")) return true;
-    return active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active instanceof HTMLSelectElement;
+    return false;
   }
 
   private captureDraftInput(target: HTMLElement | null): void {
@@ -907,6 +1031,13 @@ export class WooTasksKanbanElement extends HTMLElement {
     if (detailForm && this.detailDraft) {
       const name = target.name as keyof CreateDraft;
       if (name === "kind" || name === "name" || name === "text" || name === "labels") this.detailDraft[name] = target.value;
+      // Toggle the Create button live as the name field is edited. We can't
+      // re-render — that would steal focus mid-keystroke — so we mutate the
+      // submit button's disabled state in place. Only matters for new tasks.
+      if (name === "name" && this.openDetail?.isNew) {
+        const submit = detailForm.querySelector<HTMLButtonElement>('button[type="submit"]');
+        if (submit) submit.disabled = this.detailDraft.name.trim().length === 0;
+      }
       return;
     }
     const adminForm = target.closest<HTMLFormElement>("[data-tasks-admin-form]");
@@ -1195,66 +1326,6 @@ export class WooTasksKanbanElement extends HTMLElement {
     this.render();
   }
 
-  private handleDragStart = (event: DragEvent): void => {
-    const target = event.target as HTMLElement | null;
-    const card = target?.closest<HTMLElement>("[data-tasks-card]");
-    if (!card || !event.dataTransfer) return;
-    const taskId = card.dataset.tasksCard ?? "";
-    const sourceCol = card.closest<HTMLElement>("[data-tasks-col]")?.dataset.tasksCol ?? "";
-    if (!taskId || !sourceCol) return;
-    event.dataTransfer.setData("application/x-woo-task", taskId);
-    event.dataTransfer.setData("application/x-woo-task-source-col", sourceCol);
-    event.dataTransfer.effectAllowed = "move";
-    card.dataset.tasksDragging = "true";
-  };
-
-  private handleDragEnd = (event: DragEvent): void => {
-    const card = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tasks-card]");
-    if (card) delete card.dataset.tasksDragging;
-    for (const col of Array.from(this.querySelectorAll<HTMLElement>("[data-tasks-col]"))) {
-      delete col.dataset.tasksDropTarget;
-    }
-  };
-
-  private handleDragOver = (event: DragEvent): void => {
-    if (this.groupBy !== "state") return;
-    const col = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tasks-col]");
-    if (!col || !event.dataTransfer) return;
-    const sourceCol = event.dataTransfer.getData("application/x-woo-task-source-col") as StateColumnId | "";
-    const targetCol = (col.dataset.tasksCol ?? "") as StateColumnId | "";
-    if (!sourceCol || !targetCol || sourceCol === targetCol) return;
-    if (!DRAG_VERB_BY_TRANSITION[`${sourceCol}->${targetCol}`]) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-    col.dataset.tasksDropTarget = "true";
-  };
-
-  private handleDrop = (event: DragEvent): void => {
-    if (this.groupBy !== "state") return;
-    const col = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tasks-col]");
-    if (!col || !event.dataTransfer) return;
-    const taskId = event.dataTransfer.getData("application/x-woo-task");
-    const sourceCol = event.dataTransfer.getData("application/x-woo-task-source-col") as StateColumnId | "";
-    const targetCol = (col.dataset.tasksCol ?? "") as StateColumnId | "";
-    if (!taskId || !sourceCol || !targetCol) return;
-    const verb = DRAG_VERB_BY_TRANSITION[`${sourceCol}->${targetCol}`];
-    if (!verb) return;
-    event.preventDefault();
-    delete col.dataset.tasksDropTarget;
-    const action = this.model.tasks
-      .find((task) => task.id === taskId)?.actions
-      .find((entry) => entry.verb === verb);
-    if (!action) return;
-    this.dispatchEvent(new CustomEvent("woo-tasks-action", {
-      bubbles: true,
-      detail: { taskId, verb: action.verb, label: action.label, args: action.args, source: "drag" }
-    }));
-    if (action.args.some((arg) => arg.required)) {
-      this.openPromptFor(taskId, action.verb);
-      return;
-    }
-    void this.invokeAction(taskId, action, []);
-  };
 
   private async invokeAction(taskId: string, action: KanbanAction, args: unknown[]): Promise<void> {
     const woo = this.woo;
@@ -1335,13 +1406,12 @@ export class WooTasksKanbanElement extends HTMLElement {
 
     const boardContent = this.adminOpen
       ? this.renderAdminPanel()
-      : `${this.renderFilterBar(tasks.length)}
+      : `${this.renderFilterBar()}
           <section class="woo-tasks-kanban" aria-label="Task board">
             <div class="woo-tasks-kanban-columns">${columnsHtml}</div>
           </section>`;
-    const board = `
+    const workspace = `
       <section class="woo-tasks-workspace has-space-chat" data-space-chat-layout="${escapeHtml(registryId)}">
-        ${this.renderHeader(registryName || "Tasks")}
         <div class="woo-tasks-workarea">
           <div class="woo-tasks-board${this.adminOpen ? " has-admin" : ""}">
             ${boardContent}
@@ -1359,9 +1429,15 @@ export class WooTasksKanbanElement extends HTMLElement {
     const preservedPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap; remove: () => void }>(
       "[data-space-chat-shell] [data-space-chat-panel]"
     );
+    // Toolbar lives at the top of the custom element, outside the chat shell
+    // — same structure as pinboard (`<section class="toolbar pinboard-toolbar">`
+    // before `<section class="space-chat-shell">`). Putting it inside the
+    // shell would push the toolbar inside the chat-grid and shift y-position
+    // versus other tools.
     this.innerHTML = `
-      <section class="space-chat-shell tasks-space-chat-shell" data-space-chat-shell="${escapeHtml(registryId)}">
-        ${board}
+      ${this.renderHeader(registryName || "Tasks")}
+      <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(registryId)}">
+        ${workspace}
         <div data-tool-space-chat></div>
       </section>
     `;
@@ -1378,25 +1454,29 @@ export class WooTasksKanbanElement extends HTMLElement {
     const isNew = !!open.isNew;
     if (!isNew && open.loading) {
       return `
-        <aside class="woo-tasks-detail" data-tasks-detail data-task-id="${escapeHtml(open.taskId)}">
-          <header class="woo-tasks-detail-header">
-            <h3>${escapeHtml(open.taskId)}</h3>
-            <button type="button" data-tasks-detail-close aria-label="Close">×</button>
-          </header>
-          <div class="woo-tasks-detail-body"><p>Loading…</p></div>
-        </aside>
+        <div class="woo-tasks-modal-backdrop" data-tasks-modal-backdrop>
+          <aside class="woo-tasks-detail woo-tasks-modal" data-tasks-detail data-task-id="${escapeHtml(open.taskId)}" role="dialog" aria-modal="true">
+            <header class="woo-tasks-detail-header">
+              <h3>${escapeHtml(open.taskId)}</h3>
+              <button type="button" data-tasks-detail-close aria-label="Close">×</button>
+            </header>
+            <div class="woo-tasks-detail-body"><p>Loading…</p></div>
+          </aside>
+        </div>
       `;
     }
     if (!isNew && !open.detail) {
       const message = open.error ? `Failed to load task: ${open.error}` : "No detail returned.";
       return `
-        <aside class="woo-tasks-detail" data-tasks-detail data-task-id="${escapeHtml(open.taskId)}">
-          <header class="woo-tasks-detail-header">
-            <h3>${escapeHtml(open.taskId)}</h3>
-            <button type="button" data-tasks-detail-close aria-label="Close">×</button>
-          </header>
-          <div class="woo-tasks-detail-body"><p>${escapeHtml(message)}</p></div>
-        </aside>
+        <div class="woo-tasks-modal-backdrop" data-tasks-modal-backdrop>
+          <aside class="woo-tasks-detail woo-tasks-modal" data-tasks-detail data-task-id="${escapeHtml(open.taskId)}" role="dialog" aria-modal="true">
+            <header class="woo-tasks-detail-header">
+              <h3>${escapeHtml(open.taskId)}</h3>
+              <button type="button" data-tasks-detail-close aria-label="Close">×</button>
+            </header>
+            <div class="woo-tasks-detail-body"><p>${escapeHtml(message)}</p></div>
+          </aside>
+        </div>
       `;
     }
     const editing = this.detailDraft !== null;
@@ -1424,7 +1504,7 @@ export class WooTasksKanbanElement extends HTMLElement {
         : detailTerminal
           ? "dropped"
           : detailLocation && detailLocation !== this.model.registryId
-            ? `held by ${actorDisplay(detailLocation, actorNames)}`
+            ? `with ${actorDisplay(detailLocation, actorNames)}`
             : "ready";
 
     const headerTitle = (isNew || editing)
@@ -1439,10 +1519,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       .join("");
     const kindBlock = isNew
       ? `<label class="woo-tasks-detail-field">
-          <span class="woo-tasks-detail-field-label">Kind</span>
+          <span class="woo-tasks-detail-field-label">Workflow <span class="woo-tasks-detail-field-hint">(the ordered steps this task will walk)</span></span>
           <select name="kind" required>${policyOptions}</select>
         </label>`
-      : `<span class="woo-tasks-detail-kind">${escapeHtml(detailKind || "task")}</span>`;
+      : `<span class="woo-tasks-detail-kind" title="Workflow — the ordered steps this task walks">${escapeHtml(detailKind || "task")}</span>`;
 
     const labelsValue = draft?.labels ?? detailLabels.join(", ");
     const labelsBlock = (isNew || editing)
@@ -1459,29 +1539,42 @@ export class WooTasksKanbanElement extends HTMLElement {
     const textValue = draft?.text ?? detailText;
     const bodyBlock = (isNew || editing)
       ? `<label class="woo-tasks-detail-field">
-          <span class="woo-tasks-detail-field-label">Body</span>
-          <textarea name="text" rows="${isNew ? 12 : 8}" placeholder="markdown body (optional)">${escapeHtml(textValue)}</textarea>
+          <span class="woo-tasks-detail-field-label">Task instructions <span class="woo-tasks-detail-field-hint">(markdown — what needs doing, optional)</span></span>
+          <textarea name="text" rows="${isNew ? 12 : 8}" placeholder="What needs doing? (markdown supported, optional)">${escapeHtml(textValue)}</textarea>
         </label>`
       : detailText
         ? `<pre class="woo-tasks-detail-text">${escapeHtml(detailText)}</pre>`
-        : `<p class="woo-tasks-detail-empty">No body.</p>`;
+        : `<p class="woo-tasks-detail-empty">No instructions.</p>`;
 
+    // Disable Create until a non-empty name is typed. Save (edit mode) is
+    // enabled by default — the user is editing an existing task that already
+    // has a name; if they delete the name the `required` attr blocks submit.
+    const trimmedDraftName = (draft?.name ?? "").trim();
+    const submitDisabled = isNew && trimmedDraftName.length === 0;
     const formActions = (isNew || editing)
       ? `<div class="woo-tasks-detail-actions">
           <button type="button" data-tasks-detail-cancel class="woo-tasks-action">Cancel</button>
-          <button type="submit" class="woo-tasks-primary-action">${isNew ? "Create" : "Save"}</button>
+          <button type="submit" class="woo-tasks-primary-action"${submitDisabled ? " disabled" : ""}>${isNew ? "Create" : "Save"}</button>
         </div>`
       : "";
 
+    // Per-step status: ✓ done, ▶ current (claimable by the step's role),
+    // blank for upcoming. Role badge sits next to the name so the gating
+    // is visible without hovering.
+    const stepCount = detailObligations.length;
+    const metCount = detailObligations.filter((o) => o.met).length;
+    const stepsSummary = stepCount === 0
+      ? ""
+      : `<p class="woo-tasks-detail-section-help">Step ${Math.min(metCount + 1, stepCount)} of ${stepCount}. ${metCount === stepCount ? "All steps done." : "▶ marks the current step. Only people in that role can claim it and mark it done."}</p>`;
     const obligationsHtml = detailObligations.length === 0
-      ? `<p class="woo-tasks-detail-empty">No obligations.</p>`
-      : `<ol class="woo-tasks-detail-obligations">${detailObligations.map((o) => {
+      ? `<p class="woo-tasks-detail-empty">No steps configured for this task kind.</p>`
+      : `${stepsSummary}<ol class="woo-tasks-detail-obligations">${detailObligations.map((o) => {
           const here = o.key === detailCursorKey;
           const flag = o.met ? "✓" : here ? "▶" : " ";
-          const role = o.role ? `<span class="woo-tasks-detail-obligation-role">${escapeHtml(o.role)}</span>` : "";
+          const role = o.role ? `<span class="woo-tasks-detail-obligation-role" title="Role that owns this step">${escapeHtml(o.role)}</span>` : "";
           const criterion = o.criterion ? `<span class="woo-tasks-detail-obligation-criterion">${escapeHtml(o.criterion)}</span>` : "";
           return `<li class="woo-tasks-detail-obligation${o.met ? " met" : ""}${here ? " current" : ""}">
-            <span class="woo-tasks-detail-obligation-flag">${escapeHtml(flag)}</span>
+            <span class="woo-tasks-detail-obligation-flag" aria-hidden="true">${escapeHtml(flag)}</span>
             <span class="woo-tasks-detail-obligation-key">${escapeHtml(o.key)}</span>
             ${role}${criterion}
           </li>`;
@@ -1516,11 +1609,11 @@ export class WooTasksKanbanElement extends HTMLElement {
         </section>`;
 
     // Sections that only make sense for an existing, persisted task. New
-    // tasks haven't been minted yet, so obligations / log / waitFor / links
+    // tasks haven't been minted yet, so steps / log / waitFor / links
     // would be empty and confusing.
     const persistentSections = isNew ? "" : `
       <section class="woo-tasks-detail-section">
-        <h4>Obligations</h4>
+        <h4>Steps</h4>
         ${obligationsHtml}
       </section>
       ${waitHtml}
@@ -1531,57 +1624,85 @@ export class WooTasksKanbanElement extends HTMLElement {
       </section>
     `;
 
+    // The × close button is redundant in new/edit mode (Cancel handles it
+    // and is right next to Submit in form actions). In view mode there is
+    // no Cancel button, so the × stays as the only way to dismiss.
+    const closeButton = (isNew || editing)
+      ? ""
+      : `<button type="button" data-tasks-detail-close aria-label="Close">×</button>`;
+    // In edit/new mode the field already has its own `<label>Task
+    // instructions<textarea/></label>`, so wrapping it in another section
+    // with `<h4>Task instructions</h4>` would be a duplicate. View mode
+    // uses a `<pre>` or empty placeholder instead, so the section heading
+    // is the only label there.
+    const bodySection = (isNew || editing)
+      ? bodyBlock
+      : `<section class="woo-tasks-detail-section">
+          <h4>Task instructions</h4>
+          ${bodyBlock}
+        </section>`;
+
+    // Per-task actions (claim, release, pass, drop_terminal, ...) live on
+    // the kanban listing's task.actions. They show in the dialog when
+    // viewing an existing task — never on the cards themselves, never in
+    // edit/new mode (where the form actions own the dialog footer).
+    const viewingTask = (!isNew && !editing && detail)
+      ? this.model.tasks.find((t) => t.id === detail.id)
+      : undefined;
+    const taskActions = viewingTask && viewingTask.actions.length > 0
+      ? `<div class="woo-tasks-detail-task-actions" data-tasks-detail-task-actions>${
+          viewingTask.actions.map((action) => {
+            const needsArgs = action.args.some((arg) => arg.required);
+            const flag = needsArgs ? ' data-tasks-action-needs-args="true"' : "";
+            const { label, help } = actionPresentation(action.verb, action.label);
+            const helpAttr = help ? ` title="${escapeHtml(help)}" aria-label="${escapeHtml(label)} — ${escapeHtml(help)}"` : "";
+            return `<button type="button" class="woo-tasks-action" data-tasks-action="${escapeHtml(action.verb)}" data-task-id="${escapeHtml(viewingTask.id)}"${flag}${helpAttr}>${escapeHtml(label)}${needsArgs ? "…" : ""}</button>`;
+          }).join("")
+        }</div>`
+      : "";
+    const prompt = (viewingTask && this.openPrompt && this.openPrompt.taskId === viewingTask.id)
+      ? this.renderPrompt(viewingTask, this.openPrompt.verb)
+      : "";
+
     return `
-      <aside class="woo-tasks-detail" data-tasks-detail data-task-id="${escapeHtml(dataTaskId)}" data-task-mode="${escapeHtml(mode)}">
-        <form data-tasks-detail-form class="woo-tasks-detail-form">
-          <header class="woo-tasks-detail-header">
-            ${headerTitle}
-            ${editToggle}
-            <button type="button" data-tasks-detail-close aria-label="Close">×</button>
-          </header>
-          <div class="woo-tasks-detail-meta">
-            ${kindBlock}
-            <span class="woo-tasks-detail-status">${escapeHtml(status)}</span>
-          </div>
-          ${labelsBlock}
-          <section class="woo-tasks-detail-section">
-            <h4>Body</h4>
-            ${bodyBlock}
-          </section>
-          ${formActions}
-          ${persistentSections}
-        </form>
-      </aside>
+      <div class="woo-tasks-modal-backdrop" data-tasks-modal-backdrop>
+        <aside class="woo-tasks-detail woo-tasks-modal" data-tasks-detail data-task-id="${escapeHtml(dataTaskId)}" data-task-mode="${escapeHtml(mode)}" role="dialog" aria-modal="true">
+          <form data-tasks-detail-form class="woo-tasks-detail-form">
+            <header class="woo-tasks-detail-header">
+              ${headerTitle}
+              ${editToggle}
+              ${closeButton}
+            </header>
+            <div class="woo-tasks-detail-meta">
+              ${kindBlock}
+              <span class="woo-tasks-detail-status">${escapeHtml(status)}</span>
+            </div>
+            ${labelsBlock}
+            ${bodySection}
+            ${formActions}
+            ${taskActions}
+            ${persistentSections}
+          </form>
+          ${prompt}
+        </aside>
+      </div>
     `;
   }
 
   private renderHeader(registryName: string): string {
     const { isOwner } = this.model;
-    const buttons: string[] = [];
-    if (isOwner && !this.adminOpen) {
-      buttons.push(`<button type="button" data-tasks-admin-toggle aria-expanded="false">⚙ Admin</button>`);
-    }
-    const toolbar = buttons.filter(Boolean).join("");
-    const counts = statusCounts(this.model.tasks, this.model.registryId);
+    const adminBtn = (isOwner && !this.adminOpen)
+      ? `<button type="button" data-tasks-admin-toggle aria-expanded="false">⚙ Admin</button>`
+      : "";
     return `
-      <header class="woo-tasks-kanban-header">
-        <div class="woo-tasks-titleblock">
-          <h2>${escapeHtml(registryName)}</h2>
-          <div class="woo-tasks-status-nav" aria-label="Task status filters">
-            ${STATE_COLUMN_ORDER.map((key) => `
-              <button type="button" data-tasks-status-filter="${escapeHtml(key)}" class="${this.visibleStateColumns.has(key) ? "active" : ""}" aria-pressed="${this.visibleStateColumns.has(key) ? "true" : "false"}">
-                <span>${escapeHtml(STATE_COLUMN_LABELS[key])}</span>
-                <strong>${counts[key]}</strong>
-              </button>
-            `).join("")}
-          </div>
-        </div>
-        <div class="woo-tasks-kanban-toolbar">${toolbar}</div>
-      </header>
+      <section class="toolbar woo-tasks-toolbar">
+        <h1>${escapeHtml(registryName)}</h1>
+        ${adminBtn}
+      </section>
     `;
   }
 
-  private renderFilterBar(visibleCount = this.filteredTasks().length): string {
+  private renderFilterBar(): string {
     const labels = Array.from(this.filterLabels);
     const canCreate = this.model.policies.length > 0 && !this.openDetail?.isNew;
     const groupOptions = GROUP_BY_ORDER.map((key) => {
@@ -1598,15 +1719,26 @@ export class WooTasksKanbanElement extends HTMLElement {
     const clear = hasFilter
       ? `<button type="button" data-tasks-filter-clear class="woo-tasks-filter-clear">Clear</button>`
       : "";
+    const counts = statusCounts(this.model.tasks, this.model.registryId);
+    const statusNav = `
+      <div class="woo-tasks-status-nav" aria-label="Task status filters">
+        ${STATE_COLUMN_ORDER.map((key) => `
+          <button type="button" data-tasks-status-filter="${escapeHtml(key)}" class="${this.visibleStateColumns.has(key) ? "active" : ""}" aria-pressed="${this.visibleStateColumns.has(key) ? "true" : "false"}">
+            <span>${escapeHtml(STATE_COLUMN_LABELS[key])}</span>
+            <strong>${counts[key]}</strong>
+          </button>
+        `).join("")}
+      </div>
+    `;
     return `
       <div class="woo-tasks-kanban-filterbar">
+        ${statusNav}
         <input type="search" data-tasks-filter-text placeholder="Search tasks…" value="${escapeHtml(this.filterText)}" autocomplete="off">
         <label class="woo-tasks-kanban-groupby">
           Group by
           <select data-tasks-group-by aria-label="Group tasks by">${groupOptions}</select>
         </label>
         <div class="woo-tasks-filter-chips" data-tasks-filter-chips>${chips}</div>
-        <span class="woo-tasks-filter-count">${visibleCount} / ${this.model.tasks.length}</span>
         ${clear}
         ${canCreate ? `<button type="button" data-tasks-create-open class="woo-tasks-primary-action">+ New task</button>` : ""}
       </div>
@@ -1618,41 +1750,53 @@ export class WooTasksKanbanElement extends HTMLElement {
     const roleNames = roles.map((r) => r.name);
     const obligationKeys = obligations.map((o) => o.key);
     const section = this.adminSection;
+    // User-facing labels for each admin section. The internal model still
+    // uses obligation/policy (catalog verb names, observation types) — the
+    // rename is UI-only. "Step" makes the sequential, role-gated nature
+    // legible; "Workflow" frames a policy as the recipe a task kind follows.
     const tabs: Array<{ key: AdminSection; label: string; count: number }> = [
       { key: "role", label: "Roles", count: roles.length },
-      { key: "obligation", label: "Obligations", count: obligations.length },
-      { key: "policy", label: "Policies", count: Object.keys(policiesMap).length }
+      { key: "obligation", label: "Steps", count: obligations.length },
+      { key: "policy", label: "Workflows", count: Object.keys(policiesMap).length }
     ];
+    // Each section's help leads with what *this* section is for, then
+    // briefly frames how it fits with the other two — so the user gets
+    // the full mental model from any tab without a separate overview block.
+    const sectionHelp = section === "role"
+      ? "A role groups people who do work. Members of a role can claim and finish the steps that role owns. (Steps belong to roles; workflows order steps.)"
+      : section === "obligation"
+        ? "A step is a named gate a task moves through. Each step belongs to a role; only members of that role can claim it and mark it done. (Workflows order steps; roles supply the people.)"
+        : "A workflow is the ordered list of steps a task moves through. When you create a task, you pick a workflow; the task walks its steps in order. (Each step is owned by a role; only members of that role can claim and finish it.)";
     const table = section === "role"
       ? roles.length === 0
-        ? `<p class="woo-tasks-admin-empty">No roles.</p>`
+        ? `<p class="woo-tasks-admin-empty">No roles yet. Add one to start.</p>`
         : `<table class="woo-tasks-admin-table">
-            <thead><tr><th>Name</th><th>Description</th><th>Owners</th></tr></thead>
+            <thead><tr><th>Name</th><th>Description</th><th>Members</th></tr></thead>
             <tbody>${roles.map((r) => `
               <tr tabindex="0" role="button" aria-label="Open role ${escapeHtml(r.name)}" data-tasks-admin-row data-tasks-admin-section="role" data-key="${escapeHtml(r.name)}">
                 <td>${escapeHtml(r.name)}</td>
                 <td>${escapeHtml(r.description || "—")}</td>
-                <td>${escapeHtml(r.owners.join(", ") || "(no owners)")}</td>
+                <td>${escapeHtml(r.owners.join(", ") || "(no members)")}</td>
               </tr>`).join("")}</tbody>
           </table>`
       : section === "obligation"
         ? obligations.length === 0
-          ? `<p class="woo-tasks-admin-empty">No obligations.</p>`
+          ? `<p class="woo-tasks-admin-empty">No steps yet. Add one to define what a task must do.</p>`
           : `<table class="woo-tasks-admin-table">
-              <thead><tr><th>Key</th><th>Role</th><th>Criterion</th></tr></thead>
+              <thead><tr><th>Name</th><th>Role</th><th>Conditions of satisfaction</th></tr></thead>
               <tbody>${obligations.map((o) => `
-                <tr tabindex="0" role="button" aria-label="Open obligation ${escapeHtml(o.key)}" data-tasks-admin-row data-tasks-admin-section="obligation" data-key="${escapeHtml(o.key)}">
+                <tr tabindex="0" role="button" aria-label="Open step ${escapeHtml(o.key)}" data-tasks-admin-row data-tasks-admin-section="obligation" data-key="${escapeHtml(o.key)}">
                   <td>${escapeHtml(o.key)}</td>
                   <td>${escapeHtml(o.role || "—")}</td>
                   <td>${escapeHtml(o.criterion || "—")}</td>
                 </tr>`).join("")}</tbody>
             </table>`
         : Object.keys(policiesMap).length === 0
-          ? `<p class="woo-tasks-admin-empty">No policies.</p>`
+          ? `<p class="woo-tasks-admin-empty">No workflows yet. Add one to start minting tasks.</p>`
           : `<table class="woo-tasks-admin-table">
-              <thead><tr><th>Task kind</th><th>Obligation order</th></tr></thead>
+              <thead><tr><th>Workflow</th><th>Steps (in order)</th></tr></thead>
               <tbody>${Object.entries(policiesMap).map(([kind, keys]) => `
-                <tr tabindex="0" role="button" aria-label="Open policy ${escapeHtml(kind)}" data-tasks-admin-row data-tasks-admin-section="policy" data-key="${escapeHtml(kind)}">
+                <tr tabindex="0" role="button" aria-label="Open workflow ${escapeHtml(kind)}" data-tasks-admin-row data-tasks-admin-section="policy" data-key="${escapeHtml(kind)}">
                   <td>${escapeHtml(kind)}</td>
                   <td>${escapeHtml(keys.join(" → ") || "(empty)")}</td>
                 </tr>`).join("")}</tbody>
@@ -1663,7 +1807,7 @@ export class WooTasksKanbanElement extends HTMLElement {
           <div class="woo-tasks-admin-head">
             <div class="woo-tasks-admin-tabs" role="tablist" aria-label="Admin sections">
               ${tabs.map((tab) => `
-                <button type="button" role="tab" data-tasks-admin-tab="${escapeHtml(tab.key)}" class="${tab.key === section ? "active" : ""}" aria-selected="${tab.key === section ? "true" : "false"}">
+                <button type="button" role="tab" data-tasks-admin-tab="${escapeHtml(tab.key)}" class="${tab.key === section ? "active" : ""}" aria-selected="${tab.key === section ? "true" : "false"}" title="${escapeHtml(tab.label)}">
                   <span>${escapeHtml(tab.label)}</span>
                   <strong>${tab.count}</strong>
                 </button>
@@ -1675,6 +1819,7 @@ export class WooTasksKanbanElement extends HTMLElement {
             <h3>${escapeHtml(tabs.find((tab) => tab.key === section)?.label ?? "Admin")}</h3>
             <button type="button" class="woo-tasks-action" data-tasks-admin-new="${escapeHtml(section)}">New</button>
           </div>
+          <p class="woo-tasks-admin-section-help">${escapeHtml(sectionHelp)}</p>
           ${this.renderAdminStatus(section)}
           <div class="woo-tasks-admin-tablewrap">${table}</div>
         </div>
@@ -1686,20 +1831,29 @@ export class WooTasksKanbanElement extends HTMLElement {
   private renderAdminEditor(roleNames: string[], obligationKeys: string[]): string {
     const editing = this.adminEditing;
     if (!editing) return "";
+    // Map internal section name → user-facing singular noun. Keep this in
+    // sync with the tab labels in renderAdminPanel.
+    const sectionNoun: Record<AdminSection, string> = {
+      role: "role",
+      obligation: "step",
+      policy: "workflow"
+    };
+    const noun = sectionNoun[editing.section];
     const title = editing.key
       ? editing.mode === "view"
-        ? `View ${editing.section}`
-        : `Edit ${editing.section}`
-      : `New ${editing.section}`;
+        ? `View ${noun}`
+        : `Edit ${noun}`
+      : `New ${noun}`;
     const remove = editing.key
       ? `<button type="button" class="woo-tasks-danger-action" data-tasks-admin-remove="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Remove</button>`
       : "";
     const body = editing.mode === "view"
       ? editing.section === "role"
         ? `<section class="woo-tasks-admin-view">
+            <p class="woo-tasks-admin-form-help">A role groups people who can claim and finish the steps it owns.</p>
             <label class="woo-tasks-admin-view-field"><span>Name</span><strong>${escapeHtml(this.adminDrafts.role.name || "—")}</strong></label>
             <label class="woo-tasks-admin-view-field"><span>Description</span><p>${escapeHtml(this.adminDrafts.role.description || "—")}</p></label>
-            <label class="woo-tasks-admin-view-field"><span>Owners</span><p>${escapeHtml(this.adminDrafts.role.owners || "—")}</p></label>
+            <label class="woo-tasks-admin-view-field"><span>Members</span><p>${escapeHtml(this.adminDrafts.role.owners || "—")}</p></label>
             <div class="woo-tasks-admin-form-actions">
               <button type="button" class="woo-tasks-action" data-tasks-admin-edit="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Edit</button>
               ${remove}
@@ -1707,17 +1861,19 @@ export class WooTasksKanbanElement extends HTMLElement {
           </section>`
         : editing.section === "obligation"
           ? `<section class="woo-tasks-admin-view">
-              <label class="woo-tasks-admin-view-field"><span>Key</span><strong>${escapeHtml(this.adminDrafts.obligation.key || "—")}</strong></label>
+              <p class="woo-tasks-admin-form-help">A step is a named gate a task moves through. Only people in the listed role can claim it and mark it done.</p>
+              <label class="woo-tasks-admin-view-field"><span>Name</span><strong>${escapeHtml(this.adminDrafts.obligation.key || "—")}</strong></label>
               <label class="woo-tasks-admin-view-field"><span>Role</span><p>${escapeHtml(this.adminDrafts.obligation.role || "—")}</p></label>
-              <label class="woo-tasks-admin-view-field"><span>Criterion</span><p>${escapeHtml(this.adminDrafts.obligation.criterion || "—")}</p></label>
+              <label class="woo-tasks-admin-view-field"><span>Conditions of satisfaction</span><p>${escapeHtml(this.adminDrafts.obligation.criterion || "—")}</p></label>
               <div class="woo-tasks-admin-form-actions">
                 <button type="button" class="woo-tasks-action" data-tasks-admin-edit="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Edit</button>
                 ${remove}
               </div>
             </section>`
           : `<section class="woo-tasks-admin-view">
-              <label class="woo-tasks-admin-view-field"><span>Task kind</span><strong>${escapeHtml(this.adminDrafts.policy.kind || "—")}</strong></label>
-              <label class="woo-tasks-admin-view-field"><span>Obligation order</span><p>${escapeHtml(this.adminDrafts.policy.keys || "—")}</p></label>
+              <p class="woo-tasks-admin-form-help">A workflow is the ordered checklist of steps a task moves through. Tasks pick a workflow when they're created.</p>
+              <label class="woo-tasks-admin-view-field"><span>Workflow</span><strong>${escapeHtml(this.adminDrafts.policy.kind || "—")}</strong></label>
+              <label class="woo-tasks-admin-view-field"><span>Steps (in order)</span><p>${escapeHtml(this.adminDrafts.policy.keys || "—")}</p></label>
               <div class="woo-tasks-admin-form-actions">
                 <button type="button" class="woo-tasks-action" data-tasks-admin-edit="${escapeHtml(editing.section)}" data-key="${escapeHtml(editing.key)}">Edit</button>
                 ${remove}
@@ -1725,9 +1881,10 @@ export class WooTasksKanbanElement extends HTMLElement {
             </section>`
       : editing.section === "role"
         ? `<form class="woo-tasks-admin-form" data-tasks-admin-form="role">
-          <label>Name<input type="text" name="name" value="${escapeHtml(this.adminDrafts.role.name)}" required autocomplete="off"></label>
-          <label>Description<input type="text" name="description" value="${escapeHtml(this.adminDrafts.role.description)}" autocomplete="off"></label>
-          <label>Owners<input type="text" name="owners" value="${escapeHtml(this.adminDrafts.role.owners)}" autocomplete="off"></label>
+          <p class="woo-tasks-admin-form-help">A role groups people who can claim and finish the steps it owns. Add owner ids (people, wizards, or teams) below.</p>
+          <label>Name<input type="text" name="name" value="${escapeHtml(this.adminDrafts.role.name)}" required autocomplete="off" placeholder="e.g. doer"></label>
+          <label>Description <span class="woo-tasks-form-hint">(optional, shown in lists)</span><input type="text" name="description" value="${escapeHtml(this.adminDrafts.role.description)}" autocomplete="off"></label>
+          <label>Members <span class="woo-tasks-form-hint">(comma-separated ids of actors who have this role, e.g. <code>$wiz, guest_1</code>)</span><input type="text" name="owners" value="${escapeHtml(this.adminDrafts.role.owners)}" autocomplete="off"></label>
           <div class="woo-tasks-admin-form-actions">
             ${remove}
             <button type="button" data-tasks-admin-edit-cancel class="woo-tasks-action">Cancel</button>
@@ -1736,9 +1893,10 @@ export class WooTasksKanbanElement extends HTMLElement {
         </form>`
         : editing.section === "obligation"
           ? `<form class="woo-tasks-admin-form" data-tasks-admin-form="obligation">
-            <label>Key<input type="text" name="key" value="${escapeHtml(this.adminDrafts.obligation.key)}" required autocomplete="off"></label>
-            <label>Role<select name="role" required>${roleNames.length === 0 ? `<option value="" disabled selected>no roles yet</option>` : roleNames.map((n) => `<option value="${escapeHtml(n)}"${n === (this.adminDrafts.obligation.role || roleNames[0] || "") ? " selected" : ""}>${escapeHtml(n)}</option>`).join("")}</select></label>
-            <label>Criterion<input type="text" name="criterion" value="${escapeHtml(this.adminDrafts.obligation.criterion)}" required autocomplete="off"></label>
+            <p class="woo-tasks-admin-form-help">A step is a named gate. Tasks move through it in workflow order; only people in the listed role can claim it and mark it done.</p>
+            <label>Name <span class="woo-tasks-form-hint">(short id, e.g. <code>do:it</code> or <code>review</code>)</span><input type="text" name="key" value="${escapeHtml(this.adminDrafts.obligation.key)}" required autocomplete="off"></label>
+            <label>Role <span class="woo-tasks-form-hint">(who can claim and finish this step — must already exist)</span><select name="role" required>${roleNames.length === 0 ? `<option value="" disabled selected>no roles yet</option>` : roleNames.map((n) => `<option value="${escapeHtml(n)}"${n === (this.adminDrafts.obligation.role || roleNames[0] || "") ? " selected" : ""}>${escapeHtml(n)}</option>`).join("")}</select></label>
+            <label>Conditions of satisfaction <span class="woo-tasks-form-hint">(what 'done' looks like — shown to whoever takes the step)</span><input type="text" name="criterion" value="${escapeHtml(this.adminDrafts.obligation.criterion)}" required autocomplete="off" placeholder="e.g. Code reviewed and merged"></label>
             <div class="woo-tasks-admin-form-actions">
               ${remove}
               <button type="button" data-tasks-admin-edit-cancel class="woo-tasks-action">Cancel</button>
@@ -1746,8 +1904,9 @@ export class WooTasksKanbanElement extends HTMLElement {
             </div>
           </form>`
           : `<form class="woo-tasks-admin-form" data-tasks-admin-form="policy">
-            <label>Task kind<input type="text" name="kind" value="${escapeHtml(this.adminDrafts.policy.kind)}" required autocomplete="off"></label>
-            <label>Obligation order<input type="text" name="keys" placeholder="${obligationKeys.length ? `e.g. ${escapeHtml(obligationKeys.join(", "))}` : ""}" value="${escapeHtml(this.adminDrafts.policy.keys)}" required autocomplete="off"></label>
+            <p class="woo-tasks-admin-form-help">A workflow is the ordered checklist of steps a task moves through. Tasks pick a workflow by name when they're created.</p>
+            <label>Workflow name <span class="woo-tasks-form-hint">(short name tasks use to pick this workflow, e.g. <code>bug</code> or <code>feature</code>)</span><input type="text" name="kind" value="${escapeHtml(this.adminDrafts.policy.kind)}" required autocomplete="off"></label>
+            <label>Steps (in order) <span class="woo-tasks-form-hint">(comma-separated step names, in the order tasks should pass them)</span><input type="text" name="keys" placeholder="${obligationKeys.length ? `e.g. ${escapeHtml(obligationKeys.join(", "))}` : ""}" value="${escapeHtml(this.adminDrafts.policy.keys)}" required autocomplete="off"></label>
             <div class="woo-tasks-admin-form-actions">
               ${remove}
             <button type="button" data-tasks-admin-edit-cancel class="woo-tasks-action">Cancel</button>
@@ -1755,13 +1914,15 @@ export class WooTasksKanbanElement extends HTMLElement {
             </div>
             </form>`;
     return `
-      <aside class="woo-tasks-admin-editor">
-        <div class="woo-tasks-admin-editor-head">
-          <h3>${escapeHtml(title)}</h3>
-          <button type="button" data-tasks-admin-edit-cancel aria-label="Close">×</button>
-        </div>
-        ${body}
-      </aside>
+      <div class="woo-tasks-modal-backdrop" data-tasks-modal-backdrop>
+        <aside class="woo-tasks-admin-editor woo-tasks-modal" role="dialog" aria-modal="true">
+          <div class="woo-tasks-admin-editor-head">
+            <h3>${escapeHtml(title)}</h3>
+            <button type="button" data-tasks-admin-edit-cancel aria-label="Close">×</button>
+          </div>
+          ${body}
+        </aside>
+      </div>
     `;
   }
 
@@ -1784,7 +1945,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       })
       .join("");
     const holder = task.location && task.location !== this.model.registryId
-      ? `<span class="woo-tasks-card-holder">held by ${escapeHtml(actorDisplay(task.location, actorNames))}</span>`
+      ? `<span class="woo-tasks-card-holder">with ${escapeHtml(actorDisplay(task.location, actorNames))}</span>`
       : "";
     const meta = [
       task.kind ? `<span class="woo-tasks-card-kind">${escapeHtml(task.kind)}</span>` : "",
@@ -1792,32 +1953,13 @@ export class WooTasksKanbanElement extends HTMLElement {
       holder,
       `<span class="woo-tasks-card-age">${escapeHtml(formatAge(task.ageMs))}</span>`
     ].filter(Boolean).join("");
-    const actions = task.actions.length === 0
-      ? ""
-      : `<div class="woo-tasks-card-actions" data-tasks-card-actions>${
-          task.actions.map((action) => {
-            const needsArgs = action.args.some((arg) => arg.required);
-            const flag = needsArgs ? ' data-tasks-action-needs-args="true"' : "";
-            return `
-              <button type="button" data-tasks-action="${escapeHtml(action.verb)}" data-task-id="${escapeHtml(task.id)}"${flag}>${escapeHtml(action.label)}${needsArgs ? "…" : ""}</button>
-            `;
-          }).join("")
-        }</div>`;
-    const dragVerbs = task.actions.map((action) => action.verb);
-    const draggable = this.groupBy === "state"
-      && (dragVerbs.includes("claim") || dragVerbs.includes("release") || dragVerbs.includes("drop_terminal"));
-    const prompt = this.openPrompt && this.openPrompt.taskId === task.id
-      ? this.renderPrompt(task, this.openPrompt.verb)
-      : "";
     return `
-      <article class="woo-tasks-card${this.openDetail?.taskId === task.id ? " selected" : ""}" data-tasks-card="${escapeHtml(task.id)}"${draggable ? ' draggable="true"' : ""}>
+      <article class="woo-tasks-card${this.openDetail?.taskId === task.id ? " selected" : ""}" data-tasks-card="${escapeHtml(task.id)}" tabindex="0" role="button" aria-label="Open task ${escapeHtml(task.name || task.id)}">
         <header class="woo-tasks-card-header">
           <h3 class="woo-tasks-card-name">${escapeHtml(task.name || task.id)}</h3>
         </header>
         <div class="woo-tasks-card-meta">${meta}</div>
         ${labels ? `<div class="woo-tasks-card-labels">${labels}</div>` : ""}
-        ${actions}
-        ${prompt}
       </article>
     `;
   }
@@ -1837,9 +1979,11 @@ export class WooTasksKanbanElement extends HTMLElement {
         </label>
       `;
     }).join("");
+    const { label: promptLabel, help: promptHelp } = actionPresentation(action.verb, action.label);
     return `
       <form class="woo-tasks-prompt" data-tasks-prompt data-task-id="${escapeHtml(task.id)}" data-verb="${escapeHtml(action.verb)}">
-        <div class="woo-tasks-prompt-header">${escapeHtml(action.label)}</div>
+        <div class="woo-tasks-prompt-header">${escapeHtml(promptLabel)}</div>
+        ${promptHelp ? `<p class="woo-tasks-prompt-help">${escapeHtml(promptHelp)}</p>` : ""}
         ${fields}
         <div class="woo-tasks-prompt-actions">
           <button type="submit" data-tasks-prompt-submit class="woo-tasks-action">Submit</button>
@@ -1852,4 +1996,22 @@ export class WooTasksKanbanElement extends HTMLElement {
 
 export function registerWooComponents(registry: WooComponentRegistry): void {
   registry.defineTag("woo-tasks-kanban", WooTasksKanbanElement);
+}
+
+// Observation-driven refresh. A task mutation (claim, pass, drop, ...) or a
+// registry-policy edit lands as an observation; we fan it out as a window
+// event and any mounted woo-tasks-kanban refreshes its directCall-derived
+// view. Replaces the 3s setInterval poll. Reduce is a no-op against the
+// projection — refreshes go through directCall, not projection state — but
+// the registry still routes the observation here because we declared the
+// types.
+export function registerWooObservationHandlers(registry: ObservationRegistry): void {
+  registry.observation({
+    types: TASK_OBSERVATION_TYPES,
+    route: "both",
+    reduce: () => {
+      if (typeof window === "undefined" || typeof CustomEvent === "undefined") return;
+      window.dispatchEvent(new CustomEvent(TASKS_REFRESH_EVENT));
+    }
+  });
 }

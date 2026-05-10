@@ -14,20 +14,6 @@ function defineOnce(tag: string, ctor: CustomElementConstructor): void {
   if (!customElements.get(tag)) customElements.define(tag, ctor);
 }
 
-function makeDragEvent(type: string, target: HTMLElement, data: Record<string, string>): Event {
-  const dataTransfer = {
-    effectAllowed: "uninitialized" as string,
-    dropEffect: "none" as string,
-    getData: (key: string) => data[key] ?? "",
-    setData: (key: string, value: string) => { data[key] = value; },
-    clearData: (key?: string) => { if (key) delete data[key]; else for (const k of Object.keys(data)) delete data[k]; }
-  } as unknown as DataTransfer;
-  const event = new Event(type, { bubbles: true, cancelable: true });
-  Object.defineProperty(event, "dataTransfer", { value: dataTransfer });
-  Object.defineProperty(event, "target", { value: target });
-  return event;
-}
-
 function testWooContext(names: Record<string, string> = {}): WooContext {
   return {
     actor: "guest_1",
@@ -333,6 +319,7 @@ describe("bundled catalog UI components", () => {
         calls.push({ target, verb, args });
         if (verb === "listing") return listing;
         if (verb === "available_actions") return [{ verb: "claim", label: "Claim", args: [] }];
+        if (verb === "detail") return { id: target, name: "Triage cockatoo bug", text: "", kind: "bug", labels: ["urgent"], obligations: [], log: [], wait_for: [], links: [], location: "the_taskboard", complete: false, terminal: false, cursor: { key: "do:it" } };
         if (verb === "claim") return null;
         return undefined;
       },
@@ -347,12 +334,20 @@ describe("bundled catalog UI components", () => {
     await element.refresh!();
 
     expect(element.querySelector<HTMLElement>("[data-tasks-card]")?.dataset.tasksCard).toBe("obj_t_ready");
-    expect(element.querySelector("h2")?.textContent).toBe("Taskboard");
-    expect(element.querySelector("[data-tasks-action=\"claim\"]")?.textContent).toBe("Claim");
+    expect(element.querySelector("h1")?.textContent).toBe("Taskboard");
+    // Cards no longer carry inline action buttons — clicking a card opens
+    // the detail dialog where the actions live.
+    expect(element.querySelector("[data-tasks-card] [data-tasks-action]")).toBeNull();
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const claimBtn = element.querySelector<HTMLButtonElement>("[data-tasks-detail-task-actions] [data-tasks-action=\"claim\"]");
+    expect(claimBtn?.textContent).toBe("Claim");
 
     let detail: any;
     element.addEventListener("woo-tasks-action", (event: Event) => { detail = (event as CustomEvent).detail; });
-    element.querySelector<HTMLButtonElement>("[data-tasks-action=\"claim\"]")?.click();
+    claimBtn!.click();
     await Promise.resolve();
     await Promise.resolve();
     expect(detail).toMatchObject({ taskId: "obj_t_ready", verb: "claim" });
@@ -370,7 +365,9 @@ describe("bundled catalog UI components", () => {
       observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
       directCall: async (target, verb, args = []) => {
         calls.push({ target, verb, args });
-        if (verb === "listing") return [];
+        if (verb === "listing") return [{ task: "obj_t_drop", name: "Drop me", kind: "bug", labels: [], location: "guest_1", cursor_role: { key: "do:it", role: "doer", criterion: "Done." }, wait_for_count: 0, terminal: false, complete: false, link_count: 0, age_ms: 1000, last_change: 0 }];
+        if (verb === "available_actions") return [{ verb: "drop_terminal", label: "Drop", args: [{ name: "why", type: "str", required: true }] }];
+        if (verb === "detail") return { id: target, name: "Drop me", text: "", kind: "bug", labels: [], obligations: [], log: [], wait_for: [], links: [], location: "guest_1", complete: false, terminal: false, cursor: { key: "do:it" } };
         return null;
       },
       send: async () => undefined,
@@ -380,33 +377,15 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
-    element.data = {
-      registryId: "the_taskboard",
-      registryName: "Taskboard",
-      actor: "guest_1",
-      actorNames: { guest_1: "Guest 1" },
-      tasks: [{
-        id: "obj_t_drop",
-        name: "Drop me",
-        kind: "bug",
-        labels: [],
-        location: "guest_1",
-        cursorRole: "doer",
-        cursorKey: "do:it",
-        cursorCriterion: "Done.",
-        waitForCount: 0,
-        terminal: false,
-        complete: false,
-        linkCount: 0,
-        ageMs: 1000,
-        lastChange: 0,
-        actions: [{ verb: "drop_terminal", label: "Drop", args: [{ name: "why", type: "str", required: true }] }]
-      }]
-    };
 
-    const button = element.querySelector<HTMLButtonElement>("[data-tasks-action=\"drop_terminal\"]")!;
+    // Wait for the initial observation-driven refresh to settle so the
+    // model reflects the listing + available_actions mocks, then open
+    // the dialog.
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const button = element.querySelector<HTMLButtonElement>("[data-tasks-detail-task-actions] [data-tasks-action=\"drop_terminal\"]")!;
     expect(button.dataset.tasksActionNeedsArgs).toBe("true");
     button.click();
     const form = element.querySelector<HTMLFormElement>("form[data-tasks-prompt]")!;
@@ -419,6 +398,280 @@ describe("bundled catalog UI components", () => {
     await Promise.resolve();
     expect(calls.find((c) => c.verb === "drop_terminal")?.args).toEqual(["duplicate"]);
     expect(element.querySelector("form[data-tasks-prompt]")).toBeNull();
+  });
+
+  it("sources action tooltip help text from the catalog manifest, not duplicated in the UI", async () => {
+    // Single source of truth: each user-facing action's outcome description
+    // lives as a doc-comment in the catalog's verb source (so MCP picks it
+    // up via extractFirstParagraph too), and the kanban dialog reads from
+    // that same text. This guards against the UI drifting from MCP.
+    const tasksManifest = (await import("../catalogs/tasks/manifest.json")).default as { classes?: Array<{ local_name?: string; verbs?: Array<{ name?: string; source?: string }> }> };
+    const taskClass = tasksManifest.classes?.find((c) => c.local_name === "$task");
+    expect(taskClass, "expected $task class in tasks manifest").toBeDefined();
+    const expectedDoc = (verb: string) => {
+      const v = taskClass!.verbs!.find((entry) => entry.name === verb)!;
+      const block = /\/\*([\s\S]*?)\*\//.exec(v.source ?? "");
+      expect(block, `verb :${verb} should have a /* */ doc-comment`).not.toBeNull();
+      return block![1].split(/\n\s*\n/)[0].replace(/^\s*\*?\s?/gm, "").replace(/\s+/g, " ").trim();
+    };
+
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    const heldActions = [
+      { verb: "pass", label: "Pass", args: [] },
+      { verb: "yield", label: "Spawn related", args: [{ name: "spec", type: "map", required: true }] },
+      { verb: "drop_terminal", label: "Drop", args: [{ name: "why", type: "str", required: true }] }
+    ];
+    const detail = {
+      id: "obj_t_doc",
+      name: "Doc task",
+      text: "",
+      kind: "task",
+      labels: [],
+      obligations: [{ key: "do:it", role: "doer", criterion: "Done.", met: false }],
+      log: [],
+      wait_for: [],
+      links: [],
+      terminal: false,
+      complete: false,
+      cursor: { key: "do:it", role: "doer", criterion: "Done." },
+      location: "guest_1"
+    };
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "detail") return detail;
+        if (verb === "listing") return [{ task: "obj_t_doc", name: "Doc task", kind: "task", labels: [], location: "guest_1", cursor_role: { key: "do:it", role: "doer", criterion: "Done." }, wait_for_count: 0, terminal: false, complete: false, link_count: 0, age_ms: 0, last_change: 0 }];
+        if (verb === "available_actions") return heldActions;
+        return null;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+    await flush();
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    await flush();
+    const titleByVerb = (verb: string) =>
+      element.querySelector<HTMLButtonElement>(`[data-tasks-detail-task-actions] [data-tasks-action="${verb}"]`)?.title ?? "";
+    expect(titleByVerb("pass")).toBe(expectedDoc("pass"));
+    expect(titleByVerb("yield")).toBe(expectedDoc("yield"));
+    expect(titleByVerb("drop_terminal")).toBe(expectedDoc("drop_terminal"));
+  });
+
+  it("renames ambiguous action verbs and exposes outcome tooltips on each button", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    // Held by guest_1, so available_actions returns the holder-side verbs:
+    // pass / reject / wait / yield / handoff / release / drop_terminal.
+    const heldActions = [
+      { verb: "pass", label: "Pass", args: [] },
+      { verb: "reject", label: "Reject", args: [{ name: "i", type: "int", required: true }, { name: "why", type: "str", required: true }] },
+      { verb: "wait", label: "Wait", args: [{ name: "cond", type: "map", required: true }] },
+      { verb: "yield", label: "Spawn related", args: [{ name: "spec", type: "map", required: true }] },
+      { verb: "handoff", label: "Hand off", args: [{ name: "target", type: "obj", required: true }] },
+      { verb: "release", label: "Release", args: [] },
+      { verb: "drop_terminal", label: "Drop", args: [{ name: "why", type: "str", required: true }] }
+    ];
+    const detail = {
+      id: "obj_t_held",
+      name: "Held task",
+      text: "",
+      kind: "task",
+      labels: [],
+      obligations: [{ key: "do:it", role: "doer", criterion: "Done.", met: false }],
+      log: [],
+      wait_for: [],
+      links: [],
+      terminal: false,
+      complete: false,
+      cursor: { key: "do:it", role: "doer", criterion: "Done." },
+      location: "guest_1"
+    };
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "detail") return detail;
+        if (verb === "listing") return [{ task: "obj_t_held", name: "Held task", kind: "task", labels: [], location: "guest_1", cursor_role: { key: "do:it", role: "doer", criterion: "Done." }, wait_for_count: 0, terminal: false, complete: false, link_count: 0, age_ms: 0, last_change: 0 }];
+        if (verb === "available_actions") return heldActions;
+        return null;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+    await flush();
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    await flush();
+
+    // The "pass" button is renamed to "Mark step done" so it can't be
+    // misread as "skip / decline". "Spawn related" becomes the friendlier
+    // "Add related task". Both carry an outcome description as a title.
+    const buttonByVerb = (verb: string) =>
+      element.querySelector<HTMLButtonElement>(`[data-tasks-detail-task-actions] [data-tasks-action="${verb}"]`);
+
+    const pass = buttonByVerb("pass")!;
+    expect(pass.textContent?.trim()).toBe("Mark step done");
+    expect(pass.title).toMatch(/advances to the next step/i);
+    expect(pass.getAttribute("aria-label")).toMatch(/Mark step done/);
+    expect(pass.getAttribute("aria-label")).toMatch(/advances to the next step/i);
+
+    const yieldBtn = buttonByVerb("yield")!;
+    expect(yieldBtn.textContent?.trim()).toBe("Add related task…"); // … because yield needs args
+    expect(yieldBtn.title).toMatch(/Add a new task linked/i);
+
+    expect(buttonByVerb("reject")!.textContent?.trim()).toBe("Reopen previous step…");
+    expect(buttonByVerb("reject")!.title).toMatch(/marked done/i);
+    expect(buttonByVerb("reject")!.title).toMatch(/back to it/i);
+    expect(buttonByVerb("wait")!.textContent?.trim()).toBe("Mark blocked…");
+    expect(buttonByVerb("handoff")!.textContent?.trim()).toBe("Hand off…");
+    expect(buttonByVerb("handoff")!.title).toMatch(/another person in the same role/i);
+    expect(buttonByVerb("release")!.textContent?.trim()).toBe("Put back on board");
+    expect(buttonByVerb("release")!.title).toMatch(/can take it next/i);
+    expect(buttonByVerb("drop_terminal")!.textContent?.trim()).toBe("Cancel task…");
+    expect(buttonByVerb("drop_terminal")!.title).toMatch(/final/i);
+    expect(buttonByVerb("drop_terminal")!.title).not.toMatch(/terminal-dropped/i);
+
+    // Active-voice rewrite: claim describes what the user does, not what
+    // they passively become.
+    expect(buttonByVerb("pass")!.title).toMatch(/done/i);
+    expect(buttonByVerb("pass")!.title).not.toMatch(/passed back to unmet/i);
+
+    // No user-facing passive language: "held by", "role-holder", or the
+    // airport-y "terminal" should not appear anywhere in the action copy.
+    const allActionTitles = Array.from(element.querySelectorAll<HTMLButtonElement>("[data-tasks-detail-task-actions] [data-tasks-action]")).map((b) => b.title).join(" ");
+    expect(allActionTitles).not.toMatch(/role-holder/i);
+    expect(allActionTitles).not.toMatch(/held by/i);
+    expect(allActionTitles).not.toMatch(/terminal/i);
+    // Card and detail status use the active "with X" form, not "held by".
+    const cardHolder = element.querySelector(".woo-tasks-card-holder")?.textContent ?? "";
+    expect(cardHolder).toMatch(/with /i);
+    expect(cardHolder).not.toMatch(/held by/i);
+    const status = element.querySelector(".woo-tasks-detail-status")?.textContent ?? "";
+    expect(status).toMatch(/^with /i);
+
+    // Clicking an action that needs args opens the prompt; the prompt
+    // header carries the same friendly label and a help line.
+    yieldBtn.click();
+    await flush();
+    const promptHeader = element.querySelector(".woo-tasks-prompt-header")?.textContent;
+    expect(promptHeader).toBe("Add related task");
+    expect(element.querySelector(".woo-tasks-prompt-help")?.textContent).toMatch(/Add a new task linked/i);
+  });
+
+  it("uses Steps / Workflows labels and shows on-page explanatory copy in admin and task screens", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    const detail = {
+      id: "obj_t_view",
+      name: "Demo task",
+      text: "",
+      kind: "task",
+      labels: [],
+      obligations: [
+        { key: "do:it", role: "doer", criterion: "Done.", met: false }
+      ],
+      log: [],
+      wait_for: [],
+      links: [],
+      terminal: false,
+      complete: false,
+      cursor: { key: "do:it", role: "doer", criterion: "Done." },
+      location: "the_taskboard"
+    };
+    const registryProps: Record<string, unknown> = {
+      roles: { doer: { description: "Does", owners: ["$wiz"] } },
+      obligations: { "do:it": { role: "doer", criterion: "Done." } },
+      policies: { task: ["do:it"] }
+    };
+    const woo: WooContext = {
+      actor: "$wiz",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, owner: "$wiz", props: ref === "the_taskboard" ? registryProps : {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "detail") return detail;
+        if (verb === "listing") return [{ task: "obj_t_view", name: "Demo task", kind: "task", labels: [], location: "the_taskboard", cursor_role: { key: "do:it", role: "doer", criterion: "Done." }, wait_for_count: 0, terminal: false, complete: false, link_count: 0, age_ms: 0, last_change: 0 }];
+        if (verb === "available_actions") return [];
+        return null;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+    await flush();
+
+    // Admin: tab labels are user-facing nouns, not internal jargon.
+    element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
+    await flush();
+    const tabLabels = Array.from(element.querySelectorAll<HTMLElement>('[role="tab"] span')).map((el) => el.textContent?.trim() ?? "");
+    expect(tabLabels).toEqual(["Roles", "Steps", "Workflows"]);
+
+    // The single per-section help block leads with the active section
+    // and frames how it relates to the other two — no separate overview.
+    expect(element.querySelector(".woo-tasks-admin-overview")).toBeNull();
+    const roleHelp = element.querySelector(".woo-tasks-admin-section-help")?.textContent ?? "";
+    expect(roleHelp).toMatch(/role/i);
+    expect(roleHelp).toMatch(/step/i);
+    expect(roleHelp).toMatch(/workflow/i);
+    // Role table renames "Owners" → "Members".
+    const roleHeaders = Array.from(element.querySelectorAll<HTMLElement>(".woo-tasks-admin-table th")).map((h) => h.textContent);
+    expect(roleHeaders).toEqual(["Name", "Description", "Members"]);
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="obligation"]')!.click();
+    await flush();
+    expect(element.querySelector(".woo-tasks-admin-section-help")?.textContent).toMatch(/step/i);
+    expect(element.querySelector<HTMLElement>(".woo-tasks-admin-table th")?.textContent).toBe("Name");
+    // Step table renames "Criterion" → "Conditions of satisfaction".
+    const stepHeaders = Array.from(element.querySelectorAll<HTMLElement>(".woo-tasks-admin-table th")).map((h) => h.textContent);
+    expect(stepHeaders).toEqual(["Name", "Role", "Conditions of satisfaction"]);
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="policy"]')!.click();
+    await flush();
+    expect(element.querySelector(".woo-tasks-admin-section-help")?.textContent).toMatch(/workflow/i);
+    expect(Array.from(element.querySelectorAll<HTMLElement>(".woo-tasks-admin-table th")).map((h) => h.textContent)).toEqual(["Workflow", "Steps (in order)"]);
+
+    // Workflow editor surfaces a help block + per-field hints.
+    element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="policy"]')!.click();
+    await flush();
+    const editorHelp = element.querySelector(".woo-tasks-admin-form-help")?.textContent ?? "";
+    expect(editorHelp).toMatch(/workflow/i);
+    expect(editorHelp).toMatch(/checklist/i);
+    const hints = Array.from(element.querySelectorAll<HTMLElement>(".woo-tasks-form-hint")).map((h) => h.textContent ?? "");
+    expect(hints.some((h) => /comma-separated step names/i.test(h))).toBe(true);
+    element.querySelector<HTMLButtonElement>("[data-tasks-admin-edit-cancel]")!.click();
+    await flush();
+    element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
+    await flush();
+
+    // Task detail dialog: section is "Steps", with a summary line that
+    // exposes which step is current and who owns it.
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    const stepHeadings = Array.from(element.querySelectorAll<HTMLElement>(".woo-tasks-detail-section h4")).map((h) => h.textContent?.trim());
+    expect(stepHeadings).toContain("Steps");
+    expect(stepHeadings).not.toContain("Obligations");
+    expect(element.querySelector(".woo-tasks-detail-section-help")?.textContent).toMatch(/step 1 of 1/i);
+    expect(element.querySelector(".woo-tasks-detail-obligation-role")?.textContent).toBe("doer");
   });
 
   it("admin overlay sets a role / obligation / policy and fires the verbs in order, plus remove buttons", async () => {
@@ -448,7 +701,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = {
       registryId: "the_taskboard",
@@ -563,7 +815,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = {
       registryId: "the_taskboard",
@@ -595,7 +846,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = testWooContext({ guest_1: "Guest 1" });
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     const data = {
       registryId: "the_taskboard",
@@ -676,7 +926,6 @@ describe("bundled catalog UI components", () => {
     };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = baseData;
 
@@ -690,12 +939,51 @@ describe("bundled catalog UI components", () => {
     expect(document.activeElement).toBe(nameInput);
     expect(element.querySelector<HTMLInputElement>("[data-tasks-detail-form] input[name='name']")).toBe(nameInput);
     expect(nameInput.value).toBe("typing is still here");
-    expect(element.querySelector("h2")?.textContent).toBe("Taskboard");
+    expect(element.querySelector("h1")?.textContent).toBe("Taskboard");
 
     nameInput.blur();
     await Promise.resolve();
-    expect(element.querySelector("h2")?.textContent).toBe("Taskboard refreshed");
+    expect(element.querySelector("h1")?.textContent).toBe("Taskboard refreshed");
     expect(element.querySelector<HTMLInputElement>("[data-tasks-detail-form] input[name='name']")?.value).toBe("typing is still here");
+  });
+
+  it("does not defer refresh when focus is on a non-task input (embedded chat composer)", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; refresh?: () => Promise<void> };
+    const listing = [
+      { task: "obj_t_late", name: "Late lander", kind: "task", labels: [], location: "the_taskboard", cursor_role: null, wait_for_count: 0, terminal: false, complete: false, link_count: 0, age_ms: 0, last_change: 0 }
+    ];
+    const woo: WooContext = {
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "listing") return listing;
+        if (verb === "available_actions") return [];
+        return undefined;
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+
+    // Simulate the chat panel mounted inside the kanban — its composer is
+    // a plain <input> with no `data-tasks-*` ancestor. Focus before refresh.
+    const chatComposer = document.createElement("input");
+    chatComposer.setAttribute("data-space-chat-input", "true");
+    element.appendChild(chatComposer);
+    chatComposer.focus();
+    expect(document.activeElement).toBe(chatComposer);
+
+    await element.refresh!();
+    // Refresh must produce the rendered card even though a non-task input
+    // had focus — only tasks-owned form fields should defer the render.
+    expect(element.querySelector<HTMLElement>("[data-tasks-card='obj_t_late']")).not.toBeNull();
   });
 
   it("inline-edits name, body, and labels in the detail panel", async () => {
@@ -736,7 +1024,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = {
       registryId: "the_taskboard",
@@ -813,7 +1100,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = {
       registryId: "the_taskboard",
@@ -880,7 +1166,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = woo;
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = {
       registryId: "the_taskboard",
@@ -900,13 +1185,30 @@ describe("bundled catalog UI components", () => {
     // Unified panel: filter bar and kanban columns stay visible alongside.
     const detail = element.querySelector<HTMLElement>("[data-tasks-detail]");
     expect(detail?.dataset.taskMode).toBe("new");
+    // No "×" close button in new mode — Cancel handles it from form actions.
+    expect(form!.querySelector("[data-tasks-detail-close]")).toBeNull();
+    // The instructions field has exactly one label (rename from "Body" →
+    // "Task instructions"), not duplicated by an outer section heading.
+    const fieldLabels = Array.from(form!.querySelectorAll<HTMLElement>(".woo-tasks-detail-field-label")).map((el) => (el.firstChild?.textContent ?? "").trim());
+    expect(fieldLabels.filter((t) => /^Task instructions$/.test(t))).toHaveLength(1);
+    expect(fieldLabels.filter((t) => /^Body$/i.test(t))).toHaveLength(0);
+    expect(form!.querySelector(".woo-tasks-detail-section h4")).toBeNull();
     // Obligations / log are hidden for the not-yet-minted draft.
     expect(form!.querySelector(".woo-tasks-detail-obligations")).toBeNull();
     expect(form!.querySelector(".woo-tasks-detail-log")).toBeNull();
     const kindSelect = form!.querySelector<HTMLSelectElement>('select[name="kind"]')!;
     expect(Array.from(kindSelect.options).map((opt) => opt.value)).toEqual(["task", "bug"]);
+    // Create starts disabled (empty name); typing a name enables it.
+    const submit = form!.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    expect(submit.disabled).toBe(true);
+    const nameInput = form!.querySelector<HTMLInputElement>('input[name="name"]')!;
+    nameInput.value = "  ";
+    nameInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+    expect(submit.disabled).toBe(true);
+    nameInput.value = "Refactor verb dispatch";
+    nameInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+    expect(submit.disabled).toBe(false);
     kindSelect.value = "bug";
-    form!.querySelector<HTMLInputElement>('input[name="name"]')!.value = "Refactor verb dispatch";
     form!.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!.value = "details";
     form!.querySelector<HTMLInputElement>('input[name="labels"]')!.value = "frontend, urgent";
     form!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
@@ -922,7 +1224,6 @@ describe("bundled catalog UI components", () => {
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
     element.woo = testWooContext({});
     element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
     document.body.appendChild(element);
     element.data = {
       registryId: "the_taskboard",
@@ -941,79 +1242,10 @@ describe("bundled catalog UI components", () => {
     expect(element.querySelector("[data-tasks-seed-policy]")).toBeNull();
   });
 
-  it("drags a Ready card into In flight to dispatch claim", async () => {
+  it("refreshes on woo-tasks-refresh window events and stops on disconnect", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
-    const calls: { target: string; verb: string; args: unknown[] }[] = [];
-    const woo: WooContext = {
-      actor: "guest_1",
-      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
-      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
-      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
-      directCall: async (target, verb, args = []) => {
-        calls.push({ target, verb, args });
-        if (verb === "listing") return [];
-        return null;
-      },
-      send: async () => undefined,
-      call: async () => undefined,
-      emit: () => true
-    };
-    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
-    element.woo = woo;
-    element.subject = "the_taskboard";
-    element.setAttribute("refresh-interval-ms", "0");
-    document.body.appendChild(element);
-    element.data = {
-      registryId: "the_taskboard",
-      registryName: "Taskboard",
-      actor: "guest_1",
-      actorNames: { guest_1: "Guest 1" },
-      tasks: [{
-        id: "obj_t_drag",
-        name: "Drag-claim me",
-        kind: "bug",
-        labels: [],
-        location: "the_taskboard",
-        cursorRole: "doer",
-        cursorKey: "do:it",
-        cursorCriterion: "Done.",
-        waitForCount: 0,
-        terminal: false,
-        complete: false,
-        linkCount: 0,
-        ageMs: 1000,
-        lastChange: 0,
-        actions: [{ verb: "claim", label: "Claim", args: [] }]
-      }]
-    };
-    const card = element.querySelector<HTMLElement>("[data-tasks-card=\"obj_t_drag\"]")!;
-    const inFlight = element.querySelector<HTMLElement>("[data-tasks-col=\"in_flight\"]")!;
-    expect(card.getAttribute("draggable")).toBe("true");
-
-    const transferData: Record<string, string> = {};
-    element.dispatchEvent(makeDragEvent("dragstart", card, transferData));
-    expect(transferData["application/x-woo-task"]).toBe("obj_t_drag");
-    expect(transferData["application/x-woo-task-source-col"]).toBe("ready");
-
-    const overEvent = makeDragEvent("dragover", inFlight, transferData);
-    element.dispatchEvent(overEvent);
-    expect(overEvent.defaultPrevented).toBe(true);
-    expect(inFlight.dataset.tasksDropTarget).toBe("true");
-
-    let detail: any;
-    element.addEventListener("woo-tasks-action", (event: Event) => { detail = (event as CustomEvent).detail; });
-    const dropEvent = makeDragEvent("drop", inFlight, transferData);
-    element.dispatchEvent(dropEvent);
-    expect(detail).toMatchObject({ taskId: "obj_t_drag", verb: "claim", source: "drag" });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(calls.some((c) => c.target === "obj_t_drag" && c.verb === "claim")).toBe(true);
-  });
-
-  it("polls listing on the configured interval and stops on disconnect", async () => {
-    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
-    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
     let listingCalls = 0;
     const woo: WooContext = {
       actor: null,
@@ -1031,26 +1263,118 @@ describe("bundled catalog UI components", () => {
       call: async () => undefined,
       emit: () => true
     };
-    vi.useFakeTimers();
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    element.woo = woo;
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+    // Initial mount triggers one refresh.
+    await flush();
+    const initialCalls = listingCalls;
+    expect(initialCalls).toBeGreaterThanOrEqual(1);
+
+    // A burst of observation events while a refresh is in flight should
+    // coalesce into exactly one follow-up refresh, not one per event.
+    window.dispatchEvent(new CustomEvent("woo-tasks-refresh"));
+    window.dispatchEvent(new CustomEvent("woo-tasks-refresh"));
+    window.dispatchEvent(new CustomEvent("woo-tasks-refresh"));
+    await flush();
+    expect(listingCalls - initialCalls).toBeLessThanOrEqual(2);
+    expect(listingCalls).toBeGreaterThan(initialCalls);
+
+    // After disconnect, further events must not trigger a refresh.
+    const beforeDisconnect = listingCalls;
+    element.remove();
+    window.dispatchEvent(new CustomEvent("woo-tasks-refresh"));
+    await flush();
+    expect(listingCalls).toBe(beforeDisconnect);
+  });
+
+  it("kicks an initial refresh when woo is wired up after the element connects", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    let listingCalls = 0;
+    const woo: WooContext = {
+      actor: null,
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "listing") listingCalls += 1;
+        return [];
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    // Mount the element bare — no woo, no subject — to mirror the production
+    // sequence where main.ts calls innerHTML first and then mountTasksKanban
+    // wires woo + subject afterwards.
+    document.body.appendChild(element);
+    await flush();
+    expect(listingCalls).toBe(0);
+
+    element.subject = "the_taskboard";
+    await flush();
+    expect(listingCalls).toBe(0);
+
+    element.woo = woo;
+    await flush();
+    expect(listingCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("closes the task dialog on backdrop click and Escape", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    element.woo = testWooContext({ guest_1: "Guest 1" });
+    document.body.appendChild(element);
+    element.data = {
+      registryId: "the_taskboard",
+      registryName: "Taskboard",
+      actor: "guest_1",
+      actorNames: { guest_1: "Guest 1" },
+      tasks: [{ id: "obj_t_x", name: "X", kind: "bug", labels: [], location: "the_taskboard", cursorRole: null, cursorKey: null, cursorCriterion: null, waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [] }]
+    };
+
+    // Backdrop click closes.
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    expect(element.querySelector("[data-tasks-modal-backdrop]")).not.toBeNull();
+    element.querySelector<HTMLElement>("[data-tasks-modal-backdrop]")!.click();
+    expect(element.querySelector("[data-tasks-modal-backdrop]")).toBeNull();
+
+    // Reopen, then Escape closes.
+    element.querySelector<HTMLElement>("[data-tasks-card]")!.click();
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    expect(element.querySelector("[data-tasks-modal-backdrop]")).not.toBeNull();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(element.querySelector("[data-tasks-modal-backdrop]")).toBeNull();
+  });
+
+  it("registerWooObservationHandlers fans task observations out as window events", async () => {
+    const mod = await import("../catalogs/tasks/ui/kanban-board");
+    const handlers: Array<{ types: string[]; reduce: (...args: unknown[]) => void }> = [];
+    const fakeRegistry = {
+      observation: (handler: { types: string[]; reduce: (...args: unknown[]) => void }) => {
+        handlers.push(handler);
+      }
+    };
+    mod.registerWooObservationHandlers(fakeRegistry as unknown as Parameters<typeof mod.registerWooObservationHandlers>[0]);
+    expect(handlers).toHaveLength(1);
+    const reduce = handlers[0].reduce;
+    expect(handlers[0].types).toContain("task_passed");
+    expect(handlers[0].types).toContain("registry_role_changed");
+    let fired = 0;
+    const listener = () => { fired += 1; };
+    window.addEventListener("woo-tasks-refresh", listener);
     try {
-      const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
-      element.woo = woo;
-      element.subject = "the_taskboard";
-      element.setAttribute("refresh-interval-ms", "100");
-      document.body.appendChild(element);
-      await vi.runOnlyPendingTimersAsync();
-      const initialCalls = listingCalls;
-      expect(initialCalls).toBeGreaterThanOrEqual(1);
-      await vi.advanceTimersByTimeAsync(100);
-      await vi.advanceTimersByTimeAsync(100);
-      expect(listingCalls).toBeGreaterThan(initialCalls);
-      const beforeDisconnect = listingCalls;
-      element.remove();
-      await vi.advanceTimersByTimeAsync(500);
-      expect(listingCalls).toBe(beforeDisconnect);
+      reduce({} as never, { observation: { type: "task_passed", task: "obj_t_1" }, delivered: { route: "sequenced" } } as never);
     } finally {
-      vi.useRealTimers();
+      window.removeEventListener("woo-tasks-refresh", listener);
     }
+    expect(fired).toBe(1);
   });
 
   it("renders the tasks kanban with state columns, cursor badges, and actions", async () => {
@@ -1154,9 +1478,13 @@ describe("bundled catalog UI components", () => {
       ]
     };
 
-    expect(element.querySelector("h2")?.textContent).toBe("Taskboard");
+    expect(element.querySelector("h1")?.textContent).toBe("Taskboard");
     expect(element.querySelector('[data-space-chat-shell="the_taskboard"]')).not.toBeNull();
     expect(element.querySelector("[data-tool-space-chat]")).not.toBeNull();
+    // The status-filter lozenges live in the kanban-scoped filter bar, not
+    // in the registry header — they apply only to the kanban view.
+    expect(element.querySelector(".woo-tasks-kanban-header .woo-tasks-status-nav")).toBeNull();
+    expect(element.querySelector(".woo-tasks-kanban-filterbar .woo-tasks-status-nav")).not.toBeNull();
     const colCounts = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((col) => ({
       id: col.dataset.tasksCol,
       count: col.querySelector<HTMLElement>("[data-tasks-col-count]")?.textContent
@@ -1166,6 +1494,10 @@ describe("bundled catalog UI components", () => {
       { id: "waiting", count: "1" },
       { id: "in_flight", count: "1" }
     ]);
+    // User-facing column labels: "Active" (not "In flight"), "Blocked"
+    // (consistent with the "Mark blocked" action — not "Waiting").
+    const colLabels = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col] .woo-tasks-kanban-col-name")).map((el) => el.textContent);
+    expect(colLabels).toEqual(["Ready", "Blocked", "Active"]);
     expect(element.querySelector('[data-tasks-col="done"]')).toBeNull();
     expect(element.querySelector('[data-tasks-col="dropped"]')).toBeNull();
 
@@ -1199,10 +1531,10 @@ describe("bundled catalog UI components", () => {
     const inflightCard = element.querySelector<HTMLElement>("[data-tasks-col=\"in_flight\"] [data-tasks-card]");
     expect(inflightCard?.querySelector(".woo-tasks-card-holder")?.textContent).toContain("Guest 2");
 
-    let detail: any;
-    element.addEventListener("woo-tasks-action", (event: Event) => { detail = (event as CustomEvent).detail; });
-    element.querySelector<HTMLButtonElement>("[data-tasks-action=\"claim\"]")?.click();
-    expect(detail).toMatchObject({ taskId: "obj_t_ready", verb: "claim", label: "Claim" });
+    // Action buttons (claim, etc.) live in the detail dialog, not on the
+    // card itself. The "self-fetches listing + available_actions" test
+    // covers click-card → click-action → dispatch.
+    expect(element.querySelector("[data-tasks-card] [data-tasks-action]")).toBeNull();
   });
 
   it("regroups columns by role / holder / kind when the group-by selector changes", async () => {
@@ -1265,7 +1597,7 @@ describe("bundled catalog UI components", () => {
     cols = Array.from(element.querySelectorAll<HTMLElement>("[data-tasks-col]")).map((c) => c.dataset.tasksCol);
     expect(cols).toEqual(["bug", "task"]);
 
-    // when not in state mode, cards lose the draggable attribute even if their actions include claim
+    // group-by selection persists across data updates
     setGroup("kind");
     element.data = {
       registryId: "the_taskboard",
@@ -1276,15 +1608,10 @@ describe("bundled catalog UI components", () => {
         { id: "obj_t_d", name: "D", kind: "bug", labels: [], location: "the_taskboard", cursorRole: "doer", cursorKey: "k", cursorCriterion: "c", waitForCount: 0, terminal: false, complete: false, linkCount: 0, ageMs: 0, lastChange: 0, actions: [{ verb: "claim", label: "Claim", args: [] }] }
       ]
     };
-    // group-by survives data updates because it is local UI state
     expect(element.querySelector<HTMLSelectElement>("[data-tasks-group-by]")?.value).toBe("kind");
+    // Drag-drop is disabled — cards never carry draggable attributes.
     const card = element.querySelector<HTMLElement>("[data-tasks-card]")!;
-    expect(card.getAttribute("draggable")).toBe(null);
-
-    // back to state restores draggability
-    setGroup("state");
-    const draggableCard = element.querySelector<HTMLElement>("[data-tasks-card]")!;
-    expect(draggableCard.getAttribute("draggable")).toBe("true");
+    expect(card.getAttribute("draggable")).toBeNull();
   });
 
   it("preserves an existing task-space chat panel across rerenders", async () => {

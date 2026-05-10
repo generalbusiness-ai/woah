@@ -84,6 +84,13 @@ const LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION = "2026-05-09-dispens
 // $wiz onto $programmer so command-shaped builder/programmer verbs
 // (e.g. $builder:@recycle) resolve via normal parent-chain verb lookup.
 const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer-parent";
+// $task_registry now tracks every minted $task in `_tracked_tasks` so
+// `:listing` can find them after they've been claimed (and moved out of
+// `contents(this)`). Existing registries have tasks in contents but an
+// empty _tracked_tasks; backfill from contents — claimed tasks won't be
+// recoverable via this path, but on a freshly-deployed worktree all
+// existing tasks live at their registry.
+const LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION = "2026-05-09-tasks-tracked-backfill";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -139,7 +146,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, only: "note" },
   { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" },
-  { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" }
+  { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
+  { id: LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION, only: "tasks" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -374,6 +382,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
   run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runWizProgrammerParentMigration(world, names);
+  runTasksTrackedBackfillMigration(world, names);
   return covered;
 }
 
@@ -579,6 +588,42 @@ function runWizProgrammerParentMigration(world: WooWorld, names: readonly string
   // ordinary inheritance chain.
   world.chparentAuthoredObject("$wiz", "$wiz", "$programmer");
   markMigrationApplied(world, LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION);
+}
+
+// Backfill `_tracked_tasks` on every $task_registry instance from the
+// tasks currently present in `contents(this)`. Without this, registries
+// installed before the property existed would have an empty list, and
+// `:listing` (which now iterates _tracked_tasks instead of contents)
+// would return nothing — including for tasks still sitting at the
+// registry. Idempotent: only writes when the existing list is missing or
+// empty.
+function runTasksTrackedBackfillMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION)) return;
+  if (!names.includes("tasks") || !localCatalogInstalled(world, "tasks")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
+    return;
+  }
+  if (!world.objects.has("$task_registry") || !world.objects.has("$task")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
+    return;
+  }
+  for (const id of Array.from(world.objects.keys())) {
+    if (id === "$task_registry") continue;
+    if (!world.isDescendantOf(id, "$task_registry")) continue;
+    const existing = world.propOrNull(id, "_tracked_tasks");
+    if (Array.isArray(existing) && existing.length > 0) continue;
+    const tracked: ObjRef[] = [];
+    for (const child of Array.from(world.objects.keys())) {
+      if (!world.isDescendantOf(child, "$task")) continue;
+      if (child === "$task") continue;
+      const registry = world.propOrNull(child, "registry");
+      if (registry !== id) continue;
+      tracked.push(child as ObjRef);
+    }
+    if (tracked.length === 0 && Array.isArray(existing) && existing.length === 0) continue;
+    world.setProp(id, "_tracked_tasks", tracked as WooValue);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
 }
 
 function runDropPresenceInPropertyMigration(world: WooWorld): void {

@@ -172,6 +172,46 @@ test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
   expect(stateCalls).toEqual([]);
 });
 
+test("page header h1 aligns across tools", async ({ page, request }) => {
+  const response = await request.post("/api/auth", { data: { token: "guest:e2e-header-alignment" } });
+  expect(response.ok()).toBe(true);
+  const payload = await response.json() as { session?: string };
+  expect(payload.session).toBeTruthy();
+  const session = payload.session ?? "";
+  await page.addInitScript((nextSession: string) => {
+    localStorage.setItem("woo.session", nextSession);
+    sessionStorage.setItem("woo.session", nextSession);
+  }, session);
+  const measureH1 = async (target: string) => {
+    await page.goto(target);
+    await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 10_000 });
+    const h1 = page.locator("main.main h1").first();
+    await expect(h1).toBeVisible({ timeout: 5_000 });
+    // h1 may render before the registry name arrives; wait for non-empty.
+    await expect(h1).not.toHaveText("", { timeout: 5_000 });
+    return h1.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const styles = getComputedStyle(el);
+      return {
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+        fontSize: styles.fontSize
+      };
+    });
+  };
+  const headers = [
+    { tab: "Pinboard", m: await measureH1("/objects/the_pinboard") },
+    { tab: "Dubspace", m: await measureH1("/objects/the_dubspace") },
+    { tab: "Taskboard", m: await measureH1("/objects/the_taskboard") }
+  ];
+  const tops = headers.map((h) => h.m.top);
+  const lefts = headers.map((h) => h.m.left);
+  const sizes = new Set(headers.map((h) => h.m.fontSize));
+  expect(Math.max(...tops) - Math.min(...tops), `h1 top mismatch: ${JSON.stringify(headers)}`).toBeLessThanOrEqual(2);
+  expect(Math.max(...lefts) - Math.min(...lefts), `h1 left mismatch: ${JSON.stringify(headers)}`).toBeLessThanOrEqual(2);
+  expect(sizes.size, `h1 font-size mismatch: ${JSON.stringify(headers)}`).toBe(1);
+});
+
 test("space chat panel bottoms are visually aligned", async ({ page, request }) => {
   const response = await request.post("/api/auth", { data: { token: "guest:e2e-chat-alignment" } });
   expect(response.ok()).toBe(true);
