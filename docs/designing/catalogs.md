@@ -6,7 +6,7 @@ files and installed into a world through the catalog registry.
 
 Catalogs are the unit of distribution. The chat catalog ships rooms
 and speech verbs; the note catalog ships `$note`; pinboard,
-taskspace, dubspace each ship an application. A custom catalog is
+tasks, dubspace each ship an application. A custom catalog is
 how you'd ship your own application — your own classes, your own
 verbs, your own UI.
 
@@ -78,7 +78,7 @@ the bundled-catalog reference list is in CT15 of that spec.
 | **chat** | `$room`, `$chatroom`, `$exit`, `$portable`, `$furniture`, `$match`. The everyday verb vocabulary. Composes in `$conversational` for speech verbs. |
 | **note** | `$note` and friends — markdown-text-bearing objects with `read`/`write`/`erase`. |
 | **pinboard** | `$pinboard` (a `$space`) and `$pin` (a `$note`). Spatial drag-droppable bulletin board. |
-| **taskspace** | `$taskspace` (a `$space`) and `$task` (a `$note`). Hierarchical task coordination. |
+| **tasks** | `$task_registry` (a `$space`) and `$task` (a `$note`). Obligation-list work coordination — registries author roles/obligations/policies, tasks carry an ordered cursor that advances on `:pass`. |
 | **dubspace** | `$dubspace`, controls, channels, scenes. Collaborative audio mixer. |
 | **help** | `$generic_help_db` — the in-world help system. |
 | **prog** | `$builder`, `$programmer`, `$generic_editor`, `$verb_editor`. The authoring surface — see [builder-and-programmer.md](builder-and-programmer.md). |
@@ -89,7 +89,7 @@ the bundled-catalog reference list is in CT15 of that spec.
 | **demoworld** | Seeded rooms (`the_living_room`, `the_deck`), bundled players, fixtures. |
 
 The dependency graph is (mostly) linear: `chat` is the foundation
-most others build on; `note` underpins pinboard and taskspace;
+most others build on; `note` underpins pinboard and tasks;
 `block` underpins blocks-demo. Install order matters and is
 declared in catalog metadata.
 

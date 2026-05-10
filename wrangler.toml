@@ -11,10 +11,10 @@ head_sampling_rate = 1.0
 # Cloudflare deploys start as a clean core world by default. To auto-install
 # bundled local catalogs at bootstrap, set a comma-separated list here before
 # first deploy. Foundational catalogs (help, chat, note, prog) ship classes
-# only; demoworld + dubspace + pinboard + taskspace ship the bundled demo
+# only; demoworld + dubspace + pinboard + tasks ship the bundled demo
 # instances. For foundational-only: "help,chat,note,prog". For the full demo:
-# "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo".
-WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
+# "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo".
+WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object
@@ -83,5 +83,5 @@ renamed_classes = [
 #
 # [env.staging.vars]
 # # Foundational only: "help,chat,note,prog"
-# # Full demo: "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
-# WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
+# # Full demo: "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
+# WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"

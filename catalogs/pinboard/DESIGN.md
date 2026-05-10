@@ -454,7 +454,7 @@ client projection rather than through a full-world `/api/state` model.
 - **Voting pins, ephemeral pins, timestamped pins** — these become trivial
   `$pin` subclasses once people want them. None are in v0.2.
 - **Kanban swimlanes, WIP limits, assignees, due dates, task semantics.**
-  Those either belong to later `$pin` subclasses or to `taskspace`; first-cut
+  Those either belong to later `$pin` subclasses or to `tasks`; first-cut
   kanban is only ordered columns over shared `$pin` notes.
 
 ## Open questions

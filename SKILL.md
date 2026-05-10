@@ -166,7 +166,7 @@ Use this for portable things in inventories and rooms. `catalogs/note` defines `
 
 ### Space With Child Records
 
-Use this for coordinated apps. `catalogs/taskspace` defines `$taskspace` as a `$space`, creates `$task` children, stores root ordering on the space, and emits task lifecycle observations.
+Use this for coordinated apps. `catalogs/tasks` defines `$task_registry` as a `$space` that authors policy (roles, obligations, ordered policies per kind) and mints `$task` children. Each task carries a snapshotted obligation cursor; lifecycle verbs (`claim`, `pass`, `release`, `yield`) emit role-gated observations.
 
 ### Feature/Mixin
 

@@ -87,7 +87,7 @@ In practice: direct calls (chat, look, take, set_control) are
 conversational and ephemeral. Sequenced calls (create_task,
 transition, save_scene) are stateful and durable. You'll rarely need
 to replay direct chat; you will absolutely want to replay applied
-frames in a taskspace after reconnecting.
+frames in a task registry after reconnecting.
 
 ## Replaying after reconnect
 

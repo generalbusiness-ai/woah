@@ -52,7 +52,9 @@ sufficient to exercise create→claim→pass→release end to end.
 
 ## Replaces
 
-This catalog supersedes `@local:taskspace`. The taskspace catalog is
-removed in the same change; there is no data migration. Existing demo
-worlds drop their `the_taskspace` instance and re-seed with
-`the_taskboard`.
+This catalog supersedes `@local:taskspace`. The old catalog directory
+is removed in the same change; there is no data migration. Existing
+demo worlds drop their `the_taskspace` instance, the `$taskspace`
+class, and the orphan registry record on cold init via the
+`2026-05-10-taskspace-drop` local-boot migration, and re-seed with
+`the_taskboard` from this catalog's seed hook.

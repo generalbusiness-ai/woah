@@ -55,8 +55,14 @@ Authority for admin verbs: substrate object owner + wizard.
 ## Replacement, not migration
 
 This catalog supersedes `@local:taskspace` (v0.3). The previous catalog
-is removed in the same change; no data migration. Existing demo worlds
-re-seed `the_taskboard` from scratch.
+is removed in the same change; no data migration. The
+`2026-05-10-taskspace-drop` local-boot migration recycles
+`the_taskspace`, the `$taskspace` class, and the orphan registry
+record on every cold init, and also wipes the v0.3-only property
+defs and class verbs that catalog schema sync leaves on the adopted
+`$task` class (`parent_task`, `subtasks`, `status`, `add_subtask`, …)
+so the surface ends up coherent with the new manifest. Existing demo
+worlds re-seed `the_taskboard` from this catalog's seed hook.
 
 ## Cross-references
 

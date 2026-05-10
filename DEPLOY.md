@@ -145,7 +145,7 @@ WOO_AUTO_INSTALL_CATALOGS = ""
 That empty value means a fresh Cloudflare world starts with only the universal core objects. To bootstrap with bundled local catalogs, edit the value before first deploy:
 
 ```toml
-WOO_AUTO_INSTALL_CATALOGS = "help,chat,note,prog,demoworld,dubspace,pinboard,taskspace"
+WOO_AUTO_INSTALL_CATALOGS = "help,chat,note,prog,demoworld,dubspace,pinboard,tasks"
 ```
 
 (For a world that wants foundational classes only, with no demo content, use `"help,chat,note,prog"`.)
@@ -253,7 +253,7 @@ There is no "forgot wizard" recovery path. Your options are: restore the world f
 
 The deployed Worker starts with the clean-core/catalog policy chosen by `WOO_AUTO_INSTALL_CATALOGS`. Public GitHub tap install/update is available through the Worker; private repositories and GitHub API tokens are deferred.
 
-**Update one catalog per maintenance window.** Each catalog's migration is scoped to its own classes — a failing `dubspace v1 → v2` does not affect `chat` or `taskspace`, and rollback is contained. Run install/update, verify with `GET /api/taps` and `migration_state`, smoke-test the affected verbs, *then* move on. Bundling multiple catalog updates into one window means one failure can compound and force a multi-catalog rollback. Spec rule: [catalogs.md §CT14.5](spec/discovery/catalogs.md#ct145-operator-practice-one-catalog-per-window). Catalog updates are independent of runtime/Worker deploys ([deployments.md §DP6](spec/operations/deployments.md#dp6-rolling-vs-bluegreen)).
+**Update one catalog per maintenance window.** Each catalog's migration is scoped to its own classes — a failing `dubspace v1 → v2` does not affect `chat` or `tasks`, and rollback is contained. Run install/update, verify with `GET /api/taps` and `migration_state`, smoke-test the affected verbs, *then* move on. Bundling multiple catalog updates into one window means one failure can compound and force a multi-catalog rollback. Spec rule: [catalogs.md §CT14.5](spec/discovery/catalogs.md#ct145-operator-practice-one-catalog-per-window). Catalog updates are independent of runtime/Worker deploys ([deployments.md §DP6](spec/operations/deployments.md#dp6-rolling-vs-bluegreen)).
 
 ```sh
 curl -X POST https://your-world.example.com/api/tap/install \
@@ -389,7 +389,7 @@ Concrete production cost numbers depend on your traffic; the CF dashboard is aut
 
 Once your world is running:
 
-- Read [catalogs/dubspace/DESIGN.md](catalogs/dubspace/DESIGN.md), [catalogs/taskspace/DESIGN.md](catalogs/taskspace/DESIGN.md), and [catalogs/chat/DESIGN.md](catalogs/chat/DESIGN.md) to understand the seeded demos.
+- Read [catalogs/dubspace/DESIGN.md](catalogs/dubspace/DESIGN.md), [catalogs/tasks/DESIGN.md](catalogs/tasks/DESIGN.md), and [catalogs/chat/DESIGN.md](catalogs/chat/DESIGN.md) to understand the seeded demos.
 - Use the IDE tab in the bundled client to author verbs.
 - See [spec/authoring/minimal-ide.md](spec/authoring/minimal-ide.md) for the authoring loop.
 - File issues against your fork or upstream as you find them.

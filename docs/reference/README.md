@@ -33,7 +33,7 @@ user benefits from understanding, written for the user.
 | **Location** | The containing object (room, container, actor). |
 | **Anchor** | The atomicity-cluster root; an object and its anchored descendants live on the same host. |
 | **Actor** | An object with a connection (or that *can* have one). Inherits from `$actor`. Players, guests, and bots are all actors. |
-| **Space** | A sequencing/log surface. Rooms, taskspaces, dubspaces are all `$space` descendants. |
+| **Space** | A sequencing/log surface. Rooms, task registries, dubspaces are all `$space` descendants. |
 | **Feature** | An object composed into another to add behavior without inheritance. `$conversational` is composed into `$chatroom` to add speech verbs. |
 | **Catalog** | A versioned bundle of classes, features, schemas, and UI shipped together. The unit of distribution. |
 | **Block** | A `$block` descendant — anchored actor that bridges Port to an external data source via a "plug." |

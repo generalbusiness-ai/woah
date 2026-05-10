@@ -45,7 +45,7 @@ Plain text:
   reasonable preview length.
 
 The chat catalog's `inventory` listing, the pinboard's pin labels,
-the taskspace's task summaries — all use these to produce concise
+the task registry's task summaries — all use these to produce concise
 displays without truncating arbitrary characters.
 
 ## How clients decide
@@ -87,7 +87,7 @@ Don't conflate. A long `description` makes inventory unreadable; a
 short `text` defeats the point. The `.format` property only governs
 `text`.
 
-`$pin` (in pinboard), `$task` (in taskspace), and any other
+`$pin` (in pinboard), `$task` (in tasks), and any other
 text-bearing subclass follows the same rule: a separate name, a
 short cosmetic description, a `.format`-aware body.
 

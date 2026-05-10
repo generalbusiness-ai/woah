@@ -92,7 +92,7 @@ note:erase();                     // clear
 
 The `pinboard` catalog ships `$pin < $note` adding `.color`. The
 `dispenser` catalog ships `$dispensed_note < $note` adding back-references
-to the producing block. The `taskspace` catalog ships `$task < $note`
+to the producing block. The `tasks` catalog ships `$task < $note`
 where `text` carries the markdown task description. Other natural
 subclasses: `$voting_note` (adds vote counts), `$ephemeral_note`
 (auto-recycles after a TTL), `$encrypted_note` (overrides

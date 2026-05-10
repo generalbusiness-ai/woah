@@ -91,6 +91,16 @@ const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer
 // recoverable via this path, but on a freshly-deployed worktree all
 // existing tasks live at their registry.
 const LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION = "2026-05-09-tasks-tracked-backfill";
+// The v0.3 `taskspace` catalog was superseded by `tasks` (different
+// classes, different seed name `the_taskboard`). Worlds installed before
+// the rename still carry `the_taskspace`, its `$task` contents, the
+// `$taskspace` class object, and a `@local:taskspace` registry record —
+// none of which are produced or maintained by any current bundled
+// catalog. The migration drops them unceremoniously: contents are
+// recycled bottom-up so they don't leak into `$nowhere`, then the seed
+// instance and class are recycled, then the registry record is stripped.
+// Idempotent — gates on local presence at each step.
+const LOCAL_CATALOG_TASKSPACE_DROP_MIGRATION = "2026-05-10-taskspace-drop";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -383,6 +393,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runWizProgrammerParentMigration(world, names);
   runTasksTrackedBackfillMigration(world, names);
+  runTaskspaceCatalogDropMigration(world);
   return covered;
 }
 
@@ -624,6 +635,171 @@ function runTasksTrackedBackfillMigration(world: WooWorld, names: readonly strin
     world.setProp(id, "_tracked_tasks", tracked as WooValue);
   }
   markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
+}
+
+// Properties the v0.3 taskspace catalog defined on its `$task` class
+// that the new tasks catalog does NOT redefine. Catalog schema sync
+// adopts the existing `$task` class and updates verbs/properties from
+// the new manifest, but it does not drop entries the new manifest
+// omits — so without explicit cleanup an upgraded world's `$task` ends
+// up with a hybrid surface: new fields like `kind`/`obligations` next
+// to `parent_task`/`subtasks`/`status` from v0.3.
+const LEGACY_TASK_PROPERTY_NAMES: readonly string[] = [
+  "parent_task",
+  "subtasks",
+  "status",
+  "assignee",
+  "requirements",
+  "artifacts",
+  "messages",
+  "space"
+];
+
+// v0.3-only verbs on `$task`. `claim` and `release` exist in both
+// versions and are replaced in-place by schema sync (so they stay).
+// The new catalog has no `move`, `set_status`, `add_*`, or
+// `check_requirement` analog; those are pure carry-over.
+const LEGACY_TASK_VERB_NAMES: readonly string[] = [
+  "add_subtask",
+  "move",
+  "set_status",
+  "add_requirement",
+  "check_requirement",
+  "add_message",
+  "add_artifact"
+];
+
+// Drop the v0.3 `taskspace` superseded catalog wherever it still
+// shows up in a deployed world: the `the_taskspace` seed instance and
+// its `$task` contents (the old shape; new tasks live at
+// `the_taskboard`), the `$taskspace` class object, the
+// `@local:taskspace` registry record, and the legacy property defs /
+// own values / class verbs that schema sync left on the adopted
+// `$task` class. Each step gates on local presence so reruns are
+// no-ops; the function runs both gateway-side (where the registry
+// record lives and the_taskspace has a stub) and host-scoped (where
+// the_taskspace's own DO holds the actual contents) and each host's
+// `$system.applied_migrations` ledger tracks the run independently.
+function runTaskspaceCatalogDropMigration(world: WooWorld): void {
+  if (migrationApplied(world, LOCAL_CATALOG_TASKSPACE_DROP_MIGRATION)) return;
+
+  // Presence check: a world that never installed the v0.3 taskspace
+  // catalog has no `the_taskspace`, no `$taskspace` class, no
+  // `@local:taskspace` registry record, and no v0.3-shape leftover
+  // on `$task`. Skip without touching the ledger so the host-scoped
+  // no-op invariant (a core-only slice exports unchanged through
+  // runHostScopedLocalCatalogLifecycle) holds.
+  const hasInstance = world.objects.has("the_taskspace");
+  const hasClass = world.objects.has("$taskspace");
+  const registryRaw = world.objects.has("$catalog_registry")
+    ? world.propOrNull("$catalog_registry", "installed_catalogs")
+    : null;
+  const hasRegistryRecord = Array.isArray(registryRaw) && registryRaw.some((record) => {
+    if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+    const item = record as Record<string, WooValue>;
+    return item.tap === "@local" && (item.alias === "taskspace" || item.catalog === "taskspace");
+  });
+  const hasLegacyTaskShape = world.objects.has("$task") && hasAnyLegacyTaskSurface(world);
+  if (!hasInstance && !hasClass && !hasRegistryRecord && !hasLegacyTaskShape) return;
+
+  // 1. Recycle `the_taskspace` contents bottom-up so they leave the
+  //    world entirely. recycleObjectLocal displaces remaining contents
+  //    to $nowhere on each call, so without the bottom-up walk the
+  //    inner tasks would be orphaned rather than removed.
+  const collectContents = (root: ObjRef, into: Set<ObjRef>): void => {
+    for (const id of Array.from(world.objects.keys())) {
+      if (id === root || into.has(id)) continue;
+      const obj = world.objects.get(id);
+      if (!obj || obj.location !== root) continue;
+      collectContents(id, into);
+      into.add(id);
+    }
+  };
+  if (hasInstance) {
+    const inside = new Set<ObjRef>();
+    collectContents("the_taskspace", inside);
+    for (const id of inside) world.migrationRecycleObject(id);
+    world.migrationRecycleObject("the_taskspace");
+  }
+
+  // 2. Recycle every remaining `$taskspace` descendant (instances live
+  //    at the_taskspace shape; collect by ancestry to catch any extras
+  //    a hand-edited world may have created), then the class itself.
+  if (hasClass) {
+    const instances: ObjRef[] = [];
+    for (const id of Array.from(world.objects.keys())) {
+      if (id === "$taskspace") continue;
+      try {
+        if (world.isDescendantOf(id, "$taskspace")) instances.push(id);
+      } catch {
+        // Tolerate dangling parent refs — a missing rung in the chain
+        // means this isn't a $taskspace descendant for our purposes.
+      }
+    }
+    for (const id of instances) world.migrationRecycleObject(id);
+    world.migrationRecycleObject("$taskspace");
+  }
+
+  // 3. Strip `@local:taskspace` from $catalog_registry.installed_catalogs
+  //    so status/UI machinery stops surfacing the dead catalog.
+  if (hasRegistryRecord && Array.isArray(registryRaw)) {
+    const next = registryRaw.filter((record) => {
+      if (!record || typeof record !== "object" || Array.isArray(record)) return true;
+      const item = record as Record<string, WooValue>;
+      if (item.tap !== "@local") return true;
+      return item.alias !== "taskspace" && item.catalog !== "taskspace";
+    });
+    if (next.length !== registryRaw.length) {
+      world.setProp("$catalog_registry", "installed_catalogs", next as WooValue);
+    }
+  }
+
+  // 4. Drop the v0.3 property defs / own values / class verbs that
+  //    schema sync left on the adopted `$task` class. Strictly scoped
+  //    to `$task` and its descendants — the legacy names (`status`,
+  //    `assignee`, `messages`, `space`, …) are common enough that any
+  //    user object outside the `$task` chain may legitimately carry
+  //    one, and we mustn't touch unrelated data. The class-level
+  //    `propertyDefs` entry lives on `$task` itself; instance own
+  //    values live on `$task` descendants; anything else is none of
+  //    this migration's business.
+  if (world.objects.has("$task")) {
+    const taskScope: ObjRef[] = ["$task"];
+    for (const id of Array.from(world.objects.keys())) {
+      if (id === "$task") continue;
+      try {
+        if (world.isDescendantOf(id, "$task")) taskScope.push(id);
+      } catch {
+        // Tolerate dangling parent refs — not a $task descendant.
+      }
+    }
+    for (const id of taskScope) {
+      const obj = world.object(id);
+      for (const name of LEGACY_TASK_PROPERTY_NAMES) {
+        if (obj.propertyDefs.has(name) || obj.properties.has(name) || obj.propertyVersions.has(name)) {
+          world.deleteProp(id, name);
+        }
+      }
+      // Instance-level own verbs are vanishingly rare on `$task`, but
+      // a wizard could have stamped one. Sweep the same scope so a
+      // re-run starting from a hand-edited world ends coherent.
+      for (const name of LEGACY_TASK_VERB_NAMES) world.removeVerb(id, name);
+    }
+  }
+
+  markMigrationApplied(world, LOCAL_CATALOG_TASKSPACE_DROP_MIGRATION);
+}
+
+function hasAnyLegacyTaskSurface(world: WooWorld): boolean {
+  if (!world.objects.has("$task")) return false;
+  const taskClass = world.object("$task");
+  for (const name of LEGACY_TASK_PROPERTY_NAMES) {
+    if (taskClass.propertyDefs.has(name)) return true;
+  }
+  for (const verb of taskClass.verbs) {
+    if (LEGACY_TASK_VERB_NAMES.includes(verb.name)) return true;
+  }
+  return false;
 }
 
 function runDropPresenceInPropertyMigration(world: WooWorld): void {
@@ -1278,6 +1454,13 @@ export function runHostScopedDataMigrations(world: WooWorld, host = "host"): voi
   // Repair horoscope-note instances orphaned when $horoscope_note was
   // recycled. Per-host walk; idempotent.
   migrateHoroscopeNoteParentOrphans(world);
+  // Drop the superseded `taskspace` catalog from any host slice that
+  // still owns its objects (the_taskspace is self-hosted, so its
+  // contents live on a satellite DO that the gateway-side run cannot
+  // reach). The function gates on local presence and on the per-host
+  // applied-migrations ledger, so calling it here is safe alongside
+  // the gateway-side call in runLocalCatalogMigrations.
+  runTaskspaceCatalogDropMigration(world);
 }
 
 // Walk every object on this host slice whose parent ref is the literal

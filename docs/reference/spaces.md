@@ -1,6 +1,6 @@
 # Spaces and call routing
 
-A `$space` is a sequencing surface. Rooms, taskspaces, pinboards,
+A `$space` is a sequencing surface. Rooms, task registries, pinboards,
 dubspaces, channels — anything that needs an ordered, durable log of
 what happened — descend from `$space`.
 
@@ -51,8 +51,8 @@ record. A reconnecting client can replay from the last seen seq and
 catch up. Sequenced calls are the natural shape for stateful
 mutation.
 
-Examples: `create_task`, `claim`, `set_status`, `transition` (in
-taskspace), `place_pin`, `move_pin` (in pinboard), `save_scene` (in
+Examples: `create_task`, `claim`, `pass`, `release` (in
+tasks), `place_pin`, `move_pin` (in pinboard), `save_scene` (in
 dubspace).
 
 ## How a verb chooses
@@ -101,17 +101,17 @@ When a verb is sequenced, the runtime needs a space to write into.
 It walks up from the verb's target object until it finds a `$space`
 descendant.
 
-- `the_taskspace:create_task(...)` → enclosing space is
-  `the_taskspace` itself.
-- `<task-42>:claim()` (where `task-42`'s anchor is `the_taskspace`)
-  → enclosing space is `the_taskspace`.
+- `the_taskboard:create_task(...)` → enclosing space is
+  `the_taskboard` itself.
+- `<task-42>:claim()` (where `task-42`'s anchor is `the_taskboard`)
+  → enclosing space is `the_taskboard`.
 - A verb on a non-space object that's not anchored to any space →
   the call errors with `E_INVARG` rather than silently routing
   direct.
 
 This is why `$task` instances work cleanly: their anchor is the
-taskspace, so any sequenced verb on a task is logged in the
-taskspace. The taskspace is the durable history of all task
+task registry, so any sequenced verb on a task is logged in the
+registry. The registry is the durable history of all task
 mutations.
 
 ## Replaying
@@ -130,7 +130,7 @@ would have had if you'd been listening.
 
 For a chatroom-style space where most activity is direct (live-only),
 there's nothing to replay; you re-read the room snapshot via
-`/api/me` or the equivalent. For a taskspace, replay is essential.
+`/api/me` or the equivalent. For a task registry, replay is essential.
 
 ## Sub-spaces and the call graph
 

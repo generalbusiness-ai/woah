@@ -1,6 +1,6 @@
 {
   "from": "0.0.0",
   "to": "1.0.0",
-  "summary": "Initial 1.0 release of the tasks catalog. There is no v0; this file exists so the catalog migrations guard accepts the v1.0.0 manifest. The catalog supersedes @local:taskspace; existing taskspace instances are dropped (no data migration).",
+  "summary": "Initial 1.0 release of the tasks catalog. There is no v0; this file exists so the catalog migrations guard accepts the v1.0.0 manifest. The catalog supersedes @local:taskspace: the bootstrap local-boot migration `2026-05-10-taskspace-drop` (in src/core/local-catalogs.ts) recycles `the_taskspace` and its `$task` contents, recycles the `$taskspace` class object, strips the `@local:taskspace` registry record, and wipes the v0.3-only property defs (`parent_task`/`subtasks`/`status`/`assignee`/`requirements`/`artifacts`/`messages`/`space`) and class verbs (`add_subtask`/`move`/`set_status`/`add_requirement`/`check_requirement`/`add_message`/`add_artifact`) that catalog schema sync would otherwise leave on the adopted `$task` class on every cold init. No content from the v0.3 demo carries forward.",
   "steps": []
 }

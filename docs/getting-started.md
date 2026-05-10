@@ -110,5 +110,5 @@ mostly say "observation." Either is fine.
 
 The spec uses "task" for two things: a VM activation (the unit of
 execution inside the bytecode interpreter) and a work item in the
-taskspace catalog. These docs reserve "task" for the catalog meaning.
+tasks catalog. These docs reserve "task" for the catalog meaning.
 The runtime sense is called a **VM activation** when ambiguous.

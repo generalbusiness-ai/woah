@@ -110,16 +110,16 @@ This is specified in [`../../spec/protocol/mcp.md §M3`](../../spec/protocol/mcp
 ## The working set: `woo_focus`
 
 The working set is how you keep an object's verbs reachable as you
-move. The classic case: you call `the_taskspace:list_tasks()` and
+move. The classic case: you call `the_taskboard:listing()` and
 get back a list of task object refs. Those tasks aren't automatically
-reachable — they're contents of the taskspace, not of your current
+reachable — they're contents of the registry, not of your current
 location. You focus the ones you care about:
 
 ```
 woo_focus(target: "#01HX...task42")
 ```
 
-Now `task42`'s verbs (`claim`, `set_status`, `add_subtask`) join
+Now `task42`'s verbs (`claim`, `pass`, `release`, `yield`) join
 your tool list. They stay reachable until you `woo_unfocus(...)` or
 the entry is evicted (capped at 32, oldest evicted first).
 
@@ -139,7 +139,7 @@ metadata:
 - **Sequenced** (the verb is `tool_exposed` but mutating): the call
   goes through the verb's enclosing space, gets a sequence number,
   and lands in the durable log. Examples: `create_task`, `claim`,
-  `set_status`, `transition`. The applied frame is the tool result.
+  `pass`, `transition`. The applied frame is the tool result.
 
 You don't usually need to think about which route a call takes; the
 gateway picks correctly. But sequenced calls give you back a
@@ -171,11 +171,11 @@ woo_call("$here", "who", [])
 (`$here` is a corename for your current location resolved per
 request.)
 
-**"Find a task by name from the taskspace and start working on it."**
+**"Find a task by name from the registry and start working on it."**
 
 ```
-woo_call("the_taskspace", "list_tasks", [])
-# pick result[i].id
+woo_call("the_taskboard", "listing", [])
+# pick result[i].task
 woo_focus("#01HX...the-task-id")
 woo_call("#01HX...the-task-id", "claim", [])
 ```
@@ -195,7 +195,7 @@ agents only)
 
 ```
 woo_call("$me", "eval", [
-  "let t = the_taskspace:create_task({name: \"foo\"});\nt:claim();\nreturn t;",
+  "let t = the_taskboard:create_task(\"task\", \"foo\", \"\", [], null);\nt:claim();\nreturn t;",
   {mode: "stmts"}
 ])
 ```

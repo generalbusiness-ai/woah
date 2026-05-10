@@ -150,5 +150,5 @@ that mirror posts to a `$mail_recipient` listen for these and forward.
 - `catalogs/pinboard/DESIGN.md` — first concrete subclass (`$pin < $note`).
 - `catalogs/dispenser/DESIGN.md` — `$dispensed_note < $note` and the
   factory contract.
-- `catalogs/taskspace/DESIGN.md` — `$task < $note` where text is the
+- `catalogs/tasks/DESIGN.md` — `$task < $note` where text is the
   markdown task description.

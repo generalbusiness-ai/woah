@@ -36,7 +36,7 @@ The shape, top to bottom:
    does something special, that feature is incomplete.
 
 2. **Behavior lives in catalogs, not core.** If you find yourself adding a
-   native handler that names `pinboard`, `dubspace`, `taskspace`, `the_chatroom`,
+   native handler that names `pinboard`, `dubspace`, `tasks`, `the_chatroom`,
    `operators`, `mount_room`, or any other catalog vocabulary in `src/core/` or
    `src/worker/`, stop. Add a builtin or a generic primitive instead, and let
    the catalog source verb call it. The two acid tests:
@@ -116,7 +116,7 @@ hibernation/WS rehydration. **All of this is invisible to verbs.**
 
 ### `src/client` — browser SPA
 
-Renders the world. Subscribes via WS, presents chat / pinboard / taskspace /
+Renders the world. Subscribes via WS, presents chat / pinboard / tasks /
 dubspace UIs. Sends standard direct or sequenced calls; never speaks
 catalog-private wire formats. UI state (zoom, scroll position, focus,
 chat draft) lives in the client. World state mutates only through verbs.

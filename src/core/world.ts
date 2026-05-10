@@ -963,6 +963,30 @@ export class WooWorld {
     return true;
   }
 
+  /**
+   * Migration-only object drop. Removes `objRef` from the local slice
+   * synchronously, bypassing verb dispatch and the permission/auth and
+   * cross-host guards in `recycleChecked`. Children of the recycled
+   * object get grafted up to its parent and contents become `$nowhere`
+   * (the same bookkeeping the regular recycle pipeline performs in
+   * §RC3); a tombstone is recorded so the deletion replicates through
+   * the persistence layer. No `:recycle` handler runs.
+   *
+   * Returns false when the object isn't present locally (so reruns are
+   * safe), true when the drop happened.
+   *
+   * Use only from the local-catalog migration runner when removing seed
+   * or class objects from a superseded catalog. Caller is responsible
+   * for ordering: recycle contents bottom-up before recycling their
+   * containers, otherwise contents land in `$nowhere` instead of being
+   * removed.
+   */
+  migrationRecycleObject(objRef: ObjRef): boolean {
+    if (!this.objects.has(objRef)) return false;
+    this.recycleObjectLocal(objRef);
+    return true;
+  }
+
   // Permission-gated wrapper exposed as the `set_object_name` builtin.
   // Used by catalog verbs (e.g. $root:@rename) that need to mutate an
   // object's display name from woocode without holding wizard authority

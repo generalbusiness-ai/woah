@@ -41,7 +41,7 @@ The specification should be clear enough that independent implementations can be
 | **Verb** | Callable code attached to an object. Dispatched by name through the standard lookup rule: parent chain, then feature lookup where applicable. |
 | **Property** | Named slot on an object. *Defined* on an ancestor (with default + perms); *value* per object. |
 | **Player** | An object that has an attached client connection. Just an object, not a separate type. |
-| **Task** (VM) | A serializable activation stack; the unit of execution. Migrates between hosts on verb dispatch. Also called a *VM activation* when distinguishing from a taskspace's work-item "task" (see `catalogs/taskspace/DESIGN.md`). |
+| **Task** (VM) | A serializable activation stack; the unit of execution. Migrates between hosts on verb dispatch. Also called a *VM activation* when distinguishing from a task registry's work-item "task" (see `catalogs/tasks/DESIGN.md`). |
 | **Host** | Anything that can run a VM: an edge worker, a persistent host, or a transient host. |
 | **Event** / **Observation** | A structured map (`{type, ...}`) emitted from one object to one or more listeners. The two terms are synonyms: `core.md` says "observation" to distinguish from messages and mutations; `events.md` and the wire/API say "event" by historical naming. |
 | **Renderer** | Code that turns events into a presentation. Usually a transient object. |
@@ -171,4 +171,4 @@ Loose docs alongside the spec layers and bundled catalogs:
 - Catalog-owned design docs for bundled catalogs (see [spec/discovery/catalogs.md §CT15](spec/discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo) for the role of each):
   - **Foundational utilities** — [help](catalogs/help/DESIGN.md), [chat](catalogs/chat/DESIGN.md), [note](catalogs/note/DESIGN.md), [prog](catalogs/prog/DESIGN.md).
   - **Demo seed** — [demoworld](catalogs/demoworld/DESIGN.md).
-  - **Demo applications** — [dubspace](catalogs/dubspace/DESIGN.md), [taskspace](catalogs/taskspace/DESIGN.md), [pinboard](catalogs/pinboard/DESIGN.md).
+  - **Demo applications** — [dubspace](catalogs/dubspace/DESIGN.md), [tasks](catalogs/tasks/DESIGN.md), [pinboard](catalogs/pinboard/DESIGN.md).

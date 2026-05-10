@@ -53,8 +53,8 @@ Other bundled catalogs that contribute user-visible verbs:
 - [`note`](../../catalogs/note/) — `$note`, `read`, `write`, `erase`.
 - [`pinboard`](../../catalogs/pinboard/) — `$pinboard`, `$pin`,
   spatial drag/drop.
-- [`taskspace`](../../catalogs/taskspace/) — `$taskspace`, `$task`,
-  hierarchical work coordination.
+- [`tasks`](../../catalogs/tasks/) — `$task_registry`, `$task`,
+  obligation-list work coordination.
 - [`dubspace`](../../catalogs/dubspace/) — `$dubspace`, audio mixer
   controls.
 - [`help`](../../catalogs/help/) — the help database.

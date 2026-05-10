@@ -1284,6 +1284,113 @@ describe("local catalogs", () => {
     }));
   });
 
+  it("drops the superseded taskspace catalog state on cold init", () => {
+    // Simulate a world that installed @local:taskspace under the v0.3
+    // catalog and never saw the rename to `tasks`. Fabricate the seed
+    // shape directly so the test doesn't depend on an old manifest
+    // being present in the tree.
+    const world = createWorld();
+    world.createObject({ id: "$taskspace", name: "$taskspace", parent: "$space", owner: "$wiz" });
+    world.createObject({
+      id: "the_taskspace",
+      name: "Taskspace",
+      parent: "$taskspace",
+      owner: "$wiz",
+      location: "$nowhere"
+    });
+    // Plant a v0.3-shape `$task` instance inside `the_taskspace`. The
+    // new tasks catalog re-defines `$task`, but instances can predate
+    // the rename and still live at the_taskspace.
+    world.createObject({ id: "obj_legacy_task", name: "old task", parent: "$task", owner: "$wiz", location: "the_taskspace" });
+    world.setProp("obj_legacy_task", "status", "open");
+    // Stamp the v0.3 leftover surface that catalog schema sync would
+    // have left on `$task` after `installLocalCatalogs` adopted the
+    // existing class: legacy property defs the new manifest does not
+    // mention, and the v0.3-only class verbs.
+    const legacyProps: Array<{ name: string; defaultValue: WooValue; typeHint: string }> = [
+      { name: "parent_task", defaultValue: null, typeHint: "obj|null" },
+      { name: "subtasks", defaultValue: [] as unknown as WooValue, typeHint: "list<obj>" },
+      { name: "status", defaultValue: "open", typeHint: "str" },
+      { name: "assignee", defaultValue: null, typeHint: "obj|null" },
+      { name: "requirements", defaultValue: [] as unknown as WooValue, typeHint: "list<map>" },
+      { name: "artifacts", defaultValue: [] as unknown as WooValue, typeHint: "list<map>" },
+      { name: "messages", defaultValue: [] as unknown as WooValue, typeHint: "list<map>" },
+      { name: "space", defaultValue: null, typeHint: "obj|null" }
+    ];
+    for (const prop of legacyProps) {
+      world.defineProperty("$task", { name: prop.name, defaultValue: prop.defaultValue, owner: "$wiz", perms: "rw", typeHint: prop.typeHint });
+    }
+    const legacyVerbs = [
+      ["add_subtask", "verb :add_subtask(name, text) rx { return null; }"],
+      ["move", "verb :move(parent, index) rx { return null; }"],
+      ["set_status", "verb :set_status(status) rx { return status; }"],
+      ["add_requirement", "verb :add_requirement(text) rx { return null; }"],
+      ["check_requirement", "verb :check_requirement(index, checked) rx { return null; }"],
+      ["add_message", "verb :add_message(body) rx { return null; }"],
+      ["add_artifact", "verb :add_artifact(ref) rx { return null; }"]
+    ] as const;
+    for (const [name, source] of legacyVerbs) {
+      const result = installVerb(world, "$task", name, source, null);
+      expect(result.ok, `failed to install legacy ${name}`).toBe(true);
+    }
+    // Regression guard: a user object outside the $task chain with a
+    // property named the same as a legacy task field must not be
+    // touched. The legacy names (`status`, `assignee`, `messages`,
+    // `space`, …) are common — the migration must scope its property
+    // sweep to $task and its descendants.
+    world.createObject({ id: "obj_unrelated", name: "unrelated", parent: "$thing", owner: "$wiz", location: "$nowhere" });
+    world.defineProperty("obj_unrelated", { name: "status", defaultValue: "ok", owner: "$wiz", perms: "rw", typeHint: "str" });
+    world.setProp("obj_unrelated", "status", "live");
+    world.defineProperty("obj_unrelated", { name: "messages", defaultValue: [] as unknown as WooValue, owner: "$wiz", perms: "rw", typeHint: "list<str>" });
+    world.setProp("obj_unrelated", "messages", ["hi"] as unknown as WooValue);
+
+    const registry = world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
+    world.setProp("$catalog_registry", "installed_catalogs", [
+      ...registry,
+      {
+        tap: "@local",
+        catalog: "taskspace",
+        alias: "taskspace",
+        version: "0.3.0",
+        objects: { "$taskspace": "$taskspace" },
+        seeds: { "the_taskspace": "the_taskspace" }
+      }
+    ] as unknown as WooValue);
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-10-taskspace-drop");
+    world.setProp("$system", "applied_migrations", ledger);
+
+    installLocalCatalogs(world);
+
+    expect(world.objects.has("the_taskspace")).toBe(false);
+    expect(world.objects.has("obj_legacy_task")).toBe(false);
+    expect(world.objects.has("$taskspace")).toBe(false);
+    const after = world.getProp("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
+    expect(after.some((record) => record.alias === "taskspace" || record.catalog === "taskspace")).toBe(false);
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-10-taskspace-drop");
+
+    // The v0.3-only surface on $task is gone — no hybrid class.
+    const taskClass = world.object("$task");
+    for (const prop of legacyProps) {
+      expect(taskClass.propertyDefs.has(prop.name), `legacy prop ${prop.name} should be removed`).toBe(false);
+    }
+    for (const [name] of legacyVerbs) {
+      expect(world.ownVerbExact("$task", name), `legacy verb ${name} should be removed`).toBeNull();
+    }
+    // …while the new tasks-catalog surface stays.
+    expect(taskClass.propertyDefs.has("kind")).toBe(true);
+    expect(taskClass.propertyDefs.has("obligations")).toBe(true);
+    expect(world.ownVerbExact("$task", "pass")).not.toBeNull();
+    expect(world.ownVerbExact("$task", "claim")).not.toBeNull();
+
+    // Unrelated user data with name-coinciding properties must survive.
+    const unrelated = world.object("obj_unrelated");
+    expect(unrelated.propertyDefs.has("status")).toBe(true);
+    expect(world.getProp("obj_unrelated", "status")).toBe("live");
+    expect(unrelated.propertyDefs.has("messages")).toBe(true);
+    expect(world.getProp("obj_unrelated", "messages")).toEqual(["hi"]);
+  });
+
   it("preserves live runtime properties across host-scoped schema plans", { timeout: 30000 }, () => {
     // Host schema plans reconcile class/seed metadata but seed-hook properties
     // remain initial values. They must not overwrite live state such as
