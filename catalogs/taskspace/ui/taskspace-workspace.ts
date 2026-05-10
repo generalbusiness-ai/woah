@@ -81,7 +81,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
   private renderStatusFilter(status: string, count: number): string {
     const active = this.model.statusFilter[status] !== false;
     return `
-      <button class="status-pill status-filter ${statusClass(status)} ${active ? "active" : ""}" data-task-status="${escapeHtml(status)}" aria-pressed="${active}">
+      <button class="pill status-filter ${statusClass(status)} ${active ? "active" : ""}" data-task-status="${escapeHtml(status)}" aria-pressed="${active}">
         ${escapeHtml(statusLabel(status))}: ${count}
       </button>
     `;
@@ -105,7 +105,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
           <button class="task-select" data-select-task="${escapeHtml(id)}">
             <span class="task-title">${escapeHtml(String(task.name ?? id))}</span>
             <span class="task-meta">
-              <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
+              <span class="pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
               <span>${escapeHtml(String(props.assignee ? this.actorLabel(String(props.assignee)) : "unassigned"))}</span>
               <span>${reqStats.checked}/${reqStats.total} req</span>
             </span>
@@ -129,13 +129,13 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
           <h2>${escapeHtml(String(task.name ?? task.id ?? ""))}</h2>
           <p>${escapeHtml(String(props.text ?? "No description."))}</p>
         </div>
-        <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
+        <span class="pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
       </div>
       <div class="task-facts">
-        <div><strong>ID</strong><span>${escapeHtml(task.id)}</span></div>
-        <div><strong>Assignee</strong><span>${escapeHtml(String(props.assignee ? this.actorLabel(String(props.assignee)) : "none"))}</span></div>
-        <div><strong>Requirements</strong><span>${reqStats.checked}/${reqStats.total}</span></div>
-        <div><strong>Subtasks</strong><span>${subtasks.length}</span></div>
+        <div class="card card--tight"><strong>ID</strong><span>${escapeHtml(task.id)}</span></div>
+        <div class="card card--tight"><strong>Assignee</strong><span>${escapeHtml(String(props.assignee ? this.actorLabel(String(props.assignee)) : "none"))}</span></div>
+        <div class="card card--tight"><strong>Requirements</strong><span>${reqStats.checked}/${reqStats.total}</span></div>
+        <div class="card card--tight"><strong>Subtasks</strong><span>${subtasks.length}</span></div>
       </div>
       <div class="button-row task-actions">
         <button data-task-action="claim">Claim</button>
@@ -174,7 +174,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     return `
       <button class="related-task" data-select-task="${escapeHtml(id)}">
         <span>${escapeHtml(String(task.name ?? id))}</span>
-        <span class="status-pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
+        <span class="pill ${statusClass(String(props.status ?? ""))}">${escapeHtml(statusLabel(String(props.status ?? "")))}</span>
       </button>
     `;
   }
@@ -183,7 +183,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     const actor = typeof item?.actor === "string" ? this.actorLabel(item.actor) : "unknown";
     const ts = typeof item?.ts === "number" ? new Date(item.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
     return `
-      <div class="activity-item">
+      <div class="card card--raised card--tight activity-item">
         <div><strong>${escapeHtml(actor)}</strong><span>${escapeHtml(ts)}</span></div>
         <p>${escapeHtml(String(item?.body ?? ""))}</p>
       </div>
@@ -251,7 +251,14 @@ function requirementStats(requirements: unknown): { total: number; checked: numb
 }
 
 function statusClass(status: string): string {
-  return `status-${status.replace(/[^a-z0-9_-]/gi, "_") || "unknown"}`;
+  switch (status) {
+    case "claimed":
+    case "in_progress": return "pill--info";
+    case "blocked": return "pill--warning";
+    case "done": return "pill--success";
+    case "open": return "pill--strong";
+    default: return "";
+  }
 }
 
 function statusLabel(status: string): string {
@@ -266,7 +273,7 @@ function renderArtifact(item: any): string {
   const body = ref.startsWith("http")
     ? `<a href="${escapeHtml(ref)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
     : `<span>${escapeHtml(label)}</span>`;
-  return `<div class="artifact-item"><span>${escapeHtml(kind)}</span>${body}</div>`;
+  return `<div class="card card--raised card--tight artifact-item"><span>${escapeHtml(kind)}</span>${body}</div>`;
 }
 
 export function registerWooComponents(registry: WooComponentRegistry): void {

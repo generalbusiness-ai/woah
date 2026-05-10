@@ -104,18 +104,18 @@ export class WooWeatherBadgeElement extends HTMLElement {
     // overlay isn't gated on a mouse.
     const accessibleAttrs = `role="button" tabindex="0" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"`;
     if (status === "pending") {
-      this.innerHTML = `<span class="weather-badge pending" ${accessibleAttrs}><span aria-hidden="true">...</span></span>`;
+      this.innerHTML = `<span class="pill weather-badge pending" ${accessibleAttrs}><span aria-hidden="true">...</span></span>`;
       return;
     }
     if (status === "error") {
-      this.innerHTML = `<span class="weather-badge error" ${accessibleAttrs}><span aria-hidden="true">!</span></span>`;
+      this.innerHTML = `<span class="pill pill--danger weather-badge error" ${accessibleAttrs}><span aria-hidden="true">!</span></span>`;
       return;
     }
     const temp = formatTemperature(current);
     const code = weatherCode(current);
     const icon = iconForWeatherCode(code);
     const condition = conditionForWeatherCode(code);
-    this.innerHTML = `<span class="weather-badge" ${accessibleAttrs}><span class="weather-badge-icon" aria-hidden="true">${escapeHtml(icon)}</span><span class="weather-badge-temp">${escapeHtml(temp)}</span><span class="weather-badge-condition">${escapeHtml(condition)}</span></span>`;
+    this.innerHTML = `<span class="pill weather-badge" ${accessibleAttrs}><span class="weather-badge-icon" aria-hidden="true">${escapeHtml(icon)}</span><span class="weather-badge-temp">${escapeHtml(temp)}</span><span class="weather-badge-condition">${escapeHtml(condition)}</span></span>`;
   }
 }
 

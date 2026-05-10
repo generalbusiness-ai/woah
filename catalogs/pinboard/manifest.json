@@ -61,6 +61,12 @@
           "notes_cleared"
         ]
       }
+    ],
+    "chat_formatters": [
+      {
+        "module": "pinboard-ui",
+        "types": ["pinboard_entered", "pinboard_left", "pinboard_activity"]
+      }
     ]
   },
   "classes": [

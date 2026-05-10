@@ -1,5 +1,6 @@
 import {
   escapeHtml,
+  type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
   type WooContext
@@ -157,7 +158,7 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
   private renderFilterStrip(): string {
     const cutoff = numberProp(props(this.model.controls[this.model.filter]).cutoff, 1000);
     return `
-      <div class="filter-strip">
+      <div class="card card--raised filter-strip">
         <div class="loop-strip-head">
           <strong>F</strong>
           <span>Filter</span>
@@ -176,7 +177,7 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
     const freq = numberProp(slot.freq, defaultLoopFreq(index));
     const pitch = loopPitch(freq);
     return `
-      <div class="loop-strip ${slot.playing ? "playing" : ""} ${cue ? "cue-active" : ""}">
+      <div class="card card--raised loop-strip ${slot.playing ? "playing" : ""} ${cue ? "cue-active" : ""}">
         <div class="loop-strip-head">
           <strong>${index}</strong>
           <span>${escapeHtml(String(this.model.controls[id]?.name ?? id))}</span>
@@ -376,5 +377,18 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
         draft.patchObjectProps(target, props as Record<string, unknown>);
       }
     }
+  });
+}
+
+// Dubspace chat lines are presence/activity events, mirroring pinboard's
+// shape. The verbs supply observation.text when they have a sentence
+// ready; the formatter supplies the fallback.
+export function registerWooChatFormatters(registry: ChatFormatterRegistry): void {
+  registry.formatter({
+    types: ["dubspace_entered", "dubspace_left", "dubspace_activity"],
+    format: (observation) => ({
+      kind: "system",
+      text: typeof observation.text === "string" ? observation.text : "The dubspace changes."
+    })
   });
 }

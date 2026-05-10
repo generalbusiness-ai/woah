@@ -270,6 +270,108 @@ a:hover {
   color: var(--color-accent-hover);
 }
 
+/* ---- primitives -------------------------------------------------------- */
+/* Composable building blocks. Feature classes layer positioning, sizing,    */
+/* and one-off overrides on top of these. Keep this set small.               */
+
+/* Card: bordered surface used by panels, list items, popovers, dialog       */
+/* cards. `.card--raised` and `.card--inset` step the surface up/down a tone.*/
+/* `.card--tight` shrinks padding for dense rows (notes, event items).       */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 1rem;
+  min-width: 0;
+}
+
+.card--raised { background: var(--color-surface-2); }
+.card--inset  { background: var(--color-surface-3); }
+.card--tight  { padding: 0.55rem; border-radius: 7px; }
+.card--pre    { padding: 0.5rem; border-radius: 6px; }
+
+/* Pill: rounded badge. Status modifiers inherit the semantic-color triples. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.35rem;
+  padding: 0.08rem 0.45rem;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  white-space: nowrap;
+  font-size: 0.75rem;
+  line-height: 1;
+}
+
+.pill--info    { border-color: var(--color-info-border);    background: var(--color-info-bg);    color: var(--color-info); }
+.pill--success { border-color: var(--color-success-border); background: var(--color-success-bg); color: var(--color-success); }
+.pill--warning { border-color: var(--color-warning-border); background: var(--color-warning-bg); color: var(--color-warning); }
+.pill--danger  { border-color: var(--color-danger-border);  background: var(--color-danger-bg);  color: var(--color-danger); }
+.pill--strong  { border-color: var(--color-border-strong); }
+
+/* Alert: same semantic palette as .pill but block-shaped for messages.      */
+.alert {
+  margin: 0;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 0.85rem;
+}
+
+.alert--danger { border-color: var(--color-danger-border); background: var(--color-danger-bg); color: var(--color-danger); }
+
+/* Icon-button: transparent borderless button that lifts on hover.           */
+/* Per-instance positioning/sizing stays on the feature class.               */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0.3rem;
+  font: inherit;
+  line-height: 1;
+  transition: color 120ms, background-color 120ms;
+}
+
+.icon-button:hover,
+.icon-button:focus-visible {
+  color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+/* Split: two-column layout. Defaults match the original `.split` shape.     */
+/* Tune per-instance via custom properties:                                  */
+/*   --split-cols   grid-template-columns (default proportional 0.9fr/1.1fr) */
+/*   --split-gap    column gap                                               */
+/*   --split-align  align-items                                              */
+/* `.split--side-fixed` switches to a 1fr + fixed sidebar (use --split-side).*/
+/* `.has-space-chat` lets the layout fill its parent for chat-anchored views.*/
+.split {
+  display: grid;
+  grid-template-columns: var(--split-cols, minmax(260px, 0.9fr) minmax(360px, 1.1fr));
+  gap: var(--split-gap, 1rem);
+  align-items: var(--split-align, start);
+}
+
+.split--side-fixed {
+  --split-cols: minmax(0, 1fr) var(--split-side, 230px);
+  --split-align: stretch;
+}
+
+.split.has-space-chat {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .shell {
   min-height: 100vh;
   display: grid;
@@ -315,22 +417,6 @@ a:hover {
 .events-logout {
   margin-top: auto;
   align-self: center;
-  background: transparent;
-  border: 0;
-  color: var(--color-text-muted);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0.3rem;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: color 120ms, background-color 120ms;
-}
-
-.events-logout:hover,
-.events-logout:focus-visible {
-  color: var(--color-accent);
-  background: var(--color-surface-raised);
 }
 
 .login-shell {
@@ -347,8 +433,6 @@ a:hover {
   flex-direction: column;
   gap: 0.75rem;
   padding: 1.75rem;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
   border-radius: 10px;
   box-shadow: var(--shadow-card);
 }
@@ -443,16 +527,6 @@ a:hover {
   outline: 2px solid var(--color-input-focus-border);
   outline-offset: 1px;
   border-color: var(--color-input-focus-border);
-}
-
-.login-error {
-  margin: 0;
-  padding: 0.5rem 0.65rem;
-  background: var(--color-danger-bg);
-  border: 1px solid var(--color-danger-border);
-  border-radius: 6px;
-  color: var(--color-danger);
-  font-size: 0.85rem;
 }
 
 .events {
@@ -569,18 +643,11 @@ woo-chat-space {
 }
 
 .weather-badge {
-  display: inline-flex;
-  align-items: center;
   gap: 0.28rem;
   min-height: 1.45rem;
   padding: 0.12rem 0.42rem;
-  border: 1px solid var(--color-border);
-  border-radius: 999px;
   background: var(--color-surface);
-  color: var(--color-text);
   font-size: 0.82rem;
-  line-height: 1;
-  white-space: nowrap;
 }
 
 .weather-badge-icon {
@@ -596,12 +663,6 @@ woo-chat-space {
 .weather-badge.error {
   min-width: 1.45rem;
   justify-content: center;
-}
-
-.weather-badge.error {
-  border-color: var(--color-danger-border);
-  background: var(--color-danger-bg);
-  color: var(--color-danger);
 }
 
 woo-weather-badge {
@@ -638,8 +699,7 @@ woo-weather-badge:focus-within .weather-badge {
 
 .weather-chart-card {
   position: relative;
-  background: var(--color-surface-2);
-  border: 1px solid var(--color-border-strong);
+  border-color: var(--color-border-strong);
   border-radius: 10px;
   box-shadow: 0 22px 44px rgba(0, 0, 0, 0.55);
   padding: 1rem 1.2rem 1.2rem;
@@ -652,24 +712,12 @@ woo-weather-badge:focus-within .weather-badge {
   right: 0.4rem;
   width: 1.8rem;
   height: 1.8rem;
-  /* Flex-center the glyph: the default <button> baseline + non-zero
-     padding caused the × to drift down and right inside the hover
-     circle. With padding:0 + place-items, the glyph sits dead-centre
-     regardless of font metrics. */
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  /* Center the glyph dead-on regardless of font metrics — a non-zero    */
+  /* padding drifted the × into the lower-right of the hover circle.    */
   padding: 0;
-  border: none;
-  background: transparent;
-  font: inherit;
   font-size: 1.5rem;
-  line-height: 1;
-  color: var(--color-text-muted);
-  cursor: pointer;
   border-radius: 50%;
 }
-.weather-chart-close:hover { background: var(--color-accent-soft); color: var(--color-accent); }
 
 .weather-chart-headline {
   display: flex;
@@ -756,9 +804,6 @@ woo-weather-badge:focus-within .weather-badge {
 
 .weather-chart-panel {
   margin-top: 0.6rem;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
   padding: 0.4rem 0.4rem 0.5rem;
 }
 .weather-chart-panel-empty { background: var(--color-surface-3); }
@@ -835,20 +880,12 @@ woo-weather-badge:focus-within .weather-badge {
   gap: 0.8rem;
 }
 
-.panel {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  padding: 1rem;
-  min-width: 0;
-}
-
-.panel h2 {
+.card h2 {
   margin: 0 0 0.75rem;
   font-size: 1rem;
 }
 
-.panel-head {
+.card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -856,7 +893,7 @@ woo-weather-badge:focus-within .weather-badge {
   margin-bottom: 0.75rem;
 }
 
-.panel-head h2 {
+.card-head h2 {
   margin: 0;
 }
 
@@ -884,9 +921,7 @@ woo-weather-badge:focus-within .weather-badge {
   gap: 0.55rem;
   justify-items: center;
   padding: 0.65rem 0.45rem;
-  border: 1px solid var(--color-border);
   border-radius: 7px;
-  background: var(--color-surface-2);
 }
 
 .filter-strip {
@@ -1087,16 +1122,7 @@ input[type="range"] {
 }
 
 .taskspace-layout {
-  display: grid;
-  grid-template-columns: minmax(320px, 0.9fr) minmax(420px, 1.1fr);
-  gap: 1rem;
-  align-items: start;
-}
-
-.taskspace-layout.has-space-chat {
-  height: 100%;
-  min-height: 0;
-  overflow: hidden;
+  --split-cols: minmax(320px, 0.9fr) minmax(420px, 1.1fr);
 }
 
 .tree {
@@ -1218,13 +1244,6 @@ input[type="range"] {
   gap: 0.5rem;
 }
 
-.task-facts div {
-  border: 1px solid var(--color-border);
-  border-radius: 7px;
-  padding: 0.55rem;
-  min-width: 0;
-}
-
 .task-facts strong,
 .task-facts span {
   display: block;
@@ -1265,14 +1284,6 @@ input[type="range"] {
   align-items: center;
 }
 
-.activity-item,
-.artifact-item {
-  border: 1px solid var(--color-border);
-  border-radius: 7px;
-  padding: 0.55rem;
-  background: var(--color-surface-2);
-}
-
 .activity-item div,
 .artifact-item {
   display: flex;
@@ -1303,42 +1314,6 @@ input[type="range"] {
   font-size: 0.88rem;
 }
 
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 1.35rem;
-  padding: 0.08rem 0.45rem;
-  border-radius: 999px;
-  border: 1px solid var(--color-border);
-  background: var(--color-surface-2);
-  color: var(--color-text);
-  white-space: nowrap;
-  font-size: 0.75rem;
-}
-
-.status-open {
-  border-color: var(--color-border-strong);
-}
-
-.status-claimed,
-.status-in_progress {
-  border-color: var(--color-info-border);
-  background: var(--color-info-bg);
-  color: var(--color-info);
-}
-
-.status-blocked {
-  border-color: var(--color-warning-border);
-  background: var(--color-warning-bg);
-  color: var(--color-warning);
-}
-
-.status-done {
-  border-color: var(--color-success-border);
-  background: var(--color-success-bg);
-  color: var(--color-success);
-}
-
 .row,
 .button-row,
 .inline-form {
@@ -1363,17 +1338,15 @@ input[type="range"] {
 }
 
 .chat-layout {
-  display: grid;
-  grid-template-columns: minmax(360px, 1fr) 240px;
-  gap: 1rem;
-  align-items: stretch;
+  --split-side: 240px;
+  --split-cols: minmax(360px, 1fr) var(--split-side);
   height: calc(100dvh - 5.25rem);
   min-height: 0;
   overflow: hidden;
 }
 
 .chat-layout.solo {
-  grid-template-columns: minmax(320px, 640px);
+  --split-cols: minmax(320px, 640px);
 }
 
 .chat-empty-panel p {
@@ -1464,19 +1437,6 @@ input[type="range"] {
   gap: 0.55rem;
 }
 
-.dubspace-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 230px;
-  gap: 1rem;
-  align-items: stretch;
-}
-
-.dubspace-layout.has-space-chat {
-  height: 100%;
-  min-height: 0;
-  overflow: hidden;
-}
-
 .dubspace-work {
   min-width: 0;
 }
@@ -1487,18 +1447,12 @@ input[type="range"] {
 }
 
 .pinboard-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 230px;
-  gap: 1rem;
-  align-items: stretch;
   height: calc(100dvh - 5.25rem - var(--space-chat-h, 280px) - 0.8rem);
   min-height: 0;
 }
 
 .pinboard-layout.has-space-chat {
   height: auto;
-  min-height: 0;
-  overflow: hidden;
 }
 
 .space-chat-shell {
@@ -1624,20 +1578,8 @@ input[type="range"] {
 
 .space-chat-toggle {
   margin-left: auto;
-  background: transparent;
-  border: 0;
-  color: var(--color-text-muted);
   padding: 0.1rem 0.35rem;
   font-size: 0.75rem;
-  line-height: 1;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.space-chat-toggle:hover,
-.space-chat-toggle:focus-visible {
-  color: var(--color-text);
-  background: var(--color-surface-raised);
 }
 
 .space-chat-panel.is-collapsed {
@@ -1745,9 +1687,6 @@ input[type="range"] {
   align-items: center;
   gap: 0.25rem;
   padding: 0.25rem;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-surface);
   box-shadow: var(--shadow-zoom);
 }
 
@@ -1985,10 +1924,6 @@ pre {
 }
 
 .event-list pre {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  padding: 0.5rem;
   font-size: 0.7rem;
   line-height: 1.28;
 }

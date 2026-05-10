@@ -1,4 +1,9 @@
-import { escapeHtml, type WooComponentRegistry, type WooContext } from "../../../src/client/framework";
+import {
+  escapeHtml,
+  type ChatFormatterRegistry,
+  type WooComponentRegistry,
+  type WooContext
+} from "../../../src/client/framework";
 
 export type ChatLine = {
   kind: string;
@@ -265,6 +270,51 @@ export class WooSpaceChatPanelElement extends HTMLElement {
 export function registerWooComponents(registry: WooComponentRegistry): void {
   registry.defineTag("woo-chat-space", WooChatSpaceElement);
   registry.defineTag("woo-space-chat-panel", WooSpaceChatPanelElement);
+}
+
+// Speech and room-event types that the chat catalog owns. Each has a
+// dedicated rendering branch in renderChatLineHtml below — keeping the
+// kind equal to the observation type lets the existing branches match.
+const CHAT_PASSTHROUGH_TYPES = [
+  "said",
+  "said_to",
+  "said_as",
+  "emoted",
+  "posed",
+  "quoted",
+  "self_pointed",
+  "told",
+  "text",
+  "entered",
+  "left",
+  "looked",
+  "who",
+  "huh"
+];
+
+// Types where chat owns the line but the verb does not always supply
+// observation.text. These need a synthesized fallback; the formatter
+// produces one rather than the frame.
+const CHAT_FALLBACK_TYPES = ["blocked_exit", "taken", "dropped"];
+
+export function registerWooChatFormatters(registry: ChatFormatterRegistry): void {
+  registry.formatter({
+    types: CHAT_PASSTHROUGH_TYPES,
+    format: (observation) => ({ kind: String(observation.type ?? "") })
+  });
+  registry.formatter({
+    types: CHAT_FALLBACK_TYPES,
+    format: (observation, ctx) => {
+      const type = String(observation.type ?? "");
+      const explicit = typeof observation.text === "string" ? observation.text : undefined;
+      if (explicit !== undefined) return { kind: type, text: explicit };
+      const actorRef = typeof observation.actor === "string" ? observation.actor : undefined;
+      if (type === "blocked_exit") return { kind: type, text: "You can't go that way." };
+      if (type === "taken") return { kind: type, text: `${ctx.label(actorRef)} takes something.` };
+      // dropped
+      return { kind: type, text: `${ctx.label(actorRef)} drops something.` };
+    }
+  });
 }
 
 export function renderChatLineHtml(line: ChatLine, actorLabel: ActorLabeler): string {

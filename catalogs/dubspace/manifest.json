@@ -53,6 +53,12 @@
           "scene_recalled"
         ]
       }
+    ],
+    "chat_formatters": [
+      {
+        "module": "dubspace-ui",
+        "types": ["dubspace_entered", "dubspace_left", "dubspace_activity"]
+      }
     ]
   },
   "classes": [
