@@ -112,6 +112,16 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
         <section class="split split--side-fixed dubspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(spaceId)}">
           <div class="dubspace-work">
             <div class="grid">
+              <article class="card sequencer">
+                <div class="card-head">
+                  <h2>Percussion</h2>
+                  <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
+                </div>
+                <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(numberProp(drum.bpm, 118)))}"><span>${escapeHtml(String(numberProp(drum.bpm, 118)))}</span></label>
+                <div class="steps">
+                  ${DRUM_VOICES.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
+                </div>
+              </article>
               <article class="card loop-console-panel">
                 <div class="card-head"><h2>Loops</h2></div>
                 <div class="loop-console">${data.slots.map((id, index) => this.renderLoopStrip(id, index + 1)).join("")}${this.renderFilterStrip()}</div>
@@ -122,16 +132,6 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
                 ${slider(data.delay, "time", numberProp(delay.time, 0.25))}
                 ${slider(data.delay, "feedback", numberProp(delay.feedback, 0.35))}
                 ${slider(data.delay, "wet", numberProp(delay.wet, 0.4))}
-              </article>
-              <article class="card sequencer">
-                <div class="card-head">
-                  <h2>Percussion</h2>
-                  <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
-                </div>
-                <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(numberProp(drum.bpm, 118)))}"><span>${escapeHtml(String(numberProp(drum.bpm, 118)))}</span></label>
-                <div class="steps">
-                  ${DRUM_VOICES.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
-                </div>
               </article>
             </div>
           </div>
@@ -276,7 +276,7 @@ function renderStepRow(voice: string, label: string, steps: boolean[]): string {
   return `
     <div class="step-row">
       <span>${escapeHtml(label)}</span>
-      ${steps.map((enabled, index) => `<button class="${enabled ? "active" : ""}" data-step="${escapeHtml(`${voice}:${index}`)}" data-enabled="${enabled ? "true" : "false"}" aria-label="${escapeHtml(`${label} step ${index + 1}`)}"></button>`).join("")}
+      ${steps.map((enabled, index) => `<button class="step ${enabled ? "active" : ""}" data-step="${escapeHtml(`${voice}:${index}`)}" data-enabled="${enabled ? "true" : "false"}" aria-label="${escapeHtml(`${label} step ${index + 1}`)}"></button>`).join("")}
     </div>
   `;
 }

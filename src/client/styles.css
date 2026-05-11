@@ -97,6 +97,9 @@
   --color-step-active-bg: var(--color-accent);
   --color-step-active-border: var(--color-accent);
   --color-step-active-text: var(--color-bg);
+  --color-step-hover-bg: #1a4a62;
+  --color-step-hover-border: #2c5160;
+  --color-step-hover-text: #ffffff;
   --color-cue-active-bg: rgba(240, 180, 64, 0.18);
   --color-cue-active-border: var(--color-warning);
   --color-loop-cue-bg: rgba(240, 180, 64, 0.08);
@@ -196,6 +199,9 @@
   --color-step-active-bg: #242c24;
   --color-step-active-border: #242c24;
   --color-step-active-text: #ffffff;
+  --color-step-hover-bg: #dfe9dc;
+  --color-step-hover-border: #9ba399;
+  --color-step-hover-text: #20251f;
   --color-cue-active-bg: #f5d78d;
   --color-cue-active-border: #b18432;
   --color-loop-cue-bg: #fff8e8;
@@ -362,7 +368,7 @@ a:hover {
 }
 
 .split--side-fixed {
-  --split-cols: minmax(0, 1fr) var(--split-side, 230px);
+  --split-cols: minmax(0, 1fr) min(var(--split-side, 230px), 25vw);
   --split-align: stretch;
 }
 
@@ -1086,17 +1092,17 @@ input[type="range"] {
   text-align: center;
 }
 
+.step:hover:not(.active) {
+  background: var(--color-step-hover-bg);
+  border-color: var(--color-step-hover-border);
+  color: var(--color-step-hover-text);
+}
+
 .step.active {
   background: var(--color-step-active-bg);
   border-color: var(--color-step-active-border);
   color: var(--color-step-active-text);
-}
-
-.split {
-  display: grid;
-  grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.1fr);
-  gap: 1rem;
-  align-items: start;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-step-active-bg) 65%, #fff 35%);
 }
 
 .task-toolbar {
@@ -1509,7 +1515,7 @@ input[type="range"] {
 .space-chat-panel {
   position: relative;
   height: var(--space-chat-h, 280px);
-  min-height: 220px;
+  min-height: 42px;
   max-height: 45vh;
   overflow: hidden;
   display: grid;

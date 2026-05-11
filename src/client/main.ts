@@ -211,7 +211,8 @@ const PINBOARD_VIEW_ANIMATION_MS = 480;
 const PINBOARD_VIEWPORT_MIN_MS = 110;
 const PINBOARD_MAP_DEFAULT_ASPECT = 0.42;
 const SPACE_CHAT_DEFAULT_HEIGHT = 280;
-const SPACE_CHAT_MIN_HEIGHT = 220;
+// Keep drag-resize floor aligned with the collapsed mini-chat footprint.
+const SPACE_CHAT_MIN_HEIGHT = 42;
 const SPACE_CHAT_MAX_VIEWPORT_RATIO = 0.45;
 const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
   chat: "chat",

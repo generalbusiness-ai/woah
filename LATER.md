@@ -1,15 +1,27 @@
 # later
 
-Open items, sketches, gaps. Not commitments. Reorder freely. Style: keep / todo.txt — vibes, not roadmap.
-
-The sections below distinguish three flavors of pending item:
-
-- **Spec gaps** / **structure** / **ops/infra**: work that should happen when someone has cycles. Strike-throughs (`~~done~~`) mark closed items.
-- **Not in v1, deliberately**: design choices the spec consciously declines, recorded so future readers see why the absence is intentional.
-- **Decisions still open**: judgments deferred pending more information; the current leaning is documented but not locked.
+Open items, sketches, gaps. Not commitments.
+New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+- shell script to create a builder
+- shell script to create a programmer
+- Separate "demo" from just "tasks and inline chat"
+    - make them work in the same ui
+- onboarding for local (just tasks)
+- tasks usability
+    - "santa's workshop" should be an actual room, for multi-project doors
+    - use a "picker" for: the steps, in the workflow editing dialog, not freetext
+    - CLI command "list tasks", "list roles", "list workflows", "list steps"
+    - from "new workflow" need to be able to add "new step"
+    - are steps strictly within-workdlows?  (not necessarily)
+    - step id: is this literall the id? want a step *name*
+    - draw a graphical view of an item's workflow (and its history, and possible next steps)
+- build an ops dashboard
+- easy onboarding for cloud
+- tasks room plug - sync with git repo
+  (just using the whole regular commands, not a special authority)
 - $wiz name/description
 - a small agentic pet that wanders around (plug/block), interested, sleeps some
 - structured review process
@@ -52,26 +64,6 @@ The sections below distinguish three flavors of pending item:
 
 ## spec gaps
 
-- ~~value model~~ — done (`spec/semantics/values.md`)
-- ~~$space normative behavior~~ — done (`spec/semantics/space.md`)
-- ~~identity / session (lite)~~ — done (`spec/semantics/identity.md`); full account/credential/recovery flows still deferred
-- ~~failure model consolidation~~ — done (`spec/semantics/failures.md`)
-- ~~worktrees / sandbox / promote~~ — done (`spec/operations/worktrees.md`)
-- ~~migrations (bytecode, schema, data)~~ — done (`spec/operations/migrations.md`)
-- ~~credentialed auth (account vs actor, OAuth, multi-character)~~ — done (`spec/identity/auth.md`)
-- ~~debugging (step / breakpoint / replay)~~ — done (`spec/tooling/debugging.md`)
-- ~~backups + restore + cross-environment migration~~ — done (`spec/operations/backups.md`)
-- ~~deployments (dev/staging/prod, spec versions, blue-green)~~ — done (`spec/operations/deployments.md`)
-- ~~observability (logs, metrics, traces, audit)~~ — done (`spec/operations/observability.md`)
-- ~~conformance suite (behavioral test corpus)~~ — done (`spec/tooling/conformance.md`)
-- ~~catalogs (named reusable object sets)~~ — done (`spec/discovery/catalogs.md`)
-- ~~teams (team membership, role-based gating, team quotas)~~ — done (`spec/identity/teams.md`)
-- ~~federation v1 (minimum cross-world surface)~~ — done (`spec/discovery/federation-v1.md`)
-- ~~bootstrap world contract~~ — done (`spec/semantics/bootstrap.md`); concrete T0 bytecode fixtures in `spec/semantics/tiny-vm.md` "Concrete fixtures"
-- ~~discovery / introspection surface~~ — done (`spec/semantics/introspection.md`)
-- ~~observation schemas for the demos~~ — done (sections in dubspace-demo.md and taskspace-demo.md)
-- ~~taskspace domain invariants~~ — done (Domain Invariants section in `spec/taskspace-demo.md`)
-- ~~minimal authoring on-ramp~~ — first draft in `spec/authoring/minimal-ide.md`
 - broader authoring system: schema editor, history/replay viewer, version/rollback UI, package import/export
 - catalog migration step kinds for ownership transfer: extend `spec/discovery/catalogs.md §CT14.2` with `drop_seed` and `drop_class` (or a single `transfer_to: <other_catalog>` step) so a publisher splitting a catalog can declare the cleanup explicitly in `migration-vN-to-v(N+1).json` rather than relying on the runtime's auto-prune at adopt time. Today `installLocalCatalog` prunes adopted ids from prior owners' registry records as a side-effect of `adoptExisting`; the migration-declarative path is more honest and would become the primary mechanism once that vocabulary lands.
 - woo-flavoured rewrite of [yduj's duck tutorial](https://www.hayseed.net/MOO/yduj-duck-tutorial.text) — the canonical "build your first verb on a duck" walkthrough, ported to woo's DSL, dispatch model, and authoring surface. Aimed at first-time programmers (the original audience), not engineers porting from MOO.
@@ -94,8 +86,7 @@ The sections below distinguish three flavors of pending item:
 
 - cross-host reentrancy: reentrant lock by task-id vs explicit `with_lock` (currently leaning explicit; revisit after measurements)
 - multi-session per player: fan-out vs first-wins (currently leaning fan-out)
-- `chparent` orphan property values: drop vs preserve (currently dropping)
-- per-value size cap: 256 KiB (proposal)
+- `chparent` orphan property values: drop vs preserve (currently dropping) - check with LM
 - strict vs dynamic verb compile: dynamic for v1; opt-in strict later
 
 ## ops / infra
@@ -106,10 +97,29 @@ The sections below distinguish three flavors of pending item:
 - real cost numbers in `spec/reference/cloudflare.md` once the implementation exists
 - real-time approximation for quota accounting via per-DO delta pushes
 
-## first demo
+---
 
-The current direction is the dubspace sketch in [spec/dubspace-demo.md](spec/dubspace-demo.md): a shared persistent control surface for live sound gestures. It exercises the actor + log + emit/subscribe core without taking on cross-host migration depth, long-suspend tasks, or streamed media. A taskspace demo in [spec/taskspace-demo.md](spec/taskspace-demo.md) exercises async coordination for people and agents. A chat-shaped follow-up demo would later exercise the cross-host verb-dispatch and inheritance machinery the dubspace deliberately avoids.
+Done:
 
-## tools
-
-- ollama serve (memory provider unavailable in current sessions)
+. per-value size cap: 256 KiB
+- ~~value model~~ — done (`spec/semantics/values.md`)
+- ~~$space normative behavior~~ — done (`spec/semantics/space.md`)
+- ~~identity / session (lite)~~ — done (`spec/semantics/identity.md`); full account/credential/recovery flows still deferred
+- ~~failure model consolidation~~ — done (`spec/semantics/failures.md`)
+- ~~worktrees / sandbox / promote~~ — done (`spec/operations/worktrees.md`)
+- ~~migrations (bytecode, schema, data)~~ — done (`spec/operations/migrations.md`)
+- ~~credentialed auth (account vs actor, OAuth, multi-character)~~ — done (`spec/identity/auth.md`)
+- ~~debugging (step / breakpoint / replay)~~ — done (`spec/tooling/debugging.md`)
+- ~~backups + restore + cross-environment migration~~ — done (`spec/operations/backups.md`)
+- ~~deployments (dev/staging/prod, spec versions, blue-green)~~ — done (`spec/operations/deployments.md`)
+- ~~observability (logs, metrics, traces, audit)~~ — done (`spec/operations/observability.md`)
+- ~~conformance suite (behavioral test corpus)~~ — done (`spec/tooling/conformance.md`)
+- ~~catalogs (named reusable object sets)~~ — done (`spec/discovery/catalogs.md`)
+- ~~teams (team membership, role-based gating, team quotas)~~ — done (`spec/identity/teams.md`)
+- ~~federation v1 (minimum cross-world surface)~~ — done (`spec/discovery/federation-v1.md`)
+- ~~bootstrap world contract~~ — done (`spec/semantics/bootstrap.md`); concrete T0 bytecode fixtures in `spec/semantics/tiny-vm.md` "Concrete fixtures"
+- ~~discovery / introspection surface~~ — done (`spec/semantics/introspection.md`)
+- ~~observation schemas for the demos~~ — done (sections in dubspace-demo.md and taskspace-demo.md)
+- ~~taskspace domain invariants~~ — done (Domain Invariants section in `spec/taskspace-demo.md`)
+- ~~minimal authoring on-ramp~~ — first draft in `spec/authoring/minimal-ide.md`
+. docs rewrite for clarity
