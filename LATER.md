@@ -3,7 +3,63 @@
 Open items, sketches, gaps. Not commitments.
 New items go at the top.  Move to the bottom when final.
 
+---
+
 ## random stuff to do
+
+- edges, or reverse-objref indexes
+
+    thing about our object model is, it's not really a graph
+    and we don't have indexed collections (traversable in both directions)
+    which means sequential-scan-of-things is our default behavior
+    but that's silly, we should just build an actual "edge table"
+    and make objref-type properties trivially traversable in either direction
+    (automagic "a.owner=b" ==> "b.inverse_owners=[a,...]")
+    and we should do that the ~same way that keep does
+    by a metaproperty on the `foo` property `_inverse: bar` that says:
+    "a.foo is an objref, so b.bar is a collection of `a`"
+
+    maybe declare that on 'b' where it belongs, as
+    `b.bar: inverse_of(a.foo)`
+    which requires that a.foo is an object reference iff targeting 'b'
+
+- oh by the way: split out the "delete taskspace" from the "add tasks"
+    - they should share nothing
+
+- workflow conditions/gates with xstate-style rule definitions?
+    - just with whatever properties the state defines!
+    - just a state machine.
+
+- push to talk
+
+- multi-instance data blocks (e.g. one per claude session, one per slack channel)
+    - single auth, single websocket
+    - just exposes multiple objects on the focus list
+        - each object has its "canonical identifier"
+    - who controls the duplication? (anyone!!)
+
+- port block for claude-code or hermes or pi or something
+    - enter -> directly in its tui
+    - or: say, get responses
+    (block is an agent, but can have a room within)
+
+- user identity (MCP) for hermes
+    - make sure it can do the dynamic tool list like claude
+    - one per profile
+    - so, your hermes is "tester" -> in a loop
+    - websockets would be better actually!
+
+- port block for github (just runs as a python or ts process)
+    "say https://github/issues/1234" -> grab it
+    "say ...pull/1234"
+    list all the things
+
+- Who can create a task?
+
+- github: copy their workflow (dynamically) into our policy layer
+
+- new workflow:
+    - "Saved policy" -> should be "Saved workflow"
 
 - shell script to create a builder
 - shell script to create a programmer
@@ -123,3 +179,4 @@ Done:
 - ~~taskspace domain invariants~~ — done (Domain Invariants section in `spec/taskspace-demo.md`)
 - ~~minimal authoring on-ramp~~ — first draft in `spec/authoring/minimal-ide.md`
 . docs rewrite for clarity
+. chat resize-bar stopped working
