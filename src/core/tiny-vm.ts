@@ -994,8 +994,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return frame.ctx.world.logicalRandomInt(n, "random");
       }
       case "contents": {
-        const obj = frame.ctx.world.object(assertObj(builtinArgs[0]));
-        return Array.from(obj.contents);
+        return frame.ctx.world.contentsOf(assertObj(builtinArgs[0]));
       }
       case "location": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "location expects one object");

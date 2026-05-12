@@ -6,6 +6,7 @@ import { InMemoryTurnRecorder, type RecordedTurn, type TurnRecorderEvent } from 
 export type TurnReplayResult = {
   frame: AppliedFrame | DirectResultFrame | ErrorFrame;
   recorded: RecordedTurn;
+  serializedAfter: SerializedWorld;
 };
 
 export async function replayRecordedTurn(serializedBefore: SerializedWorld, turn: RecordedTurn): Promise<TurnReplayResult> {
@@ -33,7 +34,7 @@ export async function replayRecordedTurn(serializedBefore: SerializedWorld, turn
 
   const recorded = recorder.turns[0];
   if (!recorded) throw new Error("replay produced no recorded turn");
-  return { frame, recorded };
+  return { frame, recorded, serializedAfter: world.exportWorld() };
 }
 
 export function comparableTurnEvents(events: TurnRecorderEvent[]): TurnRecorderEvent[] {

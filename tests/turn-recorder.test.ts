@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
-import { effectTranscriptFromRecordedTurn, validateTranscriptAgainstSerializedWorld } from "../src/core/effect-transcript";
+import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
+import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld } from "../src/core/effect-transcript";
+import { shadowCommitReceipt } from "../src/core/turn-commit";
+import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { comparableTurnEvents, replayRecordedTurn } from "../src/core/turn-replay";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import { message } from "./core-support";
@@ -57,6 +60,24 @@ describe("turn recorder", () => {
     expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "prop", object: "rec_box", name: "counter" }, prior: "1", next: "2", value: 1, op: "set" }));
     expect(transcript.observations).toContainEqual(expect.objectContaining({ type: "bumped", value: 1 }));
     expect(transcript.hash).toMatch(/^[a-f0-9]{64}$/);
+    const turnKey = shadowTurnKeyFromTranscript(transcript);
+    expect(turnKey).toMatchObject({ kind: "woo.turn_key.shadow.v1", scope: "#-1", actor, target: "rec_box", verb: "bump" });
+    expect(turnKey.preimages).toEqual(expect.arrayContaining([
+      `actor:${actor}`,
+      "call:rec_box:bump",
+      "read:cell:prop:rec_box.counter",
+      "read:cell:verb:rec_box:bump",
+      "write:cell:prop:rec_box.counter"
+    ]));
+    expect(turnKey.atom_hashes).toHaveLength(turnKey.preimages.length);
+    expect(turnKey.atom_hashes.every((hash) => /^[a-f0-9]{64}$/.test(hash))).toBe(true);
+    const ad = buildShadowCapabilityAd({ node: "node-a", scope: turnKey.scope, atom_hashes: turnKey.atom_hashes, factor: 0.75 });
+    expect(ad).toMatchObject({ kind: "woo.exec_capability_ad.shadow.v1", node: "node-a", scope: "#-1", factor: 0.75 });
+    expect(ad.covers.bits_hex).toMatch(/^[a-f0-9]+$/);
+    expect(capabilityAdProbablyCoversTurn(ad, turnKey)).toBe(true);
+    expect(capabilityAdProbablyCoversTurn(buildShadowCapabilityAd({ node: "empty", scope: turnKey.scope, atom_hashes: [] }), turnKey)).toBe(false);
+    const stronger = buildShadowCapabilityAd({ node: "node-b", scope: turnKey.scope, atom_hashes: turnKey.atom_hashes, factor: 0.9 });
+    expect(rankCapabilityAdsForTurn([ad, stronger], turnKey).map((item) => item.node)).toEqual(["node-b", "node-a"]);
   });
 
   it("records sequenced turns at the applied-call boundary", async () => {
@@ -83,6 +104,115 @@ describe("turn recorder", () => {
     expect(turn.start).toMatchObject({ id: "seq-control", route: "sequenced", scope: "the_dubspace", actor, target: "the_dubspace", verb: "set_control" });
     expect(turn.events).toContainEqual(expect.objectContaining({ kind: "prop_write", object: "delay_1", name: "feedback", after: 0.37, changed: true }));
     expect(turn.events).toContainEqual(expect.objectContaining({ kind: "observe", observation: expect.objectContaining({ type: "control_changed", target: "delay_1", name: "feedback", value: 0.37 }) }));
+  });
+
+  it("normalizes verb metadata, location, and contents reads into the effect transcript", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-cells");
+    const actor = session.actor;
+
+    world.createObject({ id: "cell_room", name: "Cell Room", parent: "$thing", owner: actor, location: "$nowhere" });
+    world.createObject({ id: "cell_item", name: "Cell Item", parent: "$thing", owner: actor, location: "cell_room" });
+    const installed = installVerb(
+      world,
+      "cell_room",
+      "inspect_cells",
+      `verb :inspect_cells() rxd {
+        return { location: location(this), items: contents(this) };
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+
+    const before = world.exportWorld();
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("cell-inspect", actor, "cell_room", "inspect_cells", []);
+
+    expect(result.op).toBe("result");
+    if (result.op === "result") expect(result.result).toEqual({ location: "$nowhere", items: ["cell_item"] });
+    const turn = recorder.turns[0];
+    expect(turn.events).toContainEqual(expect.objectContaining({ kind: "dispatch", target: "cell_room", verb: "inspect_cells", definer: "cell_room", implementation: "bytecode", version: 1 }));
+    expect(turn.events).toContainEqual(expect.objectContaining({ kind: "cell_read", cell: { kind: "location", object: "cell_room" }, value: "$nowhere" }));
+    expect(turn.events).toContainEqual(expect.objectContaining({ kind: "cell_read", cell: { kind: "contents", object: "cell_room" }, value: ["cell_item"] }));
+
+    const transcript = effectTranscriptFromRecordedTurn(turn);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "cell_room", name: "inspect_cells" },
+      version: "1",
+      value: expect.objectContaining({ implementation: "bytecode", owner: actor, version: 1 })
+    }));
+    expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "cell_room" }, value: "$nowhere" }));
+    expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "contents", object: "cell_room" }, value: ["cell_item"] }));
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+  });
+
+  it("marks native verb dispatch as incomplete while preserving dispatch metadata", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-native");
+    const actor = session.actor;
+
+    world.createObject({ id: "native_box", name: "Native Box", parent: "$thing", owner: actor });
+    const before = world.exportWorld();
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("native-describe", actor, "native_box", "describe", []);
+
+    expect(result.op).toBe("result");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.complete).toBe(false);
+    expect(transcript.incompleteReasons).toContain("native:native_box:describe");
+    expect(transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "$root", name: "describe" },
+      value: expect.objectContaining({ implementation: "native", owner: "$wiz", direct_callable: true })
+    }));
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    const receipt = shadowCommitReceipt(before, world.exportWorld(), transcript);
+    expect(receipt).toMatchObject({
+      kind: "woo.commit_receipt.shadow.v1",
+      accepted: false,
+      transcript_hash: transcript.hash
+    });
+    expect(receipt.errors).toContain("incomplete:native:native_box:describe");
+  });
+
+  it("records placement writes for authored moves", async () => {
+    const world = createWorld();
+    const actor = "$wiz";
+
+    world.createObject({ id: "move_a", name: "Move A", parent: "$thing", owner: actor, location: "$nowhere" });
+    world.createObject({ id: "move_b", name: "Move B", parent: "$thing", owner: actor, location: "$nowhere" });
+    world.createObject({ id: "move_item", name: "Move Item", parent: "$thing", owner: actor, location: "move_a" });
+    const installed = installVerb(
+      world,
+      "move_item",
+      "relocate",
+      `verb :relocate(target) rxd {
+        move(this, target);
+        return { location: location(this) };
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+
+    const before = world.exportWorld();
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("move-item", actor, "move_item", "relocate", ["move_b"]);
+
+    expect(result.op).toBe("result");
+    if (result.op === "result") expect(result.result).toEqual({ location: "move_b" });
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "move_item" }, value: "move_b", op: "move" }));
+    expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "contents", object: "move_a" }, value: [], op: "remove" }));
+    expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "contents", object: "move_b" }, value: ["move_item"], op: "add" }));
+    expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "move_item" }, value: "move_b" }));
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
   it("can replay a recorded deterministic turn against a serialized pre-turn world", async () => {
@@ -119,5 +249,18 @@ describe("turn recorder", () => {
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     expect(effectTranscriptFromRecordedTurn(replay.recorded)).toEqual(transcript);
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    const preStateHash = transcriptTouchedStateHash(before, transcript);
+    const postStateHash = transcriptTouchedStateHash(replay.serializedAfter, transcript);
+    expect(preStateHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(postStateHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(postStateHash).not.toBe(preStateHash);
+    const receipt = shadowCommitReceipt(before, replay.serializedAfter, transcript);
+    expect(receipt).toMatchObject({
+      kind: "woo.commit_receipt.shadow.v1",
+      accepted: true,
+      transcript_hash: transcript.hash,
+      pre_state_hash: preStateHash,
+      post_state_hash: postStateHash
+    });
   });
 });

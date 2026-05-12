@@ -2,6 +2,15 @@ import type { ErrorValue, ObjRef, Observation, WooObject, WooValue } from "./typ
 
 export type TurnRoute = "direct" | "sequenced";
 
+export type RecordedCell =
+  | { kind: "prop"; object: ObjRef; name: string }
+  | { kind: "verb"; object: ObjRef; name: string }
+  | { kind: "location"; object: ObjRef }
+  | { kind: "contents"; object: ObjRef }
+  | { kind: "lifecycle"; object: ObjRef };
+
+export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace";
+
 export type TurnStart = {
   id?: string;
   route: TurnRoute;
@@ -18,12 +27,14 @@ export type TurnRecorderEvent =
   | { kind: "turn_start"; turn: TurnStart }
   | { kind: "turn_finish"; ok: true; result?: WooValue }
   | { kind: "turn_finish"; ok: false; error: ErrorValue }
+  | { kind: "cell_read"; cell: RecordedCell; value: WooValue; version?: string }
+  | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string }
   | { kind: "prop_read"; object: ObjRef; name: string; value: WooValue; version?: number }
   | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number; afterVersion?: number }
   | { kind: "object_create"; object: ObjRef; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null }
   | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef }
   | { kind: "observe"; observation: Observation }
-  | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef }
+  | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean }
   | { kind: "logical_input"; name: string; value: WooValue }
   | { kind: "untracked_effect"; name: string; detail?: WooValue };
 

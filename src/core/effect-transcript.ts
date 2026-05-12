@@ -2,12 +2,9 @@ import { createWorldFromSerialized } from "./bootstrap";
 import type { SerializedWorld } from "./repository";
 import { hashSource } from "./source-hash";
 import type { ErrorValue, ObjRef, Observation, WooValue } from "./types";
-import type { RecordedTurn, TurnRecorderEvent, TurnStart } from "./turn-recorder";
+import type { RecordedCell, RecordedCellWriteOp, RecordedTurn, TurnStart } from "./turn-recorder";
 
-export type TranscriptCell =
-  | { kind: "prop"; object: ObjRef; name: string }
-  | { kind: "location"; object: ObjRef }
-  | { kind: "lifecycle"; object: ObjRef };
+export type TranscriptCell = RecordedCell;
 
 export type TranscriptRead = {
   cell: TranscriptCell;
@@ -20,7 +17,7 @@ export type TranscriptWrite = {
   prior?: string;
   next?: string;
   value: WooValue;
-  op: "set" | "create" | "move";
+  op: RecordedCellWriteOp;
 };
 
 export type TranscriptCreate = {
@@ -76,6 +73,22 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
 
   for (const event of turn.events) {
     switch (event.kind) {
+      case "cell_read":
+        reads.push({
+          cell: event.cell,
+          version: event.version,
+          value: event.value
+        });
+        break;
+      case "cell_write":
+        writes.push({
+          cell: event.cell,
+          prior: event.prior,
+          next: event.next,
+          value: event.value,
+          op: event.op
+        });
+        break;
       case "prop_read":
         reads.push({
           cell: { kind: "prop", object: event.object, name: event.name },
@@ -121,6 +134,17 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         logicalInputs.push({ name: event.name, value: event.value });
         break;
       case "dispatch":
+        reads.push({
+          cell: { kind: "verb", object: event.definer, name: event.verb },
+          version: versionString(event.version),
+          value: {
+            implementation: event.implementation,
+            owner: event.owner,
+            source_hash: event.source_hash ?? null,
+            direct_callable: event.direct_callable === true,
+            version: event.version ?? null
+          }
+        });
         if (event.implementation === "native") incompleteReasons.add(`native:${event.target}:${event.verb}`);
         break;
       case "untracked_effect":
@@ -171,35 +195,101 @@ export function validateTranscriptAgainstSerializedWorld(serializedBefore: Seria
   const errors: string[] = [];
 
   for (const read of transcript.reads) {
-    if (read.cell.kind !== "prop") continue;
-    try {
-      const actual = world.getProp(read.cell.object, read.cell.name);
-      const actualVersion = propVersion(serializedBefore, read.cell.object, read.cell.name);
-      const readMatchesOwnWrite = transcript.writes.some((write) =>
-        sameCell(write.cell, read.cell) &&
-        write.next === read.version &&
-        stableJson(write.value) === stableJson(read.value)
-      );
-      if (!readMatchesOwnWrite && read.version !== versionString(actualVersion)) {
-        errors.push(`read version mismatch ${read.cell.object}.${read.cell.name}: transcript=${read.version ?? "none"} actual=${versionString(actualVersion) ?? "none"}`);
-      }
-      if (!readMatchesOwnWrite && stableJson(actual) !== stableJson(read.value)) {
-        errors.push(`read value mismatch ${read.cell.object}.${read.cell.name}`);
-      }
-    } catch (err) {
-      errors.push(`read unavailable ${read.cell.object}.${read.cell.name}: ${err instanceof Error ? err.message : String(err)}`);
+    const actual = actualReadCell(serializedBefore, world, read.cell);
+    if (!actual.ok) {
+      errors.push(actual.error);
+      continue;
+    }
+    const readMatchesOwnWrite = transcript.writes.some((write) =>
+      sameCell(write.cell, read.cell) &&
+      (write.next === undefined || write.next === read.version) &&
+      stableJson(write.value) === stableJson(read.value)
+    );
+    if (!readMatchesOwnWrite && read.version !== actual.version) {
+      errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
+    }
+    if (!readMatchesOwnWrite && stableJson(actual.value) !== stableJson(read.value)) {
+      errors.push(`read value mismatch ${cellLabel(read.cell)}`);
     }
   }
 
-  for (const write of transcript.writes) {
-    if (write.cell.kind !== "prop") continue;
-    const actualVersion = propVersion(serializedBefore, write.cell.object, write.cell.name);
-    if (write.prior !== versionString(actualVersion)) {
-      errors.push(`write prior mismatch ${write.cell.object}.${write.cell.name}: transcript=${write.prior ?? "none"} actual=${versionString(actualVersion) ?? "none"}`);
+  for (let i = 0; i < transcript.writes.length; i++) {
+    const write = transcript.writes[i];
+    if (write.prior === undefined) continue;
+    if (transcript.writes.slice(0, i).some((prior) => sameCell(prior.cell, write.cell))) continue;
+    const actual = actualReadCell(serializedBefore, world, write.cell);
+    if (!actual.ok) {
+      if (write.cell.kind !== "lifecycle" || write.op !== "create") errors.push(actual.error);
+      continue;
+    }
+    if (write.prior !== actual.version) {
+      errors.push(`write prior mismatch ${cellLabel(write.cell)}: transcript=${write.prior ?? "none"} actual=${actual.version ?? "none"}`);
     }
   }
 
   return { ok: errors.length === 0, errors };
+}
+
+export function transcriptTouchedStateHash(serialized: SerializedWorld, transcript: EffectTranscript): string {
+  const world = createWorldFromSerialized(serialized, { persist: false });
+  const cells = uniqueTranscriptCells(transcript);
+  const snapshot = cells.map((cell) => {
+    const actual = actualReadCell(serialized, world, cell);
+    return actual.ok
+      ? { cell, version: actual.version ?? null, value: actual.value }
+      : { cell, absent: true, error: actual.error };
+  });
+  return hashSource(stableJson({
+    kind: "woo.touched_state_hash.shadow.v1",
+    cells: snapshot
+  } as unknown as WooValue));
+}
+
+type ActualReadCell = { ok: true; version?: string; value: WooValue } | { ok: false; error: string };
+
+function actualReadCell(serialized: SerializedWorld, world: ReturnType<typeof createWorldFromSerialized>, cell: TranscriptCell): ActualReadCell {
+  try {
+    switch (cell.kind) {
+      case "prop":
+        return {
+          ok: true,
+          version: versionString(propVersion(serialized, cell.object, cell.name)),
+          value: world.getProp(cell.object, cell.name)
+        };
+      case "verb": {
+        const verb = serializedVerb(serialized, cell.object, cell.name);
+        if (!verb) return { ok: false, error: `read unavailable ${cellLabel(cell)}: verb not found` };
+        return {
+          ok: true,
+          version: versionString(verb.version),
+          value: {
+            implementation: verb.kind,
+            owner: verb.owner,
+            source_hash: verb.source_hash,
+            direct_callable: verb.direct_callable === true,
+            version: verb.version
+          }
+        };
+      }
+      case "location": {
+        const obj = serializedObject(serialized, cell.object);
+        if (!obj) return { ok: false, error: `read unavailable ${cellLabel(cell)}: object not found` };
+        return { ok: true, version: versionString(obj.modified), value: obj.location };
+      }
+      case "contents": {
+        const obj = serializedObject(serialized, cell.object);
+        if (!obj) return { ok: false, error: `read unavailable ${cellLabel(cell)}: object not found` };
+        return { ok: true, version: versionString(obj.modified), value: obj.contents };
+      }
+      case "lifecycle": {
+        const obj = serializedObject(serialized, cell.object);
+        if (!obj) return { ok: false, error: `read unavailable ${cellLabel(cell)}: object not found` };
+        return { ok: true, version: versionString(obj.modified), value: "present" };
+      }
+    }
+  } catch (err) {
+    return { ok: false, error: `read unavailable ${cellLabel(cell)}: ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 function propVersion(serialized: SerializedWorld, object: ObjRef, name: string): number | undefined {
@@ -209,14 +299,50 @@ function propVersion(serialized: SerializedWorld, object: ObjRef, name: string):
   return obj.propertyVersions.find(([prop]) => prop === name)?.[1] ?? 0;
 }
 
+function serializedObject(serialized: SerializedWorld, object: ObjRef): SerializedWorld["objects"][number] | undefined {
+  return serialized.objects.find((item) => item.id === object);
+}
+
+function serializedVerb(serialized: SerializedWorld, object: ObjRef, name: string): SerializedWorld["objects"][number]["verbs"][number] | undefined {
+  const obj = serializedObject(serialized, object);
+  return obj?.verbs.find((verb) => verb.name === name || verb.aliases.includes(name));
+}
+
+function uniqueTranscriptCells(transcript: EffectTranscript): TranscriptCell[] {
+  const byKey = new Map<string, TranscriptCell>();
+  for (const read of transcript.reads) byKey.set(cellKey(read.cell), read.cell);
+  for (const write of transcript.writes) byKey.set(cellKey(write.cell), write.cell);
+  return Array.from(byKey.values()).sort((a, b) => cellKey(a).localeCompare(cellKey(b)));
+}
+
 function sameCell(a: TranscriptCell, b: TranscriptCell): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "prop" && b.kind === "prop") return a.object === b.object && a.name === b.name;
+  if (a.kind === "verb" && b.kind === "verb") return a.object === b.object && a.name === b.name;
   return a.object === b.object;
 }
 
 function versionString(version: number | undefined): string | undefined {
   return version === undefined ? undefined : String(version);
+}
+
+function cellLabel(cell: TranscriptCell): string {
+  switch (cell.kind) {
+    case "prop":
+      return `${cell.object}.${cell.name}`;
+    case "verb":
+      return `${cell.object}:${cell.name}`;
+    case "location":
+      return `${cell.object}.location`;
+    case "contents":
+      return `${cell.object}.contents`;
+    case "lifecycle":
+      return `${cell.object}.lifecycle`;
+  }
+}
+
+function cellKey(cell: TranscriptCell): string {
+  return stableJson(cell as unknown as WooValue);
 }
 
 function stableJson(value: WooValue): string {

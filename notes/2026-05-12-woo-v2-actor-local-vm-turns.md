@@ -942,11 +942,20 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
 - Direct calls and sequenced `$space:call` applications open a recorded turn at
   the verb-execution boundary.
 - The central recorder events currently include dispatch, property reads,
-  property writes, object creation, object movement, observations, and logical
-  inputs for VM `now()`, VM `random(n)`, `idle_seconds`, and substrate `tell()`
-  timestamps.
-- `tests/turn-recorder.test.ts` covers one direct bytecode mutator and one
-  sequenced dubspace control mutation.
+  property writes, object creation, object movement, explicit
+  cell reads/writes, observations, and logical inputs for VM `now()`, VM
+  `random(n)`, `idle_seconds`, and substrate `tell()` timestamps.
+- The first explicit non-property cells are resolved verb metadata,
+  `location(object)`, and `contents(object)`. VM `contents()` and local
+  `location()` reads now produce transcript cells; movement and contents mirror
+  updates produce coarse placement writes.
+- Native dispatch is now visible as resolved verb metadata and marks the
+  transcript incomplete. That keeps the dispatch dependency auditable without
+  pretending the native handler's internals have been proven deterministic.
+- `tests/turn-recorder.test.ts` covers one direct bytecode mutator, one
+  sequenced dubspace control mutation, bytecode verb/location/contents reads,
+  native dispatch incompleteness, placement writes for an authored move, and
+  replay of a deterministic recorded turn.
 - `src/core/turn-replay.ts` can replay a recorded turn against a serialized
   pre-turn world and return the fresh recording. Replay feeds recorded logical
   inputs back into the cloned world, so `now()` / `random(n)` sites can replay
@@ -956,7 +965,20 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   observations, logical inputs, result/error, completeness flag, and stable
   transcript hash. The replay test compares both recorder event arrays and
   normalized transcripts. It also includes a first read/prior-write version
-  validator against a serialized pre-turn world.
+  validator against a serialized pre-turn world. It can also compute a shadow
+  touched-state hash from the transcript's read/write cells against any
+  serialized world, giving tests a pre/post hash bridge toward commit receipts.
+- `src/core/turn-commit.ts` adds a local shadow commit receipt: transcript hash,
+  pre/post touched-state hashes, validation errors, and an `accepted` bit.
+  Incomplete native transcripts now produce a concrete refused receipt shape.
+- `src/core/turn-key.ts` derives a shadow `TurnKey` from the transcript's call,
+  read, and write surface. The test shape keeps debug preimages while also
+  producing compact 64-hex atom hashes, matching the future capability-gossip
+  and Bloom-filter path.
+- `src/core/capability-ad.ts` adds a shadow `ExecCapabilityAd` with a concrete
+  Bloom-style `covers` filter over TurnKey atom hashes. This gives local tests a
+  real "probably covers this turn" predicate and a factor-based ranking helper
+  before any network transport exists.
 
 This is intentionally diagnostic. It now produces a shadow transcript and has a
 small replay/diff foothold, but it is not yet a semantic verifier.
@@ -975,19 +997,35 @@ Implementation learning:
   layer must capture result/error and synthetic `$error` observations as one
   outcome record.
 - The current recorder records property values and local property-version
-  counters. That is enough to start shaping read/write validation, but inherited
-  defaults, object lifecycle, verb metadata, and contents/location indexes still
-  need explicit version rules.
+  counters. Validation now also checks verb metadata plus local
+  location/contents cells against a serialized pre-turn world.
+- `object.modified` is a usable shadow version for location and contents, but
+  it is too coarse for the real protocol. It can false-conflict when unrelated
+  object metadata changes, and it relies on every placement writer bumping the
+  container object. A network implementation should give location and contents
+  their own per-cell versions.
+- Dispatch as a verb-metadata read is a helpful pressure test: the commit
+  validator must know not just which object properties were read, but which
+  executable definition, owner, source hash, direct-callability, and version the
+  VM actually ran.
+- Post-write reads need explicit handling. The current shadow validator accepts
+  a read that matches a same-turn write even when the write has no deterministic
+  `next` version. That is adequate for diagnostics, but a real commit protocol
+  should assign deterministic per-cell next versions at commit time.
 
 The next implementation step is to make the shadow `EffectTranscript`
 load-bearing:
 
 - include result/error and synthetic failure observations in one outcome record;
-- compute pre/post state hash;
+- promote touched-state hashes into explicit pre/post receipt fields;
+- replace the shadow receipt with a real commit-submit/accept/conflict path;
 - reject or mark transcripts that include native dispatch without a completeness
   proof;
-- expand validation from property versions to write permissions, lifecycle,
-  location/contents, verb metadata, and inherited defaults.
+- expand validation from read-set consistency to write permissions, lifecycle,
+  inherited defaults, and post-state checks;
+- introduce explicit missing-cell behavior (`E_NEED_STATE`) so a small executor
+  can abort before the VM observes absent state, acquire transfer, and retry the
+  whole turn.
 
 ## Transport/protocol readiness
 

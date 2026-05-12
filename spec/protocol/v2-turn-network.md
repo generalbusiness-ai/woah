@@ -276,7 +276,7 @@ type TranscriptWrite = {
   prior?: string;
   value_hash: Hash;
   value?: WooValue;
-  op: "set" | "delete" | "append" | "remove" | "replace";
+  op: "set" | "delete" | "append" | "add" | "remove" | "move" | "replace";
 };
 
 type TranscriptCreate = {
@@ -291,6 +291,10 @@ type TranscriptRecycle = {
   final_version?: string;
 };
 ```
+
+`move` is used for location-cell replacement when containment movement is the
+semantic operation. `add` and `remove` are used for contents-cell membership
+updates.
 
 `complete: false` means the recorder observed an untracked native effect or an
 execution boundary that cannot be validated. A commit scope MUST NOT accept an
@@ -763,4 +767,3 @@ production v2 spec needs decisions on:
 - browser optimistic-conflict UX;
 - catalog update sequencing relative to ordinary turns;
 - privacy profile for projection/state transfer to agents.
-

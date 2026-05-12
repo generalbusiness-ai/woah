@@ -459,6 +459,11 @@ export class WooWorld {
     return this.objects.get(objRef)?.propertyVersions.get(name) ?? 0;
   }
 
+  private objectVersionForRecording(objRef: ObjRef): string | undefined {
+    const modified = this.objects.get(objRef)?.modified;
+    return modified === undefined ? undefined : String(modified);
+  }
+
   setLogicalInputsForReplay(inputs: Array<{ name: string; value: WooValue }>): void {
     const queued = new Map<string, WooValue[]>();
     for (const input of inputs) {
@@ -2988,7 +2993,18 @@ export class WooWorld {
         // as "no parent override" and fall back to the standard resolveVerb walk.
         const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
         this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-        this.recordTurnEvent({ kind: "dispatch", target, verb: verbName, startAt, definer, implementation: verb.kind, owner: verb.owner });
+        this.recordTurnEvent({
+          kind: "dispatch",
+          target,
+          verb: verbName,
+          startAt,
+          definer,
+          implementation: verb.kind,
+          owner: verb.owner,
+          version: verb.version,
+          source_hash: verb.source_hash,
+          direct_callable: verb.direct_callable
+        });
         const runCtx: CallContext = {
           ...ctx,
           thisObj: target,
@@ -4725,7 +4741,15 @@ export class WooWorld {
   }
 
   contentsOf(objRef: ObjRef): ObjRef[] {
-    return Array.from(this.object(objRef).contents);
+    const obj = this.object(objRef);
+    const value = Array.from(obj.contents);
+    this.recordTurnEvent({
+      kind: "cell_read",
+      cell: { kind: "contents", object: objRef },
+      version: this.objectVersionForRecording(objRef),
+      value
+    });
+    return value;
   }
 
   /**
@@ -4738,9 +4762,17 @@ export class WooWorld {
    */
   mirrorContents(containerRef: ObjRef, objRef: ObjRef, present: boolean): void {
     const container = this.object(containerRef);
+    const prior = this.objectVersionForRecording(containerRef);
     if (present) container.contents.add(objRef);
     else container.contents.delete(objRef);
     container.modified = Date.now();
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "contents", object: containerRef },
+      value: Array.from(container.contents),
+      op: present ? "add" : "remove",
+      prior
+    });
     this.persistObject(containerRef);
     this.persist();
   }
@@ -4752,15 +4784,31 @@ export class WooWorld {
     // hot, maintain a local contents reverse index instead.
     for (const obj of this.objects.values()) {
       if (!obj.contents.delete(objRef)) continue;
+      const prior = String(obj.modified);
       obj.modified = Date.now();
+      this.recordTurnEvent({
+        kind: "cell_write",
+        cell: { kind: "contents", object: obj.id },
+        value: Array.from(obj.contents),
+        op: "remove",
+        prior
+      });
       this.persistObject(obj.id);
       changed = true;
     }
     if (this.objects.has(targetRef)) {
       const target = this.object(targetRef);
       if (!target.contents.has(objRef)) {
+        const prior = this.objectVersionForRecording(targetRef);
         target.contents.add(objRef);
         target.modified = Date.now();
+        this.recordTurnEvent({
+          kind: "cell_write",
+          cell: { kind: "contents", object: targetRef },
+          value: Array.from(target.contents),
+          op: "add",
+          prior
+        });
         this.persistObject(targetRef);
         changed = true;
       }
@@ -4801,7 +4849,16 @@ export class WooWorld {
 
   async objectLocationChecked(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef | null> {
     const remote = await this.remoteHostForObject(objRef, memo);
-    if (!remote) return this.object(objRef).location;
+    if (!remote) {
+      const obj = this.object(objRef);
+      this.recordTurnEvent({
+        kind: "cell_read",
+        cell: { kind: "location", object: objRef },
+        version: this.objectVersionForRecording(objRef),
+        value: obj.location
+      });
+      return obj.location;
+    }
     if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
     return await this.hostBridge.location(objRef, memo);
   }
@@ -6289,14 +6346,47 @@ export class WooWorld {
     const obj = this.object(objRef);
     this.object(targetRef);
     const oldLocation = obj.location;
-    if (oldLocation && this.objects.has(oldLocation)) this.object(oldLocation).contents.delete(objRef);
+    const locationPrior = this.objectVersionForRecording(objRef);
+    let oldContentsPrior: string | undefined;
+    if (oldLocation && this.objects.has(oldLocation)) {
+      const oldContainer = this.object(oldLocation);
+      oldContentsPrior = this.objectVersionForRecording(oldLocation);
+      oldContainer.contents.delete(objRef);
+      oldContainer.modified = Date.now();
+    }
     obj.location = targetRef;
-    this.object(targetRef).contents.add(objRef);
+    const target = this.object(targetRef);
+    const targetContentsPrior = this.objectVersionForRecording(targetRef);
+    target.contents.add(objRef);
+    target.modified = Date.now();
     obj.modified = Date.now();
     this.persistObject(objRef);
     if (oldLocation) this.persistObject(oldLocation);
     this.persistObject(targetRef);
     this.recordTurnEvent({ kind: "object_move", object: objRef, from: oldLocation, to: targetRef });
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "location", object: objRef },
+      value: targetRef,
+      op: "move",
+      prior: locationPrior
+    });
+    if (oldLocation && oldContentsPrior !== undefined) {
+      this.recordTurnEvent({
+        kind: "cell_write",
+        cell: { kind: "contents", object: oldLocation },
+        value: Array.from(this.object(oldLocation).contents),
+        op: "remove",
+        prior: oldContentsPrior
+      });
+    }
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "contents", object: targetRef },
+      value: Array.from(target.contents),
+      op: "add",
+      prior: targetContentsPrior
+    });
   }
 
   private async moveObjectOwned(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {
@@ -6304,12 +6394,20 @@ export class WooWorld {
     const targetRemote = await this.remoteHostForObject(targetRef);
     if (!targetRemote) this.object(targetRef);
     const oldLocation = obj.location;
+    const locationPrior = this.objectVersionForRecording(objRef);
     obj.location = targetRef;
     obj.modified = Date.now();
     this.persistObject(objRef);
     if (oldLocation && oldLocation !== targetRef) await this.mirrorContainerContents(oldLocation, objRef, false, options);
     await this.mirrorContainerContents(targetRef, objRef, true, options);
     this.recordTurnEvent({ kind: "object_move", object: objRef, from: oldLocation, to: targetRef });
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "location", object: objRef },
+      value: targetRef,
+      op: "move",
+      prior: locationPrior
+    });
     return { oldLocation, location: targetRef };
   }
 
