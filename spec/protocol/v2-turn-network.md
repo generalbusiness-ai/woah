@@ -655,6 +655,13 @@ its original envelope, `auth` MUST be present unless the ad is explicitly
 `anonymous_advisory` and confined to a trusted local link. An absent `auth`
 never upgrades an ad to same-deployment authority.
 
+Prototype profiling SHOULD treat stale ads and Bloom false positives as normal
+events, not exceptional failures. A failed execution attempt that returns
+`missing_state` contributes observed latency and a failure penalty to future
+ranking, then the caller falls back to another ad or state transfer. The ad
+plane remains advisory; correctness still comes from transcript validation and
+commit receipts.
+
 ## VTN12. State plane
 
 State transfer fills execution and display caches. It does not grant write
@@ -716,6 +723,9 @@ The shadow transfer implementation uses
 world plus the atom hashes it satisfies. This proves whole-turn retry control
 flow only; production `closure` transfer must be page/cell bounded and must
 apply authorization filtering before install.
+
+Shadow latency profiles report transfer bytes for this full-world baseline so
+later bounded-closure work has a visible performance target.
 
 Receivers MUST verify page hashes and proofs before installing cache. Receivers
 MUST apply authorization filtering before exposing transferred values to a

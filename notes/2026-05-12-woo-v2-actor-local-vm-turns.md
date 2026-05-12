@@ -988,6 +988,14 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
 - `tests/shadow-turn-exec.test.ts` covers the high-latency path: actor node
   starts cold, refuses without attempting execution, receives closure transfer,
   retries, accepts the receipt, and ends with warmed state.
+- `src/core/shadow-gossip-profile.ts` adds a deterministic profiling harness
+  over the shadow executor. It runs the same recorded turn through four network
+  shapes: warm actor-local execution, cold actor-to-anchor transfer, near remote
+  executor, and stale-ad fallback. The harness executes the turn and computes
+  latency from explicit link/transfer costs, so different shapes can be compared
+  repeatably.
+- `scripts/profile-shadow-turn-network.ts` exposes the first CLI profile via
+  `npm run v2:profile`.
 
 This is intentionally diagnostic. It now produces a shadow transcript and has a
 small replay/diff foothold, but it is not yet a semantic verifier.
@@ -1030,6 +1038,15 @@ Implementation learning:
   does not test compactness or authorization filtering. The next state-plane
   slice should export per-cell or page-level closures and install them into a
   small serialized shard.
+- The first profile run makes the cost of full-world shadow transfer visible:
+  even a tiny turn transfers the entire bootstrapped world, so cold anchor and
+  remote-executor shapes are dominated by transfer bytes. That is useful as a
+  baseline, but the next meaningful profile must compare it with bounded
+  closure pages.
+- Stale ads are not catastrophic when the retry path is cheap and bounded, but
+  they add at least one failed RTT before fallback. This supports keeping ads
+  advisory and investing in short TTLs, returned better-ads, and failure
+  penalties rather than making gossip authoritative.
 
 The next implementation step is to make the shadow `EffectTranscript`
 load-bearing:
@@ -1049,6 +1066,14 @@ The next state-plane implementation step is compact closure transfer:
 - install the closure into a small actor shard;
 - run the retry against that shard, not against the full anchor snapshot;
 - add an actual `E_NEED_STATE` VM/read guard for cells the prediction missed.
+
+The next profiling step is to add shape families rather than hard-coded cases:
+
+- browser-to-relay-to-anchor with asymmetric upload/download;
+- DO-like disposable executor with cold activation cost;
+- regional executor mesh with returned ads;
+- stable anchor under contention;
+- multi-turn warmup where the first miss should make the second turn actor-local.
 
 ## Transport/protocol readiness
 
