@@ -979,6 +979,15 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   Bloom-style `covers` filter over TurnKey atom hashes. This gives local tests a
   real "probably covers this turn" predicate and a factor-based ranking helper
   before any network transport exists.
+- `src/core/shadow-turn-exec.ts` adds the first missing-state retry simulator.
+  A shadow execution node refuses before VM replay when its atom cache does not
+  cover the predicted TurnKey, returns `missing_state`, installs a closure
+  transfer, then retries the whole recorded turn. The current transfer carries a
+  full serialized pre-turn world; it is deliberately a diagnostic stand-in for
+  future page-level closure export.
+- `tests/shadow-turn-exec.test.ts` covers the high-latency path: actor node
+  starts cold, refuses without attempting execution, receives closure transfer,
+  retries, accepts the receipt, and ends with warmed state.
 
 This is intentionally diagnostic. It now produces a shadow transcript and has a
 small replay/diff foothold, but it is not yet a semantic verifier.
@@ -1012,6 +1021,15 @@ Implementation learning:
   a read that matches a same-turn write even when the write has no deterministic
   `next` version. That is adequate for diagnostics, but a real commit protocol
   should assign deterministic per-cell next versions at commit time.
+- The missing-state path is now explicit at the TurnKey/atom layer, but not yet
+  at the VM read layer. Today the shadow executor refuses before replay if the
+  predicted atoms are absent. The harder production behavior is detecting a
+  previously unpredicted missing cell during VM execution, aborting without
+  commit, and returning enough cell identity for transfer.
+- Full-world shadow transfer is useful for proving retry control flow, but it
+  does not test compactness or authorization filtering. The next state-plane
+  slice should export per-cell or page-level closures and install them into a
+  small serialized shard.
 
 The next implementation step is to make the shadow `EffectTranscript`
 load-bearing:
@@ -1022,10 +1040,15 @@ load-bearing:
 - reject or mark transcripts that include native dispatch without a completeness
   proof;
 - expand validation from read-set consistency to write permissions, lifecycle,
-  inherited defaults, and post-state checks;
-- introduce explicit missing-cell behavior (`E_NEED_STATE`) so a small executor
-  can abort before the VM observes absent state, acquire transfer, and retry the
-  whole turn.
+  inherited defaults, and post-state checks.
+
+The next state-plane implementation step is compact closure transfer:
+
+- map TurnKey atom preimages back to the cells and objects they require;
+- export a bounded closure instead of a full serialized world;
+- install the closure into a small actor shard;
+- run the retry against that shard, not against the full anchor snapshot;
+- add an actual `E_NEED_STATE` VM/read guard for cells the prediction missed.
 
 ## Transport/protocol readiness
 

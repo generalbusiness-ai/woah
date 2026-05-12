@@ -595,6 +595,11 @@ missing. If missing state is discovered during execution, the executor MUST
 abort without commit and return `missing_state`. Partial transcripts from such
 runs are diagnostics only.
 
+The shadow implementation currently covers the pre-execution case: a predicted
+TurnKey is compared with a local atom cache, and the executor returns
+`missing_state` before replay when atoms are absent. It does not yet guard every
+VM read with an `E_NEED_STATE`-style abort for prediction misses.
+
 ## VTN11. Capability gossip
 
 Capability ads are compact routing hints.
@@ -705,6 +710,12 @@ Transfer modes:
 - `delta`: applied frames or transcript tail since a known head;
 - `closure`: executable state bundle for a predicted turn, including cells,
   parent/feature/verb metadata, bytecode hashes, and permission facts.
+
+The shadow transfer implementation uses
+`kind: "woo.state.transfer.shadow.v1"` and carries a full serialized pre-turn
+world plus the atom hashes it satisfies. This proves whole-turn retry control
+flow only; production `closure` transfer must be page/cell bounded and must
+apply authorization filtering before install.
 
 Receivers MUST verify page hashes and proofs before installing cache. Receivers
 MUST apply authorization filtering before exposing transferred values to a
