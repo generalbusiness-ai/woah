@@ -1040,6 +1040,19 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   repeatably.
 - `scripts/profile-shadow-turn-network.ts` exposes the first CLI profile via
   `npm run v2:profile`, including a transfer-warmup table.
+- `src/core/shadow-browser-node.ts` adds an in-process browser-node shim with
+  a browser-shaped cache for object pages, projections, pending turns,
+  accepted frames, conflicts, transfers, and transcript tail. It connects to a
+  local relay/commit-scope shim, preloads catalog object pages, executes
+  tentative actor-local turns, asks the in-process network for missing state,
+  and applies accepted/conflicted frames back into the browser cache.
+- `tests/shadow-browser-node.test.ts` now drives real bundled catalog actions
+  through that browser shim: `the_dubspace:set_control`, seeded
+  `the_pinboard:move_pin`, and seeded `$task:claim`/`:set_status` commit
+  successfully. The same coverage records current parity gaps for
+  `the_pinboard:add_note`, `the_taskspace:create_task`, and chat `:take`, so
+  catalog coverage distinguishes committed v2-compatible actions from known
+  transcript/validation blockers.
 
 This is still a shadow prototype. It now has a real in-process
 execute/commit/state-transfer loop, but it is not yet the production protocol
@@ -1095,6 +1108,18 @@ Implementation learning:
   records to about 5.2 KiB and three inline live records (`the_dubspace`,
   `delay_1`, and the actor). This is the strongest evidence so far that an
   in-browser node should ship with or quickly acquire immutable catalog pages.
+- The browser shim exposed an important distinction between cached pages and
+  executable state. Preseeded catalog pages must be materialized into the
+  partial serialized world used by the VM, not only retained in the page cache;
+  otherwise a turn can have the bytes for `$pin` or `$task` but still fail
+  object lookup during local execution.
+- Existing-object catalog actions are already a useful parity target:
+  dubspace control writes, pinboard layout changes, and task claim/status all
+  commit through the browser shim after granular state transfer. Creation-style
+  catalog actions remain blocked: `add_note` still hits a native `moveto`
+  incompleteness path, while `create_task` is complete but the commit validator
+  does not yet treat same-turn object creation as authority for initializing
+  and moving the created object.
 - Hash-checking inline object pages plus the shadow anchor MAC is a useful
   minimum integrity boundary, but it is not enough for production: the receiver
   still needs a real signed proof tying page hashes to a scope head/receipt
@@ -1131,7 +1156,9 @@ The local commit model has a first implementation:
 The remaining work in that layer is to remove the executor `serialized_after`
 crutch by applying transcript writes directly in the commit scope, strengthen
 write authority from coarse recorded-owner checks into exact VM-frame authority,
-and make remote bridge/sub-transcript behavior explicit.
+make remote bridge/sub-transcript behavior explicit, and close the catalog
+creation gaps by making object-create authority and native/default `moveto`
+recording exact enough for commit validation.
 
 The next state-plane implementation step is page/cell closure transfer:
 

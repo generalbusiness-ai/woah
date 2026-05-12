@@ -184,10 +184,12 @@ export function createShadowExecutionNode(input: {
   trusted_transfer_authorities?: Record<string, string>;
   serialized?: SerializedWorld;
 }): ShadowExecutionNode {
-  const serialized = input.serialized ? structuredClone(input.serialized) as SerializedWorld : undefined;
+  let serialized = input.serialized ? structuredClone(input.serialized) as SerializedWorld : undefined;
   const objectCache = new Map<string, SerializedObject>();
   for (const obj of serialized?.objects ?? []) cacheShadowObjectRecord(objectCache, obj);
-  for (const obj of input.cached_objects ?? []) cacheShadowObjectRecord(objectCache, obj);
+  const cachedObjects = input.cached_objects ?? [];
+  for (const obj of cachedObjects) cacheShadowObjectRecord(objectCache, obj);
+  if (cachedObjects.length > 0) serialized = mergeCachedObjectRecords(serialized, cachedObjects);
   return {
     kind: "woo.execution_node.shadow.v1",
     node: input.node,
@@ -198,6 +200,12 @@ export function createShadowExecutionNode(input: {
     trusted_transfer_authorities: trustedTransferAuthorities(input.trusted_transfer_authorities),
     serialized
   };
+}
+
+export function installShadowCachedObjectRecords(node: ShadowExecutionNode, objects: SerializedObject[]): void {
+  for (const obj of objects) cacheShadowObjectRecord(node.object_cache, obj);
+  if (objects.length > 0) node.serialized = mergeCachedObjectRecords(node.serialized, objects);
+  refreshNodeObjectHashes(node);
 }
 
 export function missingAtomsForShadowTurn(node: ShadowExecutionNode, key: ShadowTurnKey): ShadowMissingAtom[] {
@@ -730,6 +738,31 @@ function mergeObjectRecordTransfer(
     snapshots: mergeSnapshots(base.snapshots, transfer.snapshots),
     parkedTasks: Array.from(parkedTasks.values()).sort((a, b) => a.id.localeCompare(b.id)),
     tombstones: Array.from(tombstones).sort()
+  };
+}
+
+function mergeCachedObjectRecords(current: SerializedWorld | undefined, objects: SerializedObject[]): SerializedWorld {
+  const base = current ? structuredClone(current) as SerializedWorld : emptySerializedWorldForCache();
+  const byId = new Map<ObjRef, SerializedObject>(base.objects.map((obj) => [obj.id, obj]));
+  for (const obj of objects) byId.set(obj.id, structuredClone(obj) as SerializedObject);
+  return {
+    ...base,
+    objects: Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id))
+  };
+}
+
+function emptySerializedWorldForCache(): SerializedWorld {
+  return {
+    version: 1,
+    objectCounter: 1,
+    parkedTaskCounter: 1,
+    sessionCounter: 1,
+    objects: [],
+    sessions: [],
+    logs: [],
+    snapshots: [],
+    parkedTasks: [],
+    tombstones: []
   };
 }
 

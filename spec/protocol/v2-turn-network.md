@@ -864,6 +864,13 @@ commit scope -> worker: CommitAccepted or CommitConflict
 worker -> UI: confirm, patch-forward, or report conflict
 ```
 
+Shadow implementation status: the in-process prototype includes a
+browser-shaped node/relay shim with an object-page cache, scope projection
+cache, pending-turn table, accepted/conflict frame queues, and transfer
+tracking. It does not use Web Workers, IndexedDB, or WebSocket transport yet,
+but it exercises the same local-execution/missing-state/commit-reconcile loop
+that the browser worker is expected to expose.
+
 Browser-node dubspace preview flow:
 
 ```text
@@ -904,6 +911,12 @@ scenarios for the existing bundled workloads.
 - viewers receive applied frames for durable board changes;
 - board mini-chat remains live-only unless a durable chat feature is installed;
 - large boards can be opened through projection before full closure transfer.
+
+Prototype status: browser-shim coverage currently commits layout changes
+against seeded pins and claim/status changes against seeded tasks. Composite
+creation verbs are intentionally covered as commit-rejected gaps until
+object-create authority and native/default movement recording are exact enough
+for validation.
 
 ### Dubspace
 
