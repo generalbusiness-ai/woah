@@ -215,6 +215,43 @@ describe("turn recorder", () => {
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
+  it("reports read and write-prior validation errors against stale state", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-stale");
+    const actor = session.actor;
+
+    world.createObject({ id: "stale_box", name: "Stale Box", parent: "$thing", owner: actor });
+    world.defineProperty("stale_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+    const installed = installVerb(
+      world,
+      "stale_box",
+      "bump",
+      `verb :bump() rxd {
+        let before = this.counter;
+        this.counter = before + 1;
+        return this.counter;
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+    const result = await world.directCall("stale-bump", actor, "stale_box", "bump", []);
+    expect(result.op).toBe("result");
+
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    const staleSerializedState = world.exportWorld();
+    const validation = validateTranscriptAgainstSerializedWorld(staleSerializedState, transcript);
+
+    expect(validation.ok).toBe(false);
+    expect(validation.errors).toEqual(expect.arrayContaining([
+      "read version mismatch stale_box.counter: transcript=1 actual=2",
+      "read value mismatch stale_box.counter",
+      "write prior mismatch stale_box.counter: transcript=1 actual=2"
+    ]));
+  });
+
   it("can replay a recorded deterministic turn against a serialized pre-turn world", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-replay");

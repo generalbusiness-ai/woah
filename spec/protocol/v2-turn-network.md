@@ -81,6 +81,12 @@ The prototype uses canonical JSON values unless a message field explicitly names
 binary bytes. Hashes are over canonical bytes with the type name included in the
 preimage.
 
+This document reuses the substrate value and event vocabulary: `WooValue` is
+defined by [values.md](../semantics/values.md), `WooError` by the runtime error
+shape in [failures.md](../semantics/failures.md), and `WooObservation` by
+[events.md](../semantics/events.md). Protocol messages may carry these values,
+but protocol validation is separate from catalog event-schema validation.
+
 ```ts
 type NodeRef = string;       // "node:<deployment>:<id>"
 type ScopeRef = string;      // "scope:<id>"
@@ -105,6 +111,11 @@ type CommitPosition = ScopeHead;
 A `ScopeHead` names a commit-scope epoch and the last accepted transcript in
 that epoch. Epochs fence sequencer/commit-scope migration. Messages that carry
 an epoch MUST be rejected if the receiver knows that epoch is stale.
+
+`ScopeRef` is a v2 protocol identifier. During the shadow prototype, the
+runtime may store the scope as the existing `ObjRef` directly, with
+`scope:<objRef>` as the canonical wire spelling. This is a prototype shortcut,
+not a different authority model.
 
 ## VTN4. Message envelope
 
@@ -219,6 +230,32 @@ type LogicalInputs = {
 };
 ```
 
+Prototype route mapping:
+
+| v1 runtime path | v2 `TurnCall.route` | Notes |
+| --- | --- | --- |
+| `directCall` that may mutate durable cells | `"committed"` | Shadow recorders may label this as `"direct"` until the commit plane exists. |
+| `$space:call` / `$sequenced_log` applied call | `"committed"` | The existing space sequence is the prototype commit order. |
+| Explicit preview/chat/presence-only path | `"live"` | Must not write durable object cells or create durable applied frames. |
+
+Existing `$space` and `$sequenced_log` objects are valid prototype commit
+scopes. A v1 sequenced space maps to the v2 `ScopeRef` for that space object.
+Not every future commit scope must be a `$space`, but the prototype uses spaces
+as the bridge because they already provide ordered applied frames.
+
+The production `LogicalInputs` shape groups inputs by validation role. The
+shadow recorder currently emits an ordered flat list of named inputs
+(`Array<{name,value}>`) because that is the smallest replay mechanism. The
+mapping is:
+
+- `now`, `idle_seconds.now`, and substrate timestamp sites become
+  `logical_time` inputs or named time entries under a future structured form;
+- `random` becomes an `entropy` entry;
+- admitted service or IO results become `external` entries.
+
+Commit-plane implementations MUST preserve input order for replay even when
+they also expose the grouped production form.
+
 Committed turns MUST be deterministic given:
 
 - the turn call;
@@ -255,11 +292,13 @@ type EffectTranscript = {
   reads: TranscriptRead[];
   writes: TranscriptWrite[];
   creates?: TranscriptCreate[];
+  moves?: TranscriptMove[];
   recycles?: TranscriptRecycle[];
   observations: WooObservation[];
   result?: WooValue;
   error?: WooError;
   complete: boolean;
+  incomplete_reasons?: string[];
   pre_state_hash?: Hash;
   post_state_hash: Hash;
 };
@@ -276,7 +315,7 @@ type TranscriptWrite = {
   prior?: string;
   value_hash: Hash;
   value?: WooValue;
-  op: "set" | "delete" | "append" | "add" | "remove" | "move" | "replace";
+  op: "set" | "delete" | "append" | "add" | "remove" | "move" | "replace" | "create";
 };
 
 type TranscriptCreate = {
@@ -284,6 +323,12 @@ type TranscriptCreate = {
   parent: ObjRef;
   owner: ObjRef;
   initial_cells: TranscriptWrite[];
+};
+
+type TranscriptMove = {
+  object: ObjRef;
+  from: ObjRef | null;
+  to: ObjRef;
 };
 
 type TranscriptRecycle = {
@@ -294,12 +339,27 @@ type TranscriptRecycle = {
 
 `move` is used for location-cell replacement when containment movement is the
 semantic operation. `add` and `remove` are used for contents-cell membership
-updates.
+updates. `create` is allowed only for lifecycle cells and SHOULD also be
+represented in `creates` when the created object identity is visible.
 
 `complete: false` means the recorder observed an untracked native effect or an
 execution boundary that cannot be validated. A commit scope MUST NOT accept an
 incomplete transcript as a durable turn. It MAY store incomplete transcripts as
-diagnostics.
+diagnostics. `incomplete_reasons` is a diagnostic annotation and is only
+meaningful when `complete` is false.
+
+The current implementation emits `kind: "woo.effect_transcript.shadow.v1"`.
+That shadow shape is intentionally not wire-compatible with the production
+`woo.effect_transcript.v1`: it may omit `base`, `vm`, `pre_state_hash`, and
+`post_state_hash`, and it records logical inputs as a flat ordered list. Shadow
+transcripts MUST NOT be submitted as production commits. They may be converted
+by a later milestone once a `ScopeHead`, accepted VM/catalog hashes, and
+pre/post state hashes are available.
+
+Dispatch reads SHOULD contribute to `vm.verb_hashes`. The shadow recorder
+currently records the resolved definer, owner, version, `source_hash`, and
+direct-callability on each dispatch event; production transcripts fold that data
+into both the read set and the `vm` block.
 
 Transcript values MAY be omitted when the receiver already has the matching
 content-addressed state page. Validation still needs either the value or a
@@ -313,6 +373,33 @@ events are not.
 The commit plane orders accepted transcripts within one commit scope.
 
 ```ts
+type LeaseToken = {
+  kind: "woo.lease.v1";
+  id: string;
+  scope: ScopeRef;
+  epoch: Epoch;
+  holder: NodeRef | ActorRef;
+  cells: CellRef[];
+  mode: "write" | "sequence" | "migration";
+  issued_at: number;
+  expires_at: number;
+  fence: string;
+  signer: NodeRef | ScopeRef;
+  signature?: string;
+  mac?: string;
+};
+
+type ValidationRule = {
+  id: string;
+  scope: ScopeRef;
+  epoch: Epoch;
+  cells: CellRef[];
+  purpose: "projection";
+  max_staleness_seq?: number;
+  max_staleness_ms?: number;
+  verbs?: string[];
+};
+
 type CommitSubmit = {
   kind: "woo.commit.submit.v1";
   id: string;
@@ -320,7 +407,7 @@ type CommitSubmit = {
   expected: ScopeHead;
   transcript: EffectTranscript;
   leases?: LeaseToken[];
-  requested_transfer?: TransferRequest;
+  requested_transfer?: TransferRequest; // defined in VTN12
 };
 
 type CommitAccepted = {
@@ -382,6 +469,17 @@ A commit scope validates a `CommitSubmit` in this order:
 
 If validation fails, no write from the transcript is committed. The executor may
 catch up and retry the whole turn.
+
+Lease acquisition is intentionally minimal in this draft: a commit scope or its
+sequencer issues `LeaseToken`s for cells whose writes require fencing before the
+turn runs. The token is not authority by itself; it is valid only with envelope
+authentication and normal actor/session authorization.
+
+Validation rules are scope-epoch policy, not caller hints. Until a
+`ValidationRule` is installed for a scope epoch, projection reads are validated
+with the same exact-version rule as semantic reads. The first implementation may
+reject all stale projection reads while still carrying the type above for the
+future relaxed path.
 
 ## VTN9. Catch-up and applied frames
 
@@ -450,7 +548,7 @@ type TurnExecRequest = {
   caller_head: ScopeHead;
   predicted: TurnKey;
   required_consistency: "presentation" | "semantic" | "write";
-  requested_transfer?: TransferRequest;
+  requested_transfer?: TransferRequest; // defined in VTN12
   max_transfer_bytes?: number;
   selected_ad?: string;
   commit_policy?: "execute_and_commit" | "execute_only";
@@ -545,6 +643,12 @@ rank by observed latency + ad.factor + estimated transfer cost + failure penalty
 ```
 
 Ads are advisory. Commit receipts and state proofs are authoritative.
+
+When an ad is carried inside an `Envelope`, omitted `ExecCapabilityAd.auth`
+means the ad inherits `Envelope.auth`. When an ad is relayed or stored outside
+its original envelope, `auth` MUST be present unless the ad is explicitly
+`anonymous_advisory` and confined to a trusted local link. An absent `auth`
+never upgrades an ad to same-deployment authority.
 
 ## VTN12. State plane
 
