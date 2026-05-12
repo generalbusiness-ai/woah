@@ -8,12 +8,19 @@ enabled = true
 head_sampling_rate = 1.0
 
 [vars]
-# Cloudflare deploys start as a clean core world by default. To auto-install
-# bundled local catalogs at bootstrap, set a comma-separated list here before
-# first deploy. Foundational catalogs (help, chat, note, prog) ship classes
-# only; demoworld + dubspace + pinboard + taskspace ship the bundled demo
-# instances. For foundational-only: "help,chat,note,prog". For the full demo:
-# "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo".
+# Cloudflare deploys auto-install the bundled local catalogs listed here
+# at first-light bootstrap (empty storage). The list runs once and the
+# resulting bundle is persisted forever; flipping this variable on an
+# existing deploy does not remove already-installed catalogs.
+#
+# The shipped default is the full demo bundle so that a fresh fork-and-
+# deploy lands a populated world matching woo.hughpyle.workers.dev. For
+# faster first-light on operator deployments that don't want the demo
+# content, use the foundational-only subset — classes only, no bundled
+# instances; first-light cost drops from a few seconds to tens of ms:
+#   WOO_AUTO_INSTALL_CATALOGS = "chat,help,note,prog"
+# For an entirely clean core world (no auto-install), set the empty
+# string. See DEPLOY.md §WOO_AUTO_INSTALL_CATALOGS for details.
 WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
@@ -82,6 +89,6 @@ renamed_classes = [
 # not_found_handling = "single-page-application"
 #
 # [env.staging.vars]
-# # Foundational only: "help,chat,note,prog"
-# # Full demo: "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
-# WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
+# # Inherits the production default (foundational only). Override here to
+# # smoke-test demo catalogs in staging:
+# # WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"

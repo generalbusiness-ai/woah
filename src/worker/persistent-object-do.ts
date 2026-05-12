@@ -49,6 +49,7 @@ import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../c
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
+import { hashSource } from "../core/source-hash";
 
 // Re-import WooWorld type. Note `import type` must reach the world module
 // without dragging Node-only deps into the Worker bundle.
@@ -146,6 +147,19 @@ const INHERIT_TOMBSTONES_BATCH_SIZE = 1000;
 // Meta key under which the §RC11.2 host-teardown state is persisted.
 const HOST_STATE_META_KEY = "host_state";
 const HOST_STATE_TEARING_DOWN = "tearing_down";
+// Last gateway-supplied host-seed digest the satellite successfully merged.
+// On a subsequent cold-load, the satellite probes the gateway for the
+// current digest and skips the full seed transfer when it matches — see
+// createHostScopedWorld below.
+const HOST_SEED_DIGEST_META_KEY = "host_seed_digest";
+// SHA-256 of the (id|host|anchor) triples this DO last successfully
+// published to the Directory, sorted by id. On gateway cold-restart we
+// recompute the digest from the current route set and skip the
+// register-objects RPC entirely when it matches — see
+// registerObjectRoutes. Assumes Directory state persists; an
+// independently-wiped Directory recovers on the next route mutation,
+// which bumps the digest and triggers a fresh publish.
+const PUBLISHED_ROUTES_DIGEST_META_KEY = "published_routes_digest";
 
 export class PersistentObjectDO {
   private state: DurableObjectState;
@@ -681,7 +695,20 @@ export class PersistentObjectDO {
         });
       }
     }
+    // The cold-load path stays a single signed RPC: the satellite
+    // always fetches the full seed and runs the pre/post-lifecycle
+    // merges. The seed body now carries an x-woo-seed-digest response
+    // header and the satellite persists it as host_seed_digest after
+    // each successful merge so a future change can build a
+    // probe-then-skip path on top of it — that promotion needs to
+    // either make runHostScopedLocalCatalogLifecycle
+    // gateway-authority-aware (so foreign-hosted writes from the
+    // lifecycle don't survive the skip and break the next admin push)
+    // or cache the seed body locally so the post-lifecycle merge can
+    // run without an RPC. Adding a probe round-trip ahead of the same
+    // full fetch would be pure overhead until one of those lands.
     let freshSeed: SeedWorld | null = null;
+    let freshSeedDigest: string | null = null;
     try {
       // Use the gateway's seed verbatim — re-scoping via
       // nonEmptyHostScopedWorld would import-then-re-export, which
@@ -691,7 +718,8 @@ export class PersistentObjectDO {
       // routing input the merge needs and must come from the
       // gateway's batched directory view).
       const fetched = await this.fetchHostSeed(hostKey);
-      freshSeed = fetched.objects.length > 0 ? fetched : null;
+      freshSeed = fetched.seed.objects.length > 0 ? fetched.seed : null;
+      freshSeedDigest = fetched.digest;
     } catch (err) {
       if (!scoped) throw err;
       console.warn("woo.cluster_seed_refresh_failed", { host: hostKey, error: normalizeError(err) });
@@ -719,6 +747,14 @@ export class PersistentObjectDO {
       }
     }
     if (seedMergeChanged) world.persistFullSnapshot();
+    // Record the digest only when the gateway supplied one AND we
+    // actually pulled the matching body — if we skipped the transfer
+    // the stored digest is already correct, and an unannotated
+    // response means rolling-deploy mixed versions where the next
+    // probe will simply miss.
+    if (freshSeedDigest && freshSeed) {
+      this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, freshSeedDigest);
+    }
     this.scrubStaleSubscribersOnce(world);
     return world;
   }
@@ -909,7 +945,7 @@ export class PersistentObjectDO {
     }));
   }
 
-  private async fetchHostSeed(hostKey: ObjRef): Promise<SeedWorld> {
+  private async fetchHostSeed(hostKey: ObjRef): Promise<{ seed: SeedWorld; digest: string | null }> {
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     try {
@@ -928,7 +964,13 @@ export class PersistentObjectDO {
       }
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "ok", objects: Array.isArray((body as { objects?: unknown }).objects) ? ((body as { objects: unknown[] }).objects.length) : undefined }, hostKey);
       if (!isSeedWorld(body)) throw wooError("E_STORAGE", `host-seed response missing SeedWorld.objectHosts (spec §HS1)`, hostKey);
-      return body;
+      // The digest header lets the receiver persist the gateway's
+      // content fingerprint so its next cold-load can short-circuit
+      // the seed transfer when nothing has changed. Older gateways
+      // (rolling deploys) omit the header — treat that as "no digest
+      // known," which falls back to the full fetch every time.
+      const digest = response.headers.get("x-woo-seed-digest");
+      return { seed: body, digest: digest && digest.length > 0 ? digest : null };
     } catch (err) {
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) }, hostKey);
       throw err;
@@ -951,7 +993,8 @@ export class PersistentObjectDO {
       }
     }
     for (const host of hosts) {
-      const seed = world.buildHostSeedForDelivery(host as ObjRef);
+      const built = world.buildHostSeedForDeliveryWithDigest(host as ObjRef);
+      const seed = built.seed;
       if (seed.objects.length === 0) {
         skipped.push({ host, reason: "empty_seed" });
         continue;
@@ -960,7 +1003,7 @@ export class PersistentObjectDO {
         const result = await this.forwardInternalChecked<Record<string, unknown>>(
           host,
           "/__internal/apply-host-seed",
-          { host, seed },
+          { host, seed, digest: built.digest },
           { timeoutMs: 15_000 }
         );
         refreshed.push(result);
@@ -971,7 +1014,7 @@ export class PersistentObjectDO {
     return { ok: errors.length === 0, hosts: hosts.length, refreshed, skipped, errors };
   }
 
-  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SeedWorld): Record<string, unknown> {
+  private applyHostSeed(world: WooWorld, hostKey: ObjRef, seed: SeedWorld, digest: string | null): Record<string, unknown> {
     // Use the gateway's seed verbatim — re-scoping would discard the
     // gateway-supplied objectHosts metadata (see spec §HS1).
     if (seed.objects.length === 0) throw wooError("E_OBJNF", `host seed does not contain ${hostKey}`, hostKey);
@@ -983,6 +1026,10 @@ export class PersistentObjectDO {
       this.hostStateCache.clear();
       this.crossHostPropCache.clear();
     }
+    // Mirror the cold-load path: any successful merge of a freshly
+    // built seed leaves the satellite's stored slice consistent with
+    // that digest, so the next cold-load probe can short-circuit.
+    if (digest) this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, digest);
     return { ok: true, host: hostKey, changed: merged.changed, objects: world.objects.size };
   }
 
@@ -991,13 +1038,44 @@ export class PersistentObjectDO {
       await this.registerIncrementalObjectRoutes(world);
       return;
     }
-    const ok = await this.registerRoutes(world.objectRoutes());
-    if (ok) this.routesRegistered = true;
+    const routes = world.objectRoutes();
+    // Cold-restart skip: if the current route set hashes to the same
+    // value the DO published last time it was awake, the Directory's
+    // SQLite tables already hold an identical row set and the RPC
+    // would write zero rows. Skipping the round-trip is worth ~one
+    // signed fetch + Directory transaction per cold gateway boot.
+    // Still populate the in-memory dedup map so subsequent incremental
+    // calls in this session don't republish the same triples.
+    const currentDigest = hashRouteSet(routes);
+    const storedDigest = this.repo.loadMeta(PUBLISHED_ROUTES_DIGEST_META_KEY);
+    if (storedDigest && storedDigest === currentDigest) {
+      for (const route of routes) {
+        this.publishedRoutes.set(route.id, route.host);
+        this.routeCache.set(route.id, route.host);
+      }
+      this.routesRegistered = true;
+      this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects_skip", ms: 0, status: "ok", routes: routes.length }, this.durableHostKey());
+      return;
+    }
+    const ok = await this.registerRoutes(routes);
+    if (ok) {
+      this.routesRegistered = true;
+      this.repo.saveMeta(PUBLISHED_ROUTES_DIGEST_META_KEY, currentDigest);
+    }
   }
 
   private async registerIncrementalObjectRoutes(world: WooWorld): Promise<void> {
-    const routes = world.objectRoutes().filter((route) => this.publishedRoutes.get(route.id) !== route.host);
-    await this.registerRoutes(routes);
+    const all = world.objectRoutes();
+    const fresh = all.filter((route) => this.publishedRoutes.get(route.id) !== route.host);
+    if (fresh.length === 0) return;
+    const ok = await this.registerRoutes(fresh);
+    // Keep the persisted digest in sync with what's actually published
+    // so the cold-restart skip in registerObjectRoutes stays valid
+    // after route mutations during the session. Single-route writes via
+    // adoptLocalObjectRoute deliberately don't update the digest — they
+    // bypass `world`, so we instead let the next full registerObjectRoutes
+    // call (any request after cold-restart) recompute and refresh.
+    if (ok) this.repo.saveMeta(PUBLISHED_ROUTES_DIGEST_META_KEY, hashRouteSet(all));
   }
 
   private localObjectRoute(world: WooWorld | null | undefined, id: ObjRef): { id: ObjRef; host: string; anchor: ObjRef | null } | null {
@@ -1814,7 +1892,8 @@ export class PersistentObjectDO {
       if (request.method === "POST" && pathname === "/__internal/host-seed") {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
-        return jsonResponse(world.buildHostSeedForDelivery(host));
+        const built = world.buildHostSeedForDeliveryWithDigest(host);
+        return jsonResponse(built.seed, 200, { "x-woo-seed-digest": built.digest });
       }
 
       if (request.method === "POST" && pathname === "/__internal/apply-host-seed") {
@@ -1823,7 +1902,8 @@ export class PersistentObjectDO {
         if (!host) throw wooError("E_INVARG", "apply-host-seed requires host");
         if (host !== hostKey) throw wooError("E_INVARG", `host mismatch: ${host} != ${hostKey}`);
         if (!isSeedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires a SeedWorld with objectHosts (spec §HS1)");
-        return jsonResponse(this.applyHostSeed(world, host, body.seed));
+        const digest = typeof body.digest === "string" && body.digest.length > 0 ? body.digest : null;
+        return jsonResponse(this.applyHostSeed(world, host, body.seed, digest));
       }
 
       if (request.method === "POST" && pathname === "/__internal/broadcast-applied") {
@@ -3021,4 +3101,15 @@ function logCatalogTapEvent(event: CatalogTapLogEvent): void {
 function metricErrorCode(err: unknown): string {
   if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
   return err instanceof Error ? err.name : "E_INTERNAL";
+}
+
+// Stable digest over a set of object routes. Used by registerObjectRoutes
+// to compare the current published-route set against what was last
+// persisted, so a cold-restart with an unchanged world skips the
+// Directory register-objects RPC entirely. Triples are sorted by id and
+// joined with delimiters that cannot appear in ObjRefs.
+function hashRouteSet(routes: ReadonlyArray<{ id: ObjRef; host: string; anchor: ObjRef | null }>): string {
+  const sorted = [...routes].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const lines = sorted.map((route) => `${route.id}\t${route.host}\t${route.anchor ?? ""}`);
+  return hashSource(lines.join("\n"));
 }

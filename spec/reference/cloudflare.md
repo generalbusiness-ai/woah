@@ -524,7 +524,11 @@ Required event types (cardinality budget per DO):
 
 Cost: one AE write per call is fine at v1 traffic levels; budget revisits at scale.
 
-Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch, Directory schema setup, Directory object-route registration (`directory_register_objects`), and Directory session-route registration (`directory_register_session`). Both Directory register phases include a `writes` count distinguishing diff-deduped no-ops (`writes: 0`) from actual row writes; downstream metric consumers can monitor that ratio to confirm dedup is healthy.
+Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch (`host_seed_fetch`), Directory schema setup, Directory object-route registration (`directory_register_objects`), and Directory session-route registration (`directory_register_session`). Both Directory register phases include a `writes` count distinguishing diff-deduped no-ops (`writes: 0`) from actual row writes; downstream metric consumers can monitor that ratio to confirm dedup is healthy.
+
+Cold-restart skip paths emit dedicated phases when the gateway recognizes that no work is needed:
+
+- `directory_register_objects_skip` — gateway computed a SHA-256 of its current object-route set, found it identical to the persisted `published_routes_digest` meta value, and bypassed the Directory `register-objects` RPC entirely. Carries `routes` (count compared) but no `writes`. Absence of any `directory_register_objects` metric on a cold restart with this skip emitted is the actual savings (~one signed RPC + Directory transaction per cold gateway boot).
 
 ### R10.2 Structured logs
 

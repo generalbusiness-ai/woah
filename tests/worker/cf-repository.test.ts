@@ -343,8 +343,16 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(restartMetrics).not.toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_save", host_key: "world" })
       ]));
+      // Cold-restart fingerprint: the gateway hashed the world's route set
+      // against the persisted publish digest, found a match, and skipped
+      // the directory_register_objects RPC entirely. The skip metric is
+      // the observable signal; the absence of a register_objects metric
+      // is the actual win (no signed fetch, no Directory transaction).
       expect(restartMetrics).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects", host_key: "directory", writes: 0 })
+        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects_skip", host_key: "world", routes: 20 })
+      ]));
+      expect(restartMetrics).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects" })
       ]));
     } finally {
       logSpy.mockRestore();

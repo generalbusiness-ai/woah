@@ -375,7 +375,7 @@ export class WooWorld {
   /** Per-host cache for buildHostSeedForDelivery. Keyed by host; valid
    * while `version === mutationCounter`. Any mutation invalidates all
    * entries (cheap: just a counter compare on lookup). */
-  private hostSeedCache: Map<ObjRef, { version: number; seed: SeedWorld }> = new Map();
+  private hostSeedCache: Map<ObjRef, { version: number; seed: SeedWorld; digest: string }> = new Map();
   private callDepth = 0;
   private guestFreePool = new Set<ObjRef>();
   private objectRepository: ObjectRepository | null;
@@ -5214,6 +5214,19 @@ export class WooWorld {
    * authoritative for them on the receiver), neutralizes
    * gateway-global counters.
    *
+   * Authoring metadata stripping: verbs ship with `line_map` blanked
+   * to `{}`. line_map is large (per local measurements it dominates
+   * the seed payload — full default-world seed JSON roughly halves
+   * with it removed) and is only consulted for stack-trace formatting.
+   * The seed-merge comparison ignores `line_map` (see
+   * `normalizeVerbForCompare` in bootstrap.ts), so stored slices on
+   * satellites keep any populated line_map they already have, and the
+   * post-merge `runHostScopedLocalCatalogLifecycle` recompiles
+   * bundled-catalog verbs on first arrival to fill it in. Verbs from
+   * non-bundled sources end up with `line_map: {}` on satellites —
+   * stack traces from those verbs lose line/column info on the
+   * satellite, which is acceptable degradation.
+   *
    * Cache: when many satellites cold-load in succession the gateway
    * may rebuild the same per-host slice repeatedly. Memoize on
    * (host, mutationVersion); any mutation bumps the version and
@@ -5221,10 +5234,36 @@ export class WooWorld {
    * per mutation, vs. one rebuild per host per cold-load.
    */
   buildHostSeedForDelivery(host: ObjRef): SeedWorld {
+    return this.buildHostSeedForDeliveryWithDigest(host).seed;
+  }
+
+  /**
+   * Returns the same SeedWorld as `buildHostSeedForDelivery` plus a
+   * stable SHA-256 digest of its JSON body. The digest powers the
+   * cheap "is the satellite's stored slice still current?" probe used
+   * by satellite cold-loads to skip a full ~1 MB seed transfer when
+   * nothing has changed since they were last awake.
+   *
+   * Two satellites observing the same digest are guaranteed to be
+   * offered byte-identical seed bodies. The reverse is not true — a
+   * verb edit that only touches `line_map` would produce a different
+   * intermediate world but the SAME digest, because `line_map` is
+   * stripped from delivery (see buildHostSeedForDelivery). That's
+   * fine: line_map doesn't drive merge changes anyway.
+   */
+  buildHostSeedForDeliveryWithDigest(host: ObjRef): { seed: SeedWorld; digest: string } {
     const version = this.mutationCounter;
     const cached = this.hostSeedCache.get(host);
-    if (cached && cached.version === version) return cached.seed;
+    if (cached && cached.version === version) return { seed: cached.seed, digest: cached.digest };
     const slice = this.exportHostScopedWorld(host);
+    // The wire body keeps the insertion-order layout that the existing
+    // mergeHostScopedSeed contract assumes: per-object arrays (verbs,
+    // eventSchemas, properties, propertyDefs, propertyVersions) compare
+    // positionally in some merge paths, so reordering them inside the
+    // delivered seed would force false-positive merges against any
+    // stored slice that was produced through plain serializeObject.
+    // We strip line_map only — that drop is safe (the merge's
+    // normalizeVerbForCompare already ignores line_map).
     const seed: SeedWorld = {
       ...slice,
       objectCounter: nextScopedObjectCounter(slice.objects.map((obj) => obj.id)),
@@ -5233,10 +5272,21 @@ export class WooWorld {
       logs: [],
       snapshots: [],
       parkedTasks: [],
-      tombstones: slice.tombstones ?? []
+      tombstones: slice.tombstones ?? [],
+      objects: slice.objects.map(stripAuthoringMetadataFromObject)
     };
-    this.hostSeedCache.set(host, { version, seed });
-    return seed;
+    // The digest is computed over a DIFFERENT, canonicalized form (the
+    // wire body is left untouched). Canonical form sorts per-object
+    // arrays and JSON object keys so the digest is stable across the
+    // gateway's own eviction/reload — without it, insertion-order Maps
+    // mid-runtime produce different bytes than alphabetical SQL
+    // hydration even when no world content changed, and every gateway
+    // cold-boot would force every satellite to take the full seed
+    // transfer. The canonical form is gateway-internal, never
+    // transmitted, so it doesn't perturb merge semantics.
+    const digest = hashSource(canonicalJsonStringify(canonicalSeedForDigest(seed)));
+    this.hostSeedCache.set(host, { version, seed, digest });
+    return { seed, digest };
   }
 
   importWorld(serialized: SerializedWorld): void {
@@ -9065,6 +9115,64 @@ function nextScopedObjectCounter(ids: Iterable<ObjRef>): number {
     if (Number.isSafeInteger(value) && value >= next) next = value + 1;
   }
   return next;
+}
+
+// Drop authoring metadata from a serialized object before host-seed delivery.
+// `line_map` is the dominant verb-payload contributor and is only consumed by
+// stack-trace formatting in tiny-vm.ts; the seed-merge comparison ignores it
+// (bootstrap.ts:normalizeVerbForCompare). See buildHostSeedForDelivery for the
+// full rationale and the degradation contract for non-bundled-catalog verbs.
+function stripAuthoringMetadataFromObject(obj: SerializedObject): SerializedObject {
+  return {
+    ...obj,
+    verbs: obj.verbs.map((verb) => ({ ...verb, line_map: {} }))
+  };
+}
+
+// Stable JSON serialization for digest computation. Recursively sorts JSON
+// object keys but leaves arrays in caller-supplied order — that's a separate
+// concern handled by `canonicalSeedForDigest` for the host-seed path, which
+// pre-sorts the arrays whose iteration order differs between mid-runtime Map
+// insertion order and post-hydration SQL ORDER BY order.
+function canonicalJsonStringify(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJsonStringify).join(",") + "]";
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalJsonStringify((value as Record<string, unknown>)[k])).join(",") + "}";
+  }
+  return "null";
+}
+
+// Build a digest-only canonical view of a SeedWorld. The returned value is
+// fed straight into canonicalJsonStringify; the original `seed` (the body on
+// the wire) is left untouched. Per-object arrays (verbs, propertyDefs,
+// properties, propertyVersions, eventSchemas, children, contents) are sorted
+// by their natural key so the digest is independent of Map insertion order.
+// Without this, a freshly-hydrated gateway (alphabetical SQL ORDER BY) would
+// hash differently than the same world mid-runtime (insertion-order Maps),
+// and the satellite digest probe would miss on every gateway eviction.
+function canonicalSeedForDigest(seed: SeedWorld): unknown {
+  return {
+    ...seed,
+    objects: seed.objects.map((obj) => ({
+      ...obj,
+      propertyDefs: [...obj.propertyDefs].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+      properties: [...obj.properties].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
+      propertyVersions: [...obj.propertyVersions].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
+      eventSchemas: [...obj.eventSchemas].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
+      // Verbs are slot-ordered by both insertion and SQL hydration, but sort
+      // defensively by slot in case a caller produced an unsorted list.
+      verbs: [...obj.verbs].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0)),
+      children: [...obj.children].sort(),
+      contents: [...obj.contents].sort()
+    }))
+  };
 }
 
 type SerializedWorldRowStats = {
