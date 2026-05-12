@@ -420,7 +420,6 @@ export async function executeShadowTurnCallOrNeedState(
         scope: request.key.scope,
         expected: request.expected ?? options.commitScope.head,
         transcript: run.transcript,
-        serialized_after: run.serializedAfter,
         executor: node.node
       })
     : null;

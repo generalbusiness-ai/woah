@@ -31,7 +31,7 @@ export type TurnRecorderEvent =
   | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string }
   | { kind: "prop_read"; object: ObjRef; name: string; value: WooValue; version?: number | string }
   | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string }
-  | { kind: "object_create"; object: ObjRef; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null }
+  | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"] }
   | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef }
   | { kind: "observe"; observation: Observation }
   | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }
@@ -88,10 +88,12 @@ export function objectCreateEvent(object: WooObject): TurnRecorderEvent {
   return {
     kind: "object_create",
     object: object.id,
+    name: object.name,
     parent: object.parent,
     owner: object.owner,
     anchor: object.anchor,
-    location: object.location
+    location: object.location,
+    flags: object.flags
   };
 }
 

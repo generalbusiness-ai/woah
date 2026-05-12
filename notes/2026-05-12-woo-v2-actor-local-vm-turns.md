@@ -1011,9 +1011,9 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   executions to a shadow commit scope.
 - `src/core/shadow-commit-scope.ts` adds the first load-bearing local commit
   service. It owns a shadow scope head and full authoritative serialized state,
-  accepts `CommitSubmit`-shaped messages from executors, merges only
-  transcript-touched object records from partial executor shards, and returns
-  accepted/conflict results.
+  accepts `CommitSubmit`-shaped messages from executors, applies transcript
+  create/write/move cells and sequenced-log outcome without trusting executor
+  post-state, and returns accepted/conflict results.
 - `tests/shadow-turn-exec.test.ts` covers the high-latency path: actor node
   starts cold, refuses without attempting execution, receives closure transfer,
   retries, accepts the receipt, and ends with warmed state. It now also drives a
@@ -1143,12 +1143,12 @@ Implementation learning:
   they add at least one failed RTT before fallback. This supports keeping ads
   advisory and investing in short TTLs, returned better-ads, and failure
   penalties rather than making gossip authoritative.
-- The commit-scope merge must be object-selective. Executors often run with a
-  partial shard; replacing the authoritative scope with the executor's
-  serialized-after shard would silently delete unrelated objects. The shadow
-  commit scope now merges only objects named by transcript writes/creates/moves
-  plus the relevant log/session/counter envelopes, then validates post-state
-  against the merged full state.
+- The commit-scope apply path must be transcript-authoritative. Executors often
+  run with a partial shard; replacing or merging from the executor's
+  serialized-after shard would silently trust unvalidated object cells. The
+  shadow commit scope now constructs post-state from transcript
+  writes/creates/moves plus the sequenced-log outcome, then validates post-state
+  against that authoritative full state.
 
 The local commit model has a first implementation:
 
@@ -1160,16 +1160,18 @@ The local commit model has a first implementation:
   coarse write authority, lifecycle/move consistency, and post-state checks;
 - done: VM read-level `missing_state` aborts catch cells missed by predicted
   TurnKeys;
+- done: commit scope no longer accepts executor `serialized_after` in commit
+  submit. It builds authoritative post-state directly from transcript
+  create/write/move cells and sequenced-log outcome; accepted frames still carry
+  the scope's resulting serialized state for cache/projection consumers.
 - remaining: decide how remote sub-transcripts are merged, or keep cross-host
   bridge calls explicitly incomplete until the execution plane is in place.
 
-The remaining work in that layer is to remove the executor `serialized_after`
-crutch by applying transcript writes directly in the commit scope, strengthen
-write authority from coarse recorded-owner checks into exact VM-frame authority,
-make remote bridge/sub-transcript behavior explicit, and replace the small
-tracked-native allowlist with a declarative primitive contract that states
-which native helpers are deterministic, which state they read, and which
-effects they may emit.
+The remaining work in that layer is to strengthen write authority from coarse
+recorded-owner checks into exact VM-frame authority, make remote
+bridge/sub-transcript behavior explicit, and replace the small tracked-native
+allowlist with a declarative primitive contract that states which native helpers
+are deterministic, which state they read, and which effects they may emit.
 
 The next state-plane implementation step is page/cell closure transfer:
 

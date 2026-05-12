@@ -318,8 +318,7 @@ describe("shadow turn execution", () => {
       id: "shadow-cell-merge-wet",
       scope: commitScopeRef,
       expected: structuredClone(commitScope.head),
-      transcript: wetRun.transcript,
-      serialized_after: wetRun.serializedAfter
+      transcript: wetRun.transcript
     });
     expect(wetAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
     expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("merge_box", "wet")).toBe(0.44);
@@ -342,8 +341,7 @@ describe("shadow turn execution", () => {
       id: "shadow-cell-merge-feedback",
       scope: commitScopeRef,
       expected: structuredClone(commitScope.head),
-      transcript: staleFeedbackRun.transcript,
-      serialized_after: staleFeedbackRun.serializedAfter
+      transcript: staleFeedbackRun.transcript
     });
 
     expect(feedbackAccepted.kind).toBe("woo.commit.accepted.shadow.v1");

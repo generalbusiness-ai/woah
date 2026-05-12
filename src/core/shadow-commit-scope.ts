@@ -4,6 +4,7 @@ import {
   validateTranscriptAgainstSerializedWorld,
   type EffectTranscript,
   type TranscriptCell,
+  type TranscriptCreate,
   type TranscriptWrite
 } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -25,7 +26,6 @@ export type ShadowCommitSubmit = {
   scope: ObjRef;
   expected: ShadowScopeHead;
   transcript: EffectTranscript;
-  serialized_after: SerializedWorld;
   executor?: string;
 };
 
@@ -117,10 +117,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     if (existing) return existing;
   }
 
-  // Shadow commit receives executor post-state as a prototype shortcut. The
-  // authoritative scope must merge touched records into its full state rather
-  // than trust a partial executor shard as the whole world.
-  const mergedAfter = mergeShadowCommittedState(scope.serialized, submit.serialized_after, submit.transcript);
+  const mergedAfter = applyShadowTranscriptToCommittedState(scope.serialized, submit.transcript);
   const extraErrors = shadowCommitEnvelopeErrors(scope, submit);
   extraErrors.push(...validateShadowPostState(mergedAfter, submit.transcript));
   extraErrors.push(...validateShadowWriteAuthority(scope.serialized, submit.transcript));
@@ -250,58 +247,81 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
   return errors;
 }
 
-function mergeShadowCommittedState(current: SerializedWorld, executorAfter: SerializedWorld, transcript: EffectTranscript): SerializedWorld {
+function applyShadowTranscriptToCommittedState(current: SerializedWorld, transcript: EffectTranscript): SerializedWorld {
   const next = structuredClone(current) as SerializedWorld;
   const currentObjects = new Map<ObjRef, SerializedObject>(next.objects.map((obj) => [obj.id, obj]));
-  const executorObjects = new Map<ObjRef, SerializedObject>(executorAfter.objects.map((obj) => [obj.id, obj]));
 
-  // Object records remain the shadow transfer unit, but accepted commits must
-  // merge at cell granularity. A partial executor can hold stale unrelated
-  // cells on an object; copying the whole object record would clobber
-  // concurrent accepted cells that the transcript never wrote.
+  // The commit scope constructs authoritative post-state from the transcript.
+  // Executor post-world snapshots are intentionally not trusted across this
+  // boundary; they are diagnostics/cache-fill only.
   for (const create of transcript.creates) {
-    const obj = executorObjects.get(create.object);
-    if (!obj) continue;
-    const cloned = structuredClone(obj) as SerializedObject;
-    currentObjects.set(create.object, cloned);
-    if (cloned.parent) addUniqueObjectRef(currentObjects.get(cloned.parent)?.children, cloned.id);
-    if (cloned.location) addUniqueObjectRef(currentObjects.get(cloned.location)?.contents, cloned.id);
+    const created = serializedObjectFromCreate(create);
+    currentObjects.set(create.object, created);
+    if (created.parent) addUniqueObjectRef(currentObjects.get(created.parent)?.children, created.id);
+    if (created.location) addUniqueObjectRef(currentObjects.get(created.location)?.contents, created.id);
   }
   for (const write of finalWritesByCell(transcript)) {
-    applyTranscriptWrite(currentObjects, executorObjects, write);
+    applyTranscriptWrite(currentObjects, write);
   }
   next.objects = Array.from(currentObjects.values()).sort((a, b) => a.id.localeCompare(b.id));
-
-  const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(next.logs.map(([space, entries]) => [space, entries]));
-  for (const [space, entries] of executorAfter.logs) {
-    if (space === transcript.scope) logs.set(space, structuredClone(entries) as SerializedWorld["logs"][number][1]);
-  }
-  next.logs = Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b));
-
-  const sessions = new Map(next.sessions.map((session) => [session.id, session]));
-  for (const session of executorAfter.sessions) sessions.set(session.id, structuredClone(session) as typeof session);
-  next.sessions = Array.from(sessions.values()).sort((a, b) => a.id.localeCompare(b.id));
-
-  const snapshotKey = (snapshot: SerializedWorld["snapshots"][number]) => `${snapshot.space_id}:${snapshot.seq}:${snapshot.hash}`;
-  const snapshots = new Map(next.snapshots.map((snapshot) => [snapshotKey(snapshot), snapshot]));
-  for (const snapshot of executorAfter.snapshots) snapshots.set(snapshotKey(snapshot), structuredClone(snapshot) as typeof snapshot);
-  next.snapshots = Array.from(snapshots.values()).sort((a, b) =>
-    a.space_id.localeCompare(b.space_id) || a.seq - b.seq || a.hash.localeCompare(b.hash)
-  );
-
-  const parkedTasks = new Map(next.parkedTasks.map((task) => [task.id, task]));
-  for (const task of executorAfter.parkedTasks) parkedTasks.set(task.id, structuredClone(task) as typeof task);
-  next.parkedTasks = Array.from(parkedTasks.values()).sort((a, b) => a.id.localeCompare(b.id));
-  next.tombstones = Array.from(new Set([...(next.tombstones ?? []), ...(executorAfter.tombstones ?? [])])).sort();
-  next.objectCounter = Math.max(next.objectCounter, executorAfter.objectCounter);
-  next.parkedTaskCounter = Math.max(next.parkedTaskCounter, executorAfter.parkedTaskCounter);
-  next.sessionCounter = Math.max(next.sessionCounter, executorAfter.sessionCounter);
+  next.logs = applyTranscriptLog(next.logs, transcript);
+  next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
   return next;
+}
+
+function serializedObjectFromCreate(create: TranscriptCreate): SerializedObject {
+  return {
+    id: create.object,
+    name: create.name,
+    parent: create.parent,
+    owner: create.owner,
+    location: create.location,
+    anchor: create.anchor,
+    flags: structuredClone(create.flags) as SerializedObject["flags"],
+    created: 0,
+    modified: 0,
+    propertyDefs: [],
+    properties: [],
+    propertyVersions: [],
+    verbs: [],
+    children: [],
+    contents: [],
+    eventSchemas: []
+  };
+}
+
+function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: EffectTranscript): SerializedWorld["logs"] {
+  if (transcript.route !== "sequenced") return logEntries;
+  const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(
+    logEntries.map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]])
+  );
+  const entries = logs.get(transcript.scope) ?? [];
+  const message = {
+    actor: transcript.call.actor,
+    target: transcript.call.target,
+    verb: transcript.call.verb,
+    args: structuredClone(transcript.call.args) as WooValue[]
+  };
+  const existing = entries.findIndex((entry) => entry.seq === transcript.seq);
+  const entry = {
+    space: transcript.scope,
+    seq: transcript.seq,
+    ts: 0,
+    actor: transcript.call.actor,
+    message,
+    observations: structuredClone(transcript.observations) as EffectTranscript["observations"],
+    applied_ok: transcript.error === undefined,
+    ...(transcript.error ? { error: structuredClone(transcript.error) } : {})
+  };
+  if (existing >= 0) entries[existing] = entry;
+  else entries.push(entry);
+  entries.sort((a, b) => a.seq - b.seq);
+  logs.set(transcript.scope, entries);
+  return Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b));
 }
 
 function applyTranscriptWrite(
   currentObjects: Map<ObjRef, SerializedObject>,
-  executorObjects: Map<ObjRef, SerializedObject>,
   write: TranscriptWrite
 ): void {
   const target = currentObjects.get(write.cell.object);
@@ -317,10 +337,6 @@ function applyTranscriptWrite(
       if (Array.isArray(write.value)) target.contents = write.value.filter((item): item is ObjRef => typeof item === "string");
       return;
     case "lifecycle": {
-      if (write.op === "create") {
-        const created = executorObjects.get(write.cell.object);
-        if (created) currentObjects.set(write.cell.object, structuredClone(created) as SerializedObject);
-      }
       return;
     }
     case "verb":
@@ -339,6 +355,7 @@ function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void 
   }
   const value = structuredClone(write.value) as WooValue;
   setSerializedProperty(target, propName, value);
+  if (propName === "name" && typeof value === "string") target.name = value;
   setSerializedPropertyVersion(target, propName, write.next);
 }
 
@@ -364,6 +381,16 @@ function addUniqueObjectRef(list: ObjRef[] | undefined, id: ObjRef): void {
   if (!list || list.includes(id)) return;
   list.push(id);
   list.sort();
+}
+
+function nextObjectCounterForCreates(current: number, creates: TranscriptCreate[]): number {
+  let next = current;
+  for (const create of creates) {
+    const match = create.object.match(/_(\d+)$/);
+    if (!match) continue;
+    next = Math.max(next, Number(match[1]) + 1);
+  }
+  return next;
 }
 
 function shadowWriterCandidates(transcript: EffectTranscript): Set<ObjRef> {

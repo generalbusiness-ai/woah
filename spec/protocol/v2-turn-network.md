@@ -495,10 +495,10 @@ authoritative serialized state and shadow `ScopeHead`, validates expected head,
 scope, completeness, session/actor shape, read versions, coarse write
 authority, lifecycle/move post-state, and touched-cell post-state hashes, then
 returns `woo.commit.accepted.shadow.v1` or `woo.commit.conflict.shadow.v1`.
-The shadow submit still carries an executor `serialized_after` so the prototype
-can merge transcript-touched object records from a partial shard into the full
-authoritative state. That field is a prototype crutch, not the production commit
-encoding.
+The shadow submit no longer carries executor post-state. The commit scope
+constructs authoritative post-state from transcript creates, writes, moves, and
+sequenced-log outcome, then exposes its own resulting `serialized_after` only on
+accepted frames for cache/projection consumers.
 
 ## VTN9. Catch-up and applied frames
 

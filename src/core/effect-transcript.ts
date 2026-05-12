@@ -23,10 +23,16 @@ export type TranscriptWrite = {
 
 export type TranscriptCreate = {
   object: ObjRef;
+  name: string;
   parent: ObjRef | null;
   owner: ObjRef;
   anchor: ObjRef | null;
   location: ObjRef | null;
+  flags: {
+    wizard?: boolean;
+    programmer?: boolean;
+    fertile?: boolean;
+  };
 };
 
 export type TranscriptMove = {
@@ -111,10 +117,12 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
       case "object_create":
         creates.push({
           object: event.object,
+          name: event.name,
           parent: event.parent,
           owner: event.owner,
           anchor: event.anchor,
-          location: event.location
+          location: event.location,
+          flags: event.flags
         });
         writes.push({
           cell: { kind: "lifecycle", object: event.object },
