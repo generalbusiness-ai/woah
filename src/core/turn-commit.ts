@@ -16,10 +16,16 @@ export type ShadowCommitReceipt = {
   errors: string[];
 };
 
-export function shadowCommitReceipt(serializedBefore: SerializedWorld, serializedAfter: SerializedWorld, transcript: EffectTranscript): ShadowCommitReceipt {
+export function shadowCommitReceipt(
+  serializedBefore: SerializedWorld,
+  serializedAfter: SerializedWorld,
+  transcript: EffectTranscript,
+  extraErrors: string[] = []
+): ShadowCommitReceipt {
   const validation = validateTranscriptAgainstSerializedWorld(serializedBefore, transcript);
   const errors = [
     ...validation.errors,
+    ...extraErrors,
     ...(transcript.complete ? [] : transcript.incompleteReasons.map((reason) => `incomplete:${reason}`))
   ];
   return {

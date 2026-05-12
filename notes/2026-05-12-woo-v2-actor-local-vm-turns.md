@@ -1007,7 +1007,13 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
 - `src/core/shadow-turn-network.ts` adds the first in-process routing harness:
   rank concrete `covers`/`accepts` ads, select a registered execution node,
   request object-record transfer from an anchor on miss, merge it into the
-  selected node's partial inventory, and retry the fresh call.
+  selected node's partial inventory, retry the fresh call, and submit successful
+  executions to a shadow commit scope.
+- `src/core/shadow-commit-scope.ts` adds the first load-bearing local commit
+  service. It owns a shadow scope head and full authoritative serialized state,
+  accepts `CommitSubmit`-shaped messages from executors, merges only
+  transcript-touched object records from partial executor shards, and returns
+  accepted/conflict results.
 - `tests/shadow-turn-exec.test.ts` covers the high-latency path: actor node
   starts cold, refuses without attempting execution, receives closure transfer,
   retries, accepts the receipt, and ends with warmed state. It now also drives a
@@ -1022,6 +1028,9 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   Inline object records are now checked against their advertised page hash
   before install, and transfers carry a shadow MAC proof scoped to the anchor
   authority and recipient node.
+  The same test file now proves that an accepted real dubspace action commits
+  through the shadow commit scope and that a later execution with a stale
+  expected head is rejected without mutating the authoritative scope.
 - `src/core/shadow-gossip-profile.ts` adds a deterministic profiling harness
   over the shadow executor. It runs the same fresh dubspace `TurnCall` through
   four network
@@ -1032,8 +1041,9 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
 - `scripts/profile-shadow-turn-network.ts` exposes the first CLI profile via
   `npm run v2:profile`, including a transfer-warmup table.
 
-This is intentionally diagnostic. It now produces a shadow transcript and has a
-small replay/diff foothold, but it is not yet a semantic verifier.
+This is still a shadow prototype. It now has a real in-process
+execute/commit/state-transfer loop, but it is not yet the production protocol
+or final authority model.
 
 Implementation learning:
 
@@ -1079,10 +1089,10 @@ Implementation learning:
   profile, the first `the_dubspace:set_control` turn transfers 13 inline object
   records, while the second turn against another control on the same object has
   one missing atom, five cached page refs, zero inline object records, and about
-  1.5 KiB transferred.
+  1.8 KiB transferred.
 - A browser-like node with catalog/class object pages preseeded reduces the
   first dubspace control transfer from about 253 KiB and 13 inline object
-  records to about 4.8 KiB and three inline live records (`the_dubspace`,
+  records to about 5.2 KiB and three inline live records (`the_dubspace`,
   `delay_1`, and the actor). This is the strongest evidence so far that an
   in-browser node should ship with or quickly acquire immutable catalog pages.
 - Hash-checking inline object pages plus the shadow anchor MAC is a useful
@@ -1098,19 +1108,30 @@ Implementation learning:
   they add at least one failed RTT before fallback. This supports keeping ads
   advisory and investing in short TTLs, returned better-ads, and failure
   penalties rather than making gossip authoritative.
+- The commit-scope merge must be object-selective. Executors often run with a
+  partial shard; replacing the authoritative scope with the executor's
+  serialized-after shard would silently delete unrelated objects. The shadow
+  commit scope now merges only objects named by transcript writes/creates/moves
+  plus the relevant log/session/counter envelopes, then validates post-state
+  against the merged full state.
 
-The next implementation step is to move from diagnostic replay toward a
-load-bearing local commit model:
+The local commit model has a first implementation:
 
-- turn the fresh `TurnCall` helper into a real execution-plane request/reply
-  boundary with explicit auth, selected-ad, and transfer policy fields;
-- decide how remote sub-transcripts are merged, or keep cross-host bridge calls
-  explicitly incomplete until the execution plane is in place;
-- replace the shadow receipt with a real commit-submit/accept/conflict path;
-- expand validation from read-set consistency to write permissions, lifecycle,
-  inherited defaults, and post-state checks;
-- add VM read-level `missing_state` aborts for cells missed by predicted
-  TurnKeys.
+- done: the fresh `TurnCall` helper now accepts a protocol-shaped request and
+  returns a shadow `TurnExecReply`;
+- done: the in-process network now submits successful executions to a
+  commit-submit/accept/conflict service;
+- done: validation now extends beyond read-set consistency to session shape,
+  coarse write authority, lifecycle/move consistency, and post-state checks;
+- done: VM read-level `missing_state` aborts catch cells missed by predicted
+  TurnKeys;
+- remaining: decide how remote sub-transcripts are merged, or keep cross-host
+  bridge calls explicitly incomplete until the execution plane is in place.
+
+The remaining work in that layer is to remove the executor `serialized_after`
+crutch by applying transcript writes directly in the commit scope, strengthen
+write authority from coarse recorded-owner checks into exact VM-frame authority,
+and make remote bridge/sub-transcript behavior explicit.
 
 The next state-plane implementation step is page/cell closure transfer:
 

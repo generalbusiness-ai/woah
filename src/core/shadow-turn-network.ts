@@ -1,5 +1,6 @@
 import { buildShadowCapabilityAd, rankCapabilityAdsForTurn, type ShadowCapabilityAd } from "./capability-ad";
 import type { SerializedWorld } from "./repository";
+import { createShadowCommitScope, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
@@ -60,14 +61,20 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   };
   transferMode?: "closure" | "object_records";
   maxTransfers?: number;
+  commitScope?: ShadowCommitScope;
 }): Promise<ShadowInProcessNetworkResult> {
   const ranked = rankCapabilityAdsForTurn(input.ads, input.request.key);
   const selectedAd = ranked[0];
   if (!selectedAd) throw new Error("no shadow executor ad covers requested turn");
   const selected = input.nodes.find((node) => node.node === selectedAd.node);
   if (!selected) throw new Error(`shadow executor not registered: ${selectedAd.node}`);
+  const commitScope = input.commitScope ?? createShadowCommitScope({
+    node: input.anchor.node,
+    scope: input.request.key.scope,
+    serialized: input.anchor.serialized
+  });
 
-  const first = await executeShadowTurnCallOrNeedState(selected, input.request);
+  const first = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope });
   let result = first;
   const transfers: ShadowStateTransfer[] = [];
   const maxTransfers = input.maxTransfers ?? 3;
@@ -88,10 +95,10 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
           known_object_hashes: selected.object_hashes,
           session: input.request.call.session,
           recipient: selected.node
-        });
+    });
     installShadowStateTransfer(selected, transfer);
     transfers.push(transfer);
-    result = await executeShadowTurnCallOrNeedState(selected, input.request);
+    result = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope });
   }
 
   if (transfers.length === 0) {

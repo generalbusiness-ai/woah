@@ -300,6 +300,8 @@ type EffectTranscript = {
   creates?: TranscriptCreate[];
   moves?: TranscriptMove[];
   recycles?: TranscriptRecycle[];
+  schedules?: ScheduledTurnRequest[];      // defined in VTN18
+  cancellations?: string[];                // schedule ids to cancel; defined in VTN18
   observations: WooObservation[];
   result?: WooValue;
   error?: WooError;
@@ -487,6 +489,17 @@ with the same exact-version rule as semantic reads. The first implementation may
 reject all stale projection reads while still carrying the type above for the
 future relaxed path.
 
+The shadow implementation now includes an in-process commit scope. It accepts
+`woo.commit.submit.shadow.v1` messages from the execution helper, owns the
+authoritative serialized state and shadow `ScopeHead`, validates expected head,
+scope, completeness, session/actor shape, read versions, coarse write
+authority, lifecycle/move post-state, and touched-cell post-state hashes, then
+returns `woo.commit.accepted.shadow.v1` or `woo.commit.conflict.shadow.v1`.
+The shadow submit still carries an executor `serialized_after` so the prototype
+can merge transcript-touched object records from a partial shard into the full
+authoritative state. That field is a prototype crutch, not the production commit
+encoding.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.
@@ -618,7 +631,8 @@ The `executeShadowRecordedTurnOrNeedState` helper is a diagnostic replay
 harness: it accepts an already recorded turn and replays it with recorded
 logical inputs. The newer `executeShadowTurnCallOrNeedState` helper follows the
 target protocol shape more closely: it receives a `TurnCall`, executes it fresh
-on the selected node, and validates the fresh transcript with a shadow receipt.
+on the selected node, returns a shadow `TurnExecReply`, and can submit the fresh
+transcript to the in-process shadow commit scope for accept/conflict handling.
 
 ## VTN11. Capability gossip
 
@@ -932,10 +946,11 @@ production v2 spec needs decisions on:
 
 ## VTN18. Scheduled turns (draft/proposed)
 
-> Status: **proposed**. This section is a design proposal, not yet implemented.
-> It describes how catalog code can arrange for periodic committed turns without
-> a global clock, analogous to Croquet's `future(ms).method()` but scoped to
-> individual commit scopes and expressed as durable scheduled turn requests.
+> Status: **proposed**. This section describes how catalog code arranges for
+> periodic committed turns without a global clock. It extends the `EffectTranscript`
+> from VTN7 with `schedules` and `cancellations` arrays, defines a
+> `ScopeTimeAdvance` control frame for the commit plane, and specifies the
+> logical-time advancement rule precisely. Not yet implemented.
 
 ### VTN18.1 Motivation
 
@@ -948,210 +963,292 @@ reflector, but the commit scope for a space already owns a sequenced log and a
 logical time. A scope-local equivalent of `future()` can be built from that
 without a global dependency.
 
-The key insight is that a scheduled turn is just a committed turn that will
-happen later. It can be written into the commit scope's pending queue as part
-of an existing transcript's writes, and delivered by the scope's infrastructure
-node when the scope's logical time reaches the target.
+A scheduled turn is a committed turn that will happen later. It is recorded in
+the scheduling transcript as a first-class output (parallel to `creates` and
+`observations`), stored in the scope's durable pending queue, and fired by the
+scope's infrastructure when the scope's logical time reaches the target.
 
-### VTN18.2 ScheduledTurnRequest
+### VTN18.2 ScheduledTurnRequest and transcript extension
 
-A `ScheduledTurnRequest` is a special write that a committed verb can record.
-The commit scope stores pending requests and fires them as ordinary committed
-turns when their logical time is reached.
+`ScheduledTurnRequest` carries a full authority context so the commit scope can
+validate the scheduled turn exactly as it would validate a live-submitted one.
 
 ```ts
 type ScheduledTurnRequest = {
-  kind: "woo.scheduled_turn_request.v1";
-  id: string;                // stable idempotency key; prevents duplicate delivery
-  scope: ScopeRef;           // MUST match the current commit scope
-  target: ObjRef;
-  verb: string;
-  args: WooValue[];
-  at_logical_time: number;   // absolute logical time, not relative
-  epoch: Epoch;              // must match scope epoch at submission time
+  kind:            "woo.scheduled_turn_request.v1";
+  id:              string;       // caller-chosen stable key; see VTN18.3
+  scope:           ScopeRef;     // MUST match the current commit scope
+  epoch:           Epoch;        // MUST match scope epoch; stale entries cancelled
+  at_logical_time: number;       // absolute delivery target; > turn's logical_time
+  call: {
+    actor:        ActorRef;      // actor on whose behalf the turn fires
+    target:       ObjRef;
+    verb:         string;
+    args:         WooValue[];
+    caller_perms: ObjRef;        // progr at schedule time; bounds permission checks
+    route:        "committed";
+  };
+  authority:
+    | { kind: "scheduling_actor" }
+    // actor and caller_perms above are sufficient; commit scope validates
+    // permissions against live actor state at delivery time.
+    | { kind: "service_actor"; actor: ActorRef }
+    // Fire as a declared service actor regardless of who scheduled it.
+    // Requires the scheduling turn's actor to hold the delegation capability.
 };
 ```
 
-A `ScheduledTurnRequest` is written into the transcript with `op: "schedule"`.
-The commit scope validates it alongside other writes:
-
-- `scope` MUST match the commit scope.
-- `epoch` MUST match the current scope epoch. If the scope migrates, pending
-  scheduled turns from prior epochs are cancelled.
-- `at_logical_time` MUST be strictly greater than the turn's
-  `LogicalInputs.logical_time`.
-- `id` MUST be unique within the scope; a duplicate id with a different payload
-  is rejected.
-
-A given `ScheduledTurnRequest.id` may appear in at most one pending slot. A
-later committed turn may cancel a pending request by writing `op: "cancel_schedule"`
-with the same `id`. Not re-scheduling (simply not writing a new request) is
-sufficient to stop a periodic chain.
-
-### VTN18.3 DSL builtin: `schedule`
-
-```
-schedule(target, verb, args, delay_ms)
-```
-
-Records a `ScheduledTurnRequest` for `target:verb(args...)` to fire at
-`current_logical_time + delay_ms`. The `id` is derived deterministically from
-the enclosing turn's `TurnId` and a per-turn counter so it is stable across
-replays.
-
-For self-rescheduling (the common tick pattern):
-
-```
-// Every :step() call reschedules the next one.
-verb :step() rxd {
-  // ... advance state ...
-  if this.running {
-    schedule(this, "step", [], this.tick_ms);
-  }
-}
-```
-
-`schedule()` is a same-scope primitive. It MUST NOT schedule a turn on a
-different scope. Cross-scope scheduling requires a separate committed turn on
-the target scope, submitted through normal channels.
-
-### VTN18.4 Scope-local logical-time advancement
-
-A commit scope maintains a `logical_time: number` that advances monotonically
-with each accepted turn. The commit scope infrastructure node is responsible
-for draining the pending schedule queue.
-
-Two delivery mechanisms are defined:
-
-**Activity-driven delivery.** When any committed turn is accepted, the scope
-checks its pending queue and immediately submits any requests with
-`at_logical_time <= new_logical_time`. For scopes that receive regular external
-activity, this is sufficient. No additional infrastructure is needed.
-
-**Heartbeat delivery.** A scope with pending scheduled requests and no
-incoming activity must still advance logical time to fire its queue. An
-opt-in **scope heartbeat** is activated when a `ScheduledTurnRequest` is first
-accepted into a previously-quiet scope. The scope's infrastructure node sends a
-periodic `advance_time` message — an empty committed turn whose only effect is
-advancing `logical_time` — at a rate no faster than the scope's configured
-`min_tick_ms` floor (default: 16 ms). The heartbeat stops when the pending
-queue empties.
+`ScheduledTurnRequest` entries appear in the `schedules` array of
+`EffectTranscript` (VTN7 fields added here):
 
 ```ts
-type AdvanceTime = {
-  kind: "woo.advance_time.v1";
-  scope: ScopeRef;
-  epoch: Epoch;
-  logical_time: number;
+// Extension to EffectTranscript (VTN7):
+schedules?:     ScheduledTurnRequest[];
+cancellations?: string[];   // schedule ids to remove from pending queue
+```
+
+`schedules` and `cancellations` are **not** `TranscriptWrite` entries. They
+MUST NOT be represented with a fabricated `op` value. They are parallel to
+`creates` and `recycles`: named, typed arrays with their own validation path.
+Both arrays are included in the `post_state_hash` preimage because the pending
+queue is durable scope state.
+
+Commit scope validation for `schedules`:
+
+- `scope` MUST match the current commit scope; reject otherwise.
+- `epoch` MUST match the current scope epoch.
+- `at_logical_time` MUST be strictly greater than the scheduling turn's
+  assigned `logical_time`.
+- `id` is an **upsert key**: if a pending entry with the same `id` already
+  exists it is replaced atomically; otherwise the new entry is inserted. This
+  allows `start_ticking` to re-arm an existing chain without explicit
+  cancellation (see VTN18.7).
+- For `authority.kind = "service_actor"`: the scheduling actor MUST hold the
+  delegation capability for the named service actor.
+
+Commit scope validation for `cancellations`:
+
+- Each `id` removes the matching pending entry if one exists; cancelling a
+  non-existent id is a no-op.
+- `cancellations` and `schedules` are applied atomically. An `id` that appears
+  in both arrays in the same transcript is rejected.
+
+### VTN18.3 DSL builtin: `schedule` and `cancel_schedule`
+
+```
+schedule(target, verb, args, delay_ms)           // turn-unique id
+schedule(target, verb, args, delay_ms, id: key)  // stable caller-supplied id
+
+cancel_schedule(id)                              // appends id to cancellations[]
+```
+
+The two forms of `schedule()` differ only in id derivation:
+
+- **Turn-unique**: `id = deterministic_hash(turn_id, per_turn_counter)`. Each
+  call within one turn gets a distinct id; stable across replays. Use for
+  one-shot deferred calls.
+- **Stable-key**: `id = key` as supplied. The commit scope upserts: an existing
+  pending entry with this id is replaced. Use for periodic self-rescheduling
+  chains (see VTN18.7).
+
+`at_logical_time` is computed before recording:
+
+```
+at_logical_time = current_logical_time + delay_ms
+```
+
+No floor adjustment is performed by the builtin. The minimum-interval floor is
+enforced by the commit scope at delivery time (see VTN18.5). The transcript
+records exactly what the verb requested; the scope decides when it is safe to
+deliver.
+
+`schedule()` is same-scope only. It MUST NOT target a different scope. Cross-scope
+scheduling requires a separate committed turn submitted through normal channels.
+
+### VTN18.4 Logical-time advancement and due-turn delivery
+
+The commit scope maintains two durable state fields:
+
+```
+scope.logical_time:  number
+scope.pending_queue: ScheduledTurnRequest[]   // sorted by (at_logical_time, id)
+```
+
+Both contribute to `post_state_hash`.
+
+**Assignment rule for all committed turns:**
+
+```
+scope.logical_time ← max(scope.logical_time + 1, inputs.logical_time)
+```
+
+The commit scope assigns `inputs.logical_time` for each turn it accepts. For
+interactive turns the scope assigns `scope.logical_time + 1`. The monotonic
+increment ensures that no two accepted turns share a `logical_time`.
+
+**Due-turn delivery order:**
+
+After advancing `scope.logical_time`, the commit scope fires all pending entries
+with `at_logical_time <= scope.logical_time`, in order `(at_logical_time ASC,
+id ASC)`. Each fired turn advances `scope.logical_time` by at least 1 before the
+next one fires. Turns sharing an `at_logical_time` are therefore delivered in `id`
+order with consecutive sequence numbers.
+
+**Heartbeat via ScopeTimeAdvance:**
+
+When the pending queue is non-empty and no interactive turns arrive, the scope's
+infrastructure node sends a `ScopeTimeAdvance` control frame to trigger delivery:
+
+```ts
+type ScopeTimeAdvance = {
+  kind:       "woo.scope.time_advance.v1";
+  scope:      ScopeRef;
+  epoch:      Epoch;
+  expected:   ScopeHead;   // MUST match current scope head; prevents races
+  advance_to: number;      // MUST be > scope.logical_time
+};
+
+type ScopeTimeAdvanced = {
+  kind:     "woo.scope.time_advanced.v1";
+  scope:    ScopeRef;
+  position: CommitPosition;  // scope head after advancing and firing due turns
+  fired:    TurnId[];        // ids of scheduled turns submitted as a result
 };
 ```
 
-`AdvanceTime` is submitted to the commit scope as an ordinary committed turn
-with no `target`, no `verb`, and no transcript reads or writes beyond the
-scope's own `logical_time` cell. It is idempotent: the scope accepts it only
-if `logical_time` is strictly greater than the current value.
+`ScopeTimeAdvance` is a **commit-scope control frame**, not a `TurnCall`. It
+has no `target`, no `verb`, no VM execution, and produces no `EffectTranscript`.
+Processing: validate epoch and expected head; advance `scope.logical_time` to
+`advance_to`; fire all due entries in order; return `ScopeTimeAdvanced`.
 
-The heartbeat node does **not** need to run at the full requested tick rate. It
-runs at least fast enough to keep pending deliveries within one tick interval of
-their target time.
+The heartbeat stops when the pending queue empties. For Cloudflare DO commit
+scopes, the DO Durable Alarm replaces an external heartbeat driver: the DO sets
+its alarm to the earliest `at_logical_time` in the queue and wakes itself to send
+`ScopeTimeAdvance` when the alarm fires.
 
-### VTN18.5 Minimum tick floor
+### VTN18.5 Minimum delivery interval
 
-The commit scope MUST enforce a minimum interval between consecutive scheduled
-turns targeting the same `(scope, target, verb)` triple. The default floor is
-16 ms (≈ 60 Hz). Tighter rates require explicit scope configuration. A request
-that would produce a turn before the floor has elapsed is delayed to the floor
-boundary rather than rejected.
+The commit scope enforces a minimum interval between consecutive deliveries of
+the same `(target, verb)` pair. Default floor: 16 ms. The floor may be raised
+per scope configuration; it may not be lowered below 1 ms.
 
-This prevents catalog code from accidentally constructing a spinning committed
-loop that saturates the commit scope's bandwidth.
+The floor is applied at delivery time, not at recording time. The commit scope
+tracks `last_delivered_at[(target, verb)]`. When a due entry would fire within
+`last_delivered_at + min_tick_ms`, it is deferred to `last_delivered_at + min_tick_ms`
+in the pending queue. The recorded `at_logical_time` in the transcript is not
+changed; the `inputs.logical_time` assigned by the scope at actual delivery may
+be later. Catalog code receives the floor rate when it requests faster ticks;
+no error is returned.
 
-### VTN18.6 Epoch migration and cancellation
+### VTN18.6 Epoch migration
 
-Pending `ScheduledTurnRequest` entries are durable state in the commit scope.
-When the scope epoch is fenced (sequencer migration, `CommitConflict` with
-`scope_mismatch`, or explicit demotion):
+When the scope epoch is fenced:
 
-- All pending requests from prior epochs are **cancelled**.
-- Any in-flight `AdvanceTime` carrying a stale epoch is rejected.
-- If the scope resumes under a new epoch, catalog code must explicitly
-  re-register its scheduled turns. The `$tick_source` feature (see VTN18.7)
-  handles this by re-calling `start_ticking` from a scope-resume hook.
+- All pending entries with a stale `epoch` are cancelled.
+- Any in-flight `ScopeTimeAdvance` carrying a stale epoch is rejected.
+- Catalog code that needs periodic execution after epoch migration must
+  re-register. The `$tick_source` pattern handles this through the
+  `scope_resumed` observation described in VTN18.7.
 
 ### VTN18.7 Catalog pattern: `$tick_source`
 
-The scheduling primitive is generic. The recommended catalog abstraction for
-periodic scope-local execution is a `$tick_source` feature. This is informative,
-not normative.
+Informative, not normative. `$tick_source` uses the stable-key form of
+`schedule()` so that `start_ticking` is idempotent: calling it while a chain
+is already running replaces the existing pending entry rather than creating a
+duplicate.
 
 ```
 feature $tick_source {
-  prop tick_ms     default 100;
-  prop ticking     default false;
+  prop tick_ms   default 100;
+  prop ticking   default false;
 
-  // Call to activate periodic :tick() dispatch at the given rate.
+  // Stable key derived from object identity, not turn id.
+  prop _tick_key = hash("tick_source:" + this.id + ":_tick");
+
   verb :start_ticking(rate_ms) rxd {
     this.tick_ms = rate_ms;
     this.ticking = true;
-    schedule(this, "_tick", [], rate_ms);
+    schedule(this, "_tick", [], rate_ms, id: this._tick_key);
   }
 
-  // Call to deactivate.
   verb :stop_ticking() rxd {
     this.ticking = false;
-    // Not rescheduling is sufficient; the pending request will fire once
-    // but _tick will observe ticking=false and not reschedule.
+    cancel_schedule(this._tick_key);
   }
 
-  // Internal: do not call directly.
+  // Delivered by commit scope infrastructure; do not call directly.
   verb :_tick() rxd {
     if !this.ticking { return; }
-    call(this, "tick");                       // dispatch to the consumer's :tick
-    schedule(this, "_tick", [], this.tick_ms);
+    call(this, "tick");
+    schedule(this, "_tick", [], this.tick_ms, id: this._tick_key);
+  }
+
+  // Re-arm after epoch migration. Subscribe to scope_resumed observation
+  // (type TBD in catalog model) and call this handler.
+  verb :_on_scope_resumed() rxd {
+    if this.ticking {
+      schedule(this, "_tick", [], this.tick_ms, id: this._tick_key);
+    }
   }
 }
 ```
 
-An object using `$tick_source` defines `:tick()` to do its periodic work. A
-dubspace with transport would call `this.start_ticking(16)` when play begins
-and `this.stop_ticking()` when the transport pauses.
+### VTN18.8 Authority at delivery time
 
-### VTN18.8 Live vs. committed ticks
+The commit scope constructs a `TurnCall` from the `ScheduledTurnRequest.call`
+fields at delivery and validates it as it would any actor-submitted turn:
 
-Not all periodic behavior requires committed turns. The choice:
+```ts
+{
+  id:     scheduled_entry.id + "@" + String(scope.logical_time),
+  actor:  scheduled_entry.call.actor,   // or service_actor for service authority
+  target: scheduled_entry.call.target,
+  verb:   scheduled_entry.call.verb,
+  args:   scheduled_entry.call.args,
+  caller: "$system",   // indicates infrastructure delivery
+  route:  "committed"
+}
+```
+
+Permission checks run against live world state at delivery time, not at
+schedule time. If the actor no longer holds the required permission the turn
+produces an error frame and the pending entry is removed. Failed scheduled turns
+are not retried automatically; catalog code must re-register if it wants retry
+behavior.
+
+### VTN18.9 Queue storage
+
+The pending schedule queue is **durable commit-scope state**:
+
+- Stored alongside the sequenced log head in the scope's durable storage.
+- Its serialized content is included in the `post_state_hash` preimage.
+- On cold activation the queue is loaded from durable storage. Entries overdue
+  at activation time fire on the next `ScopeTimeAdvance` or interactive turn.
+- For Cloudflare DO commit scopes: serialized into DO storage alongside the log
+  head; the DO Durable Alarm drives delivery, replacing any external heartbeat.
+
+### VTN18.10 Live vs. committed ticks
 
 | Behavior | Plane | Rationale |
 |---|---|---|
 | Dubspace slider/cursor previews | Live | High-rate, lossy-ok, display only |
 | Pattern step advance, loop boundary | Committed | Must be ordered, reproducible |
 | Transport `playing_since` / position write | Committed | Durable mutation, must replay |
-| Visual animation interpolation in browser | Browser-local only | Ephemeral display state |
+| Visual animation interpolation in browser | Browser-local | Ephemeral display state |
 | Presence heartbeat | Live | Best-effort |
 
-A scope should not use committed ticks for behavior that is acceptable at live
-quality. Every committed tick is a full transcript with a state hash and receipt.
-At 60 Hz that is ~60 committed turns per second; this is appropriate only for
-scopes where the state changes at that rate and those changes must be durable.
-Smooth visual animation driven from a 60 Hz committed loop is the wrong design
-for almost all use cases; it belongs on the live plane or in the browser's local
-animation loop.
+A committed tick is a full transcript with a state hash and receipt. At 60 Hz
+that is ~60 committed turns per second, appropriate only when state changes at
+that rate and those changes must survive replay.
 
-### VTN18.9 Open questions
+### VTN18.11 Open questions
 
-- **Who hosts the heartbeat node?** For a Cloudflare DO commit scope, the DO
-  itself can set a WebSocket alarm or Durable Alarm; no separate node is needed.
-  For other deployments, an infrastructure node must register itself as the
-  heartbeat driver.
-- **Persistence of the pending queue.** Is the schedule queue part of the
-  sequenced log (replayed on cold activate) or a separate durable cell in the
-  scope? If it is part of the log, cold activation replays it and fires
-  overdue entries immediately.
-- **Maximum queue depth.** Should there be a cap on pending requests per scope
-  to prevent queue-hoarding?
-- **Scheduled turns and TurnKey prediction.** Because scheduled turns are
-  initiated by the commit scope infrastructure (not by the actor node), they
-  bypass the normal TurnKey / capability-ad routing. The scope's infrastructure
-  node is the executor. This simplifies routing but means the actor node
-  receives the resulting `AppliedFrame` rather than executing locally.
-- **`$tick_source` epoch-resume hook.** The hook for re-registering ticks after
-  scope migration is not yet defined in the catalog model.
+- **Maximum queue depth.** A cap on pending entries per scope prevents
+  queue-hoarding; 1000 entries per scope is a plausible default.
+- **Scheduled turns and TurnKey routing.** Scheduled turns are submitted by the
+  commit scope infrastructure, bypassing capability-ad routing. The scope node
+  is always the executor; actor-node optimistic execution of scheduled turns is
+  deferred.
+- **`scope_resumed` observation.** The system observation type that `$tick_source`
+  subscribes to for epoch-migration recovery is not yet defined in the catalog
+  model.

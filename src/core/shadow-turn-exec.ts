@@ -12,6 +12,13 @@ import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
+import {
+  submitShadowCommit,
+  type ShadowCommitAccepted,
+  type ShadowCommitConflict,
+  type ShadowCommitScope,
+  type ShadowScopeHead
+} from "./shadow-commit-scope";
 import { constantTimeEqual, hashSource } from "./source-hash";
 import { stableShadowJson } from "./shadow-cell-version";
 
@@ -101,6 +108,7 @@ export type ShadowTurnExecutionResult =
       missing_atoms: ShadowMissingAtom[];
       transcript?: EffectTranscript;
       frame?: AppliedFrame | DirectResultFrame | ErrorFrame;
+      reply?: ShadowTurnExecReply;
     }
   | {
       ok: false;
@@ -108,15 +116,19 @@ export type ShadowTurnExecutionResult =
       attempted: true;
       transcript: EffectTranscript;
       receipt: ShadowCommitReceipt;
+      commit?: ShadowCommitConflict;
       frame: AppliedFrame | DirectResultFrame | ErrorFrame;
+      reply?: ShadowTurnExecReply;
     }
   | {
       ok: true;
       attempted: true;
       transcript: EffectTranscript;
       receipt: ShadowCommitReceipt;
+      commit?: ShadowCommitAccepted;
       frame: AppliedFrame | DirectResultFrame | ErrorFrame;
       serializedAfter: SerializedWorld;
+      reply?: ShadowTurnExecReply;
     };
 
 export type ShadowTurnExecRequest = {
@@ -124,6 +136,43 @@ export type ShadowTurnExecRequest = {
   id?: string;
   call: ShadowTurnCall;
   key: ShadowTurnKey;
+  expected?: ShadowScopeHead;
+  auth?: {
+    mode: "shadow_local";
+    actor: ObjRef;
+    session?: string | null;
+  };
+  selected_ad?: string;
+  requested_transfer?: {
+    mode: "closure" | "object_records";
+    atom_hashes?: string[];
+    max_bytes?: number;
+  };
+  max_transfer_bytes?: number;
+  commit_policy?: "execute_and_commit" | "execute_only";
+};
+
+export type ShadowTurnExecReply =
+  | {
+      kind: "woo.turn.exec.reply.shadow.v1";
+      ok: true;
+      id?: string;
+      outcome: { result?: WooValue; error?: WooValue };
+      transcript: EffectTranscript;
+      commit?: ShadowCommitAccepted;
+    }
+  | {
+      kind: "woo.turn.exec.reply.shadow.v1";
+      ok: false;
+      id?: string;
+      reason: "missing_state" | "commit_rejected";
+      missing_atoms?: ShadowMissingAtom[];
+      transcript?: EffectTranscript;
+      commit?: ShadowCommitConflict;
+    };
+
+export type ShadowTurnExecutionOptions = {
+  commitScope?: ShadowCommitScope;
 };
 
 export function createShadowExecutionNode(input: {
@@ -309,17 +358,20 @@ export async function executeShadowRecordedTurnOrNeedState(
 
 export async function executeShadowTurnCallOrNeedState(
   node: ShadowExecutionNode,
-  request: ShadowTurnExecRequest
+  request: ShadowTurnExecRequest,
+  options: ShadowTurnExecutionOptions = {}
 ): Promise<ShadowTurnExecutionResult> {
   const missing = missingAtomsForShadowTurn(node, request.key);
   if (missing.length > 0 || !node.serialized) {
+    const missingAtoms = missing.length > 0
+      ? missing
+      : request.key.atom_hashes.map((hash, index) => ({ hash, preimage: request.key.preimages[index] }));
     return {
       ok: false,
       reason: "missing_state",
       attempted: false,
-      missing_atoms: missing.length > 0
-        ? missing
-        : request.key.atom_hashes.map((hash, index) => ({ hash, preimage: request.key.preimages[index] }))
+      missing_atoms: missingAtoms,
+      reply: missingStateReply(request, missingAtoms)
     };
   }
 
@@ -335,7 +387,8 @@ export async function executeShadowTurnCallOrNeedState(
       attempted: true,
       missing_atoms: needState,
       frame: run.frame,
-      transcript: run.transcript
+      transcript: run.transcript,
+      reply: missingStateReply(request, needState, run.transcript)
     };
   }
   const actualKey = shadowTurnKeyFromTranscript(run.transcript);
@@ -347,23 +400,43 @@ export async function executeShadowTurnCallOrNeedState(
       attempted: true,
       missing_atoms: unmaterialized,
       frame: run.frame,
-      transcript: run.transcript
+      transcript: run.transcript,
+      reply: missingStateReply(request, unmaterialized, run.transcript)
     };
   }
 
-  const receipt = shadowCommitReceipt(serializedBefore, run.serializedAfter, run.transcript);
+  const commit = options.commitScope && request.commit_policy !== "execute_only"
+    ? submitShadowCommit(options.commitScope, {
+        kind: "woo.commit.submit.shadow.v1",
+        id: request.id ?? request.call.id,
+        scope: request.key.scope,
+        expected: request.expected ?? options.commitScope.head,
+        transcript: run.transcript,
+        serialized_after: run.serializedAfter,
+        executor: node.node
+      })
+    : null;
+  const receipt = commit
+    ? commit.receipt
+    : shadowCommitReceipt(serializedBefore, run.serializedAfter, run.transcript);
   if (!receipt.accepted) {
+    const conflict = commit?.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
     return {
       ok: false,
       reason: "commit_rejected",
       attempted: true,
       frame: run.frame,
       transcript: run.transcript,
-      receipt
+      receipt,
+      commit: conflict,
+      reply: commitRejectedReply(request, run.transcript, conflict)
     };
   }
 
-  node.serialized = structuredClone(run.serializedAfter) as SerializedWorld;
+  const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
+    ? commit.serialized_after
+    : run.serializedAfter;
+  node.serialized = structuredClone(serializedAfter) as SerializedWorld;
   for (const hash of actualKey.atom_hashes) node.atom_hashes.add(hash);
   for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
   refreshNodeObjectHashes(node);
@@ -373,7 +446,9 @@ export async function executeShadowTurnCallOrNeedState(
     frame: run.frame,
     transcript: run.transcript,
     receipt,
-    serializedAfter: run.serializedAfter
+    commit: commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined,
+    serializedAfter,
+    reply: successReply(request, run.transcript, commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined)
   };
 }
 
@@ -516,6 +591,54 @@ function missingAtomsFromNeedStateTranscript(transcript: EffectTranscript): Shad
       ? [{ hash: map.hash, ...(typeof map.preimage === "string" ? { preimage: map.preimage } : {}) }]
       : [];
   });
+}
+
+function missingStateReply(
+  request: ShadowTurnExecRequest,
+  missingAtoms: ShadowMissingAtom[],
+  transcript?: EffectTranscript
+): ShadowTurnExecReply {
+  return {
+    kind: "woo.turn.exec.reply.shadow.v1",
+    ok: false,
+    id: request.id ?? request.call.id,
+    reason: "missing_state",
+    missing_atoms: missingAtoms,
+    transcript
+  };
+}
+
+function commitRejectedReply(
+  request: ShadowTurnExecRequest,
+  transcript: EffectTranscript,
+  commit?: ShadowCommitConflict
+): ShadowTurnExecReply {
+  return {
+    kind: "woo.turn.exec.reply.shadow.v1",
+    ok: false,
+    id: request.id ?? request.call.id,
+    reason: "commit_rejected",
+    transcript,
+    commit
+  };
+}
+
+function successReply(
+  request: ShadowTurnExecRequest,
+  transcript: EffectTranscript,
+  commit?: ShadowCommitAccepted
+): ShadowTurnExecReply {
+  const outcome = transcript.error
+    ? { error: transcript.error as unknown as WooValue }
+    : { result: transcript.result };
+  return {
+    kind: "woo.turn.exec.reply.shadow.v1",
+    ok: true,
+    id: request.id ?? request.call.id,
+    outcome,
+    transcript,
+    commit
+  };
 }
 
 function objectClosureForPreimages(serialized: SerializedWorld, preimages: string[]): Set<ObjRef> {

@@ -3,6 +3,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { capabilityAdProbablyCoversTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
+import { createShadowCommitScope } from "../src/core/shadow-commit-scope";
 import {
   buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
@@ -205,6 +206,80 @@ describe("shadow turn execution", () => {
     expect(routed.result.transcript.hash).toBe(planned.transcript.hash);
     expect(routed.result.receipt.accepted).toBe(true);
     expect(createWorldFromSerialized(routed.result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.72);
+  });
+
+  it("commits fresh network execution through a shadow commit scope and rejects stale heads", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-commit-scope");
+    const actor = session.actor;
+    await anchor.directCall("shadow-commit-scope-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+
+    const serializedBefore = anchor.exportWorld();
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const initialHead = structuredClone(commitScope.head);
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-commit-scope-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.58]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const routed = await executeShadowTurnCallAcrossInProcessNetwork({
+      request: { kind: "woo.turn_exec_request.shadow.v1" as const, call, key, expected: initialHead },
+      nodes: [createShadowExecutionNode({ node: "actor-node", scope: key.scope })],
+      ads: [buildShadowTurnExecAd({ node: "actor-node", scope: key.scope, key, factor: 0.1 })],
+      anchor: { node: "stable-anchor", serialized: serializedBefore },
+      commitScope
+    });
+
+    expect(routed.result).toMatchObject({
+      ok: true,
+      commit: { kind: "woo.commit.accepted.shadow.v1", position: { scope: "the_dubspace", seq: 1 } },
+      reply: { kind: "woo.turn.exec.reply.shadow.v1", ok: true, commit: { kind: "woo.commit.accepted.shadow.v1" } }
+    });
+    if (!routed.result.ok) throw new Error(`commit-scope execution failed: ${routed.result.reason}`);
+    expect(commitScope.head.seq).toBe(1);
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
+    expect(commitScope.serialized.objects.length).toBe(serializedBefore.objects.length);
+
+    const staleCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-commit-scope-stale",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.59]
+    };
+    const staleKey = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, staleCall)).transcript);
+    const staleNode = createShadowExecutionNode({
+      node: "stale-actor",
+      scope: staleKey.scope,
+      atom_hashes: staleKey.atom_hashes,
+      serialized: serializedBefore
+    });
+    const stale = await executeShadowTurnCallOrNeedState(staleNode, {
+      kind: "woo.turn_exec_request.shadow.v1",
+      call: staleCall,
+      key: staleKey,
+      expected: initialHead
+    }, { commitScope });
+
+    expect(stale).toMatchObject({
+      ok: false,
+      reason: "commit_rejected",
+      commit: { kind: "woo.commit.conflict.shadow.v1", reason: "stale_head" },
+      reply: { kind: "woo.turn.exec.reply.shadow.v1", ok: false, reason: "commit_rejected" }
+    });
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
+    expect(createWorldFromSerialized(staleNode.serialized!, { persist: false }).getProp("delay_1", "wet")).not.toBe(0.59);
   });
 
   it("uses cached object pages so a second real dubspace turn transfers no lineage records", async () => {

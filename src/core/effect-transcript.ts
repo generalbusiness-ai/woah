@@ -61,6 +61,8 @@ export type TranscriptValidation = {
   errors: string[];
 };
 
+export type TranscriptCellRead = { ok: true; version?: string; value: WooValue } | { ok: false; error: string };
+
 export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTranscript {
   const reads: TranscriptRead[] = [];
   const writes: TranscriptWrite[] = [];
@@ -246,9 +248,11 @@ export function transcriptTouchedStateHash(serialized: SerializedWorld, transcri
   } as unknown as WooValue));
 }
 
-type ActualReadCell = { ok: true; version?: string; value: WooValue } | { ok: false; error: string };
+export function readTranscriptCellFromSerializedWorld(serialized: SerializedWorld, cell: TranscriptCell): TranscriptCellRead {
+  return actualReadCell(serialized, createWorldFromSerialized(serialized, { persist: false }), cell);
+}
 
-function actualReadCell(serialized: SerializedWorld, world: ReturnType<typeof createWorldFromSerialized>, cell: TranscriptCell): ActualReadCell {
+function actualReadCell(serialized: SerializedWorld, world: ReturnType<typeof createWorldFromSerialized>, cell: TranscriptCell): TranscriptCellRead {
   try {
     switch (cell.kind) {
       case "prop":

@@ -1,5 +1,6 @@
 import type { SerializedWorld } from "./repository";
 import { buildShadowCapabilityAd, rankCapabilityAdsForTurn } from "./capability-ad";
+import { createShadowCommitScope } from "./shadow-commit-scope";
 import {
   buildShadowObjectRecordTransfer,
   createShadowExecutionNode,
@@ -108,7 +109,8 @@ async function profileWarmActor(
 ): Promise<ShadowNetworkProfile> {
   const key = request.key;
   const actorNode = createShadowExecutionNode({ node: "actor", scope: key.scope, atom_hashes: key.atom_hashes, serialized: serializedBefore });
-  const executed = await executeShadowTurnCallOrNeedState(actorNode, request);
+  const commitScope = createShadowCommitScope({ node: "anchor", scope: key.scope, serialized: serializedBefore });
+  const executed = await executeShadowTurnCallOrNeedState(actorNode, request, { commitScope });
   if (!executed.ok) return rejectedProfile("warm_actor_local", options.local_exec_ms, [{ kind: executed.reason, node: "actor", latency_ms: options.local_exec_ms }]);
   return {
     shape: "warm_actor_local",
@@ -129,7 +131,8 @@ async function profileColdAnchorTransfer(
 ): Promise<ShadowNetworkProfile> {
   const key = request.key;
   const actorNode = createShadowExecutionNode({ node: "actor", scope: key.scope });
-  const first = await executeShadowTurnCallOrNeedState(actorNode, request);
+  const commitScope = createShadowCommitScope({ node: "anchor", scope: key.scope, serialized: serializedBefore });
+  const first = await executeShadowTurnCallOrNeedState(actorNode, request, { commitScope });
   const missing = missingAtomsFromExecutionResult(first);
   const transfer = buildShadowObjectRecordTransfer({
     serialized: serializedBefore,
@@ -141,7 +144,7 @@ async function profileColdAnchorTransfer(
   });
   const transferBytes = estimateShadowStateTransferBytes(transfer);
   installShadowStateTransfer(actorNode, transfer);
-  const retry = await executeShadowTurnCallOrNeedState(actorNode, request);
+  const retry = await executeShadowTurnCallOrNeedState(actorNode, request, { commitScope });
   const transferLatency = transferLatencyMs(options.actor_anchor_rtt_ms, transferBytes, options);
   const steps: ShadowProfileStep[] = [
     { kind: "local_missing_state", node: "actor", latency_ms: 0, missing_atoms: missing.length },
@@ -161,7 +164,8 @@ async function profileNearExecutor(
   const ad = buildShadowCapabilityAd({ node: "near-executor", scope: key.scope, atom_hashes: key.atom_hashes, factor: 0.9 });
   const selected = rankCapabilityAdsForTurn([ad], key)[0];
   const executor = createShadowExecutionNode({ node: selected.node, scope: key.scope, atom_hashes: key.atom_hashes, serialized: serializedBefore });
-  const executed = await executeShadowTurnCallOrNeedState(executor, request);
+  const commitScope = createShadowCommitScope({ node: "anchor", scope: key.scope, serialized: serializedBefore });
+  const executed = await executeShadowTurnCallOrNeedState(executor, request, { commitScope });
   const transfer = executed.ok
     ? buildShadowObjectRecordTransfer({ serialized: executed.serializedAfter, key, atom_hashes: key.atom_hashes, session: request.call.session })
     : null;
@@ -186,7 +190,8 @@ async function profileStaleAdFallback(
   const staleAd = buildShadowCapabilityAd({ node: "stale-executor", scope: key.scope, atom_hashes: key.atom_hashes, factor: 0.95 });
   const selected = rankCapabilityAdsForTurn([staleAd], key)[0];
   const staleNode = createShadowExecutionNode({ node: selected.node, scope: key.scope });
-  const staleAttempt = await executeShadowTurnCallOrNeedState(staleNode, request);
+  const commitScope = createShadowCommitScope({ node: "anchor", scope: key.scope, serialized: serializedBefore });
+  const staleAttempt = await executeShadowTurnCallOrNeedState(staleNode, request, { commitScope });
   const actorNode = createShadowExecutionNode({ node: "actor", scope: key.scope });
   const missing = missingAtomsFromExecutionResult(staleAttempt);
   const transfer = buildShadowObjectRecordTransfer({
@@ -199,7 +204,7 @@ async function profileStaleAdFallback(
   });
   const transferBytes = estimateShadowStateTransferBytes(transfer);
   installShadowStateTransfer(actorNode, transfer);
-  const retry = await executeShadowTurnCallOrNeedState(actorNode, request);
+  const retry = await executeShadowTurnCallOrNeedState(actorNode, request, { commitScope });
   const transferLatency = transferLatencyMs(options.actor_anchor_rtt_ms, transferBytes, options);
   const steps: ShadowProfileStep[] = [
     { kind: "ad_rank_selected", node: selected.node, latency_ms: 0 },
