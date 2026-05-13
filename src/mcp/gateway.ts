@@ -1,5 +1,5 @@
 // MCP gateway — per-process state manager for the streamable-HTTP transport.
-// Owns ONE McpHost per WooWorld so the $actor:wait/focus/etc. native handlers
+// Owns ONE McpHost per WooWorld so the built-in MCP control handlers
 // only register once. Each MCP session binds a queue inside that host and
 // gets its own server + transport.
 //
@@ -12,10 +12,19 @@
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { AppliedFrame, DirectResultFrame, ObjRef, Session } from "../core/types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
+import { encodeEnvelope, decodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import {
+  createShadowBrowserRelayShim,
+  type ShadowBrowserRelayShim
+} from "../core/shadow-browser-node";
+import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
+import { applyAcceptedShadowFrame, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
+import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 
 const MCP_TOKEN_HEADER = "mcp-token";
 const MCP_SESSION_HEADER = "mcp-session-id";
@@ -23,9 +32,53 @@ const AUTHORIZATION_HEADER = "authorization";
 
 type SessionEntry = {
   woo: Session;
+  v2Token: string;
   server: Server;
   transport: WebStandardStreamableHTTPServerTransport;
   dispose: () => void;
+};
+
+export type McpV2ClientHooks = {
+  open: (scope: ObjRef, body: McpV2OpenBody) => Promise<McpV2OpenResult>;
+  envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
+};
+
+export type McpV2OpenBody = {
+  scope: ObjRef;
+  node: string;
+  token: string;
+  session: string;
+  actor: ObjRef;
+  sessions: ReturnType<WooWorld["exportSessions"]>;
+  serialized: ReturnType<WooWorld["exportWorld"]>;
+};
+
+export type McpV2OpenResult = {
+  ok: true;
+  relay: string;
+  head?: ShadowScopeHead;
+};
+
+export type McpV2EnvelopeBody = {
+  scope: ObjRef;
+  node: string;
+  token: string;
+  session: string;
+  actor: ObjRef;
+  sessions: ReturnType<WooWorld["exportSessions"]>;
+  envelope: string;
+};
+
+export type McpV2EnvelopeResult = {
+  ok: true;
+  reply: string | null;
+  head?: ShadowScopeHead;
+};
+
+type V2ScopeClient = {
+  scope: ObjRef;
+  relay: ShadowBrowserRelayShim;
+  openedSessions: Set<string>;
 };
 
 export type McpGatewayOptions = {
@@ -33,14 +86,22 @@ export type McpGatewayOptions = {
   serverVersion?: string;
   broadcasts?: McpBroadcastHooks;
   dispatch?: McpDispatchHooks;
+  v2?: McpV2ClientHooks;
 };
 
 export class McpGateway {
   readonly host: McpHost;
   private sessions = new Map<string, SessionEntry>();
+  private v2Scopes = new Map<ObjRef, V2ScopeClient>();
 
   constructor(private world: WooWorld, private options: McpGatewayOptions = {}) {
-    this.host = new McpHost(world, options.dispatch);
+    const dispatch = options.v2 ? {
+      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null) =>
+        await this.invokeV2Direct(sessionId, actor, target, verb, args, scope),
+      call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) =>
+        await this.invokeV2Call(sessionId, actor, space, message)
+    } satisfies McpDispatchHooks : options.dispatch;
+    this.host = new McpHost(world, dispatch);
     if (options.broadcasts) this.host.setBroadcastHooks(options.broadcasts);
   }
 
@@ -147,6 +208,7 @@ export class McpGateway {
   }
 
   private bind(woo: Session): SessionEntry {
+    const v2Token = mcpV2Token(woo);
     const { server, dispose } = createMcpServer({
       world: this.world,
       host: this.host,
@@ -167,7 +229,7 @@ export class McpGateway {
 
     void server.connect(transport).catch(() => {});
 
-    return { woo, server, transport, dispose };
+    return { woo, v2Token, server, transport, dispose };
   }
 
   private async tryResume(sessionId: string): Promise<SessionEntry | null> {
@@ -198,6 +260,165 @@ export class McpGateway {
     this.host.bindSession(woo.id, woo.actor);
     return entry;
   }
+
+  private async invokeV2Direct(
+    sessionId: string,
+    actor: ObjRef,
+    target: ObjRef,
+    verb: string,
+    args: WooValue[],
+    scope?: ObjRef | null
+  ): Promise<DirectResultFrame | ErrorFrame> {
+    // Direct calls record under their live audience when there is one, and
+    // under the shadow direct-call scope (`#-1`) otherwise. McpHost passes the
+    // tool's enclosing scope so the CommitScopeDO route matches the transcript.
+    const frame = await this.invokeV2(sessionId, actor, "direct", target, verb, args, scope ?? "#-1");
+    if (frame.op === "applied") throw new Error(`v2 direct call returned applied frame: ${target}:${verb}`);
+    return frame;
+  }
+
+  private async invokeV2Call(
+    sessionId: string,
+    actor: ObjRef,
+    space: ObjRef,
+    message: Message
+  ): Promise<AppliedFrame | ErrorFrame> {
+    const frame = await this.invokeV2(sessionId, actor, "sequenced", message.target, message.verb, message.args, space);
+    if (frame.op === "result") throw new Error(`v2 sequenced call returned direct result: ${message.target}:${message.verb}`);
+    return frame;
+  }
+
+  private async invokeV2(
+    sessionId: string,
+    actor: ObjRef,
+    route: ShadowTurnCall["route"],
+    target: ObjRef,
+    verb: string,
+    args: WooValue[],
+    explicitScope?: ObjRef | null
+  ): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    const hooks = this.options.v2;
+    if (!hooks) throw new Error("MCP v2 client hooks are not configured");
+    const entry = this.sessions.get(sessionId);
+    if (!entry) throw new Error(`MCP session is not bound: ${sessionId}`);
+    const scope = explicitScope ?? this.scopeForV2Call(actor, target);
+    const client = await this.ensureV2ScopeClient(entry, scope);
+    const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id,
+      route,
+      scope,
+      session: entry.woo.id,
+      actor,
+      target,
+      verb,
+      args
+    };
+    const planned = await runShadowTurnCall(client.relay.commit_scope.serialized, call);
+    const request: ShadowTurnExecRequest = {
+      kind: "woo.turn.exec.request.shadow.v1",
+      id,
+      call,
+      key: shadowTurnKeyFromTranscript(planned.transcript),
+      expected: client.relay.commit_scope.head,
+      commit_policy: "execute_and_commit"
+    };
+    const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
+      v: 2,
+      type: request.kind,
+      id,
+      from: this.v2NodeFor(entry),
+      actor,
+      session: entry.woo.id,
+      auth: { mode: "session", token: entry.v2Token },
+      body: request
+    };
+    const result = await hooks.envelope(scope, {
+      scope,
+      node: this.v2NodeFor(entry),
+      token: entry.v2Token,
+      session: entry.woo.id,
+      actor,
+      sessions: this.world.exportSessions(),
+      envelope: encodeEnvelope(envelope)
+    });
+    const replyEnvelope = result.reply ? decodeEnvelope<ShadowTurnExecReply>(result.reply) : null;
+    const reply = replyEnvelope?.body;
+    if (!reply) {
+      if (result.head) client.relay.commit_scope.head = result.head;
+      return planned.frame;
+    }
+    if (!reply.ok) {
+      if (result.head) client.relay.commit_scope.head = result.head;
+      return { op: "error", id, error: { code: reply.reason, message: reply.reason, value: reply as unknown as WooValue } };
+    }
+    if (reply.commit) {
+      this.acceptV2Commit(client, reply, sessionId);
+    }
+    return planned.frame;
+  }
+
+  private async ensureV2ScopeClient(entry: SessionEntry, scope: ObjRef): Promise<V2ScopeClient> {
+    const hooks = this.options.v2;
+    if (!hooks) throw new Error("MCP v2 client hooks are not configured");
+    let client = this.v2Scopes.get(scope);
+    if (!client) {
+      client = {
+        scope,
+        relay: createShadowBrowserRelayShim({
+          node: `mcp-v2-relay:${scope}`,
+          scope,
+          serialized: this.world.exportWorld()
+        }),
+        openedSessions: new Set()
+      };
+      this.v2Scopes.set(scope, client);
+    }
+    if (!client.openedSessions.has(entry.woo.id)) {
+      const opened = await hooks.open(scope, {
+        scope,
+        node: this.v2NodeFor(entry),
+        token: entry.v2Token,
+        session: entry.woo.id,
+        actor: entry.woo.actor,
+        sessions: this.world.exportSessions(),
+        serialized: this.world.exportWorld()
+      });
+      if (opened.head) client.relay.commit_scope.head = opened.head;
+      client.openedSessions.add(entry.woo.id);
+    }
+    return client;
+  }
+
+  private acceptV2Commit(client: V2ScopeClient, reply: Extract<ShadowTurnExecReply, { ok: true }>, originSessionId: string): void {
+    if (!reply.commit || !reply.transcript) return;
+    applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
+    this.world.applyCommittedShadowTranscript(reply.transcript);
+    this.host.routeShadowAcceptedFrame(reply.commit, originSessionId);
+  }
+
+  private scopeForV2Call(actor: ObjRef, target: ObjRef): ObjRef {
+    const enclosing = this.host.enclosingSpaceFor(target);
+    if (enclosing) return enclosing;
+    const session = this.sessionsByActor(actor);
+    return (session ? this.world.currentLocationForSession(session.woo.id) : null) ?? actor;
+  }
+
+  private sessionsByActor(actor: ObjRef): SessionEntry | null {
+    for (const entry of this.sessions.values()) {
+      if (entry.woo.actor === actor) return entry;
+    }
+    return null;
+  }
+
+  private v2NodeFor(entry: SessionEntry): string {
+    return `mcp:${entry.woo.id}`;
+  }
+}
+
+function mcpV2Token(woo: Session): string {
+  return `mcp-v2:${woo.id}:${woo.actor}`;
 }
 
 function authTokenFromHeaders(headers: Headers): string | null {

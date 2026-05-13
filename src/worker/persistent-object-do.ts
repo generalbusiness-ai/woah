@@ -48,7 +48,7 @@ import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { CFObjectRepository } from "./cf-repository";
-import { McpGateway } from "../mcp/gateway";
+import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { hashSource } from "../core/source-hash";
 
@@ -72,6 +72,13 @@ export interface Env {
 type CommitScopeOpenResponse = {
   ok: true;
   relay: string;
+  head?: {
+    kind: "woo.scope_head.shadow.v1";
+    scope: ObjRef;
+    epoch: number;
+    seq: number;
+    hash: string;
+  };
   hello: {
     kind: "woo.transport.hello.v1";
     relay: string;
@@ -88,6 +95,13 @@ type CommitScopeOpenResponse = {
 type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
+  head?: {
+    kind: "woo.scope_head.shadow.v1";
+    scope: ObjRef;
+    epoch: number;
+    seq: number;
+    hash: string;
+  };
 };
 
 const WORLD_HOST = "world";
@@ -633,31 +647,17 @@ export class PersistentObjectDO {
       const initStart = Date.now();
       this.mcpGateway = new McpGateway(world, {
         serverName: "woo",
-        dispatch: {
-          call: async (sessionId, actor, space, message) => {
-            world.touchSessionInput(sessionId);
-            const session = { sessionId, actor };
-            const host = await this.resolveObjectHost(space, WORLD_HOST);
-            const result = host === WORLD_HOST
-              ? await world.call(undefined, sessionId, space, message)
-              : await this.forwardWsCall(world, host, undefined, session, space, message);
-            if (result.op === "applied" && host !== WORLD_HOST) await this.registerRemoteObjectRoutes(host);
-            return result;
+        v2: {
+          open: async (scope, body): Promise<McpV2OpenResult> => {
+            world.touchSessionInput(body.session);
+            return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", body as unknown as Record<string, unknown>);
           },
-          direct: async (sessionId, actor, target, verb, args) => {
-            world.touchSessionInput(sessionId);
-            const session = { sessionId, actor };
-            const host = await this.resolveObjectHost(target, WORLD_HOST);
-            const { pure } = this.resolveDispatchPath(world, target, verb, host, WORLD_HOST);
-            return host === WORLD_HOST
-              ? await world.directCall(undefined, actor, target, verb, args)
-              : await this.forwardWsDirect(world, host, undefined, session, target, verb, args, { pure });
+          envelope: async (scope, body): Promise<McpV2EnvelopeResult> => {
+            world.touchSessionInput(body.session);
+            return await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
           }
         },
-        broadcasts: {
-          broadcastApplied: (frame, originSessionId) => this.handleAppliedFrame(world, frame, undefined, originSessionId),
-          broadcastLiveEvents: (result, originSessionId) => this.broadcastLiveEvents(world, result, originSessionId)
-        }
+        broadcasts: {}
       });
       world.recordMetric({ kind: "init", phase: "mcp_gateway", ms: Date.now() - initStart });
     }
