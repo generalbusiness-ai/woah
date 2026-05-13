@@ -2,6 +2,7 @@ import { buildShadowCapabilityAd, rankCapabilityAdsForTurn, type ShadowCapabilit
 import type { SerializedWorld } from "./repository";
 import { createShadowCommitScope, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
+  buildShadowCellPageTransfer,
   buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   executeShadowTurnCallOrNeedState,
@@ -59,7 +60,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     node: string;
     serialized: SerializedWorld;
   };
-  transferMode?: "closure" | "object_records";
+  transferMode?: "closure" | "object_records" | "cell_pages";
   maxTransfers?: number;
   commitScope?: ShadowCommitScope;
 }): Promise<ShadowInProcessNetworkResult> {
@@ -78,7 +79,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   let result = first;
   const transfers: ShadowStateTransfer[] = [];
   const maxTransfers = input.maxTransfers ?? 3;
-  const transferMode = input.transferMode ?? "object_records";
+  const transferMode = input.transferMode ?? "cell_pages";
 
   for (let i = 0; i < maxTransfers && !result.ok && result.reason === "missing_state"; i++) {
     const transfer = transferMode === "closure"
@@ -88,14 +89,23 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
           atom_hashes: result.missing_atoms.map((atom) => atom.hash),
           recipient: selected.node
         })
-      : buildShadowObjectRecordTransfer({
+      : transferMode === "object_records"
+        ? buildShadowObjectRecordTransfer({
           serialized: input.anchor.serialized,
           key: input.request.key,
           missing_atoms: result.missing_atoms,
           known_object_hashes: selected.object_hashes,
           session: input.request.call.session,
           recipient: selected.node
-    });
+        })
+        : buildShadowCellPageTransfer({
+          serialized: input.anchor.serialized,
+          key: input.request.key,
+          missing_atoms: result.missing_atoms,
+          known_page_hashes: selected.page_hashes,
+          session: input.request.call.session,
+          recipient: selected.node
+        });
     installShadowStateTransfer(selected, transfer);
     transfers.push(transfer);
     result = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope });

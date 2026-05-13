@@ -2,7 +2,7 @@ import type { SerializedWorld } from "./repository";
 import { buildShadowCapabilityAd, rankCapabilityAdsForTurn } from "./capability-ad";
 import { createShadowCommitScope } from "./shadow-commit-scope";
 import {
-  buildShadowObjectRecordTransfer,
+  buildShadowCellPageTransfer,
   createShadowExecutionNode,
   executeShadowTurnCallOrNeedState,
   installShadowStateTransfer,
@@ -134,11 +134,11 @@ async function profileColdAnchorTransfer(
   const commitScope = createShadowCommitScope({ node: "anchor", scope: key.scope, serialized: serializedBefore });
   const first = await executeShadowTurnCallOrNeedState(actorNode, request, { commitScope });
   const missing = missingAtomsFromExecutionResult(first);
-  const transfer = buildShadowObjectRecordTransfer({
+  const transfer = buildShadowCellPageTransfer({
     serialized: serializedBefore,
     key,
     missing_atoms: missing,
-    known_object_hashes: actorNode.object_hashes,
+    known_page_hashes: actorNode.page_hashes,
     session: request.call.session,
     recipient: actorNode.node
   });
@@ -148,7 +148,7 @@ async function profileColdAnchorTransfer(
   const transferLatency = transferLatencyMs(options.actor_anchor_rtt_ms, transferBytes, options);
   const steps: ShadowProfileStep[] = [
     { kind: "local_missing_state", node: "actor", latency_ms: 0, missing_atoms: missing.length },
-    { kind: "anchor_object_record_transfer", node: "anchor", latency_ms: transferLatency, bytes: transferBytes },
+    { kind: "anchor_cell_page_transfer", node: "anchor", latency_ms: transferLatency, bytes: transferBytes },
     { kind: "local_retry_execute", node: "actor", latency_ms: options.local_exec_ms }
   ];
   if (!retry.ok) return rejectedProfile("cold_actor_anchor_transfer", sumLatency(steps), steps);
@@ -167,13 +167,13 @@ async function profileNearExecutor(
   const commitScope = createShadowCommitScope({ node: "anchor", scope: key.scope, serialized: serializedBefore });
   const executed = await executeShadowTurnCallOrNeedState(executor, request, { commitScope });
   const transfer = executed.ok
-    ? buildShadowObjectRecordTransfer({ serialized: executed.serializedAfter, key, atom_hashes: key.atom_hashes, session: request.call.session })
+    ? buildShadowCellPageTransfer({ serialized: executed.serializedAfter, key, atom_hashes: key.atom_hashes, session: request.call.session })
     : null;
   const transferBytes = transfer ? estimateShadowStateTransferBytes(transfer) : 0;
   const remoteLatency = options.actor_executor_rtt_ms + options.remote_exec_ms + transferBytes / options.transfer_bandwidth_bytes_per_ms;
   const steps: ShadowProfileStep[] = [
     { kind: "ad_rank_selected", node: selected.node, latency_ms: 0 },
-    { kind: "remote_execute_and_object_record_transfer", node: selected.node, latency_ms: remoteLatency, bytes: transferBytes }
+    { kind: "remote_execute_and_cell_page_transfer", node: selected.node, latency_ms: remoteLatency, bytes: transferBytes }
   ];
   if (!executed.ok) return rejectedProfile("near_executor_remote", sumLatency(steps), steps);
   return acceptedProfile("near_executor_remote", executed.receipt, executed.transcript.hash, transferBytes, 1, steps);
@@ -194,11 +194,11 @@ async function profileStaleAdFallback(
   const staleAttempt = await executeShadowTurnCallOrNeedState(staleNode, request, { commitScope });
   const actorNode = createShadowExecutionNode({ node: "actor", scope: key.scope });
   const missing = missingAtomsFromExecutionResult(staleAttempt);
-  const transfer = buildShadowObjectRecordTransfer({
+  const transfer = buildShadowCellPageTransfer({
     serialized: serializedBefore,
     key,
     missing_atoms: missing,
-    known_object_hashes: actorNode.object_hashes,
+    known_page_hashes: actorNode.page_hashes,
     session: request.call.session,
     recipient: actorNode.node
   });
@@ -209,7 +209,7 @@ async function profileStaleAdFallback(
   const steps: ShadowProfileStep[] = [
     { kind: "ad_rank_selected", node: selected.node, latency_ms: 0 },
     { kind: "remote_missing_state", node: selected.node, latency_ms: options.stale_executor_rtt_ms, missing_atoms: missing.length },
-    { kind: "anchor_object_record_transfer", node: "anchor", latency_ms: transferLatency, bytes: transferBytes },
+    { kind: "anchor_cell_page_transfer", node: "anchor", latency_ms: transferLatency, bytes: transferBytes },
     { kind: "local_retry_execute", node: "actor", latency_ms: options.local_exec_ms }
   ];
   if (!retry.ok) return rejectedProfile("stale_ad_anchor_fallback", sumLatency(steps), steps);

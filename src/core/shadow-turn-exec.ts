@@ -24,6 +24,20 @@ import { constantTimeEqual, hashSource } from "./source-hash";
 import { stableShadowJson } from "./shadow-cell-version";
 import { createWorldFromSerialized } from "./bootstrap";
 import type { WooWorld } from "./world";
+import {
+  cacheShadowStatePages,
+  mergeShadowStatePagesIntoSerialized,
+  serializedStatePageHashes,
+  shadowObjectLineagePage,
+  shadowObjectLivePage,
+  shadowPropertyCellPage,
+  shadowStatePageHash,
+  shadowStatePageRef,
+  shadowStatePagesForObject,
+  shadowVerbBytecodePages,
+  type ShadowStatePage,
+  type ShadowStatePageRef
+} from "./shadow-state-pages";
 
 const DEFAULT_SHADOW_TRANSFER_AUTHORITY = "shadow-anchor";
 const DEFAULT_SHADOW_TRANSFER_KEY_ID = "shadow-dev";
@@ -62,6 +76,25 @@ export type ShadowObjectRecordTransfer = {
   proof: ShadowStateProof;
 };
 
+export type ShadowCellPageTransfer = {
+  kind: "woo.state.transfer.shadow.v1";
+  mode: "cell_pages";
+  scope: ObjRef;
+  atom_hashes: string[];
+  preimages?: string[];
+  page_refs: ShadowStatePageRef[];
+  inline_pages: ShadowStatePage[];
+  sessions: SerializedSession[];
+  logs: SerializedWorld["logs"];
+  snapshots: SpaceSnapshotRecord[];
+  parkedTasks: ParkedTaskRecord[];
+  tombstones: ObjRef[];
+  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  source_object_count: number;
+  source_page_count: number;
+  proof: ShadowStateProof;
+};
+
 export type ShadowObjectPageRef = {
   id: ObjRef;
   hash: string;
@@ -81,7 +114,7 @@ export type ShadowStateProof = {
   signature: string;
 };
 
-export type ShadowStateTransferMode = "closure" | "object_records";
+export type ShadowStateTransferMode = "closure" | "object_records" | "cell_pages";
 
 export type ShadowTransferSigning = {
   authority?: string;
@@ -90,7 +123,7 @@ export type ShadowTransferSigning = {
   recipient?: string;
 };
 
-export type ShadowStateTransfer = ShadowClosureTransfer | ShadowObjectRecordTransfer;
+export type ShadowStateTransfer = ShadowClosureTransfer | ShadowObjectRecordTransfer | ShadowCellPageTransfer;
 
 export type ShadowExecutionNode = {
   kind: "woo.execution_node.shadow.v1";
@@ -99,6 +132,8 @@ export type ShadowExecutionNode = {
   atom_hashes: Set<string>;
   object_hashes: Set<string>;
   object_cache: Map<string, SerializedObject>;
+  page_hashes: Set<string>;
+  page_cache: Map<string, ShadowStatePage>;
   trusted_transfer_authorities: Map<string, string>;
   serialized?: SerializedWorld;
   world?: WooWorld;
@@ -148,7 +183,7 @@ export type ShadowTurnExecRequest = {
   };
   selected_ad?: string;
   requested_transfer?: {
-    mode: "closure" | "object_records";
+    mode: ShadowStateTransferMode;
     atom_hashes?: string[];
     max_bytes?: number;
   };
@@ -184,15 +219,21 @@ export function createShadowExecutionNode(input: {
   scope: ObjRef;
   atom_hashes?: string[];
   object_hashes?: string[];
+  page_hashes?: string[];
   cached_objects?: SerializedObject[];
+  cached_pages?: ShadowStatePage[];
   trusted_transfer_authorities?: Record<string, string>;
   serialized?: SerializedWorld;
 }): ShadowExecutionNode {
   let serialized = input.serialized ? structuredClone(input.serialized) as SerializedWorld : undefined;
   const objectCache = new Map<string, SerializedObject>();
   for (const obj of serialized?.objects ?? []) cacheShadowObjectRecord(objectCache, obj);
+  const pageCache = new Map<string, ShadowStatePage>();
+  for (const obj of serialized?.objects ?? []) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
   const cachedObjects = input.cached_objects ?? [];
   for (const obj of cachedObjects) cacheShadowObjectRecord(objectCache, obj);
+  for (const obj of cachedObjects) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
+  cacheShadowStatePages(pageCache, input.cached_pages ?? []);
   if (cachedObjects.length > 0) serialized = mergeCachedObjectRecords(serialized, cachedObjects);
   return {
     kind: "woo.execution_node.shadow.v1",
@@ -200,7 +241,9 @@ export function createShadowExecutionNode(input: {
     scope: input.scope,
     atom_hashes: new Set(input.atom_hashes ?? []),
     object_hashes: new Set(input.object_hashes ?? objectCache.keys()),
+    page_hashes: new Set(input.page_hashes ?? pageCache.keys()),
     object_cache: objectCache,
+    page_cache: pageCache,
     trusted_transfer_authorities: trustedTransferAuthorities(input.trusted_transfer_authorities),
     serialized
   };
@@ -208,6 +251,7 @@ export function createShadowExecutionNode(input: {
 
 export function installShadowCachedObjectRecords(node: ShadowExecutionNode, objects: SerializedObject[]): void {
   for (const obj of objects) cacheShadowObjectRecord(node.object_cache, obj);
+  for (const obj of objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
   if (objects.length > 0) node.serialized = mergeCachedObjectRecords(node.serialized, objects);
   refreshNodeObjectHashes(node);
 }
@@ -309,6 +353,41 @@ export function buildShadowObjectRecordTransfer(input: {
   };
 }
 
+export function buildShadowCellPageTransfer(input: {
+  serialized: SerializedWorld;
+  key: ShadowTurnKey;
+  atom_hashes?: string[];
+  missing_atoms?: ShadowMissingAtom[];
+  known_page_hashes?: Iterable<string>;
+  session?: string | null;
+} & ShadowTransferSigning): ShadowCellPageTransfer {
+  const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
+  const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage));
+  const knownPageHashes = new Set(input.known_page_hashes ?? []);
+  const pageRefs = requiredPages.map((page) => {
+    const hash = shadowStatePageHash(page);
+    return shadowStatePageRef(page, !knownPageHashes.has(hash));
+  });
+  const inlinePages = requiredPages
+    .filter((page, index) => pageRefs[index]?.inline === true)
+    .map((page) => structuredClone(page) as ShadowStatePage);
+  const transfer = {
+    kind: "woo.state.transfer.shadow.v1",
+    mode: "cell_pages",
+    scope: input.key.scope,
+    atom_hashes: selected.map((item) => item.hash),
+    preimages: selected.map((item) => item.preimage),
+    page_refs: pageRefs,
+    inline_pages: inlinePages,
+    ...shadowTransferWorldTail(input.serialized, input.key, input.session),
+    source_page_count: input.serialized.objects.reduce((sum, obj) => sum + shadowStatePagesForObject(obj).length, 0)
+  } satisfies Omit<ShadowCellPageTransfer, "proof">;
+  return {
+    ...transfer,
+    proof: signShadowStateTransfer(transfer, input)
+  };
+}
+
 export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: ShadowStateTransfer): void {
   if (transfer.mode === "closure" && node.scope !== transfer.scope) {
     throw new Error(`state transfer scope mismatch: node=${node.scope} transfer=${transfer.scope}`);
@@ -324,12 +403,25 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
     node.world = undefined;
     for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
+    for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
+    refreshNodeObjectHashes(node);
+    return;
+  }
+  if (transfer.mode === "cell_pages") {
+    node.serialized = mergeCellPageTransfer(node.serialized, transfer, node.page_cache);
+    // Cell pages replace individual serialized cells. Any already-unpacked
+    // WooWorld was built from the old cell versions, so replay must rebuild
+    // before recording the retry transcript.
+    node.world = undefined;
+    for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
+    for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
     refreshNodeObjectHashes(node);
     return;
   }
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
   node.world = undefined;
   for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
+  for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
   refreshNodeObjectHashes(node);
 }
 
@@ -517,7 +609,8 @@ function trustedTransferAuthorities(input: Record<string, string> | undefined): 
 
 type UnsignedShadowStateTransfer =
   | Omit<ShadowClosureTransfer, "proof">
-  | Omit<ShadowObjectRecordTransfer, "proof">;
+  | Omit<ShadowObjectRecordTransfer, "proof">
+  | Omit<ShadowCellPageTransfer, "proof">;
 
 function signShadowStateTransfer(
   transfer: UnsignedShadowStateTransfer,
@@ -575,6 +668,20 @@ function shadowStateTransferRoot(
         ...base,
         serialized_hash: hashSource(stableShadowJson(transfer.serialized as unknown as WooValue))
       }
+    : transfer.mode === "cell_pages"
+      ? {
+          ...base,
+          page_refs: transfer.page_refs,
+          inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
+          sessions: transfer.sessions,
+          logs: transfer.logs,
+          snapshots: transfer.snapshots,
+          parkedTasks: transfer.parkedTasks,
+          tombstones: transfer.tombstones,
+          counters: transfer.counters,
+          source_object_count: transfer.source_object_count,
+          source_page_count: transfer.source_page_count
+        }
     : {
         ...base,
         object_pages: transfer.object_pages,
@@ -601,6 +708,10 @@ function refreshNodeObjectHashes(node: ShadowExecutionNode): void {
   node.object_hashes = new Set([
     ...serializedObjectHashes(node.serialized),
     ...node.object_cache.keys()
+  ]);
+  node.page_hashes = new Set([
+    ...serializedStatePageHashes(node.serialized),
+    ...node.page_cache.keys()
   ]);
 }
 
@@ -707,10 +818,147 @@ function objectClosureForPreimages(serialized: SerializedWorld, preimages: strin
   return objectIds;
 }
 
+function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[]): ShadowStatePage[] {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const selectedObjects = objectClosureForPreimages(serialized, preimages);
+  const pages = new Map<string, ShadowStatePage>();
+
+  const addPage = (page: ShadowStatePage): void => {
+    pages.set(shadowStatePageHash(page), page);
+  };
+  const addObjectScaffold = (id: ObjRef | null | undefined, includeLive = true): void => {
+    if (!id) return;
+    const obj = byId.get(id);
+    if (!obj) return;
+    addPage(shadowObjectLineagePage(obj));
+    if (includeLive) addPage(shadowObjectLivePage(obj));
+  };
+  const addLineage = (id: ObjRef | null | undefined): void => {
+    let current = id;
+    while (current) {
+      const obj = byId.get(current);
+      if (!obj) return;
+      addObjectScaffold(current);
+      current = obj.parent;
+    }
+  };
+  const addPropertyLookupPages = (object: ObjRef, name: string): void => {
+    const target = byId.get(object);
+    if (!target) return;
+    if (objectHasPropertyCell(target, name)) addPage(shadowPropertyCellPage(target, name));
+    if (name === "features" && objectHasPropertyCell(target, "features")) {
+      for (const feature of serializedFeatureRefs(target)) addLineage(feature);
+    }
+    if (name === "owner" || name === "name") return;
+    let parent = target.parent;
+    while (parent) {
+      const ancestor = byId.get(parent);
+      if (!ancestor) return;
+      if (ancestor.propertyDefs.some((def) => def.name === name)) {
+        addPage(shadowPropertyCellPage(ancestor, name));
+        return;
+      }
+      parent = ancestor.parent;
+    }
+  };
+  const addOwnPropertyPages = (object: ObjRef): void => {
+    const obj = byId.get(object);
+    if (!obj) return;
+    for (const page of shadowStatePagesForObject(obj)) {
+      if (page.page === "property_cell") addPage(page);
+    }
+  };
+  const addVerbPage = (object: ObjRef, name: string): void => {
+    const obj = byId.get(object);
+    const verb = obj?.verbs.find((item) => item.name === name);
+    if (!obj || !verb) return;
+    const page = shadowVerbBytecodePages(obj).find((item) => item.name === name);
+    if (page) addPage(page);
+  };
+
+  for (const id of selectedObjects) addLineage(id);
+  for (const preimage of preimages) {
+    // Sequenced-call preamble checks session/subscriber metadata before the
+    // recorder opens, so cold executable closures need root object properties
+    // in addition to the exact cells that appear in the eventual transcript.
+    const preambleRoot = preambleRootObjectFromTurnKeyPreimage(preimage);
+    if (preambleRoot) addOwnPropertyPages(preambleRoot);
+    const prop = propCellFromTurnKeyPreimage(preimage);
+    if (prop) addPropertyLookupPages(prop.object, prop.name);
+    const verb = verbCellFromTurnKeyPreimage(preimage);
+    if (verb) addVerbPage(verb.object, verb.name);
+    const structural = structuralObjectFromTurnKeyPreimage(preimage);
+    if (structural) addObjectScaffold(structural);
+  }
+
+  return Array.from(pages.values()).sort(compareStatePages);
+}
+
+function objectHasPropertyCell(obj: SerializedObject, name: string): boolean {
+  return obj.propertyDefs.some((def) => def.name === name)
+    || obj.properties.some(([prop]) => prop === name)
+    || obj.propertyVersions.some(([prop]) => prop === name);
+}
+
+function compareStatePages(a: ShadowStatePage, b: ShadowStatePage): number {
+  return a.object.localeCompare(b.object)
+    || a.page.localeCompare(b.page)
+    || (("name" in a ? a.name : "").localeCompare("name" in b ? b.name : ""));
+}
+
+function propCellFromTurnKeyPreimage(preimage: string): { object: ObjRef; name: string } | null {
+  const cell = preimage.match(/^(?:read|write):cell:prop:([^.:]+)\.(.+)$/);
+  return cell ? { object: cell[1] as ObjRef, name: cell[2] } : null;
+}
+
+function verbCellFromTurnKeyPreimage(preimage: string): { object: ObjRef; name: string } | null {
+  const cell = preimage.match(/^(?:read|write):cell:verb:([^:]+):(.+)$/);
+  return cell ? { object: cell[1] as ObjRef, name: cell[2] } : null;
+}
+
+function structuralObjectFromTurnKeyPreimage(preimage: string): ObjRef | null {
+  const structural = preimage.match(/^(?:read|write):cell:(?:location|contents|lifecycle):(.+)$/);
+  return structural ? structural[1] as ObjRef : null;
+}
+
+function preambleRootObjectFromTurnKeyPreimage(preimage: string): ObjRef | null {
+  for (const prefix of ["actor:", "target:", "scope:"]) {
+    if (preimage.startsWith(prefix)) return preimage.slice(prefix.length);
+  }
+  return null;
+}
+
 function serializedFeatureRefs(obj: SerializedObject): ObjRef[] {
   const value = obj.properties.find(([name]) => name === "features")?.[1];
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is ObjRef => typeof item === "string");
+}
+
+function shadowTransferWorldTail(
+  serialized: SerializedWorld,
+  key: ShadowTurnKey,
+  session: string | null | undefined
+): Pick<ShadowObjectRecordTransfer, "sessions" | "logs" | "snapshots" | "parkedTasks" | "tombstones" | "counters" | "source_object_count"> {
+  return {
+    sessions: serialized.sessions
+      .filter((item) => item.id === session || item.actor === key.actor)
+      .map((item) => structuredClone(item) as SerializedSession)
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    logs: serialized.logs
+      .filter(([space]) => space === key.scope)
+      .map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]] as SerializedWorld["logs"][number]),
+    snapshots: serialized.snapshots
+      .filter((snapshot) => snapshot.space_id === key.scope)
+      .map((snapshot) => structuredClone(snapshot) as SpaceSnapshotRecord),
+    parkedTasks: [],
+    tombstones: [...(serialized.tombstones ?? [])].sort(),
+    counters: {
+      objectCounter: serialized.objectCounter,
+      parkedTaskCounter: serialized.parkedTaskCounter,
+      sessionCounter: serialized.sessionCounter
+    },
+    source_object_count: serialized.objects.length
+  };
 }
 
 function objectRefFromTurnKeyPreimage(preimage: string): ObjRef | null {
@@ -780,6 +1028,39 @@ function mergeObjectRecordTransfer(
   };
 }
 
+function mergeCellPageTransfer(
+  current: SerializedWorld | undefined,
+  transfer: ShadowCellPageTransfer,
+  pageCache: Map<string, ShadowStatePage>
+): SerializedWorld {
+  const base = current ? structuredClone(current) as SerializedWorld : emptySerializedWorld(transfer);
+  const incomingPages: ShadowStatePage[] = [];
+  for (const page of transfer.inline_pages) {
+    const hash = shadowStatePageHash(page);
+    const ref = transfer.page_refs.find((item) => item.hash === hash);
+    if (!ref || ref.inline !== true) throw new Error(`inline shadow state page has no inline page ref: ${hash}`);
+    pageCache.set(hash, structuredClone(page) as ShadowStatePage);
+  }
+
+  const currentPages = new Map<string, ShadowStatePage>();
+  for (const obj of base.objects) {
+    for (const page of shadowStatePagesForObject(obj)) currentPages.set(shadowStatePageHash(page), page);
+  }
+
+  for (const ref of transfer.page_refs) {
+    const page = pageCache.get(ref.hash) ?? currentPages.get(ref.hash);
+    if (!page) throw new Error(`missing cached shadow state page: ${ref.object}:${ref.page}@${ref.hash}`);
+    const actualRef = shadowStatePageRef(page, ref.inline);
+    if (actualRef.object !== ref.object || actualRef.page !== ref.page || actualRef.name !== ref.name) {
+      throw new Error(`shadow state page ref mismatch: ${ref.object}:${ref.page}`);
+    }
+    incomingPages.push(structuredClone(page) as ShadowStatePage);
+  }
+
+  const withObjects = mergeShadowStatePagesIntoSerialized(base, incomingPages, () => emptySerializedWorld(transfer));
+  return mergeTransferTail(withObjects, transfer);
+}
+
 function mergeCachedObjectRecords(current: SerializedWorld | undefined, objects: SerializedObject[]): SerializedWorld {
   const base = current ? structuredClone(current) as SerializedWorld : emptySerializedWorldForCache();
   const byId = new Map<ObjRef, SerializedObject>(base.objects.map((obj) => [obj.id, obj]));
@@ -805,7 +1086,7 @@ function emptySerializedWorldForCache(): SerializedWorld {
   };
 }
 
-function emptySerializedWorld(transfer: ShadowObjectRecordTransfer): SerializedWorld {
+function emptySerializedWorld(transfer: ShadowObjectRecordTransfer | ShadowCellPageTransfer): SerializedWorld {
   return {
     version: 1,
     objectCounter: transfer.counters.objectCounter,
@@ -817,6 +1098,34 @@ function emptySerializedWorld(transfer: ShadowObjectRecordTransfer): SerializedW
     snapshots: [],
     parkedTasks: [],
     tombstones: []
+  };
+}
+
+function mergeTransferTail(
+  base: SerializedWorld,
+  transfer: ShadowObjectRecordTransfer | ShadowCellPageTransfer
+): SerializedWorld {
+  const sessions = new Map<string, SerializedSession>(base.sessions.map((session) => [session.id, session]));
+  for (const session of transfer.sessions) sessions.set(session.id, structuredClone(session) as SerializedSession);
+
+  const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(base.logs.map(([space, entries]) => [space, entries]));
+  for (const [space, entries] of transfer.logs) logs.set(space, structuredClone(entries) as SerializedWorld["logs"][number][1]);
+
+  const parkedTasks = new Map<string, ParkedTaskRecord>(base.parkedTasks.map((task) => [task.id, task]));
+  for (const task of transfer.parkedTasks) parkedTasks.set(task.id, structuredClone(task) as ParkedTaskRecord);
+
+  const tombstones = new Set<ObjRef>([...(base.tombstones ?? []), ...transfer.tombstones]);
+
+  return {
+    ...base,
+    objectCounter: Math.max(base.objectCounter ?? 1, transfer.counters.objectCounter ?? 1),
+    parkedTaskCounter: Math.max(base.parkedTaskCounter ?? 1, transfer.counters.parkedTaskCounter ?? 1),
+    sessionCounter: Math.max(base.sessionCounter ?? 1, transfer.counters.sessionCounter ?? 1),
+    sessions: Array.from(sessions.values()).sort((a, b) => a.id.localeCompare(b.id)),
+    logs: Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b)),
+    snapshots: mergeSnapshots(base.snapshots, transfer.snapshots),
+    parkedTasks: Array.from(parkedTasks.values()).sort((a, b) => a.id.localeCompare(b.id)),
+    tombstones: Array.from(tombstones).sort()
   };
 }
 

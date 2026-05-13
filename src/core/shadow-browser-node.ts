@@ -10,6 +10,7 @@ import {
   type ShadowTurnExecReply,
   type ShadowTurnExecutionResult
 } from "./shadow-turn-exec";
+import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
 import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
@@ -115,6 +116,8 @@ export type ShadowBrowserNodeCache = {
   kind: "woo.browser_cache.shadow.v1";
   object_pages: Map<string, SerializedObject>;
   object_page_refs: Map<ObjRef, string>;
+  state_pages: Map<string, ShadowStatePage>;
+  state_page_refs: Map<string, string>;
   projections: Map<ObjRef, WooValue>;
   transcript_tail: EffectTranscript[];
   pending_turns: Map<string, ShadowBrowserPendingTurn>;
@@ -370,6 +373,8 @@ export function createShadowBrowserNodeCache(): ShadowBrowserNodeCache {
     kind: "woo.browser_cache.shadow.v1",
     object_pages: new Map(),
     object_page_refs: new Map(),
+    state_pages: new Map(),
+    state_page_refs: new Map(),
     projections: new Map(),
     transcript_tail: [],
     pending_turns: new Map(),
@@ -857,6 +862,12 @@ export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer:
     case "object_records":
       cacheObjectPages(browser.cache, transfer.objects);
       return;
+    case "cell_pages":
+      // Cell-page transfers carry content-addressed page records sized below
+      // a full object_record; the cache stores them so later turns can install
+      // by ref instead of re-shipping the full page payload.
+      cacheStatePages(browser.cache, transfer.inline_pages);
+      return;
   }
   assertNeverTransfer(transfer);
 }
@@ -866,6 +877,15 @@ function cacheObjectPages(cache: ShadowBrowserNodeCache, objects: SerializedObje
     const hash = shadowObjectRecordHash(obj);
     cache.object_pages.set(hash, structuredClone(obj) as SerializedObject);
     cache.object_page_refs.set(obj.id, hash);
+    cacheStatePages(cache, shadowStatePagesForObject(obj));
+  }
+}
+
+function cacheStatePages(cache: ShadowBrowserNodeCache, pages: ShadowStatePage[]): void {
+  for (const page of pages) {
+    const hash = shadowStatePageHash(page);
+    cache.state_pages.set(hash, structuredClone(page) as ShadowStatePage);
+    cache.state_page_refs.set(`${page.object}:${page.page}:${"name" in page ? page.name : ""}`, hash);
   }
 }
 

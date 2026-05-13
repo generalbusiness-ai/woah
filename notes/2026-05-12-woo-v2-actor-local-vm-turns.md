@@ -996,10 +996,11 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   recorded-turn replay and fresh `TurnCall` execution. A shadow execution node
   refuses before execution when its atom cache does not cover the predicted
   TurnKey, returns `missing_state`, installs state transfer, then retries. The
-  fresh-call path now defaults to object-record transfer selected by missing
-  atom preimages. Object records are named by content hash so warmed nodes can
-  omit already-cached lineage/class pages; full-world closure transfer remains
-  only as a diagnostic replay baseline.
+  fresh-call path now defaults to cell-page transfer selected by missing atom
+  preimages. State pages split object lineage, live location/contents cells,
+  individual property cells, and individual verb bytecode cells. Object-record
+  transfer remains as a compatibility fallback, and full-world closure transfer
+  remains only as a diagnostic replay baseline.
 - `src/core/shadow-turn-call.ts` now has a shadow state guard around fresh
   execution. Dispatch, property, and structural cell recording events are
   checked against the node's materialized atom set; touching an unmaterialized
@@ -1007,7 +1008,7 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   returns the missing atom preimage for transfer.
 - `src/core/shadow-turn-network.ts` adds the first in-process routing harness:
   rank concrete `covers`/`accepts` ads, select a registered execution node,
-  request object-record transfer from an anchor on miss, merge it into the
+  request cell-page transfer from an anchor on miss, merge it into the
   selected node's partial inventory, retry the fresh call, and submit successful
   executions to a shadow commit scope.
 - `src/core/shadow-commit-scope.ts` adds the first load-bearing local commit
@@ -1022,13 +1023,12 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   `the_dubspace:set_control` catalog action, including a partial-inventory
   stale-ad case where only the missing `delay_1.wet` write atom is transferred.
   It also proves a two-turn warmup: after the first real control write installs
-  object pages, a second real control write to `delay_1.feedback` transfers no
-  inline object records. A separate catalog-cache case preloads `$...` class
-  object pages and executes the first real control write with only live object
-  records inlined.
-  Inline object records are now checked against their advertised page hash
-  before install, and transfers carry a shadow MAC proof scoped to the anchor
-  authority and recipient node.
+  state pages, a second real control write to `delay_1.feedback` transfers no
+  inline pages. A separate catalog-cache case preloads `$...` class state pages
+  and executes the first real control write without inlining catalog pages.
+  Inline state pages are now checked against their advertised page hash before
+  install, and transfers carry a shadow MAC proof scoped to the anchor authority
+  and recipient node.
   The same test file now proves that an accepted real dubspace action commits
   through the shadow commit scope and that a later execution with a stale
   expected head is rejected without mutating the authoritative scope.
@@ -1042,9 +1042,9 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
 - `scripts/profile-shadow-turn-network.ts` exposes the first CLI profile via
   `npm run v2:profile`, including a transfer-warmup table.
 - `src/core/shadow-browser-node.ts` adds an in-process browser-node shim with
-  a browser-shaped cache for object pages, projections, pending turns,
+  a browser-shaped cache for object/state pages, projections, pending turns,
   accepted frames, conflicts, transfers, and transcript tail. It connects to a
-  local relay/commit-scope shim, preloads catalog object pages, executes
+  local relay/commit-scope shim, preloads catalog state pages, executes
   tentative actor-local turns, asks the in-process network for missing state,
   and applies accepted/conflicted frames back into the browser cache. Scope
   open now installs a relay-MAC-checked projection transfer, while accepted
@@ -1102,22 +1102,21 @@ Implementation learning:
   refuses before running. If the VM touches an unpredicted cell during a real
   catalog action, the guard raises `E_NEED_STATE`; the network transfer loop can
   request that newly discovered atom and retry successfully.
-- Object-record shadow transfer is enough to prove compact state fill in
-  response to actual inventory gaps. For the current dubspace control turn, the
-  full pre-turn world is about 1.8 MiB while the executable object-record
-  transfer is about 253 KiB and 13 object records. That is still too large for
-  browser/mobile hot paths because class bytecode dominates the parent lineage,
-  but it is no longer copying unrelated room contents or the whole catalog.
-- Content-addressed object pages produce the expected warmup curve. In the CLI
-  profile, the first `the_dubspace:set_control` turn transfers 13 inline object
-  records, while the second turn against another control on the same object has
-  one missing atom, five cached page refs, zero inline object records, and about
-  1.8 KiB transferred.
-- A browser-like node with catalog/class object pages preseeded reduces the
-  first dubspace control transfer from about 253 KiB and 13 inline object
-  records to about 5.2 KiB and three inline live records (`the_dubspace`,
-  `delay_1`, and the actor). This is the strongest evidence so far that an
-  in-browser node should ship with or quickly acquire immutable catalog pages.
+- Cell-page shadow transfer is enough to prove compact state fill in response
+  to actual inventory gaps. For the current dubspace control turn, the full
+  pre-turn world is about 1.8 MiB while the executable cell-page transfer is
+  roughly tens of KiB, split across object lineage, live object structure,
+  property cells, and verb bytecode pages. It is no longer copying unrelated
+  room contents, the whole catalog, or whole object records.
+- Content-addressed state pages produce the expected warmup curve. In the CLI
+  profile, the first `the_dubspace:set_control` turn installs inline pages,
+  while the second turn against another control on the same object has one
+  missing atom, cached page refs, and no inline pages.
+- A browser-like node with catalog/class state pages preseeded avoids inlining
+  `$...` catalog pages on the first dubspace control transfer; only live
+  instance pages for `the_dubspace`, `delay_1`, and the actor need to move.
+  This is the strongest evidence so far that an in-browser node should ship
+  with or quickly acquire immutable catalog pages.
 - The browser shim exposed an important distinction between cached pages and
   executable state. Preseeded catalog pages must be materialized into the
   partial serialized world used by the VM, not only retained in the page cache;
@@ -1138,7 +1137,7 @@ Implementation learning:
   `$match:match_object` as tracked deterministic helpers. The matcher became
   safe enough for this by recording local contents reads and using ordinary
   recorded property reads for local candidate names.
-- Hash-checking inline object pages plus the shadow anchor MAC is a useful
+- Hash-checking inline state pages plus the shadow anchor MAC is a useful
   minimum integrity boundary, but it is not enough for production: the receiver
   still needs a real signed proof tying page hashes to a scope head/receipt
   before trusting transferred state from an untrusted peer.
@@ -1186,23 +1185,25 @@ The local commit model has a first implementation:
   current shadow protocol keeps them incomplete, preserves the bridge operation
   detail for diagnostics, and rejects the transcript rather than pretending a
   mergeable callee sub-transcript exists.
+- done: shadow state transfer now has page/cell closure transfer. The default
+  fresh-call network path uses `cell_pages`, with object lineage, live object
+  structure, property cells, and verb bytecode cached independently by hash.
 
 The remaining work in that layer is to expand the primitive contract model from
 the two current shadow-safe helpers into a production primitive catalog and,
 later, replace the remote bridge diagnostic with signed mergeable callee
 sub-transcripts.
 
-The next state-plane implementation step is page/cell closure transfer:
+The next state-plane hardening steps are:
 
-- split large class/object records below object granularity so reusable bytecode
-  and parent-lineage metadata do not dominate every first transfer;
-- decide when inherited class bytecode can be named by hash instead of inlined;
 - replace the shadow MAC with real signatures/proofs over a scope head or
   accepted receipt;
 - before any non-shadow use, replace the current `sha256(prefix:secret:root)`
   dev-key construction with `crypto.createHmac("sha256", secret)`;
 - apply object/property-level authorization filtering before exposing transfer
   data to browser or mobile actor nodes.
+- teach the planner to request fewer preamble pages when a live node already has
+  sequencer/session metadata under a freshness rule.
 
 The next profiling step is to add shape families rather than hard-coded cases:
 
