@@ -639,7 +639,7 @@ The Directory's session routing row is a routing cache, not the canonical sessio
 Skeleton `wrangler.toml`:
 
 ```toml
-name = "woo"
+name = "woah"
 main = "src/worker/index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_als"]

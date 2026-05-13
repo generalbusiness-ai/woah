@@ -726,21 +726,13 @@ export async function handleShadowBrowserTurnExecEnvelope(
     return cached ? structuredClone(cached) as ShadowEnvelope<ShadowTurnExecReply> : null;
   }
   const request = receipt.envelope.body as ShadowTurnExecRequest;
-  const result = await executeShadowBrowserTurn(browser, {
-    id: request.id ?? request.call.id,
-    route: request.call.route,
-    scope: request.call.scope,
-    target: request.call.target,
-    verb: request.call.verb,
-    args: request.call.args,
-    commit_policy: request.commit_policy
-  });
-  if (!result.result.reply) return null;
-  const body = shadowBrowserWireTurnExecReply(result.result.reply);
+  const result = await executeShadowBrowserTurnExecRequest(browser, request);
+  if (!result.reply) return null;
+  const body = shadowBrowserWireTurnExecReply(result.reply);
   const reply: ShadowEnvelope<ShadowTurnExecReply> = {
     v: 2,
     type: body.kind,
-    id: `${browser.relay.node}:reply:${result.id}`,
+    id: `${browser.relay.node}:reply:${request.id ?? request.call.id ?? receipt.envelope.id}`,
     from: browser.relay.node,
     to: browser.node,
     actor: browser.actor,
@@ -754,6 +746,58 @@ export async function handleShadowBrowserTurnExecEnvelope(
   browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(reply));
   trimShadowBrowserIdempotency(browser.relay);
   return reply;
+}
+
+async function executeShadowBrowserTurnExecRequest(
+  browser: ShadowBrowserNode,
+  request: ShadowTurnExecRequest
+): Promise<ShadowTurnExecutionResult> {
+  validateShadowBrowserNodeAuth(browser);
+  const executor = shadowRelayExecutorForRequest(browser.relay, request);
+  const network = await executeShadowTurnCallAcrossInProcessNetwork({
+    request,
+    nodes: browser.relay.executors,
+    // Wire clients already submit the planned turn key. The relay executor is
+    // scope-local and stateful, so server dispatch should execute that request
+    // directly instead of rebuilding a browser-origin planning turn first.
+    ads: [buildShadowTurnExecAd({ node: executor.node, scope: request.key.scope, key: request.key, factor: 0.1 })],
+    anchor: {
+      node: browser.relay.node,
+      serialized: browser.relay.commit_scope.serialized
+    },
+    commitScope: browser.relay.commit_scope
+  });
+
+  for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
+  if (network.result.ok) {
+    if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
+    else {
+      browser.cache.transcript_tail.push(network.result.transcript);
+      trimArrayHead(browser.cache.transcript_tail, MAX_SHADOW_BROWSER_CACHE_TAIL);
+    }
+  } else if (network.result.reason === "commit_rejected" && network.result.commit) {
+    applyShadowBrowserConflict(browser, network.result.commit);
+  }
+  return network.result;
+}
+
+function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: ShadowTurnExecRequest): ShadowExecutionNode {
+  const nodeId = `${relay.node}:executor`;
+  let executor = relay.executors.find((node) => node.node === nodeId);
+  if (!executor) {
+    executor = createShadowExecutionNode({
+      node: nodeId,
+      scope: request.key.scope,
+      serialized: relay.commit_scope.serialized,
+      atom_hashes: request.key.atom_hashes
+    });
+    relay.executors.push(executor);
+  }
+  // The relay executor has the authoritative scope state locally. The atom set
+  // still gates the actual execution against the client's planned key; missing
+  // actual atoms trigger the normal state-plane retry path.
+  for (const hash of request.key.atom_hashes) executor.atom_hashes.add(hash);
+  return executor;
 }
 
 function shadowBrowserWireTurnExecReply(reply: ShadowTurnExecReply): ShadowTurnExecReply {

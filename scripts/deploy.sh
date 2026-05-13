@@ -23,7 +23,7 @@ SKIP_TESTS=0
 SKIP_POSTFLIGHT=0
 DRY_RUN=0
 EXPECTED_BRANCH="main"
-WORKER_URL="${WOO_WORKER_URL:-https://woo.inguz.workers.dev}"
+WORKER_URL="${WOO_WORKER_URL:-https://woah.inguz.workers.dev}"
 POSTFLIGHT_TIMEOUT="${WOO_POSTFLIGHT_TIMEOUT:-45}"
 
 usage() {

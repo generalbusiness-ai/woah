@@ -63,6 +63,9 @@ describe("v2 CommitScopeDO cost budget", () => {
       const writes = rowWrites(harness.scopeState);
       // Expected row writes for one committed turn:
       // meta + accepted_frame + transcript_tail + seen + reply = 5.
+      // Reply envelopes stay durable so retries remain reply-idempotent across
+      // CommitScopeDO hibernation; the separate reply cap prevents unbounded
+      // growth inside the idempotency window.
       // Budget allows two small retention/accounting additions, but rejects the
       // old retained-tail rewrite pattern that produced thousands of writes.
       expect(writes).toBeLessThanOrEqual(7);

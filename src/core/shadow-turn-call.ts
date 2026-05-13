@@ -13,6 +13,7 @@ import {
   type TurnStart
 } from "./turn-recorder";
 import { shadowAtomHash, shadowReadCellPreimage, shadowWriteCellPreimage } from "./turn-key";
+import type { WooWorld } from "./world";
 
 export type ShadowTurnCall = {
   kind: "woo.turn_call.shadow.v1";
@@ -43,6 +44,14 @@ export async function runShadowTurnCall(
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
   const world = createWorldFromSerialized(serializedBefore, { persist: false });
+  return await runShadowTurnCallOnWorld(world, call, options);
+}
+
+export async function runShadowTurnCallOnWorld(
+  world: WooWorld,
+  call: ShadowTurnCall,
+  options: ShadowTurnCallOptions = {}
+): Promise<ShadowTurnCallRun> {
   const recorder = new InMemoryTurnRecorder();
   world.setTurnRecorder(options.allowed_atom_hashes
     ? new ShadowStateGuardTurnRecorder(recorder, new Set(options.allowed_atom_hashes))

@@ -11,7 +11,7 @@ import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
-import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
+import { runShadowTurnCallOnWorld, type ShadowTurnCall } from "./shadow-turn-call";
 import {
   submitShadowCommit,
   type ShadowCommitAccepted,
@@ -22,6 +22,8 @@ import {
 } from "./shadow-commit-scope";
 import { constantTimeEqual, hashSource } from "./source-hash";
 import { stableShadowJson } from "./shadow-cell-version";
+import { createWorldFromSerialized } from "./bootstrap";
+import type { WooWorld } from "./world";
 
 const DEFAULT_SHADOW_TRANSFER_AUTHORITY = "shadow-anchor";
 const DEFAULT_SHADOW_TRANSFER_KEY_ID = "shadow-dev";
@@ -99,6 +101,7 @@ export type ShadowExecutionNode = {
   object_cache: Map<string, SerializedObject>;
   trusted_transfer_authorities: Map<string, string>;
   serialized?: SerializedWorld;
+  world?: WooWorld;
 };
 
 export type ShadowTurnExecutionResult =
@@ -319,11 +322,13 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
   for (const hash of transfer.atom_hashes) node.atom_hashes.add(hash);
   if (transfer.mode === "closure") {
     node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
+    node.world = undefined;
     for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
     refreshNodeObjectHashes(node);
     return;
   }
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
+  node.world = undefined;
   for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
   refreshNodeObjectHashes(node);
 }
@@ -391,12 +396,23 @@ export async function executeShadowTurnCallOrNeedState(
     };
   }
 
-  const serializedBefore = structuredClone(node.serialized) as SerializedWorld;
-  const run = await runShadowTurnCall(serializedBefore, request.call, {
-    allowed_atom_hashes: node.atom_hashes
-  });
+  const serializedBefore = node.serialized;
+  const world = shadowExecutionWorld(node);
+  let run: Awaited<ReturnType<typeof runShadowTurnCallOnWorld>>;
+  try {
+    run = await runShadowTurnCallOnWorld(world, request.call, {
+      allowed_atom_hashes: node.atom_hashes
+    });
+  } catch (err) {
+    // A cached executor world is authoritative only after a successful turn.
+    // If VM execution throws outside the normal ErrorFrame path, discard the
+    // mutable cache and rebuild from node.serialized on the next attempt.
+    node.world = undefined;
+    throw err;
+  }
   const needState = missingAtomsFromNeedStateTranscript(run.transcript);
   if (needState.length > 0) {
+    node.world = undefined;
     return {
       ok: false,
       reason: "missing_state",
@@ -410,6 +426,7 @@ export async function executeShadowTurnCallOrNeedState(
   const actualKey = shadowTurnKeyFromTranscript(run.transcript);
   const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes);
   if (unmaterialized.length > 0) {
+    node.world = undefined;
     return {
       ok: false,
       reason: "missing_state",
@@ -435,6 +452,7 @@ export async function executeShadowTurnCallOrNeedState(
     ? commit.receipt
     : shadowCommitReceipt(serializedBefore, run.serializedAfter, run.transcript);
   if (!receipt.accepted) {
+    node.world = undefined;
     const conflict = commit?.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
     return {
       ok: false,
@@ -465,6 +483,12 @@ export async function executeShadowTurnCallOrNeedState(
     serializedAfter,
     reply: successReply(request, run.transcript, commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined)
   };
+}
+
+function shadowExecutionWorld(node: ShadowExecutionNode): WooWorld {
+  if (!node.serialized) throw new Error(`shadow executor has no serialized state: ${node.node}`);
+  if (!node.world) node.world = createWorldFromSerialized(node.serialized, { persist: false });
+  return node.world;
 }
 
 export function shadowObjectRecordHash(obj: SerializedObject): string {
