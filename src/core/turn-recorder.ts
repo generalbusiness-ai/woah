@@ -11,6 +11,17 @@ export type RecordedCell =
 
 export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace";
 
+// Authority is captured at the VM-frame boundary so commit validation can
+// authorize each mutation against the exact `progr` that performed it.
+export type RecordedWriteAuthority = {
+  progr: ObjRef;
+  thisObj: ObjRef;
+  verb: string;
+  definer: ObjRef;
+  caller: ObjRef;
+  callerPerms: ObjRef;
+};
+
 export type TurnStart = {
   id?: string;
   route: TurnRoute;
@@ -28,11 +39,11 @@ export type TurnRecorderEvent =
   | { kind: "turn_finish"; ok: true; result?: WooValue }
   | { kind: "turn_finish"; ok: false; error: ErrorValue }
   | { kind: "cell_read"; cell: RecordedCell; value: WooValue; version?: string }
-  | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string }
+  | { kind: "cell_write"; cell: RecordedCell; value: WooValue; op: RecordedCellWriteOp; prior?: string; next?: string; writer?: RecordedWriteAuthority }
   | { kind: "prop_read"; object: ObjRef; name: string; value: WooValue; version?: number | string }
-  | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string }
-  | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"] }
-  | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef }
+  | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string; writer?: RecordedWriteAuthority }
+  | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"]; writer?: RecordedWriteAuthority }
+  | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef; writer?: RecordedWriteAuthority }
   | { kind: "observe"; observation: Observation }
   | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }
   | { kind: "logical_input"; name: string; value: WooValue }

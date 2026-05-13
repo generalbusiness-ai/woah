@@ -30,7 +30,7 @@ import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
-import { objectCreateEvent, type ActiveTurnRecorder, type TurnRecorder, type TurnStart } from "./turn-recorder";
+import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -418,6 +418,7 @@ export class WooWorld {
 
   private turnRecorder: TurnRecorder | null;
   private activeTurnRecorder: ActiveTurnRecorder | null = null;
+  private currentTurnWriter: RecordedWriteAuthority | null = null;
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
 
   constructor(private repository?: WooRepository, options: { hostBridge?: HostBridge | null; turnRecorder?: TurnRecorder | null } = {}) {
@@ -437,8 +438,10 @@ export class WooWorld {
       return await fn(this.activeTurnRecorder ?? { event: () => undefined });
     }
     const previous = this.activeTurnRecorder;
+    const previousWriter = this.currentTurnWriter;
     const active = recorder.startTurn(turn);
     this.activeTurnRecorder = active;
+    this.currentTurnWriter = null;
     try {
       const result = await fn(active);
       active.event({ kind: "turn_finish", ok: true, result: result as WooValue });
@@ -448,11 +451,71 @@ export class WooWorld {
       throw err;
     } finally {
       this.activeTurnRecorder = previous;
+      this.currentTurnWriter = previousWriter;
     }
   }
 
-  private recordTurnEvent(event: Parameters<ActiveTurnRecorder["event"]>[0]): void {
-    this.activeTurnRecorder?.event(event);
+  // Called by the VM whenever execution changes frames. The recorder annotates
+  // subsequent mutations with this frame until dispatch/VM unwinds.
+  setTurnRecorderFrame(ctx: CallContext): void {
+    if (!this.activeTurnRecorder) return;
+    this.currentTurnWriter = this.turnWriterFromContext(ctx);
+  }
+
+  private async withTurnRecorderFrame<T>(ctx: CallContext, fn: () => Promise<T>): Promise<T> {
+    const previous = this.currentTurnWriter;
+    this.setTurnRecorderFrame(ctx);
+    try {
+      return await fn();
+    } finally {
+      this.currentTurnWriter = previous;
+    }
+  }
+
+  private turnWriterFromContext(ctx: CallContext): RecordedWriteAuthority {
+    return {
+      progr: ctx.progr,
+      thisObj: ctx.thisObj,
+      verb: ctx.verbName,
+      definer: ctx.definer,
+      caller: ctx.caller,
+      callerPerms: ctx.callerPerms
+    };
+  }
+
+  private recordTurnEvent(event: TurnRecorderEvent): void {
+    this.activeTurnRecorder?.event(this.recordedEventWithWriter(event));
+  }
+
+  // Local bytecode-to-bytecode calls bypass dispatch(), so the VM uses this
+  // hook to keep verb metadata reads complete for transcript validation.
+  recordTurnDispatch(target: ObjRef, verbName: string, startAt: ObjRef | null | undefined, definer: ObjRef, verb: VerbDef): void {
+    this.recordTurnEvent({
+      kind: "dispatch",
+      target,
+      verb: verbName,
+      startAt,
+      definer,
+      implementation: verb.kind,
+      owner: verb.owner,
+      version: verb.version,
+      source_hash: verb.source_hash,
+      direct_callable: verb.direct_callable,
+      ...(verb.kind === "native" ? { native: verb.native } : {})
+    });
+  }
+
+  private recordedEventWithWriter(event: TurnRecorderEvent): TurnRecorderEvent {
+    if (!this.currentTurnWriter) return event;
+    switch (event.kind) {
+      case "cell_write":
+      case "prop_write":
+      case "object_create":
+      case "object_move":
+        return event.writer ? event : { ...event, writer: this.currentTurnWriter };
+      default:
+        return event;
+    }
   }
 
   private propertyVersionForRecording(objRef: ObjRef, name: string): number | string | undefined {
@@ -3007,19 +3070,7 @@ export class WooWorld {
         // as "no parent override" and fall back to the standard resolveVerb walk.
         const { definer, verb } = startAt == null ? this.resolveVerb(target, verbName) : this.resolveVerbFrom(startAt, verbName);
         this.assertCanExecuteVerb(ctx.progr, target, verbName, verb);
-        this.recordTurnEvent({
-          kind: "dispatch",
-          target,
-          verb: verbName,
-          startAt,
-          definer,
-          implementation: verb.kind,
-          owner: verb.owner,
-          version: verb.version,
-          source_hash: verb.source_hash,
-          direct_callable: verb.direct_callable,
-          ...(verb.kind === "native" ? { native: verb.native } : {})
-        });
+        this.recordTurnDispatch(target, verbName, startAt, definer, verb);
         const runCtx: CallContext = {
           ...ctx,
           thisObj: target,
@@ -3036,9 +3087,9 @@ export class WooWorld {
           // permissions and set progr/definer/caller frame fields.
           const handler = this.nativeHandlers.get(verb.native);
           if (!handler) throw wooError("E_VERBNF", `native handler not found: ${verb.native}`);
-          result = await handler(runCtx, args);
+          result = await this.withTurnRecorderFrame(runCtx, async () => await handler(runCtx, args));
         } else {
-          result = await runTinyVm(runCtx, verb.bytecode, args);
+          result = await this.withTurnRecorderFrame(runCtx, async () => await runTinyVm(runCtx, verb.bytecode, args));
         }
       } finally {
         this.callDepth -= 1;

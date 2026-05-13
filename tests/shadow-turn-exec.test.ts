@@ -350,6 +350,78 @@ describe("shadow turn execution", () => {
     expect(committed.getProp("merge_box", "feedback")).toBe(0.37);
   });
 
+  it("rejects tampered writes that borrow authority from an unrelated verb read", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-write-authority");
+    const actor = session.actor;
+    anchor.createObject({ id: "actor_box", name: "Actor Box", parent: "$thing", owner: actor });
+    anchor.defineProperty("actor_box", { name: "value", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+    anchor.createObject({ id: "admin_box", name: "Admin Box", parent: "$thing", owner: "$wiz" });
+    anchor.defineProperty("admin_box", { name: "value", defaultValue: 0, owner: "$wiz", perms: "r", typeHint: "int" });
+    expect(installVerb(anchor, "actor_box", "set_value", `verb :set_value(value) rxd {
+      this.value = value;
+      return this.value;
+    }`, null).ok).toBe(true);
+    expect(installVerb(anchor, "admin_box", "noop", `verb :noop() rxd {
+      return 1;
+    }`, null).ok).toBe(true);
+
+    const serializedBefore = anchor.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-write-authority",
+      route: "direct",
+      scope: "actor_box",
+      session: session.id,
+      actor,
+      target: "actor_box",
+      verb: "set_value",
+      args: [1]
+    };
+    const planned = await runShadowTurnCall(serializedBefore, call);
+    const tampered = structuredClone(planned.transcript);
+    const adminVerb = serializedBefore.objects.find((obj) => obj.id === "admin_box")?.verbs.find((verb) => verb.name === "noop");
+    expect(adminVerb).toBeDefined();
+    tampered.reads.push({
+      cell: { kind: "verb", object: "admin_box", name: "noop" },
+      version: String(adminVerb!.version),
+      value: {
+        implementation: adminVerb!.kind,
+        owner: adminVerb!.owner,
+        source_hash: adminVerb!.source_hash,
+        direct_callable: adminVerb!.direct_callable === true,
+        native: adminVerb!.kind === "native" ? adminVerb!.native : null,
+        version: adminVerb!.version
+      }
+    });
+    for (const write of tampered.writes) {
+      if (write.cell.kind === "prop" && write.cell.object === "actor_box" && write.cell.name === "value") {
+        expect(write.writer?.progr).toBe(actor);
+        write.cell = { kind: "prop", object: "admin_box", name: "value" };
+      }
+    }
+    for (const read of tampered.reads) {
+      if (read.cell.kind === "prop" && read.cell.object === "actor_box" && read.cell.name === "value") {
+        read.cell = { kind: "prop", object: "admin_box", name: "value" };
+      }
+    }
+
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: planned.transcript.scope, serialized: serializedBefore });
+    const rejected = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "shadow-write-authority-tampered",
+      scope: planned.transcript.scope,
+      expected: structuredClone(commitScope.head),
+      transcript: tampered
+    });
+
+    expect(rejected.kind).toBe("woo.commit.conflict.shadow.v1");
+    if (rejected.kind !== "woo.commit.conflict.shadow.v1") throw new Error("expected tampered write to be rejected");
+    expect(rejected.reason).toBe("permission_denied");
+    expect(rejected.errors).toContain("permission_denied: no recorded authority can write admin_box.value");
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("admin_box", "value")).toBe(0);
+  });
+
   it("uses cached object pages so a second real dubspace turn transfers no lineage records", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-page-cache");

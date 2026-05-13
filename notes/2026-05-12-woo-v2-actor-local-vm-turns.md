@@ -1157,21 +1157,26 @@ The local commit model has a first implementation:
 - done: the in-process network now submits successful executions to a
   commit-submit/accept/conflict service;
 - done: validation now extends beyond read-set consistency to session shape,
-  coarse write authority, lifecycle/move consistency, and post-state checks;
+  per-write VM-frame authority, lifecycle/move consistency, and post-state
+  checks;
 - done: VM read-level `missing_state` aborts catch cells missed by predicted
   TurnKeys;
 - done: commit scope no longer accepts executor `serialized_after` in commit
   submit. It builds authoritative post-state directly from transcript
   create/write/move cells and sequenced-log outcome; accepted frames still carry
   the scope's resulting serialized state for cache/projection consumers.
+- done: mutation recorder events now carry the exact VM frame (`progr`,
+  `this`, verb, definer, caller, caller perms) that performed the write. The VM
+  also records local bytecode-to-bytecode dispatches, so commit validation can
+  bind each write to its actual frame instead of authorizing against the union
+  of all verb owners that appear in transcript reads.
 - remaining: decide how remote sub-transcripts are merged, or keep cross-host
   bridge calls explicitly incomplete until the execution plane is in place.
 
-The remaining work in that layer is to strengthen write authority from coarse
-recorded-owner checks into exact VM-frame authority, make remote
-bridge/sub-transcript behavior explicit, and replace the small tracked-native
-allowlist with a declarative primitive contract that states which native helpers
-are deterministic, which state they read, and which effects they may emit.
+The remaining work in that layer is to make remote bridge/sub-transcript
+behavior explicit, and replace the small tracked-native allowlist with a
+declarative primitive contract that states which native helpers are
+deterministic, which state they read, and which effects they may emit.
 
 The next state-plane implementation step is page/cell closure transfer:
 

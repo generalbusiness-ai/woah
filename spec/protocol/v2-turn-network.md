@@ -324,6 +324,7 @@ type TranscriptWrite = {
   value_hash: Hash;
   value?: WooValue;
   op: "set" | "delete" | "append" | "add" | "remove" | "move" | "replace" | "create";
+  writer: RecordedWriteAuthority;
 };
 
 type TranscriptCreate = {
@@ -331,17 +332,28 @@ type TranscriptCreate = {
   parent: ObjRef;
   owner: ObjRef;
   initial_cells: TranscriptWrite[];
+  writer: RecordedWriteAuthority;
 };
 
 type TranscriptMove = {
   object: ObjRef;
   from: ObjRef | null;
   to: ObjRef;
+  writer: RecordedWriteAuthority;
 };
 
 type TranscriptRecycle = {
   object: ObjRef;
   final_version?: string;
+};
+
+type RecordedWriteAuthority = {
+  progr: ObjRef;
+  this_obj: ObjRef;
+  verb: string;
+  definer: ObjRef;
+  caller: ObjRef;
+  caller_perms: ObjRef;
 };
 ```
 
@@ -349,6 +361,12 @@ type TranscriptRecycle = {
 semantic operation. `add` and `remove` are used for contents-cell membership
 updates. `create` is allowed only for lifecycle cells and SHOULD also be
 represented in `creates` when the created object identity is visible.
+
+Every mutation record MUST name the VM frame whose effective programmer
+authority performed it. The commit scope validates that frame against recorded
+dispatch/verb metadata reads, then checks property, movement, creation, and
+lease authority for that single frame. It MUST NOT authorize a write by taking
+the union of all verb owners mentioned anywhere in the transcript.
 
 `complete: false` means the recorder observed an untracked native effect or an
 execution boundary that cannot be validated. A commit scope MUST NOT accept an
@@ -366,7 +384,9 @@ pre/post state hashes are available.
 
 Dispatch reads SHOULD contribute to `vm.verb_hashes`. The shadow recorder
 currently records the resolved definer, owner, version, `source_hash`,
-direct-callability, and native handler name when the verb is native; production
+direct-callability, and native handler name when the verb is native. It records
+both top-level dispatches and local bytecode-to-bytecode calls so write-frame
+validation can prove which verb frame performed each mutation. Production
 transcripts fold that data into both the read set and the `vm` block.
 
 Transcript values MAY be omitted when the receiver already has the matching
@@ -492,7 +512,7 @@ future relaxed path.
 The shadow implementation now includes an in-process commit scope. It accepts
 `woo.commit.submit.shadow.v1` messages from the execution helper, owns the
 authoritative serialized state and shadow `ScopeHead`, validates expected head,
-scope, completeness, session/actor shape, read versions, coarse write
+scope, completeness, session/actor shape, read versions, per-write VM-frame
 authority, lifecycle/move post-state, and touched-cell post-state hashes, then
 returns `woo.commit.accepted.shadow.v1` or `woo.commit.conflict.shadow.v1`.
 The shadow submit no longer carries executor post-state. The commit scope

@@ -289,11 +289,15 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       push(value);
       return;
     }
+    caller.ctx.world.recordTurnDispatch(obj, name, startAt, definer, verb);
     pushFrame(callCtx, verb.bytecode, callArgs);
   };
 
   while (frames.length > 0) {
     const current = frame();
+    // Internal bytecode calls do not re-enter world.dispatch(), so publish the
+    // active frame here before any VM op can mutate recorded state.
+    current.ctx.world.setTurnRecorderFrame(current.ctx);
     if (current.pc >= current.bytecode.ops.length) {
       returnFromFrame(null);
       continue;

@@ -10,6 +10,7 @@ import {
 import { stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
+import type { RecordedWriteAuthority } from "./turn-recorder";
 import type { ObjRef, WooValue } from "./types";
 
 export type ShadowScopeHead = {
@@ -216,11 +217,8 @@ function finalWritesByCell(transcript: EffectTranscript): TranscriptWrite[] {
 
 function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
-  // The transcript does not yet attach each write to a VM frame/progr. Use the
-  // call actor plus recorded dispatch owners as a conservative shadow stand-in
-  // until frame-level authority is carried in the transcript.
-  const candidates = shadowWriterCandidates(transcript);
-  const authorizedCreates = new Set<ObjRef>();
+  const validWriters = new Map<string, boolean>();
+  const authorizedCreates = new Map<ObjRef, TranscriptCreate>();
   if (transcript.session) {
     const session = serializedBefore.sessions.find((item) => item.id === transcript.session);
     if (!session) errors.push(`permission_denied: session not found ${transcript.session}`);
@@ -231,16 +229,44 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
   }
 
   for (const create of transcript.creates) {
-    if (canAnyCandidateCreateObject(serializedBefore, candidates, create.parent, create.owner)) authorizedCreates.add(create.object);
-    else errors.push(`permission_denied: no recorded authority can create ${create.object}`);
+    if (!create.writer) {
+      errors.push(`permission_denied: missing writer for create ${create.object}`);
+      continue;
+    }
+    if (!recordedWriterIsValid(serializedBefore, transcript, create.writer, validWriters)) {
+      errors.push(`permission_denied: writer frame not recorded ${writerFrameLabel(create.writer)} for create ${create.object}`);
+      continue;
+    }
+    if (canWriterCreateObject(serializedBefore, create.writer.progr, create.parent, create.owner)) {
+      authorizedCreates.set(create.object, create);
+    } else {
+      errors.push(`permission_denied: no recorded authority can create ${create.object}`);
+    }
   }
 
   for (const write of transcript.writes) {
-    const writesCreatedObject = authorizedCreates.has(write.cell.object);
-    if (write.cell.kind === "prop" && !writesCreatedObject && !canAnyCandidateWriteProperty(serializedBefore, candidates, write.cell.object, write.cell.name)) {
+    if (!write.writer) {
+      errors.push(`permission_denied: missing writer for ${cellLabel(write.cell)}`);
+      continue;
+    }
+    if (!recordedWriterIsValid(serializedBefore, transcript, write.writer, validWriters)) {
+      errors.push(`permission_denied: writer frame not recorded ${writerFrameLabel(write.writer)} for ${cellLabel(write.cell)}`);
+      continue;
+    }
+    const createdObject = authorizedCreates.get(write.cell.object);
+    if (write.cell.kind === "lifecycle") {
+      if (!createdObject || !writerCanInitializeCreatedObject(serializedBefore, write.writer.progr, createdObject)) {
+        errors.push(`permission_denied: no recorded authority can create ${write.cell.object}`);
+      }
+      continue;
+    }
+    if (createdObject && writerCanInitializeCreatedObject(serializedBefore, write.writer.progr, createdObject)) {
+      continue;
+    }
+    if (write.cell.kind === "prop" && !canWriterWriteProperty(serializedBefore, write.writer.progr, write.cell.object, write.cell.name)) {
       errors.push(`permission_denied: no recorded authority can write ${cellLabel(write.cell)}`);
     }
-    if (write.cell.kind === "location" && !writesCreatedObject && !canAnyCandidateControlObject(serializedBefore, candidates, write.cell.object)) {
+    if (write.cell.kind === "location" && !canWriterControlObject(serializedBefore, write.writer.progr, write.cell.object)) {
       errors.push(`permission_denied: no recorded authority can move ${write.cell.object}`);
     }
   }
@@ -393,48 +419,55 @@ function nextObjectCounterForCreates(current: number, creates: TranscriptCreate[
   return next;
 }
 
-function shadowWriterCandidates(transcript: EffectTranscript): Set<ObjRef> {
-  const candidates = new Set<ObjRef>([transcript.call.actor]);
-  for (const read of transcript.reads) {
-    if (read.cell.kind !== "verb") continue;
-    if (!read.value || typeof read.value !== "object" || Array.isArray(read.value)) continue;
-    const owner = (read.value as Record<string, WooValue>).owner;
-    if (typeof owner === "string") candidates.add(owner);
-  }
-  return candidates;
+function recordedWriterIsValid(
+  serialized: SerializedWorld,
+  transcript: EffectTranscript,
+  writer: RecordedWriteAuthority,
+  validWriters: Map<string, boolean>
+): boolean {
+  const key = stableShadowJson(writer as unknown as WooValue);
+  const cached = validWriters.get(key);
+  if (cached !== undefined) return cached;
+  const valid =
+    serializedObject(serialized, writer.progr) !== undefined &&
+    transcript.reads.some((read) => {
+      if (read.cell.kind !== "verb" || read.cell.object !== writer.definer || read.cell.name !== writer.verb) return false;
+      if (!read.value || typeof read.value !== "object" || Array.isArray(read.value)) return false;
+      return (read.value as Record<string, WooValue>).owner === writer.progr;
+    });
+  validWriters.set(key, valid);
+  return valid;
 }
 
-function canAnyCandidateWriteProperty(serialized: SerializedWorld, candidates: Set<ObjRef>, object: ObjRef, name: string): boolean {
+function writerFrameLabel(writer: RecordedWriteAuthority): string {
+  return `${writer.progr} ${writer.definer}:${writer.verb} this=${writer.thisObj}`;
+}
+
+function canWriterWriteProperty(serialized: SerializedWorld, writer: ObjRef, object: ObjRef, name: string): boolean {
   const target = serializedObject(serialized, object);
   if (!target) return false;
   const info = serializedPropertyInfo(serialized, object, name);
-  for (const candidate of candidates) {
-    if (isWizard(serialized, candidate)) return true;
-    if (!info && target.owner === candidate) return true;
-    if (info && (info.owner === candidate || String(info.perms).includes("w"))) return true;
-  }
-  return false;
+  if (isWizard(serialized, writer)) return true;
+  if (!info && target.owner === writer) return true;
+  return info !== null && (info.owner === writer || String(info.perms).includes("w"));
 }
 
-function canAnyCandidateControlObject(serialized: SerializedWorld, candidates: Set<ObjRef>, object: ObjRef): boolean {
+function canWriterControlObject(serialized: SerializedWorld, writer: ObjRef, object: ObjRef): boolean {
   const target = serializedObject(serialized, object);
   if (!target) return false;
-  for (const candidate of candidates) {
-    if (isWizard(serialized, candidate) || target.owner === candidate) return true;
-  }
-  return false;
+  return isWizard(serialized, writer) || target.owner === writer;
 }
 
-function canAnyCandidateCreateObject(serialized: SerializedWorld, candidates: Set<ObjRef>, parent: ObjRef | null, owner: ObjRef): boolean {
+function canWriterCreateObject(serialized: SerializedWorld, writer: ObjRef, parent: ObjRef | null, owner: ObjRef): boolean {
   if (!parent) return false;
   const parentObj = serializedObject(serialized, parent);
   if (!parentObj) return false;
-  for (const candidate of candidates) {
-    if (isWizard(serialized, candidate)) return true;
-    if (owner !== candidate) continue;
-    if (parentObj.owner === candidate || parentObj.flags.fertile === true) return true;
-  }
-  return false;
+  if (isWizard(serialized, writer)) return true;
+  return owner === writer && (parentObj.owner === writer || parentObj.flags.fertile === true);
+}
+
+function writerCanInitializeCreatedObject(serialized: SerializedWorld, writer: ObjRef, create: TranscriptCreate): boolean {
+  return isWizard(serialized, writer) || create.owner === writer;
 }
 
 function serializedPropertyInfo(serialized: SerializedWorld, object: ObjRef, name: string): { owner: ObjRef; perms: string } | null {

@@ -3,7 +3,7 @@ import type { SerializedWorld } from "./repository";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import type { ErrorValue, ObjRef, Observation, WooValue } from "./types";
-import type { RecordedCell, RecordedCellWriteOp, RecordedTurn, TurnStart } from "./turn-recorder";
+import type { RecordedCell, RecordedCellWriteOp, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
 
 export type TranscriptCell = RecordedCell;
 
@@ -19,6 +19,7 @@ export type TranscriptWrite = {
   next?: string;
   value: WooValue;
   op: RecordedCellWriteOp;
+  writer?: RecordedWriteAuthority;
 };
 
 export type TranscriptCreate = {
@@ -33,12 +34,14 @@ export type TranscriptCreate = {
     programmer?: boolean;
     fertile?: boolean;
   };
+  writer?: RecordedWriteAuthority;
 };
 
 export type TranscriptMove = {
   object: ObjRef;
   from: ObjRef | null;
   to: ObjRef;
+  writer?: RecordedWriteAuthority;
 };
 
 export type EffectTranscript = {
@@ -95,7 +98,8 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           prior: event.prior,
           next: event.next,
           value: event.value,
-          op: event.op
+          op: event.op,
+          writer: event.writer
         });
         break;
       case "prop_read":
@@ -111,7 +115,8 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           prior: versionString(event.beforeVersion),
           next: versionString(event.afterVersion),
           value: event.after,
-          op: "set"
+          op: "set",
+          writer: event.writer
         });
         break;
       case "object_create":
@@ -122,20 +127,23 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           owner: event.owner,
           anchor: event.anchor,
           location: event.location,
-          flags: event.flags
+          flags: event.flags,
+          writer: event.writer
         });
         writes.push({
           cell: { kind: "lifecycle", object: event.object },
           value: "created",
-          op: "create"
+          op: "create",
+          writer: event.writer
         });
         break;
       case "object_move":
-        moves.push({ object: event.object, from: event.from, to: event.to });
+        moves.push({ object: event.object, from: event.from, to: event.to, writer: event.writer });
         writes.push({
           cell: { kind: "location", object: event.object },
           value: event.to,
-          op: "move"
+          op: "move",
+          writer: event.writer
         });
         break;
       case "observe":
