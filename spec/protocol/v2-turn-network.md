@@ -144,15 +144,76 @@ type AuthContext = {
   signature?: string;
   mac?: string;
   claims?: Record<string, unknown>;
+  token?: string;          // present only for mode:"session"
 };
 ```
 
 `sent_at` and `expires_at` are routing metadata. They are not deterministic VM
 inputs. A turn that needs time receives it through `LogicalInputs`.
 
-Authority-bearing messages MUST use `same_deployment_mac`, `signature`, or
-`session` authentication. Advisory gossip MAY use `anonymous_advisory` only on
-trusted local links where spoofing is not load-bearing.
+### VTN4.1 Wire encoding
+
+The first browser-relay transport profile uses **JSON-per-WebSocket-message**:
+
+- every WebSocket data frame contains exactly one UTF-8 JSON object;
+- the JSON object MUST be an `Envelope<T>`;
+- `v` MUST be exactly `2`;
+- `type` MUST be a registered v2 message type;
+- `body.kind`, when present, MUST match the envelope `type`;
+- binary page content MUST be base64url-encoded inside JSON fields until a
+  later binary profile is specified.
+
+Receivers MUST reject a frame before dispatch when JSON parse fails, the parsed
+value is not an object, `v !== 2`, required envelope fields are missing, or
+`type` is unknown for the negotiated transport profile. Unknown envelope fields
+MAY be ignored only after `v` and `type` are accepted; unknown message types
+MUST NOT be treated as advisory no-ops.
+
+The M4 browser-relay profile caps a single WebSocket message at 1 MiB after
+UTF-8 decoding. A receiver that sees a larger message MUST close the socket
+with WebSocket close code `1009` ("message too big"). Senders MUST chunk large
+state pages through `StatePageRef`/`StatePage` transfer rather than exceeding
+this cap. A relay MAY enforce a smaller deployment-local cap during overload,
+but MUST report it in the open handshake.
+
+### VTN4.2 Session authentication
+
+M4 browser-relay envelopes use `auth.mode:"session"`. The
+`same_deployment_mac` and `signature` modes remain reserved for M5 node-node
+and cross-deployment work; M4 implementations MUST NOT accept them on the
+browser-relay WebSocket.
+
+Session tokens are minted by the existing v1-authenticated HTTP gateway before
+the v2 WebSocket opens. The minting request is outside this v2 transport spec,
+but the resulting token MUST be a bearer credential scoped to:
+
+- `session`: session id;
+- `actor`: actor object id;
+- `deployment`: deployment id or local development profile id;
+- `issued_at`: Unix milliseconds;
+- `expires_at`: Unix milliseconds;
+- `scopes`: commit scopes or spaces the session may initially subscribe to;
+- `features`: negotiated prototype feature flags;
+- `rev`: session revocation/version counter.
+
+On the wire, the browser sends the token in the opening handshake and repeats
+it in `auth.token` on every envelope. `auth.claims` is the relay-validated,
+canonical subset of the token claims: `session`, `actor`, `deployment`,
+`issued_at`, `expires_at`, `scopes`, `features`, and `rev`. Browsers MUST NOT
+invent or modify `auth.claims`; relays either fill it before internal dispatch
+or reject the envelope.
+
+Session tokens MUST expire no later than 15 minutes after minting. A relay MAY
+issue a refreshed token on an authenticated control message before expiry.
+Revocation is checked by `(session, rev)` against the relay/gateway session
+store on connect and at least once every 60 seconds while the socket is open.
+If the token expires or is revoked, the relay MUST reject authority-bearing
+messages and close the socket with an auth failure close reason.
+
+Authority-bearing browser-relay messages MUST use `session` authentication.
+Advisory gossip MAY use `anonymous_advisory` only on trusted local links where
+spoofing is not load-bearing; browser-originated live messages are not
+anonymous advisory messages.
 
 The tuple `(from, id)` is the envelope idempotency key unless a body-level
 `turn.id` or `submit.id` narrows the key further. Receivers MUST make retry of
@@ -571,12 +632,34 @@ type CatchupReply = {
   to: ScopeHead;
   frames: AppliedFrame[];
   has_more: boolean;
+  state_transfer?: StateTransfer; // projection fallback when delta tail is gone
 };
 ```
 
 `AppliedFrame` is the durable successor of the v1 `op:"applied"` frame. It is
 the canonical subscription frame for committed observations and materialized
 state changes. Clients MUST treat missing positions as gaps and use catch-up.
+
+After a browser reconnects, it MUST NOT assume the relay buffered frames while
+the socket was absent. For every subscribed scope, the browser sends
+`CatchupRequest { from: last_known_scope_head, wants: "applied" }` or
+`wants:"projection"` when it only needs display state. If the relay still has a
+contiguous applied-frame tail after `from`, it returns frames and the new
+`to` head. If the relay no longer has the tail, or `from.epoch` is stale, the
+relay replies with `frames: []`, `has_more: false`, and `state_transfer` in
+projection mode. The browser then replaces its display projection for that
+scope and treats the returned `to` head as the new catch-up base.
+
+Relays MAY buffer accepted frames for connected sockets to smooth short
+network stalls, but browser correctness MUST come from catch-up plus state
+transfer. A reconnecting browser therefore follows this order:
+
+1. reopen the WebSocket and authenticate the session;
+2. resubscribe to desired scopes with its last known `ScopeHead`s;
+3. request deltas from those heads;
+4. fall back to projection state transfer when a delta tail is unavailable;
+5. discard optimistic browser-local state that cannot be reconciled to the new
+   head.
 
 ## VTN10. Execution plane
 
@@ -854,6 +937,32 @@ type LiveEvent = {
   coalesce?: string;
 };
 ```
+
+On the wire, `LiveEvent` is carried in an `Envelope<LiveEvent>` with
+`type:"woo.live.event.v1"`, `v:2`, and `auth.mode:"session"` for
+browser-originated events. Live events are not commit authority, but they are
+still session-authenticated because they can affect other users' displays,
+audio engines, or presence views.
+
+`coalesce` is a sender-chosen ASCII key with grammar:
+
+```text
+coalesce-key = scope "/" source "/" channel [ "/" field ]
+```
+
+Each segment is a URL-safe token (`[A-Za-z0-9._~-]+`) after object ids or field
+names are escaped. The key is scoped to `(session or actor, scope)` by the
+relay. Relays MAY keep only the newest live event for the same coalesce key
+under backpressure.
+
+Live event decoders MUST reject payloads that attempt to carry durable writes.
+In the M4 JSON profile, a live event body MUST NOT contain any of these
+top-level fields: `writes`, `creates`, `moves`, `transcript`, `commit`,
+`receipt`, `state_transfer`, `applied`, `schedule`, or `cancellations`. Live
+observations also MUST NOT use catalog observation types reserved for committed
+durable changes unless the catalog marks that type as live-safe. A rejected live
+event is dropped and MAY be reported to the sender as a protocol error; it MUST
+NOT be converted into a commit request.
 
 Live events cover:
 
@@ -1328,3 +1437,117 @@ that rate and those changes must survive replay.
 - **`scope_resumed` observation.** The system observation type that `$tick_source`
   subscribes to for epoch-migration recovery is not yet defined in the catalog
   model.
+
+## VTN19. Transport bindings
+
+VTN19 defines the M4 browser-to-relay transport binding. It is intentionally
+narrow: one browser node, one relay, one WebSocket, JSON envelopes only.
+Node-node transport, binary page transfer, `same_deployment_mac`, and
+cross-deployment signatures are deferred to M5.
+
+### VTN19.1 WebSocket endpoint and open handshake
+
+The browser opens:
+
+```text
+GET /v2/turn-network/ws?token=<session-token>&node=<browser-node-id>&resume=<resume-token?>
+Upgrade: websocket
+Sec-WebSocket-Protocol: woo-v2.turn-network.json
+```
+
+The token in the query string is allowed only for the opening handshake. After
+the socket is established, every envelope repeats the bearer token in
+`auth.token` as specified in VTN4.2. Deployments that log URLs MUST redact the
+`token` query parameter.
+
+The relay's first message MUST be:
+
+```ts
+type TransportHello = {
+  kind: "woo.transport.hello.v1";
+  relay: NodeRef;
+  session: SessionRef;
+  actor: ActorRef;
+  server_time: number;
+  max_message_bytes: number;
+  planes: Array<"execution" | "commit" | "state" | "live">;
+  resume_token?: string;
+  features: string[];
+};
+```
+
+The browser MUST NOT send authority-bearing envelopes until it receives
+`TransportHello`. If authentication fails before `TransportHello`, the relay
+MUST close the WebSocket with a policy/auth failure reason. The relay MAY accept
+idempotent `ping` control frames before hello only to keep intermediaries from
+closing a slow-auth connection.
+
+### VTN19.2 Plane multiplexing
+
+The M4 browser-relay binding multiplexes all four protocol planes on the single
+WebSocket. Plane is derived from the envelope `type`:
+
+| Type prefix | Plane |
+|---|---|
+| `woo.turn.exec.` | Execution |
+| `woo.commit.` | Commit |
+| `woo.state.` and `woo.catchup.` | State |
+| `woo.subscribe.` | State/control |
+| `woo.live.` | Live |
+| `woo.transport.` | Transport control |
+
+Messages from different planes MAY be interleaved. Receivers MUST preserve
+per-envelope idempotency by `(from, id)` and MUST preserve commit-scope order
+by `ScopeHead`, not by WebSocket arrival order. A relay MUST NOT let a live
+message overtake or rewrite durable committed state; if a live event and an
+applied frame affect the same display field, the browser's projection rules
+decide which layer is visible.
+
+### VTN19.3 Ping, idle, and backpressure
+
+Either endpoint MAY use WebSocket ping/pong frames. In addition, either endpoint
+MAY send:
+
+```ts
+type TransportPing = {
+  kind: "woo.transport.ping.v1";
+  now: number;
+};
+
+type TransportPong = {
+  kind: "woo.transport.pong.v1";
+  ping_now: number;
+  now: number;
+};
+```
+
+If no frame is received for 25 seconds, an endpoint SHOULD send ping. If no
+frame or pong is received for 60 seconds, it SHOULD close and reconnect. These
+timers are transport health checks only and MUST NOT feed VM logical time.
+
+Relays MAY drop live events under backpressure, preferring to keep the newest
+event per coalesce key. Relays MUST NOT drop accepted commit frames on an open
+socket silently; if an accepted-frame queue overflows, the relay MUST send a
+transport gap/error and force the browser through VTN9 catch-up.
+
+### VTN19.4 Reconnect and resume
+
+`resume_token` is a transport convenience, not durable state authority. It lets
+the relay identify a recently disconnected socket and may preserve subscriptions
+for a short deployment-local window, recommended 30 seconds. It does not
+guarantee replay of accepted frames.
+
+On reconnect, the browser MUST:
+
+1. open a new WebSocket with the current session token and optional
+   `resume_token`;
+2. wait for `TransportHello`;
+3. resubmit `Subscribe` for desired scopes, including last-known heads;
+4. run VTN9 catch-up for each scope;
+5. re-send only idempotent pending turn requests whose `(from, id)` keys remain
+   valid.
+
+The relay MAY restore live subscriptions from `resume_token`, but the browser
+still sends explicit `Subscribe` messages so reconnect is correct when the
+relay forgot all socket state. Live events missed while disconnected are not
+recoverable.
