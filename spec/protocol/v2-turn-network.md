@@ -606,8 +606,10 @@ authority, lifecycle/move post-state, and touched-cell post-state hashes, then
 returns `woo.commit.accepted.shadow.v1` or `woo.commit.conflict.shadow.v1`.
 The shadow submit no longer carries executor post-state. The commit scope
 constructs authoritative post-state from transcript creates, writes, moves, and
-sequenced-log outcome, then exposes its own resulting `serialized_after` only on
-accepted frames for cache/projection consumers.
+sequenced-log outcome. Accepted frames carry commit position, transcript hash,
+receipt, and observations; current projection state is derived from the commit
+scope's authoritative serialized state or from explicit state transfers, never
+from a per-frame full-world snapshot.
 
 ## VTN9. Catch-up and applied frames
 
@@ -752,10 +754,10 @@ MUST include an accepted commit receipt. `execute_only` is reserved for local
 simulation and diagnostic deployments; clients MUST NOT treat an `execute_only`
 result as authoritative state.
 
-Turn-exec replies MUST NOT carry a full serialized post-state. When the shadow
-implementation exposes `serialized_after` for local cache/projection consumers,
-that field is confined to in-process accepted frames and state-plane transfers;
-wire replies carry commit position, transcript hash, receipt, and observations.
+Turn-exec replies and accepted frames MUST NOT carry a full serialized
+post-state. Current committed state is owned by the commit scope, and browser
+state reaches clients through state-plane projection/delta transfers. Wire
+replies carry commit position, transcript hash, receipt, and observations.
 
 `atoms` are the state/code/metadata closure that a candidate must probably
 cover before execution. `write_atoms` identify write-authority-sensitive cells
@@ -1066,7 +1068,10 @@ out to subscribed browser nodes as shadow delta transfers carrying the accepted
 frame, transcript tail, and refreshed projection, and relay MAC proofs are
 verified before cache install. The shim also includes scope subscriptions and
 best-effort live-event fan-out with coalescing, without advancing the
-commit-scope head. The browser-side M4 worker opens the v2 WebSocket, persists
+commit-scope head. Relay and browser diagnostic tails are bounded in the shadow
+implementation; if a browser reconnects from a head older than the retained
+tail, it receives a projection fallback rather than an unbounded replay. The
+browser-side M4 worker opens the v2 WebSocket, persists
 hello/reply/pending-frame state in IndexedDB, applies received projection/delta
 state transfers into projection, applied-frame, and transcript-tail stores,
 replays pending envelopes after reconnect, and marks reset/catch-up-needed state

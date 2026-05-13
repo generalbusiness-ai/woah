@@ -623,6 +623,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(scopeState).toBeDefined();
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT scope FROM v2_commit_scope_meta"))).toEqual([{ scope: "#-1" }]);
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT seq FROM v2_commit_scope_accepted_frame"))).toEqual([{ seq: 1 }]);
+      const acceptedRows = sqlRows<{ body: string }>(scopeState!.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame"));
+      expect(JSON.parse(acceptedRows[0].body)).not.toHaveProperty("serialized_after");
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_transcript_tail"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_snapshot"))[0]).toMatchObject({ n: 0 });

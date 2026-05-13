@@ -38,12 +38,9 @@ export type ShadowCommitAccepted = {
   post_state_hash: string;
   observations: EffectTranscript["observations"];
   receipt: ShadowCommitReceipt;
-  serialized_after: SerializedWorld;
 };
 
-// Wire replies carry commit authority and receipt data, while full post-state
-// travels through in-process accepted frames or explicit state transfers.
-export type ShadowCommitAcceptedWire = Omit<ShadowCommitAccepted, "serialized_after">;
+export type ShadowCommitAcceptedWire = ShadowCommitAccepted;
 
 export type ShadowCommitConflict = {
   kind: "woo.commit.conflict.shadow.v1";
@@ -154,8 +151,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     transcript_hash: submit.transcript.hash,
     post_state_hash: receipt.post_state_hash,
     observations: submit.transcript.observations,
-    receipt,
-    serialized_after: structuredClone(scope.serialized) as SerializedWorld
+    receipt
   };
   if (submissionId) scope.submissions.set(submissionId, accepted);
   return accepted;

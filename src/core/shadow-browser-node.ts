@@ -1,5 +1,5 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
-import { createShadowCommitScope, type ShadowCommitAccepted, type ShadowCommitAcceptedWire, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
+import { createShadowCommitScope, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
@@ -24,7 +24,16 @@ const DEFAULT_SHADOW_BROWSER_STATE_KEY_ID = "shadow-browser-dev";
 const DEFAULT_SHADOW_BROWSER_STATE_SECRET = "shadow-browser-dev-secret";
 const DEFAULT_SHADOW_DEPLOYMENT = "shadow-local";
 const MIN_SHADOW_IDEMPOTENCY_WINDOW_MS = 5 * 60 * 1000;
+// Shadow retention caps keep the prototype from growing per-scope/per-browser
+// arrays without bound. Production can tune these once VTN17 compaction policy
+// is formalized, but unbounded tails are never acceptable on the hot path.
 const MAX_SHADOW_IDEMPOTENCY_ENTRIES = 10_000;
+const MAX_SHADOW_ACCEPTED_TAIL = 1_000;
+const MAX_SHADOW_TRANSCRIPT_TAIL = 1_000;
+const MAX_SHADOW_LIVE_EVENTS = 500;
+const MAX_SHADOW_BROWSER_TRANSFERS = 200;
+const MAX_SHADOW_BROWSER_CACHE_TAIL = 1_000;
+const MAX_SHADOW_BROWSER_CONFLICTS = 200;
 const SHADOW_LIVE_DURABILITY_RESERVED_FIELDS = new Set([
   "writes",
   "creates",
@@ -424,6 +433,7 @@ export function publishShadowBrowserLiveEvent(
   options: { except?: string | null } = {}
 ): void {
   relay.live_events.push(structuredClone(event) as ShadowLiveEvent);
+  trimArrayHead(relay.live_events, MAX_SHADOW_LIVE_EVENTS);
   for (const browser of relay.browsers.values()) {
     if (options.except && browser.node === options.except) continue;
     if (!shadowLiveEventMatchesBrowser(relay, browser, event)) continue;
@@ -441,6 +451,7 @@ function receiveShadowBrowserLiveEvent(browser: ShadowBrowserNode, event: Shadow
     }
   }
   browser.cache.live_events.push(cloned);
+  trimArrayHead(browser.cache.live_events, MAX_SHADOW_LIVE_EVENTS);
 }
 
 function shadowLiveEventMatchesBrowser(
@@ -514,7 +525,10 @@ export async function executeShadowBrowserTurn(
   if (network.result.ok) {
     browser.cache.pending_turns.delete(id);
     if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
-    else browser.cache.transcript_tail.push(network.result.transcript);
+    else {
+      browser.cache.transcript_tail.push(network.result.transcript);
+      trimArrayHead(browser.cache.transcript_tail, MAX_SHADOW_BROWSER_CACHE_TAIL);
+    }
   } else if (network.result.reason === "commit_rejected") {
     browser.cache.pending_turns.delete(id);
     if (network.result.commit) applyShadowBrowserConflict(browser, network.result.commit);
@@ -742,16 +756,7 @@ export async function handleShadowBrowserTurnExecEnvelope(
 }
 
 function shadowBrowserWireTurnExecReply(reply: ShadowTurnExecReply): ShadowTurnExecReply {
-  if (reply.ok !== true || !reply.commit) return structuredClone(reply) as ShadowTurnExecReply;
-  // In-process accepted frames keep serialized_after so browser caches can
-  // derive projections. RPC replies stay small and authority-light; committed
-  // state reaches browsers through fan-out or later state-plane catch-up.
-  const { serialized_after: _serializedAfter, ...commit } = reply.commit as ShadowCommitAccepted;
-  const cloned = structuredClone(reply) as Extract<ShadowTurnExecReply, { ok: true }>;
-  return {
-    ...cloned,
-    commit: structuredClone(commit) as ShadowCommitAcceptedWire
-  };
+  return structuredClone(reply) as ShadowTurnExecReply;
 }
 
 export function roundTripShadowBrowserEnvelope<T>(browser: ShadowBrowserNode, type: string, body: T): ShadowEnvelope<T> {
@@ -761,16 +766,19 @@ export function roundTripShadowBrowserEnvelope<T>(browser: ShadowBrowserNode, ty
 export function applyShadowBrowserAcceptedFrame(browser: ShadowBrowserNode, accepted: ShadowCommitAccepted): void {
   if (browser.cache.applied_frames.some((frame) => frame.id === accepted.id && frame.position.hash === accepted.position.hash)) return;
   browser.cache.applied_frames.push(accepted);
-  browser.cache.projections.set(browser.scope, shadowScopeProjection(accepted.serialized_after, browser.scope, accepted.position.seq));
+  trimArrayHead(browser.cache.applied_frames, MAX_SHADOW_BROWSER_CACHE_TAIL);
+  browser.cache.projections.set(browser.scope, shadowScopeProjection(browser.relay.commit_scope.serialized, browser.scope, accepted.position.seq));
 }
 
 export function applyShadowBrowserConflict(browser: ShadowBrowserNode, conflict: ShadowCommitConflict): void {
   browser.cache.conflicts.push(conflict);
+  trimArrayHead(browser.cache.conflicts, MAX_SHADOW_BROWSER_CONFLICTS);
 }
 
 export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer: ShadowBrowserStateTransfer): void {
   verifyShadowBrowserStateTransfer(browser, transfer);
   browser.cache.transfers.push(structuredClone(transfer) as ShadowBrowserStateTransfer);
+  trimArrayHead(browser.cache.transfers, MAX_SHADOW_BROWSER_TRANSFERS);
   switch (transfer.mode) {
     case "projection":
       browser.cache.projections.set(transfer.scope, structuredClone(transfer.projection) as WooValue);
@@ -781,6 +789,7 @@ export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer:
       for (const transcript of transfer.transcript_tail) {
         if (!browser.cache.transcript_tail.some((item) => item.hash === transcript.hash)) {
           browser.cache.transcript_tail.push(structuredClone(transcript) as EffectTranscript);
+          trimArrayHead(browser.cache.transcript_tail, MAX_SHADOW_BROWSER_CACHE_TAIL);
         }
       }
       for (const accepted of transfer.applied) applyShadowBrowserAcceptedFrame(browser, accepted);
@@ -908,7 +917,9 @@ function markShadowBrowserEnvelopeSeen(relay: ShadowBrowserRelayShim, envelope: 
     if (seenAt < cutoff) {
       relay.recently_seen.delete(key);
       relay.recent_replies.delete(key);
+      continue;
     }
+    break;
   }
   const key = shadowBrowserIdempotencyKey(envelope);
   if (relay.recently_seen.has(key)) return { fresh: false, key };
@@ -965,10 +976,17 @@ function rememberShadowBrowserAcceptedFrame(
   if (!relay.accepted_frames.some((frame) => frame.id === accepted.id && frame.position.hash === accepted.position.hash)) {
     relay.accepted_frames.push(structuredClone(accepted) as ShadowCommitAccepted);
     relay.accepted_frames.sort((a, b) => a.position.seq - b.position.seq || String(a.id ?? "").localeCompare(String(b.id ?? "")));
+    trimArrayHead(relay.accepted_frames, MAX_SHADOW_ACCEPTED_TAIL);
   }
   if (!relay.transcript_tail.some((item) => item.hash === transcript.hash)) {
     relay.transcript_tail.push(structuredClone(transcript) as EffectTranscript);
+    relay.transcript_tail.sort((a, b) => a.seq - b.seq || a.hash.localeCompare(b.hash));
+    trimArrayHead(relay.transcript_tail, MAX_SHADOW_TRANSCRIPT_TAIL);
   }
+}
+
+function trimArrayHead<T>(items: T[], max: number): void {
+  if (items.length > max) items.splice(0, items.length - max);
 }
 
 function signShadowBrowserStateTransfer(

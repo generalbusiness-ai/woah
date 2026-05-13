@@ -449,7 +449,7 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
-    ? commit.serialized_after
+    ? options.commitScope?.serialized ?? run.serializedAfter
     : run.serializedAfter;
   node.serialized = structuredClone(serializedAfter) as SerializedWorld;
   for (const hash of actualKey.atom_hashes) node.atom_hashes.add(hash);
