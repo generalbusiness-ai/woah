@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import type { ShadowEnvelope } from "../src/core/shadow-envelope";
+import type { ShadowStatePage } from "../src/core/shadow-state-pages";
 
 describe("v2 browser cache reducer", () => {
   it("persists projection transfers as projection head and clears catch-up-required", () => {
@@ -70,6 +71,38 @@ describe("v2 browser cache reducer", () => {
       ...envelopeFor("woo.turn.exec.reply.shadow.v1", { kind: "woo.turn.exec.reply.shadow.v1", ok: true }),
       reply_to: "pending-1"
     })).toEqual([{ kind: "pending_delete", id: "pending-1" }]);
+  });
+
+  it("persists executable cell pages for later browser-side planning", () => {
+    const page: ShadowStatePage = {
+      kind: "woo.state_page.object_live.shadow.v1",
+      page: "object_live",
+      object: "#room",
+      location: null,
+      children: [],
+      contents: ["#note"]
+    };
+    const envelope = envelopeFor("woo.state.transfer.shadow.v1", {
+      kind: "woo.state.transfer.shadow.v1",
+      mode: "cell_pages",
+      scope: "#room",
+      atom_hashes: [],
+      page_refs: [{ object: "#room", page: "object_live", hash: "page-hash", bytes: 10, inline: true }],
+      inline_pages: [page],
+      sessions: [],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: [],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      source_object_count: 1,
+      source_page_count: 1,
+      proof: { kind: "test" }
+    });
+
+    expect(v2BrowserCacheMutationsForEnvelope(envelope)).toEqual([
+      { kind: "state_page", hash: "page-hash", ref: "#room:object_live:", page }
+    ]);
   });
 });
 

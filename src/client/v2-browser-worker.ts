@@ -27,17 +27,21 @@ type V2CacheStatus = {
   projections: number;
   applied_frames: number;
   transcript_tail: number;
+  object_pages: number;
+  state_pages: number;
   last_hello?: unknown;
   catchup_required?: boolean;
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const PROJECTION_STORE = "projections";
 const APPLIED_STORE = "applied_frames";
 const TRANSCRIPT_STORE = "transcript_tail";
+const OBJECT_PAGE_STORE = "object_pages";
+const STATE_PAGE_STORE = "state_pages";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -243,6 +247,8 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(PROJECTION_STORE)) database.createObjectStore(PROJECTION_STORE, { keyPath: "scope" });
       if (!database.objectStoreNames.contains(APPLIED_STORE)) database.createObjectStore(APPLIED_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(TRANSCRIPT_STORE)) database.createObjectStore(TRANSCRIPT_STORE, { keyPath: "hash" });
+      if (!database.objectStoreNames.contains(OBJECT_PAGE_STORE)) database.createObjectStore(OBJECT_PAGE_STORE, { keyPath: "hash" });
+      if (!database.objectStoreNames.contains(STATE_PAGE_STORE)) database.createObjectStore(STATE_PAGE_STORE, { keyPath: "hash" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
@@ -288,6 +294,12 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<voi
     case "transcript":
       await putTranscript(mutation.transcript);
       return;
+    case "object_page":
+      await putObjectPage(mutation.hash, mutation.object);
+      return;
+    case "state_page":
+      await putStatePage(mutation.hash, mutation.ref, mutation.page);
+      return;
   }
 }
 
@@ -327,6 +339,14 @@ async function putTranscript(transcript: EffectTranscript): Promise<void> {
   await tx(TRANSCRIPT_STORE, "readwrite", (store) => store.put({ hash: transcript.hash, scope: transcript.scope, seq: transcript.seq, transcript, received_at: Date.now() }));
 }
 
+async function putObjectPage(hash: string, object: unknown): Promise<void> {
+  await tx(OBJECT_PAGE_STORE, "readwrite", (store) => store.put({ hash, object: (object as { id?: unknown }).id, record: object, received_at: Date.now() }));
+}
+
+async function putStatePage(hash: string, ref: string, page: unknown): Promise<void> {
+  await tx(STATE_PAGE_STORE, "readwrite", (store) => store.put({ hash, ref, page, received_at: Date.now() }));
+}
+
 async function status(): Promise<V2CacheStatus> {
   return {
     connected: socket?.readyState === WebSocket.OPEN,
@@ -334,6 +354,8 @@ async function status(): Promise<V2CacheStatus> {
     projections: await countStore(PROJECTION_STORE),
     applied_frames: await countStore(APPLIED_STORE),
     transcript_tail: await countStore(TRANSCRIPT_STORE),
+    object_pages: await countStore(OBJECT_PAGE_STORE),
+    state_pages: await countStore(STATE_PAGE_STORE),
     last_hello: await getMeta("hello"),
     catchup_required: await getMeta("catchup_required")
   };

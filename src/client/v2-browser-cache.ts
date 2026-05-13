@@ -2,6 +2,8 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowEnvelope } from "../core/shadow-envelope";
+import type { ShadowStatePage } from "../core/shadow-state-pages";
+import type { SerializedObject } from "../core/repository";
 import type { WooValue } from "../core/types";
 
 export type V2BrowserCacheMutation =
@@ -9,7 +11,9 @@ export type V2BrowserCacheMutation =
   | { kind: "pending_delete"; id: string }
   | { kind: "projection"; scope: string; head: ShadowScopeHead; projection: WooValue }
   | { kind: "applied_frame"; frame: ShadowCommitAccepted; transcript?: EffectTranscript }
-  | { kind: "transcript"; transcript: EffectTranscript };
+  | { kind: "transcript"; transcript: EffectTranscript }
+  | { kind: "object_page"; hash: string; object: SerializedObject }
+  | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage };
 
 export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2BrowserCacheMutation[] {
   if (envelope.type === "woo.transport.hello.v1") {
@@ -31,6 +35,25 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
 
 function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2BrowserCacheMutation[] {
   if (transfer.kind !== "woo.state.transfer.shadow.v1") return [];
+  if (transfer.mode === "object_records") {
+    const hashByObject = new Map(transfer.object_pages.map((page) => [page.id, page.hash]));
+    return transfer.objects
+      .map((object) => {
+        const hash = hashByObject.get(object.id);
+        return hash ? { kind: "object_page" as const, hash, object } : null;
+      })
+      .filter((item): item is Extract<V2BrowserCacheMutation, { kind: "object_page" }> => item !== null);
+  }
+  if (transfer.mode === "cell_pages") {
+    const hashByRef = new Map(transfer.page_refs.map((ref) => [statePageRefKey(ref), ref.hash]));
+    return transfer.inline_pages
+      .map((page) => {
+        const ref = statePageRefKey(page);
+        const hash = hashByRef.get(ref);
+        return hash ? { kind: "state_page" as const, hash, ref, page } : null;
+      })
+      .filter((item): item is Extract<V2BrowserCacheMutation, { kind: "state_page" }> => item !== null);
+  }
   if (transfer.mode !== "projection" && transfer.mode !== "delta") return [];
   const common: V2BrowserCacheMutation[] = [
     { kind: "projection", scope: transfer.scope, head: transfer.to, projection: transfer.projection },
@@ -43,4 +66,8 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
     ...transfer.applied.map((frame, index) => ({ kind: "applied_frame" as const, frame, transcript: transfer.transcript_tail[index] })),
     ...transfer.transcript_tail.map((transcript) => ({ kind: "transcript" as const, transcript }))
   ];
+}
+
+function statePageRefKey(page: Pick<ShadowStatePage, "object" | "page"> & { name?: string }): string {
+  return `${page.object}:${page.page}:${page.name ?? ""}`;
 }
