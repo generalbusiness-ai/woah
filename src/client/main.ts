@@ -252,6 +252,7 @@ let chatHistoryDraft = "";
 let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, location.search);
 let routeInitialized = false;
 let v2BrowserWorker: Worker | undefined;
+let v2BrowserWorkerScope = "";
 state.spaceChatHeights = loadSpaceChatHeights();
 
 installBundledCatalogUi();
@@ -459,13 +460,23 @@ function ensureV2BrowserWorker() {
     if (event.data?.kind === "frame") console.debug("woo.v2.frame", event.data.envelope);
     if (event.data?.kind === "error") console.warn("woo.v2.error", event.data.error);
   });
+  syncV2BrowserWorkerScope();
+}
+
+function syncV2BrowserWorkerScope() {
+  if (!v2BrowserWorker || !state.session || !state.actor) return;
+  const token = authToken();
+  if (!token) return;
+  // The browser state plane is display-oriented, so subscribe to the active
+  // room projection when `/api/state` has established one; actor scope is a
+  // fallback for early sessions that have not entered a space yet.
+  const scope = activeChatRoom() || state.actor;
+  if (!scope || v2BrowserWorkerScope === scope) return;
+  v2BrowserWorkerScope = scope;
   v2BrowserWorker.postMessage({
     kind: "connect",
     token,
-    // The browser state plane is display-oriented, so subscribe to the active
-    // room projection when `/api/state` has established one; actor scope is a
-    // fallback for early sessions that have not entered a space yet.
-    scope: activeChatRoom() || state.actor
+    scope
   });
 }
 
@@ -647,6 +658,7 @@ async function logout() {
   v2BrowserWorker?.postMessage({ kind: "disconnect" });
   v2BrowserWorker?.terminate();
   v2BrowserWorker = undefined;
+  v2BrowserWorkerScope = "";
   if (sessionId) {
     try {
       await fetch("/api/session", { method: "DELETE", headers: { authorization: `Session ${sessionId}` } });
@@ -991,6 +1003,7 @@ async function refresh() {
   }
   audio?.sync(effectiveDubspace(), state.clockOffset);
   hydratePinboardNotesTextIfNeeded(pinboardModel());
+  syncV2BrowserWorkerScope();
   render();
 }
 

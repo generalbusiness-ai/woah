@@ -62,13 +62,11 @@ workerScope.addEventListener("message", (event: MessageEvent<V2WorkerCommand>) =
 async function handleCommand(command: V2WorkerCommand): Promise<void> {
   switch (command.kind) {
     case "connect":
-      current = {
+      await connectTo({
         token: command.token,
         node: command.node ?? await browserNodeId(),
         scope: command.scope ?? ""
-      };
-      await postCachedProjection(current.scope);
-      await connect();
+      });
       break;
     case "disconnect":
       clearReconnect();
@@ -101,6 +99,24 @@ async function handleCommand(command: V2WorkerCommand): Promise<void> {
   }
 }
 
+async function connectTo(next: { token: string; node: string; scope: string }): Promise<void> {
+  const changed = current !== null
+    && (current.token !== next.token || current.node !== next.node || current.scope !== next.scope);
+  current = next;
+  await postCachedProjection(current.scope);
+  if (changed) {
+    // A new scope needs a new WebSocket open so the relay can send a fresh
+    // TransportHello and projection/catch-up transfer for that scope.
+    clearReconnect();
+    const previous = socket;
+    socket = null;
+    connecting = false;
+    previous?.close(1000, "v2 browser scope changed");
+    await putMeta("connected", false);
+  }
+  await connect();
+}
+
 async function connect(): Promise<void> {
   if (!current) return;
   if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
@@ -118,6 +134,7 @@ async function connect(): Promise<void> {
   }), "woo-v2.turn-network.json");
   socket = ws;
   ws.addEventListener("open", () => {
+    if (socket !== ws) return;
     connecting = false;
     reconnectDelayMs = 500;
     void putMeta("connected", true);
@@ -125,18 +142,21 @@ async function connect(): Promise<void> {
     postStatus();
   });
   ws.addEventListener("message", (event) => {
+    if (socket !== ws) return;
     if (typeof event.data !== "string") return;
     void receiveFrame(event.data).catch((err: unknown) => {
       postMessage({ kind: "error", error: errorMessage(err) });
     });
   });
   ws.addEventListener("close", () => {
+    if (socket !== ws) return;
     connecting = false;
     void putMeta("connected", false);
     postStatus();
     scheduleReconnect();
   });
   ws.addEventListener("error", () => {
+    if (socket !== ws) return;
     connecting = false;
     void putMeta("connected", false);
     postStatus();
