@@ -19,6 +19,8 @@ import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
 import type { ObjRef, Observation, WooValue } from "./types";
+import { cloneValue } from "./types";
+import type { ScopedObjectSummary } from "./world";
 
 const DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY = "shadow-relay";
 const DEFAULT_SHADOW_BROWSER_STATE_KEY_ID = "shadow-browser-dev";
@@ -71,7 +73,7 @@ export type ShadowProjectionTransfer = {
   mode: "projection";
   scope: ObjRef;
   to: ShadowCommitAccepted["position"];
-  projection: WooValue;
+  projection: ShadowScopeProjection;
   proof: ShadowBrowserStateProof;
 };
 
@@ -82,8 +84,21 @@ export type ShadowDeltaTransfer = {
   to: ShadowCommitAccepted["position"];
   applied: ShadowCommitAccepted[];
   transcript_tail: EffectTranscript[];
-  projection: WooValue;
+  projection: ShadowScopeProjection;
   proof: ShadowBrowserStateProof;
+};
+
+export type ShadowScopeProjection = {
+  kind: "woo.scope_projection.shadow.v1";
+  scope: ObjRef;
+  title: string;
+  object_count: number;
+  contents: ObjRef[];
+  seq: number;
+  cursor: { spaces: Record<ObjRef, { next_seq: number }>; live: { resumable: false } };
+  viewer?: { actor: ObjRef; session?: string | null };
+  subject: ScopedObjectSummary | null;
+  objects: ScopedObjectSummary[];
 };
 
 export type ShadowBrowserStateTransfer = ShadowStateTransfer | ShadowProjectionTransfer | ShadowDeltaTransfer;
@@ -226,6 +241,11 @@ export type ShadowBrowserOpenScopeResult = {
 export type ShadowBrowserOpenScopeOptions = {
   preseed_catalog_pages?: boolean;
   last_known_head?: ShadowCommitAccepted["position"];
+};
+
+type ShadowProjectionViewer = {
+  actor: ObjRef;
+  session?: string | null;
 };
 
 export type ShadowBrowserTurnInput = {
@@ -405,7 +425,7 @@ export async function openShadowBrowserScope(
   subscribeShadowBrowserNode(browser, browser.scope);
   // Scope open enters the state plane even for display-only projection data, so
   // every cache fill goes through the same recipient-bound verification path.
-  const transfer = buildShadowBrowserCatchupTransfer(browser.relay, browser.scope, browser.node, options.last_known_head);
+  const transfer = buildShadowBrowserCatchupTransfer(browser.relay, browser.scope, browser.node, options.last_known_head, shadowProjectionViewer(browser));
   applyShadowBrowserTransfer(browser, transfer);
   return {
     projection: transfer.projection,
@@ -564,7 +584,12 @@ export async function executeShadowBrowserTurn(
   };
 }
 
-export function buildShadowBrowserProjectionTransfer(relay: ShadowBrowserRelayShim, scope: ObjRef, recipient = "*"): ShadowProjectionTransfer {
+export function buildShadowBrowserProjectionTransfer(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  recipient = "*",
+  viewer?: ShadowProjectionViewer
+): ShadowProjectionTransfer {
   // Projection transfer replaces direct cache mutation on scope-open so display
   // state obeys the same recipient-bound relay authority check as deltas.
   const transfer = {
@@ -572,7 +597,7 @@ export function buildShadowBrowserProjectionTransfer(relay: ShadowBrowserRelaySh
     mode: "projection",
     scope,
     to: structuredClone(relay.commit_scope.head) as ShadowCommitAccepted["position"],
-    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, relay.commit_scope.head.seq)
+    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, relay.commit_scope.head.seq, viewer)
   } satisfies Omit<ShadowProjectionTransfer, "proof">;
   return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
 }
@@ -581,16 +606,18 @@ export function buildShadowBrowserDeltaTransfer(
   relay: ShadowBrowserRelayShim,
   accepted: ShadowCommitAccepted,
   transcript: EffectTranscript,
-  recipient = "*"
+  recipient = "*",
+  viewer?: ShadowProjectionViewer
 ): ShadowDeltaTransfer {
-  return buildShadowBrowserDeltaTransferFromFrames(relay, [accepted], [transcript], recipient);
+  return buildShadowBrowserDeltaTransferFromFrames(relay, [accepted], [transcript], recipient, viewer);
 }
 
 export function buildShadowBrowserDeltaTransferFromFrames(
   relay: ShadowBrowserRelayShim,
   acceptedFrames: ShadowCommitAccepted[],
   transcripts: EffectTranscript[],
-  recipient = "*"
+  recipient = "*",
+  viewer?: ShadowProjectionViewer
 ): ShadowDeltaTransfer {
   if (acceptedFrames.length === 0) throw new Error("shadow browser delta requires at least one accepted frame");
   const scope = acceptedFrames[0].position.scope;
@@ -613,7 +640,7 @@ export function buildShadowBrowserDeltaTransferFromFrames(
     to: structuredClone(ordered[ordered.length - 1].position) as ShadowCommitAccepted["position"],
     applied: ordered.map((frame) => structuredClone(frame) as ShadowCommitAccepted),
     transcript_tail: orderedTranscripts.map((transcript) => structuredClone(transcript) as EffectTranscript),
-    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, ordered[ordered.length - 1].position.seq)
+    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, ordered[ordered.length - 1].position.seq, viewer)
   } satisfies Omit<ShadowDeltaTransfer, "proof">;
   return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
 }
@@ -622,7 +649,8 @@ export function buildShadowBrowserCatchupTransfer(
   relay: ShadowBrowserRelayShim,
   scope: ObjRef,
   recipient: string,
-  lastKnownHead?: ShadowCommitAccepted["position"]
+  lastKnownHead?: ShadowCommitAccepted["position"],
+  viewer?: ShadowProjectionViewer
 ): ShadowProjectionTransfer | ShadowDeltaTransfer {
   if (lastKnownHead && lastKnownHead.scope === scope && lastKnownHead.epoch === relay.commit_scope.head.epoch && lastKnownHead.seq < relay.commit_scope.head.seq) {
     const accepted = relay.accepted_frames
@@ -632,10 +660,10 @@ export function buildShadowBrowserCatchupTransfer(
     const hasContiguousTail = accepted.length === expectedSeqs.size && accepted.every((frame) => expectedSeqs.has(frame.position.seq));
     const transcripts = accepted.map((frame) => relay.transcript_tail.find((item) => item.hash === frame.transcript_hash));
     if (hasContiguousTail && transcripts.every((item): item is EffectTranscript => Boolean(item))) {
-      return buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient);
+      return buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient, viewer);
     }
   }
-  return buildShadowBrowserProjectionTransfer(relay, scope, recipient);
+  return buildShadowBrowserProjectionTransfer(relay, scope, recipient, viewer);
 }
 
 export function publishShadowBrowserAcceptedFrame(
@@ -650,7 +678,7 @@ export function publishShadowBrowserAcceptedFrame(
     if (relay.subscriptions.get(accepted.position.scope)?.has(browser.node) !== true) continue;
     // The originator is often subscribed too; accepted-frame dedup below makes
     // that round trip harmless while preserving one relay fan-out path.
-    const transfer = buildShadowBrowserDeltaTransfer(relay, accepted, transcript, browser.node);
+    const transfer = buildShadowBrowserDeltaTransfer(relay, accepted, transcript, browser.node, shadowProjectionViewer(browser));
     applyShadowBrowserTransfer(browser, transfer);
   }
 }
@@ -827,7 +855,7 @@ export function applyShadowBrowserAcceptedFrame(browser: ShadowBrowserNode, acce
   if (browser.cache.applied_frames.some((frame) => frame.id === accepted.id && frame.position.hash === accepted.position.hash)) return;
   browser.cache.applied_frames.push(accepted);
   trimArrayHead(browser.cache.applied_frames, MAX_SHADOW_BROWSER_CACHE_TAIL);
-  browser.cache.projections.set(browser.scope, shadowScopeProjection(browser.relay.commit_scope.serialized, browser.scope, accepted.position.seq));
+  browser.cache.projections.set(browser.scope, shadowScopeProjection(browser.relay.commit_scope.serialized, browser.scope, accepted.position.seq, shadowProjectionViewer(browser)));
 }
 
 export function applyShadowBrowserConflict(browser: ShadowBrowserNode, conflict: ShadowCommitConflict): void {
@@ -889,16 +917,159 @@ function cacheStatePages(cache: ShadowBrowserNodeCache, pages: ShadowStatePage[]
   }
 }
 
-function shadowScopeProjection(serialized: SerializedWorld, scope: ObjRef, seqOverride?: number): WooValue {
-  const scopeObj = serialized.objects.find((obj) => obj.id === scope);
+function shadowProjectionViewer(browser: ShadowBrowserNode): ShadowProjectionViewer {
+  return { actor: browser.actor, session: browser.session };
+}
+
+function shadowScopeProjection(
+  serialized: SerializedWorld,
+  scope: ObjRef,
+  seqOverride?: number,
+  viewer?: ShadowProjectionViewer
+): ShadowScopeProjection {
+  const index = shadowSerializedIndex(serialized);
+  const scopeObj = index.objects.get(scope);
+  const subject = scopeObj ? shadowSerializedObjectSummary(index, scopeObj, viewer?.actor) : null;
+  const objects = shadowProjectionRefs(index, scope, viewer)
+    .map((id) => {
+      const obj = index.objects.get(id);
+      return obj ? shadowSerializedObjectSummary(index, obj, viewer?.actor) : null;
+    })
+    .filter((item): item is ScopedObjectSummary => item !== null);
+  const seq = seqOverride ?? serialized.logs.find(([space]) => space === scope)?.[1].reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0;
   return {
     kind: "woo.scope_projection.shadow.v1",
     scope,
     title: scopeObj?.name ?? scope,
     object_count: serialized.objects.length,
     contents: scopeObj?.contents ?? [],
-    seq: seqOverride ?? serialized.logs.find(([space]) => space === scope)?.[1].reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0
+    seq,
+    cursor: { spaces: { [scope]: { next_seq: seq + 1 } }, live: { resumable: false } },
+    ...(viewer ? { viewer } : {}),
+    subject,
+    objects
   };
+}
+
+type ShadowSerializedIndex = {
+  objects: Map<ObjRef, SerializedObject>;
+  sessions: Map<string, SerializedSession>;
+};
+
+function shadowSerializedIndex(serialized: SerializedWorld): ShadowSerializedIndex {
+  return {
+    objects: new Map(serialized.objects.map((obj) => [obj.id, obj])),
+    sessions: new Map(serialized.sessions.map((session) => [session.id, session]))
+  };
+}
+
+function shadowProjectionRefs(index: ShadowSerializedIndex, scope: ObjRef, viewer?: ShadowProjectionViewer): ObjRef[] {
+  // The state-plane projection exports a generic neighborhood instead of
+  // client/catalog-specific panels: visible subject, subject contents, viewer,
+  // inventory, and current location. Catalog UI can derive its own state from
+  // readable props on those summaries.
+  const refs = new Set<ObjRef>();
+  const pushObject = (id: ObjRef | null | undefined): void => {
+    if (!id || !index.objects.has(id)) return;
+    refs.add(id);
+  };
+  const pushContents = (id: ObjRef | null | undefined): void => {
+    if (!id) return;
+    for (const content of index.objects.get(id)?.contents ?? []) pushObject(content);
+  };
+  pushObject(scope);
+  pushContents(scope);
+  if (viewer) {
+    pushObject(viewer.actor);
+    pushContents(viewer.actor);
+    const session = viewer.session ? index.sessions.get(viewer.session) : undefined;
+    pushObject(session?.currentLocation ?? null);
+    pushContents(session?.currentLocation ?? null);
+  }
+  return Array.from(refs);
+}
+
+function shadowSerializedObjectSummary(index: ShadowSerializedIndex, obj: SerializedObject, actor?: ObjRef): ScopedObjectSummary {
+  const props = shadowReadableProps(index, obj, actor);
+  const aliases = props.aliases;
+  return {
+    id: obj.id,
+    name: obj.name,
+    parent: obj.parent,
+    ancestors: shadowAncestors(index, obj.id),
+    owner: obj.owner,
+    location: obj.location,
+    ...(Array.isArray(aliases) && aliases.every((item) => typeof item === "string") ? { aliases } : {}),
+    description: props.description ?? null,
+    props
+  };
+}
+
+function shadowAncestors(index: ShadowSerializedIndex, objRef: ObjRef): ObjRef[] {
+  const ancestors: ObjRef[] = [];
+  let current = index.objects.get(objRef)?.parent ?? null;
+  const seen = new Set<ObjRef>();
+  while (current && !seen.has(current)) {
+    ancestors.push(current);
+    seen.add(current);
+    current = index.objects.get(current)?.parent ?? null;
+  }
+  return ancestors.reverse();
+}
+
+function shadowReadableProps(index: ShadowSerializedIndex, obj: SerializedObject, actor?: ObjRef): Record<string, WooValue> {
+  const props: Record<string, WooValue> = {};
+  for (const name of shadowPropertyNames(index, obj.id)) {
+    const resolved = shadowPropertyValue(index, obj.id, name);
+    if (!resolved || resolved.value === undefined) continue;
+    if (!shadowCanReadProperty(index, actor, resolved.owner, resolved.perms)) continue;
+    props[name] = cloneValue(resolved.value);
+  }
+  return props;
+}
+
+function shadowPropertyNames(index: ShadowSerializedIndex, objRef: ObjRef): string[] {
+  const names = new Set<string>();
+  let current = index.objects.get(objRef) ?? null;
+  const seen = new Set<ObjRef>();
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    for (const def of current.propertyDefs) names.add(def.name);
+    for (const [name] of current.properties) names.add(name);
+    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+  }
+  return Array.from(names).sort();
+}
+
+function shadowPropertyValue(
+  index: ShadowSerializedIndex,
+  objRef: ObjRef,
+  name: string
+): { value: WooValue | undefined; owner: ObjRef; perms: string } | null {
+  let current = index.objects.get(objRef) ?? null;
+  const seen = new Set<ObjRef>();
+  let value: WooValue | undefined;
+  let hasValue = false;
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    if (!hasValue) {
+      const own = current.properties.find(([prop]) => prop === name);
+      if (own) {
+        value = own[1];
+        hasValue = true;
+      }
+    }
+    const def = current.propertyDefs.find((item) => item.name === name);
+    if (def) {
+      return { value: hasValue ? value : def.defaultValue, owner: def.owner, perms: def.perms };
+    }
+    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+  }
+  return null;
+}
+
+function shadowCanReadProperty(index: ShadowSerializedIndex, actor: ObjRef | undefined, owner: ObjRef, perms: string): boolean {
+  return Boolean(actor && (index.objects.get(actor)?.flags?.wizard === true || owner === actor)) || String(perms).includes("r");
 }
 
 function trustedBrowserStateAuthorities(input: Record<string, string> | undefined): Map<string, string> {

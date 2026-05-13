@@ -18,7 +18,7 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
-import type { V2ProjectionMessage } from "./v2-browser-messages";
+import { v2ProjectionSnapshotFromMessage, type V2ProjectionMessage } from "./v2-browser-messages";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -452,6 +452,7 @@ function ensureV2BrowserWorker() {
     if (event.data?.kind === "status") console.debug("woo.v2", event.data.status);
     if (event.data?.kind === "projection") {
       state.v2Projection = event.data as V2ProjectionMessage;
+      applyV2ProjectionMessage(state.v2Projection);
       window.dispatchEvent(new CustomEvent("woo.v2.projection", { detail: state.v2Projection }));
       console.debug("woo.v2.projection", state.v2Projection);
     }
@@ -1161,6 +1162,27 @@ function applyScopedOverlaySnapshot(key: string, snapshot: any) {
   if (surface === "pinboard") {
     hydratePinboardNotesTextIfNeeded(pinboardModel());
   }
+}
+
+function applyV2ProjectionMessage(message: V2ProjectionMessage) {
+  if (!scopedProjectionEnabled) return;
+  const snapshot = v2ProjectionSnapshotFromMessage(message);
+  if (!snapshot) return;
+  if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
+  if (snapshot.objects.length > 0) {
+    // v2 projection objects follow the same catalog-neutral summary contract as
+    // `/api/me`. Ingest them into the client projection cache, but keep the
+    // legacy scoped model as the rendering authority until the v2 worker owns
+    // turn submission and committed-frame reduction.
+    ui.ingestSnapshot(`v2:${snapshot.scope}:${message.head.seq}`, snapshot.objects);
+  }
+  let cursor = state.scopedProjection.cursor;
+  for (const [space, record] of Object.entries(snapshot.cursor?.spaces ?? {})) {
+    const nextSeq = Number(record?.next_seq);
+    if (Number.isFinite(nextSeq)) cursor = advanceProjectionCursor(cursor, space, nextSeq - 1);
+  }
+  state.scopedProjection = { ...state.scopedProjection, cursor };
+  render();
 }
 
 async function applyScopedProjectionSnapshot(me: any, catalogs: any) {

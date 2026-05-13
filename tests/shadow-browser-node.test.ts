@@ -53,6 +53,26 @@ describe("shadow browser node shim", () => {
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.44);
   });
 
+  it("opens with a catalog-neutral scope projection neighborhood", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-projection-neighborhood", async (world) => {
+      world.defineProperty("the_dubspace", { name: "private_projection_probe", defaultValue: "sealed", owner: "$wiz", perms: "", typeHint: "str" });
+    });
+    const opened = await openShadowBrowserScope(browser);
+    const projection = opened.projection as Record<string, any>;
+
+    expect(projection).toMatchObject({
+      kind: "woo.scope_projection.shadow.v1",
+      scope: "the_dubspace",
+      viewer: { actor },
+      cursor: { spaces: { the_dubspace: { next_seq: expect.any(Number) } }, live: { resumable: false } },
+      subject: { id: "the_dubspace", props: expect.any(Object) }
+    });
+    expect(projection.objects.map((item: any) => item.id)).toContain("the_dubspace");
+    expect(projection.objects.map((item: any) => item.id)).toContain(actor);
+    expect(projection.objects.every((item: any) => Array.isArray(item.ancestors))).toBe(true);
+    expect(projection.subject.props.private_projection_probe).toBeUndefined();
+  });
+
   it("drives pinboard create, edit, layout, take, and drop actions through the browser shim", async () => {
     const { browser, actor } = await browserForScope("the_pinboard", "guest:browser-pinboard");
     await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
@@ -316,7 +336,7 @@ describe("shadow browser node shim", () => {
     expect(transfer).toBeDefined();
     if (!transfer || transfer.mode !== "projection") throw new Error("expected projection transfer");
     const tampered = structuredClone(transfer);
-    tampered.projection = { ...(opened.projection as Record<string, WooValue>), seq: 999 };
+    tampered.projection = { ...(opened.projection as any), seq: 999 };
 
     expect(() => applyShadowBrowserTransfer(browser, tampered)).toThrow(/proof root mismatch/);
   });
@@ -327,7 +347,7 @@ describe("shadow browser node shim", () => {
     const transfer = browser.cache.transfers.find((item) => item.mode === "projection");
     if (!transfer || transfer.mode !== "projection") throw new Error("expected projection transfer");
     const tampered = structuredClone(transfer);
-    tampered.projection = { ...(opened.projection as Record<string, WooValue>), seq: 999 };
+    tampered.projection = { ...(opened.projection as any), seq: 999 };
     tampered.proof.root = browserStateRootForTest(tampered);
 
     expect(() => applyShadowBrowserTransfer(browser, tampered)).toThrow(/signature mismatch/);
@@ -347,7 +367,7 @@ describe("shadow browser node shim", () => {
     if (!delta || delta.mode !== "delta") throw new Error("expected delta transfer");
 
     const tamperedProjection = structuredClone(delta);
-    tamperedProjection.projection = { ...(delta.projection as Record<string, WooValue>), seq: 999 };
+    tamperedProjection.projection = { ...(delta.projection as any), seq: 999 };
     expect(() => applyShadowBrowserTransfer(browser, tamperedProjection)).toThrow(/proof root mismatch/);
 
     const tamperedTranscript = structuredClone(delta);
