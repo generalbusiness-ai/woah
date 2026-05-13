@@ -1189,6 +1189,94 @@ describe("woo core", () => {
     expect(merged.changed).toBe(false);
   });
 
+  it("HS1: buildHostSeedForDelivery strips verb.line_map (authoring metadata not needed on receiver)", () => {
+    // line_map dominates seed payload size on classes with many compiled
+    // verbs; delivery strips it to halve the per-host seed body. The
+    // satellite recompiles line_map for bundled-catalog verbs through
+    // runHostScopedLocalCatalogLifecycle's repair path, and verbs from
+    // non-bundled sources accept the soft degradation (stack traces lose
+    // line numbers on the satellite). Stored slices preserve any
+    // populated line_map they already have — see the idempotency test
+    // immediately below.
+    const gateway = createWorld();
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    expect(seed.objects.length).toBeGreaterThan(0);
+    let countedVerbs = 0;
+    for (const obj of seed.objects) {
+      for (const verb of obj.verbs) {
+        countedVerbs += 1;
+        expect(verb.line_map, `${obj.id}:${verb.name} line_map`).toEqual({});
+      }
+    }
+    expect(countedVerbs).toBeGreaterThan(0);
+
+    // Source is preserved (editor/diagnostic flows on the satellite still
+    // work); deferred to a follow-up that adds lazy-fetch infrastructure.
+    const verbsWithSource = seed.objects.flatMap((obj) => obj.verbs).filter(
+      (verb) => typeof verb.source === "string" && verb.source.length > 0
+    );
+    expect(verbsWithSource.length).toBeGreaterThan(0);
+  });
+
+  it("HS5: merge stays idempotent when stored has populated line_map and seed has empty line_map", () => {
+    // The lean-seed-fat-storage contract: a satellite's first cold load
+    // may store verbs with empty line_map; the host-scoped repair path
+    // recompiles bundled-catalog verbs to populate it; the next cold
+    // load receives an empty line_map from the gateway and must NOT
+    // count this as a real change (otherwise every cold load thrashes
+    // verb storage).
+    const gateway = createWorld();
+    const seed = gateway.buildHostSeedForDelivery("the_pinboard");
+    const stored = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_pinboard");
+    expect(stored).not.toBeNull();
+
+    // Sanity: stored has at least one populated line_map; seed has none.
+    const storedHasLineMap = stored!.objects.some((obj) =>
+      obj.verbs.some((v) => Object.keys(v.line_map ?? {}).length > 0)
+    );
+    expect(storedHasLineMap).toBe(true);
+
+    const merged = mergeHostScopedSeedWithStatus(stored!, seed, "the_pinboard");
+    expect(merged.changed).toBe(false);
+  });
+
+  it("HS1: buildHostSeedForDeliveryWithDigest returns a stable digest across cache hits", () => {
+    const gateway = createWorld();
+    const first = gateway.buildHostSeedForDeliveryWithDigest("the_pinboard");
+    const second = gateway.buildHostSeedForDeliveryWithDigest("the_pinboard");
+    expect(first.digest).toBe(second.digest);
+    expect(first.seed).toBe(second.seed);
+    expect(first.digest).toMatch(/^[0-9a-f]{64}$/); // SHA-256 hex
+  });
+
+  it("HS1: seed digest changes when world content changes", () => {
+    const gateway = createWorld();
+    const before = gateway.buildHostSeedForDeliveryWithDigest("the_chatroom").digest;
+    gateway.object("the_chatroom").name = "Renamed Chatroom";
+    gateway.setProp("the_chatroom", "next_seq", (Number(gateway.getProp("the_chatroom", "next_seq") ?? 0)) + 1);
+    const after = gateway.buildHostSeedForDeliveryWithDigest("the_chatroom").digest;
+    expect(after).not.toBe(before);
+  });
+
+  it("HS1: seed digest survives a round-trip through exportWorld + createWorldFromSerialized (insertion-order vs SQL-hydration parity)", () => {
+    // Mid-runtime serialization can produce non-canonical map iteration order
+    // (insertion order). The same world after a cold-reload from a serialized
+    // snapshot produces an alphabetical/hydration-order layout. The digest is
+    // computed over a canonicalized seed body precisely so these two
+    // serializations agree — otherwise every gateway eviction-reload would
+    // force every satellite to re-fetch its host seed in full on the next
+    // probe.
+    const live = createWorld();
+    // Force the live world out of canonical insertion order: add a property
+    // whose name sorts BEFORE an existing property on the_pinboard's class.
+    live.defineProperty("$pinboard", { name: "aaa_canonical_test", defaultValue: 1, owner: "$wiz", perms: "rcwx" });
+    const liveDigest = live.buildHostSeedForDeliveryWithDigest("the_pinboard").digest;
+
+    const reloaded = createWorldFromSerialized(live.exportWorld());
+    const reloadedDigest = reloaded.buildHostSeedForDeliveryWithDigest("the_pinboard").digest;
+    expect(reloadedDigest).toBe(liveDigest);
+  });
+
   it("HS5: buildHostSeedForDelivery cache invalidates when the world is replaced via importWorld", () => {
     const gateway = createWorld();
     const before = gateway.buildHostSeedForDelivery("the_chatroom");

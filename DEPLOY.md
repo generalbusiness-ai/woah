@@ -135,20 +135,25 @@ The v1 Worker does **not** read a seed phrase or salt object-id allocation. Seed
 
 The local Node server leaves this unset by default, which means clone/run first-light installs every bundled catalog discovered under `catalogs/`.
 
-The Cloudflare `wrangler.toml` ships with:
+The Cloudflare `wrangler.toml` ships with the full demo bundle so that a fresh fork-and-deploy lands a populated world matching woo.hughpyle.workers.dev:
 
 ```toml
 [vars]
+WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,taskspace,blocks-demo"
+```
+
+Cost: the bundled demos add a few seconds to first-light bootstrap, and the resulting world snapshot — which every later cold-restart reads — is larger by the size of the demo instances. Edit the value before first deploy to override:
+
+```toml
+# Foundational classes only (no demo instances). First-light cost drops
+# to tens of milliseconds and every cold-restart loads a smaller snapshot:
+WOO_AUTO_INSTALL_CATALOGS = "chat,help,note,prog"
+
+# Empty = bare core world (no in-world help, chat, notes, or programming):
 WOO_AUTO_INSTALL_CATALOGS = ""
 ```
 
-That empty value means a fresh Cloudflare world starts with only the universal core objects. To bootstrap with bundled local catalogs, edit the value before first deploy:
-
-```toml
-WOO_AUTO_INSTALL_CATALOGS = "help,chat,note,prog,demoworld,dubspace,pinboard,taskspace"
-```
-
-(For a world that wants foundational classes only, with no demo content, use `"help,chat,note,prog"`.)
+The variable is only consulted at first-light bootstrap. Flipping it on an already-deployed world does not remove already-installed catalogs.
 
 This is just an operator filter over catalog directories bundled with the deployment. The runtime does not privilege those catalogs over public GitHub taps.
 
