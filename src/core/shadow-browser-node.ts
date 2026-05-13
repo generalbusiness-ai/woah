@@ -130,6 +130,7 @@ export type ShadowBrowserRelayShim = {
   session_auth: Map<string, ShadowBrowserSessionClaims>;
   session_revs: Map<string, number>;
   idempotency_window_ms: number;
+  recently_seen: Map<string, number>;
   accepted_frames: ShadowCommitAccepted[];
   transcript_tail: EffectTranscript[];
   live_events: ShadowLiveEvent[];
@@ -149,6 +150,7 @@ export type ShadowBrowserNode = {
   session_token: string | null;
   next_turn: number;
   next_live: number;
+  next_envelope: number;
 };
 
 export type ShadowBrowserStateSigning = {
@@ -244,6 +246,7 @@ export function createShadowBrowserRelayShim(input: {
     session_auth: shadowBrowserSessionClaims(input.serialized.sessions, input.scope, deployment, sessionRevs),
     session_revs: sessionRevs,
     idempotency_window_ms: Math.max(input.idempotency_window_ms ?? MIN_SHADOW_IDEMPOTENCY_WINDOW_MS, MIN_SHADOW_IDEMPOTENCY_WINDOW_MS),
+    recently_seen: new Map(),
     accepted_frames: [],
     transcript_tail: [],
     live_events: [],
@@ -284,7 +287,8 @@ export function createShadowBrowserNode(input: {
     trusted_state_authorities: trustedBrowserStateAuthorities(input.trusted_state_authorities),
     session_token: sessionToken,
     next_turn: 1,
-    next_live: 1
+    next_live: 1,
+    next_envelope: 1
   };
 }
 
@@ -484,7 +488,7 @@ export function buildShadowBrowserProjectionTransfer(relay: ShadowBrowserRelaySh
     mode: "projection",
     scope,
     to: structuredClone(relay.commit_scope.head) as ShadowCommitAccepted["position"],
-    projection: shadowScopeProjection(relay.commit_scope.serialized, scope)
+    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, relay.commit_scope.head.seq)
   } satisfies Omit<ShadowProjectionTransfer, "proof">;
   return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
 }
@@ -495,16 +499,37 @@ export function buildShadowBrowserDeltaTransfer(
   transcript: EffectTranscript,
   recipient = "*"
 ): ShadowDeltaTransfer {
+  return buildShadowBrowserDeltaTransferFromFrames(relay, [accepted], [transcript], recipient);
+}
+
+export function buildShadowBrowserDeltaTransferFromFrames(
+  relay: ShadowBrowserRelayShim,
+  acceptedFrames: ShadowCommitAccepted[],
+  transcripts: EffectTranscript[],
+  recipient = "*"
+): ShadowDeltaTransfer {
+  if (acceptedFrames.length === 0) throw new Error("shadow browser delta requires at least one accepted frame");
+  const scope = acceptedFrames[0].position.scope;
+  for (const frame of acceptedFrames) {
+    if (frame.position.scope !== scope) throw new Error("shadow browser delta frames must share a scope");
+  }
+  const ordered = [...acceptedFrames].sort((a, b) => a.position.seq - b.position.seq);
+  const transcriptByHash = new Map(transcripts.map((transcript) => [transcript.hash, transcript]));
+  const orderedTranscripts = ordered.map((frame) => {
+    const transcript = transcriptByHash.get(frame.transcript_hash);
+    if (!transcript) throw new Error(`shadow browser delta missing transcript: ${frame.id}`);
+    return transcript;
+  });
   // Delta transfer carries the committed frame plus transcript tail needed by
   // browser caches to catch up without receiving executable closure state.
   const transfer = {
     kind: "woo.state.transfer.shadow.v1",
     mode: "delta",
-    scope: accepted.position.scope,
-    to: structuredClone(accepted.position) as ShadowCommitAccepted["position"],
-    applied: [structuredClone(accepted) as ShadowCommitAccepted],
-    transcript_tail: [structuredClone(transcript) as EffectTranscript],
-    projection: shadowScopeProjection(relay.commit_scope.serialized, accepted.position.scope)
+    scope,
+    to: structuredClone(ordered[ordered.length - 1].position) as ShadowCommitAccepted["position"],
+    applied: ordered.map((frame) => structuredClone(frame) as ShadowCommitAccepted),
+    transcript_tail: orderedTranscripts.map((transcript) => structuredClone(transcript) as EffectTranscript),
+    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, ordered[ordered.length - 1].position.seq)
   } satisfies Omit<ShadowDeltaTransfer, "proof">;
   return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
 }
@@ -516,9 +541,15 @@ export function buildShadowBrowserCatchupTransfer(
   lastKnownHead?: ShadowCommitAccepted["position"]
 ): ShadowProjectionTransfer | ShadowDeltaTransfer {
   if (lastKnownHead && lastKnownHead.scope === scope && lastKnownHead.epoch === relay.commit_scope.head.epoch && lastKnownHead.seq < relay.commit_scope.head.seq) {
-    const accepted = relay.accepted_frames.find((frame) => frame.position.scope === scope && frame.position.seq === lastKnownHead.seq + 1);
-    const transcript = accepted ? relay.transcript_tail.find((item) => item.hash === accepted.transcript_hash) : undefined;
-    if (accepted && transcript) return buildShadowBrowserDeltaTransfer(relay, accepted, transcript, recipient);
+    const accepted = relay.accepted_frames
+      .filter((frame) => frame.position.scope === scope && frame.position.seq > lastKnownHead.seq && frame.position.seq <= relay.commit_scope.head.seq)
+      .sort((a, b) => a.position.seq - b.position.seq);
+    const expectedSeqs = new Set(Array.from({ length: relay.commit_scope.head.seq - lastKnownHead.seq }, (_item, index) => lastKnownHead.seq + index + 1));
+    const hasContiguousTail = accepted.length === expectedSeqs.size && accepted.every((frame) => expectedSeqs.has(frame.position.seq));
+    const transcripts = accepted.map((frame) => relay.transcript_tail.find((item) => item.hash === frame.transcript_hash));
+    if (hasContiguousTail && transcripts.every((item): item is EffectTranscript => Boolean(item))) {
+      return buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient);
+    }
   }
   return buildShadowBrowserProjectionTransfer(relay, scope, recipient);
 }
@@ -540,11 +571,18 @@ export function publishShadowBrowserAcceptedFrame(
   }
 }
 
+export function purgeShadowBrowserRelayHistory(relay: ShadowBrowserRelayShim, scope: ObjRef, throughSeq = Number.POSITIVE_INFINITY): void {
+  // Test and reconnect harnesses use this to model a relay whose short catch-up
+  // tail expired while the authoritative commit scope kept advancing.
+  relay.accepted_frames = relay.accepted_frames.filter((frame) => frame.position.scope !== scope || frame.position.seq > throughSeq);
+  relay.transcript_tail = relay.transcript_tail.filter((transcript) => transcript.scope !== scope || transcript.seq > throughSeq);
+}
+
 export function shadowBrowserEnvelope<T>(
   browser: ShadowBrowserNode,
   type: string,
   body: T,
-  id = `${browser.node}:env:${browser.next_live++}`
+  id = `${browser.node}:env:${browser.next_envelope++}`
 ): ShadowEnvelope<T> {
   return {
     v: 2,
@@ -582,6 +620,7 @@ export function shadowBrowserTransportHello(browser: ShadowBrowserNode, now = Da
 export function receiveShadowBrowserEnvelope(browser: ShadowBrowserNode, encoded: string): ShadowEnvelope {
   const envelope = decodeEnvelope(encoded);
   validateShadowBrowserEnvelopeAuth(browser.relay, browser, envelope);
+  if (!markShadowBrowserEnvelopeSeen(browser.relay, envelope)) return envelope;
   switch (envelope.type) {
     case "woo.live.event.shadow.v1":
       assertShadowLiveEventIsEphemeral(envelope.body);
@@ -597,6 +636,8 @@ export function receiveShadowBrowserEnvelope(browser: ShadowBrowserNode, encoded
       applyShadowBrowserConflict(browser, envelope.body as ShadowCommitConflict);
       break;
   }
+  // Types without a built-in dispatch arm are returned for caller-level
+  // handling; the codec has already checked that they are known wire types.
   return envelope;
 }
 
@@ -607,7 +648,7 @@ export function roundTripShadowBrowserEnvelope<T>(browser: ShadowBrowserNode, ty
 export function applyShadowBrowserAcceptedFrame(browser: ShadowBrowserNode, accepted: ShadowCommitAccepted): void {
   if (browser.cache.applied_frames.some((frame) => frame.id === accepted.id && frame.position.hash === accepted.position.hash)) return;
   browser.cache.applied_frames.push(accepted);
-  browser.cache.projections.set(browser.scope, shadowScopeProjection(accepted.serialized_after, browser.scope));
+  browser.cache.projections.set(browser.scope, shadowScopeProjection(accepted.serialized_after, browser.scope, accepted.position.seq));
 }
 
 export function applyShadowBrowserConflict(browser: ShadowBrowserNode, conflict: ShadowCommitConflict): void {
@@ -620,6 +661,7 @@ export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer:
   switch (transfer.mode) {
     case "projection":
       browser.cache.projections.set(transfer.scope, structuredClone(transfer.projection) as WooValue);
+      reconcileProjectionFallbackCache(browser, transfer);
       return;
     case "delta":
       browser.cache.projections.set(transfer.scope, structuredClone(transfer.projection) as WooValue);
@@ -650,7 +692,7 @@ function cacheObjectPages(cache: ShadowBrowserNodeCache, objects: SerializedObje
   }
 }
 
-function shadowScopeProjection(serialized: SerializedWorld, scope: ObjRef): WooValue {
+function shadowScopeProjection(serialized: SerializedWorld, scope: ObjRef, seqOverride?: number): WooValue {
   const scopeObj = serialized.objects.find((obj) => obj.id === scope);
   return {
     kind: "woo.scope_projection.shadow.v1",
@@ -658,7 +700,7 @@ function shadowScopeProjection(serialized: SerializedWorld, scope: ObjRef): WooV
     title: scopeObj?.name ?? scope,
     object_count: serialized.objects.length,
     contents: scopeObj?.contents ?? [],
-    seq: serialized.logs.find(([space]) => space === scope)?.[1].reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0
+    seq: seqOverride ?? serialized.logs.find(([space]) => space === scope)?.[1].reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0
   };
 }
 
@@ -699,6 +741,8 @@ function shadowBrowserSessionRevs(
 }
 
 function shadowBrowserSessionToken(session: string, actor: ObjRef): string {
+  // Shadow-local bearer only: the relay maps this deterministic token to
+  // server-held claims. A real M4 deployment mints a signed gateway token.
   return `shadow-session:${session}:${actor}`;
 }
 
@@ -739,8 +783,37 @@ function validateShadowBrowserAuth(
   if (session && claims.session !== session) throw new Error("shadow browser auth session mismatch");
   if (claims.deployment !== relay.deployment) throw new Error("shadow browser auth deployment mismatch");
   if (claims.rev !== relay.session_revs.get(claims.session)) throw new Error("shadow browser auth rev mismatch");
+  // Transport authentication uses wall-clock expiry. It is not a VM logical
+  // time input and must not be routed through logicalNow.
   if (claims.expires_at <= Date.now()) throw new Error("shadow browser auth token is expired");
   return claims;
+}
+
+function markShadowBrowserEnvelopeSeen(relay: ShadowBrowserRelayShim, envelope: ShadowEnvelope, now = Date.now()): boolean {
+  const cutoff = now - relay.idempotency_window_ms;
+  for (const [key, seenAt] of relay.recently_seen) {
+    if (seenAt < cutoff) relay.recently_seen.delete(key);
+  }
+  const key = shadowBrowserIdempotencyKey(envelope);
+  if (relay.recently_seen.has(key)) return false;
+  relay.recently_seen.set(key, now);
+  return true;
+}
+
+function shadowBrowserIdempotencyKey(envelope: Pick<ShadowEnvelope, "from" | "id">): string {
+  return `${envelope.from}\u0000${envelope.id}`;
+}
+
+function reconcileProjectionFallbackCache(browser: ShadowBrowserNode, transfer: ShadowProjectionTransfer): void {
+  // A projection fallback means the relay could not provide a contiguous tail
+  // from the browser's last head. Keep the display projection, but discard
+  // scope-local replay material and optimistic turns that can no longer be
+  // reconciled to a proven accepted-frame sequence.
+  browser.cache.transcript_tail = browser.cache.transcript_tail.filter((transcript) => transcript.scope !== transfer.scope);
+  browser.cache.applied_frames = browser.cache.applied_frames.filter((frame) => frame.position.scope !== transfer.scope);
+  for (const [id, pending] of browser.cache.pending_turns) {
+    if (pending.key.scope === transfer.scope) browser.cache.pending_turns.delete(id);
+  }
 }
 
 function assertShadowLiveEventIsEphemeral(value: unknown): asserts value is ShadowLiveEvent {

@@ -26,6 +26,9 @@ export type ShadowEnvelope<T = WooValue> = {
 };
 
 const MAX_SHADOW_ENVELOPE_BYTES = 1024 * 1024;
+const SHADOW_TEXT_ENCODER = new TextEncoder();
+// The codec is type-neutral across production and shadow suffixes. Relay
+// policy decides which accepted wire types are legal in each direction.
 const KNOWN_SHADOW_TYPES = new Set([
   "woo.transport.hello.v1",
   "woo.transport.ping.v1",
@@ -49,14 +52,14 @@ const KNOWN_SHADOW_TYPES = new Set([
 export function encodeEnvelope<T>(env: ShadowEnvelope<T>): string {
   validateEnvelope(env);
   const encoded = JSON.stringify(env);
-  if (Buffer.byteLength(encoded, "utf8") > MAX_SHADOW_ENVELOPE_BYTES) {
+  if (shadowEnvelopeByteLength(encoded) > MAX_SHADOW_ENVELOPE_BYTES) {
     throw new Error("shadow envelope too large");
   }
   return encoded;
 }
 
 export function decodeEnvelope<T = WooValue>(str: string): ShadowEnvelope<T> {
-  if (Buffer.byteLength(str, "utf8") > MAX_SHADOW_ENVELOPE_BYTES) {
+  if (shadowEnvelopeByteLength(str) > MAX_SHADOW_ENVELOPE_BYTES) {
     throw new Error("shadow envelope too large");
   }
   let parsed: unknown;
@@ -106,4 +109,8 @@ function validateAuth(value: unknown): asserts value is ShadowEnvelopeAuth {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function shadowEnvelopeByteLength(value: string): number {
+  return SHADOW_TEXT_ENCODER.encode(value).byteLength;
 }

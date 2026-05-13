@@ -91,8 +91,8 @@ export function createShadowCommitScope(input: {
   };
 }
 
-export function shadowScopeHeadForSerialized(scope: ObjRef, epoch: number, serialized: SerializedWorld): ShadowScopeHead {
-  const seq = serialized.logs
+export function shadowScopeHeadForSerialized(scope: ObjRef, epoch: number, serialized: SerializedWorld, seqOverride?: number): ShadowScopeHead {
+  const seq = seqOverride ?? serialized.logs
     .find(([space]) => space === scope)?.[1]
     .reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0;
   const material = {
@@ -139,7 +139,10 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   }
 
   scope.serialized = mergedAfter;
-  scope.head = shadowScopeHeadForSerialized(scope.scope, scope.epoch, scope.serialized);
+  // Shadow commit scopes sequence accepted transcripts independently of the
+  // legacy durable space log. The serialized state is still in the hash, but
+  // browser catch-up needs every accepted v2 commit to advance the head.
+  scope.head = shadowScopeHeadForSerialized(scope.scope, scope.epoch, scope.serialized, scope.head.seq + 1);
   const accepted: ShadowCommitAccepted = {
     kind: "woo.commit.accepted.shadow.v1",
     id: submissionId,

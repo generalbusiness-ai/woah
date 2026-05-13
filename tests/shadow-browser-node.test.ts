@@ -10,9 +10,12 @@ import {
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
   openShadowBrowserScope,
+  purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
+  roundTripShadowBrowserEnvelope,
   shadowBrowserEnvelope,
   shadowBrowserTransportHello,
+  unsubscribeShadowBrowserNode,
   type ShadowBrowserStateTransfer,
   type ShadowBrowserNode,
   type ShadowLiveEvent
@@ -385,6 +388,7 @@ describe("shadow browser node shim", () => {
   it("advertises the M4 idempotency window through transport hello", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-hello");
     const hello = shadowBrowserTransportHello(browser, 12345);
+    const roundTripped = roundTripShadowBrowserEnvelope(browser, hello.kind, hello);
 
     expect(hello).toMatchObject({
       kind: "woo.transport.hello.v1",
@@ -395,6 +399,7 @@ describe("shadow browser node shim", () => {
       idempotency_window_ms: 300000,
       planes: ["execution", "commit", "state", "live"]
     });
+    expect(roundTripped.body).toEqual(hello);
   });
 
   it("rejects live envelopes carrying durability-reserved fields", async () => {
@@ -413,6 +418,31 @@ describe("shadow browser node shim", () => {
 
     expect(() => receiveShadowBrowserEnvelope(browser, encodeEnvelope(env))).toThrow(/durability-reserved field: writes/);
     expect(browser.relay.live_events).toHaveLength(0);
+  });
+
+  it("suppresses duplicate authority-bearing envelopes within the idempotency window", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-idempotent");
+    await openShadowBrowserScope(browser);
+    const live: ShadowLiveEvent = {
+      kind: "woo.live.event.shadow.v1",
+      id: "browser-idempotent-live",
+      source: "delay_1",
+      actor: browser.actor,
+      scope: "the_dubspace",
+      observation: { type: "control_preview", source: "delay_1", control: "wet", value: 0.22 }
+    };
+    const frame = encodeEnvelope(shadowBrowserEnvelope(browser, live.kind, live, "same-envelope-id"));
+
+    receiveShadowBrowserEnvelope(browser, frame);
+    receiveShadowBrowserEnvelope(browser, frame);
+
+    expect(browser.relay.live_events).toHaveLength(1);
+    expect(browser.relay.recently_seen.size).toBe(1);
+    for (const key of browser.relay.recently_seen.keys()) {
+      browser.relay.recently_seen.set(key, Date.now() - browser.relay.idempotency_window_ms - 1);
+    }
+    receiveShadowBrowserEnvelope(browser, frame);
+    expect(browser.relay.live_events).toHaveLength(2);
   });
 
   it("opens from a last-known head through delta catch-up when the relay has the tail", async () => {
@@ -444,6 +474,38 @@ describe("shadow browser node shim", () => {
     expect(reconnected.cache.projections.get("the_dubspace")).toMatchObject({ seq: 1 });
   });
 
+  it("opens from a last-known head through a multi-frame delta catch-up", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-catchup-multi");
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const base = structuredClone(browser.relay.commit_scope.head);
+
+    for (const [id, wet] of [["multi-1", 0.11], ["multi-2", 0.22], ["multi-3", 0.33]] as const) {
+      const turn = await executeShadowBrowserTurn(browser, {
+        id,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", wet]
+      });
+      expect(turn.result).toMatchObject({ ok: true });
+    }
+
+    const reconnected = createShadowBrowserNode({
+      node: "browser-catchup-multi-reconnect",
+      scope: "the_dubspace",
+      actor: browser.actor,
+      session: browser.session,
+      relay: browser.relay
+    });
+    const caughtUp = await openShadowBrowserScope(reconnected, { last_known_head: base });
+
+    expect(caughtUp.transfer_mode).toBe("delta");
+    expect(reconnected.cache.applied_frames.map((frame) => frame.position.seq)).toEqual([1, 2, 3]);
+    expect(reconnected.cache.transcript_tail.map((transcript) => transcript.hash)).toEqual(
+      reconnected.cache.applied_frames.map((frame) => frame.transcript_hash)
+    );
+    expect(reconnected.cache.projections.get("the_dubspace")).toMatchObject({ seq: 3 });
+  });
+
   it("falls back to projection catch-up when the relay has no delta tail", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-catchup-projection");
     await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
@@ -455,8 +517,7 @@ describe("shadow browser node shim", () => {
       args: ["delay_1", "wet", 0.79]
     });
     expect(turn.result).toMatchObject({ ok: true });
-    browser.relay.accepted_frames = [];
-    browser.relay.transcript_tail = [];
+    purgeShadowBrowserRelayHistory(browser.relay, "the_dubspace");
 
     const reconnected = createShadowBrowserNode({
       node: "browser-catchup-projection-reconnect",
@@ -471,6 +532,62 @@ describe("shadow browser node shim", () => {
     expect(reconnected.cache.applied_frames).toHaveLength(0);
     expect(reconnected.cache.transfers.find((transfer) => transfer.mode === "projection")).toBeDefined();
     expect(reconnected.cache.projections.get("the_dubspace")).toMatchObject({ seq: 1 });
+  });
+
+  it("reconciles a same-browser stale cache after projection fallback", async () => {
+    const anchor = createWorld();
+    const firstSession = anchor.auth("guest:browser-catchup-stale-a");
+    const secondSession = anchor.auth("guest:browser-catchup-stale-b");
+    await anchor.directCall("browser-catchup-stale-a-enter", firstSession.actor, "the_dubspace", "enter", [], { sessionId: firstSession.id });
+    await anchor.directCall("browser-catchup-stale-b-enter", secondSession.actor, "the_dubspace", "enter", [], { sessionId: secondSession.id });
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-catchup-stale-relay",
+      scope: "the_dubspace",
+      serialized: anchor.exportWorld()
+    });
+    const stale = createShadowBrowserNode({
+      node: "browser-catchup-stale-a",
+      scope: "the_dubspace",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay
+    });
+    const committer = createShadowBrowserNode({
+      node: "browser-catchup-stale-b",
+      scope: "the_dubspace",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay
+    });
+    await openShadowBrowserScope(stale, { preseed_catalog_pages: true });
+    await openShadowBrowserScope(committer, { preseed_catalog_pages: true });
+    const firstTurn = await executeShadowBrowserTurn(stale, {
+      id: "browser-catchup-stale-first",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.41]
+    });
+    expect(firstTurn.result).toMatchObject({ ok: true });
+    const staleHead = structuredClone(stale.cache.applied_frames[0].position);
+    unsubscribeShadowBrowserNode(stale);
+
+    const missedTurn = await executeShadowBrowserTurn(committer, {
+      id: "browser-catchup-stale-missed",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.42]
+    });
+    expect(missedTurn.result).toMatchObject({ ok: true });
+    expect(stale.cache.applied_frames.map((frame) => frame.position.seq)).toEqual([1]);
+    purgeShadowBrowserRelayHistory(relay, "the_dubspace");
+
+    const caughtUp = await openShadowBrowserScope(stale, { last_known_head: staleHead });
+
+    expect(caughtUp.transfer_mode).toBe("projection");
+    expect(stale.cache.applied_frames).toHaveLength(0);
+    expect(stale.cache.transcript_tail).toHaveLength(0);
+    expect(stale.cache.pending_turns.size).toBe(0);
+    expect(stale.cache.projections.get("the_dubspace")).toMatchObject({ seq: 2 });
   });
 
   it("multiplexes commit, state, and live planes through one in-process envelope channel", async () => {
