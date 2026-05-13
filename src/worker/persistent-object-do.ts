@@ -49,11 +49,11 @@ import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../c
 import {
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
-  executeShadowBrowserTurn,
-  receiveShadowBrowserEnvelope,
+  handleShadowBrowserTurnExecEnvelope,
+  receiveShadowBrowserEnvelopeReceipt,
+  setShadowBrowserSessionToken,
   shadowBrowserTransportHello
 } from "../core/shadow-browser-node";
-import type { ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway } from "../mcp/gateway";
@@ -236,6 +236,7 @@ export class PersistentObjectDO {
   // on rehydrate and maintained on attach/detach.
   private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
   private socketsBySession = new Map<string, Set<WebSocket>>();
+  private v2BrowserBySocket = new Map<string, ReturnType<typeof createShadowBrowserNode>>();
   // FIFO semaphore for outbound DO->DO fetch() concurrency. See
   // HOST_OUT_FETCH_CONCURRENCY. The releaser hands the slot directly to the
   // next waiter (no decrement-then-increment) to avoid an over-cap race when a
@@ -2537,7 +2538,8 @@ export class PersistentObjectDO {
     const att = this.attachment(ws);
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
-        this.indexRemoveSocket(att.sessionId, att.actor, ws);
+      this.indexRemoveSocket(att.sessionId, att.actor, ws);
+      this.v2BrowserBySocket.delete(att.socketId);
     }
     try {
       ws.close();
@@ -2551,11 +2553,15 @@ export class PersistentObjectDO {
     const att = this.attachment(ws);
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
-        this.indexRemoveSocket(att.sessionId, att.actor, ws);
+      this.indexRemoveSocket(att.sessionId, att.actor, ws);
+      this.v2BrowserBySocket.delete(att.socketId);
     }
   }
 
   private acceptV2TurnNetworkWebSocket(request: Request, world: WooWorld): Response {
+    // Public deployments rely on Cloudflare's TLS termination and route this as
+    // wss://; plaintext ws:// is only acceptable for localhost development per
+    // VTN19.
     const upgrade = request.headers.get("upgrade");
     if (upgrade?.toLowerCase() !== "websocket") {
       return jsonResponse({ error: { code: "E_INVARG", message: "expected Upgrade: websocket" } }, 400);
@@ -2585,7 +2591,11 @@ export class PersistentObjectDO {
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
 
+    // One shadow browser/relay pair lives for the socket lifetime so envelope
+    // idempotency, subscriptions, catch-up tails, and cache state survive
+    // across frames until CommitScopeDO persistence replaces this shim.
     const browser = this.v2ShadowBrowser(world, { node, token, sessionId: session.id, actor: session.actor });
+    this.v2BrowserBySocket.set(socketId, browser);
     const hello = shadowBrowserTransportHello(browser);
     server.send(encodeEnvelope({
       v: 2,
@@ -2614,34 +2624,16 @@ export class PersistentObjectDO {
     }
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
-      const browser = this.v2ShadowBrowser(world, { node: att.node, token: att.token, sessionId: att.sessionId, actor: att.actor });
-      const envelope = receiveShadowBrowserEnvelope(browser, encoded);
-      if (envelope.type === "woo.turn.exec.request.shadow.v1") {
-        const request = envelope.body as ShadowTurnExecRequest;
-        const result = await executeShadowBrowserTurn(browser, {
-          id: request.id ?? request.call.id,
-          route: request.call.route,
-          scope: request.call.scope,
-          target: request.call.target,
-          verb: request.call.verb,
-          args: request.call.args,
-          commit_policy: request.commit_policy
-        });
-        if (result.result.reply) {
-          ws.send(encodeEnvelope({
-            v: 2,
-            type: result.result.reply.kind,
-            id: `${browser.relay.node}:reply:${result.id}`,
-            from: browser.relay.node,
-            to: browser.node,
-            actor: att.actor,
-            session: att.sessionId,
-            reply_to: envelope.id,
-            auth: { mode: "session", token: att.token },
-            body: result.result.reply
-          } satisfies ShadowEnvelope<typeof result.result.reply>));
-        }
+      let browser = this.v2BrowserBySocket.get(att.socketId);
+      if (!browser) {
+        // Hibernation clears the in-memory socket table. Rehydrate once for the
+        // resumed socket; ordinary same-isolate traffic keeps this object alive.
+        browser = this.v2ShadowBrowser(world, { node: att.node, token: att.token, sessionId: att.sessionId, actor: att.actor });
+        this.v2BrowserBySocket.set(att.socketId, browser);
       }
+      const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
+      const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+      if (reply) ws.send(encodeEnvelope(reply));
     } catch (err) {
       ws.send(encodeEnvelope({
         v: 2,
@@ -2678,13 +2670,7 @@ export class PersistentObjectDO {
       session: input.sessionId,
       relay
     });
-    if (browser.session_token && browser.session_token !== input.token) {
-      const claims = relay.session_auth.get(browser.session_token);
-      if (claims) {
-        relay.session_auth.set(input.token, claims);
-        browser.session_token = input.token;
-      }
-    }
+    setShadowBrowserSessionToken(browser, input.token);
     return browser;
   }
 

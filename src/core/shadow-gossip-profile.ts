@@ -74,7 +74,7 @@ export async function profileShadowTurnAcrossNetworkShapes(input: {
   ];
   const profiles: ShadowNetworkProfile[] = [];
   const request: ShadowTurnExecRequest = {
-    kind: "woo.turn_exec_request.shadow.v1",
+    kind: "woo.turn.exec.request.shadow.v1",
     call: input.call,
     key: input.key
   };

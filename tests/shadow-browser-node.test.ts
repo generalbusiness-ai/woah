@@ -9,10 +9,13 @@ import {
   createShadowBrowserRelayShim,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
+  handleShadowBrowserTurnExecEnvelope,
   openShadowBrowserScope,
   purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
+  receiveShadowBrowserEnvelopeReceipt,
   roundTripShadowBrowserEnvelope,
+  setShadowBrowserSessionToken,
   shadowBrowserEnvelope,
   shadowBrowserTransportHello,
   unsubscribeShadowBrowserNode,
@@ -22,6 +25,8 @@ import {
 } from "../src/core/shadow-browser-node";
 import { hashSource } from "../src/core/source-hash";
 import type { ObjRef, WooValue } from "../src/core/types";
+import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
+import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
@@ -443,6 +448,46 @@ describe("shadow browser node shim", () => {
     }
     receiveShadowBrowserEnvelope(browser, frame);
     expect(browser.relay.live_events).toHaveLength(2);
+  });
+
+  it("keeps wire dispatch state across envelopes on the same browser", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-state");
+    await openShadowBrowserScope(browser);
+    setShadowBrowserSessionToken(browser, "wire-token");
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "wire-state-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor: browser.actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.61]
+    };
+    const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+    const request = {
+      kind: "woo.turn.exec.request.shadow.v1" as const,
+      id: "wire-state-wet",
+      call,
+      key: shadowTurnKeyFromTranscript(planned.transcript),
+      expected: browser.relay.commit_scope.head,
+      auth: { mode: "shadow_local" as const, actor: browser.actor, session: browser.session },
+      commit_policy: "execute_and_commit" as const
+    };
+    const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "wire-env-1"));
+
+    const first = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
+    const firstReply = await handleShadowBrowserTurnExecEnvelope(browser, first);
+    const duplicate = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
+    const duplicateReply = await handleShadowBrowserTurnExecEnvelope(browser, duplicate);
+
+    expect(first.fresh).toBe(true);
+    expect(firstReply?.body).toMatchObject({ kind: "woo.turn.exec.reply.shadow.v1", ok: true });
+    expect(duplicate.fresh).toBe(false);
+    expect(duplicateReply).toBeNull();
+    expect(browser.cache.applied_frames).toHaveLength(1);
+    expect(browser.relay.accepted_frames).toHaveLength(1);
   });
 
   it("opens from a last-known head through delta catch-up when the relay has the tail", async () => {

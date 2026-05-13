@@ -7,6 +7,7 @@ import {
   type ShadowExecutionNode,
   type ShadowStateTransfer,
   type ShadowTurnExecRequest,
+  type ShadowTurnExecReply,
   type ShadowTurnExecutionResult
 } from "./shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
@@ -189,6 +190,11 @@ export type ShadowTransportError = {
   envelope_id?: string;
 };
 
+export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
+  envelope: ShadowEnvelope<T>;
+  fresh: boolean;
+};
+
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   preseeded_objects: number;
@@ -290,6 +296,19 @@ export function createShadowBrowserNode(input: {
     next_live: 1,
     next_envelope: 1
   };
+}
+
+export function setShadowBrowserSessionToken(browser: ShadowBrowserNode, token: string): void {
+  // Wire handshakes authenticate with the caller's bearer token, while the
+  // shadow shim starts with a local dev token. Replace the registered bearer so
+  // subsequent envelope auth has exactly one valid token for this session.
+  if (!browser.session_token) throw new Error("shadow browser session auth token is required");
+  if (browser.session_token === token) return;
+  const claims = browser.relay.session_auth.get(browser.session_token);
+  if (!claims) throw new Error("shadow browser session auth token is unknown");
+  browser.relay.session_auth.delete(browser.session_token);
+  browser.relay.session_auth.set(token, claims);
+  browser.session_token = token;
 }
 
 export function createShadowBrowserNodeCache(): ShadowBrowserNodeCache {
@@ -433,7 +452,7 @@ export async function executeShadowBrowserTurn(
   browser.cache.pending_turns.set(id, pending);
 
   const request: ShadowTurnExecRequest = {
-    kind: "woo.turn_exec_request.shadow.v1",
+    kind: "woo.turn.exec.request.shadow.v1",
     id,
     call,
     key,
@@ -618,9 +637,17 @@ export function shadowBrowserTransportHello(browser: ShadowBrowserNode, now = Da
 }
 
 export function receiveShadowBrowserEnvelope(browser: ShadowBrowserNode, encoded: string): ShadowEnvelope {
+  return receiveShadowBrowserEnvelopeReceipt(browser, encoded).envelope;
+}
+
+export function receiveShadowBrowserEnvelopeReceipt(browser: ShadowBrowserNode, encoded: string): ShadowBrowserEnvelopeReceipt {
   const envelope = decodeEnvelope(encoded);
   validateShadowBrowserEnvelopeAuth(browser.relay, browser, envelope);
-  if (!markShadowBrowserEnvelopeSeen(browser.relay, envelope)) return envelope;
+  // The receipt exposes freshness to callers that perform side-effecting
+  // request dispatch after decode; duplicate envelopes must authenticate and
+  // decode successfully but must not execute a second turn.
+  const fresh = markShadowBrowserEnvelopeSeen(browser.relay, envelope);
+  if (!fresh) return { envelope, fresh };
   switch (envelope.type) {
     case "woo.live.event.shadow.v1":
       assertShadowLiveEventIsEphemeral(envelope.body);
@@ -638,7 +665,39 @@ export function receiveShadowBrowserEnvelope(browser: ShadowBrowserNode, encoded
   }
   // Types without a built-in dispatch arm are returned for caller-level
   // handling; the codec has already checked that they are known wire types.
-  return envelope;
+  return { envelope, fresh };
+}
+
+export async function handleShadowBrowserTurnExecEnvelope(
+  browser: ShadowBrowserNode,
+  receipt: ShadowBrowserEnvelopeReceipt
+): Promise<ShadowEnvelope<ShadowTurnExecReply> | null> {
+  // Keep wire turn-exec dispatch in the substrate so dev-server, Worker, and
+  // future socket bindings share the same duplicate handling and reply shape.
+  if (!receipt.fresh || receipt.envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+  const request = receipt.envelope.body as ShadowTurnExecRequest;
+  const result = await executeShadowBrowserTurn(browser, {
+    id: request.id ?? request.call.id,
+    route: request.call.route,
+    scope: request.call.scope,
+    target: request.call.target,
+    verb: request.call.verb,
+    args: request.call.args,
+    commit_policy: request.commit_policy
+  });
+  if (!result.result.reply) return null;
+  return {
+    v: 2,
+    type: result.result.reply.kind,
+    id: `${browser.relay.node}:reply:${result.id}`,
+    from: browser.relay.node,
+    to: browser.node,
+    actor: browser.actor,
+    ...(browser.session ? { session: browser.session } : {}),
+    reply_to: receipt.envelope.id,
+    auth: shadowBrowserAuth(browser),
+    body: result.result.reply
+  };
 }
 
 export function roundTripShadowBrowserEnvelope<T>(browser: ShadowBrowserNode, type: string, body: T): ShadowEnvelope<T> {

@@ -1070,9 +1070,12 @@ M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
 The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
 `TransportHello` envelope, decodes subsequent frames through the shared shadow
-envelope codec, and can return shadow execution replies. Durable
-CommitScopeDO-backed commit arbitration is reserved by binding/migration but is
-not yet the live commit authority.
+envelope codec, and can return shadow execution replies. During one open socket,
+the dev server and Worker keep one shadow browser/relay pair alive so
+idempotency, subscriptions, catch-up tails, and browser cache state survive
+across frames. Durable CommitScopeDO-backed commit arbitration and persisted
+resume across Worker hibernation/reconnect are reserved by binding/migration but
+are not yet the live commit authority.
 
 Browser-node dubspace preview flow:
 

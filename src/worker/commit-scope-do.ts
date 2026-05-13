@@ -20,6 +20,7 @@ export class CommitScopeDO {
       return jsonResponse({
         ok: true,
         kind: "woo.commit_scope_do.v1",
+        id: String(this.state.id),
         ts: Date.now()
       });
     }

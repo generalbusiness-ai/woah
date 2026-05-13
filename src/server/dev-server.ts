@@ -25,12 +25,12 @@ import { McpGateway } from "../mcp/gateway";
 import {
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
-  executeShadowBrowserTurn,
-  receiveShadowBrowserEnvelope,
+  handleShadowBrowserTurnExecEnvelope,
+  receiveShadowBrowserEnvelopeReceipt,
+  setShadowBrowserSessionToken,
   shadowBrowserTransportHello
 } from "../core/shadow-browser-node";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import type { ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 
 // Local dev server only: HTTP authoring endpoints require a session and then
 // defer to the world's object-authoring permission checks.
@@ -269,6 +269,8 @@ v2wss.on("connection", (ws, req) => {
   const socketId = `v2-ws-${socketCounter++}`;
   world.attachSocket(session.id, socketId);
   sockets.set(ws, { sessionId: session.id, actor: session.actor, socketId });
+  // The local WebSocket shim keeps one browser node for the connection, matching
+  // the Worker path's socket-lifetime idempotency and cache behavior.
   const browser = v2ShadowBrowser(node, token, session);
   const hello = shadowBrowserTransportHello(browser);
   ws.send(encodeEnvelope({
@@ -288,7 +290,7 @@ v2wss.on("connection", (ws, req) => {
       ws.close(1009, "frame too large");
       return;
     }
-    void handleV2ShadowFrame(ws, node, token, session, String(raw));
+    void handleV2ShadowFrame(ws, node, token, session, browser, String(raw));
   });
   ws.on("close", () => {
     world.detachSocket(session.id, socketId);
@@ -347,16 +349,7 @@ function v2ShadowBrowser(node: string, token: string, session: Session): ReturnT
     session: session.id,
     relay
   });
-  // Local dev accepts existing v1 session credentials at the v2 handshake.
-  // Mirror the shadow claims under that bearer so subsequent envelopes can
-  // repeat exactly the token used to open the socket.
-  if (browser.session_token && browser.session_token !== token) {
-    const claims = relay.session_auth.get(browser.session_token);
-    if (claims) {
-      relay.session_auth.set(token, claims);
-      browser.session_token = token;
-    }
-  }
+  setShadowBrowserSessionToken(browser, token);
   return browser;
 }
 
@@ -384,35 +377,13 @@ async function handleV2ShadowFrame(
   node: string,
   token: string,
   session: Session,
+  browser: ReturnType<typeof createShadowBrowserNode>,
   encoded: string
 ): Promise<void> {
   try {
-    const browser = v2ShadowBrowser(node, token, session);
-    const envelope = receiveShadowBrowserEnvelope(browser, encoded);
-    if (envelope.type !== "woo.turn.exec.request.shadow.v1") return;
-    const request = envelope.body as ShadowTurnExecRequest;
-    const result = await executeShadowBrowserTurn(browser, {
-      id: request.id ?? request.call.id,
-      route: request.call.route,
-      scope: request.call.scope,
-      target: request.call.target,
-      verb: request.call.verb,
-      args: request.call.args,
-      commit_policy: request.commit_policy
-    });
-    if (!result.result.reply) return;
-    ws.send(encodeEnvelope({
-      v: 2,
-      type: result.result.reply.kind,
-      id: `dev-relay:reply:${result.id}`,
-      from: browser.relay.node,
-      to: browser.node,
-      actor: session.actor,
-      session: session.id,
-      reply_to: envelope.id,
-      auth: { mode: "session", token },
-      body: result.result.reply
-    } satisfies ShadowEnvelope<typeof result.result.reply>));
+    const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
+    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+    if (reply) ws.send(encodeEnvelope(reply));
   } catch (err) {
     ws.send(encodeEnvelope({
       v: 2,

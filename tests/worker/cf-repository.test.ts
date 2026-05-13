@@ -292,6 +292,78 @@ class FakeHostBridge implements HostBridge {
 }
 
 describe("CFObjectRepository production-shape coverage", () => {
+  it("reserves the v2 session mint endpoint with shadow-local claims", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-mint-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/v2/session/mint", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: "wizard:cf-v2-mint-token" })
+      }));
+
+      expect(response.status).toBe(200);
+      const body = await response.json() as { token: string; claims: Record<string, unknown> };
+      expect(body.token).toMatch(/^shadow-session:/);
+      expect(body.claims).toMatchObject({
+        actor: "$wiz",
+        deployment: "shadow-local",
+        rev: 1
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
+  it("rejects v2 WebSocket upgrades without the required subprotocol", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-subprotocol-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/v2/turn-network/ws?token=wizard:cf-v2-subprotocol-token", {
+        headers: { upgrade: "websocket" }
+      }));
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "E_PROTOCOL" }
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("emits startup storage metrics before world init completes", async () => {
     const logs: string[] = [];
     const logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {

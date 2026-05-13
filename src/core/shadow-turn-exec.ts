@@ -132,7 +132,7 @@ export type ShadowTurnExecutionResult =
     };
 
 export type ShadowTurnExecRequest = {
-  kind: "woo.turn_exec_request.shadow.v1";
+  kind: "woo.turn.exec.request.shadow.v1";
   id?: string;
   call: ShadowTurnCall;
   key: ShadowTurnKey;

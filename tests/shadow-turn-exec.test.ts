@@ -99,7 +99,7 @@ describe("shadow turn execution", () => {
     expect(planned.frame).toMatchObject({ op: "applied", space: "the_dubspace", seq: 1 });
     expect(planned.transcript.complete).toBe(true);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
-    const request = { kind: "woo.turn_exec_request.shadow.v1" as const, call, key };
+    const request = { kind: "woo.turn.exec.request.shadow.v1" as const, call, key };
     const actorNode = createShadowExecutionNode({ node: "actor-node", scope: key.scope });
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
       request,
@@ -151,7 +151,7 @@ describe("shadow turn execution", () => {
     };
     const planned = await runShadowTurnCall(serializedBefore, call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
-    const request = { kind: "woo.turn_exec_request.shadow.v1" as const, call, key };
+    const request = { kind: "woo.turn.exec.request.shadow.v1" as const, call, key };
     const writeHash = key.write_atom_hashes[0];
     const preloadedHashes = key.atom_hashes.filter((hash) => hash !== writeHash);
     const partialNode = createShadowExecutionNode({ node: "partial-actor", scope: key.scope });
@@ -230,7 +230,7 @@ describe("shadow turn execution", () => {
     };
     const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
-      request: { kind: "woo.turn_exec_request.shadow.v1" as const, call, key, expected: initialHead },
+      request: { kind: "woo.turn.exec.request.shadow.v1" as const, call, key, expected: initialHead },
       nodes: [createShadowExecutionNode({ node: "actor-node", scope: key.scope })],
       ads: [buildShadowTurnExecAd({ node: "actor-node", scope: key.scope, key, factor: 0.1 })],
       anchor: { node: "stable-anchor", serialized: serializedBefore },
@@ -266,7 +266,7 @@ describe("shadow turn execution", () => {
       serialized: serializedBefore
     });
     const stale = await executeShadowTurnCallOrNeedState(staleNode, {
-      kind: "woo.turn_exec_request.shadow.v1",
+      kind: "woo.turn.exec.request.shadow.v1",
       call: staleCall,
       key: staleKey,
       expected: initialHead
@@ -444,7 +444,7 @@ describe("shadow turn execution", () => {
     const firstKey = shadowTurnKeyFromTranscript(firstPlanned.transcript);
     const actorNode = createShadowExecutionNode({ node: "actor-node", scope: firstKey.scope });
     const firstRouted = await executeShadowTurnCallAcrossInProcessNetwork({
-      request: { kind: "woo.turn_exec_request.shadow.v1" as const, call: firstCall, key: firstKey },
+      request: { kind: "woo.turn.exec.request.shadow.v1" as const, call: firstCall, key: firstKey },
       nodes: [actorNode],
       ads: [buildShadowTurnExecAd({ node: "actor-node", scope: firstKey.scope, key: firstKey, factor: 0.1 })],
       anchor: { node: "stable-anchor", serialized: firstSerializedBefore }
@@ -472,7 +472,7 @@ describe("shadow turn execution", () => {
     ]);
 
     const secondRouted = await executeShadowTurnCallAcrossInProcessNetwork({
-      request: { kind: "woo.turn_exec_request.shadow.v1" as const, call: secondCall, key: secondKey },
+      request: { kind: "woo.turn.exec.request.shadow.v1" as const, call: secondCall, key: secondKey },
       nodes: [actorNode],
       ads: [buildShadowTurnExecAd({ node: "actor-node", scope: secondKey.scope, key: secondKey, factor: 0.1 })],
       anchor: { node: "stable-anchor", serialized: secondSerializedBefore }
@@ -530,7 +530,7 @@ describe("shadow turn execution", () => {
     });
 
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
-      request: { kind: "woo.turn_exec_request.shadow.v1" as const, call, key },
+      request: { kind: "woo.turn.exec.request.shadow.v1" as const, call, key },
       nodes: [cachedNode],
       ads: [buildShadowTurnExecAd({ node: "catalog-cached-browser", scope: key.scope, key, factor: 0.1 })],
       anchor: { node: "stable-anchor", serialized: serializedBefore }
@@ -686,7 +686,7 @@ describe("shadow turn execution", () => {
     });
 
     const result = await executeShadowTurnCallOrNeedState(node, {
-      kind: "woo.turn_exec_request.shadow.v1",
+      kind: "woo.turn.exec.request.shadow.v1",
       call,
       key: predictedKey
     });
@@ -728,7 +728,7 @@ describe("shadow turn execution", () => {
     });
 
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
-      request: { kind: "woo.turn_exec_request.shadow.v1" as const, call, key: predictedKey },
+      request: { kind: "woo.turn.exec.request.shadow.v1" as const, call, key: predictedKey },
       nodes: [node],
       ads: [buildShadowTurnExecAd({ node: "actor-node", scope: predictedKey.scope, key: predictedKey, factor: 0.1 })],
       anchor: { node: "stable-anchor", serialized: serializedBefore }
