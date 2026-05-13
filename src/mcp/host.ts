@@ -674,7 +674,7 @@ export class McpHost {
     return lines.join("\n");
   }
 
-  private enclosingSpaceFor(target: ObjRef): ObjRef | null {
+  enclosingSpaceFor(target: ObjRef): ObjRef | null {
     let cursor: ObjRef | null = target;
     while (cursor && this.world.objects.has(cursor)) {
       if (this.descendsFrom(cursor, "$space")) return cursor;

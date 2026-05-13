@@ -1,5 +1,5 @@
 // MCP gateway — per-process state manager for the streamable-HTTP transport.
-// Owns ONE McpHost per WooWorld so the $actor:wait/focus/etc. native handlers
+// Owns ONE McpHost per WooWorld so the built-in MCP control handlers
 // only register once. Each MCP session binds a queue inside that host and
 // gets its own server + transport.
 //
@@ -399,22 +399,10 @@ export class McpGateway {
   }
 
   private scopeForV2Call(actor: ObjRef, target: ObjRef): ObjRef {
-    let cursor: ObjRef | null = target;
-    while (cursor && this.world.objects.has(cursor)) {
-      if (this.descendsFrom(cursor, "$space")) return cursor;
-      const obj = this.world.object(cursor);
-      cursor = obj.anchor ?? obj.location ?? null;
-    }
-    return this.world.currentLocationForSession(this.sessionsByActor(actor)?.woo.id) ?? actor;
-  }
-
-  private descendsFrom(objRef: ObjRef, ancestorRef: ObjRef): boolean {
-    let cursor: ObjRef | null = objRef;
-    while (cursor && this.world.objects.has(cursor)) {
-      if (cursor === ancestorRef) return true;
-      cursor = this.world.object(cursor).parent;
-    }
-    return false;
+    const enclosing = this.host.enclosingSpaceFor(target);
+    if (enclosing) return enclosing;
+    const session = this.sessionsByActor(actor);
+    return (session ? this.world.currentLocationForSession(session.woo.id) : null) ?? actor;
   }
 
   private sessionsByActor(actor: ObjRef): SessionEntry | null {
