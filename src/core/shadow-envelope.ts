@@ -30,6 +30,7 @@ const KNOWN_SHADOW_TYPES = new Set([
   "woo.transport.hello.v1",
   "woo.transport.ping.v1",
   "woo.transport.pong.v1",
+  "woo.transport.error.v1",
   "woo.subscribe.v1",
   "woo.catchup.request.v1",
   "woo.catchup.reply.v1",

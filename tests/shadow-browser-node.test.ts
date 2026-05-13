@@ -12,8 +12,10 @@ import {
   openShadowBrowserScope,
   receiveShadowBrowserEnvelope,
   shadowBrowserEnvelope,
+  shadowBrowserTransportHello,
   type ShadowBrowserStateTransfer,
-  type ShadowBrowserNode
+  type ShadowBrowserNode,
+  type ShadowLiveEvent
 } from "../src/core/shadow-browser-node";
 import { hashSource } from "../src/core/source-hash";
 import type { ObjRef, WooValue } from "../src/core/types";
@@ -365,6 +367,52 @@ describe("shadow browser node shim", () => {
     bad.auth = { mode: "session", token: "shadow-session:missing" };
 
     expect(() => receiveShadowBrowserEnvelope(browser, encodeEnvelope(bad))).toThrow(/token is unknown/);
+  });
+
+  it("rejects deployment and rev-mismatched session tokens in the relay shim", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-auth-binding");
+
+    const claims = browser.relay.session_auth.get(browser.session_token ?? "");
+    if (!claims || !browser.session) throw new Error("expected test session claims");
+    claims.deployment = "wrong-deployment";
+    expect(() => shadowBrowserTransportHello(browser)).toThrow(/deployment mismatch/);
+
+    claims.deployment = browser.relay.deployment;
+    browser.relay.session_revs.set(browser.session, claims.rev + 1);
+    expect(() => shadowBrowserTransportHello(browser)).toThrow(/rev mismatch/);
+  });
+
+  it("advertises the M4 idempotency window through transport hello", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-hello");
+    const hello = shadowBrowserTransportHello(browser, 12345);
+
+    expect(hello).toMatchObject({
+      kind: "woo.transport.hello.v1",
+      relay: "browser-relay",
+      actor: browser.actor,
+      session: browser.session,
+      server_time: 12345,
+      idempotency_window_ms: 300000,
+      planes: ["execution", "commit", "state", "live"]
+    });
+  });
+
+  it("rejects live envelopes carrying durability-reserved fields", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-live-durable");
+    await openShadowBrowserScope(browser);
+    const live: ShadowLiveEvent & { writes: WooValue[] } = {
+      kind: "woo.live.event.shadow.v1",
+      id: "browser-live-durable",
+      source: "delay_1",
+      actor: browser.actor,
+      scope: "the_dubspace",
+      observation: { type: "control_preview", source: "delay_1", control: "wet", value: 0.22 },
+      writes: []
+    };
+    const env = shadowBrowserEnvelope(browser, live.kind, live);
+
+    expect(() => receiveShadowBrowserEnvelope(browser, encodeEnvelope(env))).toThrow(/durability-reserved field: writes/);
+    expect(browser.relay.live_events).toHaveLength(0);
   });
 
   it("opens from a last-known head through delta catch-up when the relay has the tail", async () => {

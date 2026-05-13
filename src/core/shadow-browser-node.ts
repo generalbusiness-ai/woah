@@ -21,6 +21,20 @@ import type { ObjRef, Observation, WooValue } from "./types";
 const DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY = "shadow-relay";
 const DEFAULT_SHADOW_BROWSER_STATE_KEY_ID = "shadow-browser-dev";
 const DEFAULT_SHADOW_BROWSER_STATE_SECRET = "shadow-browser-dev-secret";
+const DEFAULT_SHADOW_DEPLOYMENT = "shadow-local";
+const MIN_SHADOW_IDEMPOTENCY_WINDOW_MS = 5 * 60 * 1000;
+const SHADOW_LIVE_DURABILITY_RESERVED_FIELDS = new Set([
+  "writes",
+  "creates",
+  "moves",
+  "transcript",
+  "commit",
+  "receipt",
+  "state_transfer",
+  "applied",
+  "schedule",
+  "cancellations"
+]);
 
 export type ShadowLiveAudience = {
   actors?: ObjRef[];
@@ -108,11 +122,14 @@ export type ShadowBrowserPendingTurn = {
 export type ShadowBrowserRelayShim = {
   kind: "woo.browser_relay.shadow.v1";
   node: string;
+  deployment: string;
   commit_scope: ShadowCommitScope;
   executors: ShadowExecutionNode[];
   subscriptions: Map<ObjRef, Set<string>>;
   browsers: Map<string, ShadowBrowserNode>;
   session_auth: Map<string, ShadowBrowserSessionClaims>;
+  session_revs: Map<string, number>;
+  idempotency_window_ms: number;
   accepted_frames: ShadowCommitAccepted[];
   transcript_tail: EffectTranscript[];
   live_events: ShadowLiveEvent[];
@@ -151,6 +168,25 @@ export type ShadowBrowserSessionClaims = {
   rev: number;
 };
 
+export type ShadowTransportHello = {
+  kind: "woo.transport.hello.v1";
+  relay: string;
+  session: string;
+  actor: ObjRef;
+  server_time: number;
+  max_message_bytes: number;
+  idempotency_window_ms: number;
+  planes: Array<"execution" | "commit" | "state" | "live">;
+  features: string[];
+};
+
+export type ShadowTransportError = {
+  kind: "woo.transport.error.v1";
+  code: string;
+  message: string;
+  envelope_id?: string;
+};
+
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   preseeded_objects: number;
@@ -187,10 +223,16 @@ export function createShadowBrowserRelayShim(input: {
   serialized: SerializedWorld;
   executors?: ShadowExecutionNode[];
   state_signing?: Partial<ShadowBrowserStateSigning>;
+  deployment?: string;
+  session_revs?: Record<string, number>;
+  idempotency_window_ms?: number;
 }): ShadowBrowserRelayShim {
+  const sessionRevs = shadowBrowserSessionRevs(input.serialized.sessions, input.session_revs);
+  const deployment = input.deployment ?? DEFAULT_SHADOW_DEPLOYMENT;
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
+    deployment,
     commit_scope: createShadowCommitScope({
       node: input.node,
       scope: input.scope,
@@ -199,7 +241,9 @@ export function createShadowBrowserRelayShim(input: {
     executors: input.executors ?? [],
     subscriptions: new Map(),
     browsers: new Map(),
-    session_auth: shadowBrowserSessionClaims(input.serialized.sessions, input.scope),
+    session_auth: shadowBrowserSessionClaims(input.serialized.sessions, input.scope, deployment, sessionRevs),
+    session_revs: sessionRevs,
+    idempotency_window_ms: Math.max(input.idempotency_window_ms ?? MIN_SHADOW_IDEMPOTENCY_WINDOW_MS, MIN_SHADOW_IDEMPOTENCY_WINDOW_MS),
     accepted_frames: [],
     transcript_tail: [],
     live_events: [],
@@ -515,11 +559,32 @@ export function shadowBrowserEnvelope<T>(
   };
 }
 
+export function shadowBrowserTransportHello(browser: ShadowBrowserNode, now = Date.now()): ShadowTransportHello {
+  const claims = validateShadowBrowserAuth(browser.relay, {
+    mode: "session",
+    token: browser.session_token ?? undefined
+  }, browser.actor, browser.session);
+  // The hello mirrors the future WebSocket handshake so in-process tests catch
+  // drift in session authority and replay-window metadata before M4 networking.
+  return {
+    kind: "woo.transport.hello.v1",
+    relay: browser.relay.node,
+    session: claims.session,
+    actor: claims.actor,
+    server_time: now,
+    max_message_bytes: 1024 * 1024,
+    idempotency_window_ms: browser.relay.idempotency_window_ms,
+    planes: ["execution", "commit", "state", "live"],
+    features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"]
+  };
+}
+
 export function receiveShadowBrowserEnvelope(browser: ShadowBrowserNode, encoded: string): ShadowEnvelope {
   const envelope = decodeEnvelope(encoded);
   validateShadowBrowserEnvelopeAuth(browser.relay, browser, envelope);
   switch (envelope.type) {
     case "woo.live.event.shadow.v1":
+      assertShadowLiveEventIsEphemeral(envelope.body);
       publishShadowBrowserLiveEvent(browser.relay, envelope.body as ShadowLiveEvent);
       break;
     case "woo.state.transfer.shadow.v1":
@@ -601,22 +666,36 @@ function trustedBrowserStateAuthorities(input: Record<string, string> | undefine
   return new Map(Object.entries(input ?? { [DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY]: DEFAULT_SHADOW_BROWSER_STATE_SECRET }));
 }
 
-function shadowBrowserSessionClaims(sessions: SerializedSession[], scope: ObjRef): Map<string, ShadowBrowserSessionClaims> {
+function shadowBrowserSessionClaims(
+  sessions: SerializedSession[],
+  scope: ObjRef,
+  deployment: string,
+  sessionRevs: Map<string, number>
+): Map<string, ShadowBrowserSessionClaims> {
   const claims = new Map<string, ShadowBrowserSessionClaims>();
   for (const session of sessions) {
     const token = shadowBrowserSessionToken(session.id, session.actor);
     claims.set(token, {
       session: session.id,
       actor: session.actor,
-      deployment: "shadow-local",
+      deployment,
       issued_at: session.started,
       expires_at: session.expiresAt ?? session.started + 15 * 60 * 1000,
       scopes: [scope],
       features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"],
-      rev: 1
+      rev: sessionRevs.get(session.id) ?? 1
     });
   }
   return claims;
+}
+
+function shadowBrowserSessionRevs(
+  sessions: SerializedSession[],
+  overrides: Record<string, number> | undefined
+): Map<string, number> {
+  const revs = new Map<string, number>();
+  for (const session of sessions) revs.set(session.id, overrides?.[session.id] ?? 1);
+  return revs;
 }
 
 function shadowBrowserSessionToken(session: string, actor: ObjRef): string {
@@ -658,8 +737,20 @@ function validateShadowBrowserAuth(
   if (!claims) throw new Error("shadow browser auth token is unknown");
   if (actor && claims.actor !== actor) throw new Error("shadow browser auth actor mismatch");
   if (session && claims.session !== session) throw new Error("shadow browser auth session mismatch");
+  if (claims.deployment !== relay.deployment) throw new Error("shadow browser auth deployment mismatch");
+  if (claims.rev !== relay.session_revs.get(claims.session)) throw new Error("shadow browser auth rev mismatch");
   if (claims.expires_at <= Date.now()) throw new Error("shadow browser auth token is expired");
   return claims;
+}
+
+function assertShadowLiveEventIsEphemeral(value: unknown): asserts value is ShadowLiveEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("shadow live event must be an object");
+  // Live-plane frames are display hints only. Rejecting the named durability
+  // fields at decode keeps callers from smuggling committed-write shapes through
+  // the same single-socket channel.
+  for (const field of SHADOW_LIVE_DURABILITY_RESERVED_FIELDS) {
+    if (field in value) throw new Error(`shadow live event carries durability-reserved field: ${field}`);
+  }
 }
 
 function rememberShadowBrowserAcceptedFrame(

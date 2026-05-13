@@ -16,6 +16,25 @@ describe("shadow envelope codec", () => {
     expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
   });
 
+  it("accepts transport error frames as first-class wire envelopes", () => {
+    const envelope: ShadowEnvelope<{ kind: "woo.transport.error.v1"; code: string; message: string; envelope_id: string }> = {
+      v: 2,
+      type: "woo.transport.error.v1",
+      id: "err-1",
+      from: "relay-node",
+      to: "browser-node",
+      auth: { mode: "session", token: "shadow-session:1:guest_1" },
+      body: {
+        kind: "woo.transport.error.v1",
+        code: "E_UNADVERTISED_PLANE",
+        message: "plane is not available on this relay",
+        envelope_id: "sent-1"
+      }
+    };
+
+    expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
+  });
+
   it("rejects malformed envelopes before dispatch", () => {
     expect(() => decodeEnvelope("{")).toThrow(/malformed/);
     expect(() => decodeEnvelope(JSON.stringify({ v: 1, type: "woo.transport.ping.v1", id: "x", from: "a", auth: { mode: "session", token: "t" }, body: {} }))).toThrow(/version/);
