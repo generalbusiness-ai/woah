@@ -1083,7 +1083,6 @@ keys, and cached replies. Gateway isolate hibernation no longer resets v2
 commit authority; browsers still resubscribe and run VTN9 catch-up after any
 transport reconnect because live socket subscriptions remain connection-local.
 The local dev server keeps the earlier socket-lifetime in-process relay shim.
-catch-up before submitting new authority-bearing turns.
 
 Browser-node dubspace preview flow:
 

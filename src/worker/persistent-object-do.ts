@@ -2610,6 +2610,7 @@ export class PersistentObjectDO {
       token,
       session: session.id,
       actor: session.actor,
+      sessions: world.exportSessions(),
       serialized: world.exportWorld()
     });
     const hello = opened.hello;
@@ -2646,7 +2647,7 @@ export class PersistentObjectDO {
         token: att.token,
         session: att.sessionId,
         actor: att.actor,
-        serialized: world.exportWorld(),
+        sessions: world.exportSessions(),
         envelope: encoded
       });
       if (result.reply) ws.send(result.reply);

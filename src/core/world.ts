@@ -5442,6 +5442,13 @@ export class WooWorld {
     };
   }
 
+  exportSessions(): SerializedSession[] {
+    // Transport relays need fresh session claims for auth/revocation checks, but
+    // not a full world snapshot. Keep this narrow so hot-path gateways do not
+    // serialize object/log state just to refresh bearer-token authority.
+    return Array.from(this.sessions.values()).map((session) => this.serializeSession(session));
+  }
+
   /**
    * Round-trippable host slice. Returns SeedWorld shape (a
    * SerializedWorld slice plus the `objectHosts` routing map required

@@ -7,8 +7,9 @@
 // tables without changing the browser/relay boundary.
 
 import type { EffectTranscript } from "../core/effect-transcript";
-import type { SerializedWorld } from "../core/repository";
+import type { SerializedSession, SerializedWorld } from "../core/repository";
 import {
+  buildShadowBrowserSessionAuth,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
   handleShadowBrowserTurnExecEnvelope,
@@ -84,12 +85,15 @@ export class CommitScopeDO {
     }, 501);
   }
 
-  private async relayFor(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim> {
+  private async relayFor(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
     if (!this.snapshotLoaded) {
       this.relay = this.loadSnapshot(input);
       this.snapshotLoaded = true;
     }
     if (!this.relay) {
+      if (!input.serialized) {
+        throw wooError("E_PROTOCOL", `commit scope ${input.scope} has no durable snapshot; open the scope before sending envelopes`);
+      }
       this.relay = createShadowBrowserRelayShim({
         node: `node:commit-scope:${input.scope}`,
         scope: input.scope,
@@ -100,18 +104,22 @@ export class CommitScopeDO {
     if (this.relay.commit_scope.scope !== input.scope) {
       throw wooError("E_PROTOCOL", `commit scope mismatch: have=${this.relay.commit_scope.scope} want=${input.scope}`);
     }
-    // Sessions can be refreshed by the gateway between messages. Rebuilding the
-    // auth maps from the latest seed keeps token revocation and actor/session
-    // checks current without overwriting the authoritative committed state.
-    const fresh = createShadowBrowserRelayShim({
-      node: this.relay.node,
-      scope: input.scope,
-      serialized: input.serialized,
-      idempotency_window_ms: this.relay.idempotency_window_ms
-    });
-    this.relay.session_auth = fresh.session_auth;
-    this.relay.session_revs = fresh.session_revs;
+    this.refreshSessionAuth(this.relay, input);
     return this.relay;
+  }
+
+  private refreshSessionAuth(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
+    // Sessions can be refreshed by the gateway between messages. Refresh only
+    // the auth maps from the narrow session export; the committed state and
+    // projection snapshot remain owned by this scope DO.
+    const auth = buildShadowBrowserSessionAuth({
+      sessions: input.sessions,
+      scope: input.scope,
+      deployment: relay.deployment,
+      session_revs: input.session_revs
+    });
+    relay.session_auth = auth.session_auth;
+    relay.session_revs = auth.session_revs;
   }
 
   private browserFor(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest) {
@@ -144,16 +152,7 @@ export class CommitScopeDO {
     relay.transcript_tail = snapshot.transcript_tail;
     relay.recently_seen = new Map(snapshot.recently_seen);
     relay.recent_replies = new Map(snapshot.recent_replies);
-    // See relayFor(): session auth is always derived from the gateway's latest
-    // serialized world, not from the possibly older committed-state snapshot.
-    const fresh = createShadowBrowserRelayShim({
-      node: relay.node,
-      scope: input.scope,
-      serialized: input.serialized,
-      idempotency_window_ms: relay.idempotency_window_ms
-    });
-    relay.session_auth = fresh.session_auth;
-    relay.session_revs = fresh.session_revs;
+    this.refreshSessionAuth(relay, input);
     return relay;
   }
 
@@ -184,10 +183,13 @@ type CommitScopeBaseRequest = {
   token: string;
   session: string;
   actor: ObjRef;
-  serialized: SerializedWorld;
+  sessions: SerializedSession[];
+  session_revs?: Record<string, number>;
 };
 
-type CommitScopeOpenRequest = CommitScopeBaseRequest;
+type CommitScopeOpenRequest = CommitScopeBaseRequest & {
+  serialized: SerializedWorld;
+};
 
 type CommitScopeOpenResponse = {
   ok: true;

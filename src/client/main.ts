@@ -447,6 +447,11 @@ function ensureV2BrowserWorker() {
   v2BrowserWorker = new Worker(new URL("./v2-browser-worker.ts", import.meta.url), { type: "module" });
   v2BrowserWorker.addEventListener("message", (event) => {
     if (event.data?.kind === "status") console.debug("woo.v2", event.data.status);
+    // Frame/error messages are exposed now so the worker-cache wire path can be
+    // inspected during the migration; UI reducers will consume them directly
+    // once the legacy `/ws` path is retired.
+    if (event.data?.kind === "frame") console.debug("woo.v2.frame", event.data.envelope);
+    if (event.data?.kind === "error") console.warn("woo.v2.error", event.data.error);
   });
   v2BrowserWorker.postMessage({
     kind: "connect",

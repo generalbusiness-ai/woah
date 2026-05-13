@@ -173,6 +173,11 @@ export type ShadowBrowserSessionClaims = {
   rev: number;
 };
 
+export type ShadowBrowserSessionAuth = {
+  session_auth: Map<string, ShadowBrowserSessionClaims>;
+  session_revs: Map<string, number>;
+};
+
 export type ShadowTransportHello = {
   kind: "woo.transport.hello.v1";
   relay: string;
@@ -238,8 +243,13 @@ export function createShadowBrowserRelayShim(input: {
   session_revs?: Record<string, number>;
   idempotency_window_ms?: number;
 }): ShadowBrowserRelayShim {
-  const sessionRevs = shadowBrowserSessionRevs(input.serialized.sessions, input.session_revs);
   const deployment = input.deployment ?? DEFAULT_SHADOW_DEPLOYMENT;
+  const auth = buildShadowBrowserSessionAuth({
+    sessions: input.serialized.sessions,
+    scope: input.scope,
+    deployment,
+    session_revs: input.session_revs
+  });
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
@@ -252,8 +262,8 @@ export function createShadowBrowserRelayShim(input: {
     executors: input.executors ?? [],
     subscriptions: new Map(),
     browsers: new Map(),
-    session_auth: shadowBrowserSessionClaims(input.serialized.sessions, input.scope, deployment, sessionRevs),
-    session_revs: sessionRevs,
+    session_auth: auth.session_auth,
+    session_revs: auth.session_revs,
     idempotency_window_ms: Math.max(input.idempotency_window_ms ?? MIN_SHADOW_IDEMPOTENCY_WINDOW_MS, MIN_SHADOW_IDEMPOTENCY_WINDOW_MS),
     recently_seen: new Map(),
     recent_replies: new Map(),
@@ -265,6 +275,23 @@ export function createShadowBrowserRelayShim(input: {
       key_id: input.state_signing?.key_id ?? DEFAULT_SHADOW_BROWSER_STATE_KEY_ID,
       secret: input.state_signing?.secret ?? DEFAULT_SHADOW_BROWSER_STATE_SECRET
     }
+  };
+}
+
+export function buildShadowBrowserSessionAuth(input: {
+  sessions: SerializedSession[];
+  scope: ObjRef;
+  deployment?: string;
+  session_revs?: Record<string, number>;
+}): ShadowBrowserSessionAuth {
+  // Session auth is intentionally derivable from the gateway's narrow session
+  // export. Commit-scope relays can refresh token authority without rebuilding
+  // execution state or receiving the full world over the transport boundary.
+  const deployment = input.deployment ?? DEFAULT_SHADOW_DEPLOYMENT;
+  const sessionRevs = shadowBrowserSessionRevs(input.sessions, input.session_revs);
+  return {
+    session_auth: shadowBrowserSessionClaims(input.sessions, input.scope, deployment, sessionRevs),
+    session_revs: sessionRevs
   };
 }
 

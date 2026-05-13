@@ -10,6 +10,8 @@ type PendingEnvelope = {
   id: string;
   encoded: string;
   created_at: number;
+  auth_token?: string;
+  from?: string;
 };
 
 type V2CacheStatus = {
@@ -29,6 +31,7 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
 let current: { token: string; node: string; scope: string } | null = null;
 let reconnectTimer: number | undefined;
+let connecting = false;
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 
@@ -58,13 +61,20 @@ async function handleCommand(command: V2WorkerCommand): Promise<void> {
       clearReconnect();
       socket?.close();
       socket = null;
+      connecting = false;
       current = null;
       await putMeta("connected", false);
       postStatus();
       break;
     case "send": {
       const encoded = encodeEnvelope(command.envelope);
-      await putPending({ id: command.envelope.id, encoded, created_at: Date.now() });
+      await putPending({
+        id: command.envelope.id,
+        encoded,
+        created_at: Date.now(),
+        auth_token: command.envelope.auth.mode === "session" ? command.envelope.auth.token : undefined,
+        from: command.envelope.from
+      });
       sendEncoded(encoded);
       postStatus();
       break;
@@ -78,6 +88,8 @@ async function handleCommand(command: V2WorkerCommand): Promise<void> {
 async function connect(): Promise<void> {
   if (!current) return;
   if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
+  if (connecting) return;
+  connecting = true;
   clearReconnect();
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams({ token: current.token, node: current.node });
@@ -85,6 +97,7 @@ async function connect(): Promise<void> {
   const ws = new WebSocket(`${protocol}//${location.host}/v2/turn-network/ws?${params}`, "woo-v2.turn-network.json");
   socket = ws;
   ws.addEventListener("open", () => {
+    connecting = false;
     reconnectDelayMs = 500;
     void putMeta("connected", true);
     void replayPending();
@@ -97,11 +110,13 @@ async function connect(): Promise<void> {
     });
   });
   ws.addEventListener("close", () => {
+    connecting = false;
     void putMeta("connected", false);
     postStatus();
     scheduleReconnect();
   });
   ws.addEventListener("error", () => {
+    connecting = false;
     void putMeta("connected", false);
     postStatus();
   });
@@ -129,7 +144,24 @@ async function receiveFrame(encoded: string): Promise<void> {
 async function replayPending(): Promise<void> {
   // Pending turn envelopes are already idempotency-keyed by (from, id), so
   // reconnect replay is a transport retry rather than a second durable action.
-  for (const pending of await allPending()) sendEncoded(pending.encoded);
+  // Entries from an older login are left in the cache for debugging but are not
+  // sent with the new bearer token's socket.
+  for (const pending of await allPending()) {
+    if (!current || !pendingMatchesCurrentSession(pending)) continue;
+    sendEncoded(pending.encoded);
+  }
+}
+
+function pendingMatchesCurrentSession(pending: PendingEnvelope): boolean {
+  if (!current) return false;
+  if (pending.auth_token) return pending.auth_token === current.token;
+  try {
+    const envelope = decodeEnvelope(pending.encoded);
+    if (envelope.auth.mode === "session") return envelope.auth.token === current.token;
+    return envelope.from === current.node;
+  } catch {
+    return false;
+  }
 }
 
 function sendEncoded(encoded: string): void {

@@ -491,6 +491,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
     const commitStates = new Map<string, FakeDurableObjectState>();
+    const envelopeBodies: Array<Record<string, unknown>> = [];
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const env = {
       WOO_INITIAL_WIZARD_TOKEN: "cf-v2-message-token",
@@ -509,7 +510,15 @@ describe("CFObjectRepository production-shape coverage", () => {
           state = new FakeDurableObjectState(name);
           commitStates.set(name, state);
         }
-        return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+        const scope = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+        return {
+          async fetch(request: Request): Promise<Response> {
+            if (new URL(request.url).pathname === "/v2/envelope") {
+              envelopeBodies.push(await request.clone().json() as Record<string, unknown>);
+            }
+            return await scope.fetch(request);
+          }
+        };
       })
     } as unknown as Env;
     const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
@@ -579,6 +588,23 @@ describe("CFObjectRepository production-shape coverage", () => {
       };
       const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "cf-v2-message-env"));
       const ws = new FakeWebSocket();
+      const openRequest = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "#-1",
+          node: "browser:worker-test",
+          token: "guest:cf-v2-message",
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          serialized: world.exportWorld()
+        })
+      }));
+      const commitScope = env.COMMIT_SCOPE;
+      if (!commitScope) throw new Error("test env missing COMMIT_SCOPE");
+      const opened = await commitScope.get(commitScope.idFromName("#-1")).fetch(openRequest);
+      expect(opened.ok).toBe(true);
 
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
 
@@ -587,6 +613,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(replies[0]).toMatchObject({ type: "woo.turn.exec.reply.shadow.v1", reply_to: "cf-v2-message-env" });
       expect(replies[0].body).toMatchObject({ ok: true, id: "cf-v2-message-value" });
       expect(replies[0].body.commit.serialized_after).toBeUndefined();
+      expect(envelopeBodies[0]?.sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: session.id, actor: session.actor })]));
+      expect(envelopeBodies[0]).not.toHaveProperty("serialized");
 
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
       const replayed = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
