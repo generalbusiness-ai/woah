@@ -478,14 +478,11 @@ function syncV2BrowserWorkerScope() {
 }
 
 function desiredV2BrowserScope(): string {
-  // The browser state plane is display-oriented. Prefer the route/tab surface
-  // the user is actually viewing, and use actor scope only while bootstrapping
-  // a session with no visible space yet.
+  // The browser state plane is display-oriented. Use the routed object as the
+  // visible scope instead of branching on catalog-specific surfaces; actor
+  // scope is only a bootstrap fallback before any object route is known.
   const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-  if (state.tab === "chat" && route?.objectId) return route.objectId;
-  if (state.tab === "dubspace") return dubspaceSpace() || activeChatRoom() || state.actor || "";
-  if (state.tab === "pinboard") return pinboardSpace() || activeChatRoom() || state.actor || "";
-  if (state.tab === "taskspace") return taskspaceSpace() || activeChatRoom() || state.actor || "";
+  if (route?.objectId) return route.objectId;
   return activeChatRoom() || state.actor || "";
 }
 
