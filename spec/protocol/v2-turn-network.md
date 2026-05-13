@@ -752,6 +752,11 @@ MUST include an accepted commit receipt. `execute_only` is reserved for local
 simulation and diagnostic deployments; clients MUST NOT treat an `execute_only`
 result as authoritative state.
 
+Turn-exec replies MUST NOT carry a full serialized post-state. When the shadow
+implementation exposes `serialized_after` for local cache/projection consumers,
+that field is confined to in-process accepted frames and state-plane transfers;
+wire replies carry commit position, transcript hash, receipt, and observations.
+
 `atoms` are the state/code/metadata closure that a candidate must probably
 cover before execution. `write_atoms` identify write-authority-sensitive cells
 so routing can avoid projection-only nodes before commit. `accept_atoms` are

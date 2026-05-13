@@ -2,6 +2,17 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
+import { encodeEnvelope } from "../../src/core/shadow-envelope";
+import {
+  createShadowBrowserNode,
+  createShadowBrowserRelayShim,
+  openShadowBrowserScope,
+  setShadowBrowserSessionToken,
+  shadowBrowserEnvelope,
+  type ShadowBrowserNode
+} from "../../src/core/shadow-browser-node";
+import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
+import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
 import type { CallContext, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
 import { CFObjectRepository } from "../../src/worker/cf-repository";
@@ -358,6 +369,104 @@ describe("CFObjectRepository production-shape coverage", () => {
       await expect(response.json()).resolves.toMatchObject({
         error: { code: "E_PROTOCOL" }
       });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
+  it("handles v2 turn requests through the Worker WebSocket message path", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-message-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    const internals = gateway as unknown as {
+      v2BrowserBySocket: Map<string, ShadowBrowserNode>;
+      webSocketV2TurnNetworkMessage: (world: WooWorld, ws: WebSocket, message: string | ArrayBuffer) => Promise<void>;
+    };
+    class FakeWebSocket {
+      readonly sent: string[] = [];
+      send(data: string): void { this.sent.push(data); }
+      close(): void {}
+      deserializeAttachment(): unknown {
+        return {
+          protocol: "v2-turn-network",
+          sessionId: session.id,
+          actor: session.actor,
+          socketId: "v2-message-socket",
+          node: "browser:worker-test",
+          token: "guest:cf-v2-message"
+        };
+      }
+    }
+    let session: ReturnType<WooWorld["auth"]>;
+
+    try {
+      const world = createWorld();
+      session = world.auth("guest:cf-v2-message");
+      world.createObject({ id: "cf_v2_message_box", name: "Worker V2 Box", parent: "$thing", owner: session.actor });
+      world.defineProperty("cf_v2_message_box", { name: "value", defaultValue: 0, owner: session.actor, perms: "rw", typeHint: "int" });
+      expect(installVerb(world, "cf_v2_message_box", "set_value", `verb :set_value(value) rxd {
+        this.value = value;
+        return this.value;
+      }`, null).ok).toBe(true);
+      const relay = createShadowBrowserRelayShim({
+        node: "node:worker-test:relay",
+        scope: "#-1",
+        serialized: world.exportWorld()
+      });
+      const browser = createShadowBrowserNode({
+        node: "browser:worker-test",
+        scope: "#-1",
+        actor: session.actor,
+        session: session.id,
+        relay
+      });
+      setShadowBrowserSessionToken(browser, "guest:cf-v2-message");
+      await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+      internals.v2BrowserBySocket.set("v2-message-socket", browser);
+      const call: ShadowTurnCall = {
+        kind: "woo.turn_call.shadow.v1",
+        id: "cf-v2-message-value",
+        route: "direct",
+        scope: "#-1",
+        session: session.id,
+        actor: session.actor,
+        target: "cf_v2_message_box",
+        verb: "set_value",
+        args: [67]
+      };
+      const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+      const request = {
+        kind: "woo.turn.exec.request.shadow.v1" as const,
+        id: call.id,
+        call,
+        key: shadowTurnKeyFromTranscript(planned.transcript),
+        expected: browser.relay.commit_scope.head,
+        commit_policy: "execute_and_commit" as const
+      };
+      const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "cf-v2-message-env"));
+      const ws = new FakeWebSocket();
+
+      await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
+
+      const replies = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({ type: "woo.turn.exec.reply.shadow.v1", reply_to: "cf-v2-message-env" });
+      expect(replies[0].body).toMatchObject({ ok: true, id: "cf-v2-message-value" });
+      expect(replies[0].body.commit.serialized_after).toBeUndefined();
     } finally {
       directoryState.close();
       gatewayState.close();

@@ -1,5 +1,5 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
-import { createShadowCommitScope, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
+import { createShadowCommitScope, type ShadowCommitAccepted, type ShadowCommitAcceptedWire, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
@@ -693,9 +693,10 @@ export async function handleShadowBrowserTurnExecEnvelope(
     commit_policy: request.commit_policy
   });
   if (!result.result.reply) return null;
+  const body = shadowBrowserWireTurnExecReply(result.result.reply);
   const reply: ShadowEnvelope<ShadowTurnExecReply> = {
     v: 2,
-    type: result.result.reply.kind,
+    type: body.kind,
     id: `${browser.relay.node}:reply:${result.id}`,
     from: browser.relay.node,
     to: browser.node,
@@ -703,12 +704,25 @@ export async function handleShadowBrowserTurnExecEnvelope(
     ...(browser.session ? { session: browser.session } : {}),
     reply_to: receipt.envelope.id,
     auth: shadowBrowserAuth(browser),
-    body: result.result.reply
+    body
   };
   // Idempotency is reply-oriented: a client retrying because it missed the
   // first reply must receive the same answer without re-running the turn.
   browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(reply));
   return reply;
+}
+
+function shadowBrowserWireTurnExecReply(reply: ShadowTurnExecReply): ShadowTurnExecReply {
+  if (reply.ok !== true || !reply.commit) return structuredClone(reply) as ShadowTurnExecReply;
+  // In-process accepted frames keep serialized_after so browser caches can
+  // derive projections. RPC replies stay small and authority-light; committed
+  // state reaches browsers through fan-out or later state-plane catch-up.
+  const { serialized_after: _serializedAfter, ...commit } = reply.commit as ShadowCommitAccepted;
+  const cloned = structuredClone(reply) as Extract<ShadowTurnExecReply, { ok: true }>;
+  return {
+    ...cloned,
+    commit: structuredClone(commit) as ShadowCommitAcceptedWire
+  };
 }
 
 export function roundTripShadowBrowserEnvelope<T>(browser: ShadowBrowserNode, type: string, body: T): ShadowEnvelope<T> {

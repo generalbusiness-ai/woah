@@ -15,6 +15,7 @@ import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
 import {
   submitShadowCommit,
   type ShadowCommitAccepted,
+  type ShadowCommitAcceptedWire,
   type ShadowCommitConflict,
   type ShadowCommitScope,
   type ShadowScopeHead
@@ -159,7 +160,7 @@ export type ShadowTurnExecReply =
       id?: string;
       outcome: { result?: WooValue; error?: WooValue };
       transcript: EffectTranscript;
-      commit?: ShadowCommitAccepted;
+      commit?: ShadowCommitAccepted | ShadowCommitAcceptedWire;
     }
   | {
       kind: "woo.turn.exec.reply.shadow.v1";
@@ -306,7 +307,14 @@ export function buildShadowObjectRecordTransfer(input: {
 }
 
 export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: ShadowStateTransfer): void {
-  if (node.scope !== transfer.scope) throw new Error(`state transfer scope mismatch: node=${node.scope} transfer=${transfer.scope}`);
+  if (transfer.mode === "closure" && node.scope !== transfer.scope) {
+    throw new Error(`state transfer scope mismatch: node=${node.scope} transfer=${transfer.scope}`);
+  }
+  // Object-record transfers are content-addressed pages for whatever atom was
+  // missing during retry. Their proof still binds transfer.scope, but the
+  // receiving execution node may be installing dependency pages such as catalog
+  // or base-object records whose atom scope differs from the node's commit
+  // scope.
   verifyShadowStateTransferProof(node, transfer);
   for (const hash of transfer.atom_hashes) node.atom_hashes.add(hash);
   if (transfer.mode === "closure") {

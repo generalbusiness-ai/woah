@@ -41,6 +41,10 @@ export type ShadowCommitAccepted = {
   serialized_after: SerializedWorld;
 };
 
+// Wire replies carry commit authority and receipt data, while full post-state
+// travels through in-process accepted frames or explicit state transfers.
+export type ShadowCommitAcceptedWire = Omit<ShadowCommitAccepted, "serialized_after">;
+
 export type ShadowCommitConflict = {
   kind: "woo.commit.conflict.shadow.v1";
   id?: string;
