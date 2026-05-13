@@ -315,6 +315,8 @@ MCP is an agent-oriented deployment surface. The MCP gateway is separate from th
 
 A second-implementation conformance suite for MCP follows the broader conformance plan ([tooling/conformance.md](../tooling/conformance.md)) and is deferred until at least one alternative MCP gateway exists.
 
+The MCP gateway is the first planned consumer of the v2 turn-network protocol ([v2-turn-network.md](v2-turn-network.md)). On a separate Cloudflare namespace that does not maintain v1 compatibility, the gateway becomes a pure v2 client: it forwards tool calls as `woo.turn.exec.request.shadow.v1` envelopes through `CommitScopeDO` and subscribes to v2 accepted-frame observations rather than v1 applied-frames. The MCP wire contract above (tools, notifications, queues) is unchanged; only the gateway's internal observation source and call path are rerouted. The legacy production namespace continues to drive MCP through the v1 path described in §M3–§M6. See [notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md) for the migration plan.
+
 ---
 
 ## Open questions

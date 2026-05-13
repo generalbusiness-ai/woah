@@ -1075,8 +1075,11 @@ browser-side M4 worker opens the v2 WebSocket, persists
 hello/reply/pending-frame state in IndexedDB, applies received projection/delta
 state transfers into projection, applied-frame, and transcript-tail stores,
 replays pending envelopes after reconnect, and marks reset/catch-up-needed state
-when the relay reports reset. It currently runs alongside the legacy `/ws` UI
-path while the UI is migrated to consume v2 committed state directly.
+when the relay reports reset. The browser worker bundles into the SPA on every
+deployment but, on the legacy namespace, runs silently alongside the v1 `/ws`
+UI: it persists state into IndexedDB for soak-testing the wire path without
+driving rendering. UI migration to consume v2 committed state directly is
+deferred until at least one catalog is v2-authoritative on that namespace.
 
 M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
@@ -1092,6 +1095,15 @@ longer resets v2 commit authority; browsers still resubscribe and run VTN9
 catch-up after any transport reconnect because live socket subscriptions remain
 connection-local. The local dev server keeps the earlier socket-lifetime
 in-process relay shim.
+
+The first production deployment of this wire path targets a separate
+namespace where v1 compatibility is not maintained. On that namespace, MCP is
+the first v2 consumer: McpGateway becomes a pure v2 client (single observation
+source, all tool calls through `/v2/envelope`), with no v1+v2 hybrid plumbing.
+The legacy production namespace stays on v1 unchanged; browsers and v1 MCP
+clients continue to use it. See
+[notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md)
+for the migration plan and namespace strategy.
 
 Browser-node dubspace preview flow:
 
