@@ -147,6 +147,11 @@ export class CommitScopeDO {
     });
     relay.session_auth = auth.session_auth;
     relay.session_revs = auth.session_revs;
+    // Commit validation reads session authority from the committed serialized
+    // state, not only from the transport auth map. Keep that narrow session
+    // slice fresh so a new MCP/browser session can commit into a scope whose
+    // durable snapshot was opened by an earlier session.
+    relay.commit_scope.serialized.sessions = structuredClone(input.sessions) as SerializedSession[];
   }
 
   private browserFor(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest) {

@@ -53,12 +53,20 @@ describe("v2 MCP e2e", () => {
         observations: expect.arrayContaining([expect.objectContaining({ type: "said" })])
       });
 
+      const charlie = await initializeMcp(gateway, "guest:v2-mcp-charlie", 20);
+      const entered = await mcp(gateway, charlie, 21, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+      expect(entered.result.isError).not.toBe(true);
+      const beforeWait = sqlRows<{ n: number }>(scopeState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
+
       await mcp(gateway, alice, 3, "tools/call", {
         name: "woo_wait",
         arguments: { timeout_ms: 0, limit: 10 }
       });
       const afterWait = sqlRows<{ n: number }>(scopeState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
-      expect(afterWait).toBe(1);
+      expect(afterWait).toBe(beforeWait);
     } finally {
       scopeState.close();
     }

@@ -1120,6 +1120,24 @@ describe("McpGateway", () => {
     expect(body.error.data?.code).toBe("E_NOSESSION");
   });
 
+  it("rejects first-request MCP tokens outside the woo auth token vocabulary", async () => {
+    const world = bootstrapWorld();
+    const gateway = new McpGateway(world);
+    const response = await gateway.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      id: 91,
+      method: "initialize",
+      params: {}
+    }, { "mcp-token": "not-a-real-token" }));
+
+    expect(response.status).toBe(401);
+    const body = await response.json() as { jsonrpc: string; id: number; error: { code: number; data?: { code?: string } } };
+    expect(body.jsonrpc).toBe("2.0");
+    expect(body.id).toBe(91);
+    expect(body.error.code).toBe(-32001);
+    expect(body.error.data?.code).toBe("E_NOSESSION");
+  });
+
   it("returns a JSON-RPC session-not-found error for stale session ids", async () => {
     const world = bootstrapWorld();
     const gateway = new McpGateway(world);

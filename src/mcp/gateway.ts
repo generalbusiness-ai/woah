@@ -149,6 +149,10 @@ export class McpGateway {
         this.world.recordMetric({ kind: "mcp_request", method: probe.method ?? "unknown", tool: probe.tool, ms: Date.now() - startedAt, status: "error" });
         return mcpError(request, 401, -32001, "E_NOSESSION", "first MCP request must include Mcp-Token or Authorization: Bearer <token>");
       }
+      if (!isAcceptedWooAuthToken(token)) {
+        this.world.recordMetric({ kind: "mcp_request", method: probe.method ?? "unknown", tool: probe.tool, ms: Date.now() - startedAt, status: "error" });
+        return mcpError(request, 401, -32001, "E_NOSESSION", "MCP auth token must be guest:, session:, wizard:, or apikey:");
+      }
       try {
         const woo = this.world.auth(token);
         entry = this.bind(woo);
@@ -303,6 +307,11 @@ export class McpGateway {
     if (!entry) throw new Error(`MCP session is not bound: ${sessionId}`);
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const client = await this.ensureV2ScopeClient(entry, scope);
+    // Gateway-side planning uses the cached serialized scope state. Sessions
+    // are minted between scope opens, so refresh that narrow authority slice
+    // before running the local prediction; CommitScopeDO performs the same
+    // refresh before authoritative validation.
+    client.relay.commit_scope.serialized.sessions = this.world.exportSessions();
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -429,6 +438,16 @@ function authTokenFromHeaders(headers: Headers): string | null {
   const match = /^bearer\s+(.+)$/i.exec(authorization);
   const token = match?.[1]?.trim();
   return token && token.length > 0 ? token : null;
+}
+
+function isAcceptedWooAuthToken(token: string): boolean {
+  // Keep MCP's first-request auth vocabulary aligned with REST auth. Without
+  // this gate, `world.auth` treats arbitrary strings as bearer-style guest
+  // bootstrap tokens, which is convenient locally but too permissive on MCP.
+  return token.startsWith("guest:")
+    || token.startsWith("session:")
+    || token.startsWith("wizard:")
+    || token.startsWith("apikey:");
 }
 
 function withRequiredMcpAccept(request: Request): Request {
