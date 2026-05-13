@@ -14,6 +14,7 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
+import type { SerializedObject } from "../core/repository";
 import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
 import { encodeEnvelope, decodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
@@ -66,6 +67,7 @@ export type McpV2EnvelopeBody = {
   session: string;
   actor: ObjRef;
   sessions: ReturnType<WooWorld["exportSessions"]>;
+  session_objects: ReturnType<WooWorld["exportObjects"]>;
   envelope: string;
 };
 
@@ -308,10 +310,12 @@ export class McpGateway {
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const client = await this.ensureV2ScopeClient(entry, scope);
     // Gateway-side planning uses the cached serialized scope state. Sessions
-    // are minted between scope opens, so refresh that narrow authority slice
-    // before running the local prediction; CommitScopeDO performs the same
-    // refresh before authoritative validation.
-    client.relay.commit_scope.serialized.sessions = this.world.exportSessions();
+    // and their actors are minted between scope opens, so refresh that narrow
+    // authority slice before running the local prediction; CommitScopeDO
+    // performs the same refresh before authoritative validation.
+    const sessions = this.world.exportSessions();
+    const sessionObjects = this.world.exportObjects(sessions.map((session) => session.actor));
+    refreshSerializedSessionAuthority(client.relay.commit_scope.serialized, sessions, sessionObjects);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -349,7 +353,8 @@ export class McpGateway {
       token: entry.v2Token,
       session: entry.woo.id,
       actor,
-      sessions: this.world.exportSessions(),
+      sessions,
+      session_objects: sessionObjects,
       envelope: encodeEnvelope(envelope)
     });
     const replyEnvelope = result.reply ? decodeEnvelope<ShadowTurnExecReply>(result.reply) : null;
@@ -428,6 +433,24 @@ export class McpGateway {
 
 function mcpV2Token(woo: Session): string {
   return `mcp-v2:${woo.id}:${woo.actor}`;
+}
+
+function refreshSerializedSessionAuthority(
+  serialized: { sessions: ReturnType<WooWorld["exportSessions"]>; objects: SerializedObject[] },
+  sessions: ReturnType<WooWorld["exportSessions"]>,
+  sessionObjects: SerializedObject[]
+): void {
+  serialized.sessions = sessions;
+  const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
+  for (const obj of sessionObjects) {
+    const index = byId.get(obj.id);
+    if (index === undefined) {
+      byId.set(obj.id, serialized.objects.length);
+      serialized.objects.push(obj);
+    } else {
+      serialized.objects[index] = obj;
+    }
+  }
 }
 
 function authTokenFromHeaders(headers: Headers): string | null {

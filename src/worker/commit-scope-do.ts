@@ -7,7 +7,7 @@
 // hot envelope retries rewrite only the state families that actually changed.
 
 import type { EffectTranscript } from "../core/effect-transcript";
-import type { SerializedSession, SerializedWorld } from "../core/repository";
+import type { SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   buildShadowBrowserSessionAuth,
   createShadowBrowserClient,
@@ -137,8 +137,8 @@ export class CommitScopeDO {
 
   private refreshSessionAuth(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
     // Sessions can be refreshed by the gateway between messages. Refresh only
-    // the auth maps from the narrow session export; the committed state and
-    // projection snapshot remain owned by this scope DO.
+    // the auth maps and session actor records from the narrow session export;
+    // the committed state and projection snapshot remain owned by this scope DO.
     const auth = buildShadowBrowserSessionAuth({
       sessions: input.sessions,
       scope: input.scope,
@@ -152,6 +152,21 @@ export class CommitScopeDO {
     // slice fresh so a new MCP/browser session can commit into a scope whose
     // durable snapshot was opened by an earlier session.
     relay.commit_scope.serialized.sessions = structuredClone(input.sessions) as SerializedSession[];
+    this.refreshSerializedObjects(relay, input.session_objects ?? []);
+  }
+
+  private refreshSerializedObjects(relay: ShadowBrowserRelayShim, objects: SerializedObject[]): void {
+    const byId = new Map(relay.commit_scope.serialized.objects.map((obj, index) => [obj.id, index] as const));
+    for (const obj of objects) {
+      const clone = structuredClone(obj) as SerializedObject;
+      const index = byId.get(clone.id);
+      if (index === undefined) {
+        byId.set(clone.id, relay.commit_scope.serialized.objects.length);
+        relay.commit_scope.serialized.objects.push(clone);
+      } else {
+        relay.commit_scope.serialized.objects[index] = clone;
+      }
+    }
   }
 
   private browserFor(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest) {
@@ -424,6 +439,7 @@ type CommitScopeBaseRequest = {
   session: string;
   actor: ObjRef;
   sessions: SerializedSession[];
+  session_objects?: SerializedObject[];
   session_revs?: Record<string, number>;
 };
 

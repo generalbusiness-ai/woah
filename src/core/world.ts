@@ -5450,6 +5450,21 @@ export class WooWorld {
     return Array.from(this.sessions.values()).map((session) => this.serializeSession(session));
   }
 
+  exportObjects(ids: Iterable<ObjRef>): SerializedObject[] {
+    // Commit-scope relays sometimes need object authority for session-bound
+    // actors minted after the scope snapshot opened. Export the named records
+    // only, preserving the no-full-world hot-path discipline.
+    const out: SerializedObject[] = [];
+    const seen = new Set<ObjRef>();
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const obj = this.objects.get(id);
+      if (obj) out.push(this.serializeObject(obj));
+    }
+    return out;
+  }
+
   /**
    * Round-trippable host slice. Returns SeedWorld shape (a
    * SerializedWorld slice plus the `objectHosts` routing map required
