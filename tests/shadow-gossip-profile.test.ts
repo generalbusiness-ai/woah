@@ -45,17 +45,17 @@ describe("shadow gossip profiling", () => {
     expect(byShape.warm_actor_local.transfer_bytes).toBe(0);
     expect(byShape.cold_actor_anchor_transfer.steps.map((step) => step.kind)).toEqual([
       "local_missing_state",
-      "anchor_object_record_transfer",
+      "anchor_cell_page_transfer",
       "local_retry_execute"
     ]);
     expect(byShape.near_executor_remote.steps.map((step) => step.kind)).toEqual([
       "ad_rank_selected",
-      "remote_execute_and_object_record_transfer"
+      "remote_execute_and_cell_page_transfer"
     ]);
     expect(byShape.stale_ad_anchor_fallback.steps.map((step) => step.kind)).toEqual([
       "ad_rank_selected",
       "remote_missing_state",
-      "anchor_object_record_transfer",
+      "anchor_cell_page_transfer",
       "local_retry_execute"
     ]);
     expect(byShape.cold_actor_anchor_transfer.transfer_bytes).toBeLessThan(

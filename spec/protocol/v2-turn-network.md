@@ -907,17 +907,24 @@ Transfer modes:
 
 The shadow transfer implementation uses
 `kind: "woo.state.transfer.shadow.v1"`. It still supports `mode: "closure"`
-with a full serialized pre-turn world for diagnostic replay, but the default
-fresh-call network path now uses `mode: "object_records"`: a bounded set of
-serialized object records selected from missing TurnKey atom preimages, plus
-session/log/counter envelope data needed to execute the turn in a small shard.
-Each object record is named by a content hash in `object_pages`; receivers can
-advertise/cache those hashes and omit already-known records from later
-transfers. Install verifies inline object records against their advertised page
-hash and verifies a shadow MAC proof scoped to an anchor authority and
-recipient node. This is not production authorization yet, but it proves that
-state transfer can be driven by exact post-selection inventory gaps instead of
-copying the whole world.
+with a full serialized pre-turn world for diagnostic replay and
+`mode: "object_records"` as a compatibility fallback, but the default fresh-call
+network path now uses `mode: "cell_pages"`. A cell-page transfer is selected
+from missing TurnKey atom preimages and carries reusable content-addressed
+pages:
+
+- `object_lineage`: object identity, parent, owner, flags, anchor, and schemas;
+- `object_live`: location, children, and contents cells;
+- `property_cell`: one property definition/value/version cell;
+- `verb_bytecode`: one verb implementation cell.
+
+The transfer also carries the session/log/counter envelope data needed to
+execute the turn in a small shard. Page refs can be advertised from cache; only
+unknown pages are inlined. Install verifies inline pages against their
+advertised page hashes and verifies a shadow MAC proof scoped to an anchor
+authority and recipient node. This is not production authorization yet, but it
+proves that state transfer can be driven by exact post-selection inventory gaps
+instead of copying the whole world or even whole object records.
 
 The shadow browser relay also implements `mode: "projection"` and
 `mode: "delta"` for display/cache catch-up. Opening a scope installs a
@@ -937,13 +944,13 @@ body-to-hash equality before installing projection/delta cache. This scheme is
 shadow-local relay authority, distinct from the execution-plane
 `shadow.anchor_mac.v1` object-record proof.
 
-Shadow latency profiles report bytes for the object-record closure so later
-page/cell-bounded work has a concrete performance target. The current profile
-also reports a two-turn warmup: after one dubspace control turn installs
-lineage pages, a second control turn for the same object can transfer page refs
-with no inline object records. A node preseeded with catalog/class object pages
-can likewise materialize those records from cache and transfer only live object
-records on its first turn.
+Shadow latency profiles report bytes for the cell-page closure and the
+object-record closure so later page/cell-bounded work has concrete performance
+targets. The current profile also reports a two-turn warmup: after one dubspace
+control turn installs lineage pages, a second control turn for the same object
+can transfer page refs with no inline records. A node preseeded with
+catalog/class pages can likewise materialize those records from cache and
+inline only live instance pages on its first turn.
 
 Receivers MUST verify page hashes and proofs before installing cache. Receivers
 MUST apply authorization filtering before exposing transferred values to a

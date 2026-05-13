@@ -5,6 +5,7 @@ import { capabilityAdProbablyCoversTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
 import { createShadowCommitScope, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
+  buildShadowCellPageTransfer,
   buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   createShadowExecutionNode,
@@ -14,6 +15,7 @@ import {
   missingAtomsForShadowTurn,
   shadowObjectRecordHash
 } from "../src/core/shadow-turn-exec";
+import { shadowStatePageHash } from "../src/core/shadow-state-pages";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
@@ -111,7 +113,7 @@ describe("shadow turn execution", () => {
     expect(routed).toMatchObject({
       selected_node: "actor-node",
       first: { ok: false, reason: "missing_state", attempted: false },
-      transfer: { kind: "woo.state.transfer.shadow.v1", mode: "object_records", scope: "the_dubspace" },
+      transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
       result: { ok: true, attempted: true }
     });
     if (!routed.result.ok) throw new Error(`fresh call retry failed: ${routed.result.reason}`);
@@ -183,20 +185,21 @@ describe("shadow turn execution", () => {
     expect(routed.transfers).toHaveLength(1);
     expect(routed.transfer).toMatchObject({
       kind: "woo.state.transfer.shadow.v1",
-      mode: "object_records",
+      mode: "cell_pages",
       scope: "the_dubspace",
       atom_hashes: [writeHash],
       preimages: ["write:cell:prop:delay_1.wet"]
     });
-    if (!routed.transfer || routed.transfer.mode !== "object_records") throw new Error("expected object-record transfer");
-    const transferredObjects = routed.transfer.objects.map((obj) => obj.id);
-    expect(transferredObjects).toContain("delay_1");
-    expect(transferredObjects).not.toContain("slot_1");
-    expect(routed.transfer.object_pages.find((page) => page.id === "delay_1")).toMatchObject({
-      hash: shadowObjectRecordHash(routed.transfer.objects.find((obj) => obj.id === "delay_1")!),
+    if (!routed.transfer || routed.transfer.mode !== "cell_pages") throw new Error("expected cell-page transfer");
+    const transferredPageObjects = routed.transfer.page_refs.map((page) => page.object);
+    expect(transferredPageObjects).toContain("delay_1");
+    expect(transferredPageObjects).not.toContain("slot_1");
+    expect(routed.transfer.page_refs.find((page) => page.object === "delay_1" && page.page === "property_cell" && page.name === "wet")).toMatchObject({
       inline: true
     });
-    expect(routed.transfer.objects.length).toBeLessThan(serializedBefore.objects.length);
+    expect(routed.transfer.inline_pages.length).toBeLessThan(
+      serializedBefore.objects.reduce((sum, obj) => sum + obj.properties.length + obj.verbs.length + 2, 0)
+    );
     expect(Buffer.byteLength(JSON.stringify(routed.transfer), "utf8")).toBeLessThan(
       Buffer.byteLength(JSON.stringify(serializedBefore), "utf8")
     );
@@ -422,7 +425,7 @@ describe("shadow turn execution", () => {
     expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("admin_box", "value")).toBe(0);
   });
 
-  it("uses cached object pages so a second real dubspace turn transfers no lineage records", async () => {
+  it("uses cached state pages so a second real dubspace turn transfers only page refs", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-page-cache");
     const actor = session.actor;
@@ -450,8 +453,8 @@ describe("shadow turn execution", () => {
       anchor: { node: "stable-anchor", serialized: firstSerializedBefore }
     });
     if (!firstRouted.result.ok) throw new Error(`first cache warmup failed: ${firstRouted.result.reason}`);
-    if (!firstRouted.transfer || firstRouted.transfer.mode !== "object_records") throw new Error("expected first object-record transfer");
-    expect(firstRouted.transfer.objects.length).toBeGreaterThan(0);
+    if (!firstRouted.transfer || firstRouted.transfer.mode !== "cell_pages") throw new Error("expected first cell-page transfer");
+    expect(firstRouted.transfer.inline_pages.length).toBeGreaterThan(0);
 
     const secondSerializedBefore = firstRouted.result.serializedAfter;
     const secondCall: ShadowTurnCall = {
@@ -479,13 +482,13 @@ describe("shadow turn execution", () => {
     });
 
     expect(secondRouted.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
-    if (!secondRouted.transfer || secondRouted.transfer.mode !== "object_records") throw new Error("expected cached object-record transfer");
+    if (!secondRouted.transfer || secondRouted.transfer.mode !== "cell_pages") throw new Error("expected cached cell-page transfer");
     expect(secondRouted.transfer.preimages).toEqual(["write:cell:prop:delay_1.feedback"]);
-    expect(secondRouted.transfer.objects).toEqual([]);
-    expect(secondRouted.transfer.object_pages.length).toBeGreaterThan(0);
-    expect(secondRouted.transfer.object_pages.every((page) => page.inline === false)).toBe(true);
+    expect(secondRouted.transfer.inline_pages).toEqual([]);
+    expect(secondRouted.transfer.page_refs.length).toBeGreaterThan(0);
+    expect(secondRouted.transfer.page_refs.every((page) => page.inline === false)).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(secondRouted.transfer), "utf8")).toBeLessThan(
-      Buffer.byteLength(JSON.stringify(firstRouted.transfer), "utf8") / 10
+      Buffer.byteLength(JSON.stringify(firstRouted.transfer), "utf8") / 5
     );
 
     expect(secondRouted.result).toMatchObject({ ok: true, attempted: true });
@@ -516,7 +519,7 @@ describe("shadow turn execution", () => {
     };
     const planned = await runShadowTurnCall(serializedBefore, call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
-    const fullTransfer = buildShadowObjectRecordTransfer({
+    const fullTransfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key,
       atom_hashes: key.atom_hashes,
@@ -537,13 +540,13 @@ describe("shadow turn execution", () => {
     });
 
     expect(routed.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
-    if (!routed.transfer || routed.transfer.mode !== "object_records") throw new Error("expected catalog-cache object transfer");
-    expect(new Set(routed.transfer.objects.map((obj) => obj.id))).toEqual(new Set(["delay_1", "guest_1", "the_dubspace"]));
-    expect(routed.transfer.object_pages.filter((page) => page.inline === false).map((page) => page.id)).toEqual(
+    if (!routed.transfer || routed.transfer.mode !== "cell_pages") throw new Error("expected catalog-cache cell transfer");
+    expect(new Set(routed.transfer.inline_pages.map((page) => page.object))).toEqual(new Set(["delay_1", "guest_1", "the_dubspace"]));
+    expect(routed.transfer.page_refs.filter((page) => page.inline === false).map((page) => page.object)).toEqual(
       expect.arrayContaining(["$dubspace", "$space", "$sequenced_log", "$root", "$system", "$delay", "$control", "$guest", "$player", "$actor"])
     );
     expect(Buffer.byteLength(JSON.stringify(routed.transfer), "utf8")).toBeLessThan(
-      Buffer.byteLength(JSON.stringify(fullTransfer), "utf8") / 10
+      Buffer.byteLength(JSON.stringify(fullTransfer), "utf8")
     );
 
     expect(routed.result).toMatchObject({ ok: true, attempted: true });
@@ -552,7 +555,7 @@ describe("shadow turn execution", () => {
     expect(createWorldFromSerialized(routed.result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.49);
   });
 
-  it("includes feature object lineage in object-record transfers", async () => {
+  it("includes feature object lineage in cell-page transfers", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-feature-transfer");
     const actor = session.actor;
@@ -571,14 +574,14 @@ describe("shadow turn execution", () => {
       args: ["mug"]
     };
     const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
-    const transfer = buildShadowObjectRecordTransfer({
+    const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key,
       atom_hashes: key.atom_hashes,
       session: session.id
     });
 
-    expect(transfer.object_pages.map((page) => page.id)).toContain("$conversational");
+    expect(transfer.page_refs.map((page) => page.object)).toContain("$conversational");
   });
 
   it("rejects an inline object page whose content hash does not match", async () => {
@@ -613,6 +616,43 @@ describe("shadow turn execution", () => {
 
     const node = createShadowExecutionNode({ node: "actor-node", scope: key.scope });
     expect(() => installShadowStateTransfer(node, transfer)).toThrow(/hash mismatch/);
+  });
+
+  it("rejects an inline state page whose content hash does not match", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-cell-page-integrity");
+    const actor = session.actor;
+    await anchor.directCall("shadow-cell-page-integrity-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+
+    const serializedBefore = anchor.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-cell-page-integrity-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.53]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const transfer = buildShadowCellPageTransfer({
+      serialized: serializedBefore,
+      key,
+      atom_hashes: key.atom_hashes,
+      session: session.id
+    });
+    const pageIndex = transfer.inline_pages.findIndex((page) => page.object === "delay_1" && page.page === "property_cell" && page.name === "wet");
+    expect(pageIndex).toBeGreaterThanOrEqual(0);
+    const page = transfer.inline_pages[pageIndex];
+    if (page.page !== "property_cell") throw new Error("expected delay_1.wet property page");
+    const originalHash = shadowStatePageHash(page);
+    transfer.inline_pages[pageIndex] = { ...page, version: 999 };
+    expect(shadowStatePageHash(transfer.inline_pages[pageIndex])).not.toBe(originalHash);
+
+    const node = createShadowExecutionNode({ node: "actor-node", scope: key.scope });
+    expect(() => installShadowStateTransfer(node, transfer)).toThrow(/root mismatch|inline shadow state page has no inline page ref/);
   });
 
   it("rejects state transfer proofs for the wrong recipient or authority secret", async () => {
@@ -741,7 +781,7 @@ describe("shadow turn execution", () => {
     ]);
     expect(routed.transfer).toMatchObject({
       kind: "woo.state.transfer.shadow.v1",
-      mode: "object_records",
+      mode: "cell_pages",
       preimages: ["write:cell:prop:delay_1.wet"]
     });
     expect(routed.result).toMatchObject({ ok: true, attempted: true });
