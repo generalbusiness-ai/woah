@@ -1,8 +1,8 @@
 // Worker entry — splits routing between Durable Objects and Workers Assets.
 //
-// Global API, /healthz, /ws → world/gateway DO.
-// Object REST routes        → Directory-resolved host DO.
-// Everything else           → env.ASSETS.fetch (the bundled SPA from ./dist).
+// Global API, /healthz, /ws, /v2/turn-network/ws → world/gateway DO.
+// Object REST routes                             → Directory-resolved host DO.
+// Everything else                                → env.ASSETS.fetch (the bundled SPA from ./dist).
 
 import type { Env } from "./persistent-object-do";
 import { signInternalRequest } from "./internal-auth";
@@ -10,6 +10,7 @@ import { wooError } from "../core/types";
 
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
+export { CommitScopeDO } from "./commit-scope-do";
 
 const WORLD_HOST = "world";
 const DIRECTORY_HOST = "directory";
@@ -20,6 +21,8 @@ function isApiPath(pathname: string): boolean {
   return (
     pathname === "/healthz" ||
     pathname === "/ws" ||
+    pathname === "/v2/turn-network/ws" ||
+    pathname === "/v2/session/mint" ||
     pathname === "/mcp" ||
     pathname.startsWith("/api/")
   );

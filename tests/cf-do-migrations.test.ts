@@ -10,8 +10,8 @@ describe("Cloudflare Durable Object migration management", () => {
     const analysis = analyzeDoMigrations(currentWrangler);
 
     expect(analysis.ok).toBe(true);
-    expect(analysis.boundClasses).toEqual(["DirectoryDO", "PersistentObjectDO"]);
-    expect(analysis.activeClasses).toEqual(["DirectoryDO", "PersistentObjectDO"]);
+    expect(analysis.boundClasses).toEqual(["CommitScopeDO", "DirectoryDO", "PersistentObjectDO"]);
+    expect(analysis.activeClasses).toEqual(["CommitScopeDO", "DirectoryDO", "PersistentObjectDO"]);
     expect(analysis.duplicateTags).toEqual([]);
   });
 
@@ -27,7 +27,7 @@ class_name = "AuditDO"
 
     expect(result.changed).toBe(true);
     expect(result.errors).toEqual([]);
-    expect(result.text).toContain('tag = "cf-do-0006"');
+    expect(result.text).toContain('tag = "cf-do-0007"');
     expect(result.text).toContain('new_sqlite_classes = [ "AuditDO" ]');
     expect(analyzeDoMigrations(result.text).ok).toBe(true);
   });

@@ -39,6 +39,10 @@ class_name = "PersistentObjectDO"
 name = "DIRECTORY"
 class_name = "DirectoryDO"
 
+[[durable_objects.bindings]]
+name = "COMMIT_SCOPE"
+class_name = "CommitScopeDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersistentObjectDO"]
@@ -66,6 +70,10 @@ renamed_classes = [
   { from = "DirectoryV3DO", to = "DirectoryDO" }
 ]
 
+[[migrations]]
+tag = "cf-do-0006"
+new_sqlite_classes = [ "CommitScopeDO" ]
+
 # Optional staging slot. Uncomment, rename to taste, and deploy with:
 #   wrangler deploy --env staging
 # The staging worker gets its own DO storage namespace; cost is per-request
@@ -82,6 +90,10 @@ renamed_classes = [
 # [[env.staging.durable_objects.bindings]]
 # name = "DIRECTORY"
 # class_name = "DirectoryDO"
+#
+# [[env.staging.durable_objects.bindings]]
+# name = "COMMIT_SCOPE"
+# class_name = "CommitScopeDO"
 #
 # [env.staging.assets]
 # directory = "./dist"

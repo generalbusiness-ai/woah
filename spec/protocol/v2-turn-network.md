@@ -1066,6 +1066,14 @@ transport yet, but it exercises the same local-execution/missing-state/state
 catch-up/commit-reconcile and live-preview loops that the browser worker is
 expected to expose.
 
+M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
+`POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
+The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
+`TransportHello` envelope, decodes subsequent frames through the shared shadow
+envelope codec, and can return shadow execution replies. Durable
+CommitScopeDO-backed commit arbitration is reserved by binding/migration but is
+not yet the live commit authority.
+
 Browser-node dubspace preview flow:
 
 ```text

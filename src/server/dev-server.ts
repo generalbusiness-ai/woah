@@ -22,6 +22,15 @@ import {
 import { installGitHubTap, updateGitHubTap } from "./github-taps";
 import { LocalSQLiteRepository } from "./sqlite-repository";
 import { McpGateway } from "../mcp/gateway";
+import {
+  createShadowBrowserNode,
+  createShadowBrowserRelayShim,
+  executeShadowBrowserTurn,
+  receiveShadowBrowserEnvelope,
+  shadowBrowserTransportHello
+} from "../core/shadow-browser-node";
+import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import type { ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 
 // Local dev server only: HTTP authoring endpoints require a session and then
 // defer to the world's object-authoring permission checks.
@@ -62,6 +71,15 @@ const server = http.createServer(async (req, res) => {
       const webResponse = await mcpGateway.handle(webRequest);
       await writeWebResponseToNode(webResponse, res);
       return;
+    }
+    if (req.method === "POST" && url.pathname === "/v2/session/mint") {
+      const body = await readJson(req);
+      const token = String(body.token ?? "");
+      const session = authenticateToken(token);
+      return json(res, {
+        token: shadowBrowserSessionBearer(session),
+        claims: shadowBrowserSessionClaimsValue(session)
+      });
     }
     const protocol = await handleRestProtocolRequest(nodeRestRequest(req, url.pathname ?? ""), {
       world,
@@ -167,6 +185,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 const wss = new WebSocketServer({ server, path: "/ws" });
+const v2wss = new WebSocketServer({
+  server,
+  path: "/v2/turn-network/ws",
+  handleProtocols: (protocols) => protocols.has("woo-v2.turn-network.json") ? "woo-v2.turn-network.json" : false
+});
 
 wss.on("connection", (ws) => {
   const socketId = `ws-${socketCounter++}`;
@@ -226,6 +249,53 @@ wss.on("connection", (ws) => {
   });
 });
 
+v2wss.on("connection", (ws, req) => {
+  if (ws.protocol !== "woo-v2.turn-network.json") {
+    ws.close(1002, "missing woo-v2.turn-network.json subprotocol");
+    return;
+  }
+  const url = new URL(req.url ?? "/v2/turn-network/ws", `http://${req.headers.host ?? "localhost"}`);
+  const token = url.searchParams.get("token") ?? "";
+  const node = url.searchParams.get("node") || `browser:dev:${socketCounter++}`;
+  let session: Session;
+  try {
+    if (!token) throw wooError("E_NOSESSION", "token query parameter is required");
+    session = authenticateToken(token);
+  } catch (err) {
+    ws.close(1008, normalizeError(err).message);
+    return;
+  }
+
+  const socketId = `v2-ws-${socketCounter++}`;
+  world.attachSocket(session.id, socketId);
+  sockets.set(ws, { sessionId: session.id, actor: session.actor, socketId });
+  const browser = v2ShadowBrowser(node, token, session);
+  const hello = shadowBrowserTransportHello(browser);
+  ws.send(encodeEnvelope({
+    v: 2,
+    type: hello.kind,
+    id: `dev-relay:hello:${Date.now()}`,
+    from: browser.relay.node,
+    to: browser.node,
+    actor: session.actor,
+    session: session.id,
+    auth: { mode: "session", token },
+    body: hello
+  } satisfies ShadowEnvelope<typeof hello>));
+
+  ws.on("message", (raw) => {
+    if (rawDataSize(raw) > 1024 * 1024) {
+      ws.close(1009, "frame too large");
+      return;
+    }
+    void handleV2ShadowFrame(ws, node, token, session, String(raw));
+  });
+  ws.on("close", () => {
+    world.detachSocket(session.id, socketId);
+    sockets.delete(ws);
+  });
+});
+
 server.listen(port, () => {
   console.log(`woo dev server http://localhost:${port}`);
 });
@@ -262,6 +332,104 @@ function attachedSession(ws: WebSocket): AttachedSocket | null {
   if (world.sessionAlive(session.sessionId)) return session;
   expireAttachedSessions([session.sessionId]);
   return null;
+}
+
+function v2ShadowBrowser(node: string, token: string, session: Session): ReturnType<typeof createShadowBrowserNode> {
+  const relay = createShadowBrowserRelayShim({
+    node: "node:dev:relay",
+    scope: session.actor,
+    serialized: world.exportWorld()
+  });
+  const browser = createShadowBrowserNode({
+    node,
+    scope: session.actor,
+    actor: session.actor,
+    session: session.id,
+    relay
+  });
+  // Local dev accepts existing v1 session credentials at the v2 handshake.
+  // Mirror the shadow claims under that bearer so subsequent envelopes can
+  // repeat exactly the token used to open the socket.
+  if (browser.session_token && browser.session_token !== token) {
+    const claims = relay.session_auth.get(browser.session_token);
+    if (claims) {
+      relay.session_auth.set(token, claims);
+      browser.session_token = token;
+    }
+  }
+  return browser;
+}
+
+function shadowBrowserSessionBearer(session: Session): string {
+  // Dev-only mirror of the shadow substrate bearer. Production minting will
+  // sign this claim set at the gateway; the local server keeps it transparent.
+  return `shadow-session:${session.id}:${session.actor}`;
+}
+
+function shadowBrowserSessionClaimsValue(session: Session): Record<string, WooValue> {
+  return {
+    session: session.id,
+    actor: session.actor,
+    deployment: "local-dev",
+    issued_at: session.started,
+    expires_at: session.expiresAt ?? session.started + 15 * 60 * 1000,
+    scopes: [session.actor],
+    features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"],
+    rev: 1
+  };
+}
+
+async function handleV2ShadowFrame(
+  ws: WebSocket,
+  node: string,
+  token: string,
+  session: Session,
+  encoded: string
+): Promise<void> {
+  try {
+    const browser = v2ShadowBrowser(node, token, session);
+    const envelope = receiveShadowBrowserEnvelope(browser, encoded);
+    if (envelope.type !== "woo.turn.exec.request.shadow.v1") return;
+    const request = envelope.body as ShadowTurnExecRequest;
+    const result = await executeShadowBrowserTurn(browser, {
+      id: request.id ?? request.call.id,
+      route: request.call.route,
+      scope: request.call.scope,
+      target: request.call.target,
+      verb: request.call.verb,
+      args: request.call.args,
+      commit_policy: request.commit_policy
+    });
+    if (!result.result.reply) return;
+    ws.send(encodeEnvelope({
+      v: 2,
+      type: result.result.reply.kind,
+      id: `dev-relay:reply:${result.id}`,
+      from: browser.relay.node,
+      to: browser.node,
+      actor: session.actor,
+      session: session.id,
+      reply_to: envelope.id,
+      auth: { mode: "session", token },
+      body: result.result.reply
+    } satisfies ShadowEnvelope<typeof result.result.reply>));
+  } catch (err) {
+    ws.send(encodeEnvelope({
+      v: 2,
+      type: "woo.transport.error.v1",
+      id: `dev-relay:error:${Date.now()}`,
+      from: "node:dev:relay",
+      to: node,
+      actor: session.actor,
+      session: session.id,
+      auth: { mode: "session", token },
+      body: {
+        kind: "woo.transport.error.v1",
+        code: "E_PROTOCOL",
+        message: normalizeError(err).message ?? "v2 transport error"
+      }
+    } satisfies ShadowEnvelope<{ kind: "woo.transport.error.v1"; code: string; message: string }>));
+  }
 }
 
 function expireAttachedSessions(sessionIds: string[]): void {
