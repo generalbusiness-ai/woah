@@ -46,14 +46,6 @@ import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEve
 import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
-import {
-  createShadowBrowserNode,
-  createShadowBrowserRelayShim,
-  handleShadowBrowserTurnExecEnvelope,
-  receiveShadowBrowserEnvelopeReceipt,
-  setShadowBrowserSessionToken,
-  shadowBrowserTransportHello
-} from "../core/shadow-browser-node";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway } from "../mcp/gateway";
@@ -76,6 +68,27 @@ export interface Env {
   WOO_HOST_WRITE_TIMEOUT_MS?: string;
   WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
 }
+
+type CommitScopeOpenResponse = {
+  ok: true;
+  relay: string;
+  hello: {
+    kind: "woo.transport.hello.v1";
+    relay: string;
+    session: string;
+    actor: ObjRef;
+    server_time: number;
+    max_message_bytes: number;
+    idempotency_window_ms: number;
+    planes: Array<"execution" | "commit" | "state" | "live">;
+    features: string[];
+  };
+};
+
+type CommitScopeEnvelopeResponse = {
+  ok: true;
+  reply: string | null;
+};
 
 const WORLD_HOST = "world";
 const REMOTE_ROUTE_SYNC_TTL_MS = 60_000;
@@ -236,10 +249,6 @@ export class PersistentObjectDO {
   // on rehydrate and maintained on attach/detach.
   private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
   private socketsBySession = new Map<string, Set<WebSocket>>();
-  // Transitional M4 state: one in-memory shadow browser per live v2 socket.
-  // CommitScopeDO persistence will replace this before large hibernated-socket
-  // counts matter; until then the map is bounded by this isolate's open sockets.
-  private v2BrowserBySocket = new Map<string, ReturnType<typeof createShadowBrowserNode>>();
   // FIFO semaphore for outbound DO->DO fetch() concurrency. See
   // HOST_OUT_FETCH_CONCURRENCY. The releaser hands the slot directly to the
   // next waiter (no decrement-then-increment) to avoid an over-cap race when a
@@ -329,7 +338,7 @@ export class PersistentObjectDO {
       }
 
       if (gatewayHost && pathname === "/v2/turn-network/ws") {
-        return this.acceptV2TurnNetworkWebSocket(request, world);
+        return await this.acceptV2TurnNetworkWebSocket(request, world);
       }
 
       if (request.method === "GET" && pathname === "/healthz") {
@@ -2542,7 +2551,6 @@ export class PersistentObjectDO {
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
       this.indexRemoveSocket(att.sessionId, att.actor, ws);
-      this.v2BrowserBySocket.delete(att.socketId);
     }
     try {
       ws.close();
@@ -2557,11 +2565,10 @@ export class PersistentObjectDO {
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
       this.indexRemoveSocket(att.sessionId, att.actor, ws);
-      this.v2BrowserBySocket.delete(att.socketId);
     }
   }
 
-  private acceptV2TurnNetworkWebSocket(request: Request, world: WooWorld): Response {
+  private async acceptV2TurnNetworkWebSocket(request: Request, world: WooWorld): Promise<Response> {
     // Public deployments rely on Cloudflare's TLS termination and route this as
     // wss://; plaintext ws:// is only acceptable for localhost development per
     // VTN19.
@@ -2575,8 +2582,10 @@ export class PersistentObjectDO {
     const url = new URL(request.url);
     const token = url.searchParams.get("token") ?? "";
     const node = url.searchParams.get("node") || `browser:${crypto.randomUUID()}`;
+    const scope = (url.searchParams.get("scope") || "") as ObjRef;
     if (!token) return jsonResponse({ error: { code: "E_NOSESSION", message: "token query parameter is required" } }, 401);
     const session = this.authenticateToken(world, token);
+    const commitScope = scope || session.actor;
     const socketId = `v2-${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     world.attachSocket(session.id, socketId);
 
@@ -2589,23 +2598,27 @@ export class PersistentObjectDO {
       actor: session.actor,
       socketId,
       node,
+      scope: commitScope,
       token
     });
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
 
-    // One shadow browser/relay pair lives for the socket lifetime so envelope
-    // idempotency, subscriptions, catch-up tails, and cache state survive
-    // across frames until CommitScopeDO persistence replaces this shim.
-    const browser = this.v2ShadowBrowser(world, { node, token, sessionId: session.id, actor: session.actor });
-    this.v2BrowserBySocket.set(socketId, browser);
-    const hello = shadowBrowserTransportHello(browser);
+    const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
+      scope: commitScope,
+      node,
+      token,
+      session: session.id,
+      actor: session.actor,
+      serialized: world.exportWorld()
+    });
+    const hello = opened.hello;
     server.send(encodeEnvelope({
       v: 2,
       type: hello.kind,
       id: `${this.durableHostKey()}:hello:${Date.now()}`,
-      from: browser.relay.node,
-      to: browser.node,
+      from: opened.relay,
+      to: node,
       actor: session.actor,
       session: session.id,
       auth: { mode: "session", token },
@@ -2627,33 +2640,16 @@ export class PersistentObjectDO {
     }
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
-      let browser = this.v2BrowserBySocket.get(att.socketId);
-      if (!browser) {
-        // Hibernation clears the in-memory socket table. Rehydrate once for the
-        // resumed socket, then force the browser through VTN9 catch-up because
-        // subscriptions and idempotent reply cache were isolate-local.
-        browser = this.v2ShadowBrowser(world, { node: att.node, token: att.token, sessionId: att.sessionId, actor: att.actor });
-        this.v2BrowserBySocket.set(att.socketId, browser);
-        ws.send(encodeEnvelope({
-          v: 2,
-          type: "woo.transport.error.v1",
-          id: `${this.durableHostKey()}:reset:${Date.now()}`,
-          from: this.durableHostKey(),
-          to: att.node,
-          actor: att.actor,
-          session: att.sessionId,
-          auth: { mode: "session", token: att.token },
-          body: {
-            kind: "woo.transport.error.v1",
-            code: "E_RESET",
-            message: "v2 relay state was reset; resubscribe and run catch-up"
-          }
-        } satisfies ShadowEnvelope<{ kind: "woo.transport.error.v1"; code: string; message: string }>));
-        return;
-      }
-      const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
-      const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
-      if (reply) ws.send(encodeEnvelope(reply));
+      const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
+        scope: att.scope,
+        node: att.node,
+        token: att.token,
+        session: att.sessionId,
+        actor: att.actor,
+        serialized: world.exportWorld(),
+        envelope: encoded
+      });
+      if (result.reply) ws.send(result.reply);
     } catch (err) {
       ws.send(encodeEnvelope({
         v: 2,
@@ -2673,25 +2669,21 @@ export class PersistentObjectDO {
     }
   }
 
-  private v2ShadowBrowser(
-    world: WooWorld,
-    input: { node: string; token: string; sessionId: string; actor: ObjRef }
-  ): ReturnType<typeof createShadowBrowserNode> {
-    const serialized = world.exportWorld();
-    const relay = createShadowBrowserRelayShim({
-      node: `node:${this.durableHostKey()}:relay`,
-      scope: input.actor,
-      serialized
-    });
-    const browser = createShadowBrowserNode({
-      node: input.node,
-      scope: input.actor,
-      actor: input.actor,
-      session: input.sessionId,
-      relay
-    });
-    setShadowBrowserSessionToken(browser, input.token);
-    return browser;
+  private async v2CommitScopePost<T>(scope: ObjRef, path: "/v2/open" | "/v2/envelope", body: Record<string, unknown>): Promise<T> {
+    if (!this.env.COMMIT_SCOPE) throw wooError("E_NOT_IMPLEMENTED", "COMMIT_SCOPE binding is required for v2 turn network");
+    const id = this.env.COMMIT_SCOPE.idFromName(String(scope));
+    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-woo-host-key": `commit-scope:${scope}`
+      },
+      body: JSON.stringify(body)
+    }));
+    const response = await this.env.COMMIT_SCOPE.get(id).fetch(request);
+    const payload = await response.json() as Record<string, unknown>;
+    if (!response.ok) throw wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
+    return payload as T;
   }
 
     private indexAddSocket(sessionId: string, actor: ObjRef, ws: WebSocket): void {
@@ -2718,7 +2710,7 @@ export class PersistentObjectDO {
 
   // ---- WS helpers ----
 
-  private attachment(ws: WebSocket): { sessionId: string; actor: ObjRef; socketId: string; protocol?: "v2-turn-network"; node?: string; token?: string } | null {
+  private attachment(ws: WebSocket): { sessionId: string; actor: ObjRef; socketId: string; protocol?: "v2-turn-network"; node?: string; scope: ObjRef; token?: string } | null {
     const raw = ws.deserializeAttachment();
     if (!raw || typeof raw !== "object") return null;
     const a = raw as Record<string, unknown>;
@@ -2729,6 +2721,7 @@ export class PersistentObjectDO {
       socketId: a.socketId,
       ...(a.protocol === "v2-turn-network" ? { protocol: "v2-turn-network" as const } : {}),
       ...(typeof a.node === "string" ? { node: a.node } : {}),
+      scope: (typeof a.scope === "string" ? a.scope : a.actor) as ObjRef,
       ...(typeof a.token === "string" ? { token: a.token } : {})
     };
   }

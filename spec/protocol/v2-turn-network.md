@@ -1066,23 +1066,23 @@ out to subscribed browser nodes as shadow delta transfers carrying the accepted
 frame, transcript tail, and refreshed projection, and relay MAC proofs are
 verified before cache install. The shim also includes scope subscriptions and
 best-effort live-event fan-out with coalescing, without advancing the
-commit-scope head. It does not use Web Workers, IndexedDB, or WebSocket
-transport yet, but it exercises the same local-execution/missing-state/state
-catch-up/commit-reconcile and live-preview loops that the browser worker is
-expected to expose.
+commit-scope head. The browser-side M4 worker opens the v2 WebSocket, persists
+hello/reply/pending-frame state in IndexedDB, replays pending envelopes after
+reconnect, and marks reset/catch-up-needed state when the relay reports reset.
+It currently runs alongside the legacy `/ws` UI path while the UI is migrated to
+consume v2 committed state directly.
 
 M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
 The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
 `TransportHello` envelope, decodes subsequent frames through the shared shadow
-envelope codec, and can return shadow execution replies. During one open socket,
-the dev server and Worker keep one shadow browser/relay pair alive so
-idempotency, subscriptions, catch-up tails, and browser cache state survive
-across frames. Durable CommitScopeDO-backed commit arbitration and persisted
-resume across Worker hibernation/reconnect are reserved by binding/migration but
-are not yet the live commit authority. If the Worker hibernates and loses the
-in-memory relay table, the transitional M4 implementation replies with
-`woo.transport.error.v1`/`E_RESET`; the browser must resubscribe and run VTN9
+envelope codec, and can return shadow execution replies. The Worker gateway
+forwards authority-bearing v2 envelopes to `CommitScopeDO`, which persists the
+shadow commit scope, accepted-frame tail, transcript tail, seen idempotency
+keys, and cached replies. Gateway isolate hibernation no longer resets v2
+commit authority; browsers still resubscribe and run VTN9 catch-up after any
+transport reconnect because live socket subscriptions remain connection-local.
+The local dev server keeps the earlier socket-lifetime in-process relay shim.
 catch-up before submitting new authority-bearing turns.
 
 Browser-node dubspace preview flow:

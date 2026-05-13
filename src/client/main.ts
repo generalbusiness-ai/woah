@@ -249,6 +249,7 @@ let chatHistoryCursor = chatHistory.length;
 let chatHistoryDraft = "";
 let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, location.search);
 let routeInitialized = false;
+let v2BrowserWorker: Worker | undefined;
 state.spaceChatHeights = loadSpaceChatHeights();
 
 installBundledCatalogUi();
@@ -302,6 +303,7 @@ function connect() {
         render();
       }
       requestReplay(socket);
+      ensureV2BrowserWorker();
       if (!scopedProjectionEnabled && shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
     }
     if (frame.op === "applied") {
@@ -432,6 +434,24 @@ function connect() {
   });
   socket.addEventListener("error", () => {
     if (state.socket === socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+  });
+}
+
+function ensureV2BrowserWorker() {
+  if (!state.session || !state.actor || v2BrowserWorker) return;
+  if (!("Worker" in window) || !("indexedDB" in window)) return;
+  const token = authToken();
+  if (!token) return;
+  // The v2 worker owns the durable browser-side cache and reconnect loop. The
+  // legacy `/ws` UI path remains active while v2 reaches feature parity.
+  v2BrowserWorker = new Worker(new URL("./v2-browser-worker.ts", import.meta.url), { type: "module" });
+  v2BrowserWorker.addEventListener("message", (event) => {
+    if (event.data?.kind === "status") console.debug("woo.v2", event.data.status);
+  });
+  v2BrowserWorker.postMessage({
+    kind: "connect",
+    token,
+    scope: state.actor
   });
 }
 
@@ -610,6 +630,9 @@ async function logout() {
   const sessionId = state.session;
   state.socket?.close();
   state.socket = undefined;
+  v2BrowserWorker?.postMessage({ kind: "disconnect" });
+  v2BrowserWorker?.terminate();
+  v2BrowserWorker = undefined;
   if (sessionId) {
     try {
       await fetch("/api/session", { method: "DELETE", headers: { authorization: `Session ${sessionId}` } });

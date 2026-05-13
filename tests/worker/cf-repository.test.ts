@@ -16,6 +16,7 @@ import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
 import type { CallContext, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
 import { CFObjectRepository } from "../../src/worker/cf-repository";
+import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -378,6 +379,7 @@ describe("CFObjectRepository production-shape coverage", () => {
   it("handles v2 turn requests through the Worker WebSocket message path", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
+    const commitStates = new Map<string, FakeDurableObjectState>();
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const env = {
       WOO_INITIAL_WIZARD_TOKEN: "cf-v2-message-token",
@@ -389,11 +391,18 @@ describe("CFObjectRepository production-shape coverage", () => {
       }),
       WOO: new FakeDurableObjectNamespace((name) => {
         throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: new FakeDurableObjectNamespace((name) => {
+        let state = commitStates.get(name);
+        if (!state) {
+          state = new FakeDurableObjectState(name);
+          commitStates.set(name, state);
+        }
+        return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
       })
     } as unknown as Env;
     const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
     const internals = gateway as unknown as {
-      v2BrowserBySocket: Map<string, ShadowBrowserNode>;
       webSocketV2TurnNetworkMessage: (world: WooWorld, ws: WebSocket, message: string | ArrayBuffer) => Promise<void>;
     };
     class FakeWebSocket {
@@ -407,6 +416,7 @@ describe("CFObjectRepository production-shape coverage", () => {
           actor: session.actor,
           socketId: "v2-message-socket",
           node: "browser:worker-test",
+          scope: "#-1",
           token: "guest:cf-v2-message"
         };
       }
@@ -423,7 +433,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         return this.value;
       }`, null).ok).toBe(true);
       const relay = createShadowBrowserRelayShim({
-        node: "node:worker-test:relay",
+        node: "node:commit-scope:#-1",
         scope: "#-1",
         serialized: world.exportWorld()
       });
@@ -436,7 +446,6 @@ describe("CFObjectRepository production-shape coverage", () => {
       });
       setShadowBrowserSessionToken(browser, "guest:cf-v2-message");
       await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
-      internals.v2BrowserBySocket.set("v2-message-socket", browser);
       const call: ShadowTurnCall = {
         kind: "woo.turn_call.shadow.v1",
         id: "cf-v2-message-value",
@@ -467,15 +476,22 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(replies[0]).toMatchObject({ type: "woo.turn.exec.reply.shadow.v1", reply_to: "cf-v2-message-env" });
       expect(replies[0].body).toMatchObject({ ok: true, id: "cf-v2-message-value" });
       expect(replies[0].body.commit.serialized_after).toBeUndefined();
+
+      await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
+      const replayed = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
+      expect(replayed).toHaveLength(2);
+      expect(replayed[1].body).toEqual(replayed[0].body);
     } finally {
       directoryState.close();
       gatewayState.close();
+      for (const state of commitStates.values()) state.close();
     }
   });
 
-  it("signals reset when Worker hibernation drops v2 socket-local relay state", async () => {
+  it("reports malformed v2 envelopes through the CommitScopeDO path", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
+    const commitStates = new Map<string, FakeDurableObjectState>();
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const env = {
       WOO_INITIAL_WIZARD_TOKEN: "cf-v2-reset-token",
@@ -487,6 +503,14 @@ describe("CFObjectRepository production-shape coverage", () => {
       }),
       WOO: new FakeDurableObjectNamespace((name) => {
         throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: new FakeDurableObjectNamespace((name) => {
+        let state = commitStates.get(name);
+        if (!state) {
+          state = new FakeDurableObjectState(name);
+          commitStates.set(name, state);
+        }
+        return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
       })
     } as unknown as Env;
     const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
@@ -520,11 +544,12 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(ws.sent).toHaveLength(1);
       expect(JSON.parse(ws.sent[0])).toMatchObject({
         type: "woo.transport.error.v1",
-        body: { code: "E_RESET" }
+        body: { code: "E_PROTOCOL" }
       });
     } finally {
       directoryState.close();
       gatewayState.close();
+      for (const state of commitStates.values()) state.close();
     }
   });
 
