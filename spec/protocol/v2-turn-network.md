@@ -1084,8 +1084,11 @@ deferred until at least one catalog is v2-authoritative on that namespace.
 M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
 The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
-`TransportHello` envelope, decodes subsequent frames through the shared shadow
-envelope codec, and can return shadow execution replies. The Worker gateway
+`TransportHello` envelope followed by an initial projection/delta state-transfer
+envelope, decodes subsequent frames through the shared shadow envelope codec,
+and can return shadow execution replies. Reconnect opens may include the
+browser's cached `last_known_head` so `CommitScopeDO` can return a retained
+delta instead of a full projection when the tail is still available. The Worker gateway
 forwards authority-bearing v2 envelopes to `CommitScopeDO`, which persists the
 shadow commit scope, accepted-frame tail, transcript tail, seen idempotency
 keys, and cached replies in row-shaped storage. Fresh envelopes write only the
@@ -1524,7 +1527,7 @@ permitted only for `localhost`, `127.0.0.1`, or `[::1]` development endpoints.
 The browser opens:
 
 ```text
-GET /v2/turn-network/ws?token=<session-token>&node=<browser-node-id>&resume=<resume-token?>
+GET /v2/turn-network/ws?token=<session-token>&node=<browser-node-id>&scope=<scope-ref?>&last_known_head=<json-scope-head?>&resume=<resume-token?>
 Upgrade: websocket
 Sec-WebSocket-Protocol: woo-v2.turn-network.json
 ```
@@ -1533,6 +1536,14 @@ The token in the query string is allowed only for the opening handshake. After
 the socket is established, every envelope repeats the bearer token in
 `auth.token` as specified in VTN4.2. Deployments that log URLs MUST redact the
 `token` query parameter.
+
+`scope` and `last_known_head` are the M4 shadow binding's open-handshake
+catch-up shortcut for a single scope. When present, `last_known_head` is a JSON
+encoded `ScopeHead` for `scope`; the relay validates the shape, treats malformed
+or stale values as absent, and sends the state transfer that VTN9 would have
+returned for that cursor. Relays with retained contiguous history SHOULD send a
+delta transfer; otherwise they send a projection transfer. This shortcut does
+not replace explicit `Subscribe`/`CatchupRequest` for multi-scope clients.
 
 The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
 reject the upgrade with HTTP 400. A server that accepts the WebSocket without
@@ -1560,6 +1571,12 @@ The browser MUST NOT send authority-bearing envelopes until it receives
 MUST close the WebSocket with a policy/auth failure reason. The relay MAY accept
 idempotent `ping` control frames before hello only to keep intermediaries from
 closing a slow-auth connection.
+
+After `TransportHello`, an M4 shadow relay SHOULD immediately send the
+projection or delta `woo.state.transfer.shadow.v1` for the opened `scope` before
+processing authority-bearing browser envelopes. This preserves hello-first
+transport semantics while ensuring browser caches install verified state before
+pending turns are replayed.
 
 `TransportHello.actor` is the relay-validated actor from the session token. If
 it differs from the browser's cached actor, the browser MUST treat

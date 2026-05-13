@@ -215,6 +215,7 @@ export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
 
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
+  transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
   preseeded_objects: number;
   transfer_mode: "projection" | "delta";
 };
@@ -403,6 +404,7 @@ export async function openShadowBrowserScope(
   applyShadowBrowserTransfer(browser, transfer);
   return {
     projection: transfer.projection,
+    transfer,
     preseeded_objects: preseed.length,
     transfer_mode: transfer.mode
   };

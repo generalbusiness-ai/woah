@@ -1,7 +1,8 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { EffectTranscript } from "../core/effect-transcript";
-import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
+import { isShadowScopeHead, v2BrowserWebSocketUrl } from "./v2-browser-url";
 
 type V2WorkerCommand =
   | { kind: "connect"; token: string; node?: string; scope?: string }
@@ -99,10 +100,15 @@ async function connect(): Promise<void> {
   if (connecting) return;
   connecting = true;
   clearReconnect();
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const params = new URLSearchParams({ token: current.token, node: current.node });
-  if (current.scope) params.set("scope", current.scope);
-  const ws = new WebSocket(`${protocol}//${location.host}/v2/turn-network/ws?${params}`, "woo-v2.turn-network.json");
+  const cachedHead = current.scope ? await getMeta<unknown>(`head:${current.scope}`) : undefined;
+  const lastKnownHead: ShadowScopeHead | undefined = isShadowScopeHead(cachedHead) ? cachedHead : undefined;
+  const ws = new WebSocket(v2BrowserWebSocketUrl({
+    location,
+    token: current.token,
+    node: current.node,
+    scope: current.scope,
+    last_known_head: lastKnownHead
+  }), "woo-v2.turn-network.json");
   socket = ws;
   ws.addEventListener("open", () => {
     connecting = false;

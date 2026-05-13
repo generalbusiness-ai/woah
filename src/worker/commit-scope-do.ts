@@ -22,6 +22,7 @@ import {
   shadowBrowserTransportHello,
   type ShadowBrowserEnvelopeReceipt,
   type ShadowBrowserRelayShim,
+  type ShadowBrowserStateTransfer,
   type ShadowTransportHello
 } from "../core/shadow-browser-node";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
@@ -72,7 +73,10 @@ export class CommitScopeDO {
       const input = await readJson<CommitScopeOpenRequest>(request);
       const relay = await this.relayFor(input);
       const browser = this.browserFor(relay, input);
-      await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+      const opened = await openShadowBrowserScope(browser, {
+        preseed_catalog_pages: true,
+        last_known_head: input.last_known_head
+      });
       const hello = shadowBrowserTransportHello(browser);
       if (this.needsFullSave) {
         await this.saveFull(relay);
@@ -82,7 +86,8 @@ export class CommitScopeDO {
         ok: true,
         relay: relay.node,
         hello,
-        head: relay.commit_scope.head
+        head: relay.commit_scope.head,
+        transfer: opened.transfer
       } satisfies CommitScopeOpenResponse);
     }
     if (request.method === "POST" && url.pathname === "/v2/envelope") {
@@ -445,6 +450,7 @@ type CommitScopeBaseRequest = {
 
 type CommitScopeOpenRequest = CommitScopeBaseRequest & {
   serialized: SerializedWorld;
+  last_known_head?: ShadowScopeHead;
 };
 
 type CommitScopeOpenResponse = {
@@ -452,6 +458,7 @@ type CommitScopeOpenResponse = {
   relay: string;
   hello: ShadowTransportHello;
   head: ShadowScopeHead;
+  transfer: ShadowBrowserStateTransfer;
 };
 
 type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {

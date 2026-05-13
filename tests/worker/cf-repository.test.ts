@@ -372,11 +372,20 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(response.status).toBe(101);
       expect(response.headers.get("sec-websocket-protocol")).toBe("woo-v2.turn-network.json");
       expect(gatewayState.acceptedWebSockets).toHaveLength(1);
-      expect(sent).toHaveLength(1);
+      expect(sent).toHaveLength(2);
       expect(JSON.parse(sent[0])).toMatchObject({
         type: "woo.transport.hello.v1",
         to: "browser:upgrade-test",
         body: { kind: "woo.transport.hello.v1", actor: "$wiz" }
+      });
+      expect(JSON.parse(sent[1])).toMatchObject({
+        type: "woo.state.transfer.shadow.v1",
+        to: "browser:upgrade-test",
+        body: {
+          kind: "woo.state.transfer.shadow.v1",
+          mode: "projection",
+          scope: "$wiz"
+        }
       });
     } finally {
       if (previousPair === undefined) {
@@ -509,6 +518,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       if (!commitScope) throw new Error("test env missing COMMIT_SCOPE");
       const opened = await commitScope.get(commitScope.idFromName("#-1")).fetch(openRequest);
       expect(opened.ok).toBe(true);
+      const openedPayload = await opened.json() as Record<string, any>;
+      expect(openedPayload.transfer).toMatchObject({ mode: "projection", scope: "#-1" });
 
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
 
@@ -527,6 +538,31 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(JSON.parse(acceptedRows[0].body)).not.toHaveProperty("serialized_after");
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_transcript_tail"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
+      const catchupRequest = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "#-1",
+          node: "browser:worker-reconnect",
+          token: "guest:cf-v2-message",
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          session_objects: world.exportObjects([session.actor]),
+          serialized: world.exportWorld(),
+          last_known_head: openedPayload.head
+        })
+      }));
+      const caughtUp = await commitScope.get(commitScope.idFromName("#-1")).fetch(catchupRequest);
+      expect(caughtUp.ok).toBe(true);
+      await expect(caughtUp.json()).resolves.toMatchObject({
+        transfer: {
+          mode: "delta",
+          scope: "#-1",
+          applied: [expect.objectContaining({ position: expect.objectContaining({ seq: 1 }) })],
+          transcript_tail: [expect.objectContaining({ scope: "#-1" })]
+        }
+      });
 
       const writesBeforeReplay = scopeState!.storage.sql.execLog.filter((entry) => /^(INSERT|DELETE|UPDATE)\b/i.test(entry.query.trim())).length;
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);

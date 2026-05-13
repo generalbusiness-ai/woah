@@ -43,10 +43,11 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, wooError } from "../core/types";
 import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
-import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue } from "../core/shadow-browser-node";
+import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
+import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
@@ -91,6 +92,7 @@ type CommitScopeOpenResponse = {
     planes: Array<"execution" | "commit" | "state" | "live">;
     features: string[];
   };
+  transfer: ShadowBrowserStateTransfer;
 };
 
 type CommitScopeEnvelopeResponse = {
@@ -166,6 +168,38 @@ function webSocketProtocols(request: Request): string[] {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function sessionActorObjects(world: WooWorld, sessions: SerializedSession[]): SerializedObject[] {
+  return world.exportObjects(sessions.map((session) => session.actor));
+}
+
+function v2SessionAuthorityPayload(world: WooWorld): { sessions: SerializedSession[]; session_objects: SerializedObject[] } {
+  // CommitScopeDO only needs fresh bearer authority and actor records on the
+  // hot path. Keep this payload narrow so WebSocket envelopes do not smuggle a
+  // full world snapshot back across the DO boundary.
+  const sessions = world.exportSessions();
+  return { sessions, session_objects: sessionActorObjects(world, sessions) };
+}
+
+function parseV2LastKnownHead(raw: string | null): ShadowScopeHead | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ShadowScopeHead>;
+    if (
+      parsed.kind === "woo.scope_head.shadow.v1"
+      && typeof parsed.scope === "string"
+      && typeof parsed.epoch === "number"
+      && typeof parsed.seq === "number"
+      && typeof parsed.hash === "string"
+    ) {
+      return parsed as ShadowScopeHead;
+    }
+  } catch {
+    // Malformed catch-up hints are advisory; the authoritative open path falls
+    // back to a projection rather than rejecting an otherwise valid socket.
+  }
+  return undefined;
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -2565,6 +2599,7 @@ export class PersistentObjectDO {
     const token = url.searchParams.get("token") ?? "";
     const node = url.searchParams.get("node") || `browser:${crypto.randomUUID()}`;
     const scope = (url.searchParams.get("scope") || "") as ObjRef;
+    const lastKnownHead = parseV2LastKnownHead(url.searchParams.get("last_known_head"));
     if (!token) return jsonResponse({ error: { code: "E_NOSESSION", message: "token query parameter is required" } }, 401);
     const session = this.authenticateToken(world, token);
     const commitScope = scope || session.actor;
@@ -2586,14 +2621,18 @@ export class PersistentObjectDO {
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
 
+    const sessions = world.exportSessions();
+    const sessionObjects = sessionActorObjects(world, sessions);
     const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
       scope: commitScope,
       node,
       token,
       session: session.id,
       actor: session.actor,
-      sessions: world.exportSessions(),
-      serialized: world.exportWorld()
+      sessions,
+      session_objects: sessionObjects,
+      serialized: world.exportWorld(),
+      ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
     });
     const hello = opened.hello;
     server.send(encodeEnvelope({
@@ -2607,6 +2646,18 @@ export class PersistentObjectDO {
       auth: { mode: "session", token },
       body: hello
     } satisfies ShadowEnvelope<typeof hello>));
+    const transfer = opened.transfer;
+    server.send(encodeEnvelope({
+      v: 2,
+      type: transfer.kind,
+      id: `${this.durableHostKey()}:state:${crypto.randomUUID()}`,
+      from: opened.relay,
+      to: node,
+      actor: session.actor,
+      session: session.id,
+      auth: { mode: "session", token },
+      body: transfer
+    } satisfies ShadowEnvelope<typeof transfer>));
 
     return new Response(null, {
       status: 101,
@@ -2624,12 +2675,12 @@ export class PersistentObjectDO {
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
       const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
+        ...v2SessionAuthorityPayload(world),
         scope: att.scope,
         node: att.node,
         token: att.token,
         session: att.sessionId,
         actor: att.actor,
-        sessions: world.exportSessions(),
         envelope: encoded
       });
       if (result.reply) ws.send(result.reply);
