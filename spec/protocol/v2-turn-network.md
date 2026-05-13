@@ -1085,10 +1085,13 @@ The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
 envelope codec, and can return shadow execution replies. The Worker gateway
 forwards authority-bearing v2 envelopes to `CommitScopeDO`, which persists the
 shadow commit scope, accepted-frame tail, transcript tail, seen idempotency
-keys, and cached replies. Gateway isolate hibernation no longer resets v2
-commit authority; browsers still resubscribe and run VTN9 catch-up after any
-transport reconnect because live socket subscriptions remain connection-local.
-The local dev server keeps the earlier socket-lifetime in-process relay shim.
+keys, and cached replies in row-shaped storage. Fresh envelopes write only the
+new idempotency key/reply and accepted commit delta; duplicate envelopes replay
+the cached reply without another durable write. Gateway isolate hibernation no
+longer resets v2 commit authority; browsers still resubscribe and run VTN9
+catch-up after any transport reconnect because live socket subscriptions remain
+connection-local. The local dev server keeps the earlier socket-lifetime
+in-process relay shim.
 
 Browser-node dubspace preview flow:
 

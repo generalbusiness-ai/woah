@@ -39,9 +39,12 @@ class FakeSqlCursor {
 }
 
 class FakeSqlStorage {
+  readonly execLog: string[] = [];
+
   constructor(private readonly db: DatabaseSync) {}
 
   exec(query: string, ...params: unknown[]): FakeSqlCursor {
+    this.execLog.push(query);
     const stmt = this.db.prepare(query);
     const head = query.trim().split(/\s+/, 1)[0]?.toUpperCase();
     if (head === "SELECT" || head === "PRAGMA") {
@@ -629,10 +632,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_snapshot"))[0]).toMatchObject({ n: 0 });
 
+      const writesBeforeReplay = scopeState!.storage.sql.execLog.filter((query) => /^(INSERT|DELETE|UPDATE)\b/i.test(query.trim())).length;
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
       const replayed = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
       expect(replayed).toHaveLength(2);
       expect(replayed[1].body).toEqual(replayed[0].body);
+      const writesAfterReplay = scopeState!.storage.sql.execLog.filter((query) => /^(INSERT|DELETE|UPDATE)\b/i.test(query.trim())).length;
+      expect(writesAfterReplay).toBe(writesBeforeReplay);
     } finally {
       directoryState.close();
       gatewayState.close();

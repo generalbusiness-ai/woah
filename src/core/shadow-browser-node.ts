@@ -27,9 +27,10 @@ const MIN_SHADOW_IDEMPOTENCY_WINDOW_MS = 5 * 60 * 1000;
 // Shadow retention caps keep the prototype from growing per-scope/per-browser
 // arrays without bound. Production can tune these once VTN17 compaction policy
 // is formalized, but unbounded tails are never acceptable on the hot path.
-const MAX_SHADOW_IDEMPOTENCY_ENTRIES = 10_000;
-const MAX_SHADOW_ACCEPTED_TAIL = 1_000;
-const MAX_SHADOW_TRANSCRIPT_TAIL = 1_000;
+export const MAX_SHADOW_IDEMPOTENCY_ENTRIES = 10_000;
+export const MAX_SHADOW_RECENT_REPLIES_ENTRIES = 10_000;
+export const MAX_SHADOW_ACCEPTED_TAIL = 1_000;
+export const MAX_SHADOW_TRANSCRIPT_TAIL = 1_000;
 const MAX_SHADOW_LIVE_EVENTS = 500;
 const MAX_SHADOW_BROWSER_TRANSFERS = 200;
 const MAX_SHADOW_BROWSER_CACHE_TAIL = 1_000;
@@ -933,7 +934,10 @@ function shadowBrowserIdempotencyKey(envelope: Pick<ShadowEnvelope, "from" | "id
 }
 
 function trimShadowBrowserIdempotency(relay: ShadowBrowserRelayShim): void {
-  if (relay.recently_seen.size <= MAX_SHADOW_IDEMPOTENCY_ENTRIES) return;
+  if (relay.recently_seen.size <= MAX_SHADOW_IDEMPOTENCY_ENTRIES) {
+    trimShadowBrowserRecentReplies(relay);
+    return;
+  }
   // The idempotency window is time-based, but a hot relay also needs a hard
   // entry cap so replay keys and cached replies cannot grow without bound.
   const overflow = relay.recently_seen.size - MAX_SHADOW_IDEMPOTENCY_ENTRIES;
@@ -944,6 +948,19 @@ function trimShadowBrowserIdempotency(relay: ShadowBrowserRelayShim): void {
     relay.recently_seen.delete(key);
     relay.recent_replies.delete(key);
   }
+  trimShadowBrowserRecentReplies(relay);
+}
+
+function trimShadowBrowserRecentReplies(relay: ShadowBrowserRelayShim): void {
+  if (relay.recent_replies.size <= MAX_SHADOW_RECENT_REPLIES_ENTRIES) return;
+  // Reply caching has its own cap because some envelope ids are remembered
+  // without producing a reply. Keep the newest replies by their seen time so a
+  // retry inside the advertised window is most likely to get the cached answer.
+  const overflow = relay.recent_replies.size - MAX_SHADOW_RECENT_REPLIES_ENTRIES;
+  const oldest = Array.from(relay.recent_replies.keys())
+    .sort((a, b) => (relay.recently_seen.get(a) ?? 0) - (relay.recently_seen.get(b) ?? 0))
+    .slice(0, overflow);
+  for (const key of oldest) relay.recent_replies.delete(key);
 }
 
 function reconcileProjectionFallbackCache(browser: ShadowBrowserNode, transfer: ShadowProjectionTransfer): void {

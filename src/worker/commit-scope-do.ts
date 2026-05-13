@@ -13,15 +13,21 @@ import {
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
   handleShadowBrowserTurnExecEnvelope,
+  MAX_SHADOW_ACCEPTED_TAIL,
+  MAX_SHADOW_IDEMPOTENCY_ENTRIES,
+  MAX_SHADOW_RECENT_REPLIES_ENTRIES,
+  MAX_SHADOW_TRANSCRIPT_TAIL,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
   setShadowBrowserSessionToken,
   shadowBrowserTransportHello,
+  type ShadowBrowserEnvelopeReceipt,
   type ShadowBrowserRelayShim,
   type ShadowTransportHello
 } from "../core/shadow-browser-node";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
@@ -29,6 +35,7 @@ import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
   private snapshotLoaded = false;
+  private needsFullSave = false;
 
   constructor(
     private readonly state: DurableObjectState,
@@ -71,7 +78,10 @@ export class CommitScopeDO {
       const browser = this.browserFor(relay, input);
       await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
       const hello = shadowBrowserTransportHello(browser);
-      await this.save(relay);
+      if (this.needsFullSave) {
+        await this.saveFull(relay);
+        this.needsFullSave = false;
+      }
       return jsonResponse({
         ok: true,
         relay: relay.node,
@@ -85,7 +95,12 @@ export class CommitScopeDO {
       const browser = this.browserFor(relay, input);
       const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
       const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
-      await this.save(relay);
+      if (this.needsFullSave) {
+        await this.saveFull(relay);
+        this.needsFullSave = false;
+      } else {
+        await this.saveEnvelopeDelta(relay, receipt, reply);
+      }
       return jsonResponse({
         ok: true,
         reply: reply ? encodeEnvelope(reply) : null,
@@ -114,7 +129,7 @@ export class CommitScopeDO {
         scope: input.scope,
         serialized: input.serialized
       });
-      await this.save(this.relay);
+      this.needsFullSave = true;
     }
     if (this.relay.commit_scope.scope !== input.scope) {
       throw wooError("E_PROTOCOL", `commit scope mismatch: have=${this.relay.commit_scope.scope} want=${input.scope}`);
@@ -170,6 +185,7 @@ export class CommitScopeDO {
     relay.recently_seen = new Map(snapshot.recently_seen);
     relay.recent_replies = new Map(snapshot.recent_replies);
     this.refreshSessionAuth(relay, input);
+    this.needsFullSave = true;
     return relay;
   }
 
@@ -202,23 +218,59 @@ export class CommitScopeDO {
     return relay;
   }
 
-  private async save(relay: ShadowBrowserRelayShim): Promise<void> {
+  private async saveFull(relay: ShadowBrowserRelayShim): Promise<void> {
+    // Full saves are reserved for cold initialization and one-time migration
+    // from the legacy blob table. Hot envelopes use saveEnvelopeDelta instead.
     const now = Date.now();
     this.state.storage.transactionSync(() => {
-      this.state.storage.sql.exec(
-        "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?)",
-        relay.commit_scope.scope,
-        relay.node,
-        JSON.stringify(relay.commit_scope.serialized),
-        JSON.stringify(relay.commit_scope.head),
-        relay.idempotency_window_ms,
-        now
-      );
+      this.saveMeta(relay, now);
       this.saveAcceptedFrames(relay, now);
       this.saveTranscriptTail(relay, now);
       this.saveSeenKeys(relay);
       this.saveRecentReplies(relay, now);
     });
+  }
+
+  private async saveEnvelopeDelta(
+    relay: ShadowBrowserRelayShim,
+    receipt: ShadowBrowserEnvelopeReceipt,
+    reply: ShadowEnvelope<ShadowTurnExecReply> | null
+  ): Promise<void> {
+    // Replayed envelopes authenticate and return the cached reply, but they do
+    // not mutate relay state. Skipping storage here makes retry idempotency
+    // side-effect-free as well as turn-execution-free.
+    if (!receipt.fresh) return;
+    const seenAt = relay.recently_seen.get(receipt.idempotency_key);
+    if (seenAt === undefined) return;
+    const now = Date.now();
+    this.state.storage.transactionSync(() => {
+      this.saveSeenKey(receipt.idempotency_key, seenAt);
+      this.pruneSeenAndReplies(relay, now);
+      if (reply) {
+        this.saveRecentReply(receipt.idempotency_key, reply, now);
+        this.pruneRecentReplies();
+      }
+      const body = reply?.body;
+      if (body?.ok === true && body.commit && body.transcript) {
+        this.saveMeta(relay, now);
+        this.saveAcceptedFrame(body.commit, now);
+        this.saveTranscript(body.transcript, now);
+        this.pruneAcceptedFrames(relay);
+        this.pruneTranscriptTail(relay);
+      }
+    });
+  }
+
+  private saveMeta(relay: ShadowBrowserRelayShim, now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?)",
+      relay.commit_scope.scope,
+      relay.node,
+      JSON.stringify(relay.commit_scope.serialized),
+      JSON.stringify(relay.commit_scope.head),
+      relay.idempotency_window_ms,
+      now
+    );
   }
 
   private saveAcceptedFrames(relay: ShadowBrowserRelayShim, now: number): void {
@@ -242,6 +294,28 @@ export class CommitScopeDO {
     }
   }
 
+  private saveAcceptedFrame(frame: ShadowCommitAccepted, now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_accepted_frame(scope, seq, id, position_hash, body, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      frame.position.scope,
+      frame.position.seq,
+      frame.id ?? "",
+      frame.position.hash,
+      JSON.stringify(frame),
+      now
+    );
+  }
+
+  private pruneAcceptedFrames(relay: ShadowBrowserRelayShim): void {
+    const oldestKeptSeq = relay.commit_scope.head.seq - MAX_SHADOW_ACCEPTED_TAIL + 1;
+    if (oldestKeptSeq <= 1) return;
+    this.state.storage.sql.exec(
+      "DELETE FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq < ?",
+      relay.commit_scope.scope,
+      oldestKeptSeq
+    );
+  }
+
   private saveTranscriptTail(relay: ShadowBrowserRelayShim, now: number): void {
     const live = new Set<string>();
     for (const transcript of relay.transcript_tail) {
@@ -260,6 +334,27 @@ export class CommitScopeDO {
     }
   }
 
+  private saveTranscript(transcript: EffectTranscript, now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_transcript_tail(scope, seq, hash, body, updated_at) VALUES (?, ?, ?, ?, ?)",
+      transcript.scope,
+      transcript.seq,
+      transcript.hash,
+      JSON.stringify(transcript),
+      now
+    );
+  }
+
+  private pruneTranscriptTail(relay: ShadowBrowserRelayShim): void {
+    const oldestKeptSeq = relay.commit_scope.head.seq - MAX_SHADOW_TRANSCRIPT_TAIL + 1;
+    if (oldestKeptSeq <= 1) return;
+    this.state.storage.sql.exec(
+      "DELETE FROM v2_commit_scope_transcript_tail WHERE scope = ? AND seq < ?",
+      relay.commit_scope.scope,
+      oldestKeptSeq
+    );
+  }
+
   private saveSeenKeys(relay: ShadowBrowserRelayShim): void {
     const live = new Set(relay.recently_seen.keys());
     for (const [key, seenAt] of relay.recently_seen) {
@@ -272,6 +367,22 @@ export class CommitScopeDO {
     for (const row of sqlRows<{ idempotency_key: string }>(this.state.storage.sql.exec("SELECT idempotency_key FROM v2_commit_scope_seen"))) {
       if (!live.has(decodeStorageKey(row.idempotency_key))) this.state.storage.sql.exec("DELETE FROM v2_commit_scope_seen WHERE idempotency_key = ?", row.idempotency_key);
     }
+  }
+
+  private saveSeenKey(key: string, seenAt: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_seen(idempotency_key, seen_at) VALUES (?, ?)",
+      storageKey(key),
+      seenAt
+    );
+  }
+
+  private pruneSeenAndReplies(relay: ShadowBrowserRelayShim, now: number): void {
+    const cutoff = now - relay.idempotency_window_ms;
+    this.state.storage.sql.exec("DELETE FROM v2_commit_scope_seen WHERE seen_at < ?", cutoff);
+    this.state.storage.sql.exec("DELETE FROM v2_commit_scope_reply WHERE idempotency_key NOT IN (SELECT idempotency_key FROM v2_commit_scope_seen)");
+    this.pruneTableByCount("v2_commit_scope_seen", "seen_at", MAX_SHADOW_IDEMPOTENCY_ENTRIES);
+    this.state.storage.sql.exec("DELETE FROM v2_commit_scope_reply WHERE idempotency_key NOT IN (SELECT idempotency_key FROM v2_commit_scope_seen)");
   }
 
   private saveRecentReplies(relay: ShadowBrowserRelayShim, now: number): void {
@@ -287,6 +398,29 @@ export class CommitScopeDO {
     for (const row of sqlRows<{ idempotency_key: string }>(this.state.storage.sql.exec("SELECT idempotency_key FROM v2_commit_scope_reply"))) {
       if (!live.has(decodeStorageKey(row.idempotency_key))) this.state.storage.sql.exec("DELETE FROM v2_commit_scope_reply WHERE idempotency_key = ?", row.idempotency_key);
     }
+  }
+
+  private saveRecentReply(key: string, reply: ShadowEnvelope<ShadowTurnExecReply>, now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_reply(idempotency_key, body, updated_at) VALUES (?, ?, ?)",
+      storageKey(key),
+      JSON.stringify(reply),
+      now
+    );
+  }
+
+  private pruneRecentReplies(): void {
+    this.pruneTableByCount("v2_commit_scope_reply", "updated_at", MAX_SHADOW_RECENT_REPLIES_ENTRIES);
+  }
+
+  private pruneTableByCount(table: string, orderColumn: string, maxRows: number): void {
+    const count = Number(sqlRows<{ n: number }>(this.state.storage.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`))[0]?.n ?? 0);
+    const overflow = count - maxRows;
+    if (overflow <= 0) return;
+    this.state.storage.sql.exec(
+      `DELETE FROM ${table} WHERE idempotency_key IN (SELECT idempotency_key FROM ${table} ORDER BY ${orderColumn} ASC LIMIT ?)`,
+      overflow
+    );
   }
 }
 
