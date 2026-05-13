@@ -579,6 +579,7 @@ describe("McpHost", () => {
 
   it("refreshes tool lists for v2 accepted-frame observers", async () => {
     const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
     const alice = world.auth("guest:mcp-v2-refresh-alice");
     const bob = world.auth("guest:mcp-v2-refresh-bob");
     const host = new McpHost(world);
@@ -602,10 +603,14 @@ describe("McpHost", () => {
           { session: bob.id, actor: bob.actor },
           { session: alice.id, actor: alice.actor }
         ], op: "set" },
+        { cell: { kind: "location", object: bob.actor }, value: "the_chatroom", op: "move" },
         { cell: { kind: "location", object: alice.actor }, value: "the_chatroom", op: "move" }
       ],
       creates: [],
-      moves: [{ object: alice.actor, from: "$nowhere", to: "the_chatroom" }],
+      moves: [
+        { object: bob.actor, from: "$nowhere", to: "the_chatroom" },
+        { object: alice.actor, from: "$nowhere", to: "the_chatroom" }
+      ],
       observations: [{ type: "entered", actor: alice.actor, room: "the_chatroom", text: "Alice entered.", ts: 1 }],
       logicalInputs: [],
       untrackedEffects: [],
