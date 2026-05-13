@@ -1046,22 +1046,27 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   accepted frames, conflicts, transfers, and transcript tail. It connects to a
   local relay/commit-scope shim, preloads catalog object pages, executes
   tentative actor-local turns, asks the in-process network for missing state,
-  and applies accepted/conflicted frames back into the browser cache. The same
-  shim now has a minimal live plane: opening a scope subscribes the browser node
-  to relay fan-out, live events are delivered best-effort to matching
-  subscribers, coalesced previews replace older cache entries, and no live
-  event advances the commit-scope head.
+  and applies accepted/conflicted frames back into the browser cache. Scope
+  open now installs a relay-MAC-checked projection transfer, while accepted
+  commits fan out to subscribed browser nodes as relay-MAC-checked delta
+  transfers carrying the accepted frame, transcript tail, and refreshed
+  projection. The same shim
+  now has a minimal live plane: opening a scope subscribes the browser node to
+  relay fan-out, live events are delivered best-effort to matching subscribers,
+  coalesced previews replace older cache entries, and no live event advances
+  the commit-scope head.
 - `tests/shadow-browser-node.test.ts` now drives real bundled catalog actions
   through that browser shim: `the_dubspace:set_control`, pinboard
   `:add_note`/`:move_pin`/`:resize_pin`/pin `:set_color`/`:set_text`/
   `:take`/`:drop`, taskspace `:create_task`/task `:claim`/`:set_status`, and
   chat `:take`/`:drop` all commit successfully after missing-state transfer.
-  It also covers dubspace-style live preview fan-out as non-durable,
-  coalesced browser-cache traffic.
+  It also covers subscribed state-plane delta fan-out, projection/delta proof
+  rejection, transcript body/hash rejection, and dubspace-style live preview
+  fan-out as non-durable, coalesced browser-cache traffic.
 
 This is still a shadow prototype. It now has a real in-process
-execute/commit/state-transfer loop, but it is not yet the production protocol
-or final authority model.
+execute/commit/state/live loop, but it is not yet the production protocol or
+final authority model.
 
 Implementation learning:
 

@@ -803,6 +803,24 @@ recipient node. This is not production authorization yet, but it proves that
 state transfer can be driven by exact post-selection inventory gaps instead of
 copying the whole world.
 
+The shadow browser relay also implements `mode: "projection"` and
+`mode: "delta"` for display/cache catch-up. Opening a scope installs a
+projection transfer instead of directly mutating the browser projection cache.
+After an accepted commit, the relay sends delta transfers only to browser nodes
+subscribed to that commit scope; other browser nodes learn the new head through
+later state transfer. A shadow delta transfer carries the accepted frame, a
+transcript tail, and a refreshed projection.
+
+Browser projection/delta transfers use proof scheme `shadow.relay_mac.v1`.
+The proof root is a canonical hash over mode, scope, recipient, target head,
+projection, accepted-frame ids/positions/transcript hashes/post-state hashes,
+and transcript-tail hashes. The proof also carries authority, key id,
+recipient, and a MAC signature over the root. Receivers MUST verify the
+recipient binding, trusted relay authority, MAC signature, and transcript
+body-to-hash equality before installing projection/delta cache. This scheme is
+shadow-local relay authority, distinct from the execution-plane
+`shadow.anchor_mac.v1` object-record proof.
+
 Shadow latency profiles report bytes for the object-record closure so later
 page/cell-bounded work has a concrete performance target. The current profile
 also reports a two-turn warmup: after one dubspace control turn installs
@@ -900,11 +918,15 @@ worker -> UI: confirm, patch-forward, or report conflict
 Shadow implementation status: the in-process prototype includes a
 browser-shaped node/relay shim with an object-page cache, scope projection
 cache, pending-turn table, accepted/conflict frame queues, and transfer
-tracking. It also includes scope subscriptions and best-effort live-event
-fan-out with coalescing, without advancing the commit-scope head. It does not
-use Web Workers, IndexedDB, or WebSocket transport yet, but it exercises the
-same local-execution/missing-state/commit-reconcile and live-preview loops that
-the browser worker is expected to expose.
+tracking. Scope open uses a shadow projection transfer, accepted commits fan
+out to subscribed browser nodes as shadow delta transfers carrying the accepted
+frame, transcript tail, and refreshed projection, and relay MAC proofs are
+verified before cache install. The shim also includes scope subscriptions and
+best-effort live-event fan-out with coalescing, without advancing the
+commit-scope head. It does not use Web Workers, IndexedDB, or WebSocket
+transport yet, but it exercises the same local-execution/missing-state/state
+catch-up/commit-reconcile and live-preview loops that the browser worker is
+expected to expose.
 
 Browser-node dubspace preview flow:
 

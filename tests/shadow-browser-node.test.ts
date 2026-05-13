@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
+import { stableShadowJson } from "../src/core/shadow-cell-version";
 import {
+  applyShadowBrowserTransfer,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
   openShadowBrowserScope,
+  type ShadowBrowserStateTransfer,
   type ShadowBrowserNode
 } from "../src/core/shadow-browser-node";
+import { hashSource } from "../src/core/source-hash";
 import type { ObjRef, WooValue } from "../src/core/types";
 
 describe("shadow browser node shim", () => {
@@ -232,6 +236,114 @@ describe("shadow browser node shim", () => {
     expect(first.cache.applied_frames).toHaveLength(0);
     expect(second.cache.applied_frames).toHaveLength(0);
   });
+
+  it("delivers accepted commits to subscribed browser nodes as state-plane deltas", async () => {
+    const anchor = createWorld();
+    const firstSession = anchor.auth("guest:browser-state-a");
+    const secondSession = anchor.auth("guest:browser-state-b");
+    await anchor.directCall("browser-state-a-enter", firstSession.actor, "the_dubspace", "enter", [], { sessionId: firstSession.id });
+    await anchor.directCall("browser-state-b-enter", secondSession.actor, "the_dubspace", "enter", [], { sessionId: secondSession.id });
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-state-relay",
+      scope: "the_dubspace",
+      serialized: anchor.exportWorld()
+    });
+    const first = createShadowBrowserNode({
+      node: "browser-state-a",
+      scope: "the_dubspace",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay
+    });
+    const second = createShadowBrowserNode({
+      node: "browser-state-b",
+      scope: "the_dubspace",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay
+    });
+    const third = createShadowBrowserNode({
+      node: "browser-state-unsubscribed",
+      scope: "the_dubspace",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay
+    });
+    relay.browsers.set(third.node, third);
+    await openShadowBrowserScope(first, { preseed_catalog_pages: true });
+    await openShadowBrowserScope(second, { preseed_catalog_pages: true });
+
+    const turn = await executeShadowBrowserTurn(first, {
+      id: "browser-state-wet",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.91]
+    });
+
+    expect(turn.result).toMatchObject({ ok: true });
+    expect(first.cache.applied_frames).toHaveLength(1);
+    expect(second.cache.applied_frames).toHaveLength(1);
+    expect(first.cache.transcript_tail).toHaveLength(1);
+    expect(second.cache.transcript_tail).toHaveLength(1);
+    expect(second.cache.transfers.some((transfer) => transfer.mode === "delta")).toBe(true);
+    expect(third.cache.transfers.some((transfer) => transfer.mode === "delta")).toBe(false);
+    expect(third.cache.applied_frames).toHaveLength(0);
+    expect(second.cache.projections.get("the_dubspace")).toMatchObject({
+      kind: "woo.scope_projection.shadow.v1",
+      scope: "the_dubspace",
+      seq: 1
+    });
+    expect(worldFor(first).getProp("delay_1", "wet")).toBe(0.91);
+  });
+
+  it("rejects tampered browser projection transfers", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-state-proof");
+    const opened = await openShadowBrowserScope(browser);
+    const transfer = browser.cache.transfers.find((item) => item.mode === "projection");
+    expect(transfer).toBeDefined();
+    if (!transfer || transfer.mode !== "projection") throw new Error("expected projection transfer");
+    const tampered = structuredClone(transfer);
+    tampered.projection = { ...(opened.projection as Record<string, WooValue>), seq: 999 };
+
+    expect(() => applyShadowBrowserTransfer(browser, tampered)).toThrow(/proof root mismatch/);
+  });
+
+  it("rejects projection tampering even when the public root is rebuilt", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-state-rebuilt-proof");
+    const opened = await openShadowBrowserScope(browser);
+    const transfer = browser.cache.transfers.find((item) => item.mode === "projection");
+    if (!transfer || transfer.mode !== "projection") throw new Error("expected projection transfer");
+    const tampered = structuredClone(transfer);
+    tampered.projection = { ...(opened.projection as Record<string, WooValue>), seq: 999 };
+    tampered.proof.root = browserStateRootForTest(tampered);
+
+    expect(() => applyShadowBrowserTransfer(browser, tampered)).toThrow(/signature mismatch/);
+  });
+
+  it("rejects tampered browser delta transfers", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-delta-proof");
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const turn = await executeShadowBrowserTurn(browser, {
+      id: "browser-delta-proof-wet",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.93]
+    });
+    expect(turn.result).toMatchObject({ ok: true });
+    const delta = browser.cache.transfers.find((item) => item.mode === "delta");
+    if (!delta || delta.mode !== "delta") throw new Error("expected delta transfer");
+
+    const tamperedProjection = structuredClone(delta);
+    tamperedProjection.projection = { ...(delta.projection as Record<string, WooValue>), seq: 999 };
+    expect(() => applyShadowBrowserTransfer(browser, tamperedProjection)).toThrow(/proof root mismatch/);
+
+    const tamperedTranscript = structuredClone(delta);
+    tamperedTranscript.transcript_tail[0] = {
+      ...tamperedTranscript.transcript_tail[0],
+      call: { ...tamperedTranscript.transcript_tail[0].call, verb: "tampered" }
+    };
+    expect(() => applyShadowBrowserTransfer(browser, tamperedTranscript)).toThrow(/transcript hash mismatch/);
+  });
 });
 
 async function browserForScope<T = undefined>(
@@ -268,4 +380,23 @@ function observationObject(turn: { result: { transcript?: { observations: Array<
   const out = observation[key];
   if (typeof out !== "string") throw new Error(`expected ${type}.${key} object ref`);
   return out;
+}
+
+function browserStateRootForTest(transfer: Extract<ShadowBrowserStateTransfer, { mode: "projection" | "delta" }>): string {
+  const material = {
+    kind: "woo.browser_state_proof_material.shadow.v1",
+    mode: transfer.mode,
+    scope: transfer.scope,
+    recipient: transfer.proof.recipient,
+    head: transfer.to,
+    projection: transfer.projection,
+    applied: transfer.mode === "delta" ? transfer.applied.map((frame) => ({
+      id: frame.id,
+      position: frame.position,
+      transcript_hash: frame.transcript_hash,
+      post_state_hash: frame.post_state_hash
+    })) : [],
+    transcript_hashes: transfer.mode === "delta" ? transfer.transcript_tail.map((transcript) => transcript.hash) : []
+  };
+  return hashSource(stableShadowJson(material as unknown as WooValue));
 }

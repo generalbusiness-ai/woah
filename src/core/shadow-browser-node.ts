@@ -13,7 +13,13 @@ import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
 import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
+import { stableShadowJson } from "./shadow-cell-version";
+import { constantTimeEqual, hashSource } from "./source-hash";
 import type { ObjRef, Observation, WooValue } from "./types";
+
+const DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY = "shadow-relay";
+const DEFAULT_SHADOW_BROWSER_STATE_KEY_ID = "shadow-browser-dev";
+const DEFAULT_SHADOW_BROWSER_STATE_SECRET = "shadow-browser-dev-secret";
 
 export type ShadowLiveAudience = {
   actors?: ObjRef[];
@@ -30,6 +36,41 @@ export type ShadowLiveEvent = {
   audience?: ShadowLiveAudience;
   observation: Observation;
   coalesce?: string;
+};
+
+export type ShadowProjectionTransfer = {
+  kind: "woo.state.transfer.shadow.v1";
+  mode: "projection";
+  scope: ObjRef;
+  to: ShadowCommitAccepted["position"];
+  projection: WooValue;
+  proof: ShadowBrowserStateProof;
+};
+
+export type ShadowDeltaTransfer = {
+  kind: "woo.state.transfer.shadow.v1";
+  mode: "delta";
+  scope: ObjRef;
+  to: ShadowCommitAccepted["position"];
+  applied: ShadowCommitAccepted[];
+  transcript_tail: EffectTranscript[];
+  projection: WooValue;
+  proof: ShadowBrowserStateProof;
+};
+
+export type ShadowBrowserStateTransfer = ShadowStateTransfer | ShadowProjectionTransfer | ShadowDeltaTransfer;
+
+export type ShadowBrowserStateProof = {
+  kind: "woo.state_proof.shadow.v1";
+  scheme: "shadow.relay_mac.v1";
+  authority: string;
+  key_id: string;
+  recipient: string;
+  scope: ObjRef;
+  mode: ShadowProjectionTransfer["mode"] | ShadowDeltaTransfer["mode"];
+  root: string;
+  head: ShadowCommitAccepted["position"];
+  signature: string;
 };
 
 export type ShadowBrowserLiveInput = {
@@ -52,7 +93,7 @@ export type ShadowBrowserNodeCache = {
   pending_turns: Map<string, ShadowBrowserPendingTurn>;
   applied_frames: ShadowCommitAccepted[];
   conflicts: ShadowCommitConflict[];
-  transfers: ShadowStateTransfer[];
+  transfers: ShadowBrowserStateTransfer[];
   live_events: ShadowLiveEvent[];
 };
 
@@ -71,6 +112,7 @@ export type ShadowBrowserRelayShim = {
   subscriptions: Map<ObjRef, Set<string>>;
   browsers: Map<string, ShadowBrowserNode>;
   live_events: ShadowLiveEvent[];
+  state_signing: ShadowBrowserStateSigning;
 };
 
 export type ShadowBrowserNode = {
@@ -82,8 +124,15 @@ export type ShadowBrowserNode = {
   execution_node: ShadowExecutionNode;
   relay: ShadowBrowserRelayShim;
   cache: ShadowBrowserNodeCache;
+  trusted_state_authorities: Map<string, string>;
   next_turn: number;
   next_live: number;
+};
+
+export type ShadowBrowserStateSigning = {
+  authority: string;
+  key_id: string;
+  secret: string;
 };
 
 export type ShadowBrowserOpenScopeResult = {
@@ -115,6 +164,7 @@ export function createShadowBrowserRelayShim(input: {
   scope: ObjRef;
   serialized: SerializedWorld;
   executors?: ShadowExecutionNode[];
+  state_signing?: Partial<ShadowBrowserStateSigning>;
 }): ShadowBrowserRelayShim {
   return {
     kind: "woo.browser_relay.shadow.v1",
@@ -127,7 +177,12 @@ export function createShadowBrowserRelayShim(input: {
     executors: input.executors ?? [],
     subscriptions: new Map(),
     browsers: new Map(),
-    live_events: []
+    live_events: [],
+    state_signing: {
+      authority: input.state_signing?.authority ?? DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY,
+      key_id: input.state_signing?.key_id ?? DEFAULT_SHADOW_BROWSER_STATE_KEY_ID,
+      secret: input.state_signing?.secret ?? DEFAULT_SHADOW_BROWSER_STATE_SECRET
+    }
   };
 }
 
@@ -138,6 +193,7 @@ export function createShadowBrowserNode(input: {
   session?: string | null;
   relay: ShadowBrowserRelayShim;
   cached_objects?: SerializedObject[];
+  trusted_state_authorities?: Record<string, string>;
 }): ShadowBrowserNode {
   const executionNode = createShadowExecutionNode({
     node: input.node,
@@ -155,6 +211,7 @@ export function createShadowBrowserNode(input: {
     execution_node: executionNode,
     relay: input.relay,
     cache,
+    trusted_state_authorities: trustedBrowserStateAuthorities(input.trusted_state_authorities),
     next_turn: 1,
     next_live: 1
   };
@@ -191,11 +248,13 @@ export async function openShadowBrowserScope(
     installShadowCachedObjectRecords(browser.execution_node, preseed);
     cacheObjectPages(browser.cache, preseed);
   }
-  const projection = shadowScopeProjection(serialized, browser.scope);
-  browser.cache.projections.set(browser.scope, projection);
   subscribeShadowBrowserNode(browser, browser.scope);
+  // Scope open enters the state plane even for display-only projection data, so
+  // every cache fill goes through the same recipient-bound verification path.
+  const transfer = buildShadowBrowserProjectionTransfer(browser.relay, browser.scope, browser.node);
+  applyShadowBrowserTransfer(browser, transfer);
   return {
-    projection,
+    projection: transfer.projection,
     preseeded_objects: preseed.length
   };
 }
@@ -325,8 +384,8 @@ export async function executeShadowBrowserTurn(
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
   if (network.result.ok) {
     browser.cache.pending_turns.delete(id);
-    browser.cache.transcript_tail.push(network.result.transcript);
-    if (network.result.commit) applyShadowBrowserAcceptedFrame(browser, network.result.commit);
+    if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
+    else browser.cache.transcript_tail.push(network.result.transcript);
   } else if (network.result.reason === "commit_rejected") {
     browser.cache.pending_turns.delete(id);
     if (network.result.commit) applyShadowBrowserConflict(browser, network.result.commit);
@@ -342,7 +401,57 @@ export async function executeShadowBrowserTurn(
   };
 }
 
+export function buildShadowBrowserProjectionTransfer(relay: ShadowBrowserRelayShim, scope: ObjRef, recipient = "*"): ShadowProjectionTransfer {
+  // Projection transfer replaces direct cache mutation on scope-open so display
+  // state obeys the same recipient-bound relay authority check as deltas.
+  const transfer = {
+    kind: "woo.state.transfer.shadow.v1",
+    mode: "projection",
+    scope,
+    to: structuredClone(relay.commit_scope.head) as ShadowCommitAccepted["position"],
+    projection: shadowScopeProjection(relay.commit_scope.serialized, scope)
+  } satisfies Omit<ShadowProjectionTransfer, "proof">;
+  return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
+}
+
+export function buildShadowBrowserDeltaTransfer(
+  relay: ShadowBrowserRelayShim,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript,
+  recipient = "*"
+): ShadowDeltaTransfer {
+  // Delta transfer carries the committed frame plus transcript tail needed by
+  // browser caches to catch up without receiving executable closure state.
+  const transfer = {
+    kind: "woo.state.transfer.shadow.v1",
+    mode: "delta",
+    scope: accepted.position.scope,
+    to: structuredClone(accepted.position) as ShadowCommitAccepted["position"],
+    applied: [structuredClone(accepted) as ShadowCommitAccepted],
+    transcript_tail: [structuredClone(transcript) as EffectTranscript],
+    projection: shadowScopeProjection(relay.commit_scope.serialized, accepted.position.scope)
+  } satisfies Omit<ShadowDeltaTransfer, "proof">;
+  return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
+}
+
+export function publishShadowBrowserAcceptedFrame(
+  relay: ShadowBrowserRelayShim,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): void {
+  // Commit fan-out is subscription-gated; browsers outside the scope must ask
+  // for later state transfer rather than receiving every accepted frame.
+  for (const browser of relay.browsers.values()) {
+    if (relay.subscriptions.get(accepted.position.scope)?.has(browser.node) !== true) continue;
+    // The originator is often subscribed too; accepted-frame dedup below makes
+    // that round trip harmless while preserving one relay fan-out path.
+    const transfer = buildShadowBrowserDeltaTransfer(relay, accepted, transcript, browser.node);
+    applyShadowBrowserTransfer(browser, transfer);
+  }
+}
+
 export function applyShadowBrowserAcceptedFrame(browser: ShadowBrowserNode, accepted: ShadowCommitAccepted): void {
+  if (browser.cache.applied_frames.some((frame) => frame.id === accepted.id && frame.position.hash === accepted.position.hash)) return;
   browser.cache.applied_frames.push(accepted);
   browser.cache.projections.set(browser.scope, shadowScopeProjection(accepted.serialized_after, browser.scope));
 }
@@ -351,13 +460,32 @@ export function applyShadowBrowserConflict(browser: ShadowBrowserNode, conflict:
   browser.cache.conflicts.push(conflict);
 }
 
-export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer: ShadowStateTransfer): void {
-  browser.cache.transfers.push(transfer);
-  if (transfer.mode === "closure") {
-    cacheObjectPages(browser.cache, transfer.serialized.objects);
-    return;
+export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer: ShadowBrowserStateTransfer): void {
+  verifyShadowBrowserStateTransfer(browser, transfer);
+  browser.cache.transfers.push(structuredClone(transfer) as ShadowBrowserStateTransfer);
+  switch (transfer.mode) {
+    case "projection":
+      browser.cache.projections.set(transfer.scope, structuredClone(transfer.projection) as WooValue);
+      return;
+    case "delta":
+      browser.cache.projections.set(transfer.scope, structuredClone(transfer.projection) as WooValue);
+      for (const transcript of transfer.transcript_tail) {
+        if (!browser.cache.transcript_tail.some((item) => item.hash === transcript.hash)) {
+          browser.cache.transcript_tail.push(structuredClone(transcript) as EffectTranscript);
+        }
+      }
+      for (const accepted of transfer.applied) applyShadowBrowserAcceptedFrame(browser, accepted);
+      return;
+    case "closure":
+      // Closure and object-record transfers keep the execution-plane
+      // shadow.anchor_mac.v1 proof; this browser cache path only stores pages.
+      cacheObjectPages(browser.cache, transfer.serialized.objects);
+      return;
+    case "object_records":
+      cacheObjectPages(browser.cache, transfer.objects);
+      return;
   }
-  cacheObjectPages(browser.cache, transfer.objects);
+  assertNeverTransfer(transfer);
 }
 
 function cacheObjectPages(cache: ShadowBrowserNodeCache, objects: SerializedObject[]): void {
@@ -378,4 +506,102 @@ function shadowScopeProjection(serialized: SerializedWorld, scope: ObjRef): WooV
     contents: scopeObj?.contents ?? [],
     seq: serialized.logs.find(([space]) => space === scope)?.[1].reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0
   };
+}
+
+function trustedBrowserStateAuthorities(input: Record<string, string> | undefined): Map<string, string> {
+  return new Map(Object.entries(input ?? { [DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY]: DEFAULT_SHADOW_BROWSER_STATE_SECRET }));
+}
+
+function signShadowBrowserStateTransfer(
+  transfer: Omit<ShadowProjectionTransfer, "proof"> | Omit<ShadowDeltaTransfer, "proof">,
+  signing: ShadowBrowserStateSigning,
+  recipient: string
+): ShadowBrowserStateProof {
+  // Browser projection/delta state is signed by the relay shim rather than by
+  // the execution anchor. This is still shadow-local authority, but unlike a
+  // checksum it binds the payload to a trusted relay key and recipient node.
+  const root = shadowBrowserStateTransferRoot(transfer, { recipient });
+  return {
+    kind: "woo.state_proof.shadow.v1",
+    scheme: "shadow.relay_mac.v1",
+    authority: signing.authority,
+    key_id: signing.key_id,
+    recipient,
+    mode: transfer.mode,
+    scope: transfer.scope,
+    head: structuredClone(transfer.to) as ShadowCommitAccepted["position"],
+    root,
+    signature: shadowBrowserStateSignature(root, signing.secret)
+  };
+}
+
+function shadowBrowserStateTransferRoot(
+  transfer: Omit<ShadowProjectionTransfer, "proof"> | Omit<ShadowDeltaTransfer, "proof"> | ShadowProjectionTransfer | ShadowDeltaTransfer,
+  proof: Pick<ShadowBrowserStateProof, "recipient">
+): string {
+  // The proof root names only projection/delta cache material. Transcript body
+  // hashes are recomputed during verification before this root is trusted.
+  const material = {
+    kind: "woo.browser_state_proof_material.shadow.v1",
+    mode: transfer.mode,
+    scope: transfer.scope,
+    recipient: proof.recipient,
+    head: transfer.to,
+    projection: transfer.projection,
+    applied: transfer.mode === "delta" ? transfer.applied.map((frame) => ({
+      id: frame.id,
+      position: frame.position,
+      transcript_hash: frame.transcript_hash,
+      post_state_hash: frame.post_state_hash
+    })) : [],
+    transcript_hashes: transfer.mode === "delta" ? transfer.transcript_tail.map((transcript) => transcript.hash) : []
+  };
+  return hashSource(stableShadowJson(material as unknown as WooValue));
+}
+
+function verifyShadowBrowserStateTransfer(browser: ShadowBrowserNode, transfer: ShadowBrowserStateTransfer): void {
+  if (transfer.mode !== "projection" && transfer.mode !== "delta") return;
+  // Verification is intentionally before cache install: transcript bodies must
+  // match their hashes, then the relay MAC must match a trusted authority.
+  verifyShadowBrowserTranscriptHashes(transfer);
+  const expectedRoot = shadowBrowserStateTransferRoot(transfer, transfer.proof);
+  if (transfer.proof.scope !== transfer.scope || transfer.proof.mode !== transfer.mode) {
+    throw new Error("shadow browser state proof scope/mode mismatch");
+  }
+  if (transfer.proof.recipient !== "*" && transfer.proof.recipient !== browser.node) {
+    throw new Error(`shadow browser state proof recipient mismatch: proof=${transfer.proof.recipient} node=${browser.node}`);
+  }
+  const secret = browser.trusted_state_authorities.get(transfer.proof.authority);
+  if (!secret) throw new Error(`untrusted shadow browser state authority: ${transfer.proof.authority}`);
+  if (!constantTimeEqual(expectedRoot, transfer.proof.root)) throw new Error("shadow browser state proof root mismatch");
+  const signature = shadowBrowserStateSignature(expectedRoot, secret);
+  if (!constantTimeEqual(signature, transfer.proof.signature)) throw new Error("shadow browser state proof signature mismatch");
+}
+
+function verifyShadowBrowserTranscriptHashes(transfer: ShadowProjectionTransfer | ShadowDeltaTransfer): void {
+  if (transfer.mode !== "delta") return;
+  const transcriptHashes = new Set<string>();
+  for (const transcript of transfer.transcript_tail) {
+    const actual = effectTranscriptHash(transcript);
+    if (actual !== transcript.hash) throw new Error(`shadow browser transcript hash mismatch: ${transcript.id}`);
+    transcriptHashes.add(transcript.hash);
+  }
+  for (const applied of transfer.applied) {
+    if (!transcriptHashes.has(applied.transcript_hash)) {
+      throw new Error(`shadow browser applied transcript missing: ${applied.id}`);
+    }
+  }
+}
+
+function effectTranscriptHash(transcript: EffectTranscript): string {
+  const { hash: _hash, ...withoutHash } = transcript;
+  return hashSource(stableShadowJson(withoutHash as unknown as WooValue));
+}
+
+function shadowBrowserStateSignature(root: string, secret: string): string {
+  return hashSource(`shadow.relay_mac.v1:${secret}:${root}`);
+}
+
+function assertNeverTransfer(transfer: never): never {
+  throw new Error(`unsupported shadow browser state transfer mode: ${(transfer as { mode?: string }).mode}`);
 }
