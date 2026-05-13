@@ -52,6 +52,71 @@ type CostHarness = {
 };
 
 describe("v2 CommitScopeDO cost budget", () => {
+  it("keeps an MCP v2 tool call off the gateway durable-write path", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const commitStates = new Map<string, FakeDurableObjectState>();
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const commitScopeNamespace = new FakeDurableObjectNamespace((name) => {
+      let state = commitStates.get(name);
+      if (!state) {
+        state = new FakeDurableObjectState(name);
+        commitStates.set(name, state);
+      }
+      return new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-mcp-cost-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected DirectoryDO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: commitScopeNamespace
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const sessionId = await initializeMcp(gateway, "guest:cf-v2-mcp-cost", 1);
+      await mcp(gateway, sessionId, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "guest_1", verb: "set_description", args: ["warm mcp v2 scope"] }
+      });
+      const directScopeState = commitStates.get("#-1");
+      expect(directScopeState).toBeTruthy();
+
+      resetStateCostLog(gatewayState);
+      resetStateCostLog(directScopeState!);
+      commitScopeNamespace.fetchCallCount = 0;
+
+      const said = await mcp(gateway, sessionId, 3, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "guest_1", verb: "set_description", args: ["cost guard over mcp v2"] }
+      });
+      expect(said.result).toMatchObject({ isError: false });
+      // The MCP gateway applies the accepted v2 transcript as an in-memory
+      // routing/tool-list cache update. It must not persist the gateway world
+      // on the v2 hot path; CommitScopeDO is the durable authority.
+      expect(rowWrites(gatewayState)).toBe(0);
+      expect(commitScopeNamespace.fetchCallCount).toBe(1);
+      expect(writeRowsByTable(directScopeState!)).toMatchObject({
+        v2_commit_scope_meta: 1,
+        v2_commit_scope_accepted_frame: 1,
+        v2_commit_scope_transcript_tail: 1,
+        v2_commit_scope_seen: 1,
+        v2_commit_scope_reply: 1
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+      for (const state of commitStates.values()) state.close();
+    }
+  });
+
   it("keeps one authority-bearing envelope inside the per-turn write and invocation budget", async () => {
     const harness = await makeCostHarness();
     try {
@@ -268,6 +333,54 @@ function resetCostLog(harness: CostHarness): void {
   harness.scopeState.storage.sql.execLog.length = 0;
   harness.gatewayState.storage.sql.execLog.length = 0;
   harness.commitScopeNamespace.fetchCallCount = 0;
+}
+
+function resetStateCostLog(state: FakeDurableObjectState): void {
+  state.storage.sql.execLog.length = 0;
+}
+
+async function initializeMcp(gateway: PersistentObjectDO, token: string, id: number): Promise<string> {
+  const init = await gateway.fetch(jsonRpcRequest({
+    jsonrpc: "2.0",
+    id,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "v2-cost-budget", version: "0.0.0" }
+    }
+  }, { "mcp-token": token }));
+  expect(init.ok).toBe(true);
+  const sessionId = init.headers.get("mcp-session-id");
+  expect(sessionId).toBeTruthy();
+  const notified = await gateway.fetch(jsonRpcRequest({
+    jsonrpc: "2.0",
+    method: "notifications/initialized"
+  }, { "mcp-session-id": sessionId! }));
+  expect(notified.status).toBe(202);
+  return sessionId!;
+}
+
+async function mcp(gateway: PersistentObjectDO, sessionId: string, id: number, method: string, params?: unknown): Promise<any> {
+  const response = await gateway.fetch(jsonRpcRequest({
+    jsonrpc: "2.0",
+    id,
+    method,
+    ...(params === undefined ? {} : { params })
+  }, { "mcp-session-id": sessionId }));
+  expect(response.ok).toBe(true);
+  return await response.json();
+}
+
+function jsonRpcRequest(body: unknown, headers: Record<string, string> = {}): Request {
+  return new Request("https://woo.test/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...headers
+    },
+    body: JSON.stringify(body)
+  });
 }
 
 function rowWrites(state: FakeDurableObjectState): number {

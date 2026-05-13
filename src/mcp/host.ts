@@ -81,7 +81,7 @@ export type McpInvocationResult = {
 };
 
 export type McpDispatchHooks = {
-  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[]) => DirectResultFrame | ErrorFrame | Promise<DirectResultFrame | ErrorFrame>;
+  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null) => DirectResultFrame | ErrorFrame | Promise<DirectResultFrame | ErrorFrame>;
   call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) => AppliedFrame | ErrorFrame | Promise<AppliedFrame | ErrorFrame>;
 };
 
@@ -697,7 +697,7 @@ export class McpHost {
         const result = this.isMcpControlTool(actor, tool)
           ? await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId })
           : this.dispatchHooks.direct
-          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args)
+          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, tool.enclosingSpace)
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
         // Self observations are returned in the call result; do NOT route them

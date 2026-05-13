@@ -157,6 +157,19 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   return accepted;
 }
 
+export function applyAcceptedShadowFrame(
+  scope: ShadowCommitScope,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): void {
+  // Consumers that receive an accepted frame from the commit authority already
+  // have the validation result. Update their local cache from the transcript
+  // and authority head without running the expensive authority checks again.
+  scope.serialized = applyShadowTranscriptToCommittedState(scope.serialized, transcript);
+  scope.head = structuredClone(accepted.position) as ShadowScopeHead;
+  if (accepted.id) scope.submissions.set(accepted.id, structuredClone(accepted) as ShadowCommitAccepted);
+}
+
 function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowCommitSubmit): string[] {
   const errors: string[] = [];
   if (submit.scope !== scope.scope || submit.transcript.scope !== scope.scope) {

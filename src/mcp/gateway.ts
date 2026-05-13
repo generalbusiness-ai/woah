@@ -22,7 +22,7 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
-import { submitShadowCommit, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 
@@ -96,8 +96,8 @@ export class McpGateway {
 
   constructor(private world: WooWorld, private options: McpGatewayOptions = {}) {
     const dispatch = options.v2 ? {
-      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[]) =>
-        await this.invokeV2Direct(sessionId, actor, target, verb, args),
+      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null) =>
+        await this.invokeV2Direct(sessionId, actor, target, verb, args, scope),
       call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) =>
         await this.invokeV2Call(sessionId, actor, space, message)
     } satisfies McpDispatchHooks : options.dispatch;
@@ -266,9 +266,13 @@ export class McpGateway {
     actor: ObjRef,
     target: ObjRef,
     verb: string,
-    args: WooValue[]
+    args: WooValue[],
+    scope?: ObjRef | null
   ): Promise<DirectResultFrame | ErrorFrame> {
-    const frame = await this.invokeV2(sessionId, actor, "direct", target, verb, args);
+    // Direct calls record under their live audience when there is one, and
+    // under the shadow direct-call scope (`#-1`) otherwise. McpHost passes the
+    // tool's enclosing scope so the CommitScopeDO route matches the transcript.
+    const frame = await this.invokeV2(sessionId, actor, "direct", target, verb, args, scope ?? "#-1");
     if (frame.op === "applied") throw new Error(`v2 direct call returned applied frame: ${target}:${verb}`);
     return frame;
   }
@@ -341,8 +345,12 @@ export class McpGateway {
     });
     const replyEnvelope = result.reply ? decodeEnvelope<ShadowTurnExecReply>(result.reply) : null;
     const reply = replyEnvelope?.body;
-    if (!reply) return planned.frame;
+    if (!reply) {
+      if (result.head) client.relay.commit_scope.head = result.head;
+      return planned.frame;
+    }
     if (!reply.ok) {
+      if (result.head) client.relay.commit_scope.head = result.head;
       return { op: "error", id, error: { code: reply.reason, message: reply.reason, value: reply as unknown as WooValue } };
     }
     if (reply.commit) {
@@ -385,18 +393,9 @@ export class McpGateway {
 
   private acceptV2Commit(client: V2ScopeClient, reply: Extract<ShadowTurnExecReply, { ok: true }>, originSessionId: string): void {
     if (!reply.commit || !reply.transcript) return;
-    const accepted = submitShadowCommit(client.relay.commit_scope, {
-      kind: "woo.commit.submit.shadow.v1",
-      id: reply.id ?? reply.transcript.id,
-      scope: client.scope,
-      expected: client.relay.commit_scope.head,
-      transcript: reply.transcript,
-      executor: "mcp-v2"
-    });
-    if (accepted.kind === "woo.commit.accepted.shadow.v1") {
-      this.world.importWorld(client.relay.commit_scope.serialized);
-      this.host.routeShadowAcceptedFrame(reply.commit, originSessionId);
-    }
+    applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
+    this.world.applyCommittedShadowTranscript(reply.transcript);
+    this.host.routeShadowAcceptedFrame(reply.commit, originSessionId);
   }
 
   private scopeForV2Call(actor: ObjRef, target: ObjRef): ObjRef {

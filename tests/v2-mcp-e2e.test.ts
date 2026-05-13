@@ -52,6 +52,13 @@ describe("v2 MCP e2e", () => {
         position: { scope: "the_chatroom", seq: 1 },
         observations: expect.arrayContaining([expect.objectContaining({ type: "said" })])
       });
+
+      await mcp(gateway, alice, 3, "tools/call", {
+        name: "woo_wait",
+        arguments: { timeout_ms: 0, limit: 10 }
+      });
+      const afterWait = sqlRows<{ n: number }>(scopeState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
+      expect(afterWait).toBe(1);
     } finally {
       scopeState.close();
     }
