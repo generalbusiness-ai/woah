@@ -577,6 +577,69 @@ describe("McpHost", () => {
     aliceInstance.dispose();
   });
 
+  it("refreshes tool lists for v2 accepted-frame observers", async () => {
+    const world = bootstrapWorld();
+    const alice = world.auth("guest:mcp-v2-refresh-alice");
+    const bob = world.auth("guest:mcp-v2-refresh-bob");
+    const host = new McpHost(world);
+    const bobInstance = createMcpServer({ world, host, actor: bob.actor, sessionId: bob.id });
+    let bobNotifications = 0;
+    (bobInstance.server as unknown as { notification: (notification: unknown) => Promise<void> }).notification = async () => { bobNotifications += 1; };
+    await host.refreshToolList(bob.id, bob.actor);
+
+    world.applyCommittedShadowTranscript({
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "mcp-v2-observer-refresh",
+      route: "direct",
+      scope: "the_chatroom",
+      seq: -1,
+      session: alice.id,
+      call: { actor: alice.actor, target: "the_chatroom", verb: "enter", args: [] },
+      reads: [],
+      writes: [
+        { cell: { kind: "prop", object: "the_chatroom", name: "subscribers" }, value: [bob.actor, alice.actor], op: "set" },
+        { cell: { kind: "prop", object: "the_chatroom", name: "session_subscribers" }, value: [
+          { session: bob.id, actor: bob.actor },
+          { session: alice.id, actor: alice.actor }
+        ], op: "set" },
+        { cell: { kind: "location", object: alice.actor }, value: "the_chatroom", op: "move" }
+      ],
+      creates: [],
+      moves: [{ object: alice.actor, from: "$nowhere", to: "the_chatroom" }],
+      observations: [{ type: "entered", actor: alice.actor, room: "the_chatroom", text: "Alice entered.", ts: 1 }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: "mcp-v2-observer-refresh"
+    });
+    host.routeShadowAcceptedFrame({
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-observer-refresh",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 1, hash: "head" },
+      transcript_hash: "mcp-v2-observer-refresh",
+      post_state_hash: "post",
+      observations: [{ type: "entered", actor: alice.actor, room: "the_chatroom", text: "Alice entered.", ts: 1 }],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: "mcp-v2-observer-refresh",
+        route: "direct",
+        scope: "the_chatroom",
+        seq: -1,
+        transcript_hash: "mcp-v2-observer-refresh",
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      }
+    }, alice.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(bobNotifications).toBe(1);
+    bobInstance.dispose();
+  });
+
   it("does not enumerate remote tools while sending post-call list_changed hints", async () => {
     const world = bootstrapWorld();
     // The bridge below declares the_chatroom remote; the lazy-refresh contract

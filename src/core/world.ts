@@ -5705,6 +5705,10 @@ export class WooWorld {
       }
       case "lifecycle":
       case "verb":
+        // The MCP v2 gateway cache does not currently surface verb edits or
+        // lifecycle deletes. CommitScopeDO's serialized state remains
+        // authoritative for those changes; the gateway cache handles the
+        // object/property/location/log deltas that MCP tool routing needs.
         return;
     }
   }

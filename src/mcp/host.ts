@@ -181,6 +181,7 @@ export class McpHost {
   // observation recipients first and then by scope subscription/presence.
   routeShadowAcceptedFrame(frame: ShadowCommitAccepted, originSessionId?: string | null): void {
     if (!frame.observations.length) return;
+    const refreshSessions = new Set<string>();
     for (const observation of frame.observations) {
       const directed = directedRecipients(observation);
       const directedActors = new Set<ObjRef>();
@@ -192,8 +193,15 @@ export class McpHost {
         const shouldDeliver = directedActors.size > 0
           ? directedActors.has(queue.actor)
           : this.actorSubscribes(queue.actor, frame.position.scope) || sessionLocation === frame.position.scope;
-        if (shouldDeliver) this.enqueueFor(sessionId, observation);
+        if (shouldDeliver) {
+          this.enqueueFor(sessionId, observation);
+          refreshSessions.add(sessionId);
+        }
       }
+    }
+    for (const sessionId of refreshSessions) {
+      const queue = this.queues.get(sessionId);
+      if (queue) void this.refreshToolList(sessionId, queue.actor).catch(() => {});
     }
   }
 
