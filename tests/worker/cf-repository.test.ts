@@ -126,6 +126,10 @@ class FakeDurableObjectNamespace {
   }
 }
 
+function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
+  return cursor.toArray() as T[];
+}
+
 type Harness = {
   world: WooWorld;
   restart: () => WooWorld;
@@ -615,6 +619,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(replies[0].body.commit.serialized_after).toBeUndefined();
       expect(envelopeBodies[0]?.sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: session.id, actor: session.actor })]));
       expect(envelopeBodies[0]).not.toHaveProperty("serialized");
+      const scopeState = commitStates.get("#-1");
+      expect(scopeState).toBeDefined();
+      expect(sqlRows(scopeState!.storage.sql.exec("SELECT scope FROM v2_commit_scope_meta"))).toEqual([{ scope: "#-1" }]);
+      expect(sqlRows(scopeState!.storage.sql.exec("SELECT seq FROM v2_commit_scope_accepted_frame"))).toEqual([{ seq: 1 }]);
+      expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_transcript_tail"))[0]).toMatchObject({ n: 1 });
+      expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
+      expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_snapshot"))[0]).toMatchObject({ n: 0 });
 
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
       const replayed = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
