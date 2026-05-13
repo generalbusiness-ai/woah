@@ -7,6 +7,18 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+want to integrate this as a hermes plugin
+- run locally (with ability to switch to cloud just by providing a URL in config)
+- local runtime has:
+    - one running woo instance, shared across hermes profiles
+    - each hermes profile *automatically gets a programmer actor*
+    - each hermes profile gets their own instance of the MCP
+
+- hermes localhost interface:
+
+- onboarding:
+    - create a user *from a hermes profile*
+
 - edges, or reverse-objref indexes
 
     thing about our object model is, it's not really a graph
@@ -180,3 +192,4 @@ Done:
 - ~~minimal authoring on-ramp~~ — first draft in `spec/authoring/minimal-ide.md`
 . docs rewrite for clarity
 . chat resize-bar stopped working
+. woah
