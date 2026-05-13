@@ -1199,6 +1199,8 @@ The next state-plane implementation step is page/cell closure transfer:
 - decide when inherited class bytecode can be named by hash instead of inlined;
 - replace the shadow MAC with real signatures/proofs over a scope head or
   accepted receipt;
+- before any non-shadow use, replace the current `sha256(prefix:secret:root)`
+  dev-key construction with `crypto.createHmac("sha256", secret)`;
 - apply object/property-level authorization filtering before exposing transfer
   data to browser or mobile actor nodes.
 

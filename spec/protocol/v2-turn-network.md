@@ -153,7 +153,8 @@ inputs. A turn that needs time receives it through `LogicalInputs`.
 
 ### VTN4.1 Wire encoding
 
-The first browser-relay transport profile uses **JSON-per-WebSocket-message**:
+The first browser-relay transport profile uses **JSON-per-WebSocket-message**;
+see VTN19 for the M4 WebSocket binding that carries this profile:
 
 - every WebSocket data frame contains exactly one UTF-8 JSON object;
 - the JSON object MUST be an `Envelope<T>`;
@@ -184,8 +185,16 @@ and cross-deployment work; M4 implementations MUST NOT accept them on the
 browser-relay WebSocket.
 
 Session tokens are minted by the existing v1-authenticated HTTP gateway before
-the v2 WebSocket opens. The minting request is outside this v2 transport spec,
-but the resulting token MUST be a bearer credential scoped to:
+the v2 WebSocket opens. The reserved mint path is:
+
+```text
+POST /v2/session/mint
+```
+
+The full HTTP request/response contract is specified by the gateway profile,
+but the gateway MUST issue a token whose claims are the canonical projection of
+the v1-authenticated session state at mint time. The resulting token MUST be a
+bearer credential scoped to:
 
 - `session`: session id;
 - `actor`: actor object id;
@@ -203,6 +212,11 @@ canonical subset of the token claims: `session`, `actor`, `deployment`,
 invent or modify `auth.claims`; relays either fill it before internal dispatch
 or reject the envelope.
 
+Relays MUST reject a session token whose `deployment` claim does not match the
+relay's own deployment id. Relays MUST also reject a token whose `rev` does not
+match the current revocation/version counter in the relay or gateway session
+store.
+
 Session tokens MUST expire no later than 15 minutes after minting. A relay MAY
 issue a refreshed token on an authenticated control message before expiry.
 Revocation is checked by `(session, rev)` against the relay/gateway session
@@ -218,7 +232,8 @@ anonymous advisory messages.
 The tuple `(from, id)` is the envelope idempotency key unless a body-level
 `turn.id` or `submit.id` narrows the key further. Receivers MUST make retry of
 the same authority-bearing message idempotent for the configured retention
-window.
+window. In the M4 browser-relay profile, the relay advertises that window in
+`TransportHello.idempotency_window_ms`; it MUST be at least 300000 ms.
 
 ## VTN5. Cells and atoms
 
@@ -634,11 +649,22 @@ type CatchupReply = {
   has_more: boolean;
   state_transfer?: StateTransfer; // projection fallback when delta tail is gone
 };
+
+type TransportError = {
+  kind: "woo.transport.error.v1";
+  code: string;
+  message: string;
+  envelope_id?: string;
+};
 ```
 
 `AppliedFrame` is the durable successor of the v1 `op:"applied"` frame. It is
 the canonical subscription frame for committed observations and materialized
 state changes. Clients MUST treat missing positions as gaps and use catch-up.
+`Subscribe.wants` uses `"both"` because a subscription can stream applied
+frames and projection updates together. `CatchupRequest.wants` uses
+`"transcript"` instead because catch-up may explicitly ask for audit/replay
+material rather than display projection.
 
 After a browser reconnects, it MUST NOT assume the relay buffered frames while
 the socket was absent. For every subscribed scope, the browser sends
@@ -956,13 +982,16 @@ relay. Relays MAY keep only the newest live event for the same coalesce key
 under backpressure.
 
 Live event decoders MUST reject payloads that attempt to carry durable writes.
-In the M4 JSON profile, a live event body MUST NOT contain any of these
-top-level fields: `writes`, `creates`, `moves`, `transcript`, `commit`,
-`receipt`, `state_transfer`, `applied`, `schedule`, or `cancellations`. Live
+The **durability-reserved envelope fields** are `writes`, `creates`, `moves`,
+`transcript`, `commit`, `receipt`, `state_transfer`, `applied`, `schedule`, and
+`cancellations`. In the M4 JSON profile, a live event body MUST NOT contain any
+durability-reserved envelope field. Future durable payload shapes MUST either
+extend this named set or explain why the field is safe on the live plane. Live
 observations also MUST NOT use catalog observation types reserved for committed
-durable changes unless the catalog marks that type as live-safe. A rejected live
-event is dropped and MAY be reported to the sender as a protocol error; it MUST
-NOT be converted into a commit request.
+durable changes unless the catalog marks that observation schema
+`live: true`, as defined in catalogs CT5.5. A rejected live event is dropped
+and MAY be reported to the sender as a protocol error; it MUST NOT be converted
+into a commit request.
 
 Live events cover:
 
@@ -1444,8 +1473,13 @@ VTN19 defines the M4 browser-to-relay transport binding. It is intentionally
 narrow: one browser node, one relay, one WebSocket, JSON envelopes only.
 Node-node transport, binary page transfer, `same_deployment_mac`, and
 cross-deployment signatures are deferred to M5.
+Transport is foundational to all four planes, but this section lives after the
+turn/state/live definitions so its message names can refer to those sections.
 
 ### VTN19.1 WebSocket endpoint and open handshake
+
+Authority-bearing v2 browser-relay connections MUST use `wss://`. `ws://` is
+permitted only for `localhost`, `127.0.0.1`, or `[::1]` development endpoints.
 
 The browser opens:
 
@@ -1460,6 +1494,10 @@ the socket is established, every envelope repeats the bearer token in
 `auth.token` as specified in VTN4.2. Deployments that log URLs MUST redact the
 `token` query parameter.
 
+The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
+reject the upgrade with HTTP 400. A server that accepts the WebSocket without
+selecting that subprotocol is not a conforming M4 v2 relay.
+
 The relay's first message MUST be:
 
 ```ts
@@ -1470,6 +1508,7 @@ type TransportHello = {
   actor: ActorRef;
   server_time: number;
   max_message_bytes: number;
+  idempotency_window_ms: number;
   planes: Array<"execution" | "commit" | "state" | "live">;
   resume_token?: string;
   features: string[];
@@ -1481,6 +1520,11 @@ The browser MUST NOT send authority-bearing envelopes until it receives
 MUST close the WebSocket with a policy/auth failure reason. The relay MAY accept
 idempotent `ping` control frames before hello only to keep intermediaries from
 closing a slow-auth connection.
+
+`TransportHello.actor` is the relay-validated actor from the session token. If
+it differs from the browser's cached actor, the browser MUST treat
+`TransportHello.actor` as authoritative and discard local state bound to the
+previous actor.
 
 ### VTN19.2 Plane multiplexing
 
@@ -1502,6 +1546,10 @@ by `ScopeHead`, not by WebSocket arrival order. A relay MUST NOT let a live
 message overtake or rewrite durable committed state; if a live event and an
 applied frame affect the same display field, the browser's projection rules
 decide which layer is visible.
+
+If a browser sends an envelope whose derived plane is not in
+`TransportHello.planes`, the relay MUST reply with `woo.transport.error.v1` and
+MAY close the socket. This is a protocol error, not an unknown-message no-op.
 
 ### VTN19.3 Ping, idle, and backpressure
 
@@ -1530,6 +1578,16 @@ event per coalesce key. Relays MUST NOT drop accepted commit frames on an open
 socket silently; if an accepted-frame queue overflows, the relay MUST send a
 transport gap/error and force the browser through VTN9 catch-up.
 
+Close-code profile for M4:
+
+- use `1002` for malformed envelopes, unknown types, unsupported planes, and
+  other protocol violations;
+- use `1008` for authentication, authorization, expiry, or revocation policy
+  failures;
+- use `1009` for message-too-big;
+- deployment-specific `4000`-`4999` close codes MAY add detail, but clients
+  MUST handle the standard code class above.
+
 ### VTN19.4 Reconnect and resume
 
 `resume_token` is a transport convenience, not durable state authority. It lets
@@ -1545,7 +1603,7 @@ On reconnect, the browser MUST:
 3. resubmit `Subscribe` for desired scopes, including last-known heads;
 4. run VTN9 catch-up for each scope;
 5. re-send only idempotent pending turn requests whose `(from, id)` keys remain
-   valid.
+   valid within `TransportHello.idempotency_window_ms`.
 
 The relay MAY restore live subscriptions from `resume_token`, but the browser
 still sends explicit `Subscribe` messages so reconnect is correct when the

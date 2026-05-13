@@ -355,7 +355,7 @@ Repair/update remains an explicit sequenced operation through
     }
   ],
   "schemas": [
-    {"on": "$loop_slot", "type": "loop_started", "shape": {...}}
+    {"on": "$loop_slot", "type": "loop_started", "shape": {...}, "live": false}
   ],
   "seed_hooks": [
     {"kind": "create_instance", "class": "$loop_slot", "as": "slot_1", "anchor": "the_dubspace"},
@@ -388,6 +388,11 @@ must add their object without knowing what other catalogs contributed. Catalogs
 use `change_parent` only for explicit opt-in surface changes such as making
 `$wiz` inherit a newly installed programmer class; it is not a hidden privilege
 grant.
+
+Schema entries may set `live: true` to declare that the observation type is safe
+on the v2 live plane. Omitted `live` means `false`: the observation type is
+reserved for committed/durable delivery unless another spec explicitly permits
+it.
 
 `set_property` hooks run with installer authority during install and repair.
 Reviewers must treat them as wizard-authored property writes, especially when
