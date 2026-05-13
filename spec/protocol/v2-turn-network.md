@@ -374,13 +374,25 @@ incomplete transcript as a durable turn. It MAY store incomplete transcripts as
 diagnostics. `incomplete_reasons` is a diagnostic annotation and is only
 meaningful when `complete` is false.
 
+Shadow v2 does not merge cross-host bridge sub-transcripts. When execution hits
+a runtime host bridge such as dispatch, remote property access, movement, or
+remote contents lookup, the recorder marks the caller transcript incomplete and
+attaches a `woo.remote_bridge_transcript_policy.shadow.v1` diagnostic policy
+value saying that sub-transcripts are deferred and the commit result is
+`reject`. This is intentional: the prototype either executes a whole turn on
+one capable node, or refuses to commit the partial local transcript. A later
+execution-plane milestone may replace this diagnostic boundary with a signed
+callee transcript that can be merged and validated by the caller's commit
+scope.
+
 The current implementation emits `kind: "woo.effect_transcript.shadow.v1"`.
 That shadow shape is intentionally not wire-compatible with the production
 `woo.effect_transcript.v1`: it may omit `base`, `vm`, `pre_state_hash`, and
-`post_state_hash`, and it records logical inputs as a flat ordered list. Shadow
-transcripts MUST NOT be submitted as production commits. They may be converted
-by a later milestone once a `ScopeHead`, accepted VM/catalog hashes, and
-pre/post state hashes are available.
+`post_state_hash`; records logical inputs as a flat ordered list; and may carry
+shadow-only incomplete-effect diagnostics. Shadow transcripts MUST NOT be
+submitted as production commits. They may be converted by a later milestone once
+a `ScopeHead`, accepted VM/catalog hashes, and pre/post state hashes are
+available.
 
 Dispatch reads SHOULD contribute to `vm.verb_hashes`. The shadow recorder
 currently records the resolved definer, owner, version, `source_hash`,
@@ -943,7 +955,9 @@ create/write facts rather than the pre-turn world. Deterministic native helpers
 are admitted only when a `woo.native_primitive_contract.shadow.v1` contract
 declares the handler transcript-tracked and deterministic, including the state
 families it reads, writes, and emits. Native dispatches without such a contract
-make the transcript incomplete.
+make the transcript incomplete. Runtime cross-host bridge boundaries are also
+explicitly incomplete in the shadow protocol; mergeable remote sub-transcripts
+are deferred until the execution plane exists.
 
 ### Dubspace
 

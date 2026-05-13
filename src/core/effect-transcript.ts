@@ -45,6 +45,11 @@ export type TranscriptMove = {
   writer?: RecordedWriteAuthority;
 };
 
+export type TranscriptUntrackedEffect = {
+  name: string;
+  detail: WooValue | null;
+};
+
 export type EffectTranscript = {
   kind: "woo.effect_transcript.shadow.v1";
   id?: string;
@@ -59,6 +64,7 @@ export type EffectTranscript = {
   moves: TranscriptMove[];
   observations: Observation[];
   logicalInputs: Array<{ name: string; value: WooValue }>;
+  untrackedEffects: TranscriptUntrackedEffect[];
   result?: WooValue;
   error?: ErrorValue;
   complete: boolean;
@@ -80,6 +86,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const moves: TranscriptMove[] = [];
   const observations: Observation[] = [];
   const logicalInputs: Array<{ name: string; value: WooValue }> = [];
+  const untrackedEffects: TranscriptUntrackedEffect[] = [];
   const incompleteReasons = new Set<string>();
   let result: WooValue | undefined;
   let error: ErrorValue | undefined;
@@ -172,6 +179,10 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         }
         break;
       case "untracked_effect":
+        untrackedEffects.push({
+          name: event.name,
+          detail: event.detail ? structuredClone(event.detail) as WooValue : null
+        });
         incompleteReasons.add(event.name);
         break;
       case "turn_finish":
@@ -202,6 +213,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     moves,
     observations,
     logicalInputs,
+    untrackedEffects,
     result,
     error,
     complete: incompleteReasons.size === 0,

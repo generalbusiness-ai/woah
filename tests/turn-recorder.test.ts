@@ -3,6 +3,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld } from "../src/core/effect-transcript";
+import { remoteBridgeEffectName } from "../src/core/remote-bridge-transcript-policy";
 import { shadowCommitReceipt } from "../src/core/turn-commit";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { comparableTurnEvents, replayRecordedTurn } from "../src/core/turn-replay";
@@ -233,7 +234,7 @@ describe("turn recorder", () => {
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
-  it("marks cross-host dispatch as incomplete until remote transcripts are merged", async () => {
+  it("marks cross-host dispatch as explicit incomplete_transcript until remote sub-transcripts are implemented", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-remote");
     const actor = session.actor;
@@ -255,6 +256,7 @@ describe("turn recorder", () => {
       isDescendantOf: async () => false,
       dispatch: async () => 7
     } as unknown as HostBridge);
+    const before = world.exportWorld();
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);
 
@@ -263,7 +265,26 @@ describe("turn recorder", () => {
     expect(result).toMatchObject({ op: "result", result: 7 });
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     expect(transcript.complete).toBe(false);
-    expect(transcript.incompleteReasons).toContain("remote_dispatch");
+    expect(transcript.incompleteReasons).toContain(remoteBridgeEffectName("dispatch"));
+    expect(transcript.untrackedEffects).toContainEqual({
+      name: remoteBridgeEffectName("dispatch"),
+      detail: expect.objectContaining({
+        target: "remote_box",
+        verb: "ping",
+        start_at: null,
+        transcript_policy: expect.objectContaining({
+          kind: "woo.remote_bridge_transcript_policy.shadow.v1",
+          boundary: "cross_host_bridge",
+          operation: "dispatch",
+          policy: "incomplete_transcript",
+          subtranscripts: "deferred",
+          commit_result: "reject"
+        })
+      })
+    });
+    const receipt = shadowCommitReceipt(before, world.exportWorld(), transcript);
+    expect(receipt.accepted).toBe(false);
+    expect(receipt.errors).toContain(`incomplete:${remoteBridgeEffectName("dispatch")}`);
   });
 
   it("records placement writes for authored moves", async () => {

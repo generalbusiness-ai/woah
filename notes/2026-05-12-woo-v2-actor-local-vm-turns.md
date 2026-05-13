@@ -953,8 +953,9 @@ The first runtime slice now exists as a shadow recorder, not a network feature:
   transcript incomplete. That keeps the dispatch dependency auditable without
   pretending the native handler's internals have been proven deterministic.
 - Cross-host runtime bridge calls currently mark the shadow transcript
-  incomplete, because this slice does not yet merge a remote transcript into the
-  caller's transcript.
+  incomplete and carry a `woo.remote_bridge_transcript_policy.shadow.v1`
+  diagnostic policy. This slice deliberately does not merge a remote transcript
+  into the caller's transcript.
 - `tests/turn-recorder.test.ts` covers one direct bytecode mutator, one
   sequenced dubspace control mutation, bytecode verb/location/contents reads,
   native and remote-dispatch incompleteness, owner-read validation, placement
@@ -1176,12 +1177,15 @@ The local commit model has a first implementation:
   contract registry instead of an inline allowlist. Native dispatch reads carry
   the contract value, and uncontracted native dispatches still mark transcripts
   incomplete.
-- remaining: decide how remote sub-transcripts are merged, or keep cross-host
-  bridge calls explicitly incomplete until the execution plane is in place.
+- done: remote host bridge boundaries are explicitly policy-deferred. The
+  current shadow protocol keeps them incomplete, preserves the bridge operation
+  detail for diagnostics, and rejects the transcript rather than pretending a
+  mergeable callee sub-transcript exists.
 
-The remaining work in that layer is to make remote bridge/sub-transcript
-behavior explicit and expand the primitive contract model from the two current
-shadow-safe helpers into a production primitive catalog.
+The remaining work in that layer is to expand the primitive contract model from
+the two current shadow-safe helpers into a production primitive catalog and,
+later, replace the remote bridge diagnostic with signed mergeable callee
+sub-transcripts.
 
 The next state-plane implementation step is page/cell closure transfer:
 

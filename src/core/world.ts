@@ -31,6 +31,7 @@ import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPur
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
+import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -1304,7 +1305,8 @@ export class WooWorld {
   async getPropChecked(progr: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      this.recordUntrackedEffect("remote_get_prop", { progr, object: objRef, property: name });
+      const effect = remoteBridgeUntrackedEffect("get_prop", { progr, object: objRef, property: name });
+      this.recordUntrackedEffect(effect.name, effect.detail);
       return await this.hostBridge.getPropChecked(progr, objRef, name, memo);
     }
     if (!this.canReadProperty(progr, objRef, name)) {
@@ -1325,7 +1327,8 @@ export class WooWorld {
   async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue, memo?: HostOperationMemo): Promise<void> {
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      this.recordUntrackedEffect("remote_set_prop", { progr, object: objRef, property: name });
+      const effect = remoteBridgeUntrackedEffect("set_prop", { progr, object: objRef, property: name });
+      this.recordUntrackedEffect(effect.name, effect.detail);
       await this.hostBridge.setPropChecked(progr, objRef, name, value, memo);
       return;
     }
@@ -3059,7 +3062,8 @@ export class WooWorld {
     let result: WooValue;
     if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      this.recordUntrackedEffect("remote_dispatch", { target, verb: verbName, start_at: startAt ?? null });
+      const effect = remoteBridgeUntrackedEffect("dispatch", { target, verb: verbName, start_at: startAt ?? null });
+      this.recordUntrackedEffect(effect.name, effect.detail);
       result = await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
     } else {
       if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
@@ -4801,7 +4805,8 @@ export class WooWorld {
   async moveObjectChecked(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {
     if (await this.remoteHostForObject(objRef)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      this.recordUntrackedEffect("remote_move", { object: objRef, target: targetRef });
+      const effect = remoteBridgeUntrackedEffect("move", { object: objRef, target: targetRef });
+      this.recordUntrackedEffect(effect.name, effect.detail);
       return await this.hostBridge.moveObject(objRef, targetRef, options);
     }
     return await this.moveObjectOwned(objRef, targetRef, options);
@@ -4927,7 +4932,8 @@ export class WooWorld {
       return obj.location;
     }
     if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-    this.recordUntrackedEffect("remote_location", { object: objRef });
+    const effect = remoteBridgeUntrackedEffect("location", { object: objRef });
+    this.recordUntrackedEffect(effect.name, effect.detail);
     return await this.hostBridge.location(objRef, memo);
   }
 
@@ -6539,7 +6545,8 @@ export class WooWorld {
     if (remote) {
       if (options.suppressMirrorHost && remote === options.suppressMirrorHost) return;
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      this.recordUntrackedEffect("remote_mirror_contents", { container: containerRef, object: objRef, present });
+      const effect = remoteBridgeUntrackedEffect("mirror_contents", { container: containerRef, object: objRef, present });
+      this.recordUntrackedEffect(effect.name, effect.detail);
       await this.hostBridge.mirrorContents(containerRef, objRef, present);
       return;
     }
@@ -7996,7 +8003,8 @@ export class WooWorld {
   private async objectContents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]> {
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      this.recordUntrackedEffect("remote_contents", { object: objRef });
+      const effect = remoteBridgeUntrackedEffect("contents", { object: objRef });
+      this.recordUntrackedEffect(effect.name, effect.detail);
       return await this.hostBridge.contents(objRef, memo);
     }
     return this.contentsOf(objRef);
