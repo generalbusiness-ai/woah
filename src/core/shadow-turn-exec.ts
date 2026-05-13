@@ -409,6 +409,10 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
   }
   if (transfer.mode === "cell_pages") {
     node.serialized = mergeCellPageTransfer(node.serialized, transfer, node.page_cache);
+    // Cell pages replace individual serialized cells. Any already-unpacked
+    // WooWorld was built from the old cell versions, so replay must rebuild
+    // before recording the retry transcript.
+    node.world = undefined;
     for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
     for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
     refreshNodeObjectHashes(node);
