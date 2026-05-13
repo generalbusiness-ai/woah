@@ -1067,10 +1067,11 @@ frame, transcript tail, and refreshed projection, and relay MAC proofs are
 verified before cache install. The shim also includes scope subscriptions and
 best-effort live-event fan-out with coalescing, without advancing the
 commit-scope head. The browser-side M4 worker opens the v2 WebSocket, persists
-hello/reply/pending-frame state in IndexedDB, replays pending envelopes after
-reconnect, and marks reset/catch-up-needed state when the relay reports reset.
-It currently runs alongside the legacy `/ws` UI path while the UI is migrated to
-consume v2 committed state directly.
+hello/reply/pending-frame state in IndexedDB, applies received projection/delta
+state transfers into projection, applied-frame, and transcript-tail stores,
+replays pending envelopes after reconnect, and marks reset/catch-up-needed state
+when the relay reports reset. It currently runs alongside the legacy `/ws` UI
+path while the UI is migrated to consume v2 committed state directly.
 
 M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.

@@ -1,4 +1,7 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import type { EffectTranscript } from "../core/effect-transcript";
+import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
 
 type V2WorkerCommand =
   | { kind: "connect"; token: string; node?: string; scope?: string }
@@ -17,15 +20,21 @@ type PendingEnvelope = {
 type V2CacheStatus = {
   connected: boolean;
   pending: number;
+  projections: number;
+  applied_frames: number;
+  transcript_tail: number;
   last_hello?: unknown;
   catchup_required?: boolean;
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const FRAME_STORE = "frames";
+const PROJECTION_STORE = "projections";
+const APPLIED_STORE = "applied_frames";
+const TRANSCRIPT_STORE = "transcript_tail";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -128,15 +137,7 @@ async function receiveFrame(encoded: string): Promise<void> {
   // relay and in-process tests.
   const envelope = decodeEnvelope(encoded);
   await putFrame(envelope);
-  if (envelope.type === "woo.transport.hello.v1") {
-    await putMeta("hello", envelope.body);
-    await putMeta("catchup_required", false);
-  } else if (envelope.type === "woo.transport.error.v1") {
-    const body = envelope.body as { code?: unknown };
-    if (body.code === "E_RESET") await putMeta("catchup_required", true);
-  } else if (envelope.reply_to) {
-    await deletePending(envelope.reply_to);
-  }
+  for (const mutation of v2BrowserCacheMutationsForEnvelope(envelope)) await applyCacheMutation(mutation);
   postMessage({ kind: "frame", envelope });
   postStatus();
 }
@@ -203,6 +204,9 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(META_STORE)) database.createObjectStore(META_STORE);
       if (!database.objectStoreNames.contains(PENDING_STORE)) database.createObjectStore(PENDING_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(FRAME_STORE)) database.createObjectStore(FRAME_STORE, { keyPath: "id" });
+      if (!database.objectStoreNames.contains(PROJECTION_STORE)) database.createObjectStore(PROJECTION_STORE, { keyPath: "scope" });
+      if (!database.objectStoreNames.contains(APPLIED_STORE)) database.createObjectStore(APPLIED_STORE, { keyPath: "id" });
+      if (!database.objectStoreNames.contains(TRANSCRIPT_STORE)) database.createObjectStore(TRANSCRIPT_STORE, { keyPath: "hash" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
@@ -227,20 +231,61 @@ async function deletePending(id: string): Promise<void> {
 }
 
 async function allPending(): Promise<PendingEnvelope[]> {
-  return await tx<PendingEnvelope[]>(PENDING_STORE, "readonly", (store) => store.getAll());
+  const pending = await tx<PendingEnvelope[]>(PENDING_STORE, "readonly", (store) => store.getAll());
+  return pending.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
 }
 
 async function putFrame(envelope: ShadowEnvelope): Promise<void> {
   await tx(FRAME_STORE, "readwrite", (store) => store.put({ id: envelope.id, envelope, received_at: Date.now() }));
 }
 
+async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<void> {
+  switch (mutation.kind) {
+    case "meta":
+      await putMeta(mutation.key, mutation.value);
+      return;
+    case "pending_delete":
+      await deletePending(mutation.id);
+      return;
+    case "projection":
+      await putProjection(mutation.scope, mutation.head, mutation.projection);
+      return;
+    case "applied_frame":
+      await putAppliedFrame(mutation.frame);
+      return;
+    case "transcript":
+      await putTranscript(mutation.transcript);
+      return;
+  }
+}
+
+async function putProjection(scope: string, head: unknown, projection: unknown): Promise<void> {
+  await tx(PROJECTION_STORE, "readwrite", (store) => store.put({ scope, head, projection, updated_at: Date.now() }));
+}
+
+async function putAppliedFrame(frame: ShadowCommitAccepted): Promise<void> {
+  const key = `${frame.position.scope}:${frame.position.seq}`;
+  await tx(APPLIED_STORE, "readwrite", (store) => store.put({ id: key, scope: frame.position.scope, seq: frame.position.seq, frame, received_at: Date.now() }));
+}
+
+async function putTranscript(transcript: EffectTranscript): Promise<void> {
+  await tx(TRANSCRIPT_STORE, "readwrite", (store) => store.put({ hash: transcript.hash, scope: transcript.scope, seq: transcript.seq, transcript, received_at: Date.now() }));
+}
+
 async function status(): Promise<V2CacheStatus> {
   return {
     connected: socket?.readyState === WebSocket.OPEN,
     pending: (await allPending()).length,
+    projections: await countStore(PROJECTION_STORE),
+    applied_frames: await countStore(APPLIED_STORE),
+    transcript_tail: await countStore(TRANSCRIPT_STORE),
     last_hello: await getMeta("hello"),
     catchup_required: await getMeta("catchup_required")
   };
+}
+
+async function countStore(storeName: string): Promise<number> {
+  return await tx<number>(storeName, "readonly", (store) => store.count());
 }
 
 function postStatus(): void {
