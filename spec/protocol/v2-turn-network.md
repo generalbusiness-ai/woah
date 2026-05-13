@@ -1075,7 +1075,10 @@ the dev server and Worker keep one shadow browser/relay pair alive so
 idempotency, subscriptions, catch-up tails, and browser cache state survive
 across frames. Durable CommitScopeDO-backed commit arbitration and persisted
 resume across Worker hibernation/reconnect are reserved by binding/migration but
-are not yet the live commit authority.
+are not yet the live commit authority. If the Worker hibernates and loses the
+in-memory relay table, the transitional M4 implementation replies with
+`woo.transport.error.v1`/`E_RESET`; the browser must resubscribe and run VTN9
+catch-up before submitting new authority-bearing turns.
 
 Browser-node dubspace preview flow:
 

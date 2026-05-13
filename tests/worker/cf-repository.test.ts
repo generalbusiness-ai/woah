@@ -364,6 +364,61 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("signals reset when Worker hibernation drops v2 socket-local relay state", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-reset-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    const internals = gateway as unknown as {
+      getWorld: (host?: string) => Promise<WooWorld>;
+      webSocketV2TurnNetworkMessage: (world: WooWorld, ws: WebSocket, message: string | ArrayBuffer) => Promise<void>;
+    };
+    class FakeWebSocket {
+      readonly sent: string[] = [];
+      send(data: string): void { this.sent.push(data); }
+      close(): void {}
+      deserializeAttachment(): unknown {
+        return {
+          protocol: "v2-turn-network",
+          sessionId: session.id,
+          actor: session.actor,
+          socketId: "v2-reset-socket",
+          node: "browser:reset-test",
+          token: "guest:cf-v2-reset"
+        };
+      }
+    }
+    let session: ReturnType<WooWorld["auth"]>;
+
+    try {
+      const world = await internals.getWorld("world");
+      session = world.auth("guest:cf-v2-reset");
+      const ws = new FakeWebSocket();
+      await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, "{}");
+
+      expect(ws.sent).toHaveLength(1);
+      expect(JSON.parse(ws.sent[0])).toMatchObject({
+        type: "woo.transport.error.v1",
+        body: { code: "E_RESET" }
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("emits startup storage metrics before world init completes", async () => {
     const logs: string[] = [];
     const logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {

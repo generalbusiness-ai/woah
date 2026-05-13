@@ -236,6 +236,9 @@ export class PersistentObjectDO {
   // on rehydrate and maintained on attach/detach.
   private socketsByActor = new Map<ObjRef, Set<WebSocket>>();
   private socketsBySession = new Map<string, Set<WebSocket>>();
+  // Transitional M4 state: one in-memory shadow browser per live v2 socket.
+  // CommitScopeDO persistence will replace this before large hibernated-socket
+  // counts matter; until then the map is bounded by this isolate's open sockets.
   private v2BrowserBySocket = new Map<string, ReturnType<typeof createShadowBrowserNode>>();
   // FIFO semaphore for outbound DO->DO fetch() concurrency. See
   // HOST_OUT_FETCH_CONCURRENCY. The releaser hands the slot directly to the
@@ -2627,9 +2630,26 @@ export class PersistentObjectDO {
       let browser = this.v2BrowserBySocket.get(att.socketId);
       if (!browser) {
         // Hibernation clears the in-memory socket table. Rehydrate once for the
-        // resumed socket; ordinary same-isolate traffic keeps this object alive.
+        // resumed socket, then force the browser through VTN9 catch-up because
+        // subscriptions and idempotent reply cache were isolate-local.
         browser = this.v2ShadowBrowser(world, { node: att.node, token: att.token, sessionId: att.sessionId, actor: att.actor });
         this.v2BrowserBySocket.set(att.socketId, browser);
+        ws.send(encodeEnvelope({
+          v: 2,
+          type: "woo.transport.error.v1",
+          id: `${this.durableHostKey()}:reset:${Date.now()}`,
+          from: this.durableHostKey(),
+          to: att.node,
+          actor: att.actor,
+          session: att.sessionId,
+          auth: { mode: "session", token: att.token },
+          body: {
+            kind: "woo.transport.error.v1",
+            code: "E_RESET",
+            message: "v2 relay state was reset; resubscribe and run catch-up"
+          }
+        } satisfies ShadowEnvelope<{ kind: "woo.transport.error.v1"; code: string; message: string }>));
+        return;
       }
       const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
       const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);

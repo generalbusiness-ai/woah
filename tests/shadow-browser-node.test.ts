@@ -450,7 +450,7 @@ describe("shadow browser node shim", () => {
     expect(browser.relay.live_events).toHaveLength(2);
   });
 
-  it("keeps wire dispatch state across envelopes on the same browser", async () => {
+  it("replays cached replies for duplicate wire turn requests on the same browser", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-state");
     await openShadowBrowserScope(browser);
     setShadowBrowserSessionToken(browser, "wire-token");
@@ -485,7 +485,8 @@ describe("shadow browser node shim", () => {
     expect(first.fresh).toBe(true);
     expect(firstReply?.body).toMatchObject({ kind: "woo.turn.exec.reply.shadow.v1", ok: true });
     expect(duplicate.fresh).toBe(false);
-    expect(duplicateReply).toBeNull();
+    expect(duplicateReply?.body).toEqual(firstReply?.body);
+    expect(duplicateReply?.reply_to).toBe("wire-env-1");
     expect(browser.cache.applied_frames).toHaveLength(1);
     expect(browser.relay.accepted_frames).toHaveLength(1);
   });

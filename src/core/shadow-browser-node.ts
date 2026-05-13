@@ -132,6 +132,7 @@ export type ShadowBrowserRelayShim = {
   session_revs: Map<string, number>;
   idempotency_window_ms: number;
   recently_seen: Map<string, number>;
+  recent_replies: Map<string, ShadowEnvelope>;
   accepted_frames: ShadowCommitAccepted[];
   transcript_tail: EffectTranscript[];
   live_events: ShadowLiveEvent[];
@@ -193,6 +194,7 @@ export type ShadowTransportError = {
 export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
   envelope: ShadowEnvelope<T>;
   fresh: boolean;
+  idempotency_key: string;
 };
 
 export type ShadowBrowserOpenScopeResult = {
@@ -253,6 +255,7 @@ export function createShadowBrowserRelayShim(input: {
     session_revs: sessionRevs,
     idempotency_window_ms: Math.max(input.idempotency_window_ms ?? MIN_SHADOW_IDEMPOTENCY_WINDOW_MS, MIN_SHADOW_IDEMPOTENCY_WINDOW_MS),
     recently_seen: new Map(),
+    recent_replies: new Map(),
     accepted_frames: [],
     transcript_tail: [],
     live_events: [],
@@ -305,7 +308,7 @@ export function setShadowBrowserSessionToken(browser: ShadowBrowserNode, token: 
   if (!browser.session_token) throw new Error("shadow browser session auth token is required");
   if (browser.session_token === token) return;
   const claims = browser.relay.session_auth.get(browser.session_token);
-  if (!claims) throw new Error("shadow browser session auth token is unknown");
+  if (!claims) throw new Error(`shadow browser session auth token is unknown: ${browser.session_token} session=${browser.session ?? "none"}`);
   browser.relay.session_auth.delete(browser.session_token);
   browser.relay.session_auth.set(token, claims);
   browser.session_token = token;
@@ -646,8 +649,8 @@ export function receiveShadowBrowserEnvelopeReceipt(browser: ShadowBrowserNode, 
   // The receipt exposes freshness to callers that perform side-effecting
   // request dispatch after decode; duplicate envelopes must authenticate and
   // decode successfully but must not execute a second turn.
-  const fresh = markShadowBrowserEnvelopeSeen(browser.relay, envelope);
-  if (!fresh) return { envelope, fresh };
+  const { fresh, key } = markShadowBrowserEnvelopeSeen(browser.relay, envelope);
+  if (!fresh) return { envelope, fresh, idempotency_key: key };
   switch (envelope.type) {
     case "woo.live.event.shadow.v1":
       assertShadowLiveEventIsEphemeral(envelope.body);
@@ -665,7 +668,7 @@ export function receiveShadowBrowserEnvelopeReceipt(browser: ShadowBrowserNode, 
   }
   // Types without a built-in dispatch arm are returned for caller-level
   // handling; the codec has already checked that they are known wire types.
-  return { envelope, fresh };
+  return { envelope, fresh, idempotency_key: key };
 }
 
 export async function handleShadowBrowserTurnExecEnvelope(
@@ -674,7 +677,11 @@ export async function handleShadowBrowserTurnExecEnvelope(
 ): Promise<ShadowEnvelope<ShadowTurnExecReply> | null> {
   // Keep wire turn-exec dispatch in the substrate so dev-server, Worker, and
   // future socket bindings share the same duplicate handling and reply shape.
-  if (!receipt.fresh || receipt.envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+  if (receipt.envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+  if (!receipt.fresh) {
+    const cached = browser.relay.recent_replies.get(receipt.idempotency_key);
+    return cached ? structuredClone(cached) as ShadowEnvelope<ShadowTurnExecReply> : null;
+  }
   const request = receipt.envelope.body as ShadowTurnExecRequest;
   const result = await executeShadowBrowserTurn(browser, {
     id: request.id ?? request.call.id,
@@ -686,7 +693,7 @@ export async function handleShadowBrowserTurnExecEnvelope(
     commit_policy: request.commit_policy
   });
   if (!result.result.reply) return null;
-  return {
+  const reply: ShadowEnvelope<ShadowTurnExecReply> = {
     v: 2,
     type: result.result.reply.kind,
     id: `${browser.relay.node}:reply:${result.id}`,
@@ -698,6 +705,10 @@ export async function handleShadowBrowserTurnExecEnvelope(
     auth: shadowBrowserAuth(browser),
     body: result.result.reply
   };
+  // Idempotency is reply-oriented: a client retrying because it missed the
+  // first reply must receive the same answer without re-running the turn.
+  browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(reply));
+  return reply;
 }
 
 export function roundTripShadowBrowserEnvelope<T>(browser: ShadowBrowserNode, type: string, body: T): ShadowEnvelope<T> {
@@ -848,15 +859,18 @@ function validateShadowBrowserAuth(
   return claims;
 }
 
-function markShadowBrowserEnvelopeSeen(relay: ShadowBrowserRelayShim, envelope: ShadowEnvelope, now = Date.now()): boolean {
+function markShadowBrowserEnvelopeSeen(relay: ShadowBrowserRelayShim, envelope: ShadowEnvelope, now = Date.now()): { fresh: boolean; key: string } {
   const cutoff = now - relay.idempotency_window_ms;
   for (const [key, seenAt] of relay.recently_seen) {
-    if (seenAt < cutoff) relay.recently_seen.delete(key);
+    if (seenAt < cutoff) {
+      relay.recently_seen.delete(key);
+      relay.recent_replies.delete(key);
+    }
   }
   const key = shadowBrowserIdempotencyKey(envelope);
-  if (relay.recently_seen.has(key)) return false;
+  if (relay.recently_seen.has(key)) return { fresh: false, key };
   relay.recently_seen.set(key, now);
-  return true;
+  return { fresh: true, key };
 }
 
 function shadowBrowserIdempotencyKey(envelope: Pick<ShadowEnvelope, "from" | "id">): string {
