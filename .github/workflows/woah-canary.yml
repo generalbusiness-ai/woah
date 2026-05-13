@@ -1,0 +1,40 @@
+name: woah-canary
+
+# Deployed-service canary for the public v2/MCP namespace. This intentionally
+# runs outside normal PR CI: it catches drift in Cloudflare config, Durable
+# Object state, Workers runtime behavior, and the live MCP transport that unit
+# tests cannot see.
+
+on:
+  schedule:
+    - cron: "13 * * * *"
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Deployed woo base URL to smoke"
+        required: false
+        default: "https://woah.inguz.workers.dev"
+
+concurrency:
+  group: woah-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mcp-smoke:
+    name: v2 MCP smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run deployed MCP smoke
+        env:
+          WOO_MCP_SMOKE_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.inguz.workers.dev' }}
+        run: npm run smoke:mcp
