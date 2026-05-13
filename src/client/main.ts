@@ -452,6 +452,7 @@ function ensureV2BrowserWorker() {
     if (event.data?.kind === "status") console.debug("woo.v2", event.data.status);
     if (event.data?.kind === "projection") {
       state.v2Projection = event.data as V2ProjectionMessage;
+      window.dispatchEvent(new CustomEvent("woo.v2.projection", { detail: state.v2Projection }));
       console.debug("woo.v2.projection", state.v2Projection);
     }
     // Frame/error messages are exposed now so the worker-cache wire path can be

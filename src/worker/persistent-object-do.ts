@@ -47,7 +47,6 @@ import type { SeedWorld, SerializedObject, SerializedSession, SerializedWorld, T
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
-import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { CFObjectRepository } from "./cf-repository";
@@ -181,10 +180,6 @@ function v2SessionAuthorityPayload(world: WooWorld): { sessions: SerializedSessi
   // full world snapshot back across the DO boundary.
   const sessions = world.exportSessions();
   return { sessions, session_objects: sessionActorObjects(world, sessions) };
-}
-
-function parseV2LastKnownHead(raw: string | null): ShadowScopeHead | undefined {
-  return parseShadowScopeHeadJson(raw);
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -2584,7 +2579,7 @@ export class PersistentObjectDO {
     const token = url.searchParams.get("token") ?? "";
     const node = url.searchParams.get("node") || `browser:${crypto.randomUUID()}`;
     const scope = (url.searchParams.get("scope") || "") as ObjRef;
-    const lastKnownHead = parseV2LastKnownHead(url.searchParams.get("last_known_head"));
+    const lastKnownHead = parseShadowScopeHeadJson(url.searchParams.get("last_known_head"));
     if (!token) return jsonResponse({ error: { code: "E_NOSESSION", message: "token query parameter is required" } }, 401);
     const session = this.authenticateToken(world, token);
     const commitScope = scope || session.actor;

@@ -106,7 +106,8 @@ async function connectTo(next: { token: string; node: string; scope: string }): 
   await postCachedProjection(current.scope);
   if (changed) {
     // A new scope needs a new WebSocket open so the relay can send a fresh
-    // TransportHello and projection/catch-up transfer for that scope.
+    // TransportHello and projection/catch-up transfer for that scope. Clear
+    // socket first so the old connection's close/error handlers are ignored.
     clearReconnect();
     const previous = socket;
     socket = null;

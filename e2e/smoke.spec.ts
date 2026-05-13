@@ -73,10 +73,14 @@ test("chat route mounts bundled UI while state is still cold-starting", async ({
 });
 
 test("browser worker receives initial v2 projection", async ({ page, request }) => {
-  const v2ProjectionLogs: string[] = [];
-  page.on("console", (message) => {
-    const text = message.text();
-    if (text.includes("woo.v2.projection")) v2ProjectionLogs.push(text);
+  let v2ProjectionEvents = 0;
+  await page.exposeFunction("recordV2ProjectionEvent", () => {
+    v2ProjectionEvents += 1;
+  });
+  await page.addInitScript(() => {
+    window.addEventListener("woo.v2.projection", () => {
+      void (window as unknown as { recordV2ProjectionEvent: () => Promise<void> }).recordV2ProjectionEvent();
+    });
   });
 
   const auth = await request.post("/api/auth", { data: { token: `guest:e2e-v2-browser-${crypto.randomUUID()}` } });
@@ -88,7 +92,7 @@ test("browser worker receives initial v2 projection", async ({ page, request }) 
   await page.goto("/objects/the_chatroom");
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
-  await expect.poll(() => v2ProjectionLogs.length, { timeout: 5_000 }).toBeGreaterThan(0);
+  await expect.poll(() => v2ProjectionEvents, { timeout: 5_000 }).toBeGreaterThan(0);
 });
 
 test("chat boot uses /api/me and moves without /api/state", async ({ page }) => {
