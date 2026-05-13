@@ -178,6 +178,7 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
+const v2AppliedFramesEnabled = new URLSearchParams(location.search).has("v2AppliedFrames");
 let scopedProjectionEnabled = (() => {
   const params = new URLSearchParams(location.search);
   if (params.get("api") === "state" || params.has("legacyState")) return false;
@@ -310,49 +311,7 @@ function connect() {
       if (!scopedProjectionEnabled && shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
     }
     if (frame.op === "applied") {
-      ui.ingestAppliedFrame(frame);
-      applyScopedMoveResult(frame.result);
-      const observations = frame.observations ?? [];
-      const frameErrors = appliedFrameErrorObservations({ observations });
-      receiveAppliedFrameErrors(frame, observations);
-      // Sequenced verb raises arrive as `$error` observations inside applied
-      // frames, so keep the pending handler until those observations route.
-      if (typeof frame.id === "string") {
-        const commandContext = pendingCommands.get(frame.id);
-        if (frameErrors.length > 0) ui.failOptimisticCall(frame.id);
-        else {
-          ui.completeOptimisticCall(frame.id);
-          if (commandContext) renderChatCommandResult(chatCommandUiActionFromMessage(frame.message), frame.result, commandContext.text);
-        }
-        pendingCommands.delete(frame.id);
-        pendingFrameErrors.delete(frame.id);
-      }
-      const pinboardAnimations = capturePinboardAnimations(observations);
-      const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
-      if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
-      if (!scopedProjectionEnabled) {
-        // Legacy /api/state mode still folds confirmed placement observations
-        // into its pinboard note array. Scoped mode gets the same fields
-        // through the framework reducer above.
-        for (const observation of observations) {
-          const type = String(observation?.type ?? "");
-          if (type === "pin_moved" || type === "pin_resized" || type === "note_moved" || type === "note_resized") {
-            const pinId = String(observation?.pin ?? observation?.id ?? "");
-            if (pinId) applyPinboardPlacementObservation(observation);
-          }
-        }
-      }
-      forgetLiveControls(observations);
-      if (observations.some((observation: any) => isDubspaceStateObservation(observation))) syncDubspaceProjectionEffects();
-      rememberTaskObservations(observations, typeof frame.id === "string" ? frame.id : undefined);
-      for (const observation of observations) if (isChatObservation(observation)) receiveChatEvent(observation, false);
-      state.observations.unshift({ seq: frame.seq, space: frame.space, observations, message: frame.message });
-      trimObservations();
-      rememberSeq(frame.space, frame.seq);
-      scheduleLegacyStateRefresh();
-      render();
-      if (needsPinboardNotesRefresh) refreshPinboardNotes();
-      animatePinboardNotes(pinboardAnimations);
+      receiveAppliedFrame(frame);
     }
     if (frame.op === "event") {
       ui.ingestLiveObservation(frame.observation);
@@ -457,7 +416,9 @@ function ensureV2BrowserWorker() {
       console.debug("woo.v2.projection", state.v2Projection);
     }
     if (event.data?.kind === "applied_frame") {
-      window.dispatchEvent(new CustomEvent("woo.v2.applied_frame", { detail: event.data as V2AppliedFrameMessage }));
+      const message = event.data as V2AppliedFrameMessage;
+      window.dispatchEvent(new CustomEvent("woo.v2.applied_frame", { detail: message }));
+      if (v2AppliedFramesEnabled && message.applied) receiveAppliedFrame(message.applied);
       console.debug("woo.v2.applied_frame", event.data);
     }
     // Frame/error messages are exposed now so the worker-cache wire path can be
@@ -481,6 +442,52 @@ function syncV2BrowserWorkerScope() {
     token,
     scope
   });
+}
+
+function receiveAppliedFrame(frame: any) {
+  ui.ingestAppliedFrame(frame);
+  applyScopedMoveResult(frame.result);
+  const observations = frame.observations ?? [];
+  const frameErrors = appliedFrameErrorObservations({ observations });
+  receiveAppliedFrameErrors(frame, observations);
+  // Sequenced verb raises arrive as `$error` observations inside applied
+  // frames, so keep the pending handler until those observations route.
+  if (typeof frame.id === "string") {
+    const commandContext = pendingCommands.get(frame.id);
+    if (frameErrors.length > 0) ui.failOptimisticCall(frame.id);
+    else {
+      ui.completeOptimisticCall(frame.id);
+      if (commandContext) renderChatCommandResult(chatCommandUiActionFromMessage(frame.message), frame.result, commandContext.text);
+    }
+    pendingCommands.delete(frame.id);
+    pendingFrameErrors.delete(frame.id);
+  }
+  const pinboardAnimations = capturePinboardAnimations(observations);
+  const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
+  if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
+  if (!scopedProjectionEnabled) {
+    // Legacy /api/state mode still folds confirmed placement observations
+    // into its pinboard note array. Scoped mode gets the same fields through
+    // the framework reducer above.
+    for (const observation of observations) {
+      const type = String(observation?.type ?? "");
+      if (type === "pin_moved" || type === "pin_resized" || type === "note_moved" || type === "note_resized") {
+        const pinId = String(observation?.pin ?? observation?.id ?? "");
+        if (pinId) applyPinboardPlacementObservation(observation);
+      }
+    }
+  }
+  forgetLiveControls(observations);
+  if (observations.some((observation: any) => isDubspaceStateObservation(observation))) syncDubspaceProjectionEffects();
+  rememberTaskObservations(observations, typeof frame.id === "string" ? frame.id : undefined);
+  for (const observation of observations) if (isChatObservation(observation)) receiveChatEvent(observation, false);
+  state.observations.unshift({ seq: frame.seq, space: frame.space, observations, message: frame.message });
+  trimObservations();
+  rememberSeq(frame.space, frame.seq);
+  scheduleLegacyStateRefresh();
+  render();
+  if (needsPinboardNotesRefresh) refreshPinboardNotes();
+  animatePinboardNotes(pinboardAnimations);
 }
 
 function desiredV2BrowserScope(): string {
