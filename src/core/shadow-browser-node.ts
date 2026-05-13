@@ -24,6 +24,7 @@ const DEFAULT_SHADOW_BROWSER_STATE_KEY_ID = "shadow-browser-dev";
 const DEFAULT_SHADOW_BROWSER_STATE_SECRET = "shadow-browser-dev-secret";
 const DEFAULT_SHADOW_DEPLOYMENT = "shadow-local";
 const MIN_SHADOW_IDEMPOTENCY_WINDOW_MS = 5 * 60 * 1000;
+const MAX_SHADOW_IDEMPOTENCY_ENTRIES = 10_000;
 const SHADOW_LIVE_DURABILITY_RESERVED_FIELDS = new Set([
   "writes",
   "creates",
@@ -709,6 +710,7 @@ export async function handleShadowBrowserTurnExecEnvelope(
   // Idempotency is reply-oriented: a client retrying because it missed the
   // first reply must receive the same answer without re-running the turn.
   browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(reply));
+  trimShadowBrowserIdempotency(browser.relay);
   return reply;
 }
 
@@ -884,11 +886,26 @@ function markShadowBrowserEnvelopeSeen(relay: ShadowBrowserRelayShim, envelope: 
   const key = shadowBrowserIdempotencyKey(envelope);
   if (relay.recently_seen.has(key)) return { fresh: false, key };
   relay.recently_seen.set(key, now);
+  trimShadowBrowserIdempotency(relay);
   return { fresh: true, key };
 }
 
 function shadowBrowserIdempotencyKey(envelope: Pick<ShadowEnvelope, "from" | "id">): string {
   return `${envelope.from}\u0000${envelope.id}`;
+}
+
+function trimShadowBrowserIdempotency(relay: ShadowBrowserRelayShim): void {
+  if (relay.recently_seen.size <= MAX_SHADOW_IDEMPOTENCY_ENTRIES) return;
+  // The idempotency window is time-based, but a hot relay also needs a hard
+  // entry cap so replay keys and cached replies cannot grow without bound.
+  const overflow = relay.recently_seen.size - MAX_SHADOW_IDEMPOTENCY_ENTRIES;
+  const oldest = Array.from(relay.recently_seen.entries())
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, overflow);
+  for (const [key] of oldest) {
+    relay.recently_seen.delete(key);
+    relay.recent_replies.delete(key);
+  }
 }
 
 function reconcileProjectionFallbackCache(browser: ShadowBrowserNode, transfer: ShadowProjectionTransfer): void {

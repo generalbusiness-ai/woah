@@ -54,6 +54,7 @@ class FakeSqlStorage {
 
 class FakeDurableObjectState {
   readonly id: { name: string };
+  readonly acceptedWebSockets: WebSocket[] = [];
   private readonly db = new DatabaseSync(":memory:");
   private transactionDepth = 0;
   private savepointCounter = 0;
@@ -71,8 +72,8 @@ class FakeDurableObjectState {
     return await fn();
   }
 
-  acceptWebSocket(_ws: WebSocket): void {
-    // Not needed for repository / REST-path tests.
+  acceptWebSocket(ws: WebSocket): void {
+    this.acceptedWebSockets.push(ws);
   }
 
   getWebSockets(): WebSocket[] {
@@ -373,6 +374,116 @@ describe("CFObjectRepository production-shape coverage", () => {
     } finally {
       directoryState.close();
       gatewayState.close();
+    }
+  });
+
+  it("accepts a v2 WebSocket upgrade and sends TransportHello first", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const commitStates = new Map<string, FakeDurableObjectState>();
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const sent: string[] = [];
+    class FakeServerWebSocket {
+      attachment: unknown;
+      readonly sent = sent;
+
+      serializeAttachment(value: unknown): void {
+        this.attachment = value;
+      }
+
+      send(data: string): void {
+        this.sent.push(data);
+      }
+
+      close(): void {}
+    }
+    class FakeWebSocketPair {
+      readonly 0 = {} as WebSocket;
+      readonly 1 = new FakeServerWebSocket() as unknown as WebSocket;
+    }
+    class CloudflareUpgradeResponse {
+      readonly body: BodyInit | null;
+      readonly headers: Headers;
+      readonly status: number;
+      readonly statusText: string;
+      readonly webSocket?: WebSocket;
+
+      constructor(body: BodyInit | null = null, init: (ResponseInit & { webSocket?: WebSocket }) = {}) {
+        this.body = body;
+        this.headers = new Headers(init.headers);
+        this.status = init.status ?? 200;
+        this.statusText = init.statusText ?? "";
+        this.webSocket = init.webSocket;
+      }
+
+      get ok(): boolean {
+        return this.status >= 200 && this.status < 300;
+      }
+
+      async text(): Promise<string> {
+        if (typeof this.body === "string") return this.body;
+        if (this.body == null) return "";
+        if (this.body instanceof ArrayBuffer) return new TextDecoder().decode(this.body);
+        return String(this.body);
+      }
+
+      async json(): Promise<unknown> {
+        return JSON.parse(await this.text());
+      }
+    }
+    const previousPair = (globalThis as unknown as { WebSocketPair?: unknown }).WebSocketPair;
+    const previousResponse = globalThis.Response;
+    vi.stubGlobal("WebSocketPair", FakeWebSocketPair);
+    vi.stubGlobal("Response", CloudflareUpgradeResponse);
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-upgrade-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: new FakeDurableObjectNamespace((name) => {
+        let state = commitStates.get(name);
+        if (!state) {
+          state = new FakeDurableObjectState(name);
+          commitStates.set(name, state);
+        }
+        return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/v2/turn-network/ws?token=wizard:cf-v2-upgrade-token&node=browser:upgrade-test", {
+        headers: {
+          upgrade: "websocket",
+          "sec-websocket-protocol": "woo-v2.turn-network.json"
+        }
+      }));
+
+      expect(response.status).toBe(101);
+      expect(response.headers.get("sec-websocket-protocol")).toBe("woo-v2.turn-network.json");
+      expect(gatewayState.acceptedWebSockets).toHaveLength(1);
+      expect(sent).toHaveLength(1);
+      expect(JSON.parse(sent[0])).toMatchObject({
+        type: "woo.transport.hello.v1",
+        to: "browser:upgrade-test",
+        body: { kind: "woo.transport.hello.v1", actor: "$wiz" }
+      });
+    } finally {
+      if (previousPair === undefined) {
+        Reflect.deleteProperty(globalThis as unknown as { WebSocketPair?: unknown }, "WebSocketPair");
+      } else {
+        vi.stubGlobal("WebSocketPair", previousPair);
+      }
+      vi.stubGlobal("Response", previousResponse);
+      directoryState.close();
+      gatewayState.close();
+      for (const state of commitStates.values()) state.close();
     }
   });
 

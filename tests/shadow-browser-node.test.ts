@@ -491,6 +491,34 @@ describe("shadow browser node shim", () => {
     expect(browser.relay.accepted_frames).toHaveLength(1);
   });
 
+  it("bounds remembered envelope ids and cached replies inside the idempotency window", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-idempotency-cap");
+    await openShadowBrowserScope(browser);
+    const maxEntries = 10_000;
+    let firstKey = "";
+
+    for (let i = 0; i < maxEntries + 5; i += 1) {
+      const reply = {
+        kind: "woo.turn.exec.reply.shadow.v1" as const,
+        id: `cap-reply-${i}`,
+        ok: false,
+        reason: "missing_state" as const
+      };
+      const frame = encodeEnvelope(shadowBrowserEnvelope(browser, reply.kind, reply, `cap-envelope-${i}`));
+      const receipt = receiveShadowBrowserEnvelopeReceipt(browser, frame);
+      if (i === 0) {
+        firstKey = receipt.idempotency_key;
+        // Reply eviction must follow envelope-id eviction so retries cannot
+        // leave old response bodies resident after their replay key is gone.
+        browser.relay.recent_replies.set(firstKey, shadowBrowserEnvelope(browser, reply.kind, reply, "cached-cap-reply"));
+      }
+    }
+
+    expect(browser.relay.recently_seen.size).toBe(maxEntries);
+    expect(browser.relay.recently_seen.has(firstKey)).toBe(false);
+    expect(browser.relay.recent_replies.has(firstKey)).toBe(false);
+  });
+
   it("opens from a last-known head through delta catch-up when the relay has the tail", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-catchup-delta");
     const opened = await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
