@@ -1,4 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
@@ -21,113 +20,11 @@ import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
 // contention they legitimately exceed Vitest's default 30s per-test timeout.
 vi.setConfig({ testTimeout: 120_000 });
-
-class FakeSqlCursor {
-  constructor(private readonly rows: Record<string, unknown>[]) {}
-
-  toArray(): Record<string, unknown>[] {
-    return this.rows;
-  }
-
-  [Symbol.iterator](): Iterator<Record<string, unknown>> {
-    return this.rows[Symbol.iterator]();
-  }
-}
-
-class FakeSqlStorage {
-  readonly execLog: string[] = [];
-
-  constructor(private readonly db: DatabaseSync) {}
-
-  exec(query: string, ...params: unknown[]): FakeSqlCursor {
-    this.execLog.push(query);
-    const stmt = this.db.prepare(query);
-    const head = query.trim().split(/\s+/, 1)[0]?.toUpperCase();
-    if (head === "SELECT" || head === "PRAGMA") {
-      return new FakeSqlCursor(stmt.all(...(params as any[])) as Record<string, unknown>[]);
-    }
-    stmt.run(...(params as any[]));
-    return new FakeSqlCursor([]);
-  }
-}
-
-class FakeDurableObjectState {
-  readonly id: { name: string };
-  readonly acceptedWebSockets: WebSocket[] = [];
-  private readonly db = new DatabaseSync(":memory:");
-  private transactionDepth = 0;
-  private savepointCounter = 0;
-
-  constructor(name = "world") {
-    this.id = { name };
-  }
-
-  readonly storage = {
-    sql: new FakeSqlStorage(this.db),
-    transactionSync: <T>(fn: () => T): T => this.transactionSync(fn)
-  };
-
-  async blockConcurrencyWhile<T>(fn: () => T | Promise<T>): Promise<T> {
-    return await fn();
-  }
-
-  acceptWebSocket(ws: WebSocket): void {
-    this.acceptedWebSockets.push(ws);
-  }
-
-  getWebSockets(): WebSocket[] {
-    return [];
-  }
-
-  close(): void {
-    this.db.close();
-  }
-
-  private transactionSync<T>(fn: () => T): T {
-    if (this.transactionDepth > 0) {
-      const name = `fake_cf_sp_${++this.savepointCounter}`;
-      this.db.exec(`SAVEPOINT ${name}`);
-      try {
-        const result = fn();
-        this.db.exec(`RELEASE SAVEPOINT ${name}`);
-        return result;
-      } catch (err) {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
-        this.db.exec(`RELEASE SAVEPOINT ${name}`);
-        throw err;
-      }
-    }
-
-    this.db.exec("BEGIN IMMEDIATE");
-    this.transactionDepth = 1;
-    try {
-      const result = fn();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    } finally {
-      this.transactionDepth = 0;
-    }
-  }
-}
-
-class FakeDurableObjectNamespace {
-  constructor(private readonly factory: (name: string) => { fetch(request: Request): Promise<Response> | Response }) {}
-
-  idFromName(name: string): { name: string } {
-    return { name };
-  }
-
-  get(id: { name: string }): { fetch(request: Request): Promise<Response> | Response } {
-    return this.factory(id.name);
-  }
-}
 
 function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
   return cursor.toArray() as T[];
@@ -632,12 +529,12 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_snapshot"))[0]).toMatchObject({ n: 0 });
 
-      const writesBeforeReplay = scopeState!.storage.sql.execLog.filter((query) => /^(INSERT|DELETE|UPDATE)\b/i.test(query.trim())).length;
+      const writesBeforeReplay = scopeState!.storage.sql.execLog.filter((entry) => /^(INSERT|DELETE|UPDATE)\b/i.test(entry.query.trim())).length;
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
       const replayed = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
       expect(replayed).toHaveLength(2);
       expect(replayed[1].body).toEqual(replayed[0].body);
-      const writesAfterReplay = scopeState!.storage.sql.execLog.filter((query) => /^(INSERT|DELETE|UPDATE)\b/i.test(query.trim())).length;
+      const writesAfterReplay = scopeState!.storage.sql.execLog.filter((entry) => /^(INSERT|DELETE|UPDATE)\b/i.test(entry.query.trim())).length;
       expect(writesAfterReplay).toBe(writesBeforeReplay);
     } finally {
       directoryState.close();

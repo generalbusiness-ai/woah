@@ -1,4 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
@@ -17,107 +16,9 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 vi.setConfig({ testTimeout: 120_000 });
-
-class FakeSqlCursor {
-  constructor(private readonly rows: Record<string, unknown>[]) {}
-
-  toArray(): Record<string, unknown>[] {
-    return this.rows;
-  }
-
-  [Symbol.iterator](): Iterator<Record<string, unknown>> {
-    return this.rows[Symbol.iterator]();
-  }
-}
-
-class FakeSqlStorage {
-  readonly execLog: Array<{ query: string; changes: number }> = [];
-
-  constructor(private readonly db: DatabaseSync) {}
-
-  exec(query: string, ...params: unknown[]): FakeSqlCursor {
-    const stmt = this.db.prepare(query);
-    const head = query.trim().split(/\s+/, 1)[0]?.toUpperCase();
-    if (head === "SELECT" || head === "PRAGMA") {
-      this.execLog.push({ query, changes: 0 });
-      return new FakeSqlCursor(stmt.all(...(params as any[])) as Record<string, unknown>[]);
-    }
-    const result = stmt.run(...(params as any[])) as { changes?: number };
-    this.execLog.push({ query, changes: Number(result.changes ?? 0) });
-    return new FakeSqlCursor([]);
-  }
-}
-
-class FakeDurableObjectState {
-  readonly id: { name: string };
-  private readonly db = new DatabaseSync(":memory:");
-  private transactionDepth = 0;
-  private savepointCounter = 0;
-
-  constructor(name = "world") {
-    this.id = { name };
-  }
-
-  readonly storage = {
-    sql: new FakeSqlStorage(this.db),
-    transactionSync: <T>(fn: () => T): T => this.transactionSync(fn)
-  };
-
-  close(): void {
-    this.db.close();
-  }
-
-  private transactionSync<T>(fn: () => T): T {
-    if (this.transactionDepth > 0) {
-      const name = `fake_v2_cost_sp_${++this.savepointCounter}`;
-      this.db.exec(`SAVEPOINT ${name}`);
-      try {
-        const result = fn();
-        this.db.exec(`RELEASE SAVEPOINT ${name}`);
-        return result;
-      } catch (err) {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${name}`);
-        this.db.exec(`RELEASE SAVEPOINT ${name}`);
-        throw err;
-      }
-    }
-
-    this.db.exec("BEGIN IMMEDIATE");
-    this.transactionDepth = 1;
-    try {
-      const result = fn();
-      this.db.exec("COMMIT");
-      return result;
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    } finally {
-      this.transactionDepth = 0;
-    }
-  }
-}
-
-class CountingDurableObjectNamespace {
-  fetchCallCount = 0;
-
-  constructor(private readonly factory: (name: string) => { fetch(request: Request): Promise<Response> | Response }) {}
-
-  idFromName(name: string): { name: string } {
-    return { name };
-  }
-
-  get(id: { name: string }): { fetch(request: Request): Promise<Response> | Response } {
-    const target = this.factory(id.name);
-    return {
-      fetch: async (request: Request): Promise<Response> => {
-        this.fetchCallCount += 1;
-        return await target.fetch(request);
-      }
-    };
-  }
-}
 
 class FakeWebSocket {
   readonly sent: string[] = [];
@@ -143,7 +44,7 @@ type CostHarness = {
   ws: FakeWebSocket;
   gatewayState: FakeDurableObjectState;
   scopeState: FakeDurableObjectState;
-  commitScopeNamespace: CountingDurableObjectNamespace;
+  commitScopeNamespace: FakeDurableObjectNamespace;
   openScope: () => Promise<void>;
   envelope: (index: number) => Promise<string>;
   sendTurn: (index: number) => Promise<void>;
@@ -248,7 +149,7 @@ async function makeCostHarness(): Promise<CostHarness> {
   const scopeState = new FakeDurableObjectState("#-1");
   const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
   const commitScope = new CommitScopeDO(scopeState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-  const commitScopeNamespace = new CountingDurableObjectNamespace((name) => {
+  const commitScopeNamespace = new FakeDurableObjectNamespace((name) => {
     if (name !== "#-1") throw new Error(`unexpected CommitScopeDO ${name}`);
     return commitScope;
   });
@@ -256,11 +157,11 @@ async function makeCostHarness(): Promise<CostHarness> {
     WOO_INITIAL_WIZARD_TOKEN: "cf-v2-cost-token",
     WOO_INTERNAL_SECRET: "cf-test-secret",
     WOO_AUTO_INSTALL_CATALOGS: "",
-    DIRECTORY: new CountingDurableObjectNamespace((name) => {
+    DIRECTORY: new FakeDurableObjectNamespace((name) => {
       if (name !== "directory") throw new Error(`unexpected DirectoryDO ${name}`);
       return directory;
     }),
-    WOO: new CountingDurableObjectNamespace((name) => {
+    WOO: new FakeDurableObjectNamespace((name) => {
       throw new Error(`unexpected Woo DO ${name}`);
     }),
     COMMIT_SCOPE: commitScopeNamespace
