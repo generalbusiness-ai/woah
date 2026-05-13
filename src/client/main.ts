@@ -467,10 +467,7 @@ function syncV2BrowserWorkerScope() {
   if (!v2BrowserWorker || !state.session || !state.actor) return;
   const token = authToken();
   if (!token) return;
-  // The browser state plane is display-oriented, so subscribe to the active
-  // room projection when `/api/state` has established one; actor scope is a
-  // fallback for early sessions that have not entered a space yet.
-  const scope = activeChatRoom() || state.actor;
+  const scope = desiredV2BrowserScope();
   if (!scope || v2BrowserWorkerScope === scope) return;
   v2BrowserWorkerScope = scope;
   v2BrowserWorker.postMessage({
@@ -478,6 +475,18 @@ function syncV2BrowserWorkerScope() {
     token,
     scope
   });
+}
+
+function desiredV2BrowserScope(): string {
+  // The browser state plane is display-oriented. Prefer the route/tab surface
+  // the user is actually viewing, and use actor scope only while bootstrapping
+  // a session with no visible space yet.
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if (state.tab === "chat" && route?.objectId) return route.objectId;
+  if (state.tab === "dubspace") return dubspaceSpace() || activeChatRoom() || state.actor || "";
+  if (state.tab === "pinboard") return pinboardSpace() || activeChatRoom() || state.actor || "";
+  if (state.tab === "taskspace") return taskspaceSpace() || activeChatRoom() || state.actor || "";
+  return activeChatRoom() || state.actor || "";
 }
 
 function sendSocket(socket: WebSocket, frame: Record<string, unknown>) {
@@ -906,6 +915,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
     if (state.tab !== tab) state.tab = tab;
     syncUrlFromCurrentState(mode);
     if (typeof done === "function") done();
+    syncV2BrowserWorkerScope();
     render();
     if (scopedProjectionEnabled && tab !== "chat" && tab !== "ide") {
       void ensureScopedOverlayForTab(tab).then(() => {
@@ -918,6 +928,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
   if (current === tab) {
     syncUrlFromCurrentState(mode);
     if (typeof done === "function") done();
+    syncV2BrowserWorkerScope();
     render();
     return;
   }
@@ -3326,6 +3337,7 @@ function applyScopedMoveResult(result: any) {
   state.scopedProjection = scopedModelWithMoveResult(state.scopedProjection, result);
   if (typeof result.room === "string" || (result.here && typeof result.here === "object" && !Array.isArray(result.here))) {
     scopedProjectionLocalRevision += 1;
+    syncV2BrowserWorkerScope();
   }
   applyScopedProjectionModel();
 }
