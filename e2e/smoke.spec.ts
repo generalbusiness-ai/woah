@@ -59,6 +59,7 @@ test("chat route mounts bundled UI while state is still cold-starting", async ({
   });
 
   await page.goto("/objects/the_chatroom");
+  await page.getByRole("button", { name: "Continue as guest" }).click({ timeout: 1_000 }).catch(() => undefined);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
@@ -69,6 +70,25 @@ test("chat route mounts bundled UI while state is still cold-starting", async ({
   releaseState?.();
   await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 5_000 });
   await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
+});
+
+test("browser worker receives initial v2 projection", async ({ page, request }) => {
+  const v2ProjectionLogs: string[] = [];
+  page.on("console", (message) => {
+    const text = message.text();
+    if (text.includes("woo.v2.projection")) v2ProjectionLogs.push(text);
+  });
+
+  const auth = await request.post("/api/auth", { data: { token: `guest:e2e-v2-browser-${crypto.randomUUID()}` } });
+  const session = String((await auth.json())?.session ?? "");
+  await page.goto("/");
+  await page.evaluate((sessionId) => {
+    localStorage.setItem("woo.session", sessionId);
+  }, session);
+  await page.goto("/objects/the_chatroom");
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+
+  await expect.poll(() => v2ProjectionLogs.length, { timeout: 5_000 }).toBeGreaterThan(0);
 });
 
 test("chat boot uses /api/me and moves without /api/state", async ({ page }) => {

@@ -187,11 +187,20 @@ const server = http.createServer(async (req, res) => {
   vite.middlewares(req, res);
 });
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
 const v2wss = new WebSocketServer({
-  server,
-  path: "/v2/turn-network/ws",
+  noServer: true,
   handleProtocols: (protocols) => protocols.has("woo-v2.turn-network.json") ? "woo-v2.turn-network.json" : false
+});
+
+server.on("upgrade", (req, socket, head) => {
+  const pathname = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`).pathname;
+  const target = pathname === "/ws" ? wss : pathname === "/v2/turn-network/ws" ? v2wss : null;
+  if (!target) {
+    socket.destroy();
+    return;
+  }
+  target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
 });
 
 wss.on("connection", (ws) => {
