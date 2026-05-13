@@ -8,6 +8,7 @@
 
 import type { CallContext, NativeHandler, WooWorld } from "../core/world";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Observation, RemoteToolDescriptor, WooValue } from "../core/types";
+import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { directedRecipients, wooError } from "../core/types";
 
 // Broadcast hooks the runtime wires into the MCP host so that MCP-initiated
@@ -171,6 +172,27 @@ export class McpHost {
         if (originSessionId && sessionId === originSessionId) continue;
         if (!audienceSet.has(queue.actor)) continue;
         this.enqueueFor(sessionId, observation);
+      }
+    }
+  }
+
+  // v2 commit-scope accepted frames are the pure-v2 observation source. They
+  // do not carry legacy AppliedFrame audience metadata, so route by directed
+  // observation recipients first and then by scope subscription/presence.
+  routeShadowAcceptedFrame(frame: ShadowCommitAccepted, originSessionId?: string | null): void {
+    if (!frame.observations.length) return;
+    for (const observation of frame.observations) {
+      const directed = directedRecipients(observation);
+      const directedActors = new Set<ObjRef>();
+      if (directed.to) directedActors.add(directed.to);
+      if (directed.from) directedActors.add(directed.from);
+      for (const [sessionId, queue] of this.queues) {
+        if (originSessionId && sessionId === originSessionId) continue;
+        const sessionLocation = this.world.currentLocationForSession(sessionId);
+        const shouldDeliver = directedActors.size > 0
+          ? directedActors.has(queue.actor)
+          : this.actorSubscribes(queue.actor, frame.position.scope) || sessionLocation === frame.position.scope;
+        if (shouldDeliver) this.enqueueFor(sessionId, observation);
       }
     }
   }
@@ -672,7 +694,9 @@ export class McpHost {
       const previous = CURRENT_WAIT_SESSION_ID;
       CURRENT_WAIT_SESSION_ID = sessionId;
       try {
-        const result = this.dispatchHooks.direct
+        const result = this.isMcpControlTool(actor, tool)
+          ? await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId })
+          : this.dispatchHooks.direct
           ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args)
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
@@ -706,6 +730,10 @@ export class McpHost {
       observations: frame.observations,
       applied: { space: frame.space, seq: frame.seq, ts: frame.ts }
     };
+  }
+
+  private isMcpControlTool(actor: ObjRef, tool: McpTool): boolean {
+    return tool.object === actor && ["wait", "focus", "unfocus", "focus_list"].includes(tool.verb);
   }
 
   // ----- $actor:wait / focus / unfocus / focus_list handlers -----

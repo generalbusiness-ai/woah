@@ -38,7 +38,7 @@ export class CommitScopeDO {
   private needsFullSave = false;
 
   constructor(
-    private readonly state: DurableObjectState,
+    private readonly state: CommitScopeDurableState,
     private readonly env: InternalAuthEnv
   ) {
     this.state.storage.sql.exec(
@@ -85,7 +85,8 @@ export class CommitScopeDO {
       return jsonResponse({
         ok: true,
         relay: relay.node,
-        hello
+        hello,
+        head: relay.commit_scope.head
       } satisfies CommitScopeOpenResponse);
     }
     if (request.method === "POST" && url.pathname === "/v2/envelope") {
@@ -427,6 +428,16 @@ export class CommitScopeDO {
   }
 }
 
+type CommitScopeDurableState = {
+  id: unknown;
+  storage: {
+    sql: {
+      exec(query: string, ...params: unknown[]): unknown;
+    };
+    transactionSync<T>(callback: () => T): T;
+  };
+};
+
 type CommitScopeBaseRequest = {
   scope: ObjRef;
   node: string;
@@ -445,6 +456,7 @@ type CommitScopeOpenResponse = {
   ok: true;
   relay: string;
   hello: ShadowTransportHello;
+  head: ShadowScopeHead;
 };
 
 type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {
