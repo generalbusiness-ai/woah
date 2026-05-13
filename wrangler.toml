@@ -51,25 +51,6 @@ new_sqlite_classes = ["PersistentObjectDO"]
 tag = "v2"
 new_sqlite_classes = ["DirectoryDO"]
 
-# v3-v5 are the wipe dance. v3 created fresh SQLite storage under temporary
-# V3 names, v4 dropped the original empty classes, v5 renames the V3 storage
-# back to the clean names. The class names in code are unchanged; the version
-# tags are CF-side bookkeeping only.
-[[migrations]]
-tag = "v3-create-2026-05-02"
-new_sqlite_classes = ["PersistentObjectV3DO", "DirectoryV3DO"]
-
-[[migrations]]
-tag = "v4-drop-old-2026-05-02"
-deleted_classes = ["PersistentObjectDO", "DirectoryDO"]
-
-[[migrations]]
-tag = "v5-rename-back-2026-05-02"
-renamed_classes = [
-  { from = "PersistentObjectV3DO", to = "PersistentObjectDO" },
-  { from = "DirectoryV3DO", to = "DirectoryDO" }
-]
-
 [[migrations]]
 tag = "cf-do-0006"
 new_sqlite_classes = [ "CommitScopeDO" ]

@@ -767,6 +767,13 @@ Seeded deterministic ULID allocation remains deferred. Until it lands, `WOO_SEED
 3. Operator runs the wizard-bootstrap exchange (§R14.4).
 4. World is live.
 
+Fresh Worker namespaces must not include historical `deleted_classes` or
+`renamed_classes` entries for classes that were never deployed in that
+namespace. Those entries are valid only as append-only upgrade history for the
+specific Worker that previously created the source classes. A renamed or
+replacement namespace such as the reference `woah` deployment starts with a
+create-only class ledger for its current Durable Object bindings.
+
 **Pulling upstream changes**:
 
 When operators pull updates from this repository and redeploy, the migration tags must be ordered consistently — never rewrite history. Specifically:
