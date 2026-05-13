@@ -135,7 +135,7 @@ The v1 Worker does **not** read a seed phrase or salt object-id allocation. Seed
 
 The local Node server leaves this unset by default, which means clone/run first-light installs every bundled catalog discovered under `catalogs/`.
 
-The Cloudflare `wrangler.toml` ships with the full demo bundle so that a fresh fork-and-deploy lands a populated world matching woo.hughpyle.workers.dev:
+The Cloudflare `wrangler.toml` ships with the full demo bundle so that a fresh fork-and-deploy lands a populated world matching woo.inguz.workers.dev:
 
 ```toml
 [vars]

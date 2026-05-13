@@ -14,7 +14,7 @@ head_sampling_rate = 1.0
 # existing deploy does not remove already-installed catalogs.
 #
 # The shipped default is the full demo bundle so that a fresh fork-and-
-# deploy lands a populated world matching woo.hughpyle.workers.dev. For
+# deploy lands a populated world matching woo.inguz.workers.dev. For
 # faster first-light on operator deployments that don't want the demo
 # content, use the foundational-only subset — classes only, no bundled
 # instances; first-light cost drops from a few seconds to tens of ms:

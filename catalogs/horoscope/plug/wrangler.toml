@@ -25,7 +25,7 @@ binding = "AI"
 #   wrangler deploy
 [vars]
 # Public routing/config values. Secrets still go through `wrangler secret put`.
-WOO_BASE_URL = "https://woo.hughpyle.workers.dev"
+WOO_BASE_URL = "https://woo.inguz.workers.dev"
 BLOCK_ID = "the_horoscope"
 MAX_TOKENS = "350"
 MAX_ORDERS_PER_TICK = "10"
