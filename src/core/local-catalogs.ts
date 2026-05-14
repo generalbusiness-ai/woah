@@ -94,6 +94,14 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION = "2026-05-13-chat-v2-
 const LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION = "2026-05-14-chat-room-roster";
 const LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION = "2026-05-14-pinboard-room-roster";
 const LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION = "2026-05-14-dubspace-room-roster";
+// Repair pass: deployed satellites recorded
+// LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION as applied while the
+// reconciler was still emitting the pre-rename `commit_policy` field, so the
+// stored arg_spec.command map for $chatroom direction verbs ended up missing
+// the `persistence: "durable"` hint the v2 plan reads. The browser then
+// defaults the move to `live`, the commit never fires, and the H1 stays put.
+// A new migration id forces one more reconcile against the current manifest.
+const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION = "2026-05-14-chat-v2-command-persistence-reconcile";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -159,7 +167,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, only: "pinboard" },
-  { id: LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, only: "dubspace" }
+  { id: LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, only: "dubspace" },
+  { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -404,6 +413,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   run(LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
+  run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   return covered;
 }
 
