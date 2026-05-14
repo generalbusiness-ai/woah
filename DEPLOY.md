@@ -351,6 +351,36 @@ npm run build && npx wrangler deploy --env staging
 
 Cost: per-request + DO storage proportional to staging data. An idle staging is near-zero; a small test world is cents per month.
 
+### Onboarding smoke
+
+For deployments with self-service signup enabled, run the API-only onboarding
+smoke against the deployed Worker URL. It uses the out-of-band verification
+token returned by the current v1 API, so no email service is required.
+
+```sh
+WORLD_URL=https://<worker>.<account>.workers.dev npm run smoke:onboarding
+```
+
+For staging, configure Cloudflare's
+[Turnstile test secret](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
+as `TURNSTILE_SECRET_KEY` and use the default dummy token, or pass the
+token explicitly:
+
+```sh
+SMOKE_TURNSTILE_TOKEN=XXXX.DUMMY.TOKEN.XXXX \
+WORLD_URL=https://<staging-worker>.<account>.workers.dev \
+npm run smoke:onboarding
+```
+
+The smoke creates a unique email/profile per run and verifies signup,
+verification token single-use, password login, bearer login, Hermes connect,
+state replay rejection, reconnect key rotation, old key revocation, new key
+auth, and unauthenticated `/connect` redirect sanitization.
+
+This smoke is repeatable but not hermetic: each successful run persists a
+smoke `$account`, `$human`, and Hermes `$agent`. Run it against staging or
+periodically clean accounts whose email matches `smoke+*@example.com`.
+
 ### 4. Backup-then-restore drill — highest confidence
 
 Restore a recent prod backup into the staging worker, redeploy staging with the new code, and watch the upgrade-adopt path execute against real prod-shaped data. This is the only way to catch upgrade bugs that depend on production state shape.
