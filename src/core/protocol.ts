@@ -70,6 +70,8 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
       return jsonProtocol({
         actor: session.actor,
         session: session.id,
+        active_scope: session.activeScope,
+        current_location: session.activeScope,
         expires_at: session.expiresAt,
         token_class: session.tokenClass,
         ...(session.apikeyId !== undefined ? { apikey_id: session.apikeyId } : {})
@@ -638,12 +640,14 @@ function rawFrameBytes(raw: string | ArrayBuffer | ArrayBufferView): number {
 
 function withSessionProjection(payload: unknown, world: WooWorld, session: Session): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const activeScope = world.activeScopeForSession(session.id);
   return {
     ...(payload as Record<string, unknown>),
     session: {
       id: session.id,
       actor: session.actor,
-      current_location: world.currentLocationForSession(session.id),
+      active_scope: activeScope,
+      current_location: activeScope,
       all_locations: world.allLocationsForActor(session.actor)
     }
   };

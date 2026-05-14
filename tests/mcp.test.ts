@@ -620,7 +620,7 @@ describe("McpHost", () => {
       incompleteReasons: [],
       hash: "mcp-v2-observer-refresh"
     });
-    expect(world.currentLocationForSession(alice.id)).toBe("the_chatroom");
+    expect(world.activeScopeForSession(alice.id)).toBe("the_chatroom");
     host.routeShadowAcceptedFrame({
       kind: "woo.commit.accepted.shadow.v1",
       id: "mcp-v2-observer-refresh",
@@ -923,7 +923,7 @@ describe("McpGateway", () => {
     const actor = wooSession?.actor;
     expect(actor).toBeTruthy();
     home.object(actor!).location = "remote_gallery";
-    wooSession!.currentLocation = "remote_gallery";
+    wooSession!.activeScope = "remote_gallery";
     home.object("remote_gallery").contents.add(actor!);
     remote.setSpaceSubscriber("remote_gallery", actor!, true, wooSession!.id);
 

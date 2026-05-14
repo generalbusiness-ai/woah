@@ -701,11 +701,11 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const replies = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
       expect(replies[0]?.body).toMatchObject({ ok: true, id: "cf-v2-session-location-move" });
-      expect(world.currentLocationForSession(session.id)).toBe("the_deck");
+      expect(world.activeScopeForSession(session.id)).toBe("the_deck");
       expect(world.exportSessions()).toContainEqual(expect.objectContaining({
         id: session.id,
         actor: session.actor,
-        currentLocation: "the_deck"
+        activeScope: "the_deck"
       }));
       const rows = sqlRows<{ current_location: string }>(directoryState.storage.sql.exec("SELECT current_location FROM session_route WHERE session_id = ?", session.id));
       expect(rows).toEqual([{ current_location: "the_deck" }]);
@@ -918,7 +918,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         roomHost.setActorPresence(actor, "cf_remote_room", true);
 
         home.object(actor).location = "cf_remote_room";
-        home.sessions.get(session.id)!.currentLocation = "cf_remote_room";
+        home.sessions.get(session.id)!.activeScope = "cf_remote_room";
         home.setActorPresence(actor, "cf_remote_room", true);
         home.createObject({ id: "cf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
         home.object("cf_home_widget").location = "cf_remote_room";
@@ -991,6 +991,49 @@ describe("CFObjectRepository production-shape coverage", () => {
         .resolves.toMatchObject({ id: "$space", host: "world" });
     } finally {
       directoryState.close();
+    }
+  });
+
+  it("accepts legacy internal current-location headers for routed REST sessions", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-legacy-current-location-header",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/api/me", {
+        headers: {
+          "x-woo-internal-session": "legacy-current-location-session",
+          "x-woo-internal-actor": "$wiz",
+          "x-woo-internal-expires-at": String(Date.now() + 60_000),
+          "x-woo-internal-token-class": "bearer",
+          "x-woo-internal-current-location": "the_deck"
+        }
+      }));
+
+      expect(response.status).toBe(200);
+      const body = await response.json() as Record<string, any>;
+      expect(body.session).toMatchObject({
+        id: "legacy-current-location-session",
+        actor: "$wiz",
+        active_scope: "the_deck",
+        current_location: "the_deck"
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
     }
   });
 
@@ -1257,7 +1300,9 @@ describe("CFObjectRepository production-shape coverage", () => {
         headers: { authorization: `Session ${session}` }
       }), env, {});
       expect(deckState.ok).toBe(true);
-      expect((await deckState.json() as Record<string, any>).session?.current_location).toBe("the_deck");
+      const deckStateBody = await deckState.json() as Record<string, any>;
+      expect(deckStateBody.session?.active_scope).toBe("the_deck");
+      expect(deckStateBody.session?.current_location).toBe("the_deck");
 
       const takeTowel = await post("/api/objects/the_deck/calls/take", { args: ["towel"] }, session);
       expect(takeTowel.status).toBe(200);
@@ -1272,7 +1317,9 @@ describe("CFObjectRepository production-shape coverage", () => {
         headers: { authorization: `Session ${session}` }
       }), env, {});
       expect(tubState.ok).toBe(true);
-      expect((await tubState.json() as Record<string, any>).session?.current_location).toBe("the_hot_tub");
+      const tubStateBody = await tubState.json() as Record<string, any>;
+      expect(tubStateBody.session?.active_scope).toBe("the_hot_tub");
+      expect(tubStateBody.session?.current_location).toBe("the_hot_tub");
 
       const dropTowel = await post("/api/objects/the_hot_tub/calls/drop", { args: ["towel"] }, session);
       expect(dropTowel.status).toBe(200);

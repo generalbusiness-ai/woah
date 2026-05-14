@@ -330,7 +330,7 @@ function applyTranscriptSessionLocation(next: SerializedWorld, transcript: Effec
   // freshly-committed subscriber rows as stale.
   for (const session of next.sessions) {
     if (session.id === transcript.session && session.actor === transcript.call.actor) {
-      session.currentLocation = actorMove.to;
+      session.activeScope = actorMove.to;
       return;
     }
   }

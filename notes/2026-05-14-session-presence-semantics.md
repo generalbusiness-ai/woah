@@ -47,9 +47,9 @@ lockstep.
 workspace before it has a command focus. UI focus changes write
 `active_scope` through a session-scope operation; catalog verbs such as
 `enter()` may also set it as part of their explicit behavior. The implementation
-PR should rename `session.currentLocation` / `session.current_location` to
-`session.active_scope`; until then, the old names are legacy aliases for command
-focus, not body placement.
+uses `Session.activeScope` internally and `session.active_scope` on the wire;
+`currentLocation` / `current_location` are legacy aliases for command focus, not
+body placement.
 
 Subscriptions need a session-side view as well as the existing space-side rows.
 `space.session_subscribers` remains the delivery index, while

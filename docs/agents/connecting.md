@@ -48,8 +48,8 @@ frame) — picking MCP doesn't change which tokens you have.
 The server resolves your token to a **session** + **actor** pair:
 
 - **Session**: the live binding between your connection and the world.
-  Your session has its own `current_location`, observation queue, and
-  focus list.
+  Your session has its own `active_scope`, observation queue, and focus
+  list.
 - **Actor**: a normal woah object. Has properties (name, description,
   inventory, etc.), verbs (`focus`, `wait`, `unfocus`, plus whatever
   the actor's class chain adds), and an owner.

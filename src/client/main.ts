@@ -19,6 +19,7 @@ import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { v2ProjectionSnapshotFromMessage, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
+import { sessionActiveScopeFromRecord } from "../core/types";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -1200,12 +1201,16 @@ function scopedToolSubject(surface: "dubspace" | "pinboard" | "taskspace"): stri
     const handleSurface = typeof (handle as any)?.surface === "string" ? (handle as any).surface : "";
     if (subject && handleSurface === surface) return subject;
   }
-  const current = state.scopedProjection?.session?.current_location;
+  const current = sessionActiveScope(state.scopedProjection?.session);
   if (typeof current === "string" && isCatalogObjectSummary(ui.observe(current), surface, className)) return current;
   for (const item of arrayOfObjects(state.scopedProjection?.here?.contents)) {
     if (isCatalogObjectSummary(item, surface, className)) return String(item.id ?? "");
   }
   return "";
+}
+
+function sessionActiveScope(session: any): string | undefined {
+  return sessionActiveScopeFromRecord(session) ?? undefined;
 }
 
 function applyScopedOverlaySnapshot(key: string, snapshot: any) {
@@ -1954,7 +1959,7 @@ function scopedPinboardPresentActors(boardId: string, props: Record<string, unkn
   // Last-resort local fallback: before the first overlay/presence frame lands,
   // show the user in their own active pinboard rather than an empty presence
   // map. This is not an authoritative subscriber list.
-  return state.actor && state.scopedProjection?.session?.current_location === boardId ? [state.actor] : [];
+  return state.actor && sessionActiveScope(state.scopedProjection?.session) === boardId ? [state.actor] : [];
 }
 
 function pinboardLayoutFromBoard(board: any): Record<string, any> {
@@ -2142,11 +2147,12 @@ function buildChatMeta(world: any) {
   const rooms = objectsByParent(world, catalogClass(chat, "$chatroom"));
   const pinned = chatRoomPin && chatRoomPin.expiresAt > Date.now() && rooms.includes(chatRoomPin.room) ? chatRoomPin.room : undefined;
   if (chatRoomPin && !pinned) chatRoomPin = null;
-  const currentLocation = typeof world?.session?.current_location === "string" && rooms.includes(world.session.current_location) ? world.session.current_location : undefined;
+  const sessionScope = sessionActiveScope(world?.session);
+  const activeScope = typeof sessionScope === "string" && rooms.includes(sessionScope) ? sessionScope : undefined;
   const occupied = rooms.find((id) => Array.isArray(world.objects?.[id]?.props?.subscribers) && world.objects[id].props.subscribers.includes(state.actor));
   const seededEntry = Object.values(demo?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
   const defaultRoom = seededEntry ?? rooms[0];
-  const current = pinned ?? currentLocation ?? occupied ?? seededEntry ?? rooms[0];
+  const current = pinned ?? activeScope ?? occupied ?? seededEntry ?? rooms[0];
   return { room: current, rooms, defaultRoom };
 }
 
@@ -2375,17 +2381,17 @@ function actorPresentInSpace(space: string) {
   const actor = state.actor;
   if (!actor) return false;
   if (scopedProjectionEnabled) {
-    if (state.scopedProjection?.session?.current_location === space) return true;
+    if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
     if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
     return actorPresenceList(actor).includes(space);
   }
-  if (state.world?.session?.current_location === space) return true;
+  if (sessionActiveScope(state.world?.session) === space) return true;
   return actorPresenceList(actor).includes(space);
 }
 
 function shouldAutoEnterDefaultChatRoom() {
   if (scopedProjectionEnabled) return false;
-  const location = state.world?.session?.current_location;
+  const location = sessionActiveScope(state.world?.session);
   if (typeof location === "string" && location && location !== "$nowhere") {
     const room = chatRoom();
     const subscribers = state.world?.objects?.[room]?.props?.subscribers;
@@ -4867,8 +4873,8 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  const currentLocation = scopedProjectionEnabled ? state.scopedProjection?.session?.current_location : state.world?.session?.current_location;
-  return Boolean(state.actor && board && currentLocation === board);
+  const activeScope = scopedProjectionEnabled ? sessionActiveScope(state.scopedProjection?.session) : sessionActiveScope(state.world?.session);
+  return Boolean(state.actor && board && activeScope === board);
 }
 
 function panPinboardBy(dx: number, dy: number) {

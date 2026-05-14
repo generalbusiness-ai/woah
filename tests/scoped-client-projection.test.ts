@@ -348,6 +348,7 @@ describe("scoped client projection", () => {
     const session = world.auth("guest:scoped-nowhere");
 
     const body = await apiMe(world, session);
+    expect(body.session.active_scope).toBe("$nowhere");
     expect(body.session.current_location).toBe("$nowhere");
     expect(body.here).toBeNull();
     expect(body.cursor.spaces).toEqual({});
@@ -376,6 +377,7 @@ describe("scoped client projection", () => {
     expect(body.session).toMatchObject({
       id: session.id,
       actor: session.actor,
+      active_scope: "the_chatroom",
       current_location: "the_chatroom"
     });
     expect(body.cursor.spaces.the_chatroom.next_seq).toBe(1);
@@ -525,7 +527,7 @@ describe("scoped client projection", () => {
     roomA.setHostBridge(new LocalHostBridge("room-a", worlds, routes));
     roomB.setHostBridge(new LocalHostBridge("room-b", worlds, routes));
     roomA.createObject({ id: actor, name: home.object(actor).name, parent: "$guest", owner: "$wiz" });
-    home.sessions.get(session.id)!.currentLocation = "the_chatroom";
+    home.sessions.get(session.id)!.activeScope = "the_chatroom";
     roomA.ensureSessionForActor(session.id, actor, session.tokenClass, session.expiresAt, "the_chatroom");
     home.setActorPresence(actor, "the_chatroom", true, session.id);
     roomA.setActorPresence(actor, "the_chatroom", true, session.id);
@@ -554,7 +556,7 @@ describe("scoped client projection", () => {
     remote.ensureSessionForActor(session.id, session.actor, session.tokenClass, session.expiresAt, "the_deck");
     remote.setSpaceSubscriber("the_deck", session.actor, true, session.id);
     remote.setActorPresence(session.actor, "the_deck", true, session.id);
-    home.sessions.get(session.id)!.currentLocation = "the_deck";
+    home.sessions.get(session.id)!.activeScope = "the_deck";
     const worlds = new Map<string, WooWorld>([
       ["home", home],
       ["deck-host", remote]
@@ -567,6 +569,7 @@ describe("scoped client projection", () => {
 
     const body = await apiMe(home, session);
     expect(body.objects).toBeUndefined();
+    expect(body.session.active_scope).toBe("the_deck");
     expect(body.session.current_location).toBe("the_deck");
     expect(body.cursor.spaces.the_deck.next_seq).toBe(1);
     expect(body.here).toMatchObject({ id: "the_deck", name: "Deck" });
@@ -577,7 +580,7 @@ describe("scoped client projection", () => {
     const home = createWorld();
     const remote = createWorld();
     const session = home.auth("guest:remote-scoped-me-errors");
-    home.sessions.get(session.id)!.currentLocation = "the_deck";
+    home.sessions.get(session.id)!.activeScope = "the_deck";
     const worlds = new Map<string, WooWorld>([
       ["home", home],
       ["deck-host", remote]
@@ -601,7 +604,7 @@ describe("scoped client projection", () => {
 
     remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$room", owner: "$wiz" });
     routes.set("remote_room", "deck-host");
-    home.sessions.get(session.id)!.currentLocation = "remote_room";
+    home.sessions.get(session.id)!.activeScope = "remote_room";
     class FailingAncestryBridge extends LocalHostBridge {
       constructor(readonly code: string) {
         super("home", worlds, routes);
@@ -676,7 +679,7 @@ describe("scoped client projection", () => {
     roomHost.ensureSessionForActor(session.id, session.actor, session.tokenClass, session.expiresAt, "the_deck");
     roomHost.setSpaceSubscriber("the_deck", session.actor, true, session.id);
     roomHost.setActorPresence(session.actor, "the_deck", true, session.id);
-    home.sessions.get(session.id)!.currentLocation = "the_deck";
+    home.sessions.get(session.id)!.activeScope = "the_deck";
 
     const worlds = new Map<string, WooWorld>([
       ["home", home],
@@ -700,15 +703,17 @@ describe("scoped client projection", () => {
     expect(roomBridge.objectSummaryManyCalls).toContainEqual([badge]);
   });
 
-  it("keeps here on the containing room when current_location is a feature space", async () => {
+  it("keeps here on the containing room when active_scope is a feature space", async () => {
     const world = createWorld();
     const session = world.auth("guest:feature-space-here");
     const entered = await world.directCall("feature-here-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
     expect(entered.op).toBe("result");
 
     const body = await apiMe(world, session);
+    expect(body.session.active_scope).toBe("the_pinboard");
     expect(body.session.current_location).toBe("the_pinboard");
     expect(body.here).toMatchObject({ id: "the_deck", name: "Deck" });
-    expect(body.overlays.current_location).toMatchObject({ subject: "the_pinboard", restore: true });
+    expect(body.overlays.active_scope).toMatchObject({ subject: "the_pinboard", restore: true });
+    expect(body.overlays.current_location).toBeUndefined();
   });
 });

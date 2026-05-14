@@ -6,7 +6,7 @@ that point onwards drives the world the same way a human player does:
 by calling verbs and observing what happens.
 
 The defining property of the MCP surface is that the **tool list
-tracks the actor's current location**. In `the_chatroom` you see
+tracks the session's active scope**. In `the_chatroom` you see
 `say` / `look` / `take`. Walk to `the_dubspace` and the tools shift to
 `set_control` / `save_scene`. The protocol is dynamic; your client
 must support `notifications/tools/list_changed` (or fall back to
@@ -76,8 +76,8 @@ authority gates) is in
 ## Why your tools change as you move
 
 Reachability — the set of objects whose verbs become tools — is
-computed from your **actor's scope**: yourself, your current location,
-the visible contents of that location, your inventory, any objects
+computed from your **actor's scope**: yourself, your active scope,
+the visible contents of that scope, your inventory, any objects
 you've focused, and the catalog singletons your role can see. Move,
 focus, or unfocus, and the scope changes; the gateway sends a
 `notifications/tools/list_changed` hint, and your next `tools/list`

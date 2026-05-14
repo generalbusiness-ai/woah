@@ -601,8 +601,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         roomB.setHostBridge(roomBBridge);
 
         roomA.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
-        home.sessions.get(session.id)!.currentLocation = "the_chatroom";
-        roomA.ensureSessionForActor(session.id, actor, "guest").currentLocation = "the_chatroom";
+        home.sessions.get(session.id)!.activeScope = "the_chatroom";
+        roomA.ensureSessionForActor(session.id, actor, "guest").activeScope = "the_chatroom";
         home.setActorPresence(actor, "the_chatroom", true);
       roomA.setActorPresence(actor, "the_chatroom", true);
       roomA.setSpaceSubscriber("the_chatroom", actor, true);
@@ -613,8 +613,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const witness = witnessSession.actor;
       routes.set(witness, "home");
       roomA.createObject({ id: witness, name: witness, parent: "$guest", owner: "$wiz" });
-      home.sessions.get(witnessSession.id)!.currentLocation = "the_chatroom";
-      roomA.ensureSessionForActor(witnessSession.id, witness, "guest").currentLocation = "the_chatroom";
+      home.sessions.get(witnessSession.id)!.activeScope = "the_chatroom";
+      roomA.ensureSessionForActor(witnessSession.id, witness, "guest").activeScope = "the_chatroom";
       roomA.setSpaceSubscriber("the_chatroom", witness, true, witnessSession.id);
 
       const moveEffects: DeferredHostEffect[] = [];
@@ -649,7 +649,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         }
 
         const tubEffects: DeferredHostEffect[] = [];
-        roomB.ensureSessionForActor(session.id, actor, "guest").currentLocation = "the_deck";
+        roomB.ensureSessionForActor(session.id, actor, "guest").activeScope = "the_deck";
         const enterTub = await roomB.directCall("enter-tub", actor, "the_hot_tub", "enter", [], {
           sessionId: session.id,
           deferHostEffect: (effect) => tubEffects.push(effect)
@@ -844,7 +844,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         // Isolation setup: this test is only about presence/subscriber mirror
         // repair, so location is direct-mutated instead of going through :enter.
         home.object(watcher).location = "conf_scrub_room";
-        home.sessions.get(watcherSession.id)!.currentLocation = "conf_scrub_room";
+        home.sessions.get(watcherSession.id)!.activeScope = "conf_scrub_room";
 
       const denied = await roomHost.directCall("stale-who", stale, "conf_scrub_room", "who", []);
       expect(denied.op).toBe("error");
@@ -905,7 +905,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       ]);
       world.setActorPresence(live.actor, "conf_session_scrub_room", true);
       world.object(live.actor).location = "conf_session_scrub_room";
-      world.sessions.get(live.id)!.currentLocation = "conf_session_scrub_room";
+      world.sessions.get(live.id)!.activeScope = "conf_session_scrub_room";
 
       // First call paid the per-space throttle and runs both scrubs.
       const looked = await world.directCall("conf-session-scrub-look", live.actor, "conf_session_scrub_room", "look", []);
@@ -987,9 +987,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       world.setSpaceSubscriber("conf_vanished_room", stale.actor, true, stale.id);
       world.setActorPresence(watcher.actor, "conf_vanished_room", true);
       world.object(watcher.actor).location = "conf_vanished_room";
-      world.sessions.get(watcher.id)!.currentLocation = "conf_vanished_room";
+      world.sessions.get(watcher.id)!.activeScope = "conf_vanished_room";
       world.object(stale.actor).location = "conf_vanished_room";
-      world.sessions.get(stale.id)!.currentLocation = "conf_vanished_room";
+      world.sessions.get(stale.id)!.activeScope = "conf_vanished_room";
 
       // Both subscribers in place, then the stale actor's session vanishes
       // out from under the world without a clean reap. `.location` stays.
@@ -1037,7 +1037,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       roomHost.setActorPresence(actor, "conf_remote_room", true);
 
       home.object(actor).location = "conf_remote_room";
-      home.sessions.get(session.id)!.currentLocation = "conf_remote_room";
+      home.sessions.get(session.id)!.activeScope = "conf_remote_room";
       home.setActorPresence(actor, "conf_remote_room", true);
       home.createObject({ id: "conf_home_widget", name: "Home Widget", parent: "$thing", owner: "$wiz" });
       home.object("conf_home_widget").location = "conf_remote_room";

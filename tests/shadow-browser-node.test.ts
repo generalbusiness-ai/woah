@@ -110,7 +110,7 @@ describe("shadow browser node shim", () => {
       scope: "the_dubspace",
       viewer: { actor },
       self: { id: actor },
-      session: { actor, current_location: "the_dubspace" },
+      session: { actor, active_scope: "the_dubspace", current_location: "the_dubspace" },
       inventory: expect.any(Array),
       cursor: { spaces: { the_dubspace: { next_seq: expect.any(Number) } }, live: { resumable: false } },
       subject: { id: "the_dubspace", props: expect.any(Object) }
@@ -224,7 +224,7 @@ describe("shadow browser node shim", () => {
       args: []
     });
     expect(enter.result).toMatchObject({ ok: true });
-    expect(worldFor(browser).currentLocationForSession(session.id)).toBe("the_pinboard");
+    expect(worldFor(browser).activeScopeForSession(session.id)).toBe("the_pinboard");
     expect(worldFor(browser).object(session.actor).location).toBe("the_pinboard");
 
     const add = await executeShadowBrowserTurn(browser, {
@@ -285,11 +285,11 @@ describe("shadow browser node shim", () => {
     const kept = anchor.auth("guest:browser-session-merge-kept");
     const fresh = anchor.auth("guest:browser-session-merge-fresh");
     const current = anchor.exportSessions().filter((session) => session.id === kept.id);
-    current[0].currentLocation = "the_pinboard";
+    current[0].activeScope = "the_pinboard";
     const merged = mergeShadowBrowserSessionState(current, anchor.exportSessions().filter((session) => session.id === fresh.id));
 
     expect(merged.map((session) => session.id).sort()).toEqual([fresh.id, kept.id].sort());
-    expect(merged.find((session) => session.id === kept.id)?.currentLocation).toBe("the_pinboard");
+    expect(merged.find((session) => session.id === kept.id)?.activeScope).toBe("the_pinboard");
   });
 
   it("unsubscribes browser nodes without leaving stale relay auth entries", async () => {

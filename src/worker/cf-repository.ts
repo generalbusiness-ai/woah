@@ -601,7 +601,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
     this.sql.exec(
       "INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class, current_location, apikey_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       record.id, record.actor, record.started,
-      record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest", record.currentLocation ?? null,
+      record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest", record.activeScope ?? null,
       record.apikeyId ?? null
     );
   }

@@ -1499,7 +1499,7 @@ describe("woo core", () => {
     const world = createWorld();
     const session = world.auth("guest:initial-room");
     expect(world.object(session.actor).location).toBe("the_chatroom");
-    expect(session.currentLocation).toBe("the_chatroom");
+    expect(session.activeScope).toBe("the_chatroom");
     expect(world.object("the_chatroom").contents.has(session.actor)).toBe(true);
     expect(world.hasPresence(session.actor, "the_chatroom")).toBe(false);
   });
@@ -1516,7 +1516,7 @@ describe("woo core", () => {
     expect(world.hasPresence(session.actor, "the_chatroom")).toBe(true);
   });
 
-  it("tracks current location per session for the same actor", async () => {
+  it("tracks active scope per session for the same actor", async () => {
     const world = createWorld();
     const primary = world.auth("guest:multi-location");
     const actor = primary.actor;
@@ -1525,14 +1525,29 @@ describe("woo core", () => {
     expect((await world.directCall("primary-enter-chat", actor, "the_chatroom", "enter", [], { sessionId: primary.id })).op).toBe("result");
     expect((await world.directCall("secondary-enter-dubspace", actor, "the_dubspace", "enter", [], { sessionId: secondary.id })).op).toBe("result");
 
-    expect(world.currentLocationForSession(primary.id)).toBe("the_chatroom");
-    expect(world.currentLocationForSession(secondary.id)).toBe("the_dubspace");
+    expect(world.activeScopeForSession(primary.id)).toBe("the_chatroom");
+    expect(world.activeScopeForSession(secondary.id)).toBe("the_dubspace");
     expect(world.object(actor).location).toBe("the_chatroom");
     expect(world.hasSessionPresence(primary.id, "the_chatroom")).toBe(true);
     expect(world.hasSessionPresence(primary.id, "the_dubspace")).toBe(false);
     expect(world.hasSessionPresence(secondary.id, "the_chatroom")).toBe(false);
     expect(world.hasSessionPresence(secondary.id, "the_dubspace")).toBe(true);
     expect(new Set(world.allLocationsForActor(actor))).toEqual(new Set(["the_chatroom", "the_dubspace"]));
+  });
+
+  it("hydrates legacy currentLocation snapshots into activeScope", () => {
+    const world = createWorld();
+    const session = world.auth("guest:legacy-current-location");
+    const serialized = world.exportWorld();
+    const stored = serialized.sessions.find((item) => item.id === session.id);
+    if (!stored) throw new Error("expected exported session");
+    delete stored.activeScope;
+    stored.currentLocation = "the_dubspace";
+
+    const reloaded = createWorldFromSerialized(serialized, { persist: false });
+
+    expect(reloaded.activeScopeForSession(session.id)).toBe("the_dubspace");
+    expect(reloaded.currentLocationForSession(session.id)).toBe("the_dubspace");
   });
 
   it("routes live observations to sessions in the source space, not every actor session", async () => {
@@ -1675,8 +1690,8 @@ describe("woo core", () => {
     });
     home.addVerb("emitter", { ...nativeVerb("emit_remote", "emit_remote_room"), direct_callable: true, skip_presence_check: true });
     remote.setSpaceSubscriber("remote_room", actor, true, primary.id);
-    home.sessions.get(primary.id)!.currentLocation = "remote_room";
-    home.sessions.get(secondary.id)!.currentLocation = "the_chatroom";
+    home.sessions.get(primary.id)!.activeScope = "remote_room";
+    home.sessions.get(secondary.id)!.activeScope = "the_chatroom";
 
     const result = await home.directCall("remote-session-audience", actor, "emitter", "emit_remote", [], { sessionId: secondary.id });
 
@@ -1699,7 +1714,7 @@ describe("woo core", () => {
     const resumed = world.auth(`session:${session.id}`);
     world.attachSocket(resumed.id, "ws-2");
     expect(resumed.actor).toBe(session.actor);
-    expect(resumed.currentLocation).toBe("the_chatroom");
+    expect(resumed.activeScope).toBe("the_chatroom");
     expect(world.sessions.get(session.id)?.lastDetachAt).toBeNull();
   });
 
@@ -1727,8 +1742,8 @@ describe("woo core", () => {
     expect(world.reapExpiredSessions()).toEqual([oldest.id]);
     expect(world.primarySessionForActor(actor)?.id).toBe(middle.id);
     expect(world.object(actor).location).toBe("the_dubspace");
-    expect(world.currentLocationForSession(middle.id)).toBe("the_dubspace");
-    expect(world.currentLocationForSession(newest.id)).toBe("the_taskspace");
+    expect(world.activeScopeForSession(middle.id)).toBe("the_dubspace");
+    expect(world.activeScopeForSession(newest.id)).toBe("the_taskspace");
   });
 
   it("does not expire a session while a socket is attached", async () => {
@@ -1955,7 +1970,7 @@ describe("woo core", () => {
     world.setProp("owned_space", "next_seq", 1);
     world.setSpaceSubscriber("owned_space", session.actor, true, session.id);
     world.setProp("owned_space", "last_snapshot_seq", 0);
-    world.sessions.get(session.id)!.currentLocation = "owned_space";
+    world.sessions.get(session.id)!.activeScope = "owned_space";
 
     const add = await world.call("add-feature", session.id, "owned_space", message(session.actor, "owned_space", "add_feature", ["owned_feature"]));
     expect(add.op).toBe("applied");
@@ -1984,7 +1999,7 @@ describe("woo core", () => {
     world.setProp("owned_chat_space", "next_seq", 1);
     world.setSpaceSubscriber("owned_chat_space", session.actor, true, session.id);
     world.setProp("owned_chat_space", "last_snapshot_seq", 0);
-    world.sessions.get(session.id)!.currentLocation = "owned_chat_space";
+    world.sessions.get(session.id)!.activeScope = "owned_chat_space";
 
     const add = await world.call("add-conversational", session.id, "owned_chat_space", message(session.actor, "owned_chat_space", "add_feature", ["$conversational"]));
     expect(add.op).toBe("applied");
