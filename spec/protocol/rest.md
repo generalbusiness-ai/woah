@@ -75,7 +75,9 @@ routes must fail closed through the normal session validation path.
 
 `GET /api/state` is the legacy full-world debug projection. It is wizard-only.
 It returns the actor-readable world projection plus
-`session: { id, actor, current_location }` for the presented session. The
+`session: { id, actor, active_scope }` for the presented session. Transitional
+implementations may include the legacy alias `current_location` with the same
+value. The
 projection's object graph may include compatibility presence mirrors, but
 ordinary clients MUST NOT use it for boot, movement, route resolution, or live
 updates. Use `/api/me`, `/api/objects/{id-or-name}/summary`, and overlay
@@ -86,16 +88,16 @@ snapshots instead.
 client-boot and reconnect endpoint. It MUST NOT serialize the full world object
 map. `cursor.spaces[space].next_seq` is the first sequenced frame to request
 after applying the snapshot. Cursor spaces are the union of
-`session.current_location`, `here.id`, and every overlay subject. Cursor
+`session.active_scope`, `here.id`, and every overlay subject. Cursor
 metadata is a system-scoped read, not a user property read; an actor may be
 entitled to replay observations from a space whose internal `next_seq` property
 is not readable by that actor. A space appears in the cursor only when it
 exposes a numeric `next_seq`; live-only state is reasserted by hydration rather
-than replay. `session.current_location` is the acting location for the
-presented session; `here` is a shallow, actor-filtered room snapshot for that
-location or `null`. Object summaries include `ancestors` so clients can resolve
-UI frames without reading a global class graph. Distributed implementations
-route `here` reads to the host that owns the current room.
+than replay. `session.active_scope` is the command focus for the presented
+session; `here` is a shallow, actor-filtered room snapshot for that scope or
+`null`. Object summaries include `ancestors` so clients can resolve UI frames
+without reading a global class graph. Distributed implementations route `here`
+reads to the host that owns the current room.
 
 Object summary `props` are actor-filtered by property read permissions. Identity
 fields (`id`, `name`, `parent`, `ancestors`, `features`, `owner`, `location`)

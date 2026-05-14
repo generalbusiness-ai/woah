@@ -6,7 +6,7 @@
 
 import type { Env } from "./persistent-object-do";
 import { signInternalRequest } from "./internal-auth";
-import { wooError } from "../core/types";
+import { sessionActiveScopeFromRecord, wooError } from "../core/types";
 
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
@@ -129,7 +129,8 @@ async function withDirectorySession(env: Env, request: Request): Promise<Request
   headers.set("x-woo-internal-actor", session.actor);
   headers.set("x-woo-internal-expires-at", String(session.expires_at));
   headers.set("x-woo-internal-token-class", session.token_class);
-  if (session.current_location) headers.set("x-woo-internal-current-location", session.current_location);
+  if (session.active_scope) headers.set("x-woo-internal-active-scope", session.active_scope);
+  if (session.active_scope) headers.set("x-woo-internal-current-location", session.active_scope);
   if (session.apikey_id) headers.set("x-woo-internal-apikey-id", session.apikey_id);
   return new Request(request, { headers });
 }
@@ -144,7 +145,8 @@ async function registerAuthResponse(env: Env, response: Response): Promise<void>
       actor: body.actor,
       expires_at: Number(body.expires_at ?? Date.now() + 5 * 60_000),
       token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
-      current_location: typeof body.current_location === "string" ? body.current_location : null,
+      active_scope: sessionActiveScope(body),
+      current_location: sessionActiveScope(body),
       apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null
     });
     await directoryPost(env, "/register-objects", {
@@ -201,6 +203,7 @@ async function registerSessionLocationFromCall(env: Env, request: Request, body:
     actor: session.actor,
     expires_at: session.expires_at,
     token_class: session.token_class,
+    active_scope: room,
     current_location: room,
     apikey_id: session.apikey_id ?? null
   });
@@ -225,7 +228,7 @@ async function registerObjectsFromApplied(env: Env, _frame: Record<string, unkno
   if (routes.length > 0) await directoryPost(env, "/register-objects", { routes });
 }
 
-async function resolveRequestSession(env: Env, request: Request): Promise<{ session_id: string; actor: string; expires_at: number; token_class: string; current_location?: string | null; apikey_id?: string | null } | null> {
+async function resolveRequestSession(env: Env, request: Request): Promise<{ session_id: string; actor: string; expires_at: number; token_class: string; active_scope?: string | null; current_location?: string | null; apikey_id?: string | null } | null> {
   const header = request.headers.get("authorization") ?? "";
   const match = /^Session\s+(.+)$/i.exec(header.trim());
   if (!match) return null;
@@ -235,17 +238,23 @@ async function resolveRequestSession(env: Env, request: Request): Promise<{ sess
     if (!session || typeof session !== "object") return null;
     const record = session as Record<string, unknown>;
     if (typeof record.session_id !== "string" || typeof record.actor !== "string") return null;
+    const activeScope = sessionActiveScope(record);
     return {
       session_id: record.session_id,
       actor: record.actor,
       expires_at: Number(record.expires_at ?? 0),
       token_class: typeof record.token_class === "string" ? record.token_class : "bearer",
-      current_location: typeof record.current_location === "string" ? record.current_location : null,
+      active_scope: activeScope,
+      current_location: activeScope,
       apikey_id: typeof record.apikey_id === "string" && record.apikey_id.length > 0 ? record.apikey_id : null
     };
   } catch {
     return null;
   }
+}
+
+function sessionActiveScope(record: Record<string, unknown>): string | null {
+  return sessionActiveScopeFromRecord(record);
 }
 
 async function resolveDirectoryObject(env: Env, id: string, fallbackHost: string): Promise<{ id: string; host: string; anchor: string | null }> {

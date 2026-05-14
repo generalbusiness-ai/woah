@@ -72,6 +72,17 @@ Each persistent host emits standard metrics:
 
 These are scraped per host on a fixed interval (default 30s). Aggregated up to per-cluster, per-deployment views.
 
+### Long-poll requests
+
+The MCP `woo_wait` tool ([protocol/mcp.md §M4](../protocol/mcp.md#m4-actor-control)) holds the worker request open for up to its `timeout_ms` budget when the per-actor observation queue is empty. In `wrangler tail` these appear as `/mcp` requests with `wallTime ≈ timeout_ms` (commonly ~1000ms in MCP smoke runs) and `cpuTime ≈ 0` — pure idle holds, not CPU work.
+
+When investigating warm-path tail latency (`/mcp` p95 ≫ p50), partition by `cpuTime / wallTime`:
+
+- `cpuTime ≈ wallTime` → real handler work; investigate the route.
+- `cpuTime ≪ wallTime` → idle hold; almost always `woo_wait` or another long-poll. Not a perf bug; do not chase.
+
+The dominant warm CPU cost on v2 commits lives at `/v2/envelope` (CommitScopeDO) and `/v2/open`, where `cpuTime ≈ wallTime`. Long-poll holds on `/mcp` should be excluded from any "is the v2 commit path slow?" measurement.
+
 ---
 
 ## O4. Per-actor / per-space metrics

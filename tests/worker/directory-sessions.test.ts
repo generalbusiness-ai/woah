@@ -92,6 +92,7 @@ describe("DirectoryDO register-session dedup", () => {
         actor: "$alice",
         expires_at: FAR_FUTURE,
         token_class: "guest",
+        active_scope: "$lobby",
         current_location: "$lobby",
         apikey_id: null
       };
@@ -113,7 +114,7 @@ describe("DirectoryDO register-session dedup", () => {
     }
   });
 
-  it("writes when current_location changes", async () => {
+  it("writes when active_scope changes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const { directory, cleanup } = makeDirectory();
@@ -123,16 +124,17 @@ describe("DirectoryDO register-session dedup", () => {
         actor: "$bob",
         expires_at: FAR_FUTURE,
         token_class: "bearer",
-        current_location: "$lobby",
+        active_scope: "$lobby",
         apikey_id: null
       };
       await postRegister(directory, base);
 
       vi.setSystemTime(T0 + 5_000);
-      const moved = await postRegister(directory, { ...base, current_location: "$garden" });
+      const moved = await postRegister(directory, { ...base, active_scope: "$garden" });
       expect(moved.wrote).toBe(true);
 
       const after = await resolve(directory, "sess_b");
+      expect(after?.active_scope).toBe("$garden");
       expect(after?.current_location).toBe("$garden");
       expect(Number(after?.updated_at)).toBe(T0 + 5_000);
     } finally {

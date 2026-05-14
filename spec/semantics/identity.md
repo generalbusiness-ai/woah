@@ -34,7 +34,7 @@ The runtime distinguishes three things that look similar but have different life
 | Layer | Concept | Lifetime | Persisted? | Identifier |
 |---|---|---|---|---|
 | **Actor** | A `$player` (or other `$actor`-descended) object in the world. The principal that authors calls and is checked for `progr`. | Indefinite — lives in the world. Guests are recycled, not deleted. | **Yes**, in object storage. | objref / ULID |
-| **Session** | A reconnect credential bound to an actor. Lets a client re-attach without re-auth. | Live while one or more connections are attached; then bounded by grace/TTL after the last connection detaches. | Credential metadata and session-scoped location (id, actor, current_location, expires_at, last_detach_at). **Not** the list of attached sockets. | unguessable random id, at least 128 bits |
+| **Session** | A reconnect credential bound to an actor. Lets a client re-attach without re-auth. | Live while one or more connections are attached; then bounded by grace/TTL after the last connection detaches. | Credential metadata and session-scoped command focus (id, actor, active_scope, expires_at, last_detach_at). **Not** the list of attached sockets. | unguessable random id, at least 128 bits |
 | **Connection** | A live transport attachment — one websocket, or one in-flight REST request. | Open-to-close of the transport. | **No** — in-memory only on the player host. Lost on host restart by design. | host-local socket id |
 
 Concretely:
@@ -52,7 +52,7 @@ The persisted session record carries:
 | `session_id` | opaque, unguessable random identifier; the client uses this to reconnect |
 | `actor` | objref of the bound actor |
 | `started_at` | ms timestamp |
-| `current_location` | objref of this session's acting location. Cross-host call envelopes carry this field so the receiving host can evaluate `location(this)` and `origin`-shaped observations against the caller's current session state before deferred host effects reconcile. |
+| `active_scope` | objref of this session's command focus. Cross-host call envelopes carry this field so the receiving host can evaluate `location(this)` and `origin`-shaped observations against the caller's active session scope before deferred host effects reconcile. Older storage rows and transitional wire payloads may also expose the legacy alias `current_location`. |
 | `expires_at` | deadline for an unattached/resumable session. Active websocket connections keep the session attached; implementations may renew or extend `expires_at` while attached. |
 | `last_detach_at` | ms timestamp of the most recent connection close (null while connected). Drives the grace-period reap path. |
 

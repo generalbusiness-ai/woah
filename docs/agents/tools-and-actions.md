@@ -21,11 +21,11 @@ Returns `{ scope, object, query, limit, cursor, next_cursor, total, tools }`.
 
 | Scope | What you see |
 |---|---|
-| `active` (default) | You + current location + inventory + other live locations + focus list. Bounded. |
-| `here` | Current location plus its visible contents. |
+| `active` (default) | You + active scope + inventory + other live scopes + focus list. Bounded. |
+| `here` | Active scope plus its visible contents. |
 | `focus` | Focused objects only. |
 | `object` | One reachable object (passed as `object`). |
-| `space` | One reachable space, or current location if omitted, plus its visible contents. |
+| `space` | One reachable space, or active scope if omitted, plus its visible contents. |
 | `all` | All directly reachable categories. Does *not* expand every space's contents — use `space` for that. |
 
 Each tool descriptor includes the **canonical call form**
@@ -88,9 +88,9 @@ tools — is the union of:
 
 1. **Self.** Your actor object. Verbs like `focus`, `wait`, `unfocus`
    come from `$actor` and are always reachable.
-2. **Current location.** The room or space you're in. Its `look`,
+2. **Active scope.** The room or space your session is focused on. Its `look`,
    `who`, `say`, `enter`, `go` come from here.
-3. **Location contents.** Visible objects in the current location.
+3. **Active-scope contents.** Visible objects in the active scope.
    Other actors and `$block` descendants appear here, but they're
    projected through **obvious verbs only** — readable verbs marked
    with command metadata. You don't get another actor's `focus` or
@@ -168,7 +168,7 @@ woo_call("$me", "describe", [])
 woo_call("$here", "who", [])
 ```
 
-(`$here` is a corename for your current location resolved per
+(`$here` is a corename for your active scope resolved per
 request.)
 
 **"Find a task by name from the taskspace and start working on it."**

@@ -28,6 +28,12 @@ export type Observation = Record<string, WooValue> & {
   type: string;
 };
 
+export function sessionActiveScopeFromRecord(record: Record<string, unknown> | null | undefined): ObjRef | null {
+  if (typeof record?.active_scope === "string") return record.active_scope;
+  if (typeof record?.current_location === "string") return record.current_location;
+  return null;
+}
+
 // Tool descriptor returned by HostBridge.enumerateRemoteTools so the gateway
 // can surface verbs on objects that live on a different host. Mirrors the
 // gateway-side McpTool shape without name sanitization (the gateway dedupes
@@ -323,7 +329,7 @@ export type Session = {
   expiresAt: number;
   lastDetachAt: number | null;
   tokenClass: "guest" | "bearer" | "apikey";
-  currentLocation: ObjRef;
+  activeScope: ObjRef;
   attachedSockets: Set<string>;
   /** Wall-clock ms of the most recent meaningful input frame on this session.
    * In-memory only — not persisted. Bumped on session create, socket attach,

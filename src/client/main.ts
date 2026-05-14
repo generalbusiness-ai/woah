@@ -19,6 +19,7 @@ import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { v2ProjectionSnapshotFromMessage, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
+import { sessionActiveScopeFromRecord } from "../core/types";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -178,10 +179,6 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
-// Generic non-chat room calls still keep a v1 fallback while the remaining
-// catalog surfaces migrate. Chat, Pinboard, and Dubspace call the v2 turn
-// helper directly and do not depend on this rollout flag.
-const v2OutboundEnabled = new URLSearchParams(location.search).has("v2Outbound");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 let scopedProjectionEnabled = (() => {
   const params = new URLSearchParams(location.search);
@@ -258,9 +255,11 @@ let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, l
 let routeInitialized = false;
 let v2BrowserWorker: Worker | undefined;
 let v2BrowserWorkerScope = "";
+let taskspaceComponentEventsBound = false;
 state.spaceChatHeights = loadSpaceChatHeights();
 
 installBundledCatalogUi();
+bindTaskspaceComponentEvents();
 state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
 if (state.authStatus === "authenticated") connect();
 else render();
@@ -1202,12 +1201,16 @@ function scopedToolSubject(surface: "dubspace" | "pinboard" | "taskspace"): stri
     const handleSurface = typeof (handle as any)?.surface === "string" ? (handle as any).surface : "";
     if (subject && handleSurface === surface) return subject;
   }
-  const current = state.scopedProjection?.session?.current_location;
+  const current = sessionActiveScope(state.scopedProjection?.session);
   if (typeof current === "string" && isCatalogObjectSummary(ui.observe(current), surface, className)) return current;
   for (const item of arrayOfObjects(state.scopedProjection?.here?.contents)) {
     if (isCatalogObjectSummary(item, surface, className)) return String(item.id ?? "");
   }
   return "";
+}
+
+function sessionActiveScope(session: any): string | undefined {
+  return sessionActiveScopeFromRecord(session) ?? undefined;
 }
 
 function applyScopedOverlaySnapshot(key: string, snapshot: any) {
@@ -1991,7 +1994,7 @@ function scopedPinboardPresentActors(boardId: string, props: Record<string, unkn
   // Last-resort local fallback: before the first overlay/presence frame lands,
   // show the user in their own active pinboard rather than an empty presence
   // map. This is not an authoritative subscriber list.
-  return state.actor && state.scopedProjection?.session?.current_location === boardId ? [state.actor] : [];
+  return state.actor && sessionActiveScope(state.scopedProjection?.session) === boardId ? [state.actor] : [];
 }
 
 function pinboardLayoutFromBoard(board: any): Record<string, any> {
@@ -2179,11 +2182,12 @@ function buildChatMeta(world: any) {
   const rooms = objectsByParent(world, catalogClass(chat, "$chatroom"));
   const pinned = chatRoomPin && chatRoomPin.expiresAt > Date.now() && rooms.includes(chatRoomPin.room) ? chatRoomPin.room : undefined;
   if (chatRoomPin && !pinned) chatRoomPin = null;
-  const currentLocation = typeof world?.session?.current_location === "string" && rooms.includes(world.session.current_location) ? world.session.current_location : undefined;
+  const sessionScope = sessionActiveScope(world?.session);
+  const activeScope = typeof sessionScope === "string" && rooms.includes(sessionScope) ? sessionScope : undefined;
   const occupied = rooms.find((id) => Array.isArray(world.objects?.[id]?.props?.subscribers) && world.objects[id].props.subscribers.includes(state.actor));
   const seededEntry = Object.values(demo?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
   const defaultRoom = seededEntry ?? rooms[0];
-  const current = pinned ?? currentLocation ?? occupied ?? seededEntry ?? rooms[0];
+  const current = pinned ?? activeScope ?? occupied ?? seededEntry ?? rooms[0];
   return { room: current, rooms, defaultRoom };
 }
 
@@ -2227,9 +2231,12 @@ function taskspaceSpace() {
     }
     if (state.routedSubjects.taskspace) return state.routedSubjects.taskspace;
     const scoped = scopedToolSubject("taskspace");
-    return scoped;
+    return scoped || activeInstalledCatalogSeed("taskspace", bundledToolSeeds.taskspace);
   }
-  return String(state.world?.taskspaceMeta?.space ?? "");
+  // Taskspace root actions can be clicked before the legacy `/api/state`
+  // compatibility meta has hydrated; use the bundled seed as the cold-start
+  // subject. Pinboard/chat still wait for their scoped route or API meta.
+  return String(state.world?.taskspaceMeta?.space || bundledToolSeeds.taskspace || "");
 }
 
 function pinboardSpace() {
@@ -2268,7 +2275,7 @@ function activeChatRoom() {
 function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (v2OutboundEnabled && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
+  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
   if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) ui.failOptimisticCall(id);
   return id;
 }
@@ -2389,6 +2396,7 @@ function callWithError(space: string, target: string, verb: string, args: unknow
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   if (onError) pendingFrameErrors.set(id, onError);
+  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
   if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) {
     ui.failOptimisticCall(id);
     pendingFrameErrors.delete(id);
@@ -2412,17 +2420,17 @@ function actorPresentInSpace(space: string) {
   const actor = state.actor;
   if (!actor) return false;
   if (scopedProjectionEnabled) {
-    if (state.scopedProjection?.session?.current_location === space) return true;
+    if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
     if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
     return actorPresenceList(actor).includes(space);
   }
-  if (state.world?.session?.current_location === space) return true;
+  if (sessionActiveScope(state.world?.session) === space) return true;
   return actorPresenceList(actor).includes(space);
 }
 
 function shouldAutoEnterDefaultChatRoom() {
   if (scopedProjectionEnabled) return false;
-  const location = state.world?.session?.current_location;
+  const location = sessionActiveScope(state.world?.session);
   if (typeof location === "string" && location && location !== "$nowhere") {
     const room = chatRoom();
     const subscribers = state.world?.objects?.[room]?.props?.subscribers;
@@ -4904,8 +4912,8 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  const currentLocation = scopedProjectionEnabled ? state.scopedProjection?.session?.current_location : state.world?.session?.current_location;
-  return Boolean(state.actor && board && currentLocation === board);
+  const activeScope = scopedProjectionEnabled ? sessionActiveScope(state.scopedProjection?.session) : sessionActiveScope(state.world?.session);
+  return Boolean(state.actor && board && activeScope === board);
 }
 
 function panPinboardBy(dx: number, dy: number) {
@@ -5304,47 +5312,50 @@ function mountTaskspaceComponent() {
   }, () => {
     if (space) mountToolSpaceChat(element, space);
   });
-  bindTaskspaceComponentEvents(element);
 }
 
-function bindTaskspaceComponentEvents(element: WooElement) {
-  if (element.dataset.taskspaceEventsBound === "true") return;
-  element.dataset.taskspaceEventsBound = "true";
-  element.addEventListener("woo-taskspace-status-filter", (event) => {
+function bindTaskspaceComponentEvents() {
+  if (taskspaceComponentEventsBound) return;
+  taskspaceComponentEventsBound = true;
+  // Taskspace can rerender the custom element while a route-enter direct call
+  // is still settling. Delegate these catalog UI events at the document level
+  // so the app bridge survives element replacement and custom-element upgrade
+  // timing.
+  document.addEventListener("woo-taskspace-status-filter", (event) => {
     const status = String((event as CustomEvent<{ status?: unknown }>).detail?.status ?? "");
     if (!status) return;
     state.taskStatusFilter[status] = state.taskStatusFilter[status] === false;
     syncTaskSelection();
     render();
   });
-  element.addEventListener("woo-taskspace-create", (event) => {
+  document.addEventListener("woo-taskspace-create", (event) => {
     const detail = (event as CustomEvent<{ name?: unknown; text?: unknown }>).detail ?? {};
     const name = String(detail.name ?? "").trim() || "Untitled";
     const text = String(detail.text ?? "").trim();
     const space = taskspaceSpace();
     if (space) taskspaceCall(space, "create_task", [name, text], (id) => pendingTaskSelections.add(id));
   });
-  element.addEventListener("woo-taskspace-toggle", (event) => {
+  document.addEventListener("woo-taskspace-toggle", (event) => {
     const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
     if (!id) return;
     state.taskExpanded[id] = state.taskExpanded[id] === false;
     render();
   });
-  element.addEventListener("woo-taskspace-select", (event) => {
+  document.addEventListener("woo-taskspace-select", (event) => {
     const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
     if (!id) return;
     setSelectedTask(id, { apply: false });
     state.taskExpanded[id] = state.taskExpanded[id] ?? true;
     setTab("taskspace", { mode: "push", leaveCurrent: false });
   });
-  element.addEventListener("woo-taskspace-task-action", (event) => {
+  document.addEventListener("woo-taskspace-task-action", (event) => {
     const id = state.selectedTask;
     const action = String((event as CustomEvent<{ action?: unknown }>).detail?.action ?? "");
     if (!id) return;
     if (action === "claim" || action === "release") taskspaceCall(id, action, []);
     if (action.startsWith("status:")) taskspaceCall(id, "set_status", [action.slice("status:".length)]);
   });
-  element.addEventListener("woo-taskspace-add-subtask", (event) => {
+  document.addEventListener("woo-taskspace-add-subtask", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const detail = (event as CustomEvent<{ name?: unknown; text?: unknown }>).detail ?? {};
@@ -5353,25 +5364,25 @@ function bindTaskspaceComponentEvents(element: WooElement) {
     state.taskExpanded[id] = true;
     taskspaceCall(id, "add_subtask", [name, text], (callId) => pendingTaskSelections.add(callId));
   });
-  element.addEventListener("woo-taskspace-add-requirement", (event) => {
+  document.addEventListener("woo-taskspace-add-requirement", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const text = String((event as CustomEvent<{ text?: unknown }>).detail?.text ?? "").trim() || "Requirement";
     taskspaceCall(id, "add_requirement", [text]);
   });
-  element.addEventListener("woo-taskspace-check-requirement", (event) => {
+  document.addEventListener("woo-taskspace-check-requirement", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const detail = (event as CustomEvent<{ index?: unknown; checked?: unknown }>).detail ?? {};
     taskspaceCall(id, "check_requirement", [Number(detail.index), detail.checked === true]);
   });
-  element.addEventListener("woo-taskspace-add-message", (event) => {
+  document.addEventListener("woo-taskspace-add-message", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const body = String((event as CustomEvent<{ body?: unknown }>).detail?.body ?? "").trim() || "Update";
     taskspaceCall(id, "add_message", [body]);
   });
-  element.addEventListener("woo-taskspace-add-artifact", (event) => {
+  document.addEventListener("woo-taskspace-add-artifact", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const ref = String((event as CustomEvent<{ ref?: unknown }>).detail?.ref ?? "").trim() || "https://example.com";

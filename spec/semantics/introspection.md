@@ -120,7 +120,7 @@ A typical first interaction for a fresh agent:
 
 ```
 1. agent connects, gets actor objref via op: "session"
-2. agent inspects the session state (`current_location`) or calls the actor's location tools
+2. agent inspects the session state (`active_scope`) or calls the actor's location tools
 3. agent calls the current space's `:describe()`
 4. agent sees verbs available on the space
 5. agent calls space's listing verb (e.g. :list_tasks)

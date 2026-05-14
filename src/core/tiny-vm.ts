@@ -1008,12 +1008,12 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "location": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "location expects one object");
         const obj = assertObj(builtinArgs[0]);
-        if (obj === frame.ctx.actor && frame.ctx.session) return frame.ctx.world.currentLocationForSession(frame.ctx.session);
+        if (obj === frame.ctx.actor && frame.ctx.session) return frame.ctx.world.activeScopeForSession(frame.ctx.session);
         return await frame.ctx.world.objectLocationChecked(obj, frame.ctx.hostMemo);
       }
       case "current_location": {
         if (builtinArgs.length !== 0) throw wooError("E_INVARG", "current_location expects no arguments");
-        return frame.ctx.world.currentLocationForSession(frame.ctx.session);
+        return frame.ctx.world.activeScopeForSession(frame.ctx.session);
       }
       case "current_session": {
         if (builtinArgs.length !== 0) throw wooError("E_INVARG", "current_session expects no arguments");
@@ -1021,7 +1021,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       }
       case "session_location": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "session_location expects one session id");
-        return frame.ctx.world.currentLocationForSession(String(builtinArgs[0] ?? ""));
+        return frame.ctx.world.activeScopeForSession(String(builtinArgs[0] ?? ""));
       }
       case "all_locations": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "all_locations expects one object");

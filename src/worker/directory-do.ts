@@ -1,4 +1,4 @@
-import { wooError, type MetricEvent, type ObjRef, type Session } from "../core/types";
+import { sessionActiveScopeFromRecord, wooError, type MetricEvent, type ObjRef, type Session } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 
 type ObjectRoute = {
@@ -23,6 +23,8 @@ type SessionRoute = {
   actor: ObjRef;
   expires_at: number;
   token_class: Session["tokenClass"];
+  active_scope: ObjRef | null;
+  /** Legacy storage/wire alias; persisted in `current_location` until a DB migration exists. */
   current_location: ObjRef | null;
   /** apikey record id when this session was minted from an apikey. Threaded
    * through Directory so cross-host routed copies can learn the apikey id
@@ -115,7 +117,8 @@ export class DirectoryDO {
             actor: String(body.actor ?? "") as ObjRef,
             expires_at: Number(body.expires_at ?? 0),
             token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
-            current_location: typeof body.current_location === "string" ? body.current_location as ObjRef : null,
+            active_scope: sessionActiveScope(body),
+            current_location: sessionActiveScope(body),
             apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
             updated_at: Date.now()
           });
@@ -271,7 +274,7 @@ export class DirectoryDO {
       && String(existing.actor) === session.actor
       && Number(existing.expires_at) === session.expires_at
       && String(existing.token_class) === session.token_class
-      && (existing.current_location === null ? null : String(existing.current_location)) === session.current_location
+      && (existing.current_location === null ? null : String(existing.current_location)) === session.active_scope
       && (existing.apikey_id === null ? null : String(existing.apikey_id)) === session.apikey_id) {
       return false;
     }
@@ -281,7 +284,7 @@ export class DirectoryDO {
       session.actor,
       session.expires_at,
       session.token_class,
-      session.current_location,
+      session.active_scope,
       session.apikey_id,
       Date.now()
     );
@@ -310,6 +313,7 @@ export class DirectoryDO {
       actor: String(row.actor),
       expires_at: expiresAt,
       token_class: row.token_class === "guest" || row.token_class === "apikey" ? row.token_class : "bearer",
+      active_scope: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
       current_location: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
       apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
       updated_at: Number(row.updated_at)
@@ -494,6 +498,10 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json; charset=utf-8" }
   });
+}
+
+function sessionActiveScope(record: Record<string, unknown>): ObjRef | null {
+  return sessionActiveScopeFromRecord(record) as ObjRef | null;
 }
 
 function metricErrorCode(err: unknown): string {

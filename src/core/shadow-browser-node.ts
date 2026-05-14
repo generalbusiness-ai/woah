@@ -101,7 +101,8 @@ export type ShadowScopeProjection = {
   session?: {
     id: string;
     actor: ObjRef;
-    current_location: ObjRef | null;
+    active_scope: ObjRef | null;
+    current_location?: ObjRef | null;
     all_locations: ObjRef[];
   } | null;
   inventory?: ScopedObjectSummary[];
@@ -361,8 +362,8 @@ export function mergeShadowBrowserSessionState(current: SerializedSession[], fre
     // owns the v2-committed session location for turns in that scope; replacing
     // it from the stale gateway snapshot would make a freshly-entered browser
     // fail the next presence gate.
-    if (existing && existing.actor === session.actor && existing.currentLocation !== undefined) {
-      merged.currentLocation = existing.currentLocation;
+    if (existing && existing.actor === session.actor && existing.activeScope !== undefined) {
+      merged.activeScope = existing.activeScope;
     }
     mergedById.set(session.id, merged);
   }
@@ -1118,8 +1119,9 @@ function shadowScopeProjection(
       session: viewer.session ? {
         id: viewer.session,
         actor: viewer.actor,
-        current_location: session?.currentLocation ?? null,
-        all_locations: session?.currentLocation ? [session.currentLocation] : []
+        active_scope: session?.activeScope ?? null,
+        current_location: session?.activeScope ?? null,
+        all_locations: session?.activeScope ? [session.activeScope] : []
       } : null,
       inventory
     } : {}),
@@ -1160,8 +1162,8 @@ function shadowProjectionRefs(index: ShadowSerializedIndex, scope: ObjRef, viewe
     pushObject(viewer.actor);
     pushContents(viewer.actor);
     const session = viewer.session ? index.sessions.get(viewer.session) : undefined;
-    pushObject(session?.currentLocation ?? null);
-    pushContents(session?.currentLocation ?? null);
+    pushObject(session?.activeScope ?? null);
+    pushContents(session?.activeScope ?? null);
   }
   return Array.from(refs);
 }

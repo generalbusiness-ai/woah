@@ -416,7 +416,7 @@ export class McpGateway {
     const enclosing = this.host.enclosingSpaceFor(target);
     if (enclosing) return enclosing;
     const session = this.sessionsByActor(actor);
-    return (session ? this.world.currentLocationForSession(session.woo.id) : null) ?? actor;
+    return (session ? this.world.activeScopeForSession(session.woo.id) : null) ?? actor;
   }
 
   private sessionsByActor(actor: ObjRef): SessionEntry | null {

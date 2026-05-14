@@ -54,20 +54,23 @@ export function scopedModelWithHere(model: ScopedProjectionStateModel, here: any
   return { ...model, me, here, cursor };
 }
 
-export function scopedModelWithCurrentLocation(model: ScopedProjectionStateModel, room: string): ScopedProjectionStateModel {
+export function scopedModelWithActiveScope(model: ScopedProjectionStateModel, room: string): ScopedProjectionStateModel {
   if (!model.session) return model;
-  const session = { ...model.session, current_location: room };
+  const session = { ...model.session, active_scope: room, current_location: room };
   const me = model.me && typeof model.me === "object" && !Array.isArray(model.me)
     ? { ...model.me, session }
     : model.me;
   return { ...model, me, session };
 }
 
+/** @deprecated Use scopedModelWithActiveScope. */
+export const scopedModelWithCurrentLocation = scopedModelWithActiveScope;
+
 export function scopedModelWithMoveResult(model: ScopedProjectionStateModel, result: any): ScopedProjectionStateModel {
   if (!result || typeof result !== "object" || Array.isArray(result)) return model;
   let next = model;
   if (result.here && typeof result.here === "object" && !Array.isArray(result.here)) next = scopedModelWithHere(next, result.here);
-  if (typeof result.room === "string") next = scopedModelWithCurrentLocation(next, result.room);
+  if (typeof result.room === "string") next = scopedModelWithActiveScope(next, result.room);
   return next;
 }
 

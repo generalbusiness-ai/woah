@@ -250,9 +250,9 @@ export class CommitScopeDO {
     const existing = relay.commit_scope.serialized.sessions[index];
     relay.commit_scope.serialized.sessions[index] = {
       ...serialized,
-      currentLocation: existing.actor === serialized.actor && existing.currentLocation !== undefined
-        ? existing.currentLocation
-        : serialized.currentLocation
+      activeScope: existing.actor === serialized.actor && existing.activeScope !== undefined
+        ? existing.activeScope
+        : serialized.activeScope
     };
   }
 

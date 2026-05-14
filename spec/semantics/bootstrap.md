@@ -243,7 +243,7 @@ directly on `$sequenced_log`.
 | `last_snapshot_seq` | int | 0 | Highest seq covered by a snapshot. Used for snapshot triggering and log truncation. |
 | `features` | list<obj> | `[]` | Feature objects contributing verbs to this space. See [features.md](features.md). |
 | `features_version` | int | 0 | Monotonic counter; verb-lookup cache invalidation. |
-| `auto_presence` | bool | false | Legacy catalog flag retained for older installed worlds. New session placement is explicit: clients/catalog verbs call `:enter`/`moveto`, which updates the session current location and `session_subscribers`. New code should not rely on automatic runtime entry from this property. |
+| `auto_presence` | bool | false | Legacy catalog flag retained for older installed worlds. New session placement is explicit: clients/catalog verbs call `:enter`/`moveto`, which updates the session active scope and `session_subscribers`. New code should not rely on automatic runtime entry from this property. |
 
 ### B2.15 `$space` verbs
 
@@ -519,7 +519,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 `$exit:invoke()` calls `$exit:move(actor)`. `$exit:move(who)` sends private
 leave/arrival text to `who`, calls `moveto(who, dest)`, and emits `left` /
 `entered` observations to the source and destination rooms. The core `moveto`
-path updates the calling session's current location and session presence.
+path updates the calling session's active scope and session presence.
 It returns `{room: dest, from: source, exit, here_request: true,
 look_deferred: true}`. Unlike LambdaCore's `$room:enterfunc`, legacy clients
 that do not consume `here` must follow movement with `dest:look()`.

@@ -153,15 +153,16 @@ cycles with `E_RECMOVE`.
 
 `location(obj)` returns the object's current container (`obj.location`) or
 `null`, except when `obj == actor` inside a session-bound task: then it returns
-that session's current location. This keeps command parsing and room verbs scoped
-to the tab/tool session that issued the call. It is a behavior-readable core
-field, not a property lookup.
+that session's active scope. This keeps command parsing and room verbs scoped to
+the tab/tool session that issued the call. It is a behavior-readable core field,
+not a property lookup.
 
 `current_session()` returns the current session id or `null` for host/bootstrap
-tasks. `current_location()` returns the current session's location or `null`.
-`session_location(id)` returns that live session's location or `null`.
+tasks. `current_location()` returns the current session's active scope or
+`null`. `session_location(id)` returns that live session's active scope or
+`null`.
 `primary_session(actor)` returns the actor's primary live session id or `null`.
-`all_locations(obj)` returns the deduplicated current locations for all live
+`all_locations(obj)` returns the deduplicated active scopes for all live
 sessions of an actor; for non-actors it returns the object's ordinary location
 as a singleton list, or `[]` when there is none.
 
@@ -214,7 +215,7 @@ core property.
 space through the host-safe presence primitive. The authoritative storage is
 `space.session_subscribers`; `space.subscribers` is an actor-level projection
 derived from those session rows. New catalog movement code should prefer
-`moveto(actor, space)`, which updates the calling session's current location and
+`moveto(actor, space)`, which updates the calling session's active scope and
 presence together. `set_presence` cannot set presence for another actor.
 
 ### 19.7 Sessions
