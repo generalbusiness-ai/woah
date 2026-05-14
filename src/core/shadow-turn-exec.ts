@@ -5,7 +5,7 @@ import type {
   SerializedWorld,
   SpaceSnapshotRecord
 } from "./repository";
-import type { AppliedFrame, DirectResultFrame, ErrorFrame, ObjRef, WooValue } from "./types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
 import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
@@ -212,6 +212,7 @@ export type ShadowTurnExecReply =
 
 export type ShadowTurnExecutionOptions = {
   commitScope?: ShadowCommitScope;
+  profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
 };
 
 export function createShadowExecutionNode(input: {
@@ -537,7 +538,8 @@ export async function executeShadowTurnCallOrNeedState(
         scope: request.key.scope,
         expected: request.expected ?? options.commitScope.head,
         transcript: run.transcript,
-        executor: node.node
+        executor: node.node,
+        profile: options.profile
       })
     : null;
   const receipt = commit

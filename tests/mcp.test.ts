@@ -5,7 +5,7 @@ import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
 import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import type { Observation, ObjRef, RemoteToolDescriptor, VerbDef, WooValue } from "../src/core/types";
+import type { MetricEvent, Observation, ObjRef, RemoteToolDescriptor, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 
 function bootstrapWorld() {
@@ -652,6 +652,8 @@ describe("McpHost", () => {
     world.setProp("$system", "guest_initial_room", null);
     const session = world.auth("guest:mcp-v2-cache-apply");
     const otherSession = world.auth("guest:mcp-v2-cache-apply-other");
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
     world.attachSocket(session.id, "socket:mcp-v2-cache-apply");
     world.attachSocket(otherSession.id, "socket:mcp-v2-cache-apply-other");
     world.touchSessionInput(otherSession.id, 123_456);
@@ -698,6 +700,23 @@ describe("McpHost", () => {
     expect(world.object(created).created).toBeGreaterThan(0);
     expect(world.object(created).modified).toBeGreaterThan(0);
     expect(world.object(session.actor).modified).toBeGreaterThanOrEqual(modifiedBefore);
+    const gatewayApplyMetrics = metrics.filter((event) => event.kind === "shadow_gateway_apply_step");
+    expect(gatewayApplyMetrics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "export_world", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "clone_world", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "apply_serialized", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "import_world", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "restore_runtime", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "total", scope: "the_chatroom", route: "sequenced" })
+    ]));
+    expect(gatewayApplyMetrics.find((event) => event.phase === "total")).toMatchObject({
+      objects: expect.any(Number),
+      properties: expect.any(Number),
+      sessions: expect.any(Number),
+      logs: expect.any(Number),
+      creates: 1,
+      writes: 1
+    });
   });
 
   it("does not enumerate remote tools while sending post-call list_changed hints", async () => {

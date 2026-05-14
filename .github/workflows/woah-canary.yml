@@ -26,7 +26,7 @@ jobs:
   mcp-smoke:
     name: v2 MCP smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -38,3 +38,9 @@ jobs:
         env:
           WOO_MCP_SMOKE_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.inguz.workers.dev' }}
         run: npm run smoke:mcp
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run deployed browser smoke
+        env:
+          WOO_E2E_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.inguz.workers.dev' }}
+        run: npm run smoke:browser

@@ -31,7 +31,7 @@ import {
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
-import type { ObjRef, WooValue } from "../core/types";
+import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 
@@ -44,6 +44,7 @@ export class CommitScopeDO {
     private readonly state: CommitScopeDurableState,
     private readonly env: InternalAuthEnv
   ) {
+    const constructorStartedAt = Date.now();
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT NOT NULL, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
     );
@@ -59,68 +60,134 @@ export class CommitScopeDO {
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_reply (idempotency_key TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     );
+    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "CommitScopeDO", ms: Date.now() - constructorStartedAt, ts: Date.now(), host_key: this.durableScopeKey() }));
   }
 
   async fetch(request: Request): Promise<Response> {
+    const handlerStartedAt = Date.now();
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/healthz") {
+    let handlerStatus: "ok" | "error" = "ok";
+    let handlerError: string | undefined;
+    try {
+      if (request.method === "GET" && url.pathname === "/healthz") {
+        return jsonResponse({
+          ok: true,
+          kind: "woo.commit_scope_do.v1",
+          id: String(this.state.id),
+          ts: Date.now()
+        });
+      }
+      if (request.method === "POST" && url.pathname === "/v2/open") {
+        const startedAt = Date.now();
+        let scope: ObjRef | undefined;
+        let node: string | undefined;
+        let fullSave = false;
+        try {
+          await verifyInternalRequest(this.env, request);
+          const input = await readJson<CommitScopeOpenRequest>(request);
+          scope = input.scope;
+          node = input.node;
+          const relay = await this.relayFor(input);
+          this.ensureSerializedSession(relay, input);
+          const browser = this.browserFor(relay, input);
+          const opened = await openShadowBrowserScope(browser, {
+            preseed_catalog_pages: true,
+            last_known_head: input.last_known_head
+          });
+          const hello = shadowBrowserTransportHello(browser);
+          if (this.needsFullSave) {
+            await this.saveFull(relay);
+            this.needsFullSave = false;
+            fullSave = true;
+          }
+          this.emitMetric({
+            kind: "v2_open",
+            scope,
+            node,
+            ms: Date.now() - startedAt,
+            status: "ok",
+            transfer_mode: opened.transfer.mode,
+            full_save: fullSave
+          });
+          return jsonResponse({
+            ok: true,
+            relay: relay.node,
+            hello,
+            head: relay.commit_scope.head,
+            transfer: opened.transfer
+          } satisfies CommitScopeOpenResponse);
+        } catch (err) {
+          this.emitMetric({ kind: "v2_open", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, error: metricErrorCode(err) });
+          throw err;
+        }
+      }
+      if (request.method === "POST" && url.pathname === "/v2/envelope") {
+        const startedAt = Date.now();
+        let scope: ObjRef | undefined;
+        let node: string | undefined;
+        let fullSave = false;
+        try {
+          await verifyInternalRequest(this.env, request);
+          const input = await readJson<CommitScopeEnvelopeRequest>(request);
+          scope = input.scope;
+          node = input.node;
+          const relay = await this.relayFor(input);
+          this.ensureSerializedSession(relay, input);
+          const browser = this.browserFor(relay, input);
+          const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
+          const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, { profile: (event) => this.emitMetric(event) });
+          if (this.needsFullSave) {
+            await this.saveFull(relay);
+            this.needsFullSave = false;
+            fullSave = true;
+          } else {
+            await this.saveEnvelopeDelta(relay, receipt, reply);
+          }
+          const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
+          this.emitMetric({
+            kind: "v2_envelope",
+            scope,
+            node,
+            ms: Date.now() - startedAt,
+            status: "ok",
+            fresh: receipt.fresh,
+            reply: shadowReplyMetricKind(reply),
+            fanout: fanout.length,
+            full_save: fullSave
+          });
+          this.emitShadowCommitMetric(reply, node, fanout.length);
+          return jsonResponse({
+            ok: true,
+            reply: reply ? encodeEnvelope(reply) : null,
+            head: relay.commit_scope.head,
+            fanout
+          } satisfies CommitScopeEnvelopeResponse);
+        } catch (err) {
+          this.emitMetric({ kind: "v2_envelope", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, error: metricErrorCode(err) });
+          throw err;
+        }
+      }
       return jsonResponse({
-        ok: true,
-        kind: "woo.commit_scope_do.v1",
-        id: String(this.state.id),
-        ts: Date.now()
+        error: {
+          code: "E_NOT_IMPLEMENTED",
+          message: "CommitScopeDO storage is reserved for the v2 turn-network commit scope"
+        }
+      }, 501);
+    } catch (err) {
+      handlerStatus = "error";
+      handlerError = metricErrorCode(err);
+      throw err;
+    } finally {
+      this.emitMetric({
+        kind: "do_handler",
+        class: "CommitScopeDO",
+        method: request.method,
+        route: url.pathname,
+        ms: Date.now() - handlerStartedAt,
+        status: handlerStatus,
+        ...(handlerError ? { error: handlerError } : {})
       });
     }
-    if (request.method === "POST" && url.pathname === "/v2/open") {
-      await verifyInternalRequest(this.env, request);
-      const input = await readJson<CommitScopeOpenRequest>(request);
-      const relay = await this.relayFor(input);
-      this.ensureSerializedSession(relay, input);
-      const browser = this.browserFor(relay, input);
-      const opened = await openShadowBrowserScope(browser, {
-        preseed_catalog_pages: true,
-        last_known_head: input.last_known_head
-      });
-      const hello = shadowBrowserTransportHello(browser);
-      if (this.needsFullSave) {
-        await this.saveFull(relay);
-        this.needsFullSave = false;
-      }
-      return jsonResponse({
-        ok: true,
-        relay: relay.node,
-        hello,
-        head: relay.commit_scope.head,
-        transfer: opened.transfer
-      } satisfies CommitScopeOpenResponse);
-    }
-    if (request.method === "POST" && url.pathname === "/v2/envelope") {
-      await verifyInternalRequest(this.env, request);
-      const input = await readJson<CommitScopeEnvelopeRequest>(request);
-      const relay = await this.relayFor(input);
-      this.ensureSerializedSession(relay, input);
-      const browser = this.browserFor(relay, input);
-      const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
-      const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
-      if (this.needsFullSave) {
-        await this.saveFull(relay);
-        this.needsFullSave = false;
-      } else {
-        await this.saveEnvelopeDelta(relay, receipt, reply);
-      }
-      return jsonResponse({
-        ok: true,
-        reply: reply ? encodeEnvelope(reply) : null,
-        head: relay.commit_scope.head,
-        fanout: reply ? this.fanoutEnvelopes(relay, input.node, reply) : []
-      } satisfies CommitScopeEnvelopeResponse);
-    }
-    return jsonResponse({
-      error: {
-        code: "E_NOT_IMPLEMENTED",
-        message: "CommitScopeDO storage is reserved for the v2 turn-network commit scope"
-      }
-    }, 501);
   }
 
   private async relayFor(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
@@ -279,6 +346,41 @@ export class CommitScopeDO {
       }
     }
     return out;
+  }
+
+  private emitShadowCommitMetric(reply: ShadowEnvelope<ShadowTurnExecReply> | null, node: string | undefined, fanout: number): void {
+    const body = reply?.body;
+    if (!body) return;
+    // Commit outcomes are split out from the endpoint metric so production
+    // tails can alert on accept/reject rates without decoding reply envelopes.
+    if (body.ok === true && body.commit) {
+      this.emitMetric({
+        kind: "shadow_commit_accepted",
+        scope: body.commit.position.scope,
+        seq: body.commit.position.seq,
+        node,
+        id: body.id,
+        fanout
+      });
+      return;
+    }
+    if (body.ok === false && body.reason === "commit_rejected") {
+      this.emitMetric({
+        kind: "shadow_commit_rejected",
+        scope: body.commit?.scope,
+        node,
+        id: body.id,
+        reason: body.commit?.reason ?? body.reason
+      });
+    }
+  }
+
+  private emitMetric(event: MetricEvent): void {
+    console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: this.durableScopeKey("scope" in event ? event.scope : undefined) }));
+  }
+
+  private durableScopeKey(scope?: ObjRef): string {
+    return String(scope ?? (this.state.id as { name?: string }).name ?? "commit_scope");
   }
 
   private loadSnapshot(input: CommitScopeBaseRequest): ShadowBrowserRelayShim | null {
@@ -600,6 +702,21 @@ function decodeStorageKey(hex: string): string {
     bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
   }
   return new TextDecoder().decode(bytes);
+}
+
+type V2EnvelopeReplyMetric = "none" | "accepted" | "live" | "missing_state" | "commit_rejected";
+
+function shadowReplyMetricKind(reply: ShadowEnvelope<ShadowTurnExecReply> | null): V2EnvelopeReplyMetric {
+  const body = reply?.body;
+  if (!body) return "none";
+  if (body.ok === false) return body.reason;
+  return body.commit ? "accepted" : "live";
+}
+
+function metricErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err && typeof (err as { code?: unknown }).code === "string") return (err as { code: string }).code;
+  if (err instanceof Error && err.name) return err.name;
+  return "E_UNKNOWN";
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

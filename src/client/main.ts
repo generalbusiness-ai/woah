@@ -1279,6 +1279,7 @@ async function applyScopedProjectionSnapshot(me: any, catalogs: any) {
     overlaySnapshots
   };
   ingestScopedSnapshots(me);
+  await hydrateCurrentLocationSummary(me);
   const currentChatRoom = chatRoom();
   if (previousChatRoom && previousChatRoom !== currentChatRoom) pushChatSeparator(previousChatRoom, false);
   lastObservedChatRoom = currentChatRoom;
@@ -1296,6 +1297,15 @@ async function applyScopedProjectionSnapshot(me: any, catalogs: any) {
   } else {
     syncUrlFromCurrentState("replace");
   }
+}
+
+async function hydrateCurrentLocationSummary(me: any): Promise<void> {
+  const current = typeof me?.session?.current_location === "string" ? me.session.current_location : "";
+  if (!current || String(me?.here?.id ?? "") === current) return;
+  // Remote room snapshots can degrade to a session-only location; hydrate the
+  // room title before the first scoped chat render so H1 never falls back to
+  // the generic component default.
+  await fetchScopedObjectSummary(current).catch(() => undefined);
 }
 
 function ingestScopedSnapshots(me: any) {
@@ -1620,7 +1630,32 @@ function projectedObjectView(id: string | undefined) {
       props: { ...(projected.props ?? {}) }
     };
   }
-  if (scopedProjectionEnabled) return null;
+  if (scopedProjectionEnabled) {
+    const here = state.scopedProjection?.here;
+    if (String(here?.id ?? "") === id) {
+      const summary = roomSnapshotAsObjectSummary(here);
+      return {
+        id,
+        name: summary.name ?? id,
+        owner: summary.owner,
+        parent: summary.parent,
+        location: summary.location,
+        props: { ...(summary.props ?? {}) }
+      };
+    }
+    const summary = state.scopedObjectSummaries[id];
+    if (summary) {
+      return {
+        id,
+        name: summary.name ?? id,
+        owner: summary.owner,
+        parent: summary.parent,
+        location: summary.location,
+        props: { ...(summary.props ?? {}) }
+      };
+    }
+    return null;
+  }
   const fallback = state.world?.dubspace?.[id] ?? objectView(state.world, id);
   if (!fallback) return null;
   return {
@@ -2211,12 +2246,16 @@ function pinboardSpace() {
 function chatRoom() {
   // Migration note: new selectors should make the scoped branch primary.
   // The `state.world` branch is the temporary `/api/state` compatibility tail.
-  if (scopedProjectionEnabled) return String(state.scopedProjection?.here?.id ?? "");
+  if (scopedProjectionEnabled) {
+    const here = String(state.scopedProjection?.here?.id ?? "");
+    if (here) return here;
+    return String(state.scopedProjection?.session?.current_location ?? "");
+  }
   return String(state.world?.chatMeta?.room ?? "");
 }
 
 function defaultChatRoom() {
-  if (scopedProjectionEnabled) return String(state.scopedProjection?.here?.id ?? "");
+  if (scopedProjectionEnabled) return chatRoom();
   return String(state.world?.chatMeta?.defaultRoom ?? "");
 }
 

@@ -45,24 +45,29 @@ export class DirectoryDO {
   private schemaEnsured = false;
 
   constructor(state: DurableObjectState, env: InternalAuthEnv) {
+    const constructorStartedAt = Date.now();
     this.state = state;
     this.env = env;
+    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "DirectoryDO", ms: Date.now() - constructorStartedAt, ts: Date.now(), host_key: "directory" }));
   }
 
   async fetch(request: Request): Promise<Response> {
-    if (!this.schemaEnsured) {
-      const schemaStartedAt = Date.now();
-      try {
-        this.ensureSchema();
-        this.schemaEnsured = true;
-        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 5 });
-      } catch (err) {
-        this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 5, error: metricErrorCode(err) });
-        throw err;
-      }
-    }
+    const handlerStartedAt = Date.now();
     const url = new URL(request.url);
+    let handlerStatus: "ok" | "error" = "ok";
+    let handlerError: string | undefined;
     try {
+      if (!this.schemaEnsured) {
+        const schemaStartedAt = Date.now();
+        try {
+          this.ensureSchema();
+          this.schemaEnsured = true;
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 5 });
+        } catch (err) {
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 5, error: metricErrorCode(err) });
+          throw err;
+        }
+      }
       await verifyInternalRequest(this.env, request);
 
       if (request.method === "GET" && url.pathname === "/healthz") {
@@ -148,7 +153,19 @@ export class DirectoryDO {
       const error = err && typeof err === "object" && "code" in err
         ? err
         : { code: "E_INTERNAL", message: err instanceof Error ? err.message : String(err) };
+      handlerStatus = "error";
+      handlerError = String((error as { code?: unknown }).code ?? "E_INTERNAL");
       return json({ error }, 500);
+    } finally {
+      this.emitMetric({
+        kind: "do_handler",
+        class: "DirectoryDO",
+        method: request.method,
+        route: url.pathname,
+        ms: Date.now() - handlerStartedAt,
+        status: handlerStatus,
+        ...(handlerError ? { error: handlerError } : {})
+      });
     }
   }
 

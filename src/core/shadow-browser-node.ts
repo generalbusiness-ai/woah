@@ -18,7 +18,7 @@ import type { EffectTranscript } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
-import type { ObjRef, Observation, WooValue } from "./types";
+import type { MetricEvent, ObjRef, Observation, WooValue } from "./types";
 import { cloneValue } from "./types";
 import type { ScopedObjectSummary } from "./world";
 
@@ -835,7 +835,8 @@ export function receiveShadowBrowserEnvelopeReceipt(browser: ShadowBrowserNode, 
 
 export async function handleShadowBrowserTurnExecEnvelope(
   browser: ShadowBrowserNode,
-  receipt: ShadowBrowserEnvelopeReceipt
+  receipt: ShadowBrowserEnvelopeReceipt,
+  options: { profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void } = {}
 ): Promise<ShadowEnvelope<ShadowTurnExecReply> | null> {
   // Keep wire turn-exec dispatch in the substrate so dev-server, Worker, and
   // future socket bindings share the same duplicate handling and reply shape.
@@ -852,7 +853,7 @@ export async function handleShadowBrowserTurnExecEnvelope(
     : receipt.envelope.body as ShadowTurnExecRequest;
   const reply = intent?.persistence === "live"
     ? await executeShadowBrowserLivePersistenceIntent(browser, request)
-    : (await executeShadowBrowserTurnExecRequest(browser, request)).reply;
+    : (await executeShadowBrowserTurnExecRequest(browser, request, options)).reply;
   if (!reply) return null;
   const response = shadowBrowserTurnExecReplyEnvelope(browser, receipt, request, reply);
   // Idempotency is reply-oriented: a client retrying because it missed the
@@ -945,7 +946,8 @@ async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, inten
 
 async function executeShadowBrowserTurnExecRequest(
   browser: ShadowBrowserNode,
-  request: ShadowTurnExecRequest
+  request: ShadowTurnExecRequest,
+  options: { profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void } = {}
 ): Promise<ShadowTurnExecutionResult> {
   validateShadowBrowserNodeAuth(browser);
   const executor = shadowRelayExecutorForRequest(browser.relay, request);
@@ -960,7 +962,8 @@ async function executeShadowBrowserTurnExecRequest(
       node: browser.relay.node,
       serialized: browser.relay.commit_scope.serialized
     },
-    commitScope: browser.relay.commit_scope
+    commitScope: browser.relay.commit_scope,
+    profile: options.profile
   });
 
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);

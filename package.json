@@ -21,6 +21,7 @@
     "test": "vitest run --reporter=dot",
     "smoke:onboarding": "tsx scripts/smoke-onboarding.ts",
     "smoke:mcp": "vitest run tests/smoke/v2-mcp-smoke.test.ts --reporter=dot",
+    "smoke:browser": "playwright test e2e/smoke.spec.ts -g \"chat boot uses /api/me\"",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "pretypecheck": "npm run catalog:index && npm run guard:object-names && npm run guard:layering && npm run guard:catalog-migrations",
