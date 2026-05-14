@@ -60,7 +60,7 @@ vocabulary REST uses; see [agents/connecting.md](agents/connecting.md).
 Once connected:
 
 1. Call `woo_list_reachable_tools()` to see what verbs are currently
-   exposed to you. The list reflects your **current location** plus a
+   exposed to you. The list reflects your **active scope** plus a
    few always-available control tools (`woo_call`, `woo_focus`,
    `woo_unfocus`, `woo_wait`).
 2. Call any tool you see, or use `woo_call("<object>", "<verb>", [args])`

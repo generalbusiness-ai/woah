@@ -12,7 +12,7 @@ import {
 describe("scoped client projection helpers", () => {
   it("applies move-result here snapshots without mutating the original /api/me snapshot", () => {
     const me = {
-      session: { id: "session_1", actor: "guest_1", current_location: "room_a", all_locations: ["room_a"] },
+      session: { id: "session_1", actor: "guest_1", active_scope: "room_a", current_location: "room_a", all_locations: ["room_a"] },
       here: { id: "room_a", name: "Room A", present_actors: [{ id: "guest_1", name: "Guest One" }] },
       cursor: { spaces: { room_a: { next_seq: 5 } }, live: { resumable: false } }
     };
@@ -35,11 +35,12 @@ describe("scoped client projection helpers", () => {
 
     expect(next).not.toBe(model);
     expect(next.me).not.toBe(me);
-    expect(next.session).toMatchObject({ current_location: "room_b" });
-    expect(next.me?.session).toMatchObject({ current_location: "room_b" });
+    expect(next.session).toMatchObject({ active_scope: "room_b", current_location: "room_b" });
+    expect(next.me?.session).toMatchObject({ active_scope: "room_b", current_location: "room_b" });
     expect(next.here).toBe(nextHere);
     expect(next.cursor?.spaces?.room_a?.next_seq).toBe(5);
     expect(next.cursor?.spaces?.room_b?.next_seq).toBe(8);
+    expect(me.session.active_scope).toBe("room_a");
     expect(me.session.current_location).toBe("room_a");
     expect(me.here.id).toBe("room_a");
     expect(scopedHerePresentActors(next.here)).toEqual(["guest_1", "guest_2"]);

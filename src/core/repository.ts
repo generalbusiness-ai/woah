@@ -26,6 +26,8 @@ export type SerializedSession = {
   expiresAt?: number;
   lastDetachAt?: number | null;
   tokenClass?: "guest" | "bearer" | "apikey";
+  activeScope?: ObjRef | null;
+  /** Legacy serialized field accepted while older snapshots exist. */
   currentLocation?: ObjRef | null;
   /** The apikey record id this session was minted from, when tokenClass is
    * "apikey". Persisted so revokeApiKey can close routed and post-restart

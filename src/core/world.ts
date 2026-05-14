@@ -309,7 +309,9 @@ export type MeSnapshot = {
   session: {
     id: string;
     actor: ObjRef;
-    current_location: ObjRef | null;
+    active_scope: ObjRef | null;
+    /** Legacy alias for clients that have not migrated to `active_scope`. */
+    current_location?: ObjRef | null;
     all_locations: ObjRef[];
   };
   here: RoomSnapshot | null;
@@ -2652,7 +2654,7 @@ export class WooWorld {
       expiresAt: now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
-      currentLocation: this.initialSessionLocation(actor),
+      activeScope: this.initialSessionLocation(actor),
       attachedSockets: new Set(),
       lastInputAt: now,
       ...(apikeyId !== undefined ? { apikeyId } : {})
@@ -2681,7 +2683,7 @@ export class WooWorld {
     actor: ObjRef,
     tokenClass: Session["tokenClass"] = "bearer",
     expiresAt?: number,
-    currentLocation?: ObjRef | null,
+    activeScope?: ObjRef | null,
     apikeyId?: string
   ): Session {
     const existing = this.sessions.get(id);
@@ -2691,8 +2693,8 @@ export class WooWorld {
         existing.expiresAt = expiresAt;
         changed = true;
       }
-      if (currentLocation && existing.currentLocation !== currentLocation) {
-        existing.currentLocation = currentLocation;
+      if (activeScope && existing.activeScope !== activeScope) {
+        existing.activeScope = activeScope;
         changed = true;
       }
       // If the originating host knows the apikey id but the routed copy
@@ -2714,7 +2716,7 @@ export class WooWorld {
       expiresAt: expiresAt ?? now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
-      currentLocation: currentLocation ?? this.initialSessionLocation(actor),
+      activeScope: activeScope ?? this.initialSessionLocation(actor),
       attachedSockets: new Set(),
       lastInputAt: now,
       ...(apikeyId !== undefined ? { apikeyId } : {})
@@ -2895,18 +2897,23 @@ export class WooWorld {
     return best;
   }
 
-  currentLocationForSession(sessionId: string | null | undefined): ObjRef | null {
+  activeScopeForSession(sessionId: string | null | undefined): ObjRef | null {
     if (!sessionId) return null;
     const session = this.sessions.get(sessionId);
     if (!session || !this.sessionAlive(sessionId)) return null;
-    return session.currentLocation;
+    return session.activeScope;
+  }
+
+  /** @deprecated Use activeScopeForSession; current location was legacy focus vocabulary. */
+  currentLocationForSession(sessionId: string | null | undefined): ObjRef | null {
+    return this.activeScopeForSession(sessionId);
   }
 
   allLocationsForActor(actor: ObjRef): ObjRef[] {
     const out: ObjRef[] = [];
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
-      if (!out.includes(session.currentLocation)) out.push(session.currentLocation);
+      if (!out.includes(session.activeScope)) out.push(session.activeScope);
     }
     if (out.length === 0) {
       const loc = this.objects.get(actor)?.location ?? null;
@@ -2927,7 +2934,7 @@ export class WooWorld {
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
       if (this.sessionExpired(session, now)) continue;
-      if (!out.includes(session.currentLocation)) out.push(session.currentLocation);
+      if (!out.includes(session.activeScope)) out.push(session.activeScope);
     }
     return out;
   }
@@ -3306,9 +3313,9 @@ export class WooWorld {
 
   private async includeMovingActorInHere(ctx: CallContext, here: RoomSnapshot, memo: HostOperationMemo): Promise<RoomSnapshot> {
     if (!ctx.session || here.present_actors.some((actor) => actor.id === ctx.actor)) return here;
-    const currentLocation = this.currentLocationForSession(ctx.session);
-    if (!currentLocation) return here;
-    const currentHere = await this.primaryRoomForLocation(currentLocation, memo);
+    const activeScope = this.activeScopeForSession(ctx.session);
+    if (!activeScope) return here;
+    const currentHere = await this.primaryRoomForLocation(activeScope, memo);
     if (currentHere !== here.id) return here;
     return {
       ...here,
@@ -3643,20 +3650,20 @@ export class WooWorld {
 
   async meSnapshot(session: Session): Promise<MeSnapshot> {
     const memo = createHostOperationMemo();
-    const currentLocation = this.currentLocationForSession(session.id);
-    const hereLocation = currentLocation
-      ? await this.primaryRoomForLocation(currentLocation, memo).catch((err) => {
+    const activeScope = this.activeScopeForSession(session.id);
+    const hereLocation = activeScope
+      ? await this.primaryRoomForLocation(activeScope, memo).catch((err) => {
         if (isReadAvailabilityError(err)) return null;
         throw err;
       })
       : null;
     const inventoryRefs = await this.objectContents(session.actor, memo);
     const inventory = await this.scopedObjectSummaries(session.actor, inventoryRefs, memo);
-    const overlays = currentLocation && hereLocation && currentLocation !== hereLocation
-      ? { current_location: { subject: currentLocation, surface: "default", restore: true } }
+    const overlays = activeScope && hereLocation && activeScope !== hereLocation
+      ? { active_scope: { subject: activeScope, surface: "default", restore: true } }
       : undefined;
     const cursorSpaces = [
-      currentLocation,
+      activeScope,
       hereLocation,
       ...Object.values(overlays ?? {}).map((overlay) => overlay.subject)
     ].filter((item): item is ObjRef => typeof item === "string");
@@ -3673,7 +3680,8 @@ export class WooWorld {
       session: {
         id: session.id,
         actor: session.actor,
-        current_location: currentLocation,
+        active_scope: activeScope,
+        current_location: activeScope,
         all_locations: this.allLocationsForActor(session.actor)
       },
       here,
@@ -4850,7 +4858,7 @@ export class WooWorld {
     } else if (ctx.session) {
       const session = this.sessions.get(ctx.session);
       if (session && session.actor === actor) {
-        session.currentLocation = destination;
+        session.activeScope = destination;
         this.persistSession(session);
       }
     }
@@ -5238,14 +5246,14 @@ export class WooWorld {
       if (!session || session.actor !== actor) throw wooError("E_NOSESSION", "actor moveto requires the calling actor's live session", { actor, session: ctx.session });
       if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.object(targetRef);
       await this.invokeAcceptableHook(ctx, targetRef, actor);
-      const oldLocation = session.currentLocation;
+      const oldLocation = session.activeScope;
       if (oldLocation && (this.objects.has(oldLocation) || await this.remoteHostForObject(oldLocation, ctx.hostMemo))) {
         await this.invokeContainerHookSwallow(ctx, oldLocation, "exitfunc", [actor]);
       }
       if (oldLocation && await this.spaceLikeOrRemote(oldLocation, ctx.hostMemo)) {
         await this.updatePresenceChecked(actor, oldLocation, false, ctx);
       }
-      session.currentLocation = targetRef;
+      session.activeScope = targetRef;
       this.persistSession(session);
       if (this.primarySessionForActor(actor)?.id === session.id) {
         if (ctx.deferHostEffect && await this.remoteHostForObject(actor, ctx.hostMemo)) {
@@ -5399,7 +5407,7 @@ export class WooWorld {
       if (present) {
         const session = this.sessions.get(sessionId);
         if (session && session.actor === actor) {
-          session.currentLocation = space;
+          session.activeScope = space;
           this.persistSession(session);
         }
       }
@@ -6169,7 +6177,7 @@ export class WooWorld {
 
   private captureRuntimeSessionStates(): Map<string, RuntimeSessionState> {
     // Keep this helper aligned with all transport-only Session fields. Durable
-    // serialized fields such as currentLocation must come from the transcript;
+    // serialized fields such as activeScope must come from the transcript;
     // socket/input state must survive cache rehydrates. Sessions created by the
     // transcript have no prior transport state, so they intentionally keep the
     // import defaults until a transport attaches or sends input.
@@ -6351,7 +6359,7 @@ export class WooWorld {
         expiresAt: session.expiresAt,
         lastDetachAt: session.lastDetachAt,
         tokenClass: session.tokenClass,
-        currentLocation: session.currentLocation,
+        activeScope: session.activeScope,
         ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
       };
     }
@@ -6900,10 +6908,10 @@ export class WooWorld {
     if (!Array.isArray(message.args)) throw wooError("E_INVARG", "message.args must be a list");
   }
 
-    private hydrateSession(
-      session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; currentLocation?: ObjRef | null; apikeyId?: string },
-      now: number
-    ): Session {
+  private hydrateSession(
+    session: { id: string; actor: ObjRef; started: number; expiresAt?: number; lastDetachAt?: number | null; tokenClass?: Session["tokenClass"]; activeScope?: ObjRef | null; active_scope?: ObjRef | null; currentLocation?: ObjRef | null; apikeyId?: string },
+    now: number
+  ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
     const lastDetachAt = session.lastDetachAt === undefined ? now : session.lastDetachAt;
     // `null` is the live-session sentinel. Import/export is used by shadow
@@ -6914,15 +6922,16 @@ export class WooWorld {
       session.expiresAt ?? session.started + this.sessionTtl(tokenClass),
       lastDetachAt === null ? 0 : lastDetachAt + this.sessionGrace(tokenClass)
     );
+    const activeScope = session.activeScope ?? session.active_scope ?? session.currentLocation ?? null;
     return {
       id: session.id,
       actor: session.actor,
       started: session.started,
       expiresAt,
-        lastDetachAt,
-        tokenClass,
-        currentLocation: session.currentLocation && this.objects.has(session.currentLocation) ? session.currentLocation : this.initialSessionLocation(session.actor),
-        attachedSockets: new Set(),
+      lastDetachAt,
+      tokenClass,
+      activeScope: activeScope && this.objects.has(activeScope) ? activeScope : this.initialSessionLocation(session.actor),
+      attachedSockets: new Set(),
       // lastInputAt isn't persisted; on cold rehydrate, treat as just-active
       // rather than restoring some old timestamp from `started`. Otherwise
       // every freshly-rehydrated DO would show huge idle for everyone.
@@ -6952,30 +6961,30 @@ export class WooWorld {
     return now >= session.lastDetachAt + this.sessionGrace(session.tokenClass);
   }
 
-    private reapSession(sessionId: string): void {
-      const session = this.sessions.get(sessionId);
-      if (!session) return;
-      const isGuest = this.inheritsFrom(session.actor, "$guest");
-      const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
-      session.attachedSockets.clear();
-      this.killReadTasksFor(session.actor);
-      this.removeSessionPresence(sessionId, session.actor);
+  private reapSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const isGuest = this.inheritsFrom(session.actor, "$guest");
+    const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
+    session.attachedSockets.clear();
+    this.killReadTasksFor(session.actor);
+    this.removeSessionPresence(sessionId, session.actor);
     // session_id mirror is no longer written (see createSessionForActor /
     // ensureSessionForActor); the matching reset on reap would just rewrite
     // the inherited default.
-      this.sessions.delete(sessionId);
-      this.deletePersistedSession(sessionId);
-      if (wasPrimary && !isGuest) this.promoteActorPrimaryLocation(session.actor);
-      if (isGuest) this.resetGuestOnDisconnect(session.actor);
-    }
+    this.sessions.delete(sessionId);
+    this.deletePersistedSession(sessionId);
+    if (wasPrimary && !isGuest) this.promoteActorPrimaryLocation(session.actor);
+    if (isGuest) this.resetGuestOnDisconnect(session.actor);
+  }
 
-    private promoteActorPrimaryLocation(actor: ObjRef): void {
-      const primary = this.primarySessionForActor(actor);
-      if (!primary) return;
-      if (this.objects.has(actor) && this.objects.get(actor)!.location !== primary.currentLocation) {
-        this.moveObject(actor, primary.currentLocation);
-      }
+  private promoteActorPrimaryLocation(actor: ObjRef): void {
+    const primary = this.primarySessionForActor(actor);
+    if (!primary) return;
+    if (this.objects.has(actor) && this.objects.get(actor)!.location !== primary.activeScope) {
+      this.moveObject(actor, primary.activeScope);
     }
+  }
 
   private resetGuestOnDisconnect(actor: ObjRef): void {
     const homeValue = this.propOrNull(actor, "home");
@@ -7150,12 +7159,12 @@ export class WooWorld {
     }
   }
 
-    private authorizePresence(actor: ObjRef, space: ObjRef, sessionId: string | null = null): void {
-      if (this.isWizard(actor)) return;
-      if (sessionId && (this.hasSessionPresence(sessionId, space) || this.currentLocationForSession(sessionId) === space)) return;
-      if (!this.hasPresence(actor, space)) {
-        throw wooError("E_PERM", `${actor} is not present in ${space}`);
-      }
+  private authorizePresence(actor: ObjRef, space: ObjRef, sessionId: string | null = null): void {
+    if (this.isWizard(actor)) return;
+    if (sessionId && (this.hasSessionPresence(sessionId, space) || this.activeScopeForSession(sessionId) === space)) return;
+    if (!this.hasPresence(actor, space)) {
+      throw wooError("E_PERM", `${actor} is not present in ${space}`);
+    }
   }
 
   private featureList(objRef: ObjRef): ObjRef[] {
@@ -7510,7 +7519,7 @@ export class WooWorld {
       if (present) {
         const session = this.sessions.get(sessionId);
         if (session && session.actor === actor) {
-          session.currentLocation = space;
+          session.activeScope = space;
           this.persistSession(session);
         }
       }
@@ -7533,7 +7542,7 @@ export class WooWorld {
     if (present) {
       const session = this.sessions.get(sessionId);
       if (session && session.actor === actor) {
-        session.currentLocation = space;
+        session.activeScope = space;
         this.persistSession(session);
       }
     }
@@ -8083,7 +8092,7 @@ export class WooWorld {
       const location = typeof value === "string"
         ? value as ObjRef
         : actor === ctx.actor && ctx.session
-          ? this.currentLocationForSession(ctx.session)
+          ? this.activeScopeForSession(ctx.session)
           : await this.objectLocationChecked(actor, ctx.hostMemo).catch((err) => {
             if (isOptionalProjectionReadError(err)) return null;
             throw err;
@@ -8101,7 +8110,7 @@ export class WooWorld {
     if (options.skipPresenceCheck === true) return;
 
       const actorLocation = actor === ctx.actor && ctx.session
-        ? this.currentLocationForSession(ctx.session)
+        ? this.activeScopeForSession(ctx.session)
         : await this.objectLocationChecked(actor, ctx.hostMemo).catch((err) => {
           if (isOptionalProjectionReadError(err)) return null;
           throw err;
@@ -8650,7 +8659,7 @@ export class WooWorld {
   }
 
   /**
-   * Resolve `currentLocation` for each actor whose home host is not this DO,
+   * Resolve `activeScope` for each actor whose home host is not this DO,
    * preferring a batched cross-host call so a room with N remote subscribers
    * costs one RPC per host instead of N. Falls back to per-actor lookup for
    * bridges that don't implement the batch method (older deployments and

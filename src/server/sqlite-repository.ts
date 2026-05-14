@@ -163,7 +163,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       );
       for (const session of world.sessions) {
         const values = [session.id, session.actor, session.started, session.expiresAt ?? null, session.lastDetachAt ?? null, session.tokenClass ?? "guest"];
-        const withCurrent = hasCurrentLocationColumn ? [...values, session.currentLocation ?? null] : values;
+        const withCurrent = hasCurrentLocationColumn ? [...values, session.activeScope ?? null] : values;
         insertSession.run(...(hasAttachmentColumn ? [...withCurrent, "{}"] : withCurrent));
       }
 
@@ -436,7 +436,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     const hasApikeyIdColumn = cols.has("apikey_id");
     const columnList = ["id", "actor", "started", "expires_at", "last_detach_at", "token_class"];
     const values: Array<string | number | null> = [record.id, record.actor, record.started, record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest"];
-    if (hasCurrentLocationColumn) { columnList.push("current_location"); values.push(record.currentLocation ?? null); }
+    if (hasCurrentLocationColumn) { columnList.push("current_location"); values.push(record.activeScope ?? null); }
     if (hasApikeyIdColumn) { columnList.push("apikey_id"); values.push(record.apikeyId ?? null); }
     if (hasAttachmentColumn) { columnList.push("attachment"); values.push("{}"); }
     const placeholders = columnList.map(() => "?").join(", ");

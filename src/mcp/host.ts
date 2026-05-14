@@ -189,7 +189,7 @@ export class McpHost {
       if (directed.from) directedActors.add(directed.from);
       for (const [sessionId, queue] of this.queues) {
         if (originSessionId && sessionId === originSessionId) continue;
-        const sessionLocation = this.world.currentLocationForSession(sessionId);
+        const sessionLocation = this.world.activeScopeForSession(sessionId);
         const shouldDeliver = directedActors.size > 0
           ? directedActors.has(queue.actor)
           : this.actorSubscribes(queue.actor, frame.position.scope) || sessionLocation === frame.position.scope;
@@ -254,10 +254,10 @@ export class McpHost {
     add(actor, "self");
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
     const activeLocations = this.world.allLocationsForActor(actor);
-    const currentLocation = actorObj?.location ?? activeLocations[0] ?? null;
-    if (currentLocation) add(currentLocation, "location", false);
-    if (currentLocation && this.world.objects.has(currentLocation) && this.descendsFrom(currentLocation, "$space")) {
-      for (const id of this.world.object(currentLocation).contents) {
+    const activeScope = actorObj?.location ?? activeLocations[0] ?? null;
+    if (activeScope) add(activeScope, "location", false);
+    if (activeScope && this.world.objects.has(activeScope) && this.descendsFrom(activeScope, "$space")) {
+      for (const id of this.world.object(activeScope).contents) {
         if (this.actorCanSee(actor, id)) add(id, "contents");
       }
     }
@@ -265,7 +265,7 @@ export class McpHost {
       if (this.isOtherActor(actor, id)) continue;
       if (this.actorCanSee(actor, id)) add(id, "inventory");
     }
-    for (const id of activeLocations) if (id !== currentLocation) add(id, "presence", false);
+    for (const id of activeLocations) if (id !== activeScope) add(id, "presence", false);
     const focusList = this.focusListOf(actor);
     for (const id of focusList) {
       if (this.world.objects.has(id)) {
@@ -398,7 +398,7 @@ export class McpHost {
     const remoteExpandCandidates = new Set<ObjRef>();
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
     const activeLocations = this.world.allLocationsForActor(actor);
-    const currentLocation = actorObj?.location ?? activeLocations[0] ?? null;
+    const activeScope = actorObj?.location ?? activeLocations[0] ?? null;
     const focus = this.focusListOf(actor);
     const reachable = this.reachable(actor);
     const reachableOrigins = new Map(reachable.map((entry) => [entry.id, entry.origin]));
@@ -413,7 +413,7 @@ export class McpHost {
     };
     const addIfReachable = (id: ObjRef | null | undefined): void => {
       if (!id) return;
-      if (id === actor || id === currentLocation || reachableIds.has(id) || activeLocations.includes(id) || focus.includes(id)) {
+      if (id === actor || id === activeScope || reachableIds.has(id) || activeLocations.includes(id) || focus.includes(id)) {
         add(id, true, reachableOrigins.get(id) === "contents" && !focus.includes(id) ? "obvious" : "tools");
       }
     };
@@ -430,15 +430,15 @@ export class McpHost {
     switch (scope) {
       case "active":
         add(actor, false);
-        add(currentLocation);
+        add(activeScope);
         if (actorObj) for (const id of actorObj.contents) addIfReachable(id);
         for (const id of activeLocations) add(id);
         for (const id of focus) add(id);
         break;
       case "here":
-        add(currentLocation);
-        addContents(currentLocation);
-        expandRemoteContents(currentLocation);
+        add(activeScope);
+        addContents(activeScope);
+        expandRemoteContents(activeScope);
         break;
       case "focus":
         for (const id of focus) add(id);
@@ -447,7 +447,7 @@ export class McpHost {
         if (object) addIfReachable(object);
         break;
       case "space": {
-        const target = object ?? currentLocation;
+        const target = object ?? activeScope;
         addIfReachable(target);
         addContents(target);
         expandRemoteContents(target);
@@ -461,7 +461,7 @@ export class McpHost {
         for (const id of focus) {
           add(id);
         }
-        expandRemoteContents(currentLocation);
+        expandRemoteContents(activeScope);
         break;
     }
 

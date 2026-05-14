@@ -195,7 +195,7 @@ CREATE TABLE session (
     expires_at     INTEGER NOT NULL,
     last_detach_at INTEGER,                  -- null while attached
     token_class    TEXT NOT NULL,            -- "guest" | "bearer" | "apikey"
-    current_location TEXT                    -- session-scoped current location
+    current_location TEXT                    -- legacy column storing session active_scope
   );
 
 -- Live websocket ids are not persisted. The in-memory connection registry is

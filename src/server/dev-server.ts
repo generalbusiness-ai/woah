@@ -463,7 +463,7 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
     expiresAt: session.expiresAt,
     lastDetachAt: session.lastDetachAt ?? null,
     tokenClass: session.tokenClass,
-    currentLocation: session.currentLocation,
+    activeScope: session.activeScope,
     apikeyId: session.apikeyId
   };
   const index = relay.commit_scope.serialized.sessions.findIndex((item) => item.id === session.id);
@@ -475,9 +475,9 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
   const existing = relay.commit_scope.serialized.sessions[index];
   relay.commit_scope.serialized.sessions[index] = {
     ...serialized,
-    currentLocation: existing.actor === session.actor && existing.currentLocation !== undefined
-      ? existing.currentLocation
-      : serialized.currentLocation
+    activeScope: existing.actor === session.actor && existing.activeScope !== undefined
+      ? existing.activeScope
+      : serialized.activeScope
   };
   refreshDevV2SerializedSessionActor(relay, session.actor);
 }
