@@ -611,6 +611,13 @@ receipt, and observations; current projection state is derived from the commit
 scope's authoritative serialized state or from explicit state transfers, never
 from a per-frame full-world snapshot.
 
+The current transcript applier materializes object creation, property writes,
+location writes, contents writes, session-location side effects, and sequenced
+log entries. Lifecycle deletes and verb edits remain recorded/validated
+transcript cells but are not yet materialized by the shared applier; callers
+that need those effects must still treat the commit scope's serialized state as
+authoritative until the applier grows those cell kinds.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.
