@@ -591,7 +591,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
-  it("syncs committed v2 session locations back into the Worker gateway world", async () => {
+  it("applies committed v2 transcripts back into the Worker gateway world", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
     const commitStates = new Map<string, FakeDurableObjectState>();

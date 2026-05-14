@@ -48,7 +48,8 @@ import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
-import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -100,7 +101,6 @@ type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
   fanout?: Array<{ node: string; envelope: string }>;
-  committed_sessions?: SerializedSession[];
   head?: {
     kind: "woo.scope_head.shadow.v1";
     scope: ObjRef;
@@ -2684,7 +2684,7 @@ export class PersistentObjectDO {
         actor: att.actor,
         envelope: encoded
       });
-      await this.syncV2CommittedSessionLocations(world, result.committed_sessions ?? []);
+      await this.applyV2CommittedTranscript(world, result.reply, att.sessionId);
       if (result.reply) ws.send(result.reply);
       this.sendV2Fanout(result.fanout ?? []);
     } catch (err) {
@@ -2718,19 +2718,13 @@ export class PersistentObjectDO {
     return payload as T;
   }
 
-  private async syncV2CommittedSessionLocations(world: WooWorld, sessions: SerializedSession[]): Promise<void> {
-    for (const serialized of sessions) {
-      if (!serialized.currentLocation) continue;
-      const session = world.ensureSessionForActor(
-        serialized.id,
-        serialized.actor,
-        serialized.tokenClass,
-        serialized.expiresAt,
-        serialized.currentLocation,
-        serialized.apikeyId ?? undefined
-      );
-      await this.registerSessionRoute(session);
-    }
+  private async applyV2CommittedTranscript(world: WooWorld, replyText: string | null, sessionId: string): Promise<void> {
+    if (!replyText) return;
+    const reply = decodeEnvelope<ShadowTurnExecReply>(replyText);
+    if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
+    world.applyCommittedShadowTranscript(reply.body.transcript);
+    const session = world.sessions.get(sessionId);
+    if (session) await this.registerSessionRoute(session);
   }
 
   private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {

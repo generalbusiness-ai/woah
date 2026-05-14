@@ -47,6 +47,10 @@ const SUBSCRIBER_SCRUB_FLOOR_MS = 5_000;
 const IDLE_PRESENCE_LIVE_WINDOW_MS = 5 * 60_000;
 const IDLE_PRESENCE_IDLE_THRESHOLD_SECONDS = 60;
 
+type RuntimeSessionState = Pick<Session, "lastDetachAt" | "lastInputAt"> & {
+  attachedSockets: Set<string>;
+};
+
 type ResolvedVerb = {
   definer: ObjRef;
   verb: VerbDef;
@@ -6158,7 +6162,33 @@ export class WooWorld {
     // shared semantic path but add a WooWorld adapter that applies the same
     // transcript operations in place. This intentionally does not persist to
     // the gateway DO.
+    const runtimeSessions = this.captureRuntimeSessionStates();
     this.importWorld(applyShadowTranscriptToCommittedState(this.exportWorld(), transcript, { objectTimestamp: Date.now() }));
+    this.restoreRuntimeSessionStates(runtimeSessions);
+  }
+
+  private captureRuntimeSessionStates(): Map<string, RuntimeSessionState> {
+    // Keep this helper aligned with all transport-only Session fields. Durable
+    // serialized fields such as currentLocation must come from the transcript;
+    // socket/input state must survive cache rehydrates. Sessions created by the
+    // transcript have no prior transport state, so they intentionally keep the
+    // import defaults until a transport attaches or sends input.
+    return new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, {
+      attachedSockets: new Set(session.attachedSockets),
+      lastInputAt: session.lastInputAt,
+      lastDetachAt: session.lastDetachAt
+    }]));
+  }
+
+  private restoreRuntimeSessionStates(runtimeSessions: Map<string, RuntimeSessionState>): void {
+    for (const [id, runtime] of runtimeSessions) {
+      const session = this.sessions.get(id);
+      if (!session) continue;
+      session.attachedSockets = runtime.attachedSockets;
+      session.lastInputAt = runtime.lastInputAt;
+      if (runtime.attachedSockets.size > 0) session.lastDetachAt = null;
+      else session.lastDetachAt = runtime.lastDetachAt;
+    }
   }
 
   private serializeObject(obj: WooObject): SerializedObject {

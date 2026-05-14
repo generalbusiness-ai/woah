@@ -108,15 +108,11 @@ export class CommitScopeDO {
       } else {
         await this.saveEnvelopeDelta(relay, receipt, reply);
       }
-      const committedSession = relay.commit_scope.serialized.sessions.find((session) => session.id === input.session && session.actor === input.actor);
       return jsonResponse({
         ok: true,
         reply: reply ? encodeEnvelope(reply) : null,
         head: relay.commit_scope.head,
-        fanout: reply ? this.fanoutEnvelopes(relay, input.node, reply) : [],
-        committed_sessions: reply?.body.ok === true && reply.body.commit && committedSession
-          ? [committedSession]
-          : []
+        fanout: reply ? this.fanoutEnvelopes(relay, input.node, reply) : []
       } satisfies CommitScopeEnvelopeResponse);
     }
     return jsonResponse({
@@ -570,7 +566,6 @@ type CommitScopeEnvelopeResponse = {
   reply: string | null;
   head: ShadowScopeHead;
   fanout: Array<{ node: string; envelope: string }>;
-  committed_sessions: SerializedSession[];
 };
 
 type CommitScopeMetaRow = {
