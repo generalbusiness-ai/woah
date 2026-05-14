@@ -418,6 +418,10 @@ describe("CFObjectRepository production-shape coverage", () => {
     const gatewayState = new FakeDurableObjectState("world");
     const commitStates = new Map<string, FakeDurableObjectState>();
     const envelopeBodies: Array<Record<string, unknown>> = [];
+    const logs: string[] = [];
+    const consoleLog = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    });
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const env = {
       WOO_INITIAL_WIZARD_TOKEN: "cf-v2-message-token",
@@ -551,6 +555,32 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(JSON.parse(acceptedRows[0].body)).not.toHaveProperty("serialized_after");
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_transcript_tail"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
+      const metrics = logs
+        .filter((line) => line.startsWith("woo.metric "))
+        .map((line) => JSON.parse(line.slice("woo.metric ".length)) as Record<string, unknown>);
+      expect(metrics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "do_constructor", class: "PersistentObjectDO", host_key: "world" }),
+        expect.objectContaining({ kind: "do_constructor", class: "CommitScopeDO", host_key: "#-1" }),
+        expect.objectContaining({ kind: "do_handler", class: "CommitScopeDO", route: "/v2/open", status: "ok", host_key: "#-1" }),
+        expect.objectContaining({ kind: "do_handler", class: "CommitScopeDO", route: "/v2/envelope", status: "ok", host_key: "#-1" }),
+        expect.objectContaining({ kind: "shadow_apply_step", phase: "clone_world", scope: "#-1", route: "direct", host_key: "#-1" }),
+        expect.objectContaining({ kind: "shadow_apply_step", phase: "total", scope: "#-1", route: "direct", host_key: "#-1" }),
+        expect.objectContaining({ kind: "v2_open", scope: "#-1", node: "browser:worker-test", status: "ok", host_key: "#-1" }),
+        expect.objectContaining({ kind: "v2_envelope", scope: "#-1", node: "browser:worker-test", status: "ok", reply: "accepted", fanout: 0, host_key: "#-1" }),
+        expect.objectContaining({ kind: "shadow_commit_accepted", scope: "#-1", seq: 1, node: "browser:worker-test", host_key: "#-1" })
+      ]));
+      const applySteps = metrics.filter((metric) => metric.kind === "shadow_apply_step" && metric.scope === "#-1");
+      const phaseIndex = (phase: string) => applySteps.findIndex((metric) => metric.phase === phase);
+      const cloneWorld = applySteps[phaseIndex("clone_world")];
+      const total = applySteps[phaseIndex("total")];
+      expect(cloneWorld).toBeDefined();
+      expect(total).toBeDefined();
+      expect(typeof cloneWorld?.ms).toBe("number");
+      expect(typeof total?.ms).toBe("number");
+      expect(cloneWorld?.ms).toBeGreaterThanOrEqual(0);
+      expect(total?.ms).toBeGreaterThanOrEqual(cloneWorld?.ms as number);
+      expect(phaseIndex("clone_world")).toBeGreaterThanOrEqual(0);
+      expect(phaseIndex("total")).toBeGreaterThan(phaseIndex("clone_world"));
       const catchupRequest = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -588,6 +618,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       directoryState.close();
       gatewayState.close();
       for (const state of commitStates.values()) state.close();
+      consoleLog.mockRestore();
     }
   });
 

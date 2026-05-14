@@ -12,7 +12,7 @@ import {
   type ShadowTurnExecRequest,
   type ShadowTurnExecutionResult
 } from "./shadow-turn-exec";
-import type { ObjRef } from "./types";
+import type { MetricEvent, ObjRef } from "./types";
 import type { ShadowTurnKey } from "./turn-key";
 
 export type ShadowInProcessNetworkResult = {
@@ -63,6 +63,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   transferMode?: "closure" | "object_records" | "cell_pages";
   maxTransfers?: number;
   commitScope?: ShadowCommitScope;
+  profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
 }): Promise<ShadowInProcessNetworkResult> {
   const ranked = rankCapabilityAdsForTurn(input.ads, input.request.key);
   const selectedAd = ranked[0];
@@ -75,7 +76,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     serialized: input.anchor.serialized
   });
 
-  const first = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope });
+  const first = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope, profile: input.profile });
   let result = first;
   const transfers: ShadowStateTransfer[] = [];
   const maxTransfers = input.maxTransfers ?? 3;
@@ -108,7 +109,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
         });
     installShadowStateTransfer(selected, transfer);
     transfers.push(transfer);
-    result = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope });
+    result = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope, profile: input.profile });
   }
 
   if (transfers.length === 0) {

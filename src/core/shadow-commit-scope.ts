@@ -11,7 +11,7 @@ import { stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import type { RecordedWriteAuthority } from "./turn-recorder";
-import type { ObjRef, WooValue } from "./types";
+import type { MetricEvent, ObjRef, WooValue } from "./types";
 
 export type ShadowScopeHead = {
   kind: "woo.scope_head.shadow.v1";
@@ -28,6 +28,7 @@ export type ShadowCommitSubmit = {
   expected: ShadowScopeHead;
   transcript: EffectTranscript;
   executor?: string;
+  profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
 };
 
 export type ShadowCommitAccepted = {
@@ -75,6 +76,7 @@ export type ShadowCommitScope = {
 
 export type ShadowTranscriptApplyOptions = {
   objectTimestamp?: number;
+  profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
 };
 
 export function createShadowCommitScope(input: {
@@ -123,7 +125,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     if (existing) return existing;
   }
 
-  const mergedAfter = applyShadowTranscriptToCommittedState(scope.serialized, submit.transcript);
+  const mergedAfter = applyShadowTranscriptToCommittedState(scope.serialized, submit.transcript, { profile: submit.profile });
   const extraErrors = shadowCommitEnvelopeErrors(scope, submit);
   extraErrors.push(...validateShadowPostState(mergedAfter, submit.transcript));
   extraErrors.push(...validateShadowWriteAuthority(scope.serialized, submit.transcript));
@@ -298,25 +300,58 @@ export function applyShadowTranscriptToCommittedState(
   transcript: EffectTranscript,
   options: ShadowTranscriptApplyOptions = {}
 ): SerializedWorld {
+  const totalStartedAt = Date.now();
+  const profile = (phase: (MetricEvent & { kind: "shadow_apply_step" })["phase"], startedAt: number) => {
+    options.profile?.({
+      kind: "shadow_apply_step",
+      phase,
+      scope: transcript.scope,
+      route: transcript.route,
+      ms: Date.now() - startedAt,
+      objects: current.objects.length,
+      creates: transcript.creates.length,
+      writes: transcript.writes.length
+    });
+  };
+  let stepStartedAt = Date.now();
   const next = structuredClone(current) as SerializedWorld;
+  profile("clone_world", stepStartedAt);
+  stepStartedAt = Date.now();
   const currentObjects = new Map<ObjRef, SerializedObject>(next.objects.map((obj) => [obj.id, obj]));
+  profile("index_objects", stepStartedAt);
 
   // The commit scope constructs authoritative post-state from the transcript.
   // Executor post-world snapshots are intentionally not trusted across this
   // boundary; they are diagnostics/cache-fill only.
+  stepStartedAt = Date.now();
   for (const create of transcript.creates) {
     const created = serializedObjectFromCreate(create, options.objectTimestamp);
     currentObjects.set(create.object, created);
     if (created.parent) addUniqueObjectRef(currentObjects.get(created.parent)?.children, created.id);
     if (created.location) addUniqueObjectRef(currentObjects.get(created.location)?.contents, created.id);
   }
-  for (const write of finalWritesByCell(transcript)) {
+  profile("apply_creates", stepStartedAt);
+  stepStartedAt = Date.now();
+  const writes = finalWritesByCell(transcript);
+  profile("collect_writes", stepStartedAt);
+  stepStartedAt = Date.now();
+  for (const write of writes) {
     applyTranscriptWrite(currentObjects, write, options.objectTimestamp);
   }
+  profile("apply_writes", stepStartedAt);
+  stepStartedAt = Date.now();
   applyTranscriptSessionLocation(next, transcript);
+  profile("apply_session", stepStartedAt);
+  stepStartedAt = Date.now();
   next.objects = Array.from(currentObjects.values()).sort((a, b) => a.id.localeCompare(b.id));
+  profile("sort_objects", stepStartedAt);
+  stepStartedAt = Date.now();
   next.logs = applyTranscriptLog(next.logs, transcript);
+  profile("apply_log", stepStartedAt);
+  stepStartedAt = Date.now();
   next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
+  profile("counters", stepStartedAt);
+  profile("total", totalStartedAt);
   return next;
 }
 

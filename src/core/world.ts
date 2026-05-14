@@ -51,6 +51,13 @@ type RuntimeSessionState = Pick<Session, "lastDetachAt" | "lastInputAt"> & {
   attachedSockets: Set<string>;
 };
 
+type ShadowGatewayApplyStats = {
+  objects: number;
+  properties: number;
+  sessions: number;
+  logs: number;
+};
+
 type ResolvedVerb = {
   definer: ObjRef;
   verb: VerbDef;
@@ -6170,9 +6177,74 @@ export class WooWorld {
     // shared semantic path but add a WooWorld adapter that applies the same
     // transcript operations in place. This intentionally does not persist to
     // the gateway DO.
+    const totalStartedAt = Date.now();
+    let stats = this.shadowGatewayLiveMetricStats();
+    const profile = (phase: (MetricEvent & { kind: "shadow_gateway_apply_step" })["phase"], startedAt: number) => {
+      this.recordMetric({
+        kind: "shadow_gateway_apply_step",
+        phase,
+        scope: transcript.scope,
+        route: transcript.route,
+        ms: Date.now() - startedAt,
+        ...stats,
+        creates: transcript.creates.length,
+        writes: transcript.writes.length
+      });
+    };
+    let stepStartedAt = Date.now();
     const runtimeSessions = this.captureRuntimeSessionStates();
-    this.importWorld(applyShadowTranscriptToCommittedState(this.exportWorld(), transcript, { objectTimestamp: Date.now() }));
+    profile("capture_runtime", stepStartedAt);
+    stepStartedAt = Date.now();
+    const exported = this.exportWorld();
+    stats = this.shadowGatewaySerializedMetricStats(exported);
+    profile("export_world", stepStartedAt);
+    stepStartedAt = Date.now();
+    const next = applyShadowTranscriptToCommittedState(exported, transcript, {
+      objectTimestamp: Date.now(),
+      profile: (event) => {
+        this.recordMetric({
+          kind: "shadow_gateway_apply_step",
+          phase: event.phase,
+          scope: transcript.scope,
+          route: transcript.route,
+          ms: event.ms,
+          ...stats,
+          creates: transcript.creates.length,
+          writes: transcript.writes.length
+        });
+      }
+    });
+    stats = this.shadowGatewaySerializedMetricStats(next);
+    profile("apply_serialized", stepStartedAt);
+    stepStartedAt = Date.now();
+    this.importWorld(next);
+    profile("import_world", stepStartedAt);
+    stepStartedAt = Date.now();
     this.restoreRuntimeSessionStates(runtimeSessions);
+    profile("restore_runtime", stepStartedAt);
+    profile("total", totalStartedAt);
+  }
+
+  private shadowGatewayLiveMetricStats(): ShadowGatewayApplyStats {
+    let properties = 0;
+    for (const object of this.objects.values()) properties += object.properties.size;
+    let logs = 0;
+    for (const entries of this.logs.values()) logs += entries.length;
+    return {
+      objects: this.objects.size,
+      properties,
+      sessions: this.sessions.size,
+      logs
+    };
+  }
+
+  private shadowGatewaySerializedMetricStats(world: SerializedWorld): ShadowGatewayApplyStats {
+    return {
+      objects: world.objects.length,
+      properties: world.objects.reduce((sum, object) => sum + object.properties.length, 0),
+      sessions: world.sessions.length,
+      logs: world.logs.reduce((sum, [, entries]) => sum + entries.length, 0)
+    };
   }
 
   private captureRuntimeSessionStates(): Map<string, RuntimeSessionState> {

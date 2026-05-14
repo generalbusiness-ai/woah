@@ -281,53 +281,61 @@ export class PersistentObjectDO {
   private teardownScheduled = false;
 
   constructor(state: DurableObjectState, env: Env) {
+    const constructorStartedAt = Date.now();
     this.state = state;
     this.env = env;
     this.repo = new CFObjectRepository(state, (event) => this.emitMetric(event, this.durableHostKey()));
+    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: Date.now() - constructorStartedAt, ts: Date.now(), host_key: this.durableHostKey() }));
   }
 
   async fetch(request: Request): Promise<Response> {
+    const handlerStartedAt = Date.now();
+    let pathname = "";
+    let hostKey = this.durableHostKey();
+    let handlerStatus: "ok" | "error" = "ok";
+    let handlerError: string | undefined;
     // Operator-bootstrap precondition check (cloudflare.md §R14.7).
-    if (!this.env.WOO_INITIAL_WIZARD_TOKEN) {
-      return jsonResponse(
-        { error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INITIAL_WIZARD_TOKEN via wrangler secret put" } },
-        503
-      );
-    }
-    if (!this.env.WOO_INTERNAL_SECRET) {
-      return jsonResponse(
-        { error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INTERNAL_SECRET via wrangler secret put" } },
-        503
-      );
-    }
-
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    const hostKey = request.headers.get("x-woo-host-key") || this.durableHostKey();
-    const gatewayHost = hostKey === WORLD_HOST;
-    const internalRequest = pathname.startsWith("/__internal/");
-
-    if (internalRequest) await verifyInternalRequest(this.env, request);
-
-    // §RC11.5 teardown gate. Once host_state is "tearing_down", this DO
-    // refuses all inbound work with E_HOST_RECYCLED until deleteAll has
-    // run. If teardown is in progress but no waitUntil is currently
-    // running it (e.g. a wake from hibernation between batches), schedule
-    // a resume so the sequence completes idempotently.
-    if (!gatewayHost && this.getHostState() === HOST_STATE_TEARING_DOWN) {
-      this.ensureTeardownScheduled(this.durableHostKey());
-      return jsonResponse(
-        { error: { code: "E_HOST_RECYCLED", message: "host is tearing down" } },
-        410
-      );
-    }
-
-    if (!gatewayHost && (pathname === "/api/auth" || pathname === "/ws" || pathname === "/v2/turn-network/ws")) {
-      return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
-    }
-
-    let postHandlerWorld: WooWorld | null = null;
     try {
+      if (!this.env.WOO_INITIAL_WIZARD_TOKEN) {
+        return jsonResponse(
+          { error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INITIAL_WIZARD_TOKEN via wrangler secret put" } },
+          503
+        );
+      }
+      if (!this.env.WOO_INTERNAL_SECRET) {
+        return jsonResponse(
+          { error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INTERNAL_SECRET via wrangler secret put" } },
+          503
+        );
+      }
+
+      const url = new URL(request.url);
+      pathname = url.pathname;
+      hostKey = request.headers.get("x-woo-host-key") || this.durableHostKey();
+      const gatewayHost = hostKey === WORLD_HOST;
+      const internalRequest = pathname.startsWith("/__internal/");
+
+      if (internalRequest) await verifyInternalRequest(this.env, request);
+
+      // §RC11.5 teardown gate. Once host_state is "tearing_down", this DO
+      // refuses all inbound work with E_HOST_RECYCLED until deleteAll has
+      // run. If teardown is in progress but no waitUntil is currently
+      // running it (e.g. a wake from hibernation between batches), schedule
+      // a resume so the sequence completes idempotently.
+      if (!gatewayHost && this.getHostState() === HOST_STATE_TEARING_DOWN) {
+        this.ensureTeardownScheduled(this.durableHostKey());
+        return jsonResponse(
+          { error: { code: "E_HOST_RECYCLED", message: "host is tearing down" } },
+          410
+        );
+      }
+
+      if (!gatewayHost && (pathname === "/api/auth" || pathname === "/ws" || pathname === "/v2/turn-network/ws")) {
+        return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
+      }
+
+      let postHandlerWorld: WooWorld | null = null;
+      try {
       const world = await this.getWorld(hostKey);
       postHandlerWorld = world;
 
@@ -443,11 +451,28 @@ export class PersistentObjectDO {
       return jsonResponse({ error: { code: "E_OBJNF", message: `no route for ${request.method} ${pathname}` } }, 404);
     } catch (err) {
       const error = normalizeError(err);
+      handlerStatus = "error";
+      handlerError = error.code;
       return jsonResponse({ error }, statusForError(error));
     } finally {
       if (!gatewayHost && postHandlerWorld) {
         this.maybeStartTeardown(postHandlerWorld, this.durableHostKey());
       }
+    }
+    } catch (err) {
+      handlerStatus = "error";
+      handlerError = metricErrorCode(err);
+      throw err;
+    } finally {
+      this.emitMetric({
+        kind: "do_handler",
+        class: "PersistentObjectDO",
+        method: request.method,
+        route: pathname || "_pre_route",
+        ms: Date.now() - handlerStartedAt,
+        status: handlerStatus,
+        ...(handlerError ? { error: handlerError } : {})
+      }, hostKey);
     }
   }
 
