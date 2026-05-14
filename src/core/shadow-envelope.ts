@@ -80,6 +80,7 @@ const KNOWN_SHADOW_TYPES = new Set([
   "woo.state.transfer.shadow.v1",
   "woo.turn.exec.request.shadow.v1",
   "woo.turn.exec.reply.shadow.v1",
+  "woo.turn.intent.request.shadow.v1",
   "woo.commit.accepted.shadow.v1",
   "woo.commit.conflict.shadow.v1"
 ]);

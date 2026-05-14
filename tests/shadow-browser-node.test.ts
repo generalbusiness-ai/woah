@@ -1,21 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../src/core/shadow-envelope";
 import { stableShadowJson } from "../src/core/shadow-cell-version";
 import {
   applyShadowBrowserTransfer,
+  buildShadowBrowserSessionAuth,
   buildShadowBrowserProjectionTransfer,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
+  disposeShadowBrowserNode,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
   handleShadowBrowserTurnExecEnvelope,
+  mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
   setShadowBrowserSessionToken,
   shadowBrowserEnvelope,
+  shadowBrowserSessionBearer,
   shadowBrowserTransportHello,
   unsubscribeShadowBrowserNode,
   type ShadowBrowserStateTransfer,
@@ -51,6 +55,70 @@ describe("shadow browser node shim", () => {
     expect(browser.cache.transcript_tail).toHaveLength(1);
     expect(browser.cache.transfers.length).toBeGreaterThanOrEqual(1);
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.44);
+  });
+
+  it("does not let execute-only live turns dirty the next committed dubspace turn", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-dubspace-live-before-commit");
+    anchor.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay",
+      scope: "the_dubspace",
+      serialized: anchor.exportWorld()
+    });
+    const browser = createShadowBrowserNode({
+      node: "browser-the_dubspace",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay
+    });
+
+    const live = await executeShadowBrowserTurn(browser, {
+      id: "browser-dubspace-live-enter",
+      route: "direct",
+      target: "the_dubspace",
+      verb: "enter",
+      args: [],
+      commit_policy: "execute_only"
+    });
+    const committed = await executeShadowBrowserTurn(browser, {
+      id: "browser-dubspace-committed-wet",
+      route: "sequenced",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.51]
+    });
+
+    expect(live.result).toMatchObject({ ok: true, commit: undefined });
+    expect(committed.result).toMatchObject({
+      ok: true,
+      commit: { kind: "woo.commit.accepted.shadow.v1", position: { scope: "the_dubspace", seq: 1 } }
+    });
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.51);
+  });
+
+  it("opens with a catalog-neutral scope projection neighborhood", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-projection-neighborhood", async (world) => {
+      world.defineProperty("the_dubspace", { name: "private_projection_probe", defaultValue: "sealed", owner: "$wiz", perms: "", typeHint: "str" });
+    });
+    const opened = await openShadowBrowserScope(browser);
+    const projection = opened.projection as Record<string, any>;
+
+    expect(projection).toMatchObject({
+      kind: "woo.scope_projection.shadow.v1",
+      scope: "the_dubspace",
+      viewer: { actor },
+      self: { id: actor },
+      session: { actor, current_location: "the_dubspace" },
+      inventory: expect.any(Array),
+      cursor: { spaces: { the_dubspace: { next_seq: expect.any(Number) } }, live: { resumable: false } },
+      subject: { id: "the_dubspace", props: expect.any(Object) }
+    });
+    expect(projection.objects.map((item: any) => item.id)).toContain("the_dubspace");
+    expect(projection.objects.map((item: any) => item.id)).toContain(actor);
+    expect(projection.objects.every((item: any) => Array.isArray(item.ancestors))).toBe(true);
+    expect(projection.subject.props.private_projection_probe).toBeUndefined();
   });
 
   it("drives pinboard create, edit, layout, take, and drop actions through the browser shim", async () => {
@@ -130,6 +198,180 @@ describe("shadow browser node shim", () => {
     expect(world.getProp(pin, "color")).toBe("green");
     expect(finalLayout[pin]).toMatchObject({ w: 180, h: 110 });
     expect(browser.cache.applied_frames).toHaveLength(7);
+  });
+
+  it("keeps session location current after a committed pinboard enter", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-pinboard-enter-then-add");
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay",
+      scope: "the_pinboard",
+      serialized: anchor.exportWorld()
+    });
+    const browser = createShadowBrowserNode({
+      node: "browser-the_pinboard",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay
+    });
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+
+    const enter = await executeShadowBrowserTurn(browser, {
+      id: "browser-pinboard-enter-then-add-enter",
+      target: "the_pinboard",
+      verb: "enter",
+      args: []
+    });
+    expect(enter.result).toMatchObject({ ok: true });
+    expect(worldFor(browser).currentLocationForSession(session.id)).toBe("the_pinboard");
+    expect(worldFor(browser).object(session.actor).location).toBe("the_pinboard");
+
+    const add = await executeShadowBrowserTurn(browser, {
+      id: "browser-pinboard-enter-then-add-add",
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["v2 entered note", "yellow", 20, 30, 210, 120]
+    });
+    expect(add.result).toMatchObject({ ok: true });
+    expect(worldFor(browser).getProp(observationObject(add, "note_added", "pin"), "text")).toBe("v2 entered note");
+  });
+
+  it("keeps imported live sessions live across shadow commits", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const anchor = createWorld();
+      const session = anchor.auth("guest:browser-pinboard-live-session-import");
+      const relay = createShadowBrowserRelayShim({
+        node: "browser-relay",
+        scope: "the_pinboard",
+        serialized: anchor.exportWorld()
+      });
+      const browser = createShadowBrowserNode({
+        node: "browser-the_pinboard",
+        scope: "the_pinboard",
+        actor: session.actor,
+        session: session.id,
+        relay
+      });
+      await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+
+      const enter = await executeShadowBrowserTurn(browser, {
+        id: "browser-pinboard-live-session-enter",
+        target: "the_pinboard",
+        verb: "enter",
+        args: []
+      });
+      expect(enter.result).toMatchObject({ ok: true });
+      expect(relay.commit_scope.serialized.sessions.find((item) => item.id === session.id)?.lastDetachAt).toBeNull();
+
+      vi.setSystemTime(1_000_000 + 61_000);
+      const add = await executeShadowBrowserTurn(browser, {
+        id: "browser-pinboard-live-session-add",
+        target: "the_pinboard",
+        verb: "add_note",
+        args: ["still live after import", "yellow", 20, 30, 210, 120]
+      });
+      expect(add.result).toMatchObject({ ok: true });
+      expect(worldFor(browser).getProp(observationObject(add, "note_added", "pin"), "text")).toBe("still live after import");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("merges fresh session authority without dropping scope-known sessions", () => {
+    const anchor = createWorld();
+    const kept = anchor.auth("guest:browser-session-merge-kept");
+    const fresh = anchor.auth("guest:browser-session-merge-fresh");
+    const current = anchor.exportSessions().filter((session) => session.id === kept.id);
+    current[0].currentLocation = "the_pinboard";
+    const merged = mergeShadowBrowserSessionState(current, anchor.exportSessions().filter((session) => session.id === fresh.id));
+
+    expect(merged.map((session) => session.id).sort()).toEqual([fresh.id, kept.id].sort());
+    expect(merged.find((session) => session.id === kept.id)?.currentLocation).toBe("the_pinboard");
+  });
+
+  it("unsubscribes browser nodes without leaving stale relay auth entries", async () => {
+    const { browser } = await browserForScope("the_pinboard", "guest:browser-unsubscribe-cleanup");
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const token = browser.session_token;
+    const localBearer = browser.session && shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor });
+
+    expect(browser.relay.browsers.get(browser.node)).toBe(browser);
+    if (token) expect(browser.relay.session_auth.has(token)).toBe(true);
+    if (localBearer && localBearer !== token) expect(browser.relay.session_auth.has(localBearer)).toBe(false);
+
+    disposeShadowBrowserNode(browser);
+
+    expect(browser.relay.browsers.has(browser.node)).toBe(false);
+    if (token) expect(browser.relay.session_auth.has(token)).toBe(false);
+  });
+
+  it("refreshes a reused relay executor before planning a new session turn", async () => {
+    const anchor = createWorld();
+    const firstSession = anchor.auth("guest:browser-reused-executor-a");
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay",
+      scope: "the_pinboard",
+      serialized: anchor.exportWorld()
+    });
+    const first = createShadowBrowserNode({
+      node: "browser-reused-executor-a",
+      scope: "the_pinboard",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay
+    });
+    await openShadowBrowserScope(first, { preseed_catalog_pages: true });
+    const firstIntent = shadowBrowserEnvelope(first, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: "browser-reused-executor-first",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      commit_policy: "execute_and_commit"
+    });
+    const firstReply = await handleShadowBrowserTurnExecEnvelope(first, receiveShadowBrowserEnvelopeReceipt(first, encodeEnvelope(firstIntent)));
+    expect(firstReply?.body).toMatchObject({ ok: true });
+    expect(relay.executors).toHaveLength(1);
+
+    const secondSession = anchor.auth("guest:browser-reused-executor-b");
+    const auth = buildShadowBrowserSessionAuth({
+      sessions: anchor.exportSessions(),
+      scope: "the_pinboard",
+      deployment: relay.deployment
+    });
+    relay.session_auth = auth.session_auth;
+    relay.session_revs = auth.session_revs;
+    relay.commit_scope.serialized.sessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, anchor.exportSessions());
+    const secondActor = anchor.exportWorld().objects.find((obj) => obj.id === secondSession.actor);
+    if (!secondActor) throw new Error("expected second actor object");
+    relay.commit_scope.serialized.objects.push(secondActor);
+    relay.commit_scope.serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
+    const second = createShadowBrowserNode({
+      node: "browser-reused-executor-b",
+      scope: "the_pinboard",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay
+    });
+    await openShadowBrowserScope(second, { preseed_catalog_pages: true });
+    const secondIntent = shadowBrowserEnvelope(second, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: "browser-reused-executor-second",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      commit_policy: "execute_and_commit"
+    });
+    const secondReply = await handleShadowBrowserTurnExecEnvelope(second, receiveShadowBrowserEnvelopeReceipt(second, encodeEnvelope(secondIntent)));
+
+    expect(secondReply?.body).toMatchObject({ ok: true });
   });
 
   it("drives taskspace create, claim, and status actions through the browser shim", async () => {
@@ -316,7 +558,7 @@ describe("shadow browser node shim", () => {
     expect(transfer).toBeDefined();
     if (!transfer || transfer.mode !== "projection") throw new Error("expected projection transfer");
     const tampered = structuredClone(transfer);
-    tampered.projection = { ...(opened.projection as Record<string, WooValue>), seq: 999 };
+    tampered.projection = { ...(opened.projection as any), seq: 999 };
 
     expect(() => applyShadowBrowserTransfer(browser, tampered)).toThrow(/proof root mismatch/);
   });
@@ -327,7 +569,7 @@ describe("shadow browser node shim", () => {
     const transfer = browser.cache.transfers.find((item) => item.mode === "projection");
     if (!transfer || transfer.mode !== "projection") throw new Error("expected projection transfer");
     const tampered = structuredClone(transfer);
-    tampered.projection = { ...(opened.projection as Record<string, WooValue>), seq: 999 };
+    tampered.projection = { ...(opened.projection as any), seq: 999 };
     tampered.proof.root = browserStateRootForTest(tampered);
 
     expect(() => applyShadowBrowserTransfer(browser, tampered)).toThrow(/signature mismatch/);
@@ -347,7 +589,7 @@ describe("shadow browser node shim", () => {
     if (!delta || delta.mode !== "delta") throw new Error("expected delta transfer");
 
     const tamperedProjection = structuredClone(delta);
-    tamperedProjection.projection = { ...(delta.projection as Record<string, WooValue>), seq: 999 };
+    tamperedProjection.projection = { ...(delta.projection as any), seq: 999 };
     expect(() => applyShadowBrowserTransfer(browser, tamperedProjection)).toThrow(/proof root mismatch/);
 
     const tamperedTranscript = structuredClone(delta);
@@ -488,6 +730,86 @@ describe("shadow browser node shim", () => {
     expect(duplicateReply?.reply_to).toBe("wire-env-1");
     expect(browser.cache.applied_frames).toHaveLength(1);
     expect(browser.relay.accepted_frames).toHaveLength(1);
+  });
+
+  it("plans browser turn intents on the relay and commits through the normal reply path", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-intent");
+    await openShadowBrowserScope(browser);
+    const intent = {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "wire-intent-wet",
+      route: "sequenced" as const,
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.72],
+      commit_policy: "execute_and_commit" as const
+    };
+    const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, intent.kind, intent, "wire-intent-env-1"));
+
+    const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
+    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+
+    expect(reply?.reply_to).toBe("wire-intent-env-1");
+    expect(reply?.body).toMatchObject({
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true,
+      commit: { position: { scope: "the_dubspace", seq: 1 } }
+    });
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.72);
+  });
+
+  it("chains execute-only browser intents through per-session live state", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-live-chain");
+    await openShadowBrowserScope(browser);
+    const observer = createShadowBrowserNode({
+      node: "browser-wire-live-chain-observer",
+      scope: "the_dubspace",
+      actor: browser.actor,
+      session: browser.session,
+      relay: browser.relay
+    });
+    await openShadowBrowserScope(observer);
+    const send = async (id: string, verb: string, args: WooValue[]) => {
+      const intent = {
+        kind: "woo.turn.intent.request.shadow.v1" as const,
+        id,
+        route: "direct" as const,
+        scope: "the_dubspace",
+        target: "the_dubspace",
+        verb,
+        args,
+        commit_policy: "execute_only" as const
+      };
+      const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(shadowBrowserEnvelope(browser, intent.kind, intent, `${id}:env`)));
+      return await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+    };
+
+    await send("live-enter", "enter", []);
+    await send("live-plan", "command_plan", ["`filter 500"]);
+    const reply = await send("live-filter", "say_to", ["filter_1", "500"]);
+
+    expect(reply?.body).toMatchObject({
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true
+    });
+    expect(reply?.body.ok === true ? reply.body.commit : undefined).toBeUndefined();
+    expect(reply?.body.ok === true ? reply.body.transcript.call.verb : "").toBe("say_to");
+    expect(reply?.body.ok === true ? reply.body.transcript.observations : []).toContainEqual(expect.objectContaining({
+      type: "control_changed",
+      target: "filter_1",
+      name: "cutoff",
+      value: 500
+    }));
+    expect(observer.cache.live_events).toContainEqual(expect.objectContaining({
+      observation: expect.objectContaining({
+        type: "control_changed",
+        target: "filter_1",
+        name: "cutoff",
+        value: 500
+      })
+    }));
+    expect(worldFor(browser).getProp("filter_1", "cutoff")).not.toBe(500);
   });
 
   it("bounds remembered envelope ids and cached replies inside the idempotency window", async () => {

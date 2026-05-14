@@ -871,6 +871,7 @@
           "name": "command_plan",
           "perms": "rxd",
           "direct_callable": true,
+          "skip_presence_check": true,
           "arg_spec": {
             "args": [
               "text"

@@ -305,10 +305,27 @@ function applyShadowTranscriptToCommittedState(current: SerializedWorld, transcr
   for (const write of finalWritesByCell(transcript)) {
     applyTranscriptWrite(currentObjects, write);
   }
+  applyTranscriptSessionLocation(next, transcript);
   next.objects = Array.from(currentObjects.values()).sort((a, b) => a.id.localeCompare(b.id));
   next.logs = applyTranscriptLog(next.logs, transcript);
   next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
   return next;
+}
+
+function applyTranscriptSessionLocation(next: SerializedWorld, transcript: EffectTranscript): void {
+  if (!transcript.session) return;
+  const actorMove = lastMoveForObject(transcript, transcript.call.actor);
+  if (!actorMove) return;
+  // Session location is transport/session authority, not an object cell, so it
+  // is not represented as a transcript write. Actor moveto calls still need the
+  // committed session view to advance, otherwise the next presence scrub drops
+  // freshly-committed subscriber rows as stale.
+  for (const session of next.sessions) {
+    if (session.id === transcript.session && session.actor === transcript.call.actor) {
+      session.currentLocation = actorMove.to;
+      return;
+    }
+  }
 }
 
 function serializedObjectFromCreate(create: TranscriptCreate): SerializedObject {

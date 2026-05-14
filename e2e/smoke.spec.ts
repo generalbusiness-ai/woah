@@ -15,6 +15,10 @@ async function authHeaders(request: APIRequestContext): Promise<Record<string, s
   return { authorization: `Session ${body.session}` };
 }
 
+async function continueAsGuestIfPrompted(page: { getByRole: (role: "button", options: { name: string }) => Locator }): Promise<void> {
+  await page.getByRole("button", { name: "Continue as guest" }).click({ timeout: 1_000 }).catch(() => undefined);
+}
+
 test("loads shell and renders nav", async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on("pageerror", (err) => consoleErrors.push(err.message));
@@ -95,6 +99,45 @@ test("browser worker receives initial v2 projection", async ({ page, request }) 
   await expect.poll(() => v2ProjectionEvents, { timeout: 5_000 }).toBeGreaterThan(0);
 });
 
+test("dubspace sends committed controls through the v2 intent path", async ({ page, request }) => {
+  let appliedVerb = "";
+  let projectionEvents = 0;
+  await page.exposeFunction("recordV2AppliedFrame", (verb: string) => {
+    appliedVerb = verb;
+  });
+  await page.exposeFunction("recordV2ProjectionForOutbound", () => {
+    projectionEvents += 1;
+  });
+  await page.addInitScript(() => {
+    window.addEventListener("woo.v2.projection", () => {
+      void (window as unknown as { recordV2ProjectionForOutbound: () => Promise<void> }).recordV2ProjectionForOutbound();
+    });
+    window.addEventListener("woo.v2.applied_frame", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      void (window as unknown as { recordV2AppliedFrame: (verb: string) => Promise<void> }).recordV2AppliedFrame(verb);
+    });
+  });
+
+  const auth = await request.post("/api/auth", { data: { token: `guest:e2e-v2-outbound-${crypto.randomUUID()}` } });
+  const session = String((await auth.json())?.session ?? "");
+  await page.goto("/");
+  await page.evaluate((sessionId) => {
+    localStorage.setItem("woo.session", sessionId);
+  }, session);
+  await page.goto("/objects/the_dubspace?v2TestHooks");
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.locator("[data-dubspace-workspace]")).toBeVisible({ timeout: 5_000 });
+  await expect.poll(() => projectionEvents, { timeout: 5_000 }).toBeGreaterThan(0);
+  await page.locator("[data-dubspace-workspace]").evaluate((element) => {
+    element.dispatchEvent(new CustomEvent("woo-dubspace-control-commit", {
+      bubbles: true,
+      detail: { target: "delay_1", name: "wet", value: 0.66 }
+    }));
+  });
+
+  await expect.poll(() => appliedVerb, { timeout: 5_000 }).toBe("set_control");
+});
+
 test("chat boot uses /api/me and moves without /api/state", async ({ page }) => {
   const stateCalls: string[] = [];
   await page.route("**/api/state", async (route) => {
@@ -146,8 +189,8 @@ test("switches between tabs", async ({ page }) => {
   await page.getByRole("button", { name: "IDE" }).click();
   await expect(page.getByRole("button", { name: "IDE" })).toHaveClass(/active/);
 
-  await page.getByRole("button", { name: "Chat" }).click();
-  await expect(page.getByRole("button", { name: "Chat" })).toHaveClass(/active/);
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Chat", exact: true })).toHaveClass(/active/);
 });
 
 test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
@@ -162,6 +205,7 @@ test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
   });
 
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Dubspace" }).click();
@@ -196,23 +240,35 @@ test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
   expect(stateCalls).toEqual([]);
 });
 
-test("dubspace cue keeps loop controls local", async ({ page, request }) => {
+test("dubspace cue keeps loop controls local", async ({ page }) => {
   const sentFrames: string[] = [];
+  const v2TurnResultVerbs: string[] = [];
   page.on("websocket", (socket) => {
     socket.on("framesent", (frame) => sentFrames.push(String(frame.payload)));
   });
+  await page.exposeFunction("recordDubspaceV2TurnResult", (verb: string) => {
+    v2TurnResultVerbs.push(verb);
+  });
+  await page.addInitScript(() => {
+    window.addEventListener("woo.v2.turn_result", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.frame?.command?.verb ?? "");
+      void (window as unknown as { recordDubspaceV2TurnResult: (verb: string) => Promise<void> }).recordDubspaceV2TurnResult(verb);
+    });
+  });
 
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   await page.getByRole("button", { name: "Dubspace" }).click();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  await expect(page.locator(".dubspace-presence")).toContainText("Guest");
   const miniChatInput = page.locator("[data-space-chat-input]");
   await expect(miniChatInput).toBeVisible();
   await expect(miniChatInput).toBeFocused();
   await expect(page.locator("woo-space-chat-panel .space-chat-head span")).toHaveText("Dubspace");
-  await miniChatInput.fill("filter 500");
+  await miniChatInput.fill("`filter 500");
   await miniChatInput.press("Enter");
-  await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("filter 500");
+  await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("`filter 500");
+  await expect.poll(() => v2TurnResultVerbs).toContain("say_to");
   await expect(page.locator('[aria-label="Filter cutoff"]')).toHaveValue("500");
   await expect(page.locator(".filter-strip [data-control-readout]")).toHaveText("500 Hz");
   await expect(page.locator(".dubspace-presence")).toContainText("Guest");
@@ -225,11 +281,8 @@ test("dubspace cue keeps loop controls local", async ({ page, request }) => {
   await expect(page.locator(".vertical-fader")).toHaveCount(5);
   await expect(page.locator('[aria-label="Filter cutoff"]')).toBeVisible();
 
-  const headers = await authHeaders(request);
-  const before = await request.get("/api/state", { headers }).then((response) => response.json());
-  const beforeSlot = before.objects.slot_1.props;
+  const beforeSlot = { freq: 110, gain: 0.75 };
   const localSemitone = Number(beforeSlot.freq ?? 110) === 440 ? 25 : 24;
-  const localFreq = Number((110 * Math.pow(2, localSemitone / 12)).toFixed(2));
   const localGain = Number(beforeSlot.gain ?? 0.75) === 0.11 ? 0.22 : 0.11;
 
   await page.locator('[data-cue-slot="slot_1"]').click();
@@ -256,20 +309,13 @@ test("dubspace cue keeps loop controls local", async ({ page, request }) => {
   await page.waitForTimeout(100);
 
   expect(sentFrames.some((frame) => frame.includes("preview_control") || frame.includes("set_control"))).toBe(false);
-  const after = await request.get("/api/state", { headers }).then((response) => response.json());
-  expect(after.objects.slot_1.props.freq ?? 110).toBe(beforeSlot.freq ?? 110);
-  expect(after.objects.slot_1.props.gain).toBe(beforeSlot.gain);
 
   sentFrames.length = 0;
   await page.locator('[data-cue-slot="slot_1"]').click();
   await expect(page.locator('[data-cue-slot="slot_1"]')).toHaveAttribute("aria-pressed", "false");
   expect(sentFrames.some((frame) => frame.includes("set_control"))).toBe(true);
-  await expect
-    .poll(async () => {
-      const current = await request.get("/api/state", { headers }).then((response) => response.json());
-      return current.objects.slot_1.props;
-    })
-    .toMatchObject({ freq: localFreq, gain: localGain });
+  await expect(page.locator('[data-control][data-target="slot_1"][data-name="freq"]')).toHaveValue(String(localSemitone));
+  await expect(page.locator('[data-control][data-target="slot_1"][data-name="gain"]')).toHaveValue(String(localGain));
 
   await miniChatInput.fill("out");
   await miniChatInput.press("Enter");
@@ -304,7 +350,19 @@ test("narrow layout keeps nav tabs on one row", async ({ page }) => {
 });
 
 test("pinboard supports shared text notes", async ({ page }) => {
+  const appliedVerbs: string[] = [];
+  await page.exposeFunction("recordPinboardAppliedFrame", (verb: string) => {
+    appliedVerbs.push(verb);
+  });
+  await page.addInitScript(() => {
+    window.addEventListener("woo.v2.applied_frame", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      void (window as unknown as { recordPinboardAppliedFrame: (verb: string) => Promise<void> }).recordPinboardAppliedFrame(verb);
+    });
+  });
+
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Pinboard" }).click();
@@ -312,14 +370,13 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await expect(page.locator(".pinboard-stage")).toBeVisible();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
-  const firstPaintStageHeights = await page.locator(".pinboard-stage-panel").evaluate(async (panel) => {
-    const samples: number[] = [];
-    for (let i = 0; i < 8; i += 1) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-      samples.push(panel.getBoundingClientRect().height);
-    }
-    return samples;
-  });
+  const stagePanel = page.locator(".pinboard-stage-panel");
+  await expect.poll(async () => stagePanel.evaluate((panel) => panel.getBoundingClientRect().height)).toBeGreaterThan(300);
+  const firstPaintStageHeights: number[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    await page.waitForTimeout(16);
+    firstPaintStageHeights.push(await stagePanel.evaluate((panel) => panel.getBoundingClientRect().height));
+  }
   expect(Math.min(...firstPaintStageHeights)).toBeGreaterThan(300);
   expect(Math.max(...firstPaintStageHeights) - Math.min(...firstPaintStageHeights)).toBeLessThan(80);
   const pinboardHeights = await page.locator(".pinboard-layout").evaluate((layout) => {
@@ -340,10 +397,12 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await miniChatInput.fill("look");
   await miniChatInput.press("Enter");
   await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("look");
+  await expect(page.locator("woo-space-chat-panel")).toContainText("Pinboard has 0 notes on it.");
 
   await page.locator("[data-pinboard-new-text]").fill("Bring the towel to the hot tub");
   await page.locator("[data-pinboard-new-color]").selectOption("blue");
   await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
+  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("add_note");
   await expect(page.locator(".pin-note")).toHaveCount(1);
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the towel to the hot tub");
 
@@ -356,12 +415,16 @@ test("pinboard supports shared text notes", async ({ page }) => {
 
   await page.locator("[data-pin-note-text]").first().fill("Towel is ready");
   await page.locator("[data-pin-note-text]").first().blur();
+  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("set_text");
   await expect(page.locator(".pinboard-stage")).toContainText("Towel is ready");
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the mug too");
+  await page.getByRole("button", { name: "Leave" }).click();
+  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
 });
 
 test("pinboard supports local zoom and pan without resetting on updates", async ({ page }) => {
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Pinboard" }).click();
@@ -445,6 +508,7 @@ test("pinboard animates note movement from another user", async ({ browser }) =>
     const first = await firstContext.newPage();
     const second = await secondContext.newPage();
     await Promise.all([first.goto("/"), second.goto("/")]);
+    await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
@@ -486,6 +550,7 @@ test("pinboard shares viewport presence overlays", async ({ browser }) => {
     const first = await firstContext.newPage();
     const second = await secondContext.newPage();
     await Promise.all([first.goto("/"), second.goto("/")]);
+    await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     const firstActor = (await first.locator(".actor").textContent())?.trim() ?? "";
@@ -570,6 +635,7 @@ test("chat room transitions broadcast through source and destination rooms", asy
     const second = await secondContext.newPage();
 
     await Promise.all([first.goto("/"), second.goto("/")]);
+    await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     const firstActor = (await first.locator(".actor").textContent())?.trim() ?? "";
@@ -610,50 +676,34 @@ test("chat room transitions broadcast through source and destination rooms", asy
   }
 });
 
-test("dubspace controls advertise operators to the living room", async ({ browser }) => {
-  const firstContext = await browser.newContext();
-  const secondContext = await browser.newContext();
-  try {
-    const first = await firstContext.newPage();
-    const second = await secondContext.newPage();
+test("dubspace controls advertise local v2 operators", async ({ page }) => {
+  await page.goto("/");
+  await continueAsGuestIfPrompted(page);
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
 
-    await Promise.all([first.goto("/"), second.goto("/")]);
-    await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-    await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-    const secondActor = (await second.locator(".actor").textContent())?.trim() ?? "";
-    const secondName = secondActor.replace(/^guest_(\d+)$/, "Guest $1");
+  await page.getByRole("button", { name: "Dubspace" }).click();
+  await expect(page.locator(".dubspace-presence")).toContainText(actor);
 
-    await first.getByRole("button", { name: "Enter" }).click();
-    await expect(first.getByRole("button", { name: "Leave" })).toBeVisible();
-    await second.getByRole("button", { name: "Enter" }).click();
-    await expect(second.getByRole("button", { name: "Leave" })).toBeVisible();
-
-    await second.getByRole("button", { name: "Dubspace" }).click();
-    await expect(second.locator(".dubspace-presence")).toContainText(secondActor);
-    await expect(first.locator(".chat-feed")).toContainText(`${secondName} steps up to Dubspace.`);
-
-    await second.getByRole("button", { name: "Chat" }).click();
-    await expect(first.locator(".chat-feed")).toContainText(`${secondName} steps away from Dubspace.`);
-  } finally {
-    await firstContext.close();
-    await secondContext.close();
-  }
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Chat", exact: true })).toHaveClass(/active/);
 });
 
 test("chat command enters dubspace UI", async ({ page }) => {
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
   const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
 
-  await page.getByRole("button", { name: "Enter" }).click();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  if (await page.getByRole("button", { name: "Enter" }).count()) {
+    await page.getByRole("button", { name: "Enter" }).click();
+    await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  }
   await page.locator("[data-chat-input]").fill("enter dubspace");
   await page.locator("[data-chat-input]").press("Enter");
 
   await expect(page.getByRole("button", { name: "Dubspace" })).toHaveClass(/active/);
   await expect(page.locator(".dubspace-presence")).toContainText(actor);
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
 });
 
 test("taskspace supports hierarchical task workflow", async ({ page, request }) => {

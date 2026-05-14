@@ -82,8 +82,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-catalog-turn");
     const actor = session.actor;
-    const entered = await anchor.directCall("shadow-catalog-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
-    expect(entered.op).toBe("result");
+    anchor.setProp("the_dubspace", "operators", [actor]);
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {

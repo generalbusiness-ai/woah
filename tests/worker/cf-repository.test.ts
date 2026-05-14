@@ -19,12 +19,25 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
 // contention they legitimately exceed Vitest's default 30s per-test timeout.
 vi.setConfig({ testTimeout: 120_000 });
+
+describe("v2 Worker fan-out helpers", () => {
+  it("preserves multiple envelopes for the same recipient node", () => {
+    const grouped = v2FanoutEnvelopesByNode([
+      { node: "browser-a", envelope: "event-1" },
+      { node: "browser-b", envelope: "event-2" },
+      { node: "browser-a", envelope: "event-3" }
+    ]);
+
+    expect(grouped.get("browser-a")).toEqual(["event-1", "event-3"]);
+    expect(grouped.get("browser-b")).toEqual(["event-2"]);
+  });
+});
 
 function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
   return cursor.toArray() as T[];
@@ -911,7 +924,7 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const pinboardPlan = await post("/api/objects/the_deck/calls/command_plan", { args: ["enter pinboard"] }, session);
       expect(pinboardPlan.status).toBe(200);
-      expect(pinboardPlan.body.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "enter", args: [] });
+      expect(pinboardPlan.body.result).toMatchObject({ ok: true, route: "sequenced", space: "the_pinboard", target: "the_pinboard", verb: "enter", args: [] });
     } finally {
       logSpy.mockRestore();
       directoryState.close();

@@ -57,6 +57,7 @@ const LOCAL_CATALOG_CHAT_EXIT_ALIAS_REPAIR_MIGRATION = "2026-05-02-chat-exit-ali
 const LOCAL_CATALOG_CHAT_STALE_CLASS_VERBS_REPAIR_MIGRATION = "2026-05-02-chat-stale-class-verbs-repair";
 const LOCAL_CATALOG_CHAT_LOOK_SKIP_PRESENCE_MIGRATION = "2026-05-02-chat-look-skip-presence";
 const LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION = "2026-05-03-chat-command-plan-source-repair";
+const LOCAL_CATALOG_CHAT_COMMAND_PLAN_SKIP_PRESENCE_MIGRATION = "2026-05-13-chat-command-plan-skip-presence";
 const LOCAL_CATALOG_CHAT_ACTOR_HUH_SOURCE_REPAIR_MIGRATION = "2026-05-06-chat-actor-huh-source-repair";
 const LOCAL_CATALOG_CHAT_LOOK_AT_COMMAND_REPAIR_MIGRATION = "2026-05-06-chat-look-at-command-repair";
 const LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION = "2026-05-03-chat-look-at-collect-prop-try";
@@ -87,6 +88,8 @@ const LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION = "2026-05-09-dispens
 // $wiz onto $programmer so command-shaped builder/programmer verbs
 // (e.g. $builder:@recycle) resolve via normal parent-chain verb lookup.
 const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer-parent";
+const LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION = "2026-05-13-dubspace-v2-control-presence";
+const LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION = "2026-05-13-dubspace-v2-control-authority";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -125,6 +128,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_STALE_CLASS_VERBS_REPAIR_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_LOOK_SKIP_PRESENCE_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_CHAT_COMMAND_PLAN_SKIP_PRESENCE_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_ACTOR_HUH_SOURCE_REPAIR_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_LOOK_AT_COMMAND_REPAIR_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION, only: "chat" },
@@ -145,7 +149,9 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_TASKSPACE_NOTE_SHAPE_MIGRATION, only: "taskspace" },
   { id: LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, only: "note" },
   { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" },
-  { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" }
+  { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
+  { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION, only: "dubspace" },
+  { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, only: "dubspace" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -362,6 +368,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_CHAT_STALE_CLASS_VERBS_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   runChatLookSkipPresenceMigration(world, names);
   run(LOCAL_CATALOG_CHAT_COMMAND_PLAN_SOURCE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
+  runChatCommandPlanSkipPresenceMigration(world, names);
   run(LOCAL_CATALOG_CHAT_ACTOR_HUH_SOURCE_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
   run(LOCAL_CATALOG_CHAT_LOOK_AT_COMMAND_REPAIR_MIGRATION, { allowImplementationHints: true, only: "chat" });
   run(LOCAL_CATALOG_CHAT_LOOK_AT_TRY_MIGRATION, { allowImplementationHints: true, only: "chat" });
@@ -383,6 +390,8 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runTaskspaceNoteShapeMigration(world, names);
   runWizProgrammerParentMigration(world, names);
+  runDubspaceV2ControlPresenceMigration(world, names);
+  run(LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
   return covered;
 }
 
@@ -754,6 +763,49 @@ function runChatLookSkipPresenceMigration(world: WooWorld, names: readonly strin
     world.addVerb("$conversational", { ...look, skip_presence_check: true, version: look.version + 1 });
   }
   markMigrationApplied(world, LOCAL_CATALOG_CHAT_LOOK_SKIP_PRESENCE_MIGRATION);
+}
+
+function runChatCommandPlanSkipPresenceMigration(world: WooWorld, names: readonly string[]): void {
+  if (!names.includes("chat")) return;
+  if (!localCatalogInstalled(world, "chat")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_CHAT_COMMAND_PLAN_SKIP_PRESENCE_MIGRATION)) return;
+  const commandPlan = world.objects.has("$conversational") ? world.ownVerbExact("$conversational", "command_plan") : null;
+  if (commandPlan && commandPlan.skip_presence_check !== true) {
+    // Browser v2 can ask a space to parse text before durable/live presence has
+    // been reconciled into that scope. Planning is read-only and authority is
+    // enforced on the planned target verb, so it should not consume presence.
+    world.addVerb("$conversational", { ...commandPlan, skip_presence_check: true, version: commandPlan.version + 1 });
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_CHAT_COMMAND_PLAN_SKIP_PRESENCE_MIGRATION);
+}
+
+function runDubspaceV2ControlPresenceMigration(world: WooWorld, names: readonly string[]): void {
+  if (!names.includes("dubspace")) return;
+  if (!localCatalogInstalled(world, "dubspace")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION)) return;
+  // Browser v2 treats Dubspace enter/leave as direct live presence, while
+  // committed control writes go through the Dubspace commit scope. Existing
+  // worlds therefore need these durable control verbs repaired so the old
+  // room-presence gate does not reject commit-scope turns before recording.
+  const controls = [
+    "set_control",
+    "start_loop",
+    "stop_loop",
+    "set_drum_step",
+    "set_tempo",
+    "start_transport",
+    "stop_transport",
+    "save_scene",
+    "recall_scene"
+  ];
+  if (world.objects.has("$dubspace")) {
+    for (const name of controls) {
+      const verb = world.ownVerbExact("$dubspace", name);
+      if (!verb || verb.skip_presence_check === true) continue;
+      world.addVerb("$dubspace", { ...verb, skip_presence_check: true, version: verb.version + 1 });
+    }
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION);
 }
 
 function runTaskspaceListTasksGuardMigration(world: WooWorld, names: readonly string[]): void {

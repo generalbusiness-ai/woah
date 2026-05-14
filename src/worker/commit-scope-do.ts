@@ -10,6 +10,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   buildShadowBrowserSessionAuth,
+  buildShadowBrowserDeltaTransfer,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   handleShadowBrowserTurnExecEnvelope,
@@ -17,8 +18,10 @@ import {
   MAX_SHADOW_IDEMPOTENCY_ENTRIES,
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
   MAX_SHADOW_TRANSCRIPT_TAIL,
+  mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
+  shadowLiveEventsForTranscript,
   shadowBrowserTransportHello,
   type ShadowBrowserEnvelopeReceipt,
   type ShadowBrowserRelayShim,
@@ -72,6 +75,7 @@ export class CommitScopeDO {
       await verifyInternalRequest(this.env, request);
       const input = await readJson<CommitScopeOpenRequest>(request);
       const relay = await this.relayFor(input);
+      this.ensureSerializedSession(relay, input);
       const browser = this.browserFor(relay, input);
       const opened = await openShadowBrowserScope(browser, {
         preseed_catalog_pages: true,
@@ -94,6 +98,7 @@ export class CommitScopeDO {
       await verifyInternalRequest(this.env, request);
       const input = await readJson<CommitScopeEnvelopeRequest>(request);
       const relay = await this.relayFor(input);
+      this.ensureSerializedSession(relay, input);
       const browser = this.browserFor(relay, input);
       const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
       const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
@@ -106,7 +111,8 @@ export class CommitScopeDO {
       return jsonResponse({
         ok: true,
         reply: reply ? encodeEnvelope(reply) : null,
-        head: relay.commit_scope.head
+        head: relay.commit_scope.head,
+        fanout: reply ? this.fanoutEnvelopes(relay, input.node, reply) : []
       } satisfies CommitScopeEnvelopeResponse);
     }
     return jsonResponse({
@@ -156,8 +162,31 @@ export class CommitScopeDO {
     // state, not only from the transport auth map. Keep that narrow session
     // slice fresh so a new MCP/browser session can commit into a scope whose
     // durable snapshot was opened by an earlier session.
-    relay.commit_scope.serialized.sessions = structuredClone(input.sessions) as SerializedSession[];
+    relay.commit_scope.serialized.sessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, input.sessions);
     this.refreshSerializedObjects(relay, input.session_objects ?? []);
+  }
+
+  private ensureSerializedSession(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
+    // Commit validation and server-assisted planning read from the scope's
+    // serialized world, not only from the transport auth maps. Keep the socket's
+    // accepted session row present even when the gateway's narrow session export
+    // and this long-lived scope snapshot briefly diverge.
+    const current = input.sessions.find((session) => session.id === input.session && session.actor === input.actor);
+    if (!current) return;
+    const serialized = structuredClone(current) as SerializedSession;
+    const index = relay.commit_scope.serialized.sessions.findIndex((session) => session.id === serialized.id);
+    if (index < 0) {
+      relay.commit_scope.serialized.sessions.push(serialized);
+      relay.commit_scope.serialized.sessions.sort((a, b) => a.id.localeCompare(b.id));
+      return;
+    }
+    const existing = relay.commit_scope.serialized.sessions[index];
+    relay.commit_scope.serialized.sessions[index] = {
+      ...serialized,
+      currentLocation: existing.actor === serialized.actor && existing.currentLocation !== undefined
+        ? existing.currentLocation
+        : serialized.currentLocation
+    };
   }
 
   private refreshSerializedObjects(relay: ShadowBrowserRelayShim, objects: SerializedObject[]): void {
@@ -183,6 +212,73 @@ export class CommitScopeDO {
       relay,
       token: input.token
     });
+  }
+
+  private fanoutEnvelopes(
+    relay: ShadowBrowserRelayShim,
+    originNode: string,
+    reply: ShadowEnvelope<ShadowTurnExecReply>
+  ): Array<{ node: string; envelope: string }> {
+    const body = reply.body;
+    if (body.ok !== true || !body.transcript) return [];
+    if (!body.commit) return this.liveFanoutEnvelopes(relay, originNode, reply);
+    const out: Array<{ node: string; envelope: string }> = [];
+    for (const browser of relay.browsers.values()) {
+      if (browser.node === originNode) continue;
+      if (relay.subscriptions.get(body.commit.position.scope)?.has(browser.node) !== true) continue;
+      const transfer = buildShadowBrowserDeltaTransfer(relay, body.commit as ShadowCommitAccepted, body.transcript, browser.node, {
+        actor: browser.actor,
+        session: browser.session
+      });
+      out.push({
+        node: browser.node,
+        envelope: encodeEnvelope({
+          v: 2,
+          type: transfer.kind,
+          id: `${relay.node}:state:${body.commit.position.seq}:${browser.node}`,
+          from: relay.node,
+          to: browser.node,
+          actor: browser.actor,
+          ...(browser.session ? { session: browser.session } : {}),
+          auth: { mode: "session", token: browser.session_token ?? "" },
+          body: transfer
+        } satisfies ShadowEnvelope<typeof transfer>)
+      });
+    }
+    return out;
+  }
+
+  private liveFanoutEnvelopes(
+    relay: ShadowBrowserRelayShim,
+    originNode: string,
+    reply: ShadowEnvelope<ShadowTurnExecReply>
+  ): Array<{ node: string; envelope: string }> {
+    const origin = relay.browsers.get(originNode);
+    const body = reply.body;
+    if (!origin || body.ok !== true || !body.transcript) return [];
+    const out: Array<{ node: string; envelope: string }> = [];
+    for (const event of shadowLiveEventsForTranscript(origin, body.transcript)) {
+      const scope = event.audience?.scope ?? event.scope;
+      for (const browser of relay.browsers.values()) {
+        if (browser.node === originNode) continue;
+        if (typeof scope === "string" && relay.subscriptions.get(scope)?.has(browser.node) !== true) continue;
+        out.push({
+          node: browser.node,
+          envelope: encodeEnvelope({
+            v: 2,
+            type: event.kind,
+            id: `${event.id}:${browser.node}`,
+            from: relay.node,
+            to: browser.node,
+            actor: browser.actor,
+            ...(browser.session ? { session: browser.session } : {}),
+            auth: { mode: "session", token: browser.session_token ?? "" },
+            body: event
+          } satisfies ShadowEnvelope<typeof event>)
+        });
+      }
+    }
+    return out;
   }
 
   private loadSnapshot(input: CommitScopeBaseRequest): ShadowBrowserRelayShim | null {
@@ -469,6 +565,7 @@ type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
   head: ShadowScopeHead;
+  fanout: Array<{ node: string; envelope: string }>;
 };
 
 type CommitScopeMetaRow = {

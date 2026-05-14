@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import type { ShadowEnvelope } from "../src/core/shadow-envelope";
+import type { ShadowStatePage } from "../src/core/shadow-state-pages";
 
 describe("v2 browser cache reducer", () => {
   it("persists projection transfers as projection head and clears catch-up-required", () => {
@@ -54,7 +55,7 @@ describe("v2 browser cache reducer", () => {
       { kind: "projection", scope: "the_dubspace", head: accepted.position, projection: envelope.body.projection },
       { kind: "meta", key: "head:the_dubspace", value: accepted.position },
       { kind: "meta", key: "catchup_required", value: false },
-      { kind: "applied_frame", frame: accepted },
+      { kind: "applied_frame", frame: accepted, transcript },
       { kind: "transcript", transcript }
     ]);
   });
@@ -70,6 +71,82 @@ describe("v2 browser cache reducer", () => {
       ...envelopeFor("woo.turn.exec.reply.shadow.v1", { kind: "woo.turn.exec.reply.shadow.v1", ok: true }),
       reply_to: "pending-1"
     })).toEqual([{ kind: "pending_delete", id: "pending-1" }]);
+
+    expect(v2BrowserCacheMutationsForEnvelope({
+      ...envelopeFor("woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: false,
+        reason: "missing_state",
+        missing_atoms: [{ hash: "needed" }]
+      }),
+      reply_to: "pending-missing"
+    })).toEqual([]);
+  });
+
+  it("reduces successful turn replies into applied frame and transcript cache mutations", () => {
+    const accepted = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "turn-2",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "the_dubspace", epoch: 1, seq: 2, hash: "h2" },
+      receipt: { kind: "woo.commit_receipt.shadow.v1", id: "turn-2", accepted: true },
+      transcript_hash: "t2",
+      post_state_hash: "p2",
+      observations: []
+    };
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "turn-2",
+      scope: "the_dubspace",
+      seq: 2,
+      hash: "t2",
+      complete: true
+    };
+    expect(v2BrowserCacheMutationsForEnvelope({
+      ...envelopeFor("woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: true,
+        transcript,
+        commit: accepted
+      }),
+      reply_to: "pending-2"
+    })).toEqual([
+      { kind: "pending_delete", id: "pending-2" },
+      { kind: "applied_frame", frame: accepted, transcript },
+      { kind: "transcript", transcript },
+      { kind: "meta", key: "head:the_dubspace", value: accepted.position }
+    ]);
+  });
+
+  it("persists executable cell pages for later browser-side planning", () => {
+    const page: ShadowStatePage = {
+      kind: "woo.state_page.object_live.shadow.v1",
+      page: "object_live",
+      object: "#room",
+      location: null,
+      children: [],
+      contents: ["#note"]
+    };
+    const envelope = envelopeFor("woo.state.transfer.shadow.v1", {
+      kind: "woo.state.transfer.shadow.v1",
+      mode: "cell_pages",
+      scope: "#room",
+      atom_hashes: [],
+      page_refs: [{ object: "#room", page: "object_live", hash: "page-hash", bytes: 10, inline: true }],
+      inline_pages: [page],
+      sessions: [],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: [],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      source_object_count: 1,
+      source_page_count: 1,
+      proof: { kind: "test" }
+    });
+
+    expect(v2BrowserCacheMutationsForEnvelope(envelope)).toEqual([
+      { kind: "state_page", hash: "page-hash", ref: "#room:object_live:", page }
+    ]);
   });
 });
 

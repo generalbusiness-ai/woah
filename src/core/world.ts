@@ -98,6 +98,7 @@ type CommandPlan = {
   verb: string;
   args: WooValue[];
   cmd: CommandMap;
+  commit_policy?: "execute_and_commit" | "execute_only";
 };
 
 const PASSWORD_PBKDF2_ITERATIONS = 600_000;
@@ -137,6 +138,10 @@ export type HermesConnectResult = {
 
 type CommandOptions = {
   deferHostEffect?: (effect: DeferredHostEffect) => void;
+};
+
+type PublicCommandLocationOptions = {
+  skipPresenceCheck?: boolean;
 };
 
 export type CallContext = {
@@ -3305,7 +3310,20 @@ export class WooWorld {
       this.validateMessage(message);
       const space = this.object(spaceRef);
       await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
+      // Sequenced calls use the same catalog-level presence override as
+      // direct calls. The check runs before the recorder opens, so ignoring
+      // skip_presence_check here would make v2 commit-scope turns fail with no
+      // transcript instead of producing an authority-verifiable result.
+      let skipPresenceCheck = false;
+      try {
+        skipPresenceCheck = this.resolveVerb(message.target, message.verb).verb.skip_presence_check === true;
+      } catch {
+        // Let unresolved target verbs continue into the sequenced call body,
+        // where they become applied $error observations and still consume seq.
+      }
+      if (!skipPresenceCheck) {
         this.authorizePresence(message.actor, spaceRef, sessionId);
+      }
       const nextSeq = Number(this.getProp(spaceRef, "next_seq"));
       const seq = nextSeq;
       this.setProp(spaceRef, "next_seq", nextSeq + 1);
@@ -3397,7 +3415,17 @@ export class WooWorld {
         this.validateMessage(message);
         const space = this.object(spaceRef);
         await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
-        this.authorizePresence(message.actor, spaceRef, sessionId);
+        // Match the in-memory apply path: verb metadata decides whether the
+        // pre-recording presence gate applies to sequenced calls.
+        let skipPresenceCheck = false;
+        try {
+          skipPresenceCheck = this.resolveVerb(message.target, message.verb).verb.skip_presence_check === true;
+        } catch {
+          // Keep missing-verb calls on the applied-frame rollback path.
+        }
+        if (!skipPresenceCheck) {
+          this.authorizePresence(message.actor, spaceRef, sessionId);
+        }
         const seq = Number(this.getProp(spaceRef, "next_seq"));
         const ts = Date.now();
         this.setPropLocal(spaceRef, "next_seq", seq + 1);
@@ -6928,10 +6956,14 @@ export class WooWorld {
       now: number
     ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
-    const lastDetachAt = session.lastDetachAt ?? now;
+    const lastDetachAt = session.lastDetachAt === undefined ? now : session.lastDetachAt;
+    // `null` is the live-session sentinel. Import/export is used by shadow
+    // execution as well as cold persistence; converting null to "now" makes an
+    // attached session look detached and lets it expire while the gateway socket
+    // is still alive.
     const expiresAt = Math.max(
       session.expiresAt ?? session.started + this.sessionTtl(tokenClass),
-      lastDetachAt + this.sessionGrace(tokenClass)
+      lastDetachAt === null ? 0 : lastDetachAt + this.sessionGrace(tokenClass)
     );
     return {
       id: session.id,
@@ -8095,7 +8127,7 @@ export class WooWorld {
     return actor;
   }
 
-  private async publicCommandLocation(ctx: CallContext, actor: ObjRef, value: WooValue | undefined): Promise<ObjRef | null> {
+  private async publicCommandLocation(ctx: CallContext, actor: ObjRef, value: WooValue | undefined, options: PublicCommandLocationOptions = {}): Promise<ObjRef | null> {
       const location = typeof value === "string"
         ? value as ObjRef
         : actor === ctx.actor && ctx.session
@@ -8104,16 +8136,17 @@ export class WooWorld {
             if (isOptionalProjectionReadError(err)) return null;
             throw err;
           });
-    await this.assertPublicCommandLocation(ctx, actor, location);
+    await this.assertPublicCommandLocation(ctx, actor, location, options);
     return location;
   }
 
-  private async assertPublicCommandLocation(ctx: CallContext, actor: ObjRef, location: ObjRef | null): Promise<void> {
+  private async assertPublicCommandLocation(ctx: CallContext, actor: ObjRef, location: ObjRef | null, options: PublicCommandLocationOptions = {}): Promise<void> {
     if (!location || this.isWizard(ctx.actor)) return;
     if (actor !== ctx.actor) {
       throw wooError("E_PERM", `${ctx.actor} cannot parse commands for ${actor}`, { actor: ctx.actor, requested_actor: actor });
     }
     if (location === actor) return;
+    if (options.skipPresenceCheck === true) return;
 
       const actorLocation = actor === ctx.actor && ctx.session
         ? this.currentLocationForSession(ctx.session)
@@ -8133,6 +8166,19 @@ export class WooWorld {
       // Missing or unreadable command locations are rejected below.
     }
     throw wooError("E_PERM", `${actor} is not present in ${location}`, { actor, location });
+  }
+
+  private currentVerbSkipsPresenceCheck(ctx: CallContext): boolean {
+    try {
+      if (this.ownVerbExact(ctx.definer, ctx.verbName)?.skip_presence_check === true) return true;
+    } catch {
+      // Fall through to the original message verb below.
+    }
+    try {
+      return this.resolveVerb(ctx.message.target, ctx.message.verb).verb.skip_presence_check === true;
+    } catch {
+      return false;
+    }
   }
 
   private async commandVisibleCandidates(ctx: CallContext, actor: ObjRef, location: ObjRef | null): Promise<ObjRef[]> {
@@ -8512,7 +8558,13 @@ export class WooWorld {
     });
     this.nativeHandlers.set("plan_command", async (ctx, args) => {
       const space = assertObj(args[1] ?? ctx.caller);
-      return await this.planCommandForSpace(ctx, assertString(args[0] ?? ""), space) as unknown as WooValue;
+      return await this.planCommandForSpace(ctx, assertString(args[0] ?? ""), space, {
+        // Catalog wrappers such as `$conversational:command_plan` are
+        // read-only planners. When the wrapper explicitly opts out of presence
+        // checks, let it plan against the supplied command space without
+        // teaching the browser about catalog command aliases.
+        skipPresenceCheck: this.currentVerbSkipsPresenceCheck(ctx)
+      }) as unknown as WooValue;
     });
     this.nativeHandlers.set("parse_command", async (ctx, args) => {
       const actor = await this.publicCommandActor(ctx, args[1]);
@@ -9278,11 +9330,11 @@ export class WooWorld {
     return resolved ? { name: resolved.verb.name, definer: resolved.definer, direct_callable: resolved.verb.direct_callable === true, arg_spec: resolved.verb.arg_spec ?? {} } : null;
   }
 
-  private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef): Promise<WooValue> {
+  private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef, options: PublicCommandLocationOptions = {}): Promise<WooValue> {
     const text = input.trim();
     if (!text) return await this.commandHuhPlan(ctx, space, input, "empty command");
     const actor = await this.publicCommandActor(ctx, undefined);
-    const location = await this.publicCommandLocation(ctx, actor, space);
+    const location = await this.publicCommandLocation(ctx, actor, space, options);
 
     const lowered = await this.lowerSpeechPrefixPlan(ctx, text, space, actor, location);
     if (lowered) return lowered as unknown as WooValue;
@@ -9518,13 +9570,32 @@ export class WooWorld {
   private async commandPlanForResolved(ctx: CallContext, commandSpace: ObjRef, target: ObjRef, verbName: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
     const resolved = await this.tryResolveVerbForCommand(ctx, target, verbName);
     const directCallable = resolved?.direct_callable === true;
-    let route: "direct" | "sequenced" = directCallable ? "direct" : "sequenced";
+    const routeHint = commandRouteHint(resolved?.arg_spec);
+    let route: "direct" | "sequenced" = routeHint ?? (directCallable ? "direct" : "sequenced");
     let space: ObjRef | null = null;
     if (route === "sequenced") {
       space = await this.isDescendantOfChecked(target, "$space", ctx.hostMemo) ? target : commandSpace;
       if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
     }
-    return { ok: true, route, space, target, verb: resolved?.name ?? verbName, args, cmd };
+    const verb = resolved?.name ?? verbName;
+    const commitPolicy = route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
+      ? "execute_and_commit" as const
+      : undefined;
+    return {
+      ok: true,
+      route,
+      space,
+      target,
+      verb,
+      args,
+      cmd,
+      ...(commitPolicy ? { commit_policy: commitPolicy } : {})
+    };
+  }
+
+  private async commandPlanRequiresDurablePresence(ctx: CallContext, target: ObjRef, verbName: string): Promise<boolean> {
+    if (verbName !== "enter" && verbName !== "leave" && verbName !== "out") return false;
+    return await this.isDescendantOfChecked(target, "$space", ctx.hostMemo);
   }
 
   private async commandHuhPlan(ctx: CallContext, space: ObjRef, text: string, reason: string): Promise<WooValue> {
@@ -10136,8 +10207,18 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     target: map.target,
     verb: map.verb,
     args: Array.isArray(map.args) ? map.args : [],
-    cmd: commandMapFromValue(map.cmd)
+    cmd: commandMapFromValue(map.cmd),
+    ...(map.commit_policy === "execute_and_commit" || map.commit_policy === "execute_only" ? { commit_policy: map.commit_policy } : {})
   };
+}
+
+function commandRouteHint(argSpec: Record<string, WooValue> | undefined): "direct" | "sequenced" | null {
+  // Catalogs own command routing hints; the client should not learn that a
+  // particular bundled surface needs a sequenced plan.
+  const command = argSpec?.command;
+  if (!command || typeof command !== "object" || Array.isArray(command)) return null;
+  const route = (command as Record<string, WooValue>).route;
+  return route === "direct" || route === "sequenced" ? route : null;
 }
 
 function addUnique<T>(items: T[], item: T): T[] {

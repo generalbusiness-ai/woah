@@ -558,10 +558,17 @@ export async function executeShadowTurnCallOrNeedState(
     };
   }
 
+  const executeOnly = request.commit_policy === "execute_only";
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
     ? options.commitScope?.serialized ?? run.serializedAfter
+    : executeOnly
+      ? serializedBefore
     : run.serializedAfter;
   node.serialized = structuredClone(serializedAfter) as SerializedWorld;
+  // Execute-only turns are live/direct observations, not authority-bearing
+  // state transitions. Keep their reply transcript, but discard the executor's
+  // speculative world so the next durable turn plans against the commit scope.
+  if (executeOnly) node.world = undefined;
   for (const hash of actualKey.atom_hashes) node.atom_hashes.add(hash);
   for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
   refreshNodeObjectHashes(node);

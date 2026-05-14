@@ -95,6 +95,7 @@ export function publicAppliedFrame(frame: AppliedFrame): AppliedFrame {
 export type DirectResultFrame = {
   op: "result";
   id?: string;
+  command?: unknown;
   result: WooValue;
   observations: Observation[];
   audience: ObjRef | null;

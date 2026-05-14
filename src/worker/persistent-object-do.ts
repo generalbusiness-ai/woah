@@ -99,6 +99,7 @@ type CommitScopeOpenResponse = {
 type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
+  fanout?: Array<{ node: string; envelope: string }>;
   head?: {
     kind: "woo.scope_head.shadow.v1";
     scope: ObjRef;
@@ -2683,6 +2684,7 @@ export class PersistentObjectDO {
         envelope: encoded
       });
       if (result.reply) ws.send(result.reply);
+      this.sendV2Fanout(result.fanout ?? []);
     } catch (err) {
       ws.send(encodeEnvelope(buildTransportErrorEnvelope({
         id: `${this.durableHostKey()}:error:${Date.now()}`,
@@ -2712,6 +2714,24 @@ export class PersistentObjectDO {
     const payload = await response.json() as Record<string, unknown>;
     if (!response.ok) throw wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
     return payload as T;
+  }
+
+  private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {
+    if (fanout.length === 0) return;
+    const byNode = v2FanoutEnvelopesByNode(fanout);
+    for (const ws of this.state.getWebSockets()) {
+      const att = this.attachment(ws);
+      const envelopes = att?.node ? byNode.get(att.node) : undefined;
+      if (!envelopes) continue;
+      for (const envelope of envelopes) {
+        try {
+          ws.send(envelope);
+        } catch {
+          // Socket cleanup is driven by webSocketClose/webSocketError; fan-out
+          // should not fail the originator's already-accepted commit.
+        }
+      }
+    }
   }
 
     private indexAddSocket(sessionId: string, actor: ObjRef, ws: WebSocket): void {
@@ -3327,6 +3347,16 @@ function logCatalogTapEvent(event: CatalogTapLogEvent): void {
 function metricErrorCode(err: unknown): string {
   if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
   return err instanceof Error ? err.name : "E_INTERNAL";
+}
+
+export function v2FanoutEnvelopesByNode(fanout: Array<{ node: string; envelope: string }>): Map<string, string[]> {
+  const byNode = new Map<string, string[]>();
+  for (const item of fanout) {
+    const envelopes = byNode.get(item.node);
+    if (envelopes) envelopes.push(item.envelope);
+    else byNode.set(item.node, [item.envelope]);
+  }
+  return byNode;
 }
 
 // Stable digest over a set of object routes. Used by registerObjectRoutes

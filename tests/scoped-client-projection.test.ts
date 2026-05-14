@@ -474,7 +474,7 @@ describe("scoped client projection", () => {
     });
   });
 
-  it("adds containing-room here to feature-space enter results", async () => {
+  it("keeps feature-space enter results lightweight", async () => {
     const world = createWorld();
     const session = world.auth("guest:feature-move-result");
     const entered = await world.directCall("feature-move-result-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
@@ -482,10 +482,12 @@ describe("scoped client projection", () => {
     if (entered.op !== "result") return;
     expect(entered.result).toMatchObject({
       room: "the_pinboard",
-      here_request: true,
-      look_deferred: true,
-      here: { id: "the_deck", name: "Deck" }
+      present: expect.arrayContaining([session.actor]),
+      present_actors: expect.arrayContaining([session.actor])
     });
+    expect((entered.result as Record<string, unknown>).here_request).toBeUndefined();
+    expect((entered.result as Record<string, unknown>).look_deferred).toBeUndefined();
+    expect((entered.result as Record<string, unknown>).here).toBeUndefined();
   });
 
   it("adds here to feature-space leave results", async () => {

@@ -98,7 +98,7 @@ Host-facing interfaces for runtime execution, transport, and client bootstrap ac
 - [browser-host.md](spec/protocol/browser-host.md) — transient host bootstrap (§18)
 - [routing.md](spec/protocol/routing.md) — `/objects/<id>` URL form, class-driven renderer dispatch, browser navigation vs MCP focus, `:locate()` / `:open_in_<view>()` verb conventions (AR1–AR13)
 - [ui-component-model.md](spec/protocol/ui-component-model.md) — client UI framework: catalog-owned browser modules, Web Component ABI, declarative frames, scoped neighborhoods, frame composition, consistent client projection, and observation normalization (UCM1–UCM30, **draft**)
-- [v2-turn-network.md](spec/protocol/v2-turn-network.md) — archived v2 node-network design note; prototype substrate was rolled back pending redesign
+- [v2-turn-network.md](spec/protocol/v2-turn-network.md) — draft v2 node-network protocol: deterministic VM turns, commit scopes, execution capability gossip, state transfer, live events, in-browser nodes, and scope-local scheduled turns (VTN1-VTN18, **draft**)
 
 ### Reference (Cloudflare)
 
