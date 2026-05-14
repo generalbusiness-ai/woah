@@ -323,7 +323,7 @@ async function makeCostHarness(): Promise<CostHarness> {
       call,
       key: shadowTurnKeyFromTranscript(planned.transcript),
       expected: browser.relay.commit_scope.head,
-      commit_policy: "execute_and_commit" as const
+      persistence: "durable" as const
     };
     return encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, `cf-v2-cost-env-${index}`));
   }

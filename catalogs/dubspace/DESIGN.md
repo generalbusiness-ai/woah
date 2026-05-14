@@ -63,6 +63,13 @@ custom events rather than private host DOM bindings.
 - A mounted-room relationship to the Living Room.
 - An operator list for actors currently at the controls.
 
+Dubspace follows the workspace roster model. `room_roster()` returns distinct
+actors from `session_subscribers`, enriched as `{id, name, presence,
+idle_seconds?}`; `live_audience(observation?)` is the separate delivery
+contract and delegates to the substrate observation routing rules. The operator
+list remains catalog authority state for control writes, not the presentation
+roster and not the live-delivery index.
+
 ## Persistent State
 
 - Loaded loop per slot.
@@ -78,7 +85,7 @@ custom events rather than private host DOM bindings.
 
 Slider motion has two layers — two v2 routes for the same control surface:
 
-- **Preview** (v2 direct intent): while a player drags a slider, the client submits a `preview_control(target, name, value)` direct intent with `execute_only`. The verb body emits a `gesture_progress` observation; per [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route), the observation is live-only because the call is direct. Not sequenced, not logged, not replayed.
+- **Preview** (v2 direct intent): while a player drags a slider, the client submits a `preview_control(target, name, value)` direct intent with `live`. The verb body emits a `gesture_progress` observation; per [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route), the observation is live-only because the call is direct. Not sequenced, not logged, not replayed.
 - **Commit** (v2 sequenced intent): when the drag ends, the client submits `set_control(target, name, value)` through the v2 commit-scope path. The value becomes materialized persistent state and is replayable.
 
 The preview layer exists so continuous gestures feel live without filling the `$space` log with every pointer sample. It is the same control surface called via a different route, not a second source of truth.

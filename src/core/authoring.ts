@@ -965,5 +965,6 @@ const VALID_BUILTINS = new Set([
   "authoring_inspect",
   "authoring_search",
   "set_object_name",
-  "is_remote_object"
+  "is_remote_object",
+  "presence_status"
 ]);

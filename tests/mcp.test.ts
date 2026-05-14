@@ -651,6 +651,10 @@ describe("McpHost", () => {
     const world = bootstrapWorld();
     world.setProp("$system", "guest_initial_room", null);
     const session = world.auth("guest:mcp-v2-cache-apply");
+    const otherSession = world.auth("guest:mcp-v2-cache-apply-other");
+    world.attachSocket(session.id, "socket:mcp-v2-cache-apply");
+    world.attachSocket(otherSession.id, "socket:mcp-v2-cache-apply-other");
+    world.touchSessionInput(otherSession.id, 123_456);
     const before = world.exportWorld().objectCounter;
     const created = `mcp_cache_obj_${before + 10}`;
     const modifiedBefore = world.object(session.actor).modified;
@@ -686,6 +690,11 @@ describe("McpHost", () => {
     const chatLog = after.logs.find(([space]) => space === "the_chatroom")?.[1] ?? [];
     expect(chatLog.filter((entry) => entry.seq === 3)).toHaveLength(1);
     expect(after.objectCounter).toBeGreaterThanOrEqual(before + 11);
+    expect(world.sessions.get(session.id)?.attachedSockets.has("socket:mcp-v2-cache-apply")).toBe(true);
+    expect(world.sessions.get(session.id)?.attachedSockets.has("socket:mcp-v2-cache-apply-other")).toBe(false);
+    expect(world.sessions.get(otherSession.id)?.attachedSockets.has("socket:mcp-v2-cache-apply-other")).toBe(true);
+    expect(world.sessions.get(otherSession.id)?.attachedSockets.has("socket:mcp-v2-cache-apply")).toBe(false);
+    expect(world.sessions.get(otherSession.id)?.lastInputAt).toBe(123_456);
     expect(world.object(created).created).toBeGreaterThan(0);
     expect(world.object(created).modified).toBeGreaterThan(0);
     expect(world.object(session.actor).modified).toBeGreaterThanOrEqual(modifiedBefore);

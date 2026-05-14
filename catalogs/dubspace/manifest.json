@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -306,6 +306,36 @@
             "args": []
           },
           "source": "verb :title() rxd { return this.name; }"
+        },
+        {
+          "name": "room_roster",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :room_roster() rxd { /* Fallback shape only: bundled runtimes bind the native handler, which filters expired session rows. */ let actors = []; for sub in this.session_subscribers { if (typeof(sub) == \"map\" && has(sub, \"actor\") && !(sub[\"actor\"] in actors)) { actors = actors + [sub[\"actor\"]]; } } let rows = []; for item in actors { if (isa(item, $actor)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "workspace_room_roster"
+          }
+        },
+        {
+          "name": "live_audience",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "observation?"
+            ]
+          },
+          "source": "verb :live_audience(observation) rxd { /* Fallback shape only: bundled runtimes bind the native handler, which applies observation routing and session liveness. */ let out = []; for row in this.session_subscribers { if (typeof(row) == \"map\" && has(row, \"session\")) { out = out + [row[\"session\"]]; } } return out; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "space_live_audience"
+          }
         },
         {
           "name": "enter",

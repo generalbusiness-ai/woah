@@ -48,7 +48,8 @@ import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
-import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -2683,6 +2684,7 @@ export class PersistentObjectDO {
         actor: att.actor,
         envelope: encoded
       });
+      await this.applyV2CommittedTranscript(world, result.reply, att.sessionId);
       if (result.reply) ws.send(result.reply);
       this.sendV2Fanout(result.fanout ?? []);
     } catch (err) {
@@ -2714,6 +2716,15 @@ export class PersistentObjectDO {
     const payload = await response.json() as Record<string, unknown>;
     if (!response.ok) throw wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
     return payload as T;
+  }
+
+  private async applyV2CommittedTranscript(world: WooWorld, replyText: string | null, sessionId: string): Promise<void> {
+    if (!replyText) return;
+    const reply = decodeEnvelope<ShadowTurnExecReply>(replyText);
+    if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
+    world.applyCommittedShadowTranscript(reply.body.transcript);
+    const session = world.sessions.get(sessionId);
+    if (session) await this.registerSessionRoute(session);
   }
 
   private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {

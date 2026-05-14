@@ -57,7 +57,7 @@ describe("shadow browser node shim", () => {
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.44);
   });
 
-  it("does not let execute-only live turns dirty the next committed dubspace turn", async () => {
+  it("does not let live-persistence turns dirty the next durable dubspace turn", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:browser-dubspace-live-before-commit");
     anchor.setProp("the_dubspace", "operators", [session.actor]);
@@ -80,7 +80,7 @@ describe("shadow browser node shim", () => {
       target: "the_dubspace",
       verb: "enter",
       args: [],
-      commit_policy: "execute_only"
+      persistence: "live"
     });
     const committed = await executeShadowBrowserTurn(browser, {
       id: "browser-dubspace-committed-wet",
@@ -332,7 +332,7 @@ describe("shadow browser node shim", () => {
       target: "the_pinboard",
       verb: "enter",
       args: [],
-      commit_policy: "execute_and_commit"
+      persistence: "durable"
     });
     const firstReply = await handleShadowBrowserTurnExecEnvelope(first, receiveShadowBrowserEnvelopeReceipt(first, encodeEnvelope(firstIntent)));
     expect(firstReply?.body).toMatchObject({ ok: true });
@@ -367,7 +367,7 @@ describe("shadow browser node shim", () => {
       target: "the_pinboard",
       verb: "enter",
       args: [],
-      commit_policy: "execute_and_commit"
+      persistence: "durable"
     });
     const secondReply = await handleShadowBrowserTurnExecEnvelope(second, receiveShadowBrowserEnvelopeReceipt(second, encodeEnvelope(secondIntent)));
 
@@ -714,7 +714,7 @@ describe("shadow browser node shim", () => {
       key: shadowTurnKeyFromTranscript(planned.transcript),
       expected: browser.relay.commit_scope.head,
       auth: { mode: "shadow_local" as const, actor: browser.actor, session: browser.session },
-      commit_policy: "execute_and_commit" as const
+      persistence: "durable" as const
     };
     const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "wire-env-1"));
 
@@ -743,7 +743,7 @@ describe("shadow browser node shim", () => {
       target: "the_dubspace",
       verb: "set_control",
       args: ["delay_1", "wet", 0.72],
-      commit_policy: "execute_and_commit" as const
+      persistence: "durable" as const
     };
     const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, intent.kind, intent, "wire-intent-env-1"));
 
@@ -759,7 +759,7 @@ describe("shadow browser node shim", () => {
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.72);
   });
 
-  it("chains execute-only browser intents through per-session live state", async () => {
+  it("chains live-persistence browser intents through per-session live state", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-live-chain");
     await openShadowBrowserScope(browser);
     const observer = createShadowBrowserNode({
@@ -779,7 +779,7 @@ describe("shadow browser node shim", () => {
         target: "the_dubspace",
         verb,
         args,
-        commit_policy: "execute_only" as const
+        persistence: "live" as const
       };
       const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(shadowBrowserEnvelope(browser, intent.kind, intent, `${id}:env`)));
       return await handleShadowBrowserTurnExecEnvelope(browser, receipt);

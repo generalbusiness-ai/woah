@@ -186,10 +186,16 @@ catalog-level command has a durable sequencing requirement that cannot be
 derived from `direct_callable`; the client must not hardcode catalog-specific
 route exceptions.
 
+`persistence`, when present, is either `durable` or
+`live`. It applies only to v2 turn-network command plans: direct
+live-only commands use `live`, while direct commands that intentionally
+mutate durable cells can request `durable` without pretending to be
+sequenced-log traffic.
+
 Command metadata is per verb definition. Aliases share the same command pattern; a different pattern requires a separate verb.
 Source-install authoring APIs MAY attach the same metadata out-of-band as
 `argSpec.command` while the source language lacks first-class `args_from` and
-`route`
+`route` / `persistence`
 syntax. The stored verb definition is still the source of truth after install.
 
 `$match:plan_command(text, space)` uses this normative target order: direct object, indirect object, command space, actor. Within each target it uses the existing runtime verb lookup rule, including parent chains and features.

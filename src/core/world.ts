@@ -45,6 +45,11 @@ const SUBSCRIBER_SCRUB_FLOOR_MS = 5_000;
 // within this window". Past it, a stateless caller without a live socket
 // reads as "sleeping" — same as a WS user whose connection has dropped.
 const IDLE_PRESENCE_LIVE_WINDOW_MS = 5 * 60_000;
+const IDLE_PRESENCE_IDLE_THRESHOLD_SECONDS = 60;
+
+type RuntimeSessionState = Pick<Session, "lastDetachAt" | "lastInputAt"> & {
+  attachedSockets: Set<string>;
+};
 
 type ResolvedVerb = {
   definer: ObjRef;
@@ -99,7 +104,7 @@ type CommandPlan = {
   verb: string;
   args: WooValue[];
   cmd: CommandMap;
-  commit_policy?: "execute_and_commit" | "execute_only";
+  persistence?: "durable" | "live";
 };
 
 const PASSWORD_PBKDF2_ITERATIONS = 600_000;
@@ -2791,13 +2796,25 @@ export class WooWorld {
    * actively making calls without keeping a socket open; once input stops,
    * they fall through to "sleeping" the same way a closed WS does. */
   actorIsConnected(actor: ObjRef): boolean {
-    const liveCutoff = Date.now() - IDLE_PRESENCE_LIVE_WINDOW_MS;
+    const now = Date.now();
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
-      if (session.attachedSockets.size > 0) return true;
-      if (session.lastInputAt >= liveCutoff) return true;
+      if (this.sessionIsLive(session, now)) return true;
     }
     return false;
+  }
+
+  private sessionIsLive(session: Session, now = Date.now()): boolean {
+    if (this.sessionExpired(session, now)) return false;
+    if (session.attachedSockets.size > 0) return true;
+    return session.lastInputAt >= now - IDLE_PRESENCE_LIVE_WINDOW_MS;
+  }
+
+  actorPresenceStatus(actor: ObjRef, now = Date.now()): "awake" | "idle" | "sleeping" {
+    if (!this.actorIsConnected(actor)) return "sleeping";
+    const lastInputAt = this.actorLastInputAt(actor);
+    if (lastInputAt !== null && Math.floor((now - lastInputAt) / 1000) >= IDLE_PRESENCE_IDLE_THRESHOLD_SECONDS) return "idle";
+    return "awake";
   }
 
   detachSocket(sessionId: string, socketId: string): void {
@@ -6145,7 +6162,33 @@ export class WooWorld {
     // shared semantic path but add a WooWorld adapter that applies the same
     // transcript operations in place. This intentionally does not persist to
     // the gateway DO.
+    const runtimeSessions = this.captureRuntimeSessionStates();
     this.importWorld(applyShadowTranscriptToCommittedState(this.exportWorld(), transcript, { objectTimestamp: Date.now() }));
+    this.restoreRuntimeSessionStates(runtimeSessions);
+  }
+
+  private captureRuntimeSessionStates(): Map<string, RuntimeSessionState> {
+    // Keep this helper aligned with all transport-only Session fields. Durable
+    // serialized fields such as currentLocation must come from the transcript;
+    // socket/input state must survive cache rehydrates. Sessions created by the
+    // transcript have no prior transport state, so they intentionally keep the
+    // import defaults until a transport attaches or sends input.
+    return new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, {
+      attachedSockets: new Set(session.attachedSockets),
+      lastInputAt: session.lastInputAt,
+      lastDetachAt: session.lastDetachAt
+    }]));
+  }
+
+  private restoreRuntimeSessionStates(runtimeSessions: Map<string, RuntimeSessionState>): void {
+    for (const [id, runtime] of runtimeSessions) {
+      const session = this.sessions.get(id);
+      if (!session) continue;
+      session.attachedSockets = runtime.attachedSockets;
+      session.lastInputAt = runtime.lastInputAt;
+      if (runtime.attachedSockets.size > 0) session.lastDetachAt = null;
+      else session.lastDetachAt = runtime.lastDetachAt;
+    }
   }
 
   private serializeObject(obj: WooObject): SerializedObject {
@@ -7362,7 +7405,10 @@ export class WooWorld {
     const sessionMap = audience ? this.presenceSessionsIn(audience) : null;
     if (sessionMap) {
       const sessions: string[] = [];
+      const now = Date.now();
       for (const [sessionId, actor] of sessionMap) {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.actor !== actor || !this.sessionIsLive(session, now)) continue;
         if (actorSet.has(actor)) sessions.push(sessionId);
       }
       return sessions;
@@ -8480,6 +8526,9 @@ export class WooWorld {
     this.nativeHandlers.set("room_look_self", (ctx) => this.spaceLookSelf(ctx));
     this.nativeHandlers.set("space_look_self", (ctx) => this.spaceLookSelf(ctx));
     this.nativeHandlers.set("room_who", (ctx) => this.roomWho(ctx));
+    this.nativeHandlers.set("embodied_room_roster", (ctx) => this.embodiedRoomRoster(ctx));
+    this.nativeHandlers.set("workspace_room_roster", (ctx) => this.workspaceRoomRoster(ctx));
+    this.nativeHandlers.set("space_live_audience", (ctx, args) => this.spaceLiveAudience(ctx, args));
     this.nativeHandlers.set("help_db_find_topics", (ctx, args) => this.helpDbFindTopics(ctx, args));
     this.nativeHandlers.set("help_db_get_topic", (ctx, args) => this.helpDbGetTopic(ctx, args));
     this.nativeHandlers.set("help_db_dump_topic", (ctx, args) => this.helpDbDumpTopic(ctx, args));
@@ -8506,8 +8555,21 @@ export class WooWorld {
     this.lastSubscriberScrubAt.set(space, now);
     let survivingActors = subscribers;
     if (subscribers.length > 0) {
+      const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+      const rowsByActor = new Map<ObjRef, Array<{ session: string; actor: ObjRef }>>();
+      if (Array.isArray(rawSessionSubscribers)) {
+        for (const entry of rawSessionSubscribers) {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+          const map = entry as Record<string, WooValue>;
+          if (typeof map.session !== "string" || typeof map.actor !== "string") continue;
+          const rows = rowsByActor.get(map.actor) ?? [];
+          rows.push({ session: map.session, actor: map.actor });
+          rowsByActor.set(map.actor, rows);
+        }
+      }
       const remoteActorsSet = new Set<ObjRef>();
       for (const actor of subscribers) {
+        if (rowsByActor.has(actor)) continue;
         if (await this.remoteHostForObject(actor, memo)) remoteActorsSet.add(actor);
       }
       const remoteLocationsByActor = await this.fetchRemoteSessionLocations(
@@ -8517,16 +8579,43 @@ export class WooWorld {
       const kept: ObjRef[] = [];
       const stale: ObjRef[] = [];
       for (const actor of subscribers) {
+        const rows = rowsByActor.get(actor);
+        if (rows && rows.length > 0) {
+          let hasKnownLiveSession = false;
+          let hasUnknownRemoteSession = false;
+          const actorRemote = await this.remoteHostForObject(actor, memo);
+          for (const row of rows) {
+            if (row.session.startsWith("legacy:")) {
+              hasKnownLiveSession = true;
+              break;
+            }
+            const session = this.sessions.get(row.session);
+            if (session && !this.sessionExpired(session, now)) {
+              hasKnownLiveSession = true;
+              break;
+            }
+            if (!session && actorRemote) hasUnknownRemoteSession = true;
+          }
+          if (hasKnownLiveSession) kept.push(actor);
+          else if (hasUnknownRemoteSession) {
+            // A remote actor with only missing session rows is excluded from
+            // this read but left persisted. The owning host may still have the
+            // session; dropping the row here would race cross-host setup.
+          }
+          else stale.push(actor);
+          continue;
+        }
         // A remote actor whose home host failed to answer (read-availability
         // error) is left in `subscribers` and excluded from this read's
         // survivingActors view, mirroring the per-actor path's behavior
         // under the same error class. Without this guard a transient remote
         // blip would mark the actor stale and persist a subscriber-row drop.
         if (remoteActorsSet.has(actor) && !remoteLocationsByActor.has(actor)) continue;
-        // `liveSessionLocationsForActor`, not `allLocationsForActor`: the
-        // latter falls back to the actor's persistent `.location` when no
-        // session is live, which would mask sessions lost to hibernation /
-        // gateway reset and keep the dead guest pinned to this space forever.
+        // Legacy subscriber rows have no session attribution. For those rows
+        // only, fall back to active-scope probing so old worlds can still shed
+        // dead live-presence mirrors. Session-attributed rows above are a real
+        // many-spaces subscription relation and must not be collapsed to the
+        // actor's active_scope.
         const localLocations = this.liveSessionLocationsForActor(actor);
         const remoteLocations = remoteLocationsByActor.get(actor) ?? [];
         const locations = remoteActorsSet.has(actor)
@@ -8790,6 +8879,7 @@ export class WooWorld {
 
   private async roomWho(ctx: CallContext): Promise<WooValue> {
     const present = this.chatPresent(ctx.thisObj);
+    const roster = await this.rosterRowsForActors(ctx, present);
     const presentNames = (await this.collectPropChecked(ctx.progr, present, "name", ctx.hostMemo)).map((name) => valueToText(name));
     ctx.observe({
       type: "who",
@@ -8798,10 +8888,71 @@ export class WooWorld {
       to: ctx.actor,
       room: ctx.thisObj,
       present_actors: present,
+      roster,
       text: `Present: ${presentNames.join(", ") || "nobody"}.`,
       ts: Date.now()
     });
     return present;
+  }
+
+  private async embodiedRoomRoster(ctx: CallContext): Promise<WooValue> {
+    const actors = this.contentsOf(ctx.thisObj)
+      .filter((item) => this.objects.has(item) && this.inheritsFrom(item, "$actor"));
+    return await this.rosterRowsForActors(ctx, actors);
+  }
+
+  private async workspaceRoomRoster(ctx: CallContext): Promise<WooValue> {
+    const sessions = this.presenceSessionsIn(ctx.thisObj);
+    if (!sessions) return [] as unknown as WooValue;
+    const actors = new Set<ObjRef>();
+    const now = Date.now();
+    for (const [sessionId, actor] of sessions) {
+      const session = this.sessions.get(sessionId);
+      if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
+      if (this.objects.has(actor) && this.inheritsFrom(actor, "$actor")) actors.add(actor);
+    }
+    return await this.rosterRowsForActors(ctx, Array.from(actors));
+  }
+
+  private async rosterRowsForActors(ctx: CallContext, actors: ObjRef[]): Promise<WooValue> {
+    const now = this.logicalNow("room_roster.now");
+    const rows = await Promise.all(actors.map(async (id) => {
+      const lastInputAt = this.actorLastInputAt(id);
+      const idleSeconds = lastInputAt === null
+        ? null
+        : Math.max(0, Math.floor((now - lastInputAt) / 1000));
+      return {
+        id,
+        name: await this.objectDisplayNameAsync(ctx.progr, id, ctx.hostMemo),
+        presence: this.actorPresenceStatus(id, now),
+        ...(idleSeconds !== null ? { idle_seconds: idleSeconds } : {})
+      } as Record<string, WooValue>;
+    }));
+    rows.sort((left, right) => String(left.name).localeCompare(String(right.name)) || String(left.id).localeCompare(String(right.id)));
+    return rows as unknown as WooValue;
+  }
+
+  private async spaceLiveAudience(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
+    const raw = args[0];
+    if (raw === undefined || raw === null) {
+      return this.liveSessionIdsIn(ctx.thisObj) as unknown as WooValue;
+    }
+    if (typeof raw !== "object" || Array.isArray(raw)) throw wooError("E_INVARG", "live_audience observation must be a map", raw);
+    const observation = raw as Observation;
+    return (await this.observationAudienceSessions(ctx.thisObj, observation) ?? []) as unknown as WooValue;
+  }
+
+  private liveSessionIdsIn(space: ObjRef): string[] {
+    const sessions = this.presenceSessionsIn(space);
+    if (!sessions) return [];
+    const out: string[] = [];
+    const now = Date.now();
+    for (const [sessionId, actor] of sessions) {
+      const session = this.sessions.get(sessionId);
+      if (!session || session.actor !== actor || !this.sessionIsLive(session, now)) continue;
+      out.push(sessionId);
+    }
+    return out.sort();
   }
 
   private async playerWho(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
@@ -9484,9 +9635,10 @@ export class WooWorld {
       if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
     }
     const verb = resolved?.name ?? verbName;
-    const commitPolicy = route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
-      ? "execute_and_commit" as const
-      : undefined;
+    const persistence = commandPersistenceHint(resolved?.arg_spec)
+      ?? (route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
+        ? "durable" as const
+        : undefined);
     return {
       ok: true,
       route,
@@ -9495,7 +9647,7 @@ export class WooWorld {
       verb,
       args,
       cmd,
-      ...(commitPolicy ? { commit_policy: commitPolicy } : {})
+      ...(persistence ? { persistence: persistence } : {})
     };
   }
 
@@ -10114,7 +10266,7 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     verb: map.verb,
     args: Array.isArray(map.args) ? map.args : [],
     cmd: commandMapFromValue(map.cmd),
-    ...(map.commit_policy === "execute_and_commit" || map.commit_policy === "execute_only" ? { commit_policy: map.commit_policy } : {})
+    ...(map.persistence === "durable" || map.persistence === "live" ? { persistence: map.persistence } : {})
   };
 }
 
@@ -10125,6 +10277,13 @@ function commandRouteHint(argSpec: Record<string, WooValue> | undefined): "direc
   if (!command || typeof command !== "object" || Array.isArray(command)) return null;
   const route = (command as Record<string, WooValue>).route;
   return route === "direct" || route === "sequenced" ? route : null;
+}
+
+function commandPersistenceHint(argSpec: Record<string, WooValue> | undefined): "durable" | "live" | null {
+  const command = argSpec?.command;
+  if (!command || typeof command !== "object" || Array.isArray(command)) return null;
+  const policy = (command as Record<string, WooValue>).persistence;
+  return policy === "durable" || policy === "live" ? policy : null;
 }
 
 function addUnique<T>(items: T[], item: T): T[] {

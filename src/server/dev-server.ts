@@ -507,6 +507,9 @@ async function handleV2ShadowFrame(
     ensureDevV2SerializedSession(browser.relay, session);
     const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
     const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+    if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
+      world.applyCommittedShadowTranscript(reply.body.transcript);
+    }
     if (reply) {
       ws.send(encodeEnvelope(reply));
       sendDevV2Fanout(browser, reply);

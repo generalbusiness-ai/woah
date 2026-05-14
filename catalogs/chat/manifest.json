@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -217,7 +217,7 @@
             "args": [
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :announce(text) rxd { return this:announce_all_but([actor], text); }"
         },
@@ -296,7 +296,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :north() rxd { set_task_perms(caller_perms()); return this:go(\"north\"); }"
         },
@@ -310,7 +310,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :northeast() rxd { set_task_perms(caller_perms()); return this:go(\"northeast\"); }"
         },
@@ -324,7 +324,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :east() rxd { set_task_perms(caller_perms()); return this:go(\"east\"); }"
         },
@@ -338,7 +338,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :southeast() rxd { set_task_perms(caller_perms()); return this:go(\"southeast\"); }"
         },
@@ -352,7 +352,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :south() rxd { set_task_perms(caller_perms()); return this:go(\"south\"); }"
         },
@@ -366,7 +366,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :southwest() rxd { set_task_perms(caller_perms()); return this:go(\"southwest\"); }"
         },
@@ -380,7 +380,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :west() rxd { set_task_perms(caller_perms()); return this:go(\"west\"); }"
         },
@@ -394,7 +394,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :northwest() rxd { set_task_perms(caller_perms()); return this:go(\"northwest\"); }"
         },
@@ -408,7 +408,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :out() rxd { set_task_perms(caller_perms()); return this:go(\"out\"); }"
         },
@@ -424,7 +424,7 @@
             "args": [
               "exit"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "durable" }
           },
           "source": "verb :go(exit) rxd { set_task_perms(caller_perms()); let exit_obj = this:match_exit(exit); if (exit_obj == $failed_match) { let msg = \"You can't go that way (\" + exit + \").\"; tell(actor, msg); return msg; } return exit_obj:invoke(); }"
         },
@@ -441,7 +441,7 @@
             "args": [
               "object"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr"], "persistence": "durable" }
           },
           "source": "verb :take(object) rxd { let name = str_trim(object); if (!name) { raise { code: \"E_INVARG\", message: \"take requires an object name\" }; } let item = $match:match_object(name, this); if (item == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + str_char(34) + name + str_char(34) + \" you mean.\", value: name }; } if (item == $failed_match || item == this || location(item) != this) { raise { code: \"E_INVARG\", message: \"I don't see \" + str_char(34) + name + str_char(34) + \" here.\", value: name }; } if (item == actor || (item in this.subscribers)) { raise { code: \"E_PERM\", message: \"actors are not carryable\", value: item }; } let title = \"\"; try { title = item:title(); } except err { title = \"\"; } if (!title) { title = to_string(item); } let portable = false; try { portable = item.portable; } except err { portable = false; } if (portable != true) { raise { code: \"E_PERM\", message: title + \" is not carryable\", value: item }; } moveto(item, actor); tell(actor, \"You take \" + title + \".\"); observe({ type: \"taken\", actor: actor, item: item, text: actor.name + \" takes \" + title + \".\", ts: now() }); return { item: item, title: title }; }"
         },
@@ -457,7 +457,7 @@
             "args": [
               "object"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr"], "persistence": "durable" }
           },
           "source": "verb :drop(object) rxd { let name = str_trim(object); if (!name) { raise { code: \"E_INVARG\", message: \"drop requires an object name\" }; } let item = $match:match_object(name, actor); if (item == $failed_match || item == $ambiguous_match || location(item) != actor) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + str_char(34) + name + str_char(34) + \".\", value: name }; } let title = \"\"; try { title = item:title(); } except err { title = \"\"; } if (!title) { title = to_string(item); } moveto(item, this); if (is_recycled(item)) { return { item: item, title: title, room: this, recycled: true }; } tell(actor, \"You drop \" + title + \".\"); observe({ type: \"dropped\", actor: actor, item: item, room: this, text: actor.name + \" drops \" + title + \".\", ts: now() }); return { item: item, title: title, room: this }; }"
         }
@@ -591,7 +591,7 @@
             "args": [
               "recipient"
             ],
-            "command": { "dobj": "this", "prep": ["to", "at"], "iobj": "string", "args_from": ["iobjstr"] }
+            "command": { "dobj": "this", "prep": ["to", "at"], "iobj": "string", "args_from": ["iobjstr"], "persistence": "durable" }
           },
           "source": "verb :give(recipient) rxd { let recipient_str = str_trim(recipient); if (!recipient_str) { raise { code: \"E_INVARG\", message: \"Give it to whom?\" }; } if (location(this) != actor) { raise { code: \"E_INVARG\", message: \"You don't have that!\", value: this }; } let here = location(actor); if (here == null) { raise { code: \"E_INVARG\", message: \"I see no \" + str_char(34) + recipient_str + str_char(34) + \" here.\" }; } let who = $match:match_object(recipient_str, here); if (who == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + str_char(34) + recipient_str + str_char(34) + \" you mean.\", value: recipient_str }; } let here_recipient = false; if (who != $failed_match && location(who) == here) { here_recipient = true; } if (who != $failed_match && !here_recipient) { here_recipient = (here in all_locations(who)); } if (who == $failed_match || !here_recipient) { raise { code: \"E_INVARG\", message: \"I see no \" + str_char(34) + recipient_str + str_char(34) + \" here.\", value: recipient_str }; } if (who == actor) { raise { code: \"E_INVARG\", message: \"Give it to yourself?\" }; } let item_title = \"\"; try { item_title = this:title(); } except err { item_title = \"\"; } if (!item_title) { item_title = to_string(this); } let who_title = \"\"; try { who_title = who:title(); } except err { who_title = \"\"; } if (!who_title) { who_title = to_string(who); } moveto(this, who); if (location(this) != who) { raise { code: \"E_PERM\", message: who_title + \" does not want that item.\", value: who }; } tell(actor, \"You hand \" + item_title + \" to \" + who_title + \".\"); tell(who, actor.name + \" hands you \" + item_title + \".\"); return { item: this, recipient: who }; }"
         }
@@ -639,7 +639,7 @@
             "args": [
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :say(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say requires text\" }; } observe({ type: \"said\", actor: actor, text: text, ts: now() }); return true; }"
         },
@@ -653,7 +653,7 @@
               "recipient",
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobj_prefix_rest"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobj_prefix_rest"], "persistence": "live" }
           },
           "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } if (recipient != null && recipient != this && recipient != actor && !isa(recipient, $player)) { let matched = $match:match_verb(\"on_say_to\", recipient); if (typeof(matched) == \"map\") { return recipient:on_say_to(text); } } let audience = []; for listener in this.subscribers { if (recipient == actor || listener != recipient) { audience = audience + [listener]; } } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now(), _audience_override: audience }); /* Non-player command recipients returned above through :on_say_to; only players get targeted [to you] text. */ if (recipient != null && recipient != actor && isa(recipient, $player)) { tell(recipient, actor.name + \" [to you] \" + text); } return true; }"
         },
@@ -667,7 +667,7 @@
               "style",
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr", "dobj_prefix_rest"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr", "dobj_prefix_rest"], "persistence": "live" }
           },
           "source": "verb :say_as(style, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_as requires text\" }; } observe({ type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); return true; }"
         },
@@ -680,7 +680,7 @@
             "args": [
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :emote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"emote requires text\" }; } observe({ type: \"emoted\", actor: actor, text: text, ts: now() }); return true; }"
         },
@@ -693,7 +693,7 @@
             "args": [
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :pose(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"pose requires text\" }; } observe({ type: \"posed\", actor: actor, text: text, ts: now() }); return true; }"
         },
@@ -706,7 +706,7 @@
             "args": [
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :quote(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"quote requires text\" }; } observe({ type: \"quoted\", actor: actor, text: text, ts: now() }); return true; }"
         },
@@ -719,7 +719,7 @@
             "args": [
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :self(text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"self requires text\" }; } observe({ type: \"self_pointed\", actor: actor, text: text, ts: now() }); return true; }"
         },
@@ -737,7 +737,7 @@
               "recipient",
               "text"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobj_prefix_rest"] }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobj_prefix_rest"], "persistence": "live" }
           },
           "source": "verb :tell(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"tell requires text\" }; } observe({ type: \"told\", from: actor, to: recipient, text: text, ts: now() }); return true; }"
         },
@@ -793,6 +793,36 @@
           }
         },
         {
+          "name": "room_roster",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { if (isa(item, $actor)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "embodied_room_roster"
+          }
+        },
+        {
+          "name": "live_audience",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "observation?"
+            ]
+          },
+          "source": "verb :live_audience(observation) rxd { /* Fallback shape only: bundled runtimes bind the native handler, which applies observation routing and session liveness. */ let out = []; for row in this.session_subscribers { if (typeof(row) == \"map\" && has(row, \"session\")) { out = out + [row[\"session\"]]; } } return out; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "space_live_audience"
+          }
+        },
+        {
           "name": "enter",
           "perms": "rxd",
           "direct_callable": true,
@@ -802,7 +832,7 @@
             "args": [
               "actor?"
             ],
-            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
           "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old != $nowhere) { try { observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } except err { } } moveto(actor, this); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
         },
@@ -865,7 +895,7 @@
               "original"
             ]
           },
-          "source": "verb :object_command_plan(cmd, original) rxd { let target = null; if (has(cmd, \"dobj_prefix\")) { target = cmd[\"dobj_prefix\"]; } if (target == null || target == this) { return null; } let rest = null; if (has(cmd, \"dobj_prefix_rest\")) { rest = cmd[\"dobj_prefix_rest\"]; } if (!has(cmd, \"verb\")) { if (rest) { let say_matched = $match:match_verb(\"on_say_to\", target); if (typeof(say_matched) == \"map\") { return { ok: true, route: \"direct\", space: null, target: target, verb: say_matched[\"name\"], args: [rest], cmd: cmd }; } } return null; } let matched = $match:match_verb(cmd[\"verb\"], target); if (typeof(matched) != \"map\") { return null; } let route = \"direct\"; let plan_space = null; if (!matched[\"direct_callable\"]) { route = \"sequenced\"; plan_space = this; } let call_args = []; if (rest) { call_args = [rest]; } return { ok: true, route: route, space: plan_space, target: target, verb: matched[\"name\"], args: call_args, cmd: cmd }; }"
+          "source": "verb :object_command_plan(cmd, original) rxd { let target = null; if (has(cmd, \"dobj_prefix\")) { target = cmd[\"dobj_prefix\"]; } if (target == null || target == this) { return null; } let rest = null; if (has(cmd, \"dobj_prefix_rest\")) { rest = cmd[\"dobj_prefix_rest\"]; } if (!has(cmd, \"verb\")) { if (rest) { let say_matched = $match:match_verb(\"on_say_to\", target); if (typeof(say_matched) == \"map\") { return { ok: true, route: \"direct\", space: null, target: target, verb: say_matched[\"name\"], args: [rest], cmd: cmd }; } } return null; } let matched = $match:match_verb(cmd[\"verb\"], target); if (typeof(matched) != \"map\") { return null; } let route = \"direct\"; let plan_space = null; if (!matched[\"direct_callable\"]) { route = \"sequenced\"; plan_space = this; } let call_args = []; if (rest) { call_args = [rest]; } let plan = { ok: true, route: route, space: plan_space, target: target, verb: matched[\"name\"], args: call_args, cmd: cmd }; if (has(matched, \"arg_spec\")) { let spec = matched[\"arg_spec\"]; if (typeof(spec) == \"map\" && has(spec, \"command\")) { let meta = spec[\"command\"]; if (typeof(meta) == \"map\" && has(meta, \"persistence\")) { plan[\"persistence\"] = meta[\"persistence\"]; } } } return plan; }"
         },
         {
           "name": "command_plan",
@@ -931,7 +961,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["text"] },
+          "arg_spec": { "args": ["text"], "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" } },
           "source": "verb :say(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"said\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
@@ -939,7 +969,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["text"] },
+          "arg_spec": { "args": ["text"], "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" } },
           "source": "verb :emote(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"emoted\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
@@ -947,7 +977,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["style", "text"] },
+          "arg_spec": { "args": ["style", "text"], "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr", "dobj_prefix_rest"], "persistence": "live" } },
           "source": "verb :say_as(style, text) rxd { pass(style, text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"said_as\", actor: actor, style: style, text: text, ts: now() }); } return true; }"
         },
         {
@@ -955,7 +985,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["text"] },
+          "arg_spec": { "args": ["text"], "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" } },
           "source": "verb :pose(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"posed\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
@@ -963,7 +993,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["text"] },
+          "arg_spec": { "args": ["text"], "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" } },
           "source": "verb :quote(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"quoted\", actor: actor, text: text, ts: now() }); } return true; }"
         },
         {
@@ -971,7 +1001,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["text"] },
+          "arg_spec": { "args": ["text"], "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" } },
           "source": "verb :self(text) rxd { pass(text); let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { observe_to_space(parent, { type: \"self_pointed\", actor: actor, text: text, ts: now() }); } return true; }"
         }
       ]

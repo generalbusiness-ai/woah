@@ -722,7 +722,7 @@ type TurnExecRequest = {
   requested_transfer?: TransferRequest; // defined in VTN12
   max_transfer_bytes?: number;
   selected_ad?: string;
-  commit_policy?: "execute_and_commit" | "execute_only";
+  persistence?: "durable" | "live";
 };
 
 type TurnExecReply =
@@ -756,10 +756,12 @@ type TurnExecReply =
     };
 ```
 
-The default `commit_policy` is `execute_and_commit`. A successful default reply
-MUST include an accepted commit receipt. `execute_only` is reserved for local
-simulation and diagnostic deployments; clients MUST NOT treat an `execute_only`
-result as authoritative state.
+The default `persistence` is `durable`. A successful default reply
+MUST include an accepted commit receipt. `live` is for turns whose
+transcript is useful to the caller but must not advance committed state: local
+simulation, diagnostic deployments, and live-only interactions such as ephemeral
+speech/tells. Clients MUST NOT treat a `live` result as authoritative
+state, and any observations it emits remain live-only.
 
 Turn-exec replies and accepted frames MUST NOT carry a full serialized
 post-state. Current committed state is owned by the commit scope, and browser
@@ -822,7 +824,7 @@ type ExecCapabilityAd = {
 During the M4 browser migration, a relay MAY also accept
 `woo.turn.intent.request.shadow.v1` from a browser node. The intent contains
 `id`, `route`, `scope`, `target`, `verb`, `args`, and optional
-`commit_policy`, but not a `TurnKey`. It is a transitional shadow-local
+`persistence`, but not a `TurnKey`. It is a transitional shadow-local
 message: the CommitScopeDO plans the deterministic transcript against its
 authoritative scope state, derives the `TurnKey`, and then processes the turn
 through the same `TurnExecRequest`/`TurnExecReply` path. Browsers MUST treat
@@ -1122,6 +1124,11 @@ through the shared browser helper; controls still on the legacy `/ws` path do
 not produce v2 applied frames. With the explicit `v2Outbound` flag, the SPA also
 sends generic sequenced UI calls through v2 so the wire path can exercise commit
 authority before browser-local planning is complete.
+The default browser chat surface uses the same helper without the rollout flag:
+it asks the catalog `command_plan` verb to parse text, executes speech/tells as
+direct `live` turns, and executes room movement/carrying commands as
+direct `durable` turns when the catalog marks them with
+`arg_spec.command.persistence`.
 
 M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
@@ -1155,7 +1162,7 @@ Browser-node dubspace preview flow:
 
 ```text
 UI -> local audio: apply preview immediately
-UI -> worker: TurnIntent(route=direct, commit_policy=execute_only, preview_control(target, name, value))
+UI -> worker: TurnIntent(route=direct, persistence=live, preview_control(target, name, value))
 worker -> relay: v2 envelope on the browser socket
 relay -> browser: direct result envelope with gesture_progress observations
 ```
@@ -1177,15 +1184,32 @@ UI -> worker: TurnIntent(route=sequenced, enter())
 commit scope -> browser: AppliedFrame(pinboard_entered)
 UI -> worker: TurnIntent(route=sequenced, add_note/move_pin/resize_pin/set_text/...)
 commit scope -> browser: AppliedFrame(note_added/pin_moved/pin_resized/note_edited/...)
-UI -> worker: TurnIntent(route=direct, commit_policy=execute_only, viewport/list_notes)
+UI -> worker: TurnIntent(route=direct, persistence=live, viewport/list_notes)
 relay -> browser: direct result envelope or live pinboard_viewport observation
 ```
 
 Pinboard enter/leave are committed turns because the board's durable presence
 is the authorization precondition for layout and note edits. Viewport telemetry
-and projection hydration are direct execute-only calls; they MUST NOT carry
+and projection hydration are direct live-persistence calls; they MUST NOT carry
 durable writes. Pinboard embedded chat uses the catalog `command_plan` verb over
 v2 so aliases and object matching remain catalog-owned.
+
+Browser-node chat flow:
+
+```text
+UI -> worker: TurnIntent(route=direct, command_plan(text), persistence=live)
+worker -> UI: direct plan result
+UI -> worker: TurnIntent(route=direct, say/tell/..., persistence=live)
+relay -> browser: direct result and live chat observation
+
+UI -> worker: TurnIntent(route=direct, go/take/drop/give, persistence=durable)
+commit scope -> browser: AppliedFrame(room/object move)
+browser -> gateway: refresh scoped projection when the accepted result asks for a deferred look
+```
+
+The default chat catalog is intentionally ephemeral for messages. Durable,
+scrollback-style chat is a future catalog concern; it should share parser and UI
+machinery with default chat but opt into its own storage and conversation model.
 
 ## VTN15. Functional parity requirements
 

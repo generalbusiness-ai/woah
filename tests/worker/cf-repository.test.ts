@@ -510,7 +510,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         call,
         key: shadowTurnKeyFromTranscript(planned.transcript),
         expected: browser.relay.commit_scope.head,
-        commit_policy: "execute_and_commit" as const
+        persistence: "durable" as const
       };
       const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "cf-v2-message-env"));
       const ws = new FakeWebSocket();
@@ -584,6 +584,131 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(replayed[1].body).toEqual(replayed[0].body);
       const writesAfterReplay = scopeState!.storage.sql.execLog.filter((entry) => /^(INSERT|DELETE|UPDATE)\b/i.test(entry.query.trim())).length;
       expect(writesAfterReplay).toBe(writesBeforeReplay);
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+      for (const state of commitStates.values()) state.close();
+    }
+  });
+
+  it("applies committed v2 transcripts back into the Worker gateway world", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const commitStates = new Map<string, FakeDurableObjectState>();
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-session-location-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: new FakeDurableObjectNamespace((name) => {
+        let state = commitStates.get(name);
+        if (!state) {
+          state = new FakeDurableObjectState(name);
+          commitStates.set(name, state);
+        }
+        return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    const internals = gateway as unknown as {
+      webSocketV2TurnNetworkMessage: (world: WooWorld, ws: WebSocket, message: string | ArrayBuffer) => Promise<void>;
+    };
+    class FakeWebSocket {
+      readonly sent: string[] = [];
+      send(data: string): void { this.sent.push(data); }
+      close(): void {}
+      deserializeAttachment(): unknown {
+        return {
+          protocol: "v2-turn-network",
+          sessionId: session.id,
+          actor: session.actor,
+          socketId: "v2-session-location-socket",
+          node: "browser:session-location-test",
+          scope: "the_chatroom",
+          token: "guest:cf-v2-session-location"
+        };
+      }
+    }
+    let session: ReturnType<WooWorld["auth"]>;
+
+    try {
+      const world = createWorld();
+      session = world.auth("guest:cf-v2-session-location");
+
+      const relay = createShadowBrowserRelayShim({
+        node: "node:commit-scope:the_chatroom",
+        scope: "the_chatroom",
+        serialized: world.exportWorld()
+      });
+      const browser = createShadowBrowserNode({
+        node: "browser:session-location-test",
+        scope: "the_chatroom",
+        actor: session.actor,
+        session: session.id,
+        relay
+      });
+      setShadowBrowserSessionToken(browser, "guest:cf-v2-session-location");
+      await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+      const call: ShadowTurnCall = {
+        kind: "woo.turn_call.shadow.v1",
+        id: "cf-v2-session-location-move",
+        route: "direct",
+        scope: "the_chatroom",
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom",
+        verb: "southeast",
+        args: []
+      };
+      const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+      const request = {
+        kind: "woo.turn.exec.request.shadow.v1" as const,
+        id: call.id,
+        call,
+        key: shadowTurnKeyFromTranscript(planned.transcript),
+        expected: browser.relay.commit_scope.head,
+        persistence: "durable" as const
+      };
+      const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "cf-v2-session-location-env"));
+      const openRequest = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_chatroom",
+          node: "browser:session-location-test",
+          token: "guest:cf-v2-session-location",
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          session_objects: world.exportObjects([session.actor]),
+          serialized: world.exportWorld()
+        })
+      }));
+      const commitScope = env.COMMIT_SCOPE;
+      if (!commitScope) throw new Error("test env missing COMMIT_SCOPE");
+      const opened = await commitScope.get(commitScope.idFromName("the_chatroom")).fetch(openRequest);
+      expect(opened.ok).toBe(true);
+
+      const ws = new FakeWebSocket();
+      await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, encoded);
+
+      const replies = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
+      expect(replies[0]?.body).toMatchObject({ ok: true, id: "cf-v2-session-location-move" });
+      expect(world.currentLocationForSession(session.id)).toBe("the_deck");
+      expect(world.exportSessions()).toContainEqual(expect.objectContaining({
+        id: session.id,
+        actor: session.actor,
+        currentLocation: "the_deck"
+      }));
+      const rows = sqlRows<{ current_location: string }>(directoryState.storage.sql.exec("SELECT current_location FROM session_route WHERE session_id = ?", session.id));
+      expect(rows).toEqual([{ current_location: "the_deck" }]);
     } finally {
       directoryState.close();
       gatewayState.close();

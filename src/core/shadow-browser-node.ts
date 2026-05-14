@@ -264,7 +264,7 @@ export type ShadowBrowserTurnInput = {
   target: ObjRef;
   verb: string;
   args?: WooValue[];
-  commit_policy?: ShadowTurnExecRequest["commit_policy"];
+  persistence?: ShadowTurnExecRequest["persistence"];
 };
 
 export type ShadowTurnIntentRequest = {
@@ -275,7 +275,7 @@ export type ShadowTurnIntentRequest = {
   target: ObjRef;
   verb: string;
   args?: WooValue[];
-  commit_policy?: ShadowTurnExecRequest["commit_policy"];
+  persistence?: ShadowTurnExecRequest["persistence"];
 };
 
 export type ShadowBrowserTurnResult = {
@@ -616,7 +616,7 @@ export async function executeShadowBrowserTurn(
       actor: browser.actor,
       session: browser.session
     },
-    commit_policy: input.commit_policy ?? "execute_and_commit"
+    persistence: input.persistence ?? "durable"
   };
 
   const network = await executeShadowTurnCallAcrossInProcessNetwork({
@@ -850,8 +850,8 @@ export async function handleShadowBrowserTurnExecEnvelope(
   const request = intent
     ? await shadowTurnExecRequestFromIntent(browser, intent)
     : receipt.envelope.body as ShadowTurnExecRequest;
-  const reply = intent?.commit_policy === "execute_only"
-    ? await executeShadowBrowserExecuteOnlyIntent(browser, request)
+  const reply = intent?.persistence === "live"
+    ? await executeShadowBrowserLivePersistenceIntent(browser, request)
     : (await executeShadowBrowserTurnExecRequest(browser, request)).reply;
   if (!reply) return null;
   const response = shadowBrowserTurnExecReplyEnvelope(browser, receipt, request, reply);
@@ -884,10 +884,10 @@ function shadowBrowserTurnExecReplyEnvelope(
   return envelope;
 }
 
-async function executeShadowBrowserExecuteOnlyIntent(browser: ShadowBrowserNode, request: ShadowTurnExecRequest): Promise<ShadowTurnExecReply> {
+async function executeShadowBrowserLivePersistenceIntent(browser: ShadowBrowserNode, request: ShadowTurnExecRequest): Promise<ShadowTurnExecReply> {
   validateShadowBrowserNodeAuth(browser);
   // Server-assisted browser intents already have a deterministic planned
-  // transcript. Execute-only turns are live/direct surface updates, so keep a
+  // transcript. Live-persistence turns are live/direct surface updates, so keep a
   // per-session live snapshot separate from the committed scope. That lets
   // direct gestures chain (for example Dubspace enter -> local control command)
   // without making the next authority-bearing commit validate against live-only
@@ -929,7 +929,7 @@ async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, inten
     verb: intent.verb,
     args: intent.args ?? []
   };
-  const serialized = intent.commit_policy === "execute_only"
+  const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? browser.relay.commit_scope.serialized
     : browser.relay.commit_scope.serialized;
   const planned = await runShadowTurnCall(serialized, call);
@@ -939,7 +939,7 @@ async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, inten
     call,
     key: shadowTurnKeyFromTranscript(planned.transcript),
     expected: browser.relay.commit_scope.head,
-    commit_policy: intent.commit_policy ?? "execute_and_commit"
+    persistence: intent.persistence ?? "durable"
   };
 }
 

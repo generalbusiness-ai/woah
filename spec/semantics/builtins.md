@@ -246,6 +246,11 @@ is the most-recent input across them. The LambdaCore `$player:look_self`
 override uses these to surface `is sleeping` / `awake and looks alert` /
 `staring off into space for N minutes`.
 
+`presence_status(actor)` returns `"awake"`, `"idle"`, or `"sleeping"` using the
+same connection and idle policy as `is_connected` and `idle_seconds`. The idle
+threshold is a substrate constant (currently 60 seconds) so catalog roster
+implementations do not each choose their own cutoff.
+
 ### 19.8 Wizard-only
 
 `shutdown(reason)`, `dump_database()`, `load_database()`,  
