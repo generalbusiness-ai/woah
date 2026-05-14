@@ -96,6 +96,10 @@ authorized by the Dubspace-owned contents/allow-list rather than by room UI
 presence. The verb bodies still authorize writes by
 checking that the target control is contained by the dubspace and that the
 property name is in the catalog's explicit allow-list.
+Any Dubspace verb with `skip_presence_check: true` MUST gate every write in
+the verb body. For dynamic control writes that means `target in contents(this)`
+and `name in allowed`; adding a new control property requires updating that
+allow-list and the catalog authorization tests.
 
 ## Command Surface
 

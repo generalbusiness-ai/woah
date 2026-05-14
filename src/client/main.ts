@@ -178,7 +178,6 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
-const v2AppliedFramesEnabled = new URLSearchParams(location.search).has("v2AppliedFrames");
 const v2OutboundEnabled = new URLSearchParams(location.search).has("v2Outbound");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 let scopedProjectionEnabled = (() => {
@@ -379,7 +378,7 @@ function ensureV2BrowserWorker() {
     if (event.data?.kind === "applied_frame") {
       const message = event.data as V2AppliedFrameMessage;
       window.dispatchEvent(new CustomEvent("woo.v2.applied_frame", { detail: message }));
-      if (message.applied && (v2AppliedFramesEnabled || isDubspaceAppliedFrame(message.applied))) receiveAppliedFrame(message.applied);
+      if (message.applied) receiveAppliedFrame(message.applied);
       console.debug("woo.v2.applied_frame", event.data);
     }
     if (event.data?.kind === "turn_result") {
@@ -467,12 +466,6 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
   trimObservations();
   if (errorHandler) errorHandler(frame.error);
   else render();
-}
-
-function isDubspaceAppliedFrame(frame: any) {
-  const space = dubspaceSpace();
-  if (space && (frame.space === space || frame.message?.target === space)) return true;
-  return Array.isArray(frame.observations) && frame.observations.some((observation: any) => isDubspaceObservation(observation) || isDubspaceStateObservation(observation));
 }
 
 function receiveAppliedFrame(frame: any) {
@@ -2225,49 +2218,56 @@ function activeChatRoom() {
 function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (v2OutboundEnabled && sendV2TurnIntent(id, "sequenced", space, target, verb, args)) return id;
+  if (v2OutboundEnabled && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
   if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) ui.failOptimisticCall(id);
   return id;
 }
 
-function sendV2TurnIntent(
-  id: string,
-  route: "direct" | "sequenced",
-  scope: string,
-  target: string,
-  verb: string,
-  args: unknown[],
-  commitPolicy?: "execute_and_commit" | "execute_only"
-): boolean {
+type V2TurnInput = {
+  id?: string;
+  route: "direct" | "sequenced";
+  scope: string;
+  target: string;
+  verb: string;
+  args?: unknown[];
+  commitPolicy?: "execute_and_commit" | "execute_only";
+  options?: ProjectionCallOptions;
+  onResult?: (result: any) => void;
+  onError?: (error: any) => void;
+};
+
+function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "commitPolicy">): boolean {
   ensureV2BrowserWorker();
   syncV2BrowserWorkerScope();
   if (!v2BrowserWorker || !state.actor || !state.session) return false;
   v2BrowserWorker.postMessage({
     kind: "call",
-    id,
-    route,
-    scope,
-    target,
-    verb,
-    args,
-    ...(commitPolicy ? { commit_policy: commitPolicy } : {})
+    id: input.id,
+    route: input.route,
+    scope: input.scope,
+    target: input.target,
+    verb: input.verb,
+    args: input.args ?? [],
+    ...(input.commitPolicy ? { commit_policy: input.commitPolicy } : {})
   });
   return true;
 }
 
-function dubspaceV2Turn(
-  route: "direct" | "sequenced",
-  verb: string,
-  args: unknown[],
-  input: { target?: string; options?: ProjectionCallOptions; onResult?: (result: any) => void; onError?: (error: any) => void; commitPolicy?: "execute_and_commit" | "execute_only" } = {}
-): string {
-  const space = dubspaceSpace();
-  if (!space) return "";
-  const id = crypto.randomUUID();
+function v2Turn(input: V2TurnInput): string {
+  if (!input.scope) return "";
+  const id = input.id ?? crypto.randomUUID();
   ui.applyOptimisticCall(id, input.options);
   if (input.onResult) pendingDirect.set(id, input.onResult);
   if (input.onError) pendingFrameErrors.set(id, input.onError);
-  if (!sendV2TurnIntent(id, route, space, input.target ?? space, verb, args, input.commitPolicy)) {
+  if (!sendV2TurnIntent({
+    id,
+    route: input.route,
+    scope: input.scope,
+    target: input.target,
+    verb: input.verb,
+    args: input.args ?? [],
+    commitPolicy: input.commitPolicy
+  })) {
     ui.failOptimisticCall(id);
     pendingDirect.delete(id);
     pendingFrameErrors.delete(id);
@@ -2276,7 +2276,7 @@ function dubspaceV2Turn(
   return id;
 }
 
-function dubspaceV2ChatCommand(space: string, text: string, onError?: (error: any) => void): string {
+function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: any) => void): string {
   const planId = crypto.randomUUID();
   if (onError) pendingFrameErrors.set(planId, onError);
   const handlePlan = (plan: any) => {
@@ -2297,18 +2297,34 @@ function dubspaceV2ChatCommand(space: string, text: string, onError?: (error: an
     ui.applyOptimisticCall(id, undefined);
     pendingCommands.set(id, { space, text, action: { target, verb } });
     if (onError) pendingFrameErrors.set(id, onError);
-    if (!sendV2TurnIntent(id, route, space, target, verb, args, route === "direct" ? "execute_only" : "execute_and_commit")) {
+    if (!sendV2TurnIntent({
+      id,
+      route,
+      scope: space,
+      target,
+      verb,
+      args,
+      commitPolicy: route === "direct" ? "execute_only" : "execute_and_commit"
+    })) {
       ui.failOptimisticCall(id);
       pendingCommands.delete(id);
       pendingFrameErrors.delete(id);
     }
   };
-  // Dubspace chat is parsed in-world so catalog command aliases such as
+  // Catalog command text is parsed in-world so aliases such as Dubspace's
   // `bpm 146` stay catalog-owned while the browser sends only generic v2 turn
-  // intents. The first direct turn plans the command; the second turn executes
-  // the catalog-selected target/verb through the appropriate v2 plane.
+  // intents. The first direct turn plans; the second executes the
+  // catalog-selected target/verb through the appropriate v2 plane.
   pendingDirect.set(planId, handlePlan);
-  if (!sendV2TurnIntent(planId, "direct", space, space, "command_plan", [text], "execute_only")) {
+  if (!sendV2TurnIntent({
+    id: planId,
+    route: "direct",
+    scope: space,
+    target: space,
+    verb: "command_plan",
+    args: [text],
+    commitPolicy: "execute_only"
+  })) {
     pendingFrameErrors.delete(planId);
     pendingDirect.delete(planId);
     return "";
@@ -2443,7 +2459,8 @@ function sendPreviewControl(target: string, name: string, value: any) {
   const last = directThrottle.get(key) ?? 0;
   if (Date.now() - last < 35) return;
   directThrottle.set(key, Date.now());
-  dubspaceV2Turn("direct", "preview_control", [target, name, value], { commitPolicy: "execute_only" });
+  const space = dubspaceSpace();
+  v2Turn({ scope: space, route: "direct", target: space, verb: "preview_control", args: [target, name, value], commitPolicy: "execute_only" });
 }
 
 function dubspaceOptimisticProps(target: string, props: Record<string, unknown>, id = `${target}:${Object.keys(props).sort().join(",")}`): ProjectionCallOptions | undefined {
@@ -2467,7 +2484,8 @@ function patchDubspaceProjectionProps(target: string, props: Record<string, unkn
 }
 
 function callDubspaceMutation(verb: string, args: unknown[], options?: ProjectionCallOptions) {
-  const id = dubspaceV2Turn("sequenced", verb, args, { options });
+  const space = dubspaceSpace();
+  const id = v2Turn({ scope: space, route: "sequenced", target: space, verb, args, options });
   audio?.sync(effectiveDubspace(), state.clockOffset);
   if (state.tab === "dubspace") render();
   return id;
@@ -3112,7 +3130,12 @@ function bindDubspace() {
 function enterDubspace() {
   const space = dubspaceSpace();
   if (!space || !canSendDubspaceV2()) return;
-  dubspaceV2Turn("direct", "enter", [], {
+  v2Turn({
+    scope: space,
+    route: "direct",
+    target: space,
+    verb: "enter",
+    args: [],
     commitPolicy: "execute_only",
     onResult: (result) => {
       setDubspaceOperators(result);
@@ -3138,7 +3161,12 @@ function leaveDubspace(done?: () => void) {
     done?.();
     return;
   }
-  dubspaceV2Turn("direct", "leave", [], {
+  v2Turn({
+    scope: space,
+    route: "direct",
+    target: space,
+    verb: "leave",
+    args: [],
     commitPolicy: "execute_only",
     onResult: (result) => {
       setDubspaceOperators(result);
@@ -4018,7 +4046,7 @@ function sendChatInput(space: string, text: string) {
   pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
   const onError = chatErrorHandler(space);
   if ((isDubspaceScope(space) || state.tab === "dubspace") && canSendDubspaceV2()) {
-    dubspaceV2ChatCommand(space, text, onError);
+    v2PlanAndExecuteCommand(space, text, onError);
     return;
   }
   ensureSpacePresence(space, () => {

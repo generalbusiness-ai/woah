@@ -661,6 +661,39 @@ describe("local catalogs", () => {
     expect(applied.op).toBe("applied");
     expect(world.getProp("delay_1", "feedback")).toBe(0.44);
 
+    const rejectedOutsideTarget = await callInDubspace(world, session.id, "set-control-outside-target", {
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["the_lamp", "feedback", 0.99]
+    });
+    expect(rejectedOutsideTarget.op).toBe("applied");
+    if (rejectedOutsideTarget.op === "applied") {
+      expect(rejectedOutsideTarget.observations).toContainEqual(expect.objectContaining({
+        type: "$error",
+        code: "E_PERM",
+        value: { target: "the_lamp", name: "feedback" }
+      }));
+    }
+    expect(world.propOrNull("the_lamp", "feedback")).toBeNull();
+
+    const rejectedProperty = await callInDubspace(world, session.id, "set-control-disallowed-property", {
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "owner", "$wiz"]
+    });
+    expect(rejectedProperty.op).toBe("applied");
+    if (rejectedProperty.op === "applied") {
+      expect(rejectedProperty.observations).toContainEqual(expect.objectContaining({
+        type: "$error",
+        code: "E_PERM",
+        value: { target: "delay_1", name: "owner" }
+      }));
+    }
+    expect(world.object("delay_1").owner).toBe("$wiz");
+    expect(world.getProp("delay_1", "feedback")).toBe(0.44);
+
     const preview = await world.directCall("preview", actor, "the_dubspace", "preview_control", ["delay_1", "feedback", 0.5]);
     expect(preview.op).toBe("result");
     if (preview.op === "result") {

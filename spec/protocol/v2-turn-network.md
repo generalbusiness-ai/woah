@@ -1108,16 +1108,13 @@ hello/reply/pending-frame state in IndexedDB, applies received projection/delta
 state transfers into projection, applied-frame, and transcript-tail stores,
 persists executable object/state pages from closure transfers, replays pending
 envelopes after reconnect, and marks reset/catch-up-needed state when the relay
-reports reset. The browser worker bundles into the SPA on every deployment but,
-on the legacy namespace, runs silently alongside the v1 `/ws` UI: it persists
-state into IndexedDB for soak-testing the wire path without driving rendering
-unless the explicit `v2AppliedFrames` flag is present. UI migration to consume
-v2 committed state directly is deferred until at least one catalog is
-v2-authoritative on that namespace. With the explicit `v2Outbound` flag, the
-SPA sends sequenced UI calls through `woo.turn.intent.request.shadow.v1` so the
-wire path can exercise v2 commit authority before browser-local planning is
-complete; direct calls and text command parsing remain on the legacy `/ws`
-transport in this slice.
+reports reset. The browser worker bundles into the SPA on every deployment and
+the UI consumes applied frames that arrive from the v2 worker. Catalogs can move
+their own controls to v2 by submitting `woo.turn.intent.request.shadow.v1`
+through the shared browser helper; controls still on the legacy `/ws` path do
+not produce v2 applied frames. With the explicit `v2Outbound` flag, the SPA also
+sends generic sequenced UI calls through v2 so the wire path can exercise commit
+authority before browser-local planning is complete.
 
 M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
