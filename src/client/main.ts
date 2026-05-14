@@ -2305,13 +2305,11 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
       render();
       return;
     }
-    if (space === pinboardSpace() && target === space && (verb === "enter" || verb === "leave" || verb === "out")) {
-      // Pinboard presence is committed because board edits use that location as
-      // their authorization precondition.
-      route = "sequenced";
-    }
     const id = crypto.randomUUID();
     const args = Array.isArray(plan.args) ? plan.args : [];
+    const commitPolicy = plan.commit_policy === "execute_and_commit" || plan.commit_policy === "execute_only"
+      ? plan.commit_policy
+      : route === "direct" ? "execute_only" : "execute_and_commit";
     ui.applyOptimisticCall(id, undefined);
     pendingCommands.set(id, { space, text, action: { target, verb } });
     if (onError) pendingFrameErrors.set(id, onError);
@@ -2322,7 +2320,7 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
       target,
       verb,
       args,
-      commitPolicy: route === "direct" ? "execute_only" : "execute_and_commit"
+      commitPolicy
     })) {
       ui.failOptimisticCall(id);
       pendingCommands.delete(id);
@@ -3162,7 +3160,7 @@ function enterDubspace() {
     target: space,
     verb: "enter",
     args: [],
-    commitPolicy: "execute_only",
+    commitPolicy: "execute_and_commit",
     onResult: (result) => {
       setDubspaceOperators(result);
       void ensureScopedOverlayForTab("dubspace").then(() => {
@@ -3193,7 +3191,7 @@ function leaveDubspace(done?: () => void) {
     target: space,
     verb: "leave",
     args: [],
-    commitPolicy: "execute_only",
+    commitPolicy: "execute_and_commit",
     onResult: (result) => {
       setDubspaceOperators(result);
       done?.();

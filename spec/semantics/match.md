@@ -180,9 +180,16 @@ behavior.
 
 `args_from` is an ordered list drawn from: `text`, `verb`, `argstr`, `prep`, `dobj`, `dobjstr`, `dobj_prefix`, `dobj_prefix_rest`, `iobj`, `iobjstr`, and `cmd`. These become the actual verb arguments. The parsed command map is available as `cmd` only as an escape hatch.
 
+`route`, when present, is either `direct` or `sequenced`. It overrides the
+planner's default route choice for the matched command verb. Use it only when a
+catalog-level command has a durable sequencing requirement that cannot be
+derived from `direct_callable`; the client must not hardcode catalog-specific
+route exceptions.
+
 Command metadata is per verb definition. Aliases share the same command pattern; a different pattern requires a separate verb.
 Source-install authoring APIs MAY attach the same metadata out-of-band as
-`argSpec.command` while the source language lacks first-class `args_from`
+`argSpec.command` while the source language lacks first-class `args_from` and
+`route`
 syntax. The stored verb definition is still the source of truth after install.
 
 `$match:plan_command(text, space)` uses this normative target order: direct object, indirect object, command space, actor. Within each target it uses the existing runtime verb lookup rule, including parent chains and features.

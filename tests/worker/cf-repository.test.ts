@@ -924,7 +924,7 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const pinboardPlan = await post("/api/objects/the_deck/calls/command_plan", { args: ["enter pinboard"] }, session);
       expect(pinboardPlan.status).toBe(200);
-      expect(pinboardPlan.body.result).toMatchObject({ ok: true, route: "direct", target: "the_pinboard", verb: "enter", args: [] });
+      expect(pinboardPlan.body.result).toMatchObject({ ok: true, route: "sequenced", space: "the_pinboard", target: "the_pinboard", verb: "enter", args: [] });
     } finally {
       logSpy.mockRestore();
       directoryState.close();

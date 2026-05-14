@@ -98,6 +98,7 @@ type CommandPlan = {
   verb: string;
   args: WooValue[];
   cmd: CommandMap;
+  commit_policy?: "execute_and_commit" | "execute_only";
 };
 
 const PASSWORD_PBKDF2_ITERATIONS = 600_000;
@@ -9569,13 +9570,32 @@ export class WooWorld {
   private async commandPlanForResolved(ctx: CallContext, commandSpace: ObjRef, target: ObjRef, verbName: string, args: WooValue[], cmd: CommandMap): Promise<CommandPlan> {
     const resolved = await this.tryResolveVerbForCommand(ctx, target, verbName);
     const directCallable = resolved?.direct_callable === true;
-    let route: "direct" | "sequenced" = directCallable ? "direct" : "sequenced";
+    const routeHint = commandRouteHint(resolved?.arg_spec);
+    let route: "direct" | "sequenced" = routeHint ?? (directCallable ? "direct" : "sequenced");
     let space: ObjRef | null = null;
     if (route === "sequenced") {
       space = await this.isDescendantOfChecked(target, "$space", ctx.hostMemo) ? target : commandSpace;
       if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
     }
-    return { ok: true, route, space, target, verb: resolved?.name ?? verbName, args, cmd };
+    const verb = resolved?.name ?? verbName;
+    const commitPolicy = route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
+      ? "execute_and_commit" as const
+      : undefined;
+    return {
+      ok: true,
+      route,
+      space,
+      target,
+      verb,
+      args,
+      cmd,
+      ...(commitPolicy ? { commit_policy: commitPolicy } : {})
+    };
+  }
+
+  private async commandPlanRequiresDurablePresence(ctx: CallContext, target: ObjRef, verbName: string): Promise<boolean> {
+    if (verbName !== "enter" && verbName !== "leave" && verbName !== "out") return false;
+    return await this.isDescendantOfChecked(target, "$space", ctx.hostMemo);
   }
 
   private async commandHuhPlan(ctx: CallContext, space: ObjRef, text: string, reason: string): Promise<WooValue> {
@@ -10187,8 +10207,18 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     target: map.target,
     verb: map.verb,
     args: Array.isArray(map.args) ? map.args : [],
-    cmd: commandMapFromValue(map.cmd)
+    cmd: commandMapFromValue(map.cmd),
+    ...(map.commit_policy === "execute_and_commit" || map.commit_policy === "execute_only" ? { commit_policy: map.commit_policy } : {})
   };
+}
+
+function commandRouteHint(argSpec: Record<string, WooValue> | undefined): "direct" | "sequenced" | null {
+  // Catalogs own command routing hints; the client should not learn that a
+  // particular bundled surface needs a sequenced plan.
+  const command = argSpec?.command;
+  if (!command || typeof command !== "object" || Array.isArray(command)) return null;
+  const route = (command as Record<string, WooValue>).route;
+  return route === "direct" || route === "sequenced" ? route : null;
 }
 
 function addUnique<T>(items: T[], item: T): T[] {

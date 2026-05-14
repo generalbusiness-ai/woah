@@ -60,6 +60,7 @@ describe("shadow browser node shim", () => {
   it("does not let execute-only live turns dirty the next committed dubspace turn", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:browser-dubspace-live-before-commit");
+    anchor.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "browser-relay",
       scope: "the_dubspace",

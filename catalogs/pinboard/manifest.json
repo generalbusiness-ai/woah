@@ -193,7 +193,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced" }
           },
           "source": "verb :enter() rxd { let old = location(actor); moveto(actor, this); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: this, present: this.subscribers, present_actors: this.subscribers }; }"
         },
@@ -217,7 +217,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced" }
           },
           "source": "verb :out() rxd { return this:leave(); }"
         },
