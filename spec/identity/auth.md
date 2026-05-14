@@ -43,11 +43,16 @@ This separation lets credential management live alongside the runtime (where it 
 
 Extending [identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline):
 
-- **`bearer:<jwt>`** — a signed JWT issued by a known issuer (the world's auth service or a delegated IdP). Required claims: `iss`, `sub`, `exp`, `aud`, `actor` (objref), `scope`. The runtime verifies signature against a published JWK set and rejects tokens with unknown `iss`, expired `exp`, wrong `aud`, or invalid signature.
+- **`bearer:<token>`** — a bearer issued by the world's auth service or a delegated IdP. A Cloudflare production issuer may use a signed JWT with claims `iss`, `sub`, `exp`, `aud`, `actor` (objref), and `scope`, verified against a published JWK set. The local v1 issuer may instead use an opaque unguessable handle stored in `$system.bearer_tokens`; it must still carry the same effective actor, scope, and expiry semantics and reject expired, revoked, wrong-audience, or unknown tokens.
 
 - **`oauth_code:<provider>:<code>`** — a single-use OAuth/OIDC authorization code from a known external provider. The runtime exchanges with the provider's token endpoint, validates the resulting id_token, looks up the bound account by `(iss, sub)`, creates a session.
 
-- **Password authentication is *not* a wire token.** Passwords never cross the WebSocket wire. A world that hosts its own credential store exposes a separate HTTPS endpoint (e.g., `POST /auth/password`) that accepts `{username, password}` over TLS, validates with argon2id (per-account salt + pepper, rate-limited per username), and returns a `bearer:<jwt>` plus a refresh token. The client then connects with `auth { token: "bearer:<jwt>" }` over the WebSocket. This keeps password material out of the wire-level protocol and the observability log/trace payloads.
+- **Password authentication is *not* a wire token.** Passwords never cross the WebSocket wire. A world that hosts its own credential store exposes a separate HTTPS endpoint (e.g., `POST /api/auth/password`) that accepts `{email, password}` over TLS, validates against the account's stored verifier, and returns a `bearer:<token>` plus a session. The client then connects with `auth { token: "bearer:<token>" }` over the WebSocket. This keeps password material out of the wire-level protocol and the observability log/trace payloads.
+
+  Local v1 password verifiers use PBKDF2-HMAC-SHA-256 via WebCrypto with
+  at least 600,000 iterations and a per-account random salt, encoded as
+  `pbkdf2-sha256:<iterations>:<salt_hex>:<digest_hex>`. Raw salted SHA-256
+  is forbidden for password storage.
 
 - **`session:<session_id>`** — unchanged from identity.md. A live-session resume token.
 
@@ -63,15 +68,15 @@ The token format is server policy; clients receive their next-presentable token 
 
 ```
 1. Client authenticates via the credentialed exchange (password POST or OAuth code).
-2. Server issues a JWT (bearer) and a session.
+2. Server issues a bearer and a session.
 3. Client persists the bearer (and refresh token) per its threat model.
-4. On WebSocket connect, client sends `auth { token: "bearer:<jwt>" }`.
-5. Server validates: signature, claims, expiry. If valid, binds session to actor.
+4. On WebSocket connect, client sends `auth { token: "bearer:<token>" }`.
+5. Server validates signature/claims for JWT-shaped tokens or the opaque-handle record for local tokens, then checks expiry and actor/account lifecycle. If valid, it binds the session to the actor.
 ```
 
 **Client-side persistence is a threat-model decision, not a normative recommendation.** Browsers offer no fully-secure option for storing bearers in-process: `localStorage` is XSS-exfiltratable; HTTP-only cookies are XSS-resistant but require CSRF mitigations and don't compose cleanly with WebSocket auth flows; in-memory only is XSS-safe but loses on refresh. Worlds choose based on their actor population (web, native, agent) and their tolerance for re-authentication. Tokens crossing the wire (via `auth { token }`) are subject to the observability redaction rules ([observability.md §O8](../operations/observability.md#o8-privacy--pii)) — bearer values must not appear verbatim in logs, traces, or audit records.
 
-**Bearer lifetime.** Default 1 hour. A separate **refresh token** (JWT with `purpose: refresh`, longer lifetime — default 30 days) can mint new bearers without re-credentialing via `op: "refresh", token: "refresh:<jwt>"`. This frame is part of the credentialed wire.
+**Bearer lifetime.** Default 1 hour. A separate **refresh token** (JWT or opaque handle with `purpose: refresh`, longer lifetime — default 30 days) can mint new bearers without re-credentialing via `op: "refresh", token: "refresh:<token>"`. Refresh is deferred from the local v1 onboarding surface but remains part of the credentialed-token design.
 
 **Per-claim scopes.** A bearer's `scope` claim lists what the actor may do. v1 scopes: `read`, `write`, `admin`. Worlds may add their own. Scope is **advisory in v1**; the runtime trusts the actor's `progr` discipline as the enforcement primitive. Future versions may pre-filter calls by scope.
 
@@ -120,16 +125,31 @@ Recovery flows are the auth service's responsibility; verbs see the result as `o
 
 ---
 
-## A8. Service / agent accounts
+## A8. Agent / service-owned credentials
 
-Long-lived programmatic credentials for non-interactive actors:
+Long-lived programmatic credentials for non-interactive actors. See
+[provisioning.md AP4](provisioning.md#ap4-class-model-normative) for
+the class shape and ownership model — this section covers the wire
+contract.
 
-- **`apikey:<id>:<secret>`** — equivalent to a refresh token but indefinite. Tied to one `$account`, typically one actor.
+- **`apikey:<id>:<secret>`** — equivalent to a refresh token but
+  indefinite. Bound to exactly one actor. For human-owned `$agent`s
+  the actor's `owner` resolves to a `$human` and that human's
+  `$account` carries the deactivation lifecycle (suspending the
+  account invalidates the key, per
+  [provisioning.md AP4.3](provisioning.md#ap43-lifecycle-and-deactivation)).
+  For `$wiz`-owned infra agents (bundled plugs, deployment-bound
+  identities) there is no `$account`; the key is bound to the agent
+  directly and its lifecycle follows the deployment.
 - API keys are scoped (`read-only`, `bot:<purpose>`, etc.).
 - Revocable independently of bearer tokens.
 - May have IP / origin restrictions.
 
-A service account's bound actor is typically a `$bot` (descended from `$player`) with no human-attached UI. The actor's verbs run as the bot.
+The agent's verbs run under the agent's own `progr`. Capability gates
+follow [provisioning.md AP4](provisioning.md#ap4-class-model-normative)'s
+kind-vs-capability split: class via `$agent`, authoring privilege via
+the `programmer` flag (subject to its own quota — see
+[provisioning.md AP6](provisioning.md#ap6-self-service-agent-provisioning-in-world)).
 
 Audit: API key issuance is logged; usage is logged at session-start (not per-call, to keep the volume bounded).
 

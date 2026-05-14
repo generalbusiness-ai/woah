@@ -14,6 +14,11 @@ WOO_INITIAL_WIZARD_TOKEN=local-dev-wizard-token
 # `wrangler secret put WOO_INTERNAL_SECRET`.
 WOO_INTERNAL_SECRET=local-dev-internal-secret
 
+# Cloudflare Turnstile siteverify secret for self-service signup in Worker
+# mode. Local Node protocol tests can omit it; Worker signup fails closed until
+# this is configured.
+# TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+
 # Local SQLite database path. Created on first run.
 WOO_DB=.woo/dev.sqlite
 

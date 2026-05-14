@@ -24,6 +24,7 @@ function isApiPath(pathname: string): boolean {
     pathname === "/v2/turn-network/ws" ||
     pathname === "/v2/session/mint" ||
     pathname === "/mcp" ||
+    pathname === "/connect" ||
     pathname.startsWith("/api/")
   );
 }

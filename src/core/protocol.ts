@@ -34,6 +34,7 @@ export type RestProtocolHost = {
   world: WooWorld;
   requireSession(request: RestProtocolRequest): Session;
   authenticateToken(token: string): Session | Promise<Session>;
+  verifyTurnstile?(token: string, request: RestProtocolRequest): boolean | Promise<boolean>;
   onAuthenticated?(session: Session): void | Promise<void>;
   onSessionEnded?(session: Session): void | Promise<void>;
   onSessionsEnded?(sessions: Session[]): void | Promise<void>;
@@ -61,8 +62,8 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
     if (request.method === "POST" && request.pathname === "/api/auth") {
       const body = await request.readJson();
       const token = String(body.token ?? "");
-      if (!token.startsWith("guest:") && !token.startsWith("session:") && !token.startsWith("wizard:") && !token.startsWith("apikey:")) {
-        throw wooError("E_INVARG", "REST accepts guest:, session:, wizard:, and apikey: tokens");
+      if (!token.startsWith("guest:") && !token.startsWith("session:") && !token.startsWith("wizard:") && !token.startsWith("apikey:") && !token.startsWith("bearer:")) {
+        throw wooError("E_INVARG", "REST accepts guest:, session:, wizard:, bearer:, and apikey: tokens");
       }
       const session = await host.authenticateToken(token);
       await host.onAuthenticated?.(session);
@@ -73,6 +74,48 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
         token_class: session.tokenClass,
         ...(session.apikeyId !== undefined ? { apikey_id: session.apikeyId } : {})
       });
+    }
+
+    if (request.method === "POST" && request.pathname === "/api/signup") {
+      const body = await request.readJson();
+      const turnstileToken = String(body.turnstile_token ?? "");
+      if (!turnstileToken) throw wooError("E_PERM", "turnstile token is required");
+      if (host.verifyTurnstile && !await host.verifyTurnstile(turnstileToken, request)) throw wooError("E_PERM", "turnstile verification failed");
+      const result = await world.beginSignup(String(body.email ?? ""), String(body.password ?? ""), {
+        inviteCode: typeof body.invite_code === "string" ? body.invite_code : null
+      });
+      return jsonProtocol(result, 201);
+    }
+
+    if (request.method === "POST" && request.pathname === "/api/signup/verify") {
+      const session = optionalSession(host, request);
+      const body = await request.readJson();
+      const result = world.verifySignup(String(body.token ?? ""), session?.id ?? null);
+      await host.onAuthenticated?.(result.session);
+      return jsonProtocol(authProjection(result));
+    }
+
+    if (request.method === "POST" && request.pathname === "/api/auth/password") {
+      const body = await request.readJson();
+      const result = await world.authenticatePassword(String(body.email ?? ""), String(body.password ?? ""));
+      await host.onAuthenticated?.(result.session);
+      return jsonProtocol(authProjection(result));
+    }
+
+    if (request.method === "POST" && request.pathname === "/api/connect") {
+      const session = host.requireSession(request);
+      const body = await request.readJson();
+      const result = world.connectHermes(session.actor, String(body.return ?? ""), String(body.state ?? ""), String(body.profile_id ?? ""), {
+        force: body.force === true
+      });
+      return jsonProtocol(result);
+    }
+
+    if (request.method === "GET" && request.pathname === "/connect") {
+      const session = optionalSession(host, request);
+      if (!session) return jsonProtocol({ ok: false, login_required: true }, 302, { Location: `/signup?return=${encodeURIComponent(connectReturnPath(request))}` });
+      const result = world.connectHermes(session.actor, request.query("return") ?? "", request.query("state") ?? "", request.query("profile_id") ?? "");
+      return jsonProtocol(result, 302, { Location: result.redirect_url });
     }
 
     if (request.method === "GET" && request.pathname === "/api/state") {
@@ -254,6 +297,36 @@ export function objectRoute(pathname: string): { id: string; rest: string[] } | 
   return {
     id: decodeURIComponent(parts[2]),
     rest: parts.slice(3).map((part) => decodeURIComponent(part))
+  };
+}
+
+function optionalSession(host: RestProtocolHost, request: RestProtocolRequest): Session | null {
+  try {
+    return host.requireSession(request);
+  } catch {
+    return null;
+  }
+}
+
+function connectReturnPath(request: RestProtocolRequest): string {
+  const params = new URLSearchParams();
+  for (const name of ["return", "state", "profile_id"]) {
+    const value = request.query(name);
+    if (value !== null) params.set(name, value);
+  }
+  const query = params.toString();
+  return query ? `/connect?${query}` : "/connect";
+}
+
+function authProjection(result: { account: ObjRef; actor: ObjRef; bearer: string; session: Session; promoted_guest?: boolean }): Record<string, WooValue> {
+  return {
+    account: result.account,
+    actor: result.actor,
+    bearer: result.bearer,
+    session: result.session.id,
+    expires_at: result.session.expiresAt,
+    token_class: result.session.tokenClass,
+    ...(result.promoted_guest !== undefined ? { promoted_guest: result.promoted_guest } : {})
   };
 }
 

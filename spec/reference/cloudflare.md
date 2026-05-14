@@ -711,14 +711,15 @@ That is the entire required surface. Optional bindings (Workers Analytics Engine
 
 ### R14.2 Required configuration
 
-Two secrets must be set before first deploy. They are single-string values and go through `wrangler secret put` (never the `[vars]` block in `wrangler.toml`).
+Two secrets must be set before first deploy. A third secret is required before enabling self-service signup. They are single-string values and go through `wrangler secret put` (never the `[vars]` block in `wrangler.toml`).
 
 | Secret | Purpose |
 |---|---|
 | `WOO_INITIAL_WIZARD_TOKEN` | One-time token presented at first auth to claim the `$wiz` binding. Consumed on use; subsequent auths cannot present the same value. See §R14.4. |
 | `WOO_INTERNAL_SECRET` | HMAC key for gateway/Directory/cluster-host internal requests. Unsigned or tampered internal requests are rejected before forwarded session, actor, or `progr` fields are trusted. |
+| `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile siteverify secret for `/api/signup`. Required only for self-service signup; requests fail closed when unset. |
 
-The Worker checks these at startup. A missing required secret is a `503` with a clear remediation message — see §R14.7.
+The Worker checks bootstrap/internal secrets at startup. A missing signup secret is reported on `/api/signup` with `E_PERM` — see §R14.7.
 
 For local development, the value lives in `.dev.vars` (gitignored) with a sane default. A `.dev.vars.example` file in the repo root shows the shape; operators copy it to `.dev.vars` and edit.
 

@@ -65,6 +65,7 @@ export interface Env {
   ASSETS?: Fetcher;
   WOO_INITIAL_WIZARD_TOKEN?: string;
   WOO_INTERNAL_SECRET?: string;
+  TURNSTILE_SECRET_KEY?: string;
   WOO_AUTO_INSTALL_CATALOGS?: string;
   WOO_HOST_READ_TIMEOUT_MS?: string;
   WOO_HOST_WRITE_TIMEOUT_MS?: string;
@@ -385,6 +386,7 @@ export class PersistentObjectDO {
         world,
         authenticateToken: (token) => this.authenticateToken(world, token),
         requireSession: () => this.requireRestSession(world, request),
+        verifyTurnstile: (token, protocolRequest) => this.verifyTurnstile(token, protocolRequest),
         onAuthenticated: (session) => this.registerSessionRoute(session),
         onSessionEnded: (session) => this.unregisterSessionRoute(session.id),
         onSessionsEnded: async (sessions) => {
@@ -639,7 +641,7 @@ export class PersistentObjectDO {
     }
   }
 
-  private getMcpGateway(world: WooWorld): McpGateway {
+    private getMcpGateway(world: WooWorld): McpGateway {
     if (!this.mcpGateway) {
       const initStart = Date.now();
       this.mcpGateway = new McpGateway(world, {
@@ -659,9 +661,26 @@ export class PersistentObjectDO {
       world.recordMetric({ kind: "init", phase: "mcp_gateway", ms: Date.now() - initStart });
     }
     return this.mcpGateway;
-  }
+    }
 
-  private async getWorld(hostKey = this.durableHostKey()): Promise<WooWorld> {
+    private async verifyTurnstile(token: string, request: RestProtocolRequest): Promise<boolean> {
+      const secret = this.env.TURNSTILE_SECRET_KEY;
+      if (!secret) throw wooError("E_PERM", "TURNSTILE_SECRET_KEY is required for signup");
+      const body = new FormData();
+      body.set("secret", secret);
+      body.set("response", token);
+      const remoteIp = request.header("cf-connecting-ip") ?? request.header("x-forwarded-for")?.split(",")[0]?.trim();
+      if (remoteIp) body.set("remoteip", remoteIp);
+      const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+        method: "POST",
+        body
+      });
+      if (!response.ok) return false;
+      const parsed = await response.json().catch(() => null);
+      return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { success?: unknown }).success === true);
+    }
+
+    private async getWorld(hostKey = this.durableHostKey()): Promise<WooWorld> {
     if (this.world) {
       if (hostKey === WORLD_HOST) await this.registerObjectRoutes(this.world);
       return this.world;
@@ -2699,16 +2718,18 @@ export class PersistentObjectDO {
 
   private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {
     if (fanout.length === 0) return;
-    const byNode = new Map(fanout.map((item) => [item.node, item.envelope]));
+    const byNode = v2FanoutEnvelopesByNode(fanout);
     for (const ws of this.state.getWebSockets()) {
       const att = this.attachment(ws);
-      const envelope = att?.node ? byNode.get(att.node) : undefined;
-      if (!envelope) continue;
-      try {
-        ws.send(envelope);
-      } catch {
-        // Socket cleanup is driven by webSocketClose/webSocketError; fan-out
-        // should not fail the originator's already-accepted commit.
+      const envelopes = att?.node ? byNode.get(att.node) : undefined;
+      if (!envelopes) continue;
+      for (const envelope of envelopes) {
+        try {
+          ws.send(envelope);
+        } catch {
+          // Socket cleanup is driven by webSocketClose/webSocketError; fan-out
+          // should not fail the originator's already-accepted commit.
+        }
       }
     }
   }
@@ -3326,6 +3347,16 @@ function logCatalogTapEvent(event: CatalogTapLogEvent): void {
 function metricErrorCode(err: unknown): string {
   if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
   return err instanceof Error ? err.name : "E_INTERNAL";
+}
+
+export function v2FanoutEnvelopesByNode(fanout: Array<{ node: string; envelope: string }>): Map<string, string[]> {
+  const byNode = new Map<string, string[]>();
+  for (const item of fanout) {
+    const envelopes = byNode.get(item.node);
+    if (envelopes) envelopes.push(item.envelope);
+    else byNode.set(item.node, [item.envelope]);
+  }
+  return byNode;
 }
 
 // Stable digest over a set of object routes. Used by registerObjectRoutes

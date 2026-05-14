@@ -1,6 +1,6 @@
 # Designing objects
 
-This section covers what you need to make new things in a Port world:
+This section covers what you need to make new things in a woah world:
 spawning a new object, giving it properties, writing verbs, packaging
 the whole thing into a catalog so others can install it, and the
 programmer surfaces (eval, the editor room) you'll use along the way.

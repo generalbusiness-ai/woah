@@ -17,7 +17,7 @@ This is the contract the implementation must produce on first start; without it,
 
 1. **Directory** is created first. Holds corename → ULID map and world metadata. Empty at boot until populated.
 2. **`$system` (`#0`)** is created with the reserved ULID `00000000000000000000000000`. `parent = null`.
-3. **Remaining universal seed objects** are created in dependency order: `$root` → `$actor` → `$player` → `$wiz` / `$guest`, `$sequenced_log` → `$space`, `$thing` → `$catalog`, plus `$catalog_registry` and `$nowhere`. Corenames registered in Directory.
+3. **Remaining universal seed objects** are created in dependency order: `$root` → `$actor` → `$player` → `$wiz` / `$guest` / `$human` / `$agent`, `$account`, `$sequenced_log` → `$space`, `$thing` → `$catalog`, plus `$catalog_registry` and `$nowhere`. Corenames registered in Directory.
 4. **Configured local catalogs** are installed in dependency order. The bundled set is split between foundational class libraries (`@local:help`, `@local:chat`, `@local:note`, `@local:prog`), the demo seed catalog (`@local:demoworld`), and demo applications (`@local:dubspace`, `@local:pinboard`, `@local:taskspace`); see [catalogs.md §CT15](../discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo) for roles. The normative source is the catalog manifests; bootstrap no longer hard-seeds demo classes and instances directly.
 5. **Catalog scaffold and demo instances** are created by the configured local catalogs. The Living Room / Deck / Hot Tub set, `the_cockatoo`, exits, and props come from `@local:demoworld`. `the_dubspace` is seeded by `@local:dubspace` mounted in `demoworld:the_chatroom`; `the_pinboard` by `@local:pinboard` in `demoworld:the_deck`; `the_taskspace` by `@local:taskspace`. `:add_feature` calls attach `$conversational` to ordinary rooms and `$transparent` (from `chat`) to embedded demo spaces, running as wizard at boot and satisfying both attach-policy gates.
 6. **Guest player pool** is pre-seeded so first connections don't need to mint identities.
@@ -41,12 +41,15 @@ the target for runtime-created objects, but it is not active in v1.
 
 | Corename | Kind | Parent | Owner | Flags | Own state / definitions | Own verbs | Purpose |
 |---|---|---|---|---|---|---|---|
-| `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]` | `:return_guest(guest)` | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
+| `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]`; credential/provisioning ledgers | `:return_guest(guest)` plus auth/provisioning primitives | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
 | `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement`, `help` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
 | `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:huh(text,reason?,source?)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
 | `$player` | class | `$actor` | `$wiz` | — | Defines `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)`, `:who_all(names?)`, `:join_player(name)`, `:ways(room?)`, `:examine_detailed(name)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
 | `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc()` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
+| `$account` | class | `$root` | `$wiz` | — | Defines credential, actor-binding, quota, and lifecycle properties | Inherits root verbs | Credential record class. Accounts are not actors; `$human.account` points at one account, and agent quotas live there. |
+| `$human` | class | `$player` | `$wiz` | — | Defines `account` | Agent self-service verbs | Credentialed human actor class. Humans authenticate through their account and can provision owned `$agent` actors. |
+| `$agent` | class | `$player` | `$wiz` | — | Defines API-key, profile, purpose, scope, and lifecycle properties | Inherits player/actor/root verbs | Programmatic actor class for API-key-authenticated tools and service identities. |
 | `$sequenced_log` | class | `$root` | `$wiz` | — | Inherits descriptive slots | Host operations `append(message)`, `read(from,limit)` | Append-only sequenced log base class. `$space` and registry-like coordination objects inherit its sequence/replay shape. |
 | `$space` | class | `$sequenced_log` | `$wiz` | — | Defines `next_seq`, `session_subscribers`, `subscribers`, `last_snapshot_seq`, `features`, `features_version`, `auto_presence` | `:replay(from_seq,limit)`, `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)` | Coordination base class: one local sequence, applied-frame history, present sessions/subscribers, and feature-extended direct verbs. Room composition is catalog-level behavior, not part of `$space`. |
 | `$thing` | class | `$root` | `$wiz` | fertile | Inherits descriptive slots | `:can_be_attached_by(actor)`, `:moveto(target)` | Simple non-actor base for addressable stateful objects. Fertile so programmer actors can create ordinary owned objects. |
@@ -57,9 +60,10 @@ the target for runtime-created objects, but it is not active in v1.
 ### B2.1 Common descriptive property definitions
 
 The `name`, `description`, and `aliases` property definitions are installed on
-`$root`, `$actor`, `$player`, `$sequenced_log`, `$space`, `$thing`, `$catalog`,
-and `$catalog_registry` so these core classes each carry their own descriptive
-slot definitions. `host_placement` is defined on `$root` and inherited by
+`$root`, `$actor`, `$player`, `$account`, `$human`, `$agent`,
+`$sequenced_log`, `$space`, `$thing`, `$catalog`, and `$catalog_registry` so
+these core classes each carry their own descriptive slot definitions.
+`host_placement` is defined on `$root` and inherited by
 ordinary descendants. `$system` has its own local `description` value because it
 has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 `$thing`.
@@ -82,6 +86,16 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `applied_migrations` | list<str> | `[]` | Idempotency ledger for deployment-local boot migrations, including local catalog repair migrations. See [catalogs.md §CT5.4.1](../discovery/catalogs.md#ct541-local-boot-migrations). |
 | `catalog_migration_records` | list<map> | `[]` | Trace ledger for content-addressed catalog schema/data plans. Records plan id, catalog, manifest hash, scope, host, steps, status, and postcondition issues. |
 | `help_dbs` | list<obj> | `[]` | Global in-world help database list. The bundled help catalog appends `$help` here with a generic `set_property` catalog hook; future catalogs can append additional DBs without runtime object-name knowledge. |
+| `api_keys` | map | `{}` | API-key records keyed by key id. Cleartext secrets are returned only once; stored records carry hashes and actor bindings. |
+| `bearer_tokens` | map | `{}` | Short-lived credentialed session tokens issued by signup verification and password auth. |
+| `pending_email_verifications` | list<map> | `[]` | Single-use signup verification records with token hashes, account ids, and expiry timestamps. Expired entries are swept by `$system:gc_pending_credentials()`. |
+| `signup_invites` | list<map> | `[]` | Optional invite-gate codes issued by wizards and consumed by signup. Expired unused invites and old used invites are swept by `$system:gc_pending_credentials()`. |
+| `signup_invite_required` | bool | false | When true, signup requires an unused invite code. |
+| `allowed_provision_return_schemes` | list<str> | `["hermes://"]` | Exact scheme prefixes allowed for `/connect` credential return redirects. |
+| `provision_state_nonces` | list<map> | `[]` | Single-use `/connect` state nonces used for Hermes-style onboarding replay protection. Expired entries are swept by `$system:gc_pending_credentials()`. |
+| `mcp_endpoint_url` | str | `"/mcp"` | MCP endpoint URL advertised in agent provisioning and `/connect` responses. |
+| `default_agent_quota` | int | 5 | Initial per-account quota for self-service human-owned agents. |
+| `default_programmer_grant_quota` | int | 0 | Initial per-account quota for human-owned agents carrying `programmer=true`. |
 
 ### B2.3 `$root` verbs
 
@@ -145,7 +159,68 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 
 `$guest:on_disfunc()` overrides the default to reset state per [identity.md §I6.4](identity.md#i64-guest-reset-the-on_disfunc-convention): eject inventory to each item's `home` (or the disconnect room, then the guest home), move the guest to `home` (or `$nowhere`), clear `description`/`aliases`/`features`, and return to the free pool via `$system:return_guest(this)`.
 
-### B2.9 `$sequenced_log` host operations
+### B2.9 `$account` properties
+
+| Property | Type | Default | Notes |
+|---|---|---|---|
+| `email` | str | `""` | Normalized account email. |
+| `email_verified_at` | str \| null | null | Set when signup verification succeeds. |
+| `password_hash` | str | `""` | Stored PBKDF2 verifier (`pbkdf2-sha256:<iterations>:<salt_hex>:<digest_hex>`). Cleartext passwords never enter object state. Stripped from delivered host seeds. |
+| `password_salt` | str | `""` | Per-account salt used by the local password verifier. Stripped from delivered host seeds. |
+| `oauth_identities` | list<map> | `[]` | Reserved for OAuth/OIDC account bindings. Stripped from delivered host seeds. |
+| `actors` | list<obj> | `[]` | Bound `$player` descendants for this account. |
+| `primary_actor` | obj \| null | null | Default `$human` actor for password and bearer auth. |
+| `agent_quota` | int | 5 | Maximum active human-owned agents for this account. |
+| `programmer_grant_quota` | int | 0 | Maximum active human-owned agents that may carry `programmer=true`. |
+| `agent_count` | int | 0 | Denormalized active human-owned agent count. |
+| `programmer_agent_count` | int | 0 | Denormalized active programmer-agent count. |
+| `signup_method` | str | `""` | `turnstile_email`, `invite`, `oauth`, `wizard`, or another deployment-defined method. |
+| `created_at` | str | `""` | Creation timestamp. |
+| `deactivated_at` | str \| null | null | Suspended accounts reject new auth while preserving actors for audit. |
+| `recycle_on_delete` | bool | false | Whether hard account deletion should recycle bound actors. |
+
+### B2.10 `$human` properties and verbs
+
+| Property | Type | Default | Notes |
+|---|---|---|---|
+| `account` | obj \| null | null | Owning `$account` credential record. |
+
+| Verb | Args | Purpose |
+|---|---|---|
+| `:create_agent(name, purpose?, programmer?)` rxd | str, str?, bool? | Mint an owned `$agent`, quota-checking the bound account, and return the one-time API key. |
+| `:list_agents()` rxd | — | List active agents owned by this human. |
+| `:revoke_agent(actor_id, reason?)` rxd | obj, str? | Deactivate an owned agent and revoke its API key. |
+| `:promote_agent_to_programmer(actor_id)` rxd | obj | Set `programmer=true` on an owned agent, subject to account quota. |
+| `:demote_agent_from_programmer(actor_id)` rxd | obj | Clear `programmer` on an owned agent and free the quota slot. |
+| `:rotate_agent_key(actor_id, force?)` rxd | obj, bool? | Rotate an owned agent's API key and return the new key once. |
+
+### B2.11 `$agent` properties
+
+| Property | Type | Default | Notes |
+|---|---|---|---|
+| `api_key_id` | str | `""` | Current API-key id, if any. |
+| `created_via` | str | `""` | `in_world`, `hermes_provision`, `wizard`, or `infra`. |
+| `profile_id` | str | `""` | Stable Hermes profile id for reconnect lookup. |
+| `last_seen_at` | str \| null | null | Updated on successful API-key auth. |
+| `purpose` | str | `""` | Human-readable owner-provided label. |
+| `scope` | str | `"write"` | API-key scope hint. |
+| `deactivated_at` | str \| null | null | Deactivated agents reject new auth while remaining audit-visible. |
+
+### B2.12 `$system` provisioning verbs
+
+| Verb | Args | Purpose |
+|---|---|---|
+| `:provision_actor(class, owner, attrs?)` | obj, obj, map? | Create a `$human` or `$agent` actor under wizard authority and audit the creation. |
+| `:rotate_api_key(actor)` | obj | Mint a replacement API key for an agent, revoking the previous key record. |
+| `:deactivate_actor(actor, reason?)` | obj, str? | Soft-deactivate an actor/account path and reap live sessions where applicable. |
+| `:reactivate_actor(actor)` | obj | Clear deactivation state. |
+| `:recycle_actor(actor)` | obj | Hard-recycle an actor for incident response. |
+| `:issue_signup_invite(quantity, expires_at?)` | int, str? | Mint signup invite codes. |
+| `:gc_pending_credentials()` | — | Sweep expired bearer tokens, verification tokens, provision-state nonces, expired unused invites, and old used invite records. |
+| `:set_actor_flag(actor, flag, value)` | obj, str, bool | Set runtime-blessed actor flags with programmer-agent quota accounting. |
+| `:set_quota(account, kind, value)` | obj, str, int | Adjust per-account agent quotas. |
+
+### B2.13 `$sequenced_log` host operations
 
 These are the native log operations that back `$sequenced_log` descendants.
 They are host/repository primitives in the current implementation, not ordinary
@@ -158,7 +233,7 @@ directly on `$sequenced_log`.
 | `append(message)` | any | Native; atomically allocates a seq and persists `(seq, message)`. See [sequenced-log.md §SL2](sequenced-log.md#sl2-the-native-host-operations). |
 | `read(from, limit)` | int, int | Native; paged history read. |
 
-### B2.10 `$space` additional properties
+### B2.14 `$space` additional properties
 
 | Property | Type | Default | Notes |
 |---|---|---|---|
@@ -170,7 +245,7 @@ directly on `$sequenced_log`.
 | `features_version` | int | 0 | Monotonic counter; verb-lookup cache invalidation. |
 | `auto_presence` | bool | false | Legacy catalog flag retained for older installed worlds. New session placement is explicit: clients/catalog verbs call `:enter`/`moveto`, which updates the session current location and `session_subscribers`. New code should not rely on automatic runtime entry from this property. |
 
-### B2.11 `$space` verbs
+### B2.15 `$space` verbs
 
 | Verb | Args | Purpose |
 |---|---|---|
@@ -186,7 +261,7 @@ reserved conventions until the full core grows object-level wrappers for them.
 Current movement/catalog verbs update `session_subscribers`; the runtime keeps
 `subscribers` as a compatibility projection.
 
-### B2.12 `$thing` verbs
+### B2.16 `$thing` verbs
 
 | Verb | Args | Purpose |
 |---|---|---|

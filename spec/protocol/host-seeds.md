@@ -118,6 +118,14 @@ Never participate in merge, on any subject:
 - `created` — set once at create; immutable.
 - `id` — the subject key.
 
+Credential-bearing `$account` objects are additionally redacted before
+delivery to satellite hosts: `password_hash`, `password_salt`, and
+`oauth_identities` are omitted from the delivered object's `properties`
+and `propertyVersions`. Credential verification is gateway-local; a
+satellite may need account identity/quota metadata for object graph
+consistency, but it must not receive reusable password or OAuth
+material through host-seed propagation.
+
 **Deletions.** The seed's per-object property loop only adds and
 updates. To propagate gateway-side deletes/renames, after applying the
 table above, for each foreign-hosted `S`:

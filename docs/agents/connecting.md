@@ -26,7 +26,7 @@ If your client only supports bearer-token auth:
 Authorization: Bearer guest:<any-name>
 ```
 
-The bearer envelope is just transport syntax — the Port token (`guest:...`,
+The bearer envelope is just transport syntax — the woah token (`guest:...`,
 `bearer:<jwt>`, `apikey:<id>:<secret>`, etc.) goes inside it.
 
 | Token | Purpose |
@@ -50,7 +50,7 @@ The server resolves your token to a **session** + **actor** pair:
 - **Session**: the live binding between your connection and the world.
   Your session has its own `current_location`, observation queue, and
   focus list.
-- **Actor**: a normal Port object. Has properties (name, description,
+- **Actor**: a normal woah object. Has properties (name, description,
   inventory, etc.), verbs (`focus`, `wait`, `unfocus`, plus whatever
   the actor's class chain adds), and an owner.
 

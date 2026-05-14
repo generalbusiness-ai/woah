@@ -1,6 +1,6 @@
 # Eval — `;` and `;;`
 
-`$programmer:eval(source, opts?)` is Port's analogue of LambdaCore's
+`$programmer:eval(source, opts?)` is woah's analogue of LambdaCore's
 `eval`. It compiles a piece of woocode through the same DSL pipeline
 as `install_verb`, then runs the bytecode under the invoking
 actor's `progr`. The verb is `tool_exposed`, so MCP-attached

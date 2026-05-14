@@ -405,7 +405,11 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   // receiver-authoritative on satellites: first cold-load takes the
   // gateway's view, subsequent cold-loads skip even if the gateway has
   // bumped last_seen_at.
-  "api_keys"
+  "api_keys",
+  "bearer_tokens",
+  "pending_email_verifications",
+  "signup_invites",
+  "provision_state_nonces"
 ]);
 
 /** Drop "phantom" boolean fields whose persistent encoding represents
@@ -714,6 +718,9 @@ function seedUniversal(world: WooWorld): void {
   world.createObject({ id: "$player", name: "$player", parent: "$actor", owner: "$wiz" });
   world.createObject({ id: "$wiz", name: "$wiz", parent: "$player", owner: "$wiz", flags: { wizard: true, programmer: true } });
   world.createObject({ id: "$guest", name: "$guest", parent: "$player", owner: "$wiz" });
+  world.createObject({ id: "$account", name: "$account", parent: "$root", owner: "$wiz" });
+  world.createObject({ id: "$human", name: "$human", parent: "$player", owner: "$wiz" });
+  world.createObject({ id: "$agent", name: "$agent", parent: "$player", owner: "$wiz" });
   world.createObject({ id: "$sequenced_log", name: "$sequenced_log", parent: "$root", owner: "$wiz" });
   world.createObject({ id: "$space", name: "$space", parent: "$sequenced_log", owner: "$wiz" });
   world.createObject({ id: "$thing", name: "$thing", parent: "$root", owner: "$wiz" });
@@ -726,7 +733,7 @@ function seedUniversal(world: WooWorld): void {
   world.createObject({ id: "$nowhere", name: "$nowhere", parent: "$thing", owner: "$wiz" });
   reparentSeed(world, "$space", "$sequenced_log");
 
-  for (const id of ["$root", "$actor", "$player", "$sequenced_log", "$space", "$thing", "$catalog", "$catalog_registry"]) {
+  for (const id of ["$root", "$actor", "$player", "$account", "$human", "$agent", "$sequenced_log", "$space", "$thing", "$catalog", "$catalog_registry"]) {
     // Seed the `name` property with the WooObject.name attribute (rather
     // than ""), so woocode `obj.name` reads the actual seed name on every
     // descendant. createAuthoredObject already follows this mirroring rule
@@ -749,6 +756,9 @@ function seedUniversal(world: WooWorld): void {
   describeSeed(world, "$player", "Session-capable actor class for humans, agents, or tools connected over the wire. A player composes actor identity with session bookkeeping and live connection state.");
   describeSeed(world, "$wiz", "Seed administrator player. It carries wizard and programmer flags so the initial world can bootstrap, inspect, and repair code, schema, and seeded objects.");
   describeSeed(world, "$guest", "Reusable temporary player class. Guest instances bind to short-lived sessions, reset through on_disfunc when the session is reaped, and then return to the free guest pool.");
+  describeSeed(world, "$account", "Credential-bearing identity record. Accounts are not actors; they bind email/password or OAuth credentials to one primary $human and the $agent actors owned by that human.");
+  describeSeed(world, "$human", "Credentialed human actor class. A human has an account backpointer and can provision owned agent actors within account quotas.");
+  describeSeed(world, "$agent", "API-key-authenticated actor class. Agents are owned by a human or wizard, carry one active API key, and record their provisioning source for audit and reconnect flows.");
   describeSeed(world, "$sequenced_log", "Append-only sequenced log base class. It owns the conceptual sequence allocation and replay surface inherited by coordination spaces and catalog registries.");
   describeSeed(world, "$space", "Coordination base class. A space owns a local message sequence, accepts calls, applies them one at a time, stores replayable history, and pushes observations to present subscribers.");
   describeSeed(world, "$thing", "Simple non-actor base class for persistent objects that primarily hold state. Use it when an object should be addressable and programmable but should not itself originate calls.");
@@ -759,12 +769,45 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "bootstrap_token_used", false);
   seedProp(world, "$system", "applied_migrations", []);
   seedProp(world, "$system", "catalog_migration_records", []);
+  seedProp(world, "$system", "api_keys", {});
+  seedProp(world, "$system", "bearer_tokens", {});
+  seedProp(world, "$system", "pending_email_verifications", []);
+  seedProp(world, "$system", "signup_invites", []);
+  seedProp(world, "$system", "signup_invite_required", false);
+  seedProp(world, "$system", "allowed_provision_return_schemes", ["hermes://"]);
+  seedProp(world, "$system", "provision_state_nonces", []);
+  seedProp(world, "$system", "mcp_endpoint_url", "/mcp");
+  seedProp(world, "$system", "default_agent_quota", 5);
+  seedProp(world, "$system", "default_programmer_grant_quota", 0);
   define(world, "$system", "help_dbs", [], "list<obj>", "r");
   define(world, "$root", "help", null, "obj|list<obj>|null", "r");
   define(world, "$actor", "features", [], "list<obj>", "r");
   define(world, "$actor", "features_version", 0, "int", "r");
   define(world, "$actor", "focus_list", [], "list<obj>", "r");
   define(world, "$player", "home", "$nowhere", "obj|null");
+  define(world, "$account", "email", "", "str", "r");
+  define(world, "$account", "email_verified_at", null, "int|null", "r");
+  define(world, "$account", "password_hash", null, "str|null", "r");
+  define(world, "$account", "password_salt", null, "str|null", "r");
+  define(world, "$account", "oauth_identities", [], "list<map>", "r");
+  define(world, "$account", "actors", [], "list<obj>", "r");
+  define(world, "$account", "primary_actor", null, "obj|null", "r");
+  define(world, "$account", "agent_quota", 5, "int", "r");
+  define(world, "$account", "programmer_grant_quota", 0, "int", "r");
+  define(world, "$account", "agent_count", 0, "int", "r");
+  define(world, "$account", "programmer_agent_count", 0, "int", "r");
+  define(world, "$account", "signup_method", "wizard", "str", "r");
+  define(world, "$account", "created_at", 0, "int", "r");
+  define(world, "$account", "deactivated_at", null, "int|null", "r");
+  define(world, "$account", "recycle_on_delete", false, "bool", "r");
+  define(world, "$human", "account", null, "obj|null", "r");
+  define(world, "$agent", "api_key_id", null, "str|null", "r");
+  define(world, "$agent", "created_via", "wizard", "str", "r");
+  define(world, "$agent", "profile_id", null, "str|null", "r");
+  define(world, "$agent", "last_seen_at", null, "int|null", "r");
+  define(world, "$agent", "purpose", "", "str", "r");
+  define(world, "$agent", "scope", "write", "str", "r");
+  define(world, "$agent", "deactivated_at", null, "int|null", "r");
   removeSeedProperty(world, "$player", "attached_sockets");
   // Legacy: $player.session_id was a write-only mirror of the session table
   // that no reader ever consulted. Retired now that session lifecycle lives
@@ -862,6 +905,21 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$system", "revoke_api_key", "revoke_api_key", "verb :revoke_api_key(id) rxd { /* native: callable by wizard or by the owner of the apikey's bound actor. Marks api_keys[id].revoked_at so future authentications fail; in-memory sessions minted from this key are also closed. The record is kept (with revoked_at populated) for audit. Returns true on first revoke, false if already revoked or id unknown. Audited. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["id"] } });
   native(world, "$system", "list_api_keys", "list_api_keys", "verb :list_api_keys() rxd { /* native: wizard-only. Returns [{id, actor, label, created_at, last_seen_at, revoked_at}] for inspection — secrets are NEVER readable post-mint. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
   native(world, "$system", "list_api_keys_for_owner", "list_api_keys_for_owner", "verb :list_api_keys_for_owner() rxd { /* native: returns api-key metadata for actors the caller owns. Wizard sees everything. Same shape as :list_api_keys. Useful so a block's owner can audit \"is my plug connected and which key is it using?\" without wizard authority. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
+  native(world, "$system", "provision_actor", "provision_actor", "verb :provision_actor(class, owner, attrs?) rxd { /* native: wizard-only audited actor provisioning primitive. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["class", "owner", "attrs?"] } });
+  native(world, "$system", "rotate_api_key", "rotate_api_key", "verb :rotate_api_key(actor, force?) rxd { /* native: mint a replacement API key for an agent actor. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "force?"] } });
+  native(world, "$system", "deactivate_actor", "deactivate_actor", "verb :deactivate_actor(actor, reason?) rxd { /* native: deactivate an account-bound actor and reap relevant sessions. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "reason?"] } });
+  native(world, "$system", "reactivate_actor", "reactivate_actor", "verb :reactivate_actor(actor) rxd { /* native: clear deactivation markers for an actor/account. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor"] } });
+  native(world, "$system", "recycle_actor", "recycle_actor", "verb :recycle_actor(actor) rxd { /* native: audited hard-recycle wrapper. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor"] } });
+  native(world, "$system", "issue_signup_invite", "issue_signup_invite", "verb :issue_signup_invite(quantity, expires_at) rxd { /* native: wizard-only signup invite minting. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["quantity", "expires_at"] } });
+  native(world, "$system", "gc_pending_credentials", "gc_pending_credentials", "verb :gc_pending_credentials() rxd { /* native: wizard-only sweep for expired bearer tokens, signup verifications, provision states, and stale invite records. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
+  native(world, "$system", "set_actor_flag", "set_actor_flag", "verb :set_actor_flag(actor, flag, value) rxd { /* native: audited flag mutation with agent programmer quota checks. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "flag", "value"] } });
+  native(world, "$system", "set_quota", "set_quota", "verb :set_quota(account, kind, value) rxd { /* native: audited per-account quota mutation. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["account", "kind", "value"] } });
+  native(world, "$human", "create_agent", "human_create_agent", "verb :create_agent(name, purpose?, programmer?) rxd { /* native: self-service agent provisioning. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["name", "purpose?", "programmer?"] } });
+  native(world, "$human", "list_agents", "human_list_agents", "verb :list_agents() rxd { /* native: list agents owned by this human. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: [] } });
+  native(world, "$human", "revoke_agent", "human_revoke_agent", "verb :revoke_agent(actor_id, reason?) rxd { /* native: revoke an owned agent and its current key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "reason?"] } });
+  native(world, "$human", "promote_agent_to_programmer", "human_promote_agent_to_programmer", "verb :promote_agent_to_programmer(actor_id) rxd { /* native: consume programmer-agent quota and set programmer flag. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"] } });
+  native(world, "$human", "demote_agent_from_programmer", "human_demote_agent_from_programmer", "verb :demote_agent_from_programmer(actor_id) rxd { /* native: clear programmer flag on an owned agent. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id"] } });
+  native(world, "$human", "rotate_agent_key", "human_rotate_agent_key", "verb :rotate_agent_key(actor_id, force?) rxd { /* native: rotate an owned agent key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "force?"] } });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });
   native(world, "$thing", "moveto", "thing_moveto", "verb :moveto(target) rxd { return moveto(this, target); }");
   native(world, "$thing", "look", "thing_look", "verb :look() rxd { let r = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: this, text: r.description, look: r, ts: now() }); return r; }", { directCallable: true, aliases: ["l@ook", "ex@amine"] });

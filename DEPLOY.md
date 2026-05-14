@@ -1,6 +1,6 @@
-# Deploying your own Port world
+# Deploying your own woah world
 
-Port is built to be **fork-and-deploy**. This document is the operator quick reference for:
+woah is built to be **fork-and-deploy**. This document is the operator quick reference for:
 
 - local test/single-node deployment (`npm run dev`, local SQLite, and in-memory testing), and
 - production deployment on your own Cloudflare account.
@@ -126,6 +126,18 @@ npx wrangler secret put WOO_INTERNAL_SECRET
 ```
 
 Unsigned or tampered internal requests are rejected before forwarded actor, session, or `progr` fields are trusted.
+
+### `TURNSTILE_SECRET_KEY`
+
+Required when self-service signup is enabled. The Worker verifies `/api/signup`
+tokens against Cloudflare Turnstile before creating pending accounts:
+
+```sh
+npx wrangler secret put TURNSTILE_SECRET_KEY
+```
+
+Deployments that do not expose signup can leave it unset; signup requests fail
+closed until the secret is configured.
 
 ### Future deterministic ID seed
 
@@ -286,7 +298,7 @@ Major-version updates require `"accept_major": true` and a matching `migration-v
 
 When you pull updates from upstream and redeploy, the Durable Object class-history
 migrations in `wrangler.toml` must remain consistent. These tags are Cloudflare
-deployment bookkeeping, not catalog versions and not Port schema versions.
+deployment bookkeeping, not catalog versions and not woah schema versions.
 
 - Run `npm run cf:migrations:check` before deploy, or let `npm run deploy` do it.
 - If a new Durable Object class binding was added, run `npm run cf:migrations` to append a deterministic `cf-do-NNNN` migration.
@@ -339,6 +351,36 @@ npm run build && npx wrangler deploy --env staging
 
 Cost: per-request + DO storage proportional to staging data. An idle staging is near-zero; a small test world is cents per month.
 
+### Onboarding smoke
+
+For deployments with self-service signup enabled, run the API-only onboarding
+smoke against the deployed Worker URL. It uses the out-of-band verification
+token returned by the current v1 API, so no email service is required.
+
+```sh
+WORLD_URL=https://<worker>.<account>.workers.dev npm run smoke:onboarding
+```
+
+For staging, configure Cloudflare's
+[Turnstile test secret](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
+as `TURNSTILE_SECRET_KEY` and use the default dummy token, or pass the
+token explicitly:
+
+```sh
+SMOKE_TURNSTILE_TOKEN=XXXX.DUMMY.TOKEN.XXXX \
+WORLD_URL=https://<staging-worker>.<account>.workers.dev \
+npm run smoke:onboarding
+```
+
+The smoke creates a unique email/profile per run and verifies signup,
+verification token single-use, password login, bearer login, Hermes connect,
+state replay rejection, reconnect key rotation, old key revocation, new key
+auth, and unauthenticated `/connect` redirect sanitization.
+
+This smoke is repeatable but not hermetic: each successful run persists a
+smoke `$account`, `$human`, and Hermes `$agent`. Run it against staging or
+periodically clean accounts whose email matches `smoke+*@example.com`.
+
 ### 4. Backup-then-restore drill — highest confidence
 
 Restore a recent prod backup into the staging worker, redeploy staging with the new code, and watch the upgrade-adopt path execute against real prod-shaped data. This is the only way to catch upgrade bugs that depend on production state shape.
@@ -369,7 +411,7 @@ Cost: staging slot + transfer. Use this before deploys that touch catalog schema
 
 ## Cost expectations
 
-Port runs on:
+woah runs on:
 
 - **Workers Paid** ($5/mo) — covers Workers and Durable Objects
 - DO storage costs scale with the number of objects and their size; small worlds (~hundreds of objects, KB each) are nearly free

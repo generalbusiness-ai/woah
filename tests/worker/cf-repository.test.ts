@@ -19,12 +19,25 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
 // contention they legitimately exceed Vitest's default 30s per-test timeout.
 vi.setConfig({ testTimeout: 120_000 });
+
+describe("v2 Worker fan-out helpers", () => {
+  it("preserves multiple envelopes for the same recipient node", () => {
+    const grouped = v2FanoutEnvelopesByNode([
+      { node: "browser-a", envelope: "event-1" },
+      { node: "browser-b", envelope: "event-2" },
+      { node: "browser-a", envelope: "event-3" }
+    ]);
+
+    expect(grouped.get("browser-a")).toEqual(["event-1", "event-3"]);
+    expect(grouped.get("browser-b")).toEqual(["event-2"]);
+  });
+});
 
 function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
   return cursor.toArray() as T[];
@@ -678,7 +691,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_load", host_key: "world", stored: false }),
         expect.objectContaining({ kind: "startup_storage", phase: "cf_repository_save", host_key: "world" }),
         expect.objectContaining({ kind: "startup_storage", phase: "directory_schema", host_key: "directory" }),
-        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects", host_key: "directory", writes: 20 })
+        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects", host_key: "directory", writes: 23 })
       ]));
 
       logs.length = 0;
@@ -700,7 +713,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       // the observable signal; the absence of a register_objects metric
       // is the actual win (no signed fetch, no Directory transaction).
       expect(restartMetrics).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects_skip", host_key: "world", routes: 20 })
+        expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects_skip", host_key: "world", routes: 23 })
       ]));
       expect(restartMetrics).not.toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "startup_storage", phase: "directory_register_objects" })
