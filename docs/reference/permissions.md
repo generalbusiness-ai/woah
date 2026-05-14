@@ -1,6 +1,6 @@
 # Permissions
 
-Port separates **substrate-level** permission flags (the `r/w/c` bits
+woah separates **substrate-level** permission flags (the `r/w/c` bits
 on properties, the `r/x/d` bits on verbs, owner, wizard) from
 **catalog-level** policy (who can write *this particular* note's
 text, when does a `$block` accept config changes, etc.).

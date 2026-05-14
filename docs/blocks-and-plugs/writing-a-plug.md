@@ -2,7 +2,7 @@
 
 A plug is an external process that authenticates as a block's actor,
 pushes data into the block's properties, and answers calls to the
-block's verbs. From Port's perspective, a plug is just an
+block's verbs. From woah's perspective, a plug is just an
 authenticated WebSocket client — there's no special "plug" type in
 the substrate.
 

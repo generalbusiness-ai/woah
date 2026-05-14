@@ -1,6 +1,6 @@
-# Deploying your own Port world
+# Deploying your own woah world
 
-Port is built to be **fork-and-deploy**. This document is the operator quick reference for:
+woah is built to be **fork-and-deploy**. This document is the operator quick reference for:
 
 - local test/single-node deployment (`npm run dev`, local SQLite, and in-memory testing), and
 - production deployment on your own Cloudflare account.
@@ -298,7 +298,7 @@ Major-version updates require `"accept_major": true` and a matching `migration-v
 
 When you pull updates from upstream and redeploy, the Durable Object class-history
 migrations in `wrangler.toml` must remain consistent. These tags are Cloudflare
-deployment bookkeeping, not catalog versions and not Port schema versions.
+deployment bookkeeping, not catalog versions and not woah schema versions.
 
 - Run `npm run cf:migrations:check` before deploy, or let `npm run deploy` do it.
 - If a new Durable Object class binding was added, run `npm run cf:migrations` to append a deterministic `cf-do-NNNN` migration.
@@ -411,7 +411,7 @@ Cost: staging slot + transfer. Use this before deploys that touch catalog schema
 
 ## Cost expectations
 
-Port runs on:
+woah runs on:
 
 - **Workers Paid** ($5/mo) — covers Workers and Durable Objects
 - DO storage costs scale with the number of objects and their size; small worlds (~hundreds of objects, KB each) are nearly free

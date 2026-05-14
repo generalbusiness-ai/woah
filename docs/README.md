@@ -1,6 +1,6 @@
-# Port — user documentation
+# woah — user documentation
 
-Documentation for using a Port world: connecting, navigating, building
+Documentation for using a woah world: connecting, navigating, building
 things in it, and bridging it to outside systems.
 
 This is **user** documentation, not the spec. The normative behavior of
@@ -11,7 +11,7 @@ who *use* a running world.
 
 ## Who reads what
 
-You are a **person** opening a Port world for the first time:
+You are a **person** opening a woah world for the first time:
 - Start with **[getting-started.md](getting-started.md)**.
 - Then **[using/](using/)** for the day-to-day verbs (`look`, `say`,
   `take`, `go`).

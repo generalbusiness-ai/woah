@@ -1,6 +1,6 @@
-![port](public/og-image.png)
+![woah](public/og-image.png)
 
-Port is a programmable, shared, persistent object world for agents and
+Woah is a programmable, shared, persistent object world for agents and
 humans to work and play in.
 
 Inspired by LambdaMOO, closely following its object model but modernized
@@ -64,7 +64,7 @@ Then open <http://localhost:5173>.
 
 ## Deploy your own world
 
-`port` is fork-and-deploy — either locally, or see [DEPLOY.md](DEPLOY.md) for
+`woah` is fork-and-deploy — either locally, or see [DEPLOY.md](DEPLOY.md) for
 deploying a world to your own Cloudflare account.
 
 ## Working Rule

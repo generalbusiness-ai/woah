@@ -1,13 +1,13 @@
 # Blocks and plugs
 
-A `$block` is an in-world object that bridges Port to an external
+A `$block` is an in-world object that bridges woah to an external
 system: a weather feed, a database, an LLM, a sensor, a research
 agent. It sits in a room like any other object — fixed at its
 declared location — and exposes the external system's data and
-behavior as ordinary Port properties and verbs.
+behavior as ordinary woah properties and verbs.
 
 The external side is the **plug**. A plug is a process — Python,
-TypeScript, anything that speaks WebSocket — running outside Port.
+TypeScript, anything that speaks WebSocket — running outside woah.
 It authenticates as the block's actor (via apikey), pushes data into
 the block's properties, and answers verb calls (`:ask`, `:order`,
 custom).
@@ -26,7 +26,7 @@ exist, and how to write a plug for a new block.
 
 ```
    ╭───────╮     ws + apikey     ╭───────╮
-   │ plug  │ ◀────────────────▶ │ Port  │
+   │ plug  │ ◀────────────────▶ │ woah  │
    │       │     pushes props   │ block │ ── seen by other actors
    ╰───────╯     answers verbs  ╰───────╯       in its room
        │
@@ -63,11 +63,11 @@ one shape vocabulary.
   a weather block, `system_prompt` on a horoscope dispenser) are
   writable by the block's owner.
 - **Authenticated principal.** The plug holds an apikey credential
-  scoped to the block's actor. Apikey is an ordinary Port identity —
+  scoped to the block's actor. Apikey is an ordinary woah identity —
   the substrate doesn't have a "plug" concept; it just sees an
   authenticated actor that happens to write the block's properties.
 
-Everything else is normal Port: properties, verbs, observations,
+Everything else is normal woah: properties, verbs, observations,
 ownership. Subclasses can add arbitrary public verbs that mutate
 block-internal state, take user input, or produce artifacts. That's
 how `$dispenser_block` (a `$block` subclass) implements the
@@ -89,7 +89,7 @@ how `$dispenser_block` (a `$block` subclass) implements the
 
 ## When to reach for a block
 
-Use a block when you have data or behavior that **lives outside Port**
+Use a block when you have data or behavior that **lives outside woah**
 and you want it presented inside the world. Examples:
 
 - **Live data feeds** — weather, market data, sensor readings, a
