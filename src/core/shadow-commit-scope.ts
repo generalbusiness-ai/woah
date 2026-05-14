@@ -73,6 +73,10 @@ export type ShadowCommitScope = {
   submissions: Map<string, ShadowCommitResult>;
 };
 
+export type ShadowTranscriptApplyOptions = {
+  objectTimestamp?: number;
+};
+
 export function createShadowCommitScope(input: {
   node: string;
   scope: ObjRef;
@@ -289,7 +293,11 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
   return errors;
 }
 
-function applyShadowTranscriptToCommittedState(current: SerializedWorld, transcript: EffectTranscript): SerializedWorld {
+export function applyShadowTranscriptToCommittedState(
+  current: SerializedWorld,
+  transcript: EffectTranscript,
+  options: ShadowTranscriptApplyOptions = {}
+): SerializedWorld {
   const next = structuredClone(current) as SerializedWorld;
   const currentObjects = new Map<ObjRef, SerializedObject>(next.objects.map((obj) => [obj.id, obj]));
 
@@ -297,13 +305,13 @@ function applyShadowTranscriptToCommittedState(current: SerializedWorld, transcr
   // Executor post-world snapshots are intentionally not trusted across this
   // boundary; they are diagnostics/cache-fill only.
   for (const create of transcript.creates) {
-    const created = serializedObjectFromCreate(create);
+    const created = serializedObjectFromCreate(create, options.objectTimestamp);
     currentObjects.set(create.object, created);
     if (created.parent) addUniqueObjectRef(currentObjects.get(created.parent)?.children, created.id);
     if (created.location) addUniqueObjectRef(currentObjects.get(created.location)?.contents, created.id);
   }
   for (const write of finalWritesByCell(transcript)) {
-    applyTranscriptWrite(currentObjects, write);
+    applyTranscriptWrite(currentObjects, write, options.objectTimestamp);
   }
   applyTranscriptSessionLocation(next, transcript);
   next.objects = Array.from(currentObjects.values()).sort((a, b) => a.id.localeCompare(b.id));
@@ -328,7 +336,8 @@ function applyTranscriptSessionLocation(next: SerializedWorld, transcript: Effec
   }
 }
 
-function serializedObjectFromCreate(create: TranscriptCreate): SerializedObject {
+function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: number | undefined): SerializedObject {
+  const timestamp = objectTimestamp ?? 0;
   return {
     id: create.object,
     name: create.name,
@@ -337,8 +346,8 @@ function serializedObjectFromCreate(create: TranscriptCreate): SerializedObject 
     location: create.location,
     anchor: create.anchor,
     flags: structuredClone(create.flags) as SerializedObject["flags"],
-    created: 0,
-    modified: 0,
+    created: timestamp,
+    modified: timestamp,
     propertyDefs: [],
     properties: [],
     propertyVersions: [],
@@ -381,27 +390,39 @@ function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: Eff
 
 function applyTranscriptWrite(
   currentObjects: Map<ObjRef, SerializedObject>,
-  write: TranscriptWrite
+  write: TranscriptWrite,
+  objectTimestamp: number | undefined
 ): void {
   const target = currentObjects.get(write.cell.object);
   if (!target) return;
   switch (write.cell.kind) {
     case "prop":
       applyPropWrite(target, write);
+      touchSerializedObject(target, objectTimestamp);
       return;
     case "location":
       if (typeof write.value === "string" || write.value === null) target.location = write.value;
+      touchSerializedObject(target, objectTimestamp);
       return;
     case "contents":
       if (Array.isArray(write.value)) target.contents = write.value.filter((item): item is ObjRef => typeof item === "string");
+      touchSerializedObject(target, objectTimestamp);
       return;
     case "lifecycle": {
+      // Recycle/delete materialization is still outside the shadow applier.
+      // The transcript records the cell for validation, but the commit scope's
+      // full serialized state remains the authority for that effect.
       return;
     }
     case "verb":
-      // The shadow recorder currently observes verb reads, not verb writes.
+      // The shadow recorder currently observes verb reads, not verb writes, so
+      // accepted verb-edit materialization is intentionally not implemented.
       return;
   }
+}
+
+function touchSerializedObject(target: SerializedObject, objectTimestamp: number | undefined): void {
+  if (objectTimestamp !== undefined) target.modified = objectTimestamp;
 }
 
 function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void {

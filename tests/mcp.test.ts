@@ -4,6 +4,7 @@ import { createWorld } from "../src/core/bootstrap";
 import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
 import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
+import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { Observation, ObjRef, RemoteToolDescriptor, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 
@@ -619,6 +620,7 @@ describe("McpHost", () => {
       incompleteReasons: [],
       hash: "mcp-v2-observer-refresh"
     });
+    expect(world.currentLocationForSession(alice.id)).toBe("the_chatroom");
     host.routeShadowAcceptedFrame({
       kind: "woo.commit.accepted.shadow.v1",
       id: "mcp-v2-observer-refresh",
@@ -643,6 +645,50 @@ describe("McpHost", () => {
 
     expect(bobNotifications).toBe(1);
     bobInstance.dispose();
+  });
+
+  it("applies v2 accepted transcript logs, counters, and modified times through the gateway cache", () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const session = world.auth("guest:mcp-v2-cache-apply");
+    const before = world.exportWorld().objectCounter;
+    const created = `mcp_cache_obj_${before + 10}`;
+    const modifiedBefore = world.object(session.actor).modified;
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "mcp-v2-cache-apply",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 3,
+      session: session.id,
+      call: { actor: session.actor, target: "the_chatroom", verb: "cache_apply_probe", args: [] },
+      reads: [],
+      writes: [
+        { cell: { kind: "prop", object: session.actor, name: "cache_probe" }, value: "updated", op: "set" }
+      ],
+      creates: [
+        { object: created, name: "cache probe", parent: "$thing", owner: session.actor, location: "the_chatroom", anchor: null, flags: {}, writer: { progr: "$wiz", definer: "$thing", verb: "cache_apply_probe", thisObj: "the_chatroom", caller: session.actor, callerPerms: session.actor } }
+      ],
+      moves: [],
+      observations: [{ type: "cache_apply_probe", actor: session.actor, source: "the_chatroom", text: "probe", ts: 1 }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: "mcp-v2-cache-apply"
+    };
+
+    world.applyCommittedShadowTranscript(transcript);
+    world.applyCommittedShadowTranscript(transcript);
+
+    const after = world.exportWorld();
+    const chatLog = after.logs.find(([space]) => space === "the_chatroom")?.[1] ?? [];
+    expect(chatLog.filter((entry) => entry.seq === 3)).toHaveLength(1);
+    expect(after.objectCounter).toBeGreaterThanOrEqual(before + 11);
+    expect(world.object(created).created).toBeGreaterThan(0);
+    expect(world.object(created).modified).toBeGreaterThan(0);
+    expect(world.object(session.actor).modified).toBeGreaterThanOrEqual(modifiedBefore);
   });
 
   it("does not enumerate remote tools while sending post-call list_changed hints", async () => {

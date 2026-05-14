@@ -32,7 +32,8 @@ import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
-import type { EffectTranscript, TranscriptCreate, TranscriptWrite } from "./effect-transcript";
+import type { EffectTranscript } from "./effect-transcript";
+import { applyShadowTranscriptToCommittedState } from "./shadow-commit-scope";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -6137,109 +6138,14 @@ export class WooWorld {
 
   applyCommittedShadowTranscript(transcript: EffectTranscript): void {
     // CommitScopeDO is the authority for v2 shadow commits. The gateway keeps
-    // this WooWorld as a routing/tool-list cache, so apply the already-accepted
-    // transcript directly instead of importing a full SerializedWorld after
-    // every MCP turn. This intentionally does not persist to the gateway DO.
-    this.bumpMutationVersion();
-    this.hostSeedCache.clear();
-    this.withPersistencePaused(() => {
-      for (const create of transcript.creates) this.applyCommittedShadowCreate(create);
-      for (const write of finalShadowWritesByCell(transcript)) this.applyCommittedShadowWrite(write);
-      this.applyCommittedShadowLog(transcript);
-      this.objectCounter = nextObjectCounterAfterShadowCreates(this.objectCounter, transcript.creates);
-    });
-  }
-
-  private applyCommittedShadowCreate(create: TranscriptCreate): void {
-    if (this.objects.has(create.object)) return;
-    const now = Date.now();
-    const obj: WooObject = {
-      id: create.object,
-      name: create.name,
-      parent: create.parent,
-      owner: create.owner,
-      location: create.location,
-      anchor: create.anchor,
-      flags: create.flags ?? {},
-      created: now,
-      modified: now,
-      propertyDefs: new Map(),
-      properties: new Map(),
-      propertyVersions: new Map(),
-      verbs: [],
-      children: new Set(),
-      contents: new Set(),
-      eventSchemas: new Map()
-    };
-    this.objects.set(obj.id, obj);
-    if (obj.parent) this.objects.get(obj.parent)?.children.add(obj.id);
-    if (obj.location) this.objects.get(obj.location)?.contents.add(obj.id);
-  }
-
-  private applyCommittedShadowWrite(write: TranscriptWrite): void {
-    const obj = this.objects.get(write.cell.object);
-    if (!obj) return;
-    switch (write.cell.kind) {
-      case "prop": {
-        if (write.op === "remove") {
-          obj.properties.delete(write.cell.name);
-          obj.propertyVersions.delete(write.cell.name);
-          return;
-        }
-        obj.properties.set(write.cell.name, cloneValue(write.value));
-        obj.propertyVersions.set(write.cell.name, shadowWriteVersion(obj, write));
-        if (write.cell.name === "name" && typeof write.value === "string") obj.name = write.value;
-        if (write.cell.name === "subscribers" || write.cell.name === "session_subscribers") this.invalidatePresenceIndex();
-        obj.modified = Date.now();
-        return;
-      }
-      case "location": {
-        const next = typeof write.value === "string" ? write.value : null;
-        if (obj.location && obj.location !== next) this.objects.get(obj.location)?.contents.delete(obj.id);
-        obj.location = next;
-        if (next) this.objects.get(next)?.contents.add(obj.id);
-        obj.modified = Date.now();
-        return;
-      }
-      case "contents": {
-        obj.contents = new Set(Array.isArray(write.value) ? write.value.filter((item): item is ObjRef => typeof item === "string") : []);
-        obj.modified = Date.now();
-        return;
-      }
-      case "lifecycle":
-      case "verb":
-        // The MCP v2 gateway cache does not currently surface verb edits or
-        // lifecycle deletes. CommitScopeDO's serialized state remains
-        // authoritative for those changes; the gateway cache handles the
-        // object/property/location/log deltas that MCP tool routing needs.
-        return;
-    }
-  }
-
-  private applyCommittedShadowLog(transcript: EffectTranscript): void {
-    if (transcript.route !== "sequenced") return;
-    const entries = this.logs.get(transcript.scope) ?? [];
-    const message: Message = {
-      actor: transcript.call.actor,
-      target: transcript.call.target,
-      verb: transcript.call.verb,
-      args: cloneValue(transcript.call.args as WooValue) as WooValue[]
-    };
-    const entry: SpaceLogEntry = {
-      space: transcript.scope,
-      seq: transcript.seq,
-      ts: 0,
-      actor: transcript.call.actor,
-      message,
-      observations: cloneValue(transcript.observations as unknown as WooValue) as Observation[],
-      applied_ok: transcript.error === undefined,
-      ...(transcript.error ? { error: cloneValue(transcript.error as unknown as WooValue) as ErrorValue } : {})
-    };
-    const existing = entries.findIndex((item) => item.seq === transcript.seq);
-    if (existing >= 0) entries[existing] = entry;
-    else entries.push(entry);
-    entries.sort((a, b) => a.seq - b.seq);
-    this.logs.set(transcript.scope, entries);
+    // this WooWorld as a routing/tool-list cache. Use the same transcript
+    // applier as the commit scope so object state, logs, counters, and
+    // session-location side effects cannot drift between the two views. This is
+    // a full cache rehydrate; if MCP v2 commit volume becomes hot, keep this
+    // shared semantic path but add a WooWorld adapter that applies the same
+    // transcript operations in place. This intentionally does not persist to
+    // the gateway DO.
+    this.importWorld(applyShadowTranscriptToCommittedState(this.exportWorld(), transcript, { objectTimestamp: Date.now() }));
   }
 
   private serializeObject(obj: WooObject): SerializedObject {
@@ -10311,46 +10217,6 @@ function canonicalJsonStringify(value: unknown): string {
     return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalJsonStringify((value as Record<string, unknown>)[k])).join(",") + "}";
   }
   return "null";
-}
-
-function finalShadowWritesByCell(transcript: EffectTranscript): TranscriptWrite[] {
-  const writes = new Map<string, TranscriptWrite>();
-  for (const write of transcript.writes) {
-    writes.set(shadowWriteCellKey(write), write);
-  }
-  return Array.from(writes.values());
-}
-
-function shadowWriteCellKey(write: TranscriptWrite): string {
-  const cell = write.cell;
-  switch (cell.kind) {
-    case "prop":
-    case "verb":
-      return `${cell.kind}\u0000${cell.object}\u0000${cell.name}`;
-    case "location":
-    case "contents":
-    case "lifecycle":
-      return `${cell.kind}\u0000${cell.object}`;
-  }
-}
-
-function shadowWriteVersion(obj: WooObject, write: TranscriptWrite): number {
-  if (write.cell.kind !== "prop") return 0;
-  const parsed = write.next === undefined ? null : Number(write.next);
-  return parsed !== null && Number.isInteger(parsed) && parsed >= 0
-    ? parsed
-    : (obj.propertyVersions.get(write.cell.name) ?? 0) + 1;
-}
-
-function nextObjectCounterAfterShadowCreates(current: number, creates: TranscriptCreate[]): number {
-  let next = current;
-  for (const create of creates) {
-    const match = create.object.match(/_(\d+)$/);
-    if (!match) continue;
-    const value = Number(match[1]);
-    if (Number.isSafeInteger(value) && value >= next) next = value + 1;
-  }
-  return next;
 }
 
 // Build a digest-only canonical view of a SeedWorld. The returned value is
