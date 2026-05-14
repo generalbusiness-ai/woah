@@ -73,7 +73,10 @@ export async function runShadowTurnCallOnWorld(
   }
 
   const recorded = recorder.turns[0];
-  if (!recorded) throw new Error(`fresh turn produced no recording: ${call.target}:${call.verb}`);
+  if (!recorded) {
+    const suffix = frame.op === "error" ? `: ${frame.error.code} ${frame.error.message}` : "";
+    throw new Error(`fresh turn produced no recording: ${call.target}:${call.verb}${suffix}`);
+  }
   const transcript = effectTranscriptFromRecordedTurn(recorded);
   return {
     frame,

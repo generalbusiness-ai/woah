@@ -1,7 +1,7 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
-import type { ShadowTurnIntentRequest } from "../core/shadow-browser-node";
+import type { ShadowLiveEvent, ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
@@ -200,6 +200,9 @@ async function receiveFrame(encoded: string): Promise<void> {
   if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
     const message = v2TurnResultMessageFromReply(envelope.body as ShadowTurnExecReply, envelope.reply_to);
     if (message) postMessage(message);
+  }
+  if (envelope.type === "woo.live.event.shadow.v1") {
+    postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
   }
   if (installedExecutableState) await replayPending();
   postMessage({ kind: "frame", envelope });

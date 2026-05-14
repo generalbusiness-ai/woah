@@ -1,21 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../src/core/shadow-envelope";
 import { stableShadowJson } from "../src/core/shadow-cell-version";
 import {
   applyShadowBrowserTransfer,
+  buildShadowBrowserSessionAuth,
   buildShadowBrowserProjectionTransfer,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
+  disposeShadowBrowserNode,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
   handleShadowBrowserTurnExecEnvelope,
+  mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
   setShadowBrowserSessionToken,
   shadowBrowserEnvelope,
+  shadowBrowserSessionBearer,
   shadowBrowserTransportHello,
   unsubscribeShadowBrowserNode,
   type ShadowBrowserStateTransfer,
@@ -193,6 +197,180 @@ describe("shadow browser node shim", () => {
     expect(world.getProp(pin, "color")).toBe("green");
     expect(finalLayout[pin]).toMatchObject({ w: 180, h: 110 });
     expect(browser.cache.applied_frames).toHaveLength(7);
+  });
+
+  it("keeps session location current after a committed pinboard enter", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-pinboard-enter-then-add");
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay",
+      scope: "the_pinboard",
+      serialized: anchor.exportWorld()
+    });
+    const browser = createShadowBrowserNode({
+      node: "browser-the_pinboard",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay
+    });
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+
+    const enter = await executeShadowBrowserTurn(browser, {
+      id: "browser-pinboard-enter-then-add-enter",
+      target: "the_pinboard",
+      verb: "enter",
+      args: []
+    });
+    expect(enter.result).toMatchObject({ ok: true });
+    expect(worldFor(browser).currentLocationForSession(session.id)).toBe("the_pinboard");
+    expect(worldFor(browser).object(session.actor).location).toBe("the_pinboard");
+
+    const add = await executeShadowBrowserTurn(browser, {
+      id: "browser-pinboard-enter-then-add-add",
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["v2 entered note", "yellow", 20, 30, 210, 120]
+    });
+    expect(add.result).toMatchObject({ ok: true });
+    expect(worldFor(browser).getProp(observationObject(add, "note_added", "pin"), "text")).toBe("v2 entered note");
+  });
+
+  it("keeps imported live sessions live across shadow commits", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const anchor = createWorld();
+      const session = anchor.auth("guest:browser-pinboard-live-session-import");
+      const relay = createShadowBrowserRelayShim({
+        node: "browser-relay",
+        scope: "the_pinboard",
+        serialized: anchor.exportWorld()
+      });
+      const browser = createShadowBrowserNode({
+        node: "browser-the_pinboard",
+        scope: "the_pinboard",
+        actor: session.actor,
+        session: session.id,
+        relay
+      });
+      await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+
+      const enter = await executeShadowBrowserTurn(browser, {
+        id: "browser-pinboard-live-session-enter",
+        target: "the_pinboard",
+        verb: "enter",
+        args: []
+      });
+      expect(enter.result).toMatchObject({ ok: true });
+      expect(relay.commit_scope.serialized.sessions.find((item) => item.id === session.id)?.lastDetachAt).toBeNull();
+
+      vi.setSystemTime(1_000_000 + 61_000);
+      const add = await executeShadowBrowserTurn(browser, {
+        id: "browser-pinboard-live-session-add",
+        target: "the_pinboard",
+        verb: "add_note",
+        args: ["still live after import", "yellow", 20, 30, 210, 120]
+      });
+      expect(add.result).toMatchObject({ ok: true });
+      expect(worldFor(browser).getProp(observationObject(add, "note_added", "pin"), "text")).toBe("still live after import");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("merges fresh session authority without dropping scope-known sessions", () => {
+    const anchor = createWorld();
+    const kept = anchor.auth("guest:browser-session-merge-kept");
+    const fresh = anchor.auth("guest:browser-session-merge-fresh");
+    const current = anchor.exportSessions().filter((session) => session.id === kept.id);
+    current[0].currentLocation = "the_pinboard";
+    const merged = mergeShadowBrowserSessionState(current, anchor.exportSessions().filter((session) => session.id === fresh.id));
+
+    expect(merged.map((session) => session.id).sort()).toEqual([fresh.id, kept.id].sort());
+    expect(merged.find((session) => session.id === kept.id)?.currentLocation).toBe("the_pinboard");
+  });
+
+  it("unsubscribes browser nodes without leaving stale relay auth entries", async () => {
+    const { browser } = await browserForScope("the_pinboard", "guest:browser-unsubscribe-cleanup");
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const token = browser.session_token;
+    const localBearer = browser.session && shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor });
+
+    expect(browser.relay.browsers.get(browser.node)).toBe(browser);
+    if (token) expect(browser.relay.session_auth.has(token)).toBe(true);
+    if (localBearer && localBearer !== token) expect(browser.relay.session_auth.has(localBearer)).toBe(false);
+
+    disposeShadowBrowserNode(browser);
+
+    expect(browser.relay.browsers.has(browser.node)).toBe(false);
+    if (token) expect(browser.relay.session_auth.has(token)).toBe(false);
+  });
+
+  it("refreshes a reused relay executor before planning a new session turn", async () => {
+    const anchor = createWorld();
+    const firstSession = anchor.auth("guest:browser-reused-executor-a");
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay",
+      scope: "the_pinboard",
+      serialized: anchor.exportWorld()
+    });
+    const first = createShadowBrowserNode({
+      node: "browser-reused-executor-a",
+      scope: "the_pinboard",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay
+    });
+    await openShadowBrowserScope(first, { preseed_catalog_pages: true });
+    const firstIntent = shadowBrowserEnvelope(first, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: "browser-reused-executor-first",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      commit_policy: "execute_and_commit"
+    });
+    const firstReply = await handleShadowBrowserTurnExecEnvelope(first, receiveShadowBrowserEnvelopeReceipt(first, encodeEnvelope(firstIntent)));
+    expect(firstReply?.body).toMatchObject({ ok: true });
+    expect(relay.executors).toHaveLength(1);
+
+    const secondSession = anchor.auth("guest:browser-reused-executor-b");
+    const auth = buildShadowBrowserSessionAuth({
+      sessions: anchor.exportSessions(),
+      scope: "the_pinboard",
+      deployment: relay.deployment
+    });
+    relay.session_auth = auth.session_auth;
+    relay.session_revs = auth.session_revs;
+    relay.commit_scope.serialized.sessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, anchor.exportSessions());
+    const secondActor = anchor.exportWorld().objects.find((obj) => obj.id === secondSession.actor);
+    if (!secondActor) throw new Error("expected second actor object");
+    relay.commit_scope.serialized.objects.push(secondActor);
+    relay.commit_scope.serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
+    const second = createShadowBrowserNode({
+      node: "browser-reused-executor-b",
+      scope: "the_pinboard",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay
+    });
+    await openShadowBrowserScope(second, { preseed_catalog_pages: true });
+    const secondIntent = shadowBrowserEnvelope(second, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: "browser-reused-executor-second",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      commit_policy: "execute_and_commit"
+    });
+    const secondReply = await handleShadowBrowserTurnExecEnvelope(second, receiveShadowBrowserEnvelopeReceipt(second, encodeEnvelope(secondIntent)));
+
+    expect(secondReply?.body).toMatchObject({ ok: true });
   });
 
   it("drives taskspace create, claim, and status actions through the browser shim", async () => {
@@ -583,6 +761,14 @@ describe("shadow browser node shim", () => {
   it("chains execute-only browser intents through per-session live state", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-live-chain");
     await openShadowBrowserScope(browser);
+    const observer = createShadowBrowserNode({
+      node: "browser-wire-live-chain-observer",
+      scope: "the_dubspace",
+      actor: browser.actor,
+      session: browser.session,
+      relay: browser.relay
+    });
+    await openShadowBrowserScope(observer);
     const send = async (id: string, verb: string, args: WooValue[]) => {
       const intent = {
         kind: "woo.turn.intent.request.shadow.v1" as const,
@@ -613,6 +799,14 @@ describe("shadow browser node shim", () => {
       target: "filter_1",
       name: "cutoff",
       value: 500
+    }));
+    expect(observer.cache.live_events).toContainEqual(expect.objectContaining({
+      observation: expect.objectContaining({
+        type: "control_changed",
+        target: "filter_1",
+        name: "cutoff",
+        value: 500
+      })
     }));
     expect(worldFor(browser).getProp("filter_1", "cutoff")).not.toBe(500);
   });

@@ -178,6 +178,9 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
+// Generic chat/room calls still keep a v1 fallback while the remaining
+// catalogs migrate. Catalogs that have been moved to v2 call the turn helper
+// directly and do not depend on this rollout flag.
 const v2OutboundEnabled = new URLSearchParams(location.search).has("v2Outbound");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 let scopedProjectionEnabled = (() => {
@@ -388,6 +391,13 @@ function ensureV2BrowserWorker() {
       if (message.frame.op === "result") receiveDirectResultFrame(message.frame);
       else receiveErrorFrame(message.frame);
     }
+    if (event.data?.kind === "live_event") {
+      const observation = event.data.event?.observation;
+      if (observation) {
+        ui.ingestLiveObservation(observation);
+        receiveLiveEvent(observation);
+      }
+    }
     // Frame/error messages are exposed now so the worker-cache wire path can be
     // inspected during the migration; UI reducers will consume them directly
     // once the legacy `/ws` path is retired.
@@ -401,11 +411,11 @@ function ensureV2BrowserWorker() {
   syncV2BrowserWorkerScope();
 }
 
-function syncV2BrowserWorkerScope() {
+function syncV2BrowserWorkerScope(scopeOverride?: string) {
   if (!v2BrowserWorker || !state.session || !state.actor) return;
   const token = authToken();
   if (!token) return;
-  const scope = desiredV2BrowserScope();
+  const scope = scopeOverride || desiredV2BrowserScope();
   const connectionKey = `${token}\u0000${state.actor}\u0000${state.session}\u0000${scope}`;
   if (!scope || v2BrowserWorkerScope === connectionKey) return;
   v2BrowserWorkerScope = connectionKey;
@@ -478,11 +488,14 @@ function receiveAppliedFrame(frame: any) {
   // frames, so keep the pending handler until those observations route.
   if (typeof frame.id === "string") {
     const commandContext = pendingCommands.get(frame.id);
+    const resultHandler = pendingDirect.get(frame.id);
     if (frameErrors.length > 0) ui.failOptimisticCall(frame.id);
     else {
       ui.completeOptimisticCall(frame.id);
+      if (resultHandler) resultHandler(frame.result);
       if (commandContext) renderChatCommandResult(chatCommandUiActionFromMessage(frame.message), frame.result, commandContext.text);
     }
+    pendingDirect.delete(frame.id);
     pendingCommands.delete(frame.id);
     pendingFrameErrors.delete(frame.id);
   }
@@ -2083,7 +2096,7 @@ function hydratePinboardNotesTextIfNeeded(pinboard: any) {
   const board = pinboard?.board;
   const boardId = typeof board?.id === "string" ? board.id : "";
   const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
-  if (!canSendDirect()) return;
+  if (!canSendPinboardV2()) return;
   if (!pinboardActorPresent()) return;
   if (!pinboardNotesHaveMissingText(notes)) return;
   if (!boardId) return;
@@ -2238,7 +2251,7 @@ type V2TurnInput = {
 
 function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "commitPolicy">): boolean {
   ensureV2BrowserWorker();
-  syncV2BrowserWorkerScope();
+  syncV2BrowserWorkerScope(input.scope);
   if (!v2BrowserWorker || !state.actor || !state.session) return false;
   v2BrowserWorker.postMessage({
     kind: "call",
@@ -2287,10 +2300,15 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     }
     const target = String(plan.target ?? space);
     const verb = String(plan.verb ?? "");
-    const route = plan.route === "sequenced" ? "sequenced" : "direct";
+    let route: "direct" | "sequenced" = plan.route === "sequenced" ? "sequenced" : "direct";
     if (!verb) {
       render();
       return;
+    }
+    if (space === pinboardSpace() && target === space && (verb === "enter" || verb === "leave" || verb === "out")) {
+      // Pinboard presence is committed because board edits use that location as
+      // their authorization precondition.
+      route = "sequenced";
     }
     const id = crypto.randomUUID();
     const args = Array.isArray(plan.args) ? plan.args : [];
@@ -2422,8 +2440,16 @@ function canSendDirect() {
   return Boolean(state.actor && state.session && state.socket?.readyState === WebSocket.OPEN);
 }
 
-function canSendDubspaceV2() {
+function canSendV2Browser() {
   return Boolean(state.actor && state.session && authToken());
+}
+
+function canSendDubspaceV2() {
+  return canSendV2Browser();
+}
+
+function canSendPinboardV2() {
+  return canSendV2Browser();
 }
 
 function liveKey(target: string, name: string) {
@@ -4049,6 +4075,10 @@ function sendChatInput(space: string, text: string) {
     v2PlanAndExecuteCommand(space, text, onError);
     return;
   }
+  if ((space === pinboardSpace() || state.tab === "pinboard") && canSendPinboardV2()) {
+    v2PlanAndExecuteCommand(space, text, onError);
+    return;
+  }
   ensureSpacePresence(space, () => {
     command(space, text, undefined, onError);
   }, onError);
@@ -4398,7 +4428,7 @@ function mountPinboardComponent() {
     view: normalizedPinboardView(),
     actor: state.actor ?? null,
     inBoard: pinboardActorPresent(),
-    canSend: canSendDirect(),
+    canSend: canSendPinboardV2(),
     newText: state.pinboardNewText,
     newColor: state.pinboardNewColor,
     viewports: state.pinboardViewports
@@ -4412,6 +4442,7 @@ function bindPinboardComponentEvents(element: WooElement) {
   if (element.dataset.pinboardEventsBound === "true") return;
   element.dataset.pinboardEventsBound = "true";
   element.addEventListener("woo-pinboard-enter", enterPinboard);
+  element.addEventListener("woo-pinboard-leave", () => leavePinboard());
   element.addEventListener("woo-pinboard-create", (event) => {
     const detail = (event as CustomEvent<{ text?: unknown; color?: unknown }>).detail ?? {};
     const text = String(detail.text ?? state.pinboardNewText).trim();
@@ -4771,7 +4802,7 @@ function beginPinboardViewAnimation(stage: HTMLElement | null, canvas: HTMLEleme
 }
 
 function schedulePinboardViewportPublish() {
-  if (!pinboardActorPresent() || state.tab !== "pinboard" || !canSendDirect()) return;
+  if (!pinboardActorPresent() || state.tab !== "pinboard" || !canSendPinboardV2()) return;
   if (pinboardViewportTimer !== undefined) return;
   const wait = Math.max(0, PINBOARD_VIEWPORT_MIN_MS - (Date.now() - lastPinboardViewportPublishAt));
   pinboardViewportTimer = window.setTimeout(() => {
@@ -4781,13 +4812,22 @@ function schedulePinboardViewportPublish() {
 }
 
 function publishPinboardViewport() {
-  if (!pinboardActorPresent() || state.tab !== "pinboard" || !canSendDirect()) return;
+  if (!pinboardActorPresent() || state.tab !== "pinboard" || !canSendPinboardV2()) return;
   const viewport = currentPinboardViewport();
   if (!viewport || !pinboardViewportChanged(viewport, lastPinboardViewportSent)) return;
   lastPinboardViewportSent = viewport;
   lastPinboardViewportPublishAt = Date.now();
   const board = pinboardSpace();
-  if (board) direct(board, "viewport", [viewport.x, viewport.y, viewport.w, viewport.h, viewport.scale]);
+  if (board) {
+    v2Turn({
+      scope: board,
+      route: "direct",
+      target: board,
+      verb: "viewport",
+      args: [viewport.x, viewport.y, viewport.w, viewport.h, viewport.scale],
+      commitPolicy: "execute_only"
+    });
+  }
 }
 
 function currentPinboardViewport(): (PinNoteBox & { scale: number }) | undefined {
@@ -4964,21 +5004,29 @@ function bindPinNoteResize(handle: HTMLButtonElement) {
 
 function enterPinboard() {
   const board = pinboardSpace();
-  if (!board || !canSendDirect()) return;
-  direct(board, "enter", [], (result) => {
-    applyScopedMoveResult(result);
-    setPinboardPresent(result);
-    void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
-      if (state.tab === "pinboard") render();
-    });
-    refreshPinboardNotes({ force: true });
-    requestSpaceChatFocus(board);
+  if (!board || !canSendPinboardV2()) return;
+  v2Turn({
+    scope: board,
+    route: "sequenced",
+    target: board,
+    verb: "enter",
+    args: [],
+    commitPolicy: "execute_and_commit",
+    onResult: (result) => {
+      applyScopedMoveResult(result);
+      setPinboardPresent(result);
+      void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
+        if (state.tab === "pinboard") render();
+      });
+      refreshPinboardNotes({ force: true });
+      requestSpaceChatFocus(board);
+    }
   });
 }
 
 function leavePinboard(done?: () => void) {
   const board = pinboardSpace();
-  if (!board || !canSendDirect()) {
+  if (!board || !canSendPinboardV2()) {
     done?.();
     return;
   }
@@ -4986,16 +5034,28 @@ function leavePinboard(done?: () => void) {
     done?.();
     return;
   }
-  direct(board, "leave", [], (result) => {
-    applyScopedMoveResult(result);
-    setPinboardPresent(result);
-    clearPinboardViewports();
-    done?.();
-    // Legacy mode still needs a projection refresh after feature-space leave;
-    // scoped mode consumes the move-shaped `here` result above.
-    if (!scopedProjectionEnabled) void refresh();
-    void ensureScopedOverlayForTab("pinboard", { force: true });
-    if (state.tab === "pinboard") render();
+  v2Turn({
+    scope: board,
+    route: "sequenced",
+    target: board,
+    verb: "leave",
+    args: [],
+    commitPolicy: "execute_and_commit",
+    onResult: (result) => {
+      applyScopedMoveResult(result);
+      setPinboardPresent(result);
+      clearPinboardViewports();
+      done?.();
+      // Legacy mode still needs a projection refresh after feature-space leave;
+      // scoped mode consumes the move-shaped `here` result above.
+      if (!scopedProjectionEnabled) void refresh();
+      void ensureScopedOverlayForTab("pinboard", { force: true });
+      if (state.tab === "pinboard") render();
+    },
+    onError: () => {
+      done?.();
+      if (state.tab === "pinboard") render();
+    }
   });
 }
 
@@ -5025,32 +5085,41 @@ function setPinboardPresent(result: any) {
 
 function pinboardCall(verb: string, args: any[] = [], options?: ProjectionCallOptions) {
   const board = pinboardSpace();
-  if (board) call(board, board, verb, args, options);
+  if (board) v2Turn({ scope: board, route: "sequenced", target: board, verb, args, options });
 }
 
 function pinboardTargetCall(target: string, verb: string, args: any[] = [], options?: ProjectionCallOptions) {
   const board = pinboardSpace();
-  if (board && target) call(board, target, verb, args, options);
+  if (board && target) v2Turn({ scope: board, route: "sequenced", target, verb, args, options });
 }
 
 function refreshPinboardNotes(options: { force?: boolean } = {}) {
   const board = pinboardSpace();
-  if (!board || !canSendDirect()) return;
+  if (!board || !canSendPinboardV2()) return;
   if (pinboardNotesRefreshPending && options.force !== true) return;
   pinboardNotesRefreshPending = true;
   window.setTimeout(() => {
     pinboardNotesRefreshPending = false;
   }, 2500);
-  direct(board, "list_notes", [], (result) => {
-    pinboardNotesRefreshPending = false;
-    if (!Array.isArray(result)) return;
-    applyPinboardNotesCanonical(board, result);
-    if (state.tab === "pinboard") render();
-  }, () => {
-    pinboardNotesRefreshPending = false;
-    // Allow the next /api/state arrival to retry hydration if a transient
-    // failure (cold remote DO, network blip) ate this list_notes call.
-    pinboardTextHydrationRequested = false;
+  v2Turn({
+    scope: board,
+    route: "direct",
+    target: board,
+    verb: "list_notes",
+    args: [],
+    commitPolicy: "execute_only",
+    onResult: (result) => {
+      pinboardNotesRefreshPending = false;
+      if (!Array.isArray(result)) return;
+      applyPinboardNotesCanonical(board, result);
+      if (state.tab === "pinboard") render();
+    },
+    onError: () => {
+      pinboardNotesRefreshPending = false;
+      // Allow the next projection arrival to retry hydration if a transient
+      // failure (cold remote DO, network blip) ate this list_notes call.
+      pinboardTextHydrationRequested = false;
+    }
   });
 }
 

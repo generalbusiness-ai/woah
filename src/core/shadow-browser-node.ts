@@ -350,6 +350,25 @@ export function buildShadowBrowserSessionAuth(input: {
   };
 }
 
+export function mergeShadowBrowserSessionState(current: SerializedSession[], fresh: SerializedSession[]): SerializedSession[] {
+  const mergedById = new Map<string, SerializedSession>(
+    current.map((session) => [session.id, structuredClone(session) as SerializedSession])
+  );
+  for (const session of fresh) {
+    const existing = mergedById.get(session.id);
+    const merged = structuredClone(session) as SerializedSession;
+    // The gateway owns session identity, expiry, and revocation. A commit scope
+    // owns the v2-committed session location for turns in that scope; replacing
+    // it from the stale gateway snapshot would make a freshly-entered browser
+    // fail the next presence gate.
+    if (existing && existing.actor === session.actor && existing.currentLocation !== undefined) {
+      merged.currentLocation = existing.currentLocation;
+    }
+    mergedById.set(session.id, merged);
+  }
+  return Array.from(mergedById.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
 export function createShadowBrowserNode(input: {
   node: string;
   scope: ObjRef;
@@ -470,6 +489,12 @@ export function unsubscribeShadowBrowserNode(browser: ShadowBrowserNode, scope: 
   browser.relay.subscriptions.get(scope)?.delete(browser.node);
 }
 
+export function disposeShadowBrowserNode(browser: ShadowBrowserNode, scope: ObjRef = browser.scope): void {
+  unsubscribeShadowBrowserNode(browser, scope);
+  browser.relay.browsers.delete(browser.node);
+  if (browser.session_token) browser.relay.session_auth.delete(browser.session_token);
+}
+
 export function emitShadowBrowserLiveEvent(browser: ShadowBrowserNode, input: ShadowBrowserLiveInput): ShadowLiveEvent {
   validateShadowBrowserNodeAuth(browser);
   const event: ShadowLiveEvent = {
@@ -486,6 +511,32 @@ export function emitShadowBrowserLiveEvent(browser: ShadowBrowserNode, input: Sh
     except: input.deliver_to_self === true ? null : browser.node
   });
   return event;
+}
+
+export function shadowLiveEventsForTranscript(browser: ShadowBrowserNode, transcript: EffectTranscript): ShadowLiveEvent[] {
+  return transcript.observations.map((observation, index) => {
+    const actor = typeof observation?.actor === "string" ? observation.actor : transcript.call.actor;
+    const scope = transcript.scope;
+    const coalesce = typeof observation?.coalesce_key === "string" ? observation.coalesce_key : undefined;
+    return {
+      kind: "woo.live.event.shadow.v1",
+      id: `${browser.relay.node}:live:${transcript.hash}:${index}`,
+      source: shadowLiveEventSource(observation, transcript),
+      actor,
+      scope,
+      audience: { scope },
+      observation,
+      ...(coalesce ? { coalesce } : {})
+    };
+  });
+}
+
+function shadowLiveEventSource(observation: Observation, transcript: EffectTranscript): ObjRef {
+  for (const key of ["source", "target"] as const) {
+    const value = observation?.[key];
+    if (typeof value === "string") return value;
+  }
+  return transcript.call.target;
 }
 
 export function publishShadowBrowserLiveEvent(
@@ -845,6 +896,9 @@ async function executeShadowBrowserExecuteOnlyIntent(browser: ShadowBrowserNode,
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? browser.relay.commit_scope.serialized;
   const run = await runShadowTurnCall(serializedBefore, request.call);
   browser.relay.live_session_serialized.set(sessionKey, run.serializedAfter);
+  for (const event of shadowLiveEventsForTranscript(browser, run.transcript)) {
+    publishShadowBrowserLiveEvent(browser.relay, event, { except: browser.node });
+  }
   const outcome = run.transcript.error
     ? { error: run.transcript.error as unknown as WooValue }
     : { result: run.transcript.result };
@@ -933,6 +987,13 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
       atom_hashes: request.key.atom_hashes
     });
     relay.executors.push(executor);
+  } else {
+    // The relay executor is reused across socket lifetimes, while the commit
+    // scope's serialized session slice can refresh between turns. Rebuild the
+    // executor world from the current committed snapshot before planning or an
+    // old cached world can reject a freshly accepted session before recording.
+    executor.serialized = structuredClone(relay.commit_scope.serialized);
+    executor.world = undefined;
   }
   // The relay executor has the authoritative scope state locally. The atom set
   // still gates the actual execution against the client's planned key; missing

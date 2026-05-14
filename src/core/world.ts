@@ -6495,10 +6495,14 @@ export class WooWorld {
       now: number
     ): Session {
     const tokenClass = session.tokenClass ?? (this.inheritsFrom(session.actor, "$guest") ? "guest" : "bearer");
-    const lastDetachAt = session.lastDetachAt ?? now;
+    const lastDetachAt = session.lastDetachAt === undefined ? now : session.lastDetachAt;
+    // `null` is the live-session sentinel. Import/export is used by shadow
+    // execution as well as cold persistence; converting null to "now" makes an
+    // attached session look detached and lets it expire while the gateway socket
+    // is still alive.
     const expiresAt = Math.max(
       session.expiresAt ?? session.started + this.sessionTtl(tokenClass),
-      lastDetachAt + this.sessionGrace(tokenClass)
+      lastDetachAt === null ? 0 : lastDetachAt + this.sessionGrace(tokenClass)
     );
     return {
       id: session.id,

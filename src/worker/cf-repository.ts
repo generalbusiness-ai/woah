@@ -55,6 +55,13 @@ import { wooError, type ErrorValue, type Message, type MetricEvent, type ObjRef,
 
 type Row = Record<string, unknown>;
 
+function persistedSessionFromRow(row: Row, now: number): SerializedSession {
+  const session = sessionFromRow(row);
+  // Durable Object reloads do not preserve WebSocket attachment sets. Treat a
+  // stored live sentinel as detached at load time so normal grace expiry works.
+  return session.lastDetachAt === null ? { ...session, lastDetachAt: now } : session;
+}
+
 export class CFObjectRepository implements ObjectRepository, WorldRepository {
   private sql: SqlStorage;
   private transactionDepth = 0;
@@ -147,7 +154,8 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
         )
       }));
 
-      const sessions = this.all("SELECT * FROM session ORDER BY id").map(sessionFromRow);
+      const sessionLoadTime = Date.now();
+      const sessions = this.all("SELECT * FROM session ORDER BY id").map((row) => persistedSessionFromRow(row, sessionLoadTime));
 
       const logRows = this.all("SELECT * FROM space_message ORDER BY space_id, seq");
       const logs = Array.from(groupBy(logRows, "space_id").entries()).map(([space, entries]) => [
@@ -586,7 +594,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
 
   loadSession(session_id: string): SerializedSession | null {
     const row = this.one("SELECT * FROM session WHERE id = ?", session_id);
-    return row ? sessionFromRow(row) : null;
+    return row ? persistedSessionFromRow(row, Date.now()) : null;
   }
 
   saveSession(record: SerializedSession): void {

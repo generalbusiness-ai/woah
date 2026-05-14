@@ -1163,6 +1163,23 @@ commit scope -> browser: AppliedFrame(control_changed)
 browser UI/audio engines apply the committed frame
 ```
 
+Browser-node pinboard flow:
+
+```text
+UI -> worker: TurnIntent(route=sequenced, enter())
+commit scope -> browser: AppliedFrame(pinboard_entered)
+UI -> worker: TurnIntent(route=sequenced, add_note/move_pin/resize_pin/set_text/...)
+commit scope -> browser: AppliedFrame(note_added/pin_moved/pin_resized/note_edited/...)
+UI -> worker: TurnIntent(route=direct, commit_policy=execute_only, viewport/list_notes)
+relay -> browser: direct result envelope or live pinboard_viewport observation
+```
+
+Pinboard enter/leave are committed turns because the board's durable presence
+is the authorization precondition for layout and note edits. Viewport telemetry
+and projection hydration are direct execute-only calls; they MUST NOT carry
+durable writes. Pinboard embedded chat uses the catalog `command_plan` verb over
+v2 so aliases and object matching remain catalog-owned.
+
 ## VTN15. Functional parity requirements
 
 The first implementation that claims v2 protocol support MUST pass parity

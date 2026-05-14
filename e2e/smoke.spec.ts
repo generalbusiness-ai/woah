@@ -205,6 +205,7 @@ test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
   });
 
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Dubspace" }).click();
@@ -349,7 +350,19 @@ test("narrow layout keeps nav tabs on one row", async ({ page }) => {
 });
 
 test("pinboard supports shared text notes", async ({ page }) => {
+  const appliedVerbs: string[] = [];
+  await page.exposeFunction("recordPinboardAppliedFrame", (verb: string) => {
+    appliedVerbs.push(verb);
+  });
+  await page.addInitScript(() => {
+    window.addEventListener("woo.v2.applied_frame", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      void (window as unknown as { recordPinboardAppliedFrame: (verb: string) => Promise<void> }).recordPinboardAppliedFrame(verb);
+    });
+  });
+
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Pinboard" }).click();
@@ -357,14 +370,13 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await expect(page.locator(".pinboard-stage")).toBeVisible();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
-  const firstPaintStageHeights = await page.locator(".pinboard-stage-panel").evaluate(async (panel) => {
-    const samples: number[] = [];
-    for (let i = 0; i < 8; i += 1) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-      samples.push(panel.getBoundingClientRect().height);
-    }
-    return samples;
-  });
+  const stagePanel = page.locator(".pinboard-stage-panel");
+  await expect.poll(async () => stagePanel.evaluate((panel) => panel.getBoundingClientRect().height)).toBeGreaterThan(300);
+  const firstPaintStageHeights: number[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    await page.waitForTimeout(16);
+    firstPaintStageHeights.push(await stagePanel.evaluate((panel) => panel.getBoundingClientRect().height));
+  }
   expect(Math.min(...firstPaintStageHeights)).toBeGreaterThan(300);
   expect(Math.max(...firstPaintStageHeights) - Math.min(...firstPaintStageHeights)).toBeLessThan(80);
   const pinboardHeights = await page.locator(".pinboard-layout").evaluate((layout) => {
@@ -385,10 +397,12 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await miniChatInput.fill("look");
   await miniChatInput.press("Enter");
   await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("look");
+  await expect(page.locator("woo-space-chat-panel")).toContainText("Pinboard has 0 notes on it.");
 
   await page.locator("[data-pinboard-new-text]").fill("Bring the towel to the hot tub");
   await page.locator("[data-pinboard-new-color]").selectOption("blue");
   await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
+  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("add_note");
   await expect(page.locator(".pin-note")).toHaveCount(1);
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the towel to the hot tub");
 
@@ -401,12 +415,16 @@ test("pinboard supports shared text notes", async ({ page }) => {
 
   await page.locator("[data-pin-note-text]").first().fill("Towel is ready");
   await page.locator("[data-pin-note-text]").first().blur();
+  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("set_text");
   await expect(page.locator(".pinboard-stage")).toContainText("Towel is ready");
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the mug too");
+  await page.getByRole("button", { name: "Leave" }).click();
+  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
 });
 
 test("pinboard supports local zoom and pan without resetting on updates", async ({ page }) => {
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Pinboard" }).click();
@@ -490,6 +508,7 @@ test("pinboard animates note movement from another user", async ({ browser }) =>
     const first = await firstContext.newPage();
     const second = await secondContext.newPage();
     await Promise.all([first.goto("/"), second.goto("/")]);
+    await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
@@ -531,6 +550,7 @@ test("pinboard shares viewport presence overlays", async ({ browser }) => {
     const first = await firstContext.newPage();
     const second = await secondContext.newPage();
     await Promise.all([first.goto("/"), second.goto("/")]);
+    await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     const firstActor = (await first.locator(".actor").textContent())?.trim() ?? "";

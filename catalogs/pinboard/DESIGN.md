@@ -40,6 +40,21 @@ SPA host supplies scoped projection data, verb-call services, and the current
 pinboard view; drag/resize gesture plumbing remains host-owned until the frame
 action model carries those gestures directly.
 
+Browser clients route Pinboard through v2. Enter/leave commit because durable
+board presence is the authorization precondition for sequenced note/layout
+edits. Viewport telemetry and read-only note hydration execute on the v2 direct
+plane with `execute_only`; create, edit, recolor, layout, take, and drop execute
+on the commit plane. The embedded mini-chat also uses the catalog command
+planner over v2 so command aliases remain catalog-owned instead of being parsed
+in client code.
+
+Pinboard `enter`/`leave` return only the board room and subscriber lists. They
+intentionally do not request a full `here` payload: v2 commit validation treats
+post-commit projection reads as ordinary transcript reads, and a board-mounted
+parent-room snapshot can otherwise read the board's post-increment `next_seq`
+while validating against the pre-commit head. The browser already refreshes the
+board overlay through the v2 state plane.
+
 ## Class graph
 
 Two independent inheritance trees, each rooted under `$thing`:
