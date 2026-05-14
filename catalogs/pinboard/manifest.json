@@ -1,6 +1,6 @@
 {
   "name": "pinboard",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "spec_version": "v1",
   "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins inherit the v0.2 $note shape (name + description + text, where text is a single markdown string); board-level layout is independent of note content. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
@@ -184,6 +184,36 @@
             "args": []
           },
           "source": "verb :look_self() rxd { let pins = this:list_notes(); let note_count = length(pins); let other = []; for item in contents(this) { if (!isa(item, $note) && !isa(item, $actor)) { other = other + [{ id: item, title: item.name, description: item.description }]; } } let summary = this.name + \" has \" + to_string(note_count) + \" note\"; if (note_count != 1) { summary = summary + \"s\"; } summary = summary + \" on it\"; if (length(other) > 0) { summary = summary + \" and \" + to_string(length(other)) + \" other thing\"; if (length(other) != 1) { summary = summary + \"s\"; } summary = summary + \" here\"; } summary = summary + \".\"; return { id: this, title: this.name, description: this.description, summary: summary, note_count: note_count, notes: pins, contents: other, present_actors: this.subscribers, viewport: this.viewport }; }"
+        },
+        {
+          "name": "room_roster",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :room_roster() rxd { /* Fallback shape only: bundled runtimes bind the native handler, which filters expired session rows. */ let actors = []; for sub in this.session_subscribers { if (typeof(sub) == \"map\" && has(sub, \"actor\") && !(sub[\"actor\"] in actors)) { actors = actors + [sub[\"actor\"]]; } } let rows = []; for item in actors { if (isa(item, $actor)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "workspace_room_roster"
+          }
+        },
+        {
+          "name": "live_audience",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": {
+            "args": [
+              "observation?"
+            ]
+          },
+          "source": "verb :live_audience(observation) rxd { /* Fallback shape only: bundled runtimes bind the native handler, which applies observation routing and session liveness. */ let out = []; for row in this.session_subscribers { if (typeof(row) == \"map\" && has(row, \"session\")) { out = out + [row[\"session\"]]; } } return out; }",
+          "implementation": {
+            "kind": "native",
+            "handler": "space_live_audience"
+          }
         },
         {
           "name": "enter",

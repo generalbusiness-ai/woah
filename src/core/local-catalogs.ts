@@ -91,6 +91,9 @@ const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer
 const LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION = "2026-05-13-dubspace-v2-control-presence";
 const LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION = "2026-05-13-dubspace-v2-control-authority";
 const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION = "2026-05-13-chat-v2-command-persistence";
+const LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION = "2026-05-14-chat-room-roster";
+const LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION = "2026-05-14-pinboard-room-roster";
+const LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION = "2026-05-14-dubspace-room-roster";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -153,7 +156,10 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION, only: "dubspace" },
   { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, only: "dubspace" },
-  { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, only: "chat" }
+  { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, only: "pinboard" },
+  { id: LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, only: "dubspace" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -395,6 +401,9 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runDubspaceV2ControlPresenceMigration(world, names);
   run(LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
   run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
+  run(LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
+  run(LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
+  run(LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
   return covered;
 }
 

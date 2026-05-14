@@ -63,6 +63,13 @@ custom events rather than private host DOM bindings.
 - A mounted-room relationship to the Living Room.
 - An operator list for actors currently at the controls.
 
+Dubspace follows the workspace roster model. `room_roster()` returns distinct
+actors from `session_subscribers`, enriched as `{id, name, presence,
+idle_seconds?}`; `live_audience(observation?)` is the separate delivery
+contract and delegates to the substrate observation routing rules. The operator
+list remains catalog authority state for control writes, not the presentation
+roster and not the live-delivery index.
+
 ## Persistent State
 
 - Loaded loop per slot.

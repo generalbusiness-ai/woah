@@ -171,7 +171,8 @@ export const BUILTIN_NAMES = [
   // outright because the wrapper-level atomicity guarantees can't
   // hold across a host boundary; they call this builtin first and
   // raise E_CROSS_HOST_WRITE before reaching SET_PROP.
-  "is_remote_object"
+  "is_remote_object",
+  "presence_status"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -974,6 +975,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "idle_seconds expects one actor");
         const at = frame.ctx.world.actorLastInputAt(assertObj(builtinArgs[0]));
         return at === null ? null : Math.max(0, Math.floor((frame.ctx.world.logicalNow("idle_seconds.now") - at) / 1000));
+      }
+      case "presence_status": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "presence_status expects one actor");
+        return frame.ctx.world.actorPresenceStatus(assertObj(builtinArgs[0]), frame.ctx.world.logicalNow("presence_status.now"));
       }
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");

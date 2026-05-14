@@ -26,6 +26,20 @@ A space has the inherited fields from `$sequenced_log` ([sequenced-log.md §SL1]
 
 Spaces may carry additional materialized state — the dubspace's `delay_feedback`, a chat room's `topic`. That state is the result of applying messages.
 
+`session_subscribers` answers "who can receive live/applied frames here?" It
+does not answer "who appears in this room or workspace?" Catalogs that expose a
+room-like surface SHOULD provide `room_roster()` for presentation/API use and
+`live_audience(observation?)` for delivery introspection. The roster row shape is
+`{ id, name, presence, idle_seconds? }`, where `presence` is `"awake"`,
+`"idle"`, or `"sleeping"` as returned by `presence_status(actor)`. Rows are
+sorted by display `name` then `id`; `name` is the object's display title, not
+necessarily the raw `.name` property. Embodied room catalogs typically build the
+roster from contained actor bodies; workspace catalogs typically build it from
+non-expired subscribed sessions. A workspace actor whose subscribed session is
+no longer live may still appear as `"sleeping"` until the session expires or
+repair removes the subscription; live delivery remains stricter and only targets
+live sessions.
+
 ---
 
 ## S2. The call lifecycle

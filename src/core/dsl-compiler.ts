@@ -158,7 +158,8 @@ const BUILTINS = new Set([
   "set_object_name",
   // Cross-host detection (catalog authoring surfaces use it to refuse
   // remote writes with E_CROSS_HOST_WRITE before reaching SET_PROP).
-  "is_remote_object"
+  "is_remote_object",
+  "presence_status"
 ]);
 const RESERVED_NAMES = new Set([...FRAME_GLOBALS.keys(), ...KEYWORDS]);
 

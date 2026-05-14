@@ -204,8 +204,10 @@ workspace subscription.
   not move the actor.
 - In an embodied room catalog, a disconnected actor remains in
   `room_roster(actor.location)` and renders as sleeping.
-- Idle is presentation state derived from `idle_seconds(actor)`. Thresholds and
-  wording are catalog/UI policy.
+- Idle is presentation state derived from `presence_status(actor)` and
+  `idle_seconds(actor)`. The awake/idle/sleeping threshold is a shared
+  substrate policy so roster rows stay consistent; exact wording remains
+  catalog/UI policy.
 - Moving home after disconnect is catalog/world policy, usually `on_disfunc`,
   `@home`, guest reset, or a timed task. It is not a substrate invariant.
 - Non-player actors do not automatically need sleeping/awake presentation.
@@ -224,8 +226,8 @@ rules. Do not hardcode "must have a live session in this room" into substrate
 speech or observation machinery.
 
 The substrate should provide building blocks such as `contents`,
-`session_subscribers_for`, `is_connected`, and `idle_seconds`; the catalog
-chooses how to assemble them.
+`session_subscribers_for`, `presence_status`, `is_connected`, and
+`idle_seconds`; the catalog chooses how to assemble them.
 
 ## Migration and repair
 

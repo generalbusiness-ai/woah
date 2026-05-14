@@ -55,6 +55,14 @@ durable cells (`enter`, `go`/directions, `take`, `drop`, `give`) request
 `durable` so the commit scope, not a live-session snapshot, owns the
 resulting object/session location.
 
+`$room:room_roster()` is the catalog-facing answer to "who appears here" for
+embodied chat rooms. It lists actors physically contained by the room and
+enriches each row with the shared roster shape `{id, name, presence,
+idle_seconds?}`. `$room:live_audience(observation?)` is the separate delivery
+answer; it delegates to the substrate's observation audience rules and returns
+live subscribed session ids. Render/API code should use `room_roster()`, not
+`subscribers`, for presentation.
+
 **Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a taskspace's `:claim`, `:transition`); chat traffic flows past it.
 
 > Being a `$space` does not mean every verb on the object is sequenced ([core.md §C12](../../spec/semantics/core.md#c12-direct-messages-vs-space-mediated-messages)). A `$chatroom` is a `$space` and a feature consumer; chat verbs run as direct calls and never enter the room's sequence log. Saying something does not advance `next_seq`.
@@ -80,7 +88,9 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:tell(recipient, text)` | obj, str | Directed message; emits `told {from: actor, to: recipient, text}` to recipient only. |
 | `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
 | `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
-| `:who()` rxd | — | Returns the present-actor list and emits a private `who` observation to the caller. |
+| `:who()` rxd | — | Returns the present-actor list and emits a private `who` observation to the caller, including both compatibility `present_actors` and canonical `roster` rows. |
+| `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: physical occupants plus awake/idle/sleeping status. |
+| `:live_audience(observation?)` rxd | map? | Returns the live session audience for delivery using the substrate observation routing rules. |
 | `:enter(actor?)` | obj? | Moves the calling session into the room; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
 | `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |
 | `:huh(text, reason?)` | str, str? | Compatibility wrapper that delegates parse-failure output to `actor:huh(text, reason, this)`. |

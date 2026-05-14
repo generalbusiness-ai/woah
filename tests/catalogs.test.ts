@@ -2244,6 +2244,79 @@ describe("local catalogs", () => {
     }
   });
 
+  it("exposes roster and live-audience contracts on v2 spaces", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["pinboard", "dubspace"]);
+
+    const first = world.auth("guest:v2-roster-first");
+    const second = world.auth("guest:v2-roster-second");
+    await world.directCall("roster-chat-first", first.actor, "the_chatroom", "enter", []);
+    await world.directCall("roster-chat-second", second.actor, "the_chatroom", "enter", []);
+    const secondSession = world.sessions.get(second.id);
+    if (secondSession) secondSession.lastInputAt = Date.now() - 1_000_000;
+
+    const chatRoster = await world.directCall("roster-chat", first.actor, "the_chatroom", "room_roster", []);
+    expect(chatRoster.op).toBe("result");
+    if (chatRoster.op === "result") {
+      expect(chatRoster.result).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: first.actor, name: expect.any(String), presence: expect.stringMatching(/^(awake|idle)$/) }),
+        expect.objectContaining({ id: second.actor, name: expect.any(String), presence: "sleeping" })
+      ]));
+    }
+
+    const chatAudience = await world.directCall("audience-chat", first.actor, "the_chatroom", "live_audience", []);
+    expect(chatAudience.op).toBe("result");
+    if (chatAudience.op === "result") expect(chatAudience.result).toEqual([first.id]);
+
+    await world.directCall("roster-pinboard-enter", first.actor, "the_pinboard", "enter", []);
+    const pinboardRoster = await world.directCall("roster-pinboard", first.actor, "the_pinboard", "room_roster", []);
+    expect(pinboardRoster.op).toBe("result");
+    if (pinboardRoster.op === "result") {
+      expect(pinboardRoster.result).toEqual([
+        expect.objectContaining({ id: first.actor, name: expect.any(String), presence: expect.stringMatching(/^(awake|idle)$/) })
+      ]);
+    }
+    const pinboardAudience = await world.directCall("audience-pinboard", first.actor, "the_pinboard", "live_audience", []);
+    expect(pinboardAudience.op).toBe("result");
+    if (pinboardAudience.op === "result") expect(pinboardAudience.result).toEqual([first.id]);
+
+    world.createObject({ id: "the_side_pinboard", name: "Side Pinboard", parent: "$pinboard", owner: "$wiz", location: "the_deck" });
+    world.setProp("the_side_pinboard", "session_subscribers", [{ session: first.id, actor: first.actor }] as unknown as WooValue);
+    world.setProp("the_side_pinboard", "subscribers", [first.actor]);
+    const sidePinboardRoster = await world.directCall("roster-side-pinboard", first.actor, "the_side_pinboard", "room_roster", []);
+    expect(sidePinboardRoster.op).toBe("result");
+    if (sidePinboardRoster.op === "result") {
+      expect(sidePinboardRoster.result).toEqual([
+        expect.objectContaining({ id: first.actor, name: expect.any(String), presence: expect.stringMatching(/^(awake|idle)$/) })
+      ]);
+    }
+    const sidePinboardAudience = await world.directCall("audience-side-pinboard", first.actor, "the_side_pinboard", "live_audience", []);
+    expect(sidePinboardAudience.op).toBe("result");
+    if (sidePinboardAudience.op === "result") expect(sidePinboardAudience.result).toEqual([first.id]);
+
+    await world.directCall("roster-dubspace-enter", first.actor, "the_dubspace", "enter", []);
+    const dubspaceRoster = await world.directCall("roster-dubspace", first.actor, "the_dubspace", "room_roster", []);
+    expect(dubspaceRoster.op).toBe("result");
+    if (dubspaceRoster.op === "result") {
+      expect(dubspaceRoster.result).toEqual([
+        expect.objectContaining({ id: first.actor, name: expect.any(String), presence: expect.stringMatching(/^(awake|idle)$/) })
+      ]);
+    }
+
+    const observer = world.auth("guest:v2-roster-observer");
+    await world.directCall("roster-observer-deck", observer.actor, "the_deck", "enter", []);
+    world.setProp("the_chatroom", "session_subscribers", [{ session: observer.id, actor: observer.actor }] as unknown as WooValue);
+    world.setProp("the_chatroom", "subscribers", [observer.actor]);
+    const observedRoomRoster = await world.directCall("roster-chat-observer", observer.actor, "the_chatroom", "room_roster", []);
+    expect(observedRoomRoster.op).toBe("result");
+    if (observedRoomRoster.op === "result") {
+      expect((observedRoomRoster.result as Array<{ id: string }>).map((row) => row.id)).not.toContain(observer.actor);
+    }
+    const observedRoomAudience = await world.directCall("audience-chat-observer", observer.actor, "the_chatroom", "live_audience", []);
+    expect(observedRoomAudience.op).toBe("result");
+    if (observedRoomAudience.op === "result") expect(observedRoomAudience.result).toEqual([observer.id]);
+  });
+
   it("surfaces idle/connected presence via $player:look_self and the substrate readers", async () => {
     const world = createWorld();
     const guest = world.auth("guest:idle-a");
