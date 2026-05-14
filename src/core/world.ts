@@ -99,7 +99,7 @@ type CommandPlan = {
   verb: string;
   args: WooValue[];
   cmd: CommandMap;
-  commit_policy?: "execute_and_commit" | "execute_only";
+  persistence?: "durable" | "live";
 };
 
 const PASSWORD_PBKDF2_ITERATIONS = 600_000;
@@ -9484,9 +9484,10 @@ export class WooWorld {
       if (!space) throw wooError("E_NOLOCATION", "sequenced command has no command space", { target, verb: verbName });
     }
     const verb = resolved?.name ?? verbName;
-    const commitPolicy = route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
-      ? "execute_and_commit" as const
-      : undefined;
+    const persistence = commandPersistenceHint(resolved?.arg_spec)
+      ?? (route === "direct" && await this.commandPlanRequiresDurablePresence(ctx, target, verb)
+        ? "durable" as const
+        : undefined);
     return {
       ok: true,
       route,
@@ -9495,7 +9496,7 @@ export class WooWorld {
       verb,
       args,
       cmd,
-      ...(commitPolicy ? { commit_policy: commitPolicy } : {})
+      ...(persistence ? { persistence: persistence } : {})
     };
   }
 
@@ -10114,7 +10115,7 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     verb: map.verb,
     args: Array.isArray(map.args) ? map.args : [],
     cmd: commandMapFromValue(map.cmd),
-    ...(map.commit_policy === "execute_and_commit" || map.commit_policy === "execute_only" ? { commit_policy: map.commit_policy } : {})
+    ...(map.persistence === "durable" || map.persistence === "live" ? { persistence: map.persistence } : {})
   };
 }
 
@@ -10125,6 +10126,13 @@ function commandRouteHint(argSpec: Record<string, WooValue> | undefined): "direc
   if (!command || typeof command !== "object" || Array.isArray(command)) return null;
   const route = (command as Record<string, WooValue>).route;
   return route === "direct" || route === "sequenced" ? route : null;
+}
+
+function commandPersistenceHint(argSpec: Record<string, WooValue> | undefined): "durable" | "live" | null {
+  const command = argSpec?.command;
+  if (!command || typeof command !== "object" || Array.isArray(command)) return null;
+  const policy = (command as Record<string, WooValue>).persistence;
+  return policy === "durable" || policy === "live" ? policy : null;
 }
 
 function addUnique<T>(items: T[], item: T): T[] {

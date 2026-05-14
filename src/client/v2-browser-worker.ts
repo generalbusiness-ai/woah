@@ -13,7 +13,7 @@ type V2WorkerCommand =
   | { kind: "connect"; token: string; node?: string; scope?: string; actor?: string; session?: string }
   | { kind: "disconnect" }
   | { kind: "send"; envelope: ShadowEnvelope }
-  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; commit_policy?: "execute_and_commit" | "execute_only" }
+  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; persistence?: "durable" | "live" }
   | { kind: "get_projection"; scope?: string }
   | { kind: "cache_status" };
 
@@ -245,7 +245,7 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     target: command.target,
     verb: command.verb,
     args: Array.isArray(command.args) ? command.args as WooValue[] : [],
-    commit_policy: command.commit_policy ?? (command.route === "direct" ? "execute_only" : "execute_and_commit")
+    persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
   };
   const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
     v: 2,

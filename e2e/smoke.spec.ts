@@ -140,6 +140,24 @@ test("dubspace sends committed controls through the v2 intent path", async ({ pa
 
 test("chat boot uses /api/me and moves without /api/state", async ({ page }) => {
   const stateCalls: string[] = [];
+  const v2AppliedVerbs: string[] = [];
+  const v2TurnResultVerbs: string[] = [];
+  await page.exposeFunction("recordChatV2Applied", (verb: string) => {
+    v2AppliedVerbs.push(verb);
+  });
+  await page.exposeFunction("recordChatV2TurnResult", (verb: string) => {
+    v2TurnResultVerbs.push(verb);
+  });
+  await page.addInitScript(() => {
+    window.addEventListener("woo.v2.applied_frame", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      void (window as unknown as { recordChatV2Applied: (verb: string) => Promise<void> }).recordChatV2Applied(verb);
+    });
+    window.addEventListener("woo.v2.turn_result", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.frame?.command?.verb ?? "");
+      void (window as unknown as { recordChatV2TurnResult: (verb: string) => Promise<void> }).recordChatV2TurnResult(verb);
+    });
+  });
   await page.route("**/api/state", async (route) => {
     stateCalls.push(route.request().url());
     await route.fulfill({
@@ -149,18 +167,25 @@ test("chat boot uses /api/me and moves without /api/state", async ({ page }) => 
     });
   });
 
-  await page.goto("/objects/the_chatroom");
+  await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
 
-  await page.getByRole("button", { name: "Enter" }).click();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
   await expect(page.locator(".toolbar h1")).toHaveText("Living Room");
-  await expect(page.locator("[data-chat-input]")).toBeFocused();
+  await expect(page.locator("[data-chat-input]")).toBeFocused({ timeout: 5_000 });
+
+  const speech = `hello v2 chat ${crypto.randomUUID()}`;
+  await page.locator("[data-chat-input]").fill(`say ${speech}`);
+  await page.locator("[data-chat-input]").press("Enter");
+  await expect.poll(() => v2TurnResultVerbs, { timeout: 5_000 }).toContain("say");
+  expect(v2AppliedVerbs).not.toContain("say");
+  await expect(page.locator(".chat-feed")).toContainText(speech);
 
   await page.locator("[data-chat-input]").fill("se");
   await page.locator("[data-chat-input]").press("Enter");
+  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("southeast");
   await expect(page.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
   await expect(page.locator("[data-chat-input]")).toBeFocused();
   await expect(page.locator(".chat-feed")).toContainText("se");
@@ -168,7 +193,9 @@ test("chat boot uses /api/me and moves without /api/state", async ({ page }) => 
   await page.locator("[data-chat-input]").fill("west");
   await page.locator("[data-chat-input]").press("Enter");
   await expect(page.locator(".toolbar h1")).toHaveText("Living Room", { timeout: 5_000 });
+  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("west");
   await expect(page.locator("[data-chat-input]")).toBeFocused();
+  expect(v2AppliedVerbs).not.toContain("say");
   expect(stateCalls).toEqual([]);
 });
 

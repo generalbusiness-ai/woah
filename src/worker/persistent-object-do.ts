@@ -100,6 +100,7 @@ type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
   fanout?: Array<{ node: string; envelope: string }>;
+  committed_sessions?: SerializedSession[];
   head?: {
     kind: "woo.scope_head.shadow.v1";
     scope: ObjRef;
@@ -2683,6 +2684,7 @@ export class PersistentObjectDO {
         actor: att.actor,
         envelope: encoded
       });
+      await this.syncV2CommittedSessionLocations(world, result.committed_sessions ?? []);
       if (result.reply) ws.send(result.reply);
       this.sendV2Fanout(result.fanout ?? []);
     } catch (err) {
@@ -2714,6 +2716,21 @@ export class PersistentObjectDO {
     const payload = await response.json() as Record<string, unknown>;
     if (!response.ok) throw wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
     return payload as T;
+  }
+
+  private async syncV2CommittedSessionLocations(world: WooWorld, sessions: SerializedSession[]): Promise<void> {
+    for (const serialized of sessions) {
+      if (!serialized.currentLocation) continue;
+      const session = world.ensureSessionForActor(
+        serialized.id,
+        serialized.actor,
+        serialized.tokenClass,
+        serialized.expiresAt,
+        serialized.currentLocation,
+        serialized.apikeyId ?? undefined
+      );
+      await this.registerSessionRoute(session);
+    }
   }
 
   private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {

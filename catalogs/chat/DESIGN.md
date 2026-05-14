@@ -48,6 +48,13 @@ The chat verbs use the **direct live interaction** pattern from [core.md §C13](
 
 Because the chat verbs route directly, every observation they emit is live-only by [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route): pushed to the room's session audience, never stored. A late-joining client sees no scrollback. This matches MOO's `notify()` semantics. Object commands that mutate state can still route through the room's sequenced log; for example `teach bird "hello"` plans as a `$space:call` against the cockatoo, so the mutation and observation are replay-visible.
 
+On the v2 browser path, `arg_spec.command.persistence` distinguishes the two
+direct cases without changing the catalog's route model. Purely live speech
+(`say`, `tell`, `emote`, etc.) uses `live`; direct commands that move
+durable cells (`enter`, `go`/directions, `take`, `drop`, `give`) request
+`durable` so the commit scope, not a live-session snapshot, owns the
+resulting object/session location.
+
 **Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a taskspace's `:claim`, `:transition`); chat traffic flows past it.
 
 > Being a `$space` does not mean every verb on the object is sequenced ([core.md §C12](../../spec/semantics/core.md#c12-direct-messages-vs-space-mediated-messages)). A `$chatroom` is a `$space` and a feature consumer; chat verbs run as direct calls and never enter the room's sequence log. Saying something does not advance `next_seq`.

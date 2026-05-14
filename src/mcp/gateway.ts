@@ -335,7 +335,7 @@ export class McpGateway {
       call,
       key: shadowTurnKeyFromTranscript(planned.transcript),
       expected: client.relay.commit_scope.head,
-      commit_policy: "execute_and_commit"
+      persistence: "durable"
     };
     const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
       v: 2,

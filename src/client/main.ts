@@ -178,9 +178,9 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
-// Generic chat/room calls still keep a v1 fallback while the remaining
-// catalogs migrate. Catalogs that have been moved to v2 call the turn helper
-// directly and do not depend on this rollout flag.
+// Generic non-chat room calls still keep a v1 fallback while the remaining
+// catalog surfaces migrate. Chat, Pinboard, and Dubspace call the v2 turn
+// helper directly and do not depend on this rollout flag.
 const v2OutboundEnabled = new URLSearchParams(location.search).has("v2Outbound");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 let scopedProjectionEnabled = (() => {
@@ -481,6 +481,12 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
 function receiveAppliedFrame(frame: any) {
   ui.ingestAppliedFrame(frame);
   applyScopedMoveResult(frame.result);
+  const needsScopedDeferredLook = scopedProjectionEnabled
+    && frame.result
+    && typeof frame.result === "object"
+    && !Array.isArray(frame.result)
+    && frame.result.look_deferred === true
+    && typeof frame.result.room === "string";
   const observations = frame.observations ?? [];
   const frameErrors = appliedFrameErrorObservations({ observations });
   receiveAppliedFrameErrors(frame, observations);
@@ -524,6 +530,7 @@ function receiveAppliedFrame(frame: any) {
   rememberSeq(frame.space, frame.seq);
   scheduleLegacyStateRefresh();
   render();
+  if (needsScopedDeferredLook) void refresh().then(() => focusChatInput());
   if (needsPinboardNotesRefresh) refreshPinboardNotes();
   animatePinboardNotes(pinboardAnimations);
 }
@@ -2171,15 +2178,6 @@ function dubspaceSpace() {
   return String(state.world?.dubspaceMeta?.space ?? "");
 }
 
-function isDubspaceScope(space: string): boolean {
-  return Boolean(space && [
-    dubspaceSpace(),
-    activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace),
-    bundledToolSeeds.dubspace,
-    String(state.world?.dubspaceMeta?.space ?? "")
-  ].includes(space));
-}
-
 function taskspaceSpace() {
   if (scopedProjectionEnabled) {
     const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
@@ -2243,13 +2241,13 @@ type V2TurnInput = {
   target: string;
   verb: string;
   args?: unknown[];
-  commitPolicy?: "execute_and_commit" | "execute_only";
+  persistence?: "durable" | "live";
   options?: ProjectionCallOptions;
   onResult?: (result: any) => void;
   onError?: (error: any) => void;
 };
 
-function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "commitPolicy">): boolean {
+function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "persistence">): boolean {
   ensureV2BrowserWorker();
   syncV2BrowserWorkerScope(input.scope);
   if (!v2BrowserWorker || !state.actor || !state.session) return false;
@@ -2261,7 +2259,7 @@ function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "sc
     target: input.target,
     verb: input.verb,
     args: input.args ?? [],
-    ...(input.commitPolicy ? { commit_policy: input.commitPolicy } : {})
+    ...(input.persistence ? { persistence: input.persistence } : {})
   });
   return true;
 }
@@ -2279,7 +2277,7 @@ function v2Turn(input: V2TurnInput): string {
     target: input.target,
     verb: input.verb,
     args: input.args ?? [],
-    commitPolicy: input.commitPolicy
+    persistence: input.persistence
   })) {
     ui.failOptimisticCall(id);
     pendingDirect.delete(id);
@@ -2307,9 +2305,9 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     }
     const id = crypto.randomUUID();
     const args = Array.isArray(plan.args) ? plan.args : [];
-    const commitPolicy = plan.commit_policy === "execute_and_commit" || plan.commit_policy === "execute_only"
-      ? plan.commit_policy
-      : route === "direct" ? "execute_only" : "execute_and_commit";
+    const persistence = plan.persistence === "durable" || plan.persistence === "live"
+      ? plan.persistence
+      : route === "direct" ? "live" : "durable";
     ui.applyOptimisticCall(id, undefined);
     pendingCommands.set(id, { space, text, action: { target, verb } });
     if (onError) pendingFrameErrors.set(id, onError);
@@ -2320,7 +2318,7 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
       target,
       verb,
       args,
-      commitPolicy
+      persistence
     })) {
       ui.failOptimisticCall(id);
       pendingCommands.delete(id);
@@ -2339,7 +2337,7 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     target: space,
     verb: "command_plan",
     args: [text],
-    commitPolicy: "execute_only"
+    persistence: "live"
   })) {
     pendingFrameErrors.delete(planId);
     pendingDirect.delete(planId);
@@ -2438,8 +2436,16 @@ function canSendDirect() {
   return Boolean(state.actor && state.session && state.socket?.readyState === WebSocket.OPEN);
 }
 
+function canSendChat() {
+  return canSendChatV2() || canSendDirect();
+}
+
 function canSendV2Browser() {
   return Boolean(state.actor && state.session && authToken());
+}
+
+function canSendChatV2() {
+  return canSendV2Browser();
 }
 
 function canSendDubspaceV2() {
@@ -2484,7 +2490,7 @@ function sendPreviewControl(target: string, name: string, value: any) {
   if (Date.now() - last < 35) return;
   directThrottle.set(key, Date.now());
   const space = dubspaceSpace();
-  v2Turn({ scope: space, route: "direct", target: space, verb: "preview_control", args: [target, name, value], commitPolicy: "execute_only" });
+  v2Turn({ scope: space, route: "direct", target: space, verb: "preview_control", args: [target, name, value], persistence: "live" });
 }
 
 function dubspaceOptimisticProps(target: string, props: Record<string, unknown>, id = `${target}:${Object.keys(props).sort().join(",")}`): ProjectionCallOptions | undefined {
@@ -2652,7 +2658,7 @@ function syncDubspaceProjectionEffects(observation?: any) {
     const name = String(observation.name ?? "");
     const input = findControlInput(target, name);
     const projected = target && name ? projectedObjectView(target)?.props?.[name] : undefined;
-    // Direct v2 control gestures are execute-only, so the durable projection can
+    // Direct v2 control gestures use live persistence, so the durable projection can
     // legitimately lag the live observation. Applied frames call this without an
     // observation and use the projected value after the commit lands.
     if (input && document.activeElement !== input) setControlInputValue(input, observation ? observation.value : projected);
@@ -3160,7 +3166,7 @@ function enterDubspace() {
     target: space,
     verb: "enter",
     args: [],
-    commitPolicy: "execute_and_commit",
+    persistence: "durable",
     onResult: (result) => {
       setDubspaceOperators(result);
       void ensureScopedOverlayForTab("dubspace").then(() => {
@@ -3191,7 +3197,7 @@ function leaveDubspace(done?: () => void) {
     target: space,
     verb: "leave",
     args: [],
-    commitPolicy: "execute_and_commit",
+    persistence: "durable",
     onResult: (result) => {
       setDubspaceOperators(result);
       done?.();
@@ -3297,15 +3303,20 @@ function renderStepRow(voice: string, label: string, row: boolean[]) {
 
 function enterChat() {
   const room = activeChatRoom();
-  if (!room || !canSendDirect()) return;
+  if (!room || !canSendChat()) return;
   const onError = chatErrorHandler(room);
-  direct(room, "enter", [], (result) => {
+  const onResult = (result: any) => {
     applyScopedMoveResult(result);
     setCurrentChatRoom(room);
     setChatPresent(result);
     if (!scopedProjectionEnabled && result?.look_deferred === true) direct(room, "look", [], applyLookResult, onError);
     if (state.tab === "chat") render();
-  }, onError);
+  };
+  if (canSendChatV2()) {
+    v2Turn({ scope: room, route: "direct", target: room, verb: "enter", args: [], persistence: "durable", onResult, onError });
+    return;
+  }
+  direct(room, "enter", [], onResult, onError);
 }
 
 function isChatObservation(observation: any) {
@@ -3861,7 +3872,7 @@ function mountChatComponent() {
     present,
     draft: state.chatDraft,
     inRoom,
-    canSend: canSendDirect()
+    canSend: canSendChat()
   }, () => scrollChatFeedToEnd(element.querySelector<HTMLElement>(".chat-feed") ?? ".chat-feed"));
 }
 
@@ -4069,11 +4080,7 @@ function sendChatInput(space: string, text: string) {
   // Local-only echo so the feed reads as a transcript; never emitted server-side.
   pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
   const onError = chatErrorHandler(space);
-  if ((isDubspaceScope(space) || state.tab === "dubspace") && canSendDubspaceV2()) {
-    v2PlanAndExecuteCommand(space, text, onError);
-    return;
-  }
-  if ((space === pinboardSpace() || state.tab === "pinboard") && canSendPinboardV2()) {
+  if (canSendChatV2()) {
     v2PlanAndExecuteCommand(space, text, onError);
     return;
   }
@@ -4155,6 +4162,7 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setChatPresent(result);
     if (!scopedProjectionEnabled && result.look_deferred === true) direct(room, "look", [], applyLookResult, chatErrorHandler(room));
     if (!scopedProjectionEnabled) void refresh();
+    else if (result.look_deferred === true) void refresh().then(() => focusChatInput());
     else render();
     return;
   }
@@ -4163,6 +4171,7 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setChatPresent(result);
     if (!scopedProjectionEnabled && result?.look_deferred === true && target) direct(target, "look", [], applyLookResult, chatErrorHandler(target));
     if (!scopedProjectionEnabled) void refresh();
+    else if (result?.look_deferred === true) void refresh().then(() => focusChatInput());
     else render();
     return;
   }
@@ -4823,7 +4832,7 @@ function publishPinboardViewport() {
       target: board,
       verb: "viewport",
       args: [viewport.x, viewport.y, viewport.w, viewport.h, viewport.scale],
-      commitPolicy: "execute_only"
+      persistence: "live"
     });
   }
 }
@@ -5009,7 +5018,7 @@ function enterPinboard() {
     target: board,
     verb: "enter",
     args: [],
-    commitPolicy: "execute_and_commit",
+    persistence: "durable",
     onResult: (result) => {
       applyScopedMoveResult(result);
       setPinboardPresent(result);
@@ -5038,7 +5047,7 @@ function leavePinboard(done?: () => void) {
     target: board,
     verb: "leave",
     args: [],
-    commitPolicy: "execute_and_commit",
+    persistence: "durable",
     onResult: (result) => {
       applyScopedMoveResult(result);
       setPinboardPresent(result);
@@ -5105,7 +5114,7 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
     target: board,
     verb: "list_notes",
     args: [],
-    commitPolicy: "execute_only",
+    persistence: "live",
     onResult: (result) => {
       pinboardNotesRefreshPending = false;
       if (!Array.isArray(result)) return;

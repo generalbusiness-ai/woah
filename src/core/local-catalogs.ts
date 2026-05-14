@@ -90,6 +90,7 @@ const LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION = "2026-05-09-dispens
 const LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION = "2026-05-09-wiz-programmer-parent";
 const LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION = "2026-05-13-dubspace-v2-control-presence";
 const LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION = "2026-05-13-dubspace-v2-control-authority";
+const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION = "2026-05-13-chat-v2-command-persistence";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -151,7 +152,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION, only: "dubspace" },
-  { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, only: "dubspace" }
+  { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, only: "dubspace" },
+  { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, only: "chat" }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -392,6 +394,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runWizProgrammerParentMigration(world, names);
   runDubspaceV2ControlPresenceMigration(world, names);
   run(LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
+  run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   return covered;
 }
 

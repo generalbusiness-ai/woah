@@ -507,6 +507,7 @@ async function handleV2ShadowFrame(
     ensureDevV2SerializedSession(browser.relay, session);
     const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
     const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+    if (reply?.body.ok === true && reply.body.commit) syncDevV2CommittedSessionLocation(browser.relay, session);
     if (reply) {
       ws.send(encodeEnvelope(reply));
       sendDevV2Fanout(browser, reply);
@@ -523,6 +524,19 @@ async function handleV2ShadowFrame(
       message: normalizeError(err).message ?? "v2 transport error"
     })));
   }
+}
+
+function syncDevV2CommittedSessionLocation(relay: ShadowBrowserRelayShim, session: Session): void {
+  const serialized = relay.commit_scope.serialized.sessions.find((item) => item.id === session.id && item.actor === session.actor);
+  if (!serialized?.currentLocation) return;
+  world.ensureSessionForActor(
+    serialized.id,
+    serialized.actor,
+    serialized.tokenClass,
+    serialized.expiresAt,
+    serialized.currentLocation,
+    serialized.apikeyId ?? undefined
+  );
 }
 
 function sendDevV2Fanout(

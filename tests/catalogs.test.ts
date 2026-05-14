@@ -1574,7 +1574,7 @@ describe("local catalogs", () => {
     const dubspaceChatPlan = await world.directCall("plan-dubspace-chat", first.actor, "the_dubspace", "command_plan", ["say hello dubspace"]);
     expect(dubspaceChatPlan.op).toBe("result");
     if (dubspaceChatPlan.op === "result") {
-      expect(dubspaceChatPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "say", args: ["hello dubspace"] });
+      expect(dubspaceChatPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "say", args: ["hello dubspace"], persistence: "live" });
     }
 
     const dubspaceBareMiss = await world.directCall("plan-dubspace-bare-miss", first.actor, "the_dubspace", "command_plan", ["hello dubspace"]);
@@ -1594,7 +1594,7 @@ describe("local catalogs", () => {
     const dubspaceBareEnterPlan = await world.directCall("plan-dubspace-bare-enter", first.actor, "the_dubspace", "command_plan", ["enter"]);
     expect(dubspaceBareEnterPlan.op).toBe("result");
     if (dubspaceBareEnterPlan.op === "result") {
-      expect(dubspaceBareEnterPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "enter", args: [], commit_policy: "execute_and_commit" });
+      expect(dubspaceBareEnterPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "enter", args: [], persistence: "durable" });
     }
 
     const dubspaceBpmPlan = await world.directCall("plan-dubspace-bpm-direct", first.actor, "$match", "plan_command", ["bpm 142", "the_dubspace"]);
@@ -1878,10 +1878,16 @@ describe("local catalogs", () => {
       expect(room.contents.map((item) => item.id)).not.toContain(session.actor);
     }
 
+    const sayPlan = await world.directCall("plan-say", session.actor, "the_chatroom", "command_plan", ["say hello"]);
+    expect(sayPlan.op).toBe("result");
+    if (sayPlan.op === "result") {
+      expect(sayPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "say", args: ["hello"], persistence: "live" });
+    }
+
     const takePlan = await world.directCall("plan-take-lamp", session.actor, "the_chatroom", "command_plan", ["take lamp"]);
     expect(takePlan.op).toBe("result");
     if (takePlan.op === "result") {
-      expect(takePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["lamp"] });
+      expect(takePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["lamp"], persistence: "durable" });
     }
 
     // "get mug" — the dobj resolves to the_mug (visible in the room) but the
@@ -1893,7 +1899,7 @@ describe("local catalogs", () => {
     const getMugPlan = await world.directCall("plan-get-mug", session.actor, "the_chatroom", "command_plan", ["get mug"]);
     expect(getMugPlan.op).toBe("result");
     if (getMugPlan.op === "result") {
-      expect(getMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["mug"] });
+      expect(getMugPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["mug"], persistence: "durable" });
     }
 
     // "get whatever" should route to the room's take verb so room_take owns
@@ -1902,7 +1908,7 @@ describe("local catalogs", () => {
     const missingTakePlan = await world.directCall("plan-take-missing", session.actor, "the_chatroom", "command_plan", ["get whatever"]);
     expect(missingTakePlan.op).toBe("result");
     if (missingTakePlan.op === "result") {
-      expect(missingTakePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["whatever"] });
+      expect(missingTakePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "take", args: ["whatever"], persistence: "durable" });
     }
 
     const bareDropPlan = await world.directCall("plan-drop-bare", session.actor, "the_chatroom", "command_plan", ["drop"]);
@@ -1935,7 +1941,7 @@ describe("local catalogs", () => {
     const goPlan = await world.directCall("plan-se-deck", session.actor, "the_chatroom", "command_plan", ["se"]);
     expect(goPlan.op).toBe("result");
     if (goPlan.op === "result") {
-      expect(goPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "southeast", args: [] });
+      expect(goPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "southeast", args: [], persistence: "durable" });
     }
 
     const goDeck = await world.directCall("se-deck", session.actor, "the_chatroom", "southeast", []);
@@ -1956,7 +1962,7 @@ describe("local catalogs", () => {
     const enterTubPlan = await world.directCall("plan-enter-tub", session.actor, "the_deck", "command_plan", ["enter tub"]);
     expect(enterTubPlan.op).toBe("result");
     if (enterTubPlan.op === "result") {
-      expect(enterTubPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "enter", args: [] });
+      expect(enterTubPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "enter", args: [], persistence: "durable" });
     }
 
     const takeTowel = await world.directCall("take-towel", session.actor, "the_deck", "take", ["towel"]);
@@ -2008,7 +2014,7 @@ describe("local catalogs", () => {
     const givePlan = await world.directCall("plan-give", giver.actor, "the_chatroom", "command_plan", [`give lamp to ${recvName}`]);
     expect(givePlan.op).toBe("result");
     if (givePlan.op === "result") {
-      expect(givePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_lamp", verb: "give", args: [recvName] });
+      expect(givePlan.result).toMatchObject({ ok: true, route: "direct", target: "the_lamp", verb: "give", args: [recvName], persistence: "durable" });
     }
 
     const give = await world.directCall("give-lamp", giver.actor, "the_lamp", "give", [recvName]);
@@ -2758,7 +2764,7 @@ describe("local catalogs", () => {
     await world.directCall("enter-command-plan-repair", session.actor, "the_chatroom", "enter", []);
     const plan = await world.directCall("repaired-plan", session.actor, "the_chatroom", "command_plan", ["say hello after repair"]);
     expect(plan.op).toBe("result");
-    if (plan.op === "result") expect(plan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "say", args: ["hello after repair"] });
+    if (plan.op === "result") expect(plan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "say", args: ["hello after repair"], persistence: "live" });
     const lookPlan = await world.directCall("repaired-look-plan", session.actor, "the_chatroom", "command_plan", ["look mug"]);
     expect(lookPlan.op).toBe("result");
     if (lookPlan.op === "result") expect(lookPlan.result).toMatchObject({ route: "direct", target: "the_chatroom", verb: "look_at", args: ["the_mug"] });

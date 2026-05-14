@@ -43,7 +43,7 @@ action model carries those gestures directly.
 Browser clients route Pinboard through v2. Enter/leave commit because durable
 board presence is the authorization precondition for sequenced note/layout
 edits. Viewport telemetry and read-only note hydration execute on the v2 direct
-plane with `execute_only`; create, edit, recolor, layout, take, and drop execute
+plane with `live`; create, edit, recolor, layout, take, and drop execute
 on the commit plane. The embedded mini-chat also uses the catalog command
 planner over v2 so command aliases remain catalog-owned instead of being parsed
 in client code.

@@ -188,7 +188,7 @@ export type ShadowTurnExecRequest = {
     max_bytes?: number;
   };
   max_transfer_bytes?: number;
-  commit_policy?: "execute_and_commit" | "execute_only";
+  persistence?: "durable" | "live";
 };
 
 export type ShadowTurnExecReply =
@@ -530,7 +530,7 @@ export async function executeShadowTurnCallOrNeedState(
     };
   }
 
-  const commit = options.commitScope && request.commit_policy !== "execute_only"
+  const commit = options.commitScope && request.persistence !== "live"
     ? submitShadowCommit(options.commitScope, {
         kind: "woo.commit.submit.shadow.v1",
         id: request.id ?? request.call.id,
@@ -558,17 +558,17 @@ export async function executeShadowTurnCallOrNeedState(
     };
   }
 
-  const executeOnly = request.commit_policy === "execute_only";
+  const livePersistence = request.persistence === "live";
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
     ? options.commitScope?.serialized ?? run.serializedAfter
-    : executeOnly
+    : livePersistence
       ? serializedBefore
     : run.serializedAfter;
   node.serialized = structuredClone(serializedAfter) as SerializedWorld;
-  // Execute-only turns are live/direct observations, not authority-bearing
+  // Live-persistence turns are live/direct observations, not authority-bearing
   // state transitions. Keep their reply transcript, but discard the executor's
   // speculative world so the next durable turn plans against the commit scope.
-  if (executeOnly) node.world = undefined;
+  if (livePersistence) node.world = undefined;
   for (const hash of actualKey.atom_hashes) node.atom_hashes.add(hash);
   for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
   refreshNodeObjectHashes(node);
