@@ -1121,10 +1121,10 @@ reports reset. The browser worker bundles into the SPA on every deployment and
 the UI consumes applied frames that arrive from the v2 worker. Catalogs can move
 their own controls to v2 by submitting `woo.turn.intent.request.shadow.v1`
 through the shared browser helper; controls still on the legacy `/ws` path do
-not produce v2 applied frames. With the explicit `v2Outbound` flag, the SPA also
-sends generic sequenced UI calls through v2 so the wire path can exercise commit
-authority before browser-local planning is complete.
-The default browser chat surface uses the same helper without the rollout flag:
+not produce v2 applied frames. The SPA sends generic sequenced UI calls through
+the same v2 helper whenever a browser-session token is available, falling back
+to the legacy `/ws` call frame only when v2 cannot be opened.
+The default browser chat surface uses the same helper:
 it asks the catalog `command_plan` verb to parse text, executes speech/tells as
 direct `live` turns, and executes room movement/carrying commands as
 direct `durable` turns when the catalog marks them with

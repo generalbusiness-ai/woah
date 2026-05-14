@@ -178,10 +178,6 @@ const pinboardNewColorKey = "woo.pinboard.newColor";
 const legacyPinboardChatHeightKey = "woo.pinboard.chatHeight";
 const spaceChatHeightsKey = "woo.spaceChat.heights";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
-// Generic non-chat room calls still keep a v1 fallback while the remaining
-// catalog surfaces migrate. Chat, Pinboard, and Dubspace call the v2 turn
-// helper directly and do not depend on this rollout flag.
-const v2OutboundEnabled = new URLSearchParams(location.search).has("v2Outbound");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 let scopedProjectionEnabled = (() => {
   const params = new URLSearchParams(location.search);
@@ -258,9 +254,11 @@ let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, l
 let routeInitialized = false;
 let v2BrowserWorker: Worker | undefined;
 let v2BrowserWorkerScope = "";
+let taskspaceComponentEventsBound = false;
 state.spaceChatHeights = loadSpaceChatHeights();
 
 installBundledCatalogUi();
+bindTaskspaceComponentEvents();
 state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
 if (state.authStatus === "authenticated") connect();
 else render();
@@ -2192,9 +2190,12 @@ function taskspaceSpace() {
     }
     if (state.routedSubjects.taskspace) return state.routedSubjects.taskspace;
     const scoped = scopedToolSubject("taskspace");
-    return scoped;
+    return scoped || activeInstalledCatalogSeed("taskspace", bundledToolSeeds.taskspace);
   }
-  return String(state.world?.taskspaceMeta?.space ?? "");
+  // Taskspace root actions can be clicked before the legacy `/api/state`
+  // compatibility meta has hydrated; use the bundled seed as the cold-start
+  // subject. Pinboard/chat still wait for their scoped route or API meta.
+  return String(state.world?.taskspaceMeta?.space || bundledToolSeeds.taskspace || "");
 }
 
 function pinboardSpace() {
@@ -2229,7 +2230,7 @@ function activeChatRoom() {
 function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (v2OutboundEnabled && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
+  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
   if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) ui.failOptimisticCall(id);
   return id;
 }
@@ -2350,6 +2351,7 @@ function callWithError(space: string, target: string, verb: string, args: unknow
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   if (onError) pendingFrameErrors.set(id, onError);
+  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
   if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) {
     ui.failOptimisticCall(id);
     pendingFrameErrors.delete(id);
@@ -5265,47 +5267,50 @@ function mountTaskspaceComponent() {
   }, () => {
     if (space) mountToolSpaceChat(element, space);
   });
-  bindTaskspaceComponentEvents(element);
 }
 
-function bindTaskspaceComponentEvents(element: WooElement) {
-  if (element.dataset.taskspaceEventsBound === "true") return;
-  element.dataset.taskspaceEventsBound = "true";
-  element.addEventListener("woo-taskspace-status-filter", (event) => {
+function bindTaskspaceComponentEvents() {
+  if (taskspaceComponentEventsBound) return;
+  taskspaceComponentEventsBound = true;
+  // Taskspace can rerender the custom element while a route-enter direct call
+  // is still settling. Delegate these catalog UI events at the document level
+  // so the app bridge survives element replacement and custom-element upgrade
+  // timing.
+  document.addEventListener("woo-taskspace-status-filter", (event) => {
     const status = String((event as CustomEvent<{ status?: unknown }>).detail?.status ?? "");
     if (!status) return;
     state.taskStatusFilter[status] = state.taskStatusFilter[status] === false;
     syncTaskSelection();
     render();
   });
-  element.addEventListener("woo-taskspace-create", (event) => {
+  document.addEventListener("woo-taskspace-create", (event) => {
     const detail = (event as CustomEvent<{ name?: unknown; text?: unknown }>).detail ?? {};
     const name = String(detail.name ?? "").trim() || "Untitled";
     const text = String(detail.text ?? "").trim();
     const space = taskspaceSpace();
     if (space) taskspaceCall(space, "create_task", [name, text], (id) => pendingTaskSelections.add(id));
   });
-  element.addEventListener("woo-taskspace-toggle", (event) => {
+  document.addEventListener("woo-taskspace-toggle", (event) => {
     const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
     if (!id) return;
     state.taskExpanded[id] = state.taskExpanded[id] === false;
     render();
   });
-  element.addEventListener("woo-taskspace-select", (event) => {
+  document.addEventListener("woo-taskspace-select", (event) => {
     const id = String((event as CustomEvent<{ id?: unknown }>).detail?.id ?? "");
     if (!id) return;
     setSelectedTask(id, { apply: false });
     state.taskExpanded[id] = state.taskExpanded[id] ?? true;
     setTab("taskspace", { mode: "push", leaveCurrent: false });
   });
-  element.addEventListener("woo-taskspace-task-action", (event) => {
+  document.addEventListener("woo-taskspace-task-action", (event) => {
     const id = state.selectedTask;
     const action = String((event as CustomEvent<{ action?: unknown }>).detail?.action ?? "");
     if (!id) return;
     if (action === "claim" || action === "release") taskspaceCall(id, action, []);
     if (action.startsWith("status:")) taskspaceCall(id, "set_status", [action.slice("status:".length)]);
   });
-  element.addEventListener("woo-taskspace-add-subtask", (event) => {
+  document.addEventListener("woo-taskspace-add-subtask", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const detail = (event as CustomEvent<{ name?: unknown; text?: unknown }>).detail ?? {};
@@ -5314,25 +5319,25 @@ function bindTaskspaceComponentEvents(element: WooElement) {
     state.taskExpanded[id] = true;
     taskspaceCall(id, "add_subtask", [name, text], (callId) => pendingTaskSelections.add(callId));
   });
-  element.addEventListener("woo-taskspace-add-requirement", (event) => {
+  document.addEventListener("woo-taskspace-add-requirement", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const text = String((event as CustomEvent<{ text?: unknown }>).detail?.text ?? "").trim() || "Requirement";
     taskspaceCall(id, "add_requirement", [text]);
   });
-  element.addEventListener("woo-taskspace-check-requirement", (event) => {
+  document.addEventListener("woo-taskspace-check-requirement", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const detail = (event as CustomEvent<{ index?: unknown; checked?: unknown }>).detail ?? {};
     taskspaceCall(id, "check_requirement", [Number(detail.index), detail.checked === true]);
   });
-  element.addEventListener("woo-taskspace-add-message", (event) => {
+  document.addEventListener("woo-taskspace-add-message", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const body = String((event as CustomEvent<{ body?: unknown }>).detail?.body ?? "").trim() || "Update";
     taskspaceCall(id, "add_message", [body]);
   });
-  element.addEventListener("woo-taskspace-add-artifact", (event) => {
+  document.addEventListener("woo-taskspace-add-artifact", (event) => {
     const id = state.selectedTask;
     if (!id) return;
     const ref = String((event as CustomEvent<{ ref?: unknown }>).detail?.ref ?? "").trim() || "https://example.com";

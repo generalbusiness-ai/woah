@@ -734,7 +734,60 @@ test("chat command enters dubspace UI", async ({ page }) => {
 });
 
 test("taskspace supports hierarchical task workflow", async ({ page, request }) => {
+  const v2AppliedVerbs: string[] = [];
+  const v2WorkerCalls: string[] = [];
+  const taskspaceEvents: string[] = [];
+  const legacyOutboundOps: string[] = [];
+  await page.exposeFunction("recordTaskspaceV2Applied", (verb: string) => {
+    v2AppliedVerbs.push(verb);
+  });
+  await page.exposeFunction("recordTaskspaceV2WorkerCall", (verb: string) => {
+    v2WorkerCalls.push(verb);
+  });
+  await page.exposeFunction("recordTaskspaceEvent", (kind: string) => {
+    taskspaceEvents.push(kind);
+  });
+  await page.exposeFunction("recordTaskspaceLegacyOutbound", (op: string) => {
+    legacyOutboundOps.push(op);
+  });
+  await page.addInitScript(() => {
+    document.addEventListener("woo-taskspace-create", () => {
+      void (window as unknown as { recordTaskspaceEvent: (kind: string) => Promise<void> }).recordTaskspaceEvent("create");
+    });
+    window.addEventListener("woo.v2.applied_frame", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      void (window as unknown as { recordTaskspaceV2Applied: (verb: string) => Promise<void> }).recordTaskspaceV2Applied(verb);
+    });
+    const OriginalWorker = Worker;
+    class InstrumentedWooWorker extends OriginalWorker {
+      postMessage(message: unknown, transfer?: Transferable[] | StructuredSerializeOptions): void {
+        const body = message as { kind?: string; verb?: string };
+        if (body?.kind === "call" && typeof body.verb === "string") {
+          void (window as unknown as { recordTaskspaceV2WorkerCall: (verb: string) => Promise<void> }).recordTaskspaceV2WorkerCall(body.verb);
+        }
+        if (transfer === undefined) super.postMessage(message);
+        else super.postMessage(message, transfer as Transferable[]);
+      }
+    }
+    window.Worker = InstrumentedWooWorker as unknown as typeof Worker;
+    const originalSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function patchedWooSend(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+      if (typeof data === "string") {
+        try {
+          const frame = JSON.parse(data);
+          if (frame?.op === "call" || frame?.op === "command" || frame?.op === "direct") {
+            void (window as unknown as { recordTaskspaceLegacyOutbound: (op: string) => Promise<void> }).recordTaskspaceLegacyOutbound(String(frame.op));
+          }
+        } catch {
+          // Ignore non-JSON websocket payloads; the production sender handles them.
+        }
+      }
+      return originalSend.call(this, data);
+    };
+  });
+
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
   const actorName = actor.replace(/^guest_(\d+)$/, "Guest $1");
@@ -749,16 +802,25 @@ test("taskspace supports hierarchical task workflow", async ({ page, request }) 
   await page.getByRole("button", { name: "Taskspace" }).click();
   await expect(page.locator('[data-task-status="open"]')).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator('[data-task-status="done"]')).toHaveAttribute("aria-pressed", "false");
-  await page.getByPlaceholder("Root task title").fill(rootTitle);
-  await page.locator(".task-create").getByPlaceholder("Description").fill("Root task from browser smoke");
+  const rootTitleInput = page.getByPlaceholder("Root task title");
+  const rootDescriptionInput = page.locator(".task-create").getByPlaceholder("Description");
+  await rootTitleInput.fill(rootTitle);
+  await rootDescriptionInput.fill("Root task from browser smoke");
+  await expect(rootTitleInput).toHaveValue(rootTitle);
+  await expect(rootDescriptionInput).toHaveValue("Root task from browser smoke");
   await page.locator(".task-create").getByRole("button", { name: "Create" }).click();
+  await expect.poll(() => taskspaceEvents, { timeout: 2_000 }).toContain("create");
+  await expect.poll(() => v2WorkerCalls, { timeout: 5_000 }).toContain("create_task");
   await expect(page.locator(".inspector h2")).toHaveText(rootTitle, { timeout: 5_000 });
+  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("create_task");
 
   const inspector = page.locator(".inspector");
   await inspector.getByRole("button", { name: "Claim" }).click();
   await expect(inspector).toContainText(actorText);
+  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("claim");
   await inspector.getByRole("button", { name: "In Progress" }).click();
-  await expect(inspector.locator(".status-pill").first()).toContainText("in progress");
+  await expect(inspector.locator(".task-inspector-head .pill").first()).toContainText("in progress");
+  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("set_status");
 
   const session = await page.evaluate(() => localStorage.getItem("woo.session"));
   expect(session).toBeTruthy();
@@ -796,6 +858,7 @@ test("taskspace supports hierarchical task workflow", async ({ page, request }) 
   await expect(page.locator(".tree")).not.toContainText(subTitle);
   await page.locator('[data-task-status="done"]').click();
   await expect(page.locator(".tree")).toContainText(subTitle);
+  expect(legacyOutboundOps.filter((op) => op === "call" || op === "command")).toEqual([]);
 });
 
 test("REST runtime API supports auth, calls, properties, and logs", async ({ request }) => {
