@@ -2333,7 +2333,13 @@ function v2Turn(input: V2TurnInput): string {
   return id;
 }
 
-function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: any) => void): string {
+function v2PlanAndExecuteCommand(
+  space: string,
+  text: string,
+  onError?: (error: any) => void,
+  onResult?: (result: any) => void,
+  options?: ProjectionCallOptions
+): string {
   const planId = crypto.randomUUID();
   if (onError) pendingFrameErrors.set(planId, onError);
   const handlePlan = (plan: any) => {
@@ -2354,13 +2360,20 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     const persistence = plan.persistence === "durable" || plan.persistence === "live"
       ? plan.persistence
       : route === "direct" ? "live" : "durable";
-    ui.applyOptimisticCall(id, undefined);
+    const plannedScope = typeof plan.space === "string" && plan.space ? plan.space : "";
+    // Catalog command plans for workspace entry and room movement can be
+    // direct durable calls without an explicit scope. Execute those against
+    // the destination scope so commit validation and accepted-frame fan-out
+    // match toolbar entry points such as the Dubspace and Pinboard buttons.
+    const scope = plannedScope || (route === "direct" && persistence === "durable" && directPersistenceForVerb(verb) === "durable" ? target : space);
+    ui.applyOptimisticCall(id, options);
     pendingCommands.set(id, { space, text, action: { target, verb } });
+    if (onResult) pendingDirect.set(id, onResult);
     if (onError) pendingFrameErrors.set(id, onError);
     if (!sendV2TurnIntent({
       id,
       route,
-      scope: space,
+      scope,
       target,
       verb,
       args,
@@ -2368,6 +2381,7 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     })) {
       ui.failOptimisticCall(id);
       pendingCommands.delete(id);
+      pendingDirect.delete(id);
       pendingFrameErrors.delete(id);
     }
   };
@@ -2440,7 +2454,7 @@ function shouldAutoEnterDefaultChatRoom() {
 }
 
 function ensureSpacePresence(space: string, onReady: () => void, onError?: (error: any) => void) {
-  if (!space || !canSendDirect()) {
+  if (!space || (!canSendV2Browser() && !canSendDirect())) {
     onReady();
     return;
   }
@@ -2451,11 +2465,32 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
   direct(space, "enter", [], onReady, onError);
 }
 
-function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
+function directPersistenceForVerb(verb: string): "durable" | "live" {
+  return verb === "enter" || verb === "leave" || verb === "out" ? "durable" : "live";
+}
+
+function direct(
+  target: string,
+  verb: string,
+  args: unknown[] = [],
+  onResult?: (result: any) => void,
+  onError?: (error: any) => void,
+  options?: ProjectionCallOptions,
+  scope = target
+) {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   if (onResult) pendingDirect.set(id, onResult);
   if (onError) pendingFrameErrors.set(id, onError);
+  if (canSendV2Browser() && sendV2TurnIntent({
+    id,
+    route: "direct",
+    scope,
+    target,
+    verb,
+    args,
+    persistence: directPersistenceForVerb(verb)
+  })) return id;
   if (!sendFrame({ op: "direct", id, target, verb, args })) {
     ui.failOptimisticCall(id);
     pendingDirect.delete(id);
@@ -2465,6 +2500,9 @@ function direct(target: string, verb: string, args: unknown[] = [], onResult?: (
 }
 
 function command(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
+  if (canSendV2Browser()) {
+    return v2PlanAndExecuteCommand(space, text, onError, onResult, options);
+  }
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   pendingCommands.set(id, { space, text });
@@ -2488,7 +2526,7 @@ function canSendChat() {
 }
 
 function canSendV2Browser() {
-  return Boolean(state.actor && state.session && authToken());
+  return scopedProjectionEnabled && Boolean(state.actor && state.session && authToken());
 }
 
 function canSendChatV2() {
@@ -4066,7 +4104,7 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
       return null;
     },
     directCall: (target, verb, args = [], options) => new Promise((resolve, reject) => {
-      direct(target, verb, args, resolve, reject, options);
+      direct(target, verb, args, resolve, reject, options, subject);
     }),
     emit: (action) => ui.frames.emit(action)
   };
@@ -5268,7 +5306,7 @@ function firstMatchingTask(ids: string[], tasks: any, active: Set<string>): stri
 
 function enterTaskspace() {
   const space = taskspaceSpace();
-  if (!space || !canSendDirect() || actorPresentInSpace(space)) return;
+  if (!space || (!canSendV2Browser() && !canSendDirect()) || actorPresentInSpace(space)) return;
   direct(space, "enter", [], () => {
     void ensureScopedOverlayForTab("taskspace").then(() => {
       if (state.tab === "taskspace") render();
@@ -5280,6 +5318,11 @@ function enterTaskspace() {
 function taskspaceCall(target: string, verb: string, args: unknown[] = [], onCall?: (id: string) => void) {
   const space = taskspaceSpace();
   if (!space || !target) return;
+  if (canSendV2Browser()) {
+    const id = call(space, target, verb, args);
+    onCall?.(id);
+    return;
+  }
   ensureSpacePresence(space, () => {
     const id = call(space, target, verb, args);
     onCall?.(id);

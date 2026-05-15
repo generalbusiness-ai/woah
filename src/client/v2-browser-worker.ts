@@ -52,6 +52,8 @@ let socket: WebSocket | null = null;
 let current: { token: string; node: string; scope: string; actor?: string; session?: string } | null = null;
 let reconnectTimer: number | undefined;
 let connecting = false;
+let connectPromise: Promise<void> | null = null;
+let connectReadyResolve: (() => void) | null = null;
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
@@ -139,10 +141,18 @@ async function connectTo(next: { token: string; node: string; scope: string; act
   await connect();
 }
 
+/**
+ * Opens the v2 transport for `current`.
+ *
+ * The returned promise resolves when the relay has delivered the initial state
+ * transfer for this scope, or when the socket errors/closes before that point.
+ * Once a socket has already reached that state-transfer boundary, later callers
+ * return immediately.
+ */
 async function connect(): Promise<void> {
   if (!current) return;
-  if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
-  if (connecting) return;
+  if (socket?.readyState === WebSocket.OPEN) return;
+  if (connecting) return connectPromise ?? undefined;
   connecting = true;
   clearReconnect();
   const cachedHead = current.scope ? await getMeta<unknown>(`head:${current.scope}`) : undefined;
@@ -155,34 +165,48 @@ async function connect(): Promise<void> {
     last_known_head: lastKnownHead
   }), "woo-v2.turn-network.json");
   socket = ws;
-  ws.addEventListener("open", () => {
-    if (socket !== ws) return;
-    connecting = false;
-    reconnectDelayMs = 500;
-    void putMeta("connected", true);
-    void replayPending();
-    postStatus();
-  });
-  ws.addEventListener("message", (event) => {
-    if (socket !== ws) return;
-    if (typeof event.data !== "string") return;
-    void receiveFrame(event.data).catch((err: unknown) => {
-      postMessage({ kind: "error", error: errorMessage(err) });
+  connectPromise = new Promise<void>((resolve) => {
+    // WebSocket open is not enough: the dev relay sends TransportHello before
+    // openShadowBrowserScope subscribes this node. Resolve connect only after
+    // the state transfer, so immediate turn intents cannot miss accepted-frame
+    // fan-out for their new scope.
+    const settle = () => {
+      if (connectPromise) connectPromise = null;
+      if (connectReadyResolve === settle) connectReadyResolve = null;
+      resolve();
+    };
+    connectReadyResolve = settle;
+    ws.addEventListener("open", () => {
+      if (socket !== ws) return;
+      connecting = false;
+      reconnectDelayMs = 500;
+      void putMeta("connected", true);
+      postStatus();
+    });
+    ws.addEventListener("message", (event) => {
+      if (socket !== ws) return;
+      if (typeof event.data !== "string") return;
+      void receiveFrame(event.data).catch((err: unknown) => {
+        postMessage({ kind: "error", error: errorMessage(err) });
+      });
+    });
+    ws.addEventListener("close", () => {
+      if (socket !== ws) return;
+      connecting = false;
+      void putMeta("connected", false);
+      postStatus();
+      scheduleReconnect();
+      settle();
+    });
+    ws.addEventListener("error", () => {
+      if (socket !== ws) return;
+      connecting = false;
+      void putMeta("connected", false);
+      postStatus();
+      settle();
     });
   });
-  ws.addEventListener("close", () => {
-    if (socket !== ws) return;
-    connecting = false;
-    void putMeta("connected", false);
-    postStatus();
-    scheduleReconnect();
-  });
-  ws.addEventListener("error", () => {
-    if (socket !== ws) return;
-    connecting = false;
-    void putMeta("connected", false);
-    postStatus();
-  });
+  return connectPromise;
 }
 
 async function receiveFrame(encoded: string): Promise<void> {
@@ -191,6 +215,7 @@ async function receiveFrame(encoded: string): Promise<void> {
   // relay and in-process tests.
   const envelope = decodeEnvelope(encoded);
   let installedExecutableState = false;
+  const receivedStateTransfer = envelope.type === "woo.state.transfer.shadow.v1";
   for (const mutation of v2BrowserCacheMutationsForEnvelope(envelope)) {
     await applyCacheMutation(mutation);
     if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
@@ -204,7 +229,8 @@ async function receiveFrame(encoded: string): Promise<void> {
   if (envelope.type === "woo.live.event.shadow.v1") {
     postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
   }
-  if (installedExecutableState) await replayPending();
+  if (installedExecutableState || receivedStateTransfer) await replayPending();
+  if (receivedStateTransfer || envelope.type === "woo.transport.error.v1") connectReadyResolve?.();
   postMessage({ kind: "frame", envelope });
   postStatus();
 }
