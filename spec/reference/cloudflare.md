@@ -731,9 +731,32 @@ Each of the following is **optional**: the Worker checks for the binding at star
 |---|---|---|---|
 | `METRICS` | Analytics Engine dataset | Per-call AE writes per [§R10.1](#r101-workers-analytics-engine). | All AE writes no-op. Structured logs still emitted. |
 | `LOGPUSH_BUCKET` | R2 bucket for Logpush | Operator configures Logpush separately to push structured logs there. | Logs reach `wrangler tail` only; no durable retention. |
-| `CUSTOM_DOMAIN` | Worker route | World served at the operator's domain. | World served at `<worker-name>.<account-subdomain>.workers.dev`. |
 
 Operators may add bindings in `wrangler.toml` after deploy without redeploying the runtime — the runtime detects new bindings on next isolate cold-start.
+
+#### R14.3.1 Custom domain
+
+Optional, and not a binding. By default the world is served at
+`<worker-name>.<account-subdomain>.workers.dev`. To serve it at an
+operator-owned hostname, add a `routes` entry to `wrangler.toml`:
+
+```toml
+routes = [
+  { pattern = "<your-host>", custom_domain = true }
+]
+```
+
+`custom_domain = true` attaches the hostname directly to the Worker:
+the next `wrangler deploy` registers the route, Cloudflare creates the
+DNS record on the zone, and a TLS certificate is provisioned
+automatically. The zone must be on the same Cloudflare account as the
+Worker. The `workers.dev` URL continues to serve in parallel, which is
+useful for canary smoke tests during a cutover.
+
+The reference deployment ships its production route block in the
+committed `wrangler.toml` as a working example; a fork-and-deploy
+operator replaces `<your-host>` with their own hostname (or deletes the
+block to keep serving on `workers.dev` only).
 
 ### R14.4 Operator identity bootstrap
 

@@ -13,7 +13,7 @@ describe("v2 browser websocket URL", () => {
       hash: "hash-12"
     };
     const url = new URL(v2BrowserWebSocketUrl({
-      location: { protocol: "https:", host: "woah.inguz.workers.dev" },
+      location: { protocol: "https:", host: "woah.generalbusiness.ai" },
       token: "guest:token",
       node: "browser:test",
       scope: "#room",

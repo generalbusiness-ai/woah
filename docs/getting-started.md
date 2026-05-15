@@ -20,7 +20,7 @@ of the model.
 
 ## Path A: a person opening a world in a browser
 
-The reference deployment is at <https://woah.inguz.workers.dev/>.
+The reference deployment is at <https://woah.generalbusiness.ai/>.
 
 1. Open the URL. The client connects, allocates you a guest actor, and
    drops you into the starting room (usually `the_living_room`).
@@ -46,7 +46,7 @@ When you're ready for more:
 
 ## Path B: an LLM agent connecting over MCP
 
-Point any MCP client at `https://woah.inguz.workers.dev/mcp` (or the
+Point any MCP client at `https://woah.generalbusiness.ai/mcp` (or the
 `/mcp` path of your chosen deployment) with one of:
 
 ```

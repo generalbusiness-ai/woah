@@ -13,7 +13,7 @@ on:
       base_url:
         description: "Deployed woo base URL to smoke"
         required: false
-        default: "https://woah.inguz.workers.dev"
+        default: "https://woah.generalbusiness.ai"
 
 concurrency:
   group: woah-canary
@@ -36,11 +36,11 @@ jobs:
       - run: npm ci
       - name: Run deployed MCP smoke
         env:
-          WOO_MCP_SMOKE_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.inguz.workers.dev' }}
+          WOO_MCP_SMOKE_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.generalbusiness.ai' }}
         run: npm run smoke:mcp
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
       - name: Run deployed browser smoke
         env:
-          WOO_E2E_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.inguz.workers.dev' }}
+          WOO_E2E_BASE_URL: ${{ github.event.inputs.base_url || 'https://woah.generalbusiness.ai' }}
         run: npm run smoke:browser

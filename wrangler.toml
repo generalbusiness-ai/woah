@@ -3,6 +3,15 @@ main = "src/worker/index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Public hostname. Cloudflare attaches the domain to this Worker on deploy,
+# auto-creates the DNS record, and provisions a TLS certificate. Requires
+# the `generalbusiness.ai` zone to be on the same Cloudflare account as
+# this Worker. The workers.dev URL (woah.inguz.workers.dev) continues to
+# serve in parallel for canary/internal use.
+routes = [
+  { pattern = "woah.generalbusiness.ai", custom_domain = true }
+]
+
 [observability]
 enabled = true
 head_sampling_rate = 1.0
@@ -14,7 +23,7 @@ head_sampling_rate = 1.0
 # existing deploy does not remove already-installed catalogs.
 #
 # The shipped default is the full demo bundle so that a fresh fork-and-
-# deploy lands a populated world matching woah.inguz.workers.dev. For
+# deploy lands a populated world matching woah.generalbusiness.ai. For
 # faster first-light on operator deployments that don't want the demo
 # content, use the foundational-only subset — classes only, no bundled
 # instances; first-light cost drops from a few seconds to tens of ms:
