@@ -12,20 +12,20 @@
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Session, WooValue } from "../core/types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, ErrorValue, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedObject } from "../core/repository";
 import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
-import { encodeEnvelope, decodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { encodeEnvelope, decodeEnvelope } from "../core/shadow-envelope";
 import {
+  buildShadowTurnIntentEnvelope,
   createShadowBrowserRelayShim,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
-import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
+import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, type ShadowScopeHead } from "../core/shadow-commit-scope";
-import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
-import { shadowTurnKeyFromTranscript } from "../core/turn-key";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 
 const MCP_TOKEN_HEADER = "mcp-token";
 const MCP_SESSION_HEADER = "mcp-session-id";
@@ -310,44 +310,26 @@ export class McpGateway {
     if (!entry) throw new Error(`MCP session is not bound: ${sessionId}`);
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const client = await this.ensureV2ScopeClient(entry, scope);
-    // Gateway-side planning uses the cached serialized scope state. Sessions
-    // and their actors are minted between scope opens, so refresh that narrow
-    // authority slice before running the local prediction; CommitScopeDO
-    // performs the same refresh before authoritative validation.
+    // MCP submits intent envelopes so CommitScopeDO plans against its live
+    // head. Keep the local relay's session authority fresh for applying the
+    // accepted transcript and serving later local cache reads.
     const sessions = this.world.exportSessions();
     const sessionObjects = this.world.exportObjects(sessions.map((session) => session.actor));
     refreshSerializedSessionAuthority(client.relay.commit_scope.serialized, sessions, sessionObjects);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-    const call: ShadowTurnCall = {
-      kind: "woo.turn_call.shadow.v1",
+    const envelope = buildShadowTurnIntentEnvelope({
+      node: this.v2NodeFor(entry),
+      actor,
+      session: entry.woo.id,
+      token: entry.v2Token,
       id,
       route,
       scope,
-      session: entry.woo.id,
-      actor,
       target,
       verb,
-      args
-    };
-    const planned = await runShadowTurnCall(client.relay.commit_scope.serialized, call);
-    const request: ShadowTurnExecRequest = {
-      kind: "woo.turn.exec.request.shadow.v1",
-      id,
-      call,
-      key: shadowTurnKeyFromTranscript(planned.transcript),
-      expected: client.relay.commit_scope.head,
+      args,
       persistence: "durable"
-    };
-    const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
-      v: 2,
-      type: request.kind,
-      id,
-      from: this.v2NodeFor(entry),
-      actor,
-      session: entry.woo.id,
-      auth: { mode: "session", token: entry.v2Token },
-      body: request
-    };
+    });
     const result = await hooks.envelope(scope, {
       scope,
       node: this.v2NodeFor(entry),
@@ -362,7 +344,7 @@ export class McpGateway {
     const reply = replyEnvelope?.body;
     if (!reply) {
       if (result.head) client.relay.commit_scope.head = result.head;
-      return planned.frame;
+      return { op: "error", id, error: { code: "E_INTERNAL", message: "v2 MCP turn produced no reply" } };
     }
     if (!reply.ok) {
       if (result.head) client.relay.commit_scope.head = result.head;
@@ -371,7 +353,7 @@ export class McpGateway {
     if (reply.commit) {
       this.acceptV2Commit(client, reply, sessionId);
     }
-    return planned.frame;
+    return mcpFrameFromTurnReply(scope, reply);
   }
 
   private async ensureV2ScopeClient(entry: SessionEntry, scope: ObjRef): Promise<V2ScopeClient> {
@@ -454,6 +436,57 @@ function refreshSerializedSessionAuthority(
       serialized.objects[index] = obj;
     }
   }
+}
+
+function mcpFrameFromTurnReply(scope: ObjRef, reply: Extract<ShadowTurnExecReply, { ok: true }>): AppliedFrame | DirectResultFrame | ErrorFrame {
+  if (reply.outcome.error) {
+    return {
+      op: "error",
+      id: reply.id,
+      error: reply.transcript.error ?? wooValueAsError(reply.outcome.error, "v2 MCP turn failed")
+    };
+  }
+  if (reply.transcript.route === "direct") {
+    return {
+      op: "result",
+      id: reply.id,
+      command: reply.transcript.call,
+      // DirectResultFrame requires a result value; direct calls that return
+      // nothing have historically surfaced null rather than omitting it.
+      result: reply.outcome.result ?? null,
+      observations: reply.transcript.observations,
+      audience: scope
+    };
+  }
+  // ShadowCommitAccepted.position is the authority head, not log metadata; it
+  // currently carries no accepted-at timestamp. Keep the old planned-frame
+  // wall clock until commit replies grow an explicit authoritative timestamp.
+  return {
+    op: "applied",
+    id: reply.id,
+    space: reply.commit?.position.scope ?? reply.transcript.scope,
+    seq: reply.commit ? Number(reply.commit.position.seq) : reply.transcript.seq,
+    ts: Date.now(),
+    message: {
+      actor: reply.transcript.call.actor,
+      target: reply.transcript.call.target,
+      verb: reply.transcript.call.verb,
+      args: reply.transcript.call.args
+    },
+    observations: reply.transcript.observations,
+    // AppliedFrame.result is optional. Preserve null when the verb returned
+    // null, and omit undefined so JSON output matches normal applied frames.
+    ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
+  };
+}
+
+function wooValueAsError(value: WooValue, fallbackMessage: string): ErrorValue {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const code = typeof value.code === "string" ? value.code : "E_INTERNAL";
+    const message = typeof value.message === "string" ? value.message : fallbackMessage;
+    return { code, message, value };
+  }
+  return { code: "E_INTERNAL", message: fallbackMessage, value };
 }
 
 function authTokenFromHeaders(headers: Headers): string | null {

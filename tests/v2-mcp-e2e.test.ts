@@ -145,6 +145,62 @@ describe("v2 MCP e2e", () => {
       for (const state of scopeStates.values()) state.close();
     }
   });
+
+  it("serializes concurrent MCP v2 intents without stale-head rejects", async () => {
+    const world = createWorld();
+    const scopeState = new FakeDurableObjectState("the_chatroom");
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    const concurrentCalls = 4;
+    const pendingEnvelopes: Array<() => void> = [];
+    const releaseEnvelopeBatch = (): void => {
+      const releases = pendingEnvelopes.splice(0);
+      for (const release of releases) release();
+    };
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/open", body),
+        envelope: async (commitScope, body) => {
+          // Hold the first batch until every caller has locally reached the
+          // commit boundary. Exec envelopes planned at the gateway race here
+          // and stale-head reject; intent envelopes let CommitScopeDO plan in
+          // arrival order and accept each turn.
+          if (pendingEnvelopes.length < concurrentCalls) {
+            await new Promise<void>((resolve) => {
+              pendingEnvelopes.push(resolve);
+              if (pendingEnvelopes.length === concurrentCalls) releaseEnvelopeBatch();
+            });
+          }
+          return await postCommitScope(scope, env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const sessions = await Promise.all(Array.from({ length: concurrentCalls }, async (_, index) =>
+        await initializeMcp(gateway, `guest:v2-mcp-concurrent-${index}`, 100 + index)
+      ));
+      const results = await Promise.all(sessions.map(async (session, index) =>
+        await mcp(gateway, session, 200 + index, "tools/call", {
+          name: "woo_call",
+          arguments: { object: "the_chatroom", verb: "say", args: [`concurrent MCP ${index}`] }
+        })
+      ));
+
+      for (const [index, result] of results.entries()) {
+        expect(
+          result.result.isError,
+          `call ${index} failed: ${JSON.stringify(result.result.structuredContent)}`
+        ).not.toBe(true);
+      }
+      const accepted = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
+      expect(accepted).toHaveLength(concurrentCalls);
+      expect(accepted.map((row) => JSON.parse(row.body).position.seq)).toEqual([1, 2, 3, 4]);
+    } finally {
+      releaseEnvelopeBatch();
+      scopeState.close();
+    }
+  });
 });
 
 async function initializeMcp(gateway: McpGateway, token: string, id: number): Promise<string> {
