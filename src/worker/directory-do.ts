@@ -136,6 +136,12 @@ export class DirectoryDO {
         return json({ ok: true });
       }
 
+      if (request.method === "POST" && url.pathname === "/unregister-apikey-sessions") {
+        const body = await readJson(request);
+        const removed = this.unregisterApiKeySessions(String(body.apikey_id ?? ""));
+        return json({ ok: true, removed });
+      }
+
       if (request.method === "POST" && url.pathname === "/resolve-session") {
         const body = await readJson(request);
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
@@ -294,6 +300,16 @@ export class DirectoryDO {
   private unregisterSession(sessionId: string): void {
     if (!sessionId) return;
     this.state.storage.sql.exec("DELETE FROM session_route WHERE session_id = ?", sessionId);
+  }
+
+  private unregisterApiKeySessions(apikeyId: string): number {
+    if (!apikeyId) return 0;
+    const before = this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS count FROM session_route WHERE apikey_id = ?",
+      apikeyId
+    ).toArray()[0] as { count?: number } | undefined;
+    this.state.storage.sql.exec("DELETE FROM session_route WHERE apikey_id = ?", apikeyId);
+    return Number(before?.count ?? 0);
   }
 
   private resolveSession(sessionId: string): SessionRoute | null {

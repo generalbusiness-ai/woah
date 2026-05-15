@@ -2462,6 +2462,29 @@ export class PersistentObjectDO {
     }
   }
 
+  private async unregisterApiKeySessionRoutes(apikeyId: string): Promise<void> {
+    if (!apikeyId) return;
+    try {
+      const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/unregister-apikey-sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ apikey_id: apikeyId })
+      }));
+      await this.env.DIRECTORY.get(id).fetch(request);
+    } catch {
+      // Revocation is authoritative in the gateway world. Directory cleanup
+      // prevents stale routed REST sessions from being resurrected through
+      // x-woo-internal-session before the normal expiry window.
+    }
+  }
+
+  private closeLocalApiKeySessions(world: WooWorld, apikeyId: string): void {
+    for (const session of [...world.sessions.values()]) {
+      if (session.apikeyId === apikeyId) world.endSession(session.id);
+    }
+  }
+
   private requireRestSession(world: WooWorld, request: Request): Session {
     const internalSession = request.headers.get("x-woo-internal-session");
     const internalActor = request.headers.get("x-woo-internal-actor");
@@ -2867,7 +2890,17 @@ export class PersistentObjectDO {
     if (run.frame.op === "error") return run.frame;
     if (input.persistence === "durable") {
       world.applyCommittedShadowTranscript(run.transcript);
-      const seq = Number(world.getProp(input.scope, "next_seq") ?? 1) - 1;
+      if (input.verb === "revoke_api_key" && run.frame.result === true && typeof input.args[0] === "string") {
+        this.closeLocalApiKeySessions(world, input.args[0]);
+        await this.unregisterApiKeySessionRoutes(input.args[0]);
+      }
+      const session = world.sessions.get(input.session.id);
+      if (session) {
+        this.mirrorResultRoomToSession(world, session, run.frame.result);
+        await this.registerSessionRoute(session);
+      }
+      const seq = this.committedScopeSeq(world, input.scope);
+      if (seq === null) return run.frame;
       return {
         op: "applied",
         id: input.id,
@@ -2922,7 +2955,29 @@ export class PersistentObjectDO {
     if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
     world.applyCommittedShadowTranscript(reply.body.transcript);
     const session = world.sessions.get(sessionId);
-    if (session) await this.registerSessionRoute(session);
+    if (session) {
+      this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
+      await this.registerSessionRoute(session);
+    }
+  }
+
+  private mirrorResultRoomToSession(world: WooWorld, session: Session, result: unknown): void {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return;
+    const room = (result as Record<string, unknown>).room;
+    if (typeof room !== "string" || !room) return;
+    const activeScope = room as ObjRef;
+    session.activeScope = activeScope;
+    world.ensureSessionForActor(session.id, session.actor, session.tokenClass, session.expiresAt, activeScope, session.apikeyId);
+  }
+
+  private committedScopeSeq(world: WooWorld, scope: ObjRef): number | null {
+    try {
+      return Number(world.getProp(scope, "next_seq")) - 1;
+    } catch (err) {
+      const code = err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code) : "";
+      if (code === "E_PROPNF") return null;
+      throw err;
+    }
   }
 
   private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {

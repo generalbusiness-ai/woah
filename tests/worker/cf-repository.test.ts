@@ -1208,12 +1208,10 @@ describe("CFObjectRepository production-shape coverage", () => {
       if (planned === "timeout") throw new Error("command_plan timed out");
       expect(planned).toMatchObject({ status: 200 });
       expect(planned.body.result).toMatchObject({
-        ok: false,
-        route: "huh",
+        ok: true,
+        route: "direct",
         target: expect.any(String),
-        verb: "huh",
-        text: "enter tub",
-        error: "I don't understand that."
+        verb: "enter"
       });
     } finally {
       logSpy.mockRestore();
@@ -1463,6 +1461,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(enterChat.status).toBe(200);
       const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, guestSession);
       expect(goDeck.status).toBe(200);
+      await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_deck" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
 
       const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
       const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
@@ -1566,6 +1567,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       const guestSession = String(guestAuth.body.session);
       expect((await post("/api/objects/the_chatroom/calls/enter", { args: [] }, guestSession)).status).toBe(200);
       expect((await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, guestSession)).status).toBe(200);
+      await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_deck" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
 
       const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
       const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
