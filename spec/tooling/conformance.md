@@ -84,7 +84,7 @@ The suite covers every normative section of the spec. Categories:
 | **Identity** | I3 auth flows, I4 reconnect, I5 multi-attach, I6 disconnect |
 | **VM (T0)** | All T0 opcodes, T0 fixtures from tiny-vm.md, tick metering, memory metering |
 | **Wire** | All op types, idempotent retry, gap recovery via replay |
-| **REST + SSE** | All six endpoints, body-level `space` sequencing, `direct_callable` gate, `$me` resolution, single-space SSE resume, multi-space SSE re-fetch fallback |
+| **REST** | Runtime HTTP endpoints, body-level `space` sequencing, `direct_callable` gate, `$me` resolution, log paging, and retired object-stream rejection |
 | **Permissions** | Verb perms, property perms, wizard bypass, progr discipline |
 | **Failures** | Every row of failures.md §F2 |
 | **Persistence** | Anchor cluster scoping, message log integrity, snapshot reconstruction |

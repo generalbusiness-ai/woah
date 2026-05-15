@@ -13,7 +13,7 @@ describe("scoped client projection helpers", () => {
   it("applies move-result here snapshots without mutating the original /api/me snapshot", () => {
     const me = {
       session: { id: "session_1", actor: "guest_1", active_scope: "room_a", current_location: "room_a", all_locations: ["room_a"] },
-      here: { id: "room_a", name: "Room A", present_actors: [{ id: "guest_1", name: "Guest One" }] },
+      here: { id: "room_a", name: "Room A", roster: [{ id: "guest_1", name: "Guest One" }] },
       cursor: { spaces: { room_a: { next_seq: 5 } }, live: { resumable: false } }
     };
     const model: ScopedProjectionStateModel = {
@@ -28,7 +28,7 @@ describe("scoped client projection helpers", () => {
       id: "room_b",
       name: "Room B",
       props: { next_seq: 8 },
-      present_actors: [{ id: "guest_1", name: "Guest One" }, { id: "guest_2", name: "Guest Two" }]
+      roster: [{ id: "guest_1", name: "Guest One" }, { id: "guest_2", name: "Guest Two" }]
     };
 
     const next = scopedModelWithMoveResult(model, { room: "room_b", here: nextHere });
@@ -59,21 +59,21 @@ describe("scoped client projection helpers", () => {
   });
 
   describe("presentActorsFromObservation", () => {
-    it("prefers a top-level present_actors (the `who` shape)", () => {
+    it("prefers a top-level roster (the `who` shape)", () => {
       const observation = {
         type: "who",
         room: "the_deck",
-        present_actors: ["guest_3", { id: "guest_5", name: "Guest Five" }]
+        roster: ["guest_3", { id: "guest_5", name: "Guest Five" }]
       };
       expect(presentActorsFromObservation(observation)).toEqual(["guest_3", "guest_5"]);
     });
 
-    it("falls back to `look.present_actors` for `looked` events targeting the room", () => {
+    it("falls back to `look.roster` for `looked` events targeting the room", () => {
       const observation = {
         type: "looked",
         room: "the_deck",
         target: "the_deck",
-        look: { id: "the_deck", present_actors: ["guest_3", "guest_5"] }
+        look: { id: "the_deck", roster: ["guest_3", "guest_5"] }
       };
       expect(presentActorsFromObservation(observation)).toEqual(["guest_3", "guest_5"]);
     });
@@ -82,19 +82,24 @@ describe("scoped client projection helpers", () => {
       const observation = {
         type: "looked",
         room: "the_deck",
-        look: { present_actors: ["guest_3"] }
+        look: { roster: ["guest_3"] }
       };
       expect(presentActorsFromObservation(observation)).toEqual(["guest_3"]);
     });
 
-    it("does not leak a sub-object's present_actors when looking at it (e.g. pinboard)", () => {
+    it("does not leak a sub-object's roster when looking at it (e.g. pinboard)", () => {
       const observation = {
         type: "looked",
         room: "the_deck",
         target: "the_pinboard",
-        look: { id: "the_pinboard", present_actors: ["guest_99"] }
+        look: { id: "the_pinboard", roster: ["guest_99"] }
       };
       expect(presentActorsFromObservation(observation)).toEqual([]);
+    });
+
+    it("accepts legacy present_actors as an input fallback", () => {
+      expect(presentActorsFromObservation({ type: "who", present_actors: ["guest_3"] })).toEqual(["guest_3"]);
+      expect(presentActorsFromObservation({ type: "looked", room: "the_deck", look: { present_actors: ["guest_4"] } })).toEqual(["guest_4"]);
     });
 
     it("returns [] for non-looked observations without a top-level list", () => {

@@ -9,22 +9,18 @@
 // authority, but they do apply host-scoped catalog migration plans and data
 // migrations for the objects they actually own.
 //
-// What's wired through fetch() / the WS handlers:
+// What's wired through fetch() / the v2 WS handlers:
 // - REST routing ported from src/server/dev-server.ts: auth, describe (with
 //   actor-permission filtering), property reads (filtered), sequenced and
-//   direct verb calls (with broadcast to connected WS clients), log paging,
-//   /api/state (authenticated demo aggregate).
-// - WebSocket upgrade with the CF hibernation API: state.acceptWebSocket,
-//   serializeAttachment for per-socket {sessionId, actor, socketId}, and
-//   webSocketMessage/Close/Error handlers. After DO wake-from-hibernation
-//   getWorld() rehydrates session.attachedSockets from state.getWebSockets()
-//   so reap doesn't expire active clients.
+//   direct verb calls (with broadcast to connected WS clients), log paging.
+// - v2 turn-network WebSocket upgrade with the CF hibernation API:
+//   state.acceptWebSocket, serializeAttachment, and webSocketMessage/Close/Error
+//   handlers. Legacy /ws returns 410; v2 sockets carry protocol-scoped
+//   attachments so wake-from-hibernation can route frames back to CommitScopeDO.
 //
 // What's still deferred to later phases:
 // - Alarms for parked tasks (Phase 4): state.storage.setAlarm + alarm()
 //   handler. Needed for FORK/SUSPEND wakeups on CF.
-// - SSE streams (/api/objects/{id}/stream) — return 501. Browser uses WS;
-//   SSE matters for HTTP-only agent integrations.
 // - Authoring REST endpoints (/api/compile, /api/install, /api/property,
 //   /api/property/value, /api/authoring/objects/{create,move,chparent}) — the
 //   IDE tab can read on CF but not author.
@@ -35,21 +31,29 @@ import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, 
 import { parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
-  handleWsProtocolFrame,
-  parseWsProtocolFrame,
+  restFrameFromTurnReply,
   statusForError,
+  type RestProtocolHost,
   type RestProtocolRequest
 } from "../core/protocol";
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
-import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SeedWorld, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
-import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
+import {
+  buildShadowTurnExecEnvelope,
+  buildShadowTurnIntentEnvelope,
+  shadowBrowserSessionBearer,
+  shadowBrowserSessionClaimsValue,
+  type ShadowBrowserStateTransfer
+} from "../core/shadow-browser-node";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
+import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
+import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -117,8 +121,6 @@ const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
 const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
-const HOST_STATE_CACHE_LIMIT = 32;
-const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
 // Read-only cross-host RPCs (room-snapshot, remote-get-prop, contents, etc.)
 // are deadlined tightly so a wedge surfaces fast and the local task chain
 // can fall back to a degraded reply. 5s is the working ceiling: a hot
@@ -200,7 +202,6 @@ const COALESCEABLE_INTERNAL_PATHS: ReadonlySet<string> = new Set([
   "/__internal/remote-describe-many",
   "/__internal/remote-get-prop",
   "/__internal/replay",
-  "/__internal/state",
   "/__internal/actor-session-locations-batch",
   "/__internal/space-audience-sessions",
   "/__internal/room-snapshot",
@@ -242,11 +243,6 @@ export class PersistentObjectDO {
   // Throttle to one round-trip per host per `REMOTE_ROUTE_SYNC_TTL_MS`.
   private remoteRouteSyncAt = new Map<string, number>();
   private mcpGateway: McpGateway | null = null;
-  // Per-actor cache of `world.state(actor)` keyed by world.mutationVersion().
-  // Both /__internal/state and the local-host slice inside aggregateState
-  // hit this; a cache hit returns instantly without re-walking the object
-  // graph. Cleared implicitly on DO restart (cold init wipes the Map).
-  private hostStateCache = new Map<ObjRef, { version: number; payload: Record<string, unknown> }>();
   // Cross-host property cache for stable, hot-path property reads
   // (actor.name in a verb that runs on a different host's DO is a common
   // case). Keyed by `${host}|${objRef}|${name}`. Only entries for
@@ -330,7 +326,7 @@ export class PersistentObjectDO {
         );
       }
 
-      if (!gatewayHost && (pathname === "/api/auth" || pathname === "/ws" || pathname === "/v2/turn-network/ws")) {
+      if (!gatewayHost && (pathname === "/api/auth" || pathname === "/v2/turn-network/ws")) {
         return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
       }
 
@@ -343,19 +339,8 @@ export class PersistentObjectDO {
         return await this.handleInternal(request, world, pathname, hostKey);
       }
 
-      // WebSocket upgrade — accept via hibernation API. The connection survives
-      // DO hibernation; per-socket state is in serializeAttachment(). Per
-      // cloudflare.md §R8.
       if (pathname === "/ws") {
-        const upgrade = request.headers.get("upgrade");
-        if (upgrade?.toLowerCase() !== "websocket") {
-          return jsonResponse({ error: { code: "E_INVARG", message: "expected Upgrade: websocket" } }, 400);
-        }
-        const pair = new WebSocketPair();
-        const client = pair[0];
-        const server = pair[1];
-        this.state.acceptWebSocket(server);
-        return new Response(null, { status: 101, webSocket: client });
+        return jsonResponse({ error: { code: "E_NOTSUPPORTED", message: "legacy /ws protocol has been removed; use /v2/turn-network/ws" } }, 410);
       }
 
       if (gatewayHost && pathname === "/v2/turn-network/ws") {
@@ -401,7 +386,7 @@ export class PersistentObjectDO {
         onSessionsEnded: async (sessions) => {
           for (const session of sessions) await this.unregisterSessionRoute(session.id);
         },
-        state: (actor) => this.aggregateState(world, actor),
+        executeTurn: (input) => this.restV2Turn(world, input),
         installTap: async (actor, body) => {
           if (!gatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap install is only available on the world gateway host");
           return await installGitHubTap(world, actor, {
@@ -429,15 +414,6 @@ export class PersistentObjectDO {
         },
         resolveObject: (id, session) => this.resolveRestObject(world, id, session),
         resolveActor: (_protocolRequest, actorValue, session) => this.resolveRestActor(world, request, actorValue, session),
-        directCall: async (id, actor, target, verb, args, options) => {
-          const deferredHostEffects: DeferredHostEffect[] = [];
-          const result = await world.directCall(id, actor, target, verb, args, {
-            ...options,
-            deferHostEffect: (effect) => deferredHostEffects.push(effect)
-          });
-          if (deferredHostEffects.length > 0) await world.applyDeferredHostEffects(deferredHostEffects);
-          return result;
-        },
         broadcastApplied: (frame) => this.handleAppliedFrame(world, frame),
         broadcastLiveEvents: (result) => this.broadcastLiveEvents(world, result)
       });
@@ -1132,7 +1108,6 @@ export class PersistentObjectDO {
     if (merged.changed) {
       world.importWorld(merged.world);
       world.persistFullSnapshot("host_seed_apply");
-      this.hostStateCache.clear();
       this.crossHostPropCache.clear();
     }
     // Mirror the cold-load path: any successful merge of a freshly
@@ -1844,156 +1819,8 @@ export class PersistentObjectDO {
     }
   }
 
-  private cachedHostState(world: WooWorld, actor: ObjRef): Record<string, unknown> {
-    const version = world.mutationVersion();
-    const hit = this.hostStateCache.get(actor);
-    // Clone on read so callers (notably aggregateState, which reassigns
-    // state.object_routes / state.spaces / state.objects) can't mutate the
-    // cached copy. structuredClone on a ~127KB plain object is much cheaper
-    // than rebuilding state via the full object-graph walk.
-    if (hit && hit.version === version) {
-      this.hostStateCache.delete(actor);
-      this.hostStateCache.set(actor, hit);
-      return this.withFreshStateClock(structuredClone(hit.payload));
-    }
-    const payload = world.state(actor) as unknown as Record<string, unknown>;
-    this.hostStateCache.delete(actor);
-    this.hostStateCache.set(actor, { version, payload: structuredClone(payload) });
-    while (this.hostStateCache.size > HOST_STATE_CACHE_LIMIT) {
-      const oldest = this.hostStateCache.keys().next().value as ObjRef | undefined;
-      if (!oldest) break;
-      this.hostStateCache.delete(oldest);
-    }
-    return this.withFreshStateClock(payload);
-  }
-
-  private withFreshStateClock(payload: Record<string, unknown>): Record<string, unknown> {
-    // Mutates only the response object being returned. On cache hits that is a
-    // clone of the cached payload; on misses the cache already stored its own
-    // clone before this clock field is stamped.
-    payload.server_time = Date.now();
-    return payload;
-  }
-
-  private async aggregateState(world: WooWorld, actor: ObjRef): Promise<Record<string, unknown>> {
-    const startedAt = Date.now();
-    const result = await this.aggregateStateInner(world, actor);
-    world.recordMetric({
-      kind: "state_projection",
-      ms: Date.now() - startedAt,
-      objects: Object.keys((result.objects ?? {}) as Record<string, unknown>).length,
-      remote_hosts: Array.isArray(result.object_routes) ? new Set((result.object_routes as Array<{ host?: string }>).map((r) => r.host ?? "").filter(Boolean)).size : 0
-    });
-    return result;
-  }
-
-  private async aggregateStateInner(world: WooWorld, actor: ObjRef): Promise<Record<string, unknown>> {
-    const state = this.cachedHostState(world, actor);
-    const routes = Array.isArray(state.object_routes)
-      ? state.object_routes.filter((route): route is { id: string; host: string; anchor: string | null } => (
-          route !== null &&
-          typeof route === "object" &&
-          !Array.isArray(route) &&
-          typeof (route as Record<string, unknown>).id === "string" &&
-          typeof (route as Record<string, unknown>).host === "string"
-        ))
-      : [];
-    const remoteHosts = Array.from(new Set(routes.map((route) => route.host).filter((host) => host && host !== WORLD_HOST)));
-    // Fan out to every remote host in parallel; each /__internal/state takes
-    // O(per-host-state-compose) so a serial loop turns into O(N × that). The
-    // per-host timeout keeps a cold or wedged remote host from blocking the
-    // gateway's first state projection indefinitely.
-    const fetched = await Promise.all(
-      remoteHosts.map((host) => this.fetchHostState(world, host, actor).then((remote) => ({ host, remote })))
-    );
-    for (const { host, remote } of fetched) {
-      if (!remote) continue;
-      const remoteRoutes = Array.isArray(remote.object_routes)
-        ? remote.object_routes.filter((route): route is { id: string; host: string; anchor: string | null } => (
-            route !== null &&
-            typeof route === "object" &&
-            !Array.isArray(route) &&
-            typeof (route as Record<string, unknown>).id === "string" &&
-            (route as Record<string, unknown>).host === host
-          ))
-        : [];
-      const hostRoutes = [...routes.filter((route) => route.host === host), ...remoteRoutes];
-      state.object_routes = uniqueRoutes([...(Array.isArray(state.object_routes) ? state.object_routes as Array<{ id: string; host: string; anchor: string | null }> : []), ...remoteRoutes]);
-      const routeIds = new Set(hostRoutes.map((route) => route.id));
-      const spaces = { ...readMap(state.spaces) };
-      for (const id of routeIds) {
-        const remoteSpace = readMap(remote.spaces)[id];
-        if (remoteSpace) spaces[id] = remoteSpace;
-      }
-      state.spaces = spaces;
-      const objects = { ...readMap(state.objects) };
-      const remoteObjects = readMap(remote.objects);
-      for (const id of routeIds) {
-        if (remoteObjects[id]) objects[id] = remoteObjects[id];
-      }
-      state.objects = objects;
-    }
-    return state;
-  }
-
-  private async fetchHostState(world: WooWorld, host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
-    let settled = false;
-    const startedAt = Date.now();
-    // The deadline now drives an AbortController, so on timeout the inner
-    // fetch — and the queue waiter behind it — both wind down rather than
-    // running on in the background after the outer race rejects.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "timeout" });
-      }
-      controller.abort(wooError("E_TIMEOUT", `host state fetch timed out: ${host}`, { host, timeout_ms: HOST_STATE_FETCH_TIMEOUT_MS }));
-    }, HOST_STATE_FETCH_TIMEOUT_MS);
-    try {
-      const remote = await this.fetchHostStateInner(host, actor, controller.signal);
-      if (!settled) {
-        settled = true;
-        world.recordMetric({
-          kind: "cross_host_rpc",
-          route: "/__internal/state",
-          host,
-          ms: Date.now() - startedAt,
-          status: remote ? "ok" : "error",
-          ...(remote ? {} : { error: "E_BAD_RESPONSE" })
-        });
-      }
-      return remote;
-    } catch (err) {
-      if (!settled) {
-        settled = true;
-        const error = normalizeError(err);
-        world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "error", error: error.code });
-      }
-      return null;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  private async fetchHostStateInner(host: string, actor: ObjRef, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
-    const id = this.env.WOO.idFromName(host);
-    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/state`, {
-      headers: { "x-woo-host-key": host, "x-woo-internal-actor": actor }
-    }));
-    const { response } = await this.outboundFetch(id, request, signal);
-    if (!response.ok) return null;
-    const body = await response.json();
-    return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
-  }
-
   private async handleInternal(request: Request, world: WooWorld, pathname: string, hostKey: string): Promise<Response> {
     try {
-      if (request.method === "GET" && pathname === "/__internal/state") {
-        const actor = request.headers.get("x-woo-internal-actor");
-        return jsonResponse(actor ? this.cachedHostState(world, actor as ObjRef) : world.state());
-      }
-
       const body = await readJsonBody(request);
       if (request.method === "POST" && pathname === "/__internal/object-routes") {
         return jsonResponse(world.objectRoutes());
@@ -2054,53 +1881,6 @@ export class PersistentObjectDO {
         if (!audience) throw wooError("E_INVARG", "broadcast-live-events requires audience");
           this.broadcastLiveEvents(world, { op: "result", result: null, observations, audience, audienceActors, observationAudiences, audienceSessions, observationSessionAudiences });
         return jsonResponse({ ok: true });
-      }
-
-      if (request.method === "POST" && pathname === "/__internal/ws-call") {
-        const session = this.ensureInternalSession(
-          world,
-          String(body.session_id ?? ""),
-          String(body.actor ?? "") as ObjRef,
-          Number(body.expires_at ?? 0),
-          body.token_class,
-          sessionActiveScope(body),
-          typeof body.apikey_id === "string" ? body.apikey_id : null
-        );
-        const raw = body.message && typeof body.message === "object" && !Array.isArray(body.message)
-          ? body.message as Record<string, unknown>
-          : {};
-        const message: Message = {
-          actor: session.actor,
-          target: String(raw.target ?? "") as ObjRef,
-          verb: String(raw.verb ?? ""),
-          args: Array.isArray(raw.args) ? raw.args as WooValue[] : [],
-          body: raw.body && typeof raw.body === "object" && !Array.isArray(raw.body)
-            ? raw.body as Record<string, WooValue>
-            : undefined
-        };
-        return jsonResponse(await world.call(typeof body.frame_id === "string" ? body.frame_id : undefined, session.id, String(body.space ?? "") as ObjRef, message));
-      }
-
-      if (request.method === "POST" && pathname === "/__internal/ws-direct") {
-        const session = this.ensureInternalSession(
-          world,
-          String(body.session_id ?? ""),
-          String(body.actor ?? "") as ObjRef,
-          Number(body.expires_at ?? 0),
-          body.token_class,
-          sessionActiveScope(body),
-          typeof body.apikey_id === "string" ? body.apikey_id : null
-        );
-        const deferredHostEffects: DeferredHostEffect[] = [];
-        const result = await world.directCall(
-          typeof body.frame_id === "string" ? body.frame_id : undefined,
-          session.actor,
-          String(body.target ?? "") as ObjRef,
-          String(body.verb ?? ""),
-          Array.isArray(body.args) ? body.args as WooValue[] : [],
-            { sessionId: session.id, deferHostEffect: (effect) => deferredHostEffects.push(effect) }
-        );
-        return jsonResponse(result.op === "result" ? { ...result, deferred_host_effects: deferredHostEffects } : result);
       }
 
       if (request.method === "POST" && pathname === "/__internal/replay") {
@@ -2458,6 +2238,49 @@ export class PersistentObjectDO {
     }
   }
 
+  private async unregisterApiKeySessionRoutes(apikeyId: string): Promise<void> {
+    if (!apikeyId) return;
+    try {
+      const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/unregister-apikey-sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ apikey_id: apikeyId })
+      }));
+      await this.env.DIRECTORY.get(id).fetch(request);
+    } catch {
+      // Revocation is authoritative in the gateway world. Directory cleanup
+      // prevents stale routed REST sessions from being resurrected through
+      // x-woo-internal-session before the normal expiry window.
+    }
+  }
+
+  private closeLocalApiKeySessions(world: WooWorld, apikeyId: string): void {
+    for (const session of [...world.sessions.values()]) {
+      if (session.apikeyId === apikeyId) world.endSession(session.id);
+    }
+  }
+
+  private revokedApiKeyIds(world: WooWorld): Set<string> {
+    const raw = world.propOrNull("$system", "api_keys");
+    const out = new Set<string>();
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+    for (const [id, record] of Object.entries(raw as Record<string, WooValue>)) {
+      if (record && typeof record === "object" && !Array.isArray(record) && (record as Record<string, WooValue>).revoked_at != null) {
+        out.add(id);
+      }
+    }
+    return out;
+  }
+
+  private async cleanupNewlyRevokedApiKeys(world: WooWorld, revokedBefore: Set<string>): Promise<void> {
+    for (const id of this.revokedApiKeyIds(world)) {
+      if (revokedBefore.has(id)) continue;
+      this.closeLocalApiKeySessions(world, id);
+      await this.unregisterApiKeySessionRoutes(id);
+    }
+  }
+
   private requireRestSession(world: WooWorld, request: Request): Session {
     const internalSession = request.headers.get("x-woo-internal-session");
     const internalActor = request.headers.get("x-woo-internal-actor");
@@ -2506,13 +2329,6 @@ export class PersistentObjectDO {
     throw wooError("E_PERM", "actor does not match session actor", { actor: requested, session_actor: session.actor });
   }
 
-  // ---- WebSocket lifecycle (CF hibernation API) ----
-  //
-  // Each accepted ws carries a serialized attachment {sessionId, actor, socketId}
-  // that survives DO hibernation. webSocketMessage() ports the WS frame
-  // dispatch from src/server/dev-server.ts; broadcast helpers iterate
-  // state.getWebSockets() for fan-out instead of an in-memory Map.
-
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const world = await this.getWorld();
     const existing = this.attachment(ws);
@@ -2520,79 +2336,7 @@ export class PersistentObjectDO {
       await this.webSocketV2TurnNetworkMessage(world, ws, message);
       return;
     }
-    const frame = parseWsProtocolFrame(message);
-    if (frame.op === "error") {
-      ws.send(JSON.stringify(frame));
-      return;
-    }
-    await handleWsProtocolFrame(ws, frame, {
-      authenticate: async (token) => {
-        const session = this.authenticateToken(world, token);
-        await this.registerSessionRoute(session);
-        return session;
-      },
-      attach: (_connection, session) => {
-        const previous = this.attachment(ws);
-        if (previous) {
-          world.detachSocket(previous.sessionId, previous.socketId);
-            this.indexRemoveSocket(previous.sessionId, previous.actor, ws);
-        }
-        const socketId = `ws-${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        world.attachSocket(session.id, socketId);
-        ws.serializeAttachment({ sessionId: session.id, actor: session.actor, socketId });
-          this.indexAddSocket(session.id, session.actor, ws);
-      },
-      session: () => this.liveAttachment(world, ws),
-      send: (_connection, frameValue) => ws.send(JSON.stringify(frameValue)),
-      call: async (frameId, session, space, messageValue) => {
-        world.touchSessionInput(session.sessionId);
-        const host = await this.resolveObjectHost(space, WORLD_HOST);
-        const result = host === WORLD_HOST
-          ? await world.call(frameId, session.sessionId, space, messageValue)
-          : await this.forwardWsCall(world, host, frameId, session, space, messageValue);
-        if (result.op === "applied") {
-          if (host !== WORLD_HOST) await this.registerRemoteObjectRoutes(host);
-        }
-        return result;
-      },
-      command: async (frameId, session, space, text) => {
-        world.touchSessionInput(session.sessionId);
-        return await this.executeWsCommand(world, frameId, session, space, text);
-      },
-      direct: async (frameId, session, target, verb, args) => {
-        world.touchSessionInput(session.sessionId);
-        const host = await this.resolveObjectHost(target, WORLD_HOST);
-        const { pure } = this.resolveDispatchPath(world, target, verb, host, WORLD_HOST);
-        return host === WORLD_HOST
-            ? await world.directCall(
-                frameId,
-                session.actor,
-                target,
-                verb,
-                args,
-                { sessionId: session.sessionId }
-              )
-          : await this.forwardWsDirect(world, host, frameId, session, target, verb, args, { pure });
-      },
-      replay: async (frameId, session, space, fromValue, limitValue) => {
-        // Replay is recovery, not user input — does NOT touch lastInputAt.
-        const host = await this.resolveObjectHost(space, WORLD_HOST);
-        if (host !== WORLD_HOST) {
-          return this.forwardWsReplay(world, host, frameId, session, space, fromValue, limitValue);
-        }
-        if (!world.hasPresence(session.actor, space)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
-        const from = Math.max(1, Number(fromValue ?? 1));
-        const limit = Math.min(Math.max(1, Number(limitValue ?? 100)), 500);
-        return { op: "replay", id: frameId, space, from, entries: world.replay(space, from, limit) };
-      },
-      deliverInput: (session, input) => {
-        world.touchSessionInput(session.sessionId);
-        return world.deliverInput(session.actor, input);
-      },
-      broadcastApplied: (frameValue, originator) => this.handleAppliedFrame(world, frameValue, originator),
-      broadcastTaskResult: (result) => this.broadcastTaskResult(world, result),
-      broadcastLiveEvents: (result, originator) => this.broadcastLiveEvents(world, result, null, originator)
-    });
+    ws.close(1002, "legacy /ws protocol has been removed");
   }
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
@@ -2751,13 +2495,184 @@ export class PersistentObjectDO {
     return payload as T;
   }
 
+  private async restV2Turn(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    if (!this.env.COMMIT_SCOPE) {
+      this.emitRestV2InProcessFallback(input, "no_commit_scope");
+      return await this.restV2TurnInProcess(world, input);
+    }
+    const node = `${this.durableHostKey()}:rest:${input.id ?? crypto.randomUUID()}`;
+    const token = shadowBrowserSessionBearer(input.session);
+    if (input.persistence === "live") {
+      const snapshot = world.exportWorld();
+      const envelope = encodeEnvelope(buildShadowTurnIntentEnvelope({
+        ...input,
+        node,
+        session: input.session.id,
+        token,
+        persistence: "live"
+      }));
+      const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(input.scope, "/v2/envelope", {
+        ...v2SessionAuthorityPayload(world),
+        scope: input.scope,
+        node,
+        token,
+        session: input.session.id,
+        actor: input.actor,
+        serialized: snapshot,
+        envelope
+      });
+      this.sendV2Fanout(result.fanout ?? []);
+      if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
+      const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
+      return restFrameFromTurnReply(input.scope, reply.body);
+    }
+    const snapshot = world.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: input.id,
+      route: input.route,
+      scope: input.scope,
+      session: input.session.id,
+      actor: input.actor,
+      target: input.target,
+      verb: input.verb,
+      args: input.args,
+      body: input.body
+    };
+    const planned = await runShadowTurnCall(snapshot, call);
+    if (planned.frame.op === "error") return planned.frame;
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    const body: ShadowTurnExecRequest = {
+      kind: "woo.turn.exec.request.shadow.v1",
+      id: input.id,
+      call,
+      key,
+      auth: {
+        mode: "shadow_local",
+        actor: input.actor,
+        session: input.session.id
+      },
+      persistence: input.persistence
+    };
+    const envelope = encodeEnvelope(buildShadowTurnExecEnvelope({
+      node,
+      actor: input.actor,
+      session: input.session.id,
+      token,
+      id: input.id,
+      body
+    }));
+    const commitScope = key.scope;
+    const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(commitScope, "/v2/envelope", {
+      ...v2SessionAuthorityPayload(world),
+      scope: commitScope,
+      node,
+      token,
+      session: input.session.id,
+      actor: input.actor,
+      serialized: snapshot,
+      envelope
+    });
+    await this.applyV2CommittedTranscript(world, result.reply, input.session.id);
+    this.sendV2Fanout(result.fanout ?? []);
+    if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
+    const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
+    return restFrameFromTurnReply(input.scope, reply.body);
+  }
+
+  private emitRestV2InProcessFallback(
+    input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0],
+    reason: "no_commit_scope"
+  ): void {
+    const event = {
+      kind: "rest_v2_in_process_fallback" as const,
+      reason,
+      scope: input.scope,
+      target: input.target,
+      verb: input.verb,
+      route: input.route,
+      persistence: input.persistence
+    };
+    this.emitMetric(event, this.durableHostKey());
+    console.warn("woo.rest.v2_in_process_fallback", event);
+  }
+
+  private async restV2TurnInProcess(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    const snapshot = world.exportWorld();
+    const run = await runShadowTurnCall(snapshot, {
+      kind: "woo.turn_call.shadow.v1",
+      id: input.id,
+      route: input.route,
+      scope: input.scope,
+      session: input.session.id,
+      actor: input.actor,
+      target: input.target,
+      verb: input.verb,
+      args: input.args,
+      body: input.body
+    });
+    if (run.frame.op === "error") return run.frame;
+    if (input.persistence === "durable") {
+      const revokedBefore = this.revokedApiKeyIds(world);
+      world.applyCommittedShadowTranscript(run.transcript);
+      await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
+      const session = world.sessions.get(input.session.id);
+      if (session) {
+        this.mirrorResultRoomToSession(world, session, run.frame.result);
+        await this.registerSessionRoute(session);
+      }
+      const seq = this.committedScopeSeq(world, input.scope);
+      if (seq === null) return run.frame;
+      return {
+        op: "applied",
+        id: input.id,
+        space: input.scope,
+        seq,
+        ts: Date.now(),
+        message: {
+          actor: input.actor,
+          target: input.target,
+          verb: input.verb,
+          args: input.args
+        },
+        observations: run.transcript.observations,
+        ...(run.transcript.result !== undefined ? { result: run.transcript.result } : {})
+      };
+    }
+    return run.frame;
+  }
+
   private async applyV2CommittedTranscript(world: WooWorld, replyText: string | null, sessionId: string): Promise<void> {
     if (!replyText) return;
     const reply = decodeEnvelope<ShadowTurnExecReply>(replyText);
     if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
+    const revokedBefore = this.revokedApiKeyIds(world);
     world.applyCommittedShadowTranscript(reply.body.transcript);
+    await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
     const session = world.sessions.get(sessionId);
-    if (session) await this.registerSessionRoute(session);
+    if (session) {
+      this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
+      await this.registerSessionRoute(session);
+    }
+  }
+
+  private mirrorResultRoomToSession(world: WooWorld, session: Session, result: unknown): void {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return;
+    const room = (result as Record<string, unknown>).room;
+    if (typeof room !== "string" || !room) return;
+    const activeScope = room as ObjRef;
+    session.activeScope = activeScope;
+    world.ensureSessionForActor(session.id, session.actor, session.tokenClass, session.expiresAt, activeScope, session.apikeyId);
+  }
+
+  private committedScopeSeq(world: WooWorld, scope: ObjRef): number | null {
+    try {
+      return Number(world.getProp(scope, "next_seq")) - 1;
+    } catch (err) {
+      const code = err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code) : "";
+      if (code === "E_PROPNF") return null;
+      throw err;
+    }
   }
 
   private sendV2Fanout(fanout: Array<{ node: string; envelope: string }>): void {
@@ -2818,48 +2733,8 @@ export class PersistentObjectDO {
     };
   }
 
-  private liveAttachment(world: WooWorld, ws: WebSocket): { sessionId: string; actor: ObjRef; socketId: string } | null {
-    const att = this.attachment(ws);
-    if (!att) return null;
-    return world.sessionAlive(att.sessionId) ? att : null;
-  }
-
   private async resolveObjectHost(id: ObjRef, fallbackHost: string): Promise<string> {
     return await this.resolveObjectHostForWorld(this.world, id, fallbackHost);
-  }
-
-  private async forwardWsCall(
-    world: WooWorld,
-    host: string,
-    frameId: string | undefined,
-    session: { sessionId: string; actor: ObjRef },
-    space: ObjRef,
-    message: Message
-  ): Promise<AppliedFrame | ErrorFrame> {
-    const body = this.forwardBody(world, session, { frame_id: frameId, space, message });
-    return this.forwardInternal<AppliedFrame | ErrorFrame>(host, "/__internal/ws-call", body);
-  }
-
-  private async forwardWsDirect(
-    world: WooWorld,
-    host: string,
-    frameId: string | undefined,
-    session: { sessionId: string; actor: ObjRef },
-    target: ObjRef,
-    verb: string,
-    args: WooValue[],
-    options: { pure?: boolean } = {}
-  ): Promise<DirectResultFrame | ErrorFrame> {
-    const body = this.forwardBody(world, session, { frame_id: frameId, target, verb, args });
-    // Pure verbs get the read deadline; mutating verbs pass through the
-    // default write watchdog in forwardInternalRaw.
-    const timeoutMs = options.pure === true ? this.hostReadRpcTimeoutMs() : undefined;
-    const result = await this.forwardInternal<((DirectResultFrame & { deferred_host_effects?: DeferredHostEffect[] }) | ErrorFrame)>(host, "/__internal/ws-direct", body, { timeoutMs });
-    if (result.op === "result" && Array.isArray(result.deferred_host_effects)) {
-      await world.applyDeferredHostEffects(result.deferred_host_effects);
-      delete result.deferred_host_effects;
-    }
-    return result;
   }
 
   // Helper used at every cross-host verb-dispatch site to (a) probe verb
@@ -2883,52 +2758,6 @@ export class PersistentObjectDO {
     const path: "local" | "read" | "mutating" = local ? "local" : (pure ? "read" : "mutating");
     world?.recordMetric({ kind: "dispatch_resolved", target, verb, host: resolvedHost, path, pure });
     return { pure, path };
-  }
-
-  private async executeWsCommand(
-    world: WooWorld,
-    frameId: string | undefined,
-    session: { sessionId: string; actor: ObjRef },
-    space: ObjRef,
-    text: string
-  ): Promise<CommandFrame> {
-    const planned = await world.planCommand(frameId, session.sessionId, space, text);
-    if (planned.op === "error") return planned;
-    const plan = commandPlanFromProtocolValue(planned.result);
-    if (!plan) return planned;
-
-    if (plan.route === "direct") {
-      const host = await this.resolveObjectHost(plan.target, WORLD_HOST);
-      const { pure } = this.resolveDispatchPath(world, plan.target, plan.verb, host, WORLD_HOST);
-      const result = host === WORLD_HOST
-        ? await world.directCall(frameId, session.actor, plan.target, plan.verb, plan.args, { sessionId: session.sessionId })
-        : await this.forwardWsDirect(world, host, frameId, session, plan.target, plan.verb, plan.args, { pure });
-      return result.op === "result" ? { ...result, command: plan } as DirectResultFrame : result;
-    }
-
-    // If the resolved command target is itself a $space, the planner chooses
-    // that space; object commands sequence through the originating surface.
-    const commandSpace = plan.space ?? space;
-    const message: Message = { actor: session.actor, target: plan.target, verb: plan.verb, args: plan.args };
-    const host = await this.resolveObjectHost(commandSpace, WORLD_HOST);
-    const result = host === WORLD_HOST
-      ? await world.call(frameId, session.sessionId, commandSpace, message)
-      : await this.forwardWsCall(world, host, frameId, session, commandSpace, message);
-    if (result.op === "applied" && host !== WORLD_HOST) await this.registerRemoteObjectRoutes(host);
-    return result;
-  }
-
-  private async forwardWsReplay(
-    world: WooWorld,
-    host: string,
-    frameId: string | undefined,
-    session: { sessionId: string; actor: ObjRef },
-    space: ObjRef,
-    from: unknown,
-    limit: unknown
-  ): Promise<unknown> {
-    const body = this.forwardBody(world, session, { frame_id: frameId, space, from, limit });
-    return this.forwardInternal(host, "/__internal/replay", body);
   }
 
   private hostReadRpcTimeoutMs(): number {
@@ -3304,10 +3133,6 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   }
 }
 
-function readMap(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
 function isSerializedWorld(value: unknown): value is SerializedWorld {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<Record<keyof SerializedWorld, unknown>>;
@@ -3349,30 +3174,6 @@ function isSeedWorld(value: unknown): value is SeedWorld {
     if (typeof objectHosts[obj.id] !== "string" || (objectHosts[obj.id] as string).length === 0) return false;
   }
   return true;
-}
-
-function uniqueRoutes(routes: Array<{ id: string; host: string; anchor: string | null }>): Array<{ id: string; host: string; anchor: string | null }> {
-  const byId = new Map<string, { id: string; host: string; anchor: string | null }>();
-  for (const route of routes) {
-    if (!route?.id || !route.host) continue;
-    byId.set(route.id, route);
-  }
-  return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
-}
-
-function commandPlanFromProtocolValue(value: WooValue): { route: "direct" | "sequenced"; space: ObjRef | null; target: ObjRef; verb: string; args: WooValue[] } | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const map = value as Record<string, WooValue>;
-  if (map.ok !== true) return null;
-  if (map.route !== "direct" && map.route !== "sequenced") return null;
-  if (typeof map.target !== "string" || typeof map.verb !== "string") return null;
-  return {
-    route: map.route,
-    space: typeof map.space === "string" ? map.space : null,
-    target: map.target,
-    verb: map.verb,
-    args: Array.isArray(map.args) ? map.args : []
-  };
 }
 
 function isReadAvailabilityError(err: unknown): boolean {

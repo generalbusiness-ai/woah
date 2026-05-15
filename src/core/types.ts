@@ -269,6 +269,7 @@ export type MetricEvent =
   | { kind: "shadow_gateway_apply_step"; phase: "capture_runtime" | "export_world" | "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "apply_serialized" | "import_world" | "restore_runtime" | "total"; scope: ObjRef; route: string; ms: number; objects: number; properties: number; sessions: number; logs: number; creates: number; writes: number }
   | { kind: "v2_open"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; transfer_mode?: string; full_save?: boolean; error?: string }
   | { kind: "v2_envelope"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; fresh?: boolean; reply?: "none" | "accepted" | "live" | "missing_state" | "commit_rejected"; fanout?: number; full_save?: boolean; error?: string }
+  | { kind: "rest_v2_in_process_fallback"; reason: "no_commit_scope"; scope: ObjRef; target: ObjRef; verb: string; route: "direct" | "sequenced"; persistence: "durable" | "live" }
   | { kind: "shadow_commit_accepted"; scope: ObjRef; seq: number; node?: string; id?: string; fanout?: number }
   | { kind: "shadow_commit_rejected"; scope?: ObjRef; node?: string; id?: string; reason: string }
   | { kind: "init"; phase: "world" | "mcp_gateway"; ms: number }

@@ -22,7 +22,7 @@ Guest-baseline identity ([identity.md §I3](../semantics/identity.md#i3-auth-gue
 - An agent connecting programmatically with a service credential.
 - Any flow that requires "I am the same person who was here yesterday."
 
-This document specifies the credentialed-token vocabulary that extends `op: "auth"` to support real identity.
+This document specifies the credentialed-token vocabulary that extends the baseline HTTP/v2 authentication flow to support real identity.
 
 ---
 
@@ -60,7 +60,7 @@ Extending [identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline):
 
 - **`recovery:<token>`** — single-use, narrow-scope token from a recovery flow. Lands the user in a session that can change credentials and nothing else.
 
-The token format is server policy; clients receive their next-presentable token in the `op: "session"` response when a credentialed flow lands.
+The token format is server policy; clients receive their next-presentable token in the HTTP/v2 auth response when a credentialed flow lands.
 
 ---
 
@@ -70,13 +70,13 @@ The token format is server policy; clients receive their next-presentable token 
 1. Client authenticates via the credentialed exchange (password POST or OAuth code).
 2. Server issues a bearer and a session.
 3. Client persists the bearer (and refresh token) per its threat model.
-4. On WebSocket connect, client sends `auth { token: "bearer:<token>" }`.
+4. On HTTP/v2 authentication or v2 session mint, client presents `bearer:<token>`.
 5. Server validates signature/claims for JWT-shaped tokens or the opaque-handle record for local tokens, then checks expiry and actor/account lifecycle. If valid, it binds the session to the actor.
 ```
 
-**Client-side persistence is a threat-model decision, not a normative recommendation.** Browsers offer no fully-secure option for storing bearers in-process: `localStorage` is XSS-exfiltratable; HTTP-only cookies are XSS-resistant but require CSRF mitigations and don't compose cleanly with WebSocket auth flows; in-memory only is XSS-safe but loses on refresh. Worlds choose based on their actor population (web, native, agent) and their tolerance for re-authentication. Tokens crossing the wire (via `auth { token }`) are subject to the observability redaction rules ([observability.md §O8](../operations/observability.md#o8-privacy--pii)) — bearer values must not appear verbatim in logs, traces, or audit records.
+**Client-side persistence is a threat-model decision, not a normative recommendation.** Browsers offer no fully-secure option for storing bearers in-process: `localStorage` is XSS-exfiltratable; HTTP-only cookies are XSS-resistant but require CSRF mitigations; in-memory only is XSS-safe but loses on refresh. Worlds choose based on their actor population (web, native, agent) and their tolerance for re-authentication. Tokens crossing the wire are subject to the observability redaction rules ([observability.md §O8](../operations/observability.md#o8-privacy--pii)) — bearer values must not appear verbatim in logs, traces, or audit records.
 
-**Bearer lifetime.** Default 1 hour. A separate **refresh token** (JWT or opaque handle with `purpose: refresh`, longer lifetime — default 30 days) can mint new bearers without re-credentialing via `op: "refresh", token: "refresh:<token>"`. Refresh is deferred from the local v1 onboarding surface but remains part of the credentialed-token design.
+**Bearer lifetime.** Default 1 hour. A separate **refresh token** (JWT or opaque handle with `purpose: refresh`, longer lifetime — default 30 days) can mint new bearers without re-credentialing through a refresh endpoint. Refresh is deferred from the local v1 onboarding surface but remains part of the credentialed-token design.
 
 **Per-claim scopes.** A bearer's `scope` claim lists what the actor may do. v1 scopes: `read`, `write`, `admin`. Worlds may add their own. Scope is **advisory in v1**; the runtime trusts the actor's `progr` discipline as the enforcement primitive. Future versions may pre-filter calls by scope.
 
@@ -93,10 +93,10 @@ Setup:
 
 Flow:
 - Client redirects to provider for code (browser-mediated).
-- Client receives code, sends `auth { token: "oauth_code:<provider>:<code>" }`.
+- Client receives code and presents `oauth_code:<provider>:<code>` to the credentialed auth endpoint.
 - Server exchanges code with provider, validates id_token.
 - Server looks up account; creates if first-time. Selects a default actor.
-- Server returns `op: "session", actor: <objref>` plus a fresh bearer token.
+- Server returns session metadata plus a fresh bearer token.
 
 **Identity unification.** A user authenticated via two providers (Google + GitHub) can bind both to the same `$account`. The runtime stores `account.identities = [{provider, sub}, ...]`; matching any of them resolves to the same account. Binding additional identities requires re-authenticating both.
 
@@ -121,7 +121,7 @@ Standard flows:
 - **Compromised credentials.** Password change automatically revokes all live sessions and bearers. OAuth identity unbind requires re-authenticating both the OAuth identity and the account password (or another OAuth identity).
 - **Account deletion.** Soft-deletes the account (marks inactive); actors stay alive but are no longer bound to a credentialed login. Wizards may rebind.
 
-Recovery flows are the auth service's responsibility; verbs see the result as `op: "session", actor: ...`.
+Recovery flows are the auth service's responsibility; verbs see only the resulting authenticated actor/session.
 
 ---
 

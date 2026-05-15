@@ -9,7 +9,7 @@ status: implemented
 
 The minimum agent/developer-facing API for "what is this object, and what can I do with it?" — the contract that lets agents discover affordances without hardcoded knowledge of a world's verbs.
 
-This document specifies the *convention* (a `:describe()` verb on `$root` that every descendant inherits) plus the underlying builtins. The wire layer surfaces these as ordinary `op: "call"` calls; no special protocol is required.
+This document specifies the *convention* (a `:describe()` verb on `$root` that every descendant inherits) plus the underlying builtins. The wire layer surfaces these as ordinary v2 or REST calls; no special protocol is required.
 
 ---
 
@@ -119,13 +119,13 @@ For very large collections, paginate: `:list_tasks(offset, limit)` returning `{i
 A typical first interaction for a fresh agent:
 
 ```
-1. agent connects, gets actor objref via op: "session"
+1. agent authenticates, gets actor objref and session id
 2. agent inspects the session state (`active_scope`) or calls the actor's location tools
 3. agent calls the current space's `:describe()`
 4. agent sees verbs available on the space
 5. agent calls space's listing verb (e.g. :list_tasks)
 6. for each interesting object, agent calls obj:describe() to see its verbs
-7. agent calls a verb via op: "call" with a structured message
+7. agent calls a verb via a v2 turn intent or REST object call
 ```
 
 This loop requires no out-of-band knowledge about the world. It works on dubspace, tasks, future demos. The schema-discovery part (`event_schema(obj, type)`) lets agents construct valid event payloads when they need to reason about possible observations.

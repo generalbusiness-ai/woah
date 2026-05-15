@@ -66,6 +66,18 @@ function makeCfHarness(): Harness {
   };
 }
 
+function fakeCommitScopeNamespace(secret = "cf-test-secret"): DurableObjectNamespace {
+  const states = new Map<string, FakeDurableObjectState>();
+  return new FakeDurableObjectNamespace((name) => {
+    let state = states.get(name);
+    if (!state) {
+      state = new FakeDurableObjectState(name);
+      states.set(name, state);
+    }
+    return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+  }) as unknown as DurableObjectNamespace;
+}
+
 function message(actor: string, target: string, verb: string, args: WooValue[] = []): Message {
   return { actor, target, verb, args };
 }
@@ -254,6 +266,39 @@ describe("CFObjectRepository production-shape coverage", () => {
         actor: "$wiz",
         deployment: "shadow-local",
         rev: 1
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
+  it("rejects the removed legacy WebSocket endpoint", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-legacy-ws-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/ws", {
+        headers: { upgrade: "websocket" }
+      }));
+
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "E_NOTSUPPORTED" }
       });
     } finally {
       directoryState.close();
@@ -1092,7 +1137,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1161,7 +1207,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1194,12 +1241,10 @@ describe("CFObjectRepository production-shape coverage", () => {
       if (planned === "timeout") throw new Error("command_plan timed out");
       expect(planned).toMatchObject({ status: 200 });
       expect(planned.body.result).toMatchObject({
-        ok: false,
-        route: "huh",
+        ok: true,
+        route: "direct",
         target: expect.any(String),
-        verb: "huh",
-        text: "enter tub",
-        error: "I don't understand that."
+        verb: "enter"
       });
     } finally {
       logSpy.mockRestore();
@@ -1232,7 +1277,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1423,7 +1469,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1447,6 +1494,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(enterChat.status).toBe(200);
       const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, guestSession);
       expect(goDeck.status).toBe(200);
+      await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_deck" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
 
       const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
       const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
@@ -1527,7 +1577,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1549,6 +1600,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       const guestSession = String(guestAuth.body.session);
       expect((await post("/api/objects/the_chatroom/calls/enter", { args: [] }, guestSession)).status).toBe(200);
       expect((await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, guestSession)).status).toBe(200);
+      await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_deck" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
 
       const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
       const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
@@ -1581,108 +1635,6 @@ describe("CFObjectRepository production-shape coverage", () => {
       logSpy.mockRestore();
       directoryState.close();
       for (const state of wooStates.values()) state.close();
-    }
-  });
-
-  it("serves gateway state when a cold remote host state request stalls", async () => {
-    const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
-    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    let gateway: PersistentObjectDO;
-    const stalledHost = {
-      fetch: async () => await new Promise<Response>(() => {})
-    };
-    const env = {
-      WOO_INITIAL_WIZARD_TOKEN: "cf-cold-state-token",
-      WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
-      DIRECTORY: new FakeDurableObjectNamespace((name) => {
-        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-        return directory;
-      }),
-      WOO: new FakeDurableObjectNamespace((name) => {
-        if (name === "world") return gateway;
-        return stalledHost;
-      })
-    } as unknown as Env;
-    gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
-    const logs: string[] = [];
-    const logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {
-      logs.push(args.map(String).join(" "));
-    });
-
-    try {
-      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token: "wizard:cf-cold-state-token" })
-      }));
-      expect(auth.ok).toBe(true);
-      const { session } = await auth.json() as { session: string };
-
-      const state = await Promise.race([
-        gateway.fetch(new Request("https://woo.test/api/state", {
-          headers: { authorization: `Session ${session}` }
-        })),
-        new Promise<Response>((_, reject) => setTimeout(() => reject(new Error("gateway /api/state did not return")), 4_000))
-      ]);
-      expect(state.ok).toBe(true);
-      const body = await state.json() as Record<string, unknown>;
-      expect(body.objects).toBeTruthy();
-      expect(body.object_routes).toEqual(expect.arrayContaining([expect.objectContaining({ host: "the_chatroom" })]));
-      expect(logs.some((line) => line.includes("woo.metric") && line.includes("\"kind\":\"cross_host_rpc\"") && line.includes("\"route\":\"/__internal/state\"") && line.includes("\"status\":\"timeout\""))).toBe(true);
-    } finally {
-      logSpy.mockRestore();
-      directoryState.close();
-      gatewayState.close();
-    }
-  });
-
-  it("keeps cached api state clock fresh", async () => {
-    const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
-    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    const env = {
-      WOO_INITIAL_WIZARD_TOKEN: "cf-state-token",
-      WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "",
-      DIRECTORY: new FakeDurableObjectNamespace((name) => {
-        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-        return directory;
-      }),
-      WOO: new FakeDurableObjectNamespace((name) => {
-        throw new Error(`unexpected Woo DO ${name}`);
-      })
-    } as unknown as Env;
-    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
-
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(1_000_000);
-      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token: "wizard:cf-state-token" })
-      }));
-      expect(auth.ok).toBe(true);
-      const { session } = await auth.json() as { session: string };
-
-      const first = await gateway.fetch(new Request("https://woo.test/api/state", {
-        headers: { authorization: `Session ${session}` }
-      }));
-      expect(first.ok).toBe(true);
-      expect((await first.json() as Record<string, unknown>).server_time).toBe(1_000_000);
-
-      vi.setSystemTime(1_005_000);
-      const second = await gateway.fetch(new Request("https://woo.test/api/state", {
-        headers: { authorization: `Session ${session}` }
-      }));
-      expect(second.ok).toBe(true);
-      expect((await second.json() as Record<string, unknown>).server_time).toBe(1_005_000);
-    } finally {
-      vi.useRealTimers();
-      directoryState.close();
-      gatewayState.close();
     }
   });
 
@@ -1728,10 +1680,10 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(await ended.json()).toMatchObject({ ok: true, session });
       expect(await directoryHealth()).toMatchObject({ sessions: 0 });
 
-      const staleState = await gateway.fetch(new Request("https://woo.test/api/state", {
+      const staleMe = await gateway.fetch(new Request("https://woo.test/api/me", {
         headers: { authorization: `Session ${session}` }
       }));
-      expect(staleState.status).toBe(401);
+      expect(staleMe.status).toBe(401);
     } finally {
       directoryState.close();
       gatewayState.close();
@@ -1746,7 +1698,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       WOO_INTERNAL_SECRET: "cf-test-secret",
       WOO_AUTO_INSTALL_CATALOGS: "",
       DIRECTORY: undefined,
-      WOO: undefined
+      WOO: undefined,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, env);
     (env as any).DIRECTORY = new FakeDurableObjectNamespace((name) => {
@@ -1776,9 +1729,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(auth.status).toBe(200);
       const wizardSession = String(auth.body.session);
 
-      const created = await post("/api/objects/%24system/calls/create_api_key", { args: ["$wiz", "revoke-route"] }, wizardSession);
-      expect(created.status).toBe(200);
-      const key = created.body.result as { id: string; secret: string };
+      const gatewayWorld = await (gateway as any).getWorld("world") as WooWorld;
+      const key = gatewayWorld.ensureApiKey("$wiz", "$wiz", "revoke-route-key", "revoke-route-secret", "revoke-route");
 
       const apiAuth = await post("/api/auth", { token: `apikey:${key.id}:${key.secret}` });
       expect(apiAuth.status).toBe(200);
@@ -1794,6 +1746,15 @@ describe("CFObjectRepository production-shape coverage", () => {
       const stale = await post("/api/objects/%24system/calls/list_api_keys", { args: [] }, apiSession);
       expect(stale.status).toBe(401);
       expect(stale.body.error).toMatchObject({ code: "E_NOSESSION" });
+
+      const resolveRequest = await signInternalRequest({ WOO_INTERNAL_SECRET: "cf-test-secret" }, new Request("https://woo.test/resolve-session", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-woo-host-key": "world" },
+        body: JSON.stringify({ session_id: apiSession })
+      }));
+      const resolved = await directory.fetch(resolveRequest);
+      expect(resolved.status).toBe(200);
+      expect(await resolved.json()).toMatchObject({ session: null });
     } finally {
       directoryState.close();
       gatewayState.close();
