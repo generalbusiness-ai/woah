@@ -678,10 +678,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         const looked = look.observations.find((o) => o.type === "looked" && o.room === "the_chatroom");
         expect(looked).toMatchObject({
           look: {
-            present_actors: expect.arrayContaining([actor, witness])
+            roster: expect.arrayContaining([expect.objectContaining({ id: actor })])
           }
         });
-        expect(String(looked?.text ?? "")).not.toContain("Present: nobody");
       }
     } finally {
       roomBHarness.cleanup();
@@ -690,16 +689,15 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
-  it("issues a single batched cross-host call for scrub instead of one per remote subscriber", async () => {
+  it("ignores legacy subscribers when building an embodied room roster", async () => {
     const homeHarness = make();
     const roomHarness = make();
     try {
       const home = homeHarness.world;
       const roomHost = roomHarness.world;
-      // Three remote-hosted subscribers all on the same `home` host. Without
-      // batching, the room's per-look scrub would fire one cross-host RPC per
-      // actor — N+1 against the home DO and a real subrequest-budget hazard
-      // when N grows.
+      // These rows model an old subscriber mirror with no body placement.
+      // In the v2 presence model they are live-audience hints at most; they
+      // must not make actors appear in an embodied room roster.
       const live1 = home.auth("guest:conf-batch-1").actor;
       const live2 = home.auth("guest:conf-batch-2").actor;
       const live3 = home.auth("guest:conf-batch-3").actor;
@@ -729,11 +727,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const who = await roomHost.directCall("batch-who", live1, "conf_batch_room", "who", []);
       expect(who.op).toBe("result");
       if (who.op === "result") {
-        expect(who.result).toEqual([live1, live2, live3]);
+        expect(who.result).toEqual([]);
       }
-      // One batch call, all three actors in it; zero per-actor calls.
-      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
-      expect(new Set(roomBridge.actorSessionLocationsBatchCalls[0])).toEqual(new Set([live1, live2, live3]));
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(0);
       expect(roomBridge.actorSessionLocationsCalls).toBe(0);
     } finally {
       roomHarness.cleanup();
@@ -741,7 +737,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
-  it("leaves remote subscribers in place when the batched location lookup is unavailable", async () => {
+  it("does not consult remote subscriber mirrors for embodied room roster fallback", async () => {
     const homeHarness = make();
     const roomHarness = make();
     try {
@@ -767,22 +763,16 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       home.setActorPresence(live, "conf_batch_fail_room", true);
       home.object(live).location = "conf_batch_fail_room";
 
-      // Simulate the home host being unreachable: the batched lookup throws
-      // a read-availability error. The scrub must not interpret "no remote
-      // location data" as "actor is gone" — that would persist a subscriber-
-      // row drop on a transient blip.
+      // Simulate the home host being unreachable. Roster construction should
+      // not consult the legacy subscriber mirror at all, so no remote lookup
+      // is attempted and the actor is not rendered as present.
       roomBridge.failBatchWith = { code: "E_TIMEOUT", message: "remote home unreachable" };
 
       const who = await roomHost.directCall("batch-fail-who", live, "conf_batch_fail_room", "who", []);
       expect(who.op).toBe("result");
-      // Persisted subscribers row is preserved — the actor is NOT scrubbed
-      // on a transient remote-read failure, so subsequent operations and
-      // any verb that reads `subscribers` directly still see the actor.
       expect(roomHost.getProp("conf_batch_fail_room", "subscribers")).toEqual([live]);
-      if (who.op === "result") expect(who.result).toEqual([live]);
-      // The batch was attempted (and failed); no per-actor fallback was
-      // tried, since this caller provides the batch method.
-      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(1);
+      if (who.op === "result") expect(who.result).toEqual([]);
+      expect(roomBridge.actorSessionLocationsBatchCalls.length).toBe(0);
       expect(roomBridge.actorSessionLocationsCalls).toBe(0);
     } finally {
       roomHarness.cleanup();
@@ -790,7 +780,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
-  it("lazily scrubs stale remote subscribers from room reads and direct audiences", async () => {
+  it("keeps legacy subscribers out of room roster and direct audiences", async () => {
     const homeHarness = make();
     const roomHarness = make();
     try {
@@ -820,17 +810,16 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         home.object(watcher).location = "conf_scrub_room";
         home.sessions.get(watcherSession.id)!.activeScope = "conf_scrub_room";
 
-      const denied = await roomHost.directCall("stale-who", stale, "conf_scrub_room", "who", []);
-      expect(denied.op).toBe("error");
-      if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
-      expect(roomHost.getProp("conf_scrub_room", "subscribers")).toEqual([watcher]);
+      const staleWho = await roomHost.directCall("stale-who", stale, "conf_scrub_room", "who", []);
+      expect(staleWho.op).toBe("result");
+      expect(roomHost.getProp("conf_scrub_room", "subscribers")).toEqual([stale, watcher]);
 
       const who = await roomHost.directCall("live-who", watcher, "conf_scrub_room", "who", []);
       expect(who.op).toBe("result");
       if (who.op === "result") {
-        expect(who.result).toEqual([watcher]);
+        expect(who.result).toEqual([]);
         const observed = who.observations.find((obs) => obs.type === "who");
-        expect(observed).toMatchObject({ present_actors: [watcher] });
+        expect(observed).toMatchObject({ roster: [] });
       }
     } finally {
       roomHarness.cleanup();
@@ -838,21 +827,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
-  it("scrubs session_subscribers rows whose session is in this DO's table and expired", async () => {
-    // Regression: rows in `<space>.session_subscribers` whose session has
-    // expired on this DO sit there forever once the actor-level scrub no
-    // longer reaches them — `removeSessionPresence` is only called when
-    // `reapSession` runs on this DO, and that loop is racy on cold-start
-    // hosts. The session-level sibling scrub now drops any expired-in-table
-    // row alongside the actor-level pass, recomputing the `subscribers`
-    // mirror from the survivors.
-    //
-    // The actor-level pass now also evicts every row for an actor with
-    // no live local session and no remote-host bridge confirmation —
-    // see "evicts subscribers whose session vanished without a clean
-    // reap" below for the dedicated coverage. Cross-host actors whose
-    // home host *does* confirm presence are exercised by "lazily scrubs
-    // stale remote subscribers from room reads and direct audiences".
+  it("live_audience ignores expired and malformed session_subscribers rows", async () => {
+    // Room presentation no longer repairs or reads the legacy subscribers
+    // mirror. The live-audience primitive is the contract that matters for
+    // delivery: only live session rows should be returned.
     const harness = make();
     try {
       const world = harness.world;
@@ -881,40 +859,12 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       world.object(live.actor).location = "conf_session_scrub_room";
       world.sessions.get(live.id)!.activeScope = "conf_session_scrub_room";
 
-      // First call paid the per-space throttle and runs both scrubs.
-      const looked = await world.directCall("conf-session-scrub-look", live.actor, "conf_session_scrub_room", "look", []);
-      expect(looked.op, looked.op === "error" ? JSON.stringify(looked.error) : "").toBe("result");
-
-      const remainingRows = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string; actor: string }>;
-      expect(remainingRows.map((row) => row.session).sort()).toEqual([
-        live.id,
-        `legacy:${live.actor}`
-      ].sort());
-      // Both scrubs collaborated to recompute `subscribers`. The actor pass
-      // drops guest_blank (malformed row, no live session) and expiredAuth
-      // (expired session in table, no other live session). What's left is
-      // the live actor.
-      expect((world.getProp("conf_session_scrub_room", "subscribers") as ObjRef[]).sort()).toEqual([
-        live.actor
-      ].sort());
-
-      // Re-running look within the SUBSCRIBER_SCRUB_FLOOR_MS window must NOT
-      // re-trigger the scrub. Plant a row that the scrub would otherwise
-      // remove and verify the throttle holds it in place. The throttle is
-      // the only thing keeping write amplification bounded for chatty rooms.
-      const survivors = world.getProp("conf_session_scrub_room", "session_subscribers") as WooValue;
-      const replant = (survivors as Array<Record<string, WooValue>>).concat([{ session: expired.id, actor: expiredAuth.actor }]);
-      world.setProp("conf_session_scrub_room", "session_subscribers", replant as unknown as WooValue);
-      const lookedAgain = await world.directCall("conf-session-scrub-look-throttled", live.actor, "conf_session_scrub_room", "look", []);
-      expect(lookedAgain.op).toBe("result");
-      const stillThere = world.getProp("conf_session_scrub_room", "session_subscribers") as Array<{ session: string }>;
-      expect(stillThere.map((row) => row.session)).toContain(expired.id);
+      const audience = await world.directCall("conf-session-audience", live.actor, "conf_session_scrub_room", "live_audience", []);
+      expect(audience.op).toBe("result");
+      if (audience.op === "result") expect(audience.result).toEqual([live.id]);
 
       // Sanity: when reapSession runs through removeSessionPresence first,
-      // there's nothing left for the new scrub to do. The session and its
-      // row both go away through the existing path; this pins that the
-      // sibling scrub stays a safety net rather than the primary cleanup.
-      world.setProp("conf_session_scrub_room", "session_subscribers", survivors);
+      // the session and its row both go away through the existing path.
       const reapedActor = "guest_reaped" as ObjRef;
       const reapedSession = "session-conf-reaped";
       world.createObject({ id: reapedActor, name: reapedActor, parent: "$guest", owner: "$wiz" });
@@ -935,20 +885,11 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
-  it("evicts subscribers whose session vanished without a clean reap (DO hibernation / gateway loss)", async () => {
-    // Production failure: an MCP gateway session lives only in the DO's
-    // in-memory map. On hibernation the session row disappears from
-    // `world.sessions` without going through `reapSession`, so the actor's
-    // persistent `.location` keeps pointing at the room. The previous
-    // scrubber consulted `allLocationsForActor`, whose final fallback to
-    // the actor's `.location` property then masked the dead session and
-    // pinned the guest to the subscribers list forever — the deck would
-    // accumulate dozens of `Guest 1, Guest 2, …` over a day's hibernations.
-    //
-    // The fix narrows the scrubber to live sessions only and drops every
-    // session_subscribers row for the stale actor (the orphan row's
-    // session is gone from this DO's table, so the default sessionId
-    // resolution can't match it).
+  it("excludes vanished sessions from live_audience without relying on subscribers repair", async () => {
+    // Production failure class: an MCP gateway session can vanish from the
+    // in-memory map without a clean reap. Delivery must ignore that orphan
+    // session row even if legacy subscribers and actor.location still mention
+    // the actor.
     const harness = make();
     try {
       const world = harness.world;
@@ -971,13 +912,14 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       expect(world.object(stale.actor).location).toBe("conf_vanished_room");
       expect((world.getProp("conf_vanished_room", "subscribers") as ObjRef[]).sort()).toEqual([watcher.actor, stale.actor].sort());
 
-      const looked = await world.directCall("conf-vanished-look", watcher.actor, "conf_vanished_room", "look", [], { sessionId: watcher.id });
-      expect(looked.op, looked.op === "error" ? JSON.stringify(looked.error) : "").toBe("result");
+      const audience = await world.directCall("conf-vanished-audience", watcher.actor, "conf_vanished_room", "live_audience", [], { sessionId: watcher.id });
+      expect(audience.op, audience.op === "error" ? JSON.stringify(audience.error) : "").toBe("result");
+      if (audience.op === "result") expect(audience.result).toEqual([watcher.id]);
 
-      expect(world.getProp("conf_vanished_room", "subscribers")).toEqual([watcher.actor]);
+      expect((world.getProp("conf_vanished_room", "subscribers") as ObjRef[]).sort()).toEqual([watcher.actor, stale.actor].sort());
       const remainingRows = world.getProp("conf_vanished_room", "session_subscribers") as Array<{ session: string; actor: string }>;
-      expect(remainingRows.map((row) => row.actor)).toEqual([watcher.actor]);
-      expect(remainingRows.map((row) => row.session)).not.toContain(stale.id);
+      expect(remainingRows.map((row) => row.actor).sort()).toEqual([watcher.actor, stale.actor].sort());
+      expect(remainingRows.map((row) => row.session)).toContain(stale.id);
     } finally {
       harness.cleanup();
     }

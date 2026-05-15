@@ -23,7 +23,7 @@
         "surface": "chat",
         "subject": "$space",
         "neighborhood": {
-          "include": ["subject", "subscribers", "actor"]
+          "include": ["subject", "session_subscribers", "actor"]
         }
       },
       {
@@ -33,7 +33,7 @@
         "surface": "space-chat",
         "subject": "$space",
         "neighborhood": {
-          "include": ["subject", "subscribers", "actor"]
+          "include": ["subject", "session_subscribers", "actor"]
         }
       }
     ],
@@ -243,7 +243,7 @@
               "origin?"
             ]
           },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = null; try { matched = $match:match_verb(\"hear_parent_announce\", item); } except err { matched = null; } if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = null; try { matched = $match:match_verb(\"hear_parent_announce\", item); } except err { matched = null; } if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
         },
         {
           "name": "match_exit",
@@ -443,7 +443,7 @@
             ],
             "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobjstr"], "persistence": "durable" }
           },
-          "source": "verb :take(object) rxd { let name = str_trim(object); if (!name) { raise { code: \"E_INVARG\", message: \"take requires an object name\" }; } let item = $match:match_object(name, this); if (item == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + str_char(34) + name + str_char(34) + \" you mean.\", value: name }; } if (item == $failed_match || item == this || location(item) != this) { raise { code: \"E_INVARG\", message: \"I don't see \" + str_char(34) + name + str_char(34) + \" here.\", value: name }; } if (item == actor || (item in this.subscribers)) { raise { code: \"E_PERM\", message: \"actors are not carryable\", value: item }; } let title = \"\"; try { title = item:title(); } except err { title = \"\"; } if (!title) { title = to_string(item); } let portable = false; try { portable = item.portable; } except err { portable = false; } if (portable != true) { raise { code: \"E_PERM\", message: title + \" is not carryable\", value: item }; } moveto(item, actor); tell(actor, \"You take \" + title + \".\"); observe({ type: \"taken\", actor: actor, item: item, text: actor.name + \" takes \" + title + \".\", ts: now() }); return { item: item, title: title }; }"
+          "source": "verb :take(object) rxd { let name = str_trim(object); if (!name) { raise { code: \"E_INVARG\", message: \"take requires an object name\" }; } let item = $match:match_object(name, this); if (item == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + str_char(34) + name + str_char(34) + \" you mean.\", value: name }; } if (item == $failed_match || item == this || location(item) != this) { raise { code: \"E_INVARG\", message: \"I don't see \" + str_char(34) + name + str_char(34) + \" here.\", value: name }; } if (item == actor || isa(item, $actor)) { raise { code: \"E_PERM\", message: \"actors are not carryable\", value: item }; } let title = \"\"; try { title = item:title(); } except err { title = \"\"; } if (!title) { title = to_string(item); } let portable = false; try { portable = item.portable; } except err { portable = false; } if (portable != true) { raise { code: \"E_PERM\", message: title + \" is not carryable\", value: item }; } moveto(item, actor); tell(actor, \"You take \" + title + \".\"); observe({ type: \"taken\", actor: actor, item: item, text: actor.name + \" takes \" + title + \".\", ts: now() }); return { item: item, title: title }; }"
         },
         {
           "name": "drop",
@@ -655,7 +655,7 @@
             ],
             "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix", "dobj_prefix_rest"], "persistence": "live" }
           },
-          "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } if (recipient != null && recipient != this && recipient != actor && !isa(recipient, $player)) { let matched = $match:match_verb(\"on_say_to\", recipient); if (typeof(matched) == \"map\") { return recipient:on_say_to(text); } } let audience = []; for listener in this.subscribers { if (recipient == actor || listener != recipient) { audience = audience + [listener]; } } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now(), _audience_override: audience }); /* Non-player command recipients returned above through :on_say_to; only players get targeted [to you] text. */ if (recipient != null && recipient != actor && isa(recipient, $player)) { tell(recipient, actor.name + \" [to you] \" + text); } return true; }"
+          "source": "verb :say_to(recipient, text) rxd { if (!text) { raise { code: \"E_INVARG\", message: \"say_to requires text\" }; } if (recipient != null && recipient != this && recipient != actor && !isa(recipient, $player)) { let matched = $match:match_verb(\"on_say_to\", recipient); if (typeof(matched) == \"map\") { return recipient:on_say_to(text); } } let audience = []; for row in this:room_roster() { let listener = row[\"id\"]; if (recipient == actor || listener != recipient) { audience = audience + [listener]; } } observe({ type: \"said_to\", actor: actor, to: recipient, text: text, ts: now(), _audience_override: audience }); /* Non-player command recipients returned above through :on_say_to; only players get targeted [to you] text. */ if (recipient != null && recipient != actor && isa(recipient, $player)) { tell(recipient, actor.name + \" [to you] \" + text); } return true; }"
         },
         {
           "name": "say_as",
@@ -753,7 +753,7 @@
           "arg_spec": {
             "args": []
             ,
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
           "source": "verb :look() rxd { return this:look_at(this); }"
         },
@@ -772,9 +772,9 @@
             "args": [
               "target"
             ],
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"] }
+            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "live" }
           },
-          "source": "verb :look_at(target) rxd { set_task_perms(caller_perms()); let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } if (has(view, \"present_actors\")) { let names = \"\"; try { let present = []; for who in view[\"present_actors\"] { if (who != actor) { present = present + [who]; } } names = str_join(collect_prop(present, \"name\"), \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }"
+          "source": "verb :look_at(target) rxd { set_task_perms(caller_perms()); let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } let roster = []; if (has(view, \"roster\")) { roster = view[\"roster\"]; } else { if (has(view, \"present_actors\")) { roster = view[\"present_actors\"]; } } if (length(roster) > 0) { let names = \"\"; try { let present = []; for who in roster { if (typeof(who) == \"map\" && has(who, \"id\")) { who = who[\"id\"]; } if (who != actor) { present = present + [who]; } } names = str_join(collect_prop(present, \"name\"), \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }"
         },
         {
           "name": "who",
@@ -784,9 +784,9 @@
           "arg_spec": {
             "args": []
             ,
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
-          "source": "verb :who() rxd { observe({ type: \"who\", actor: actor, to: actor, room: this, present_actors: this.subscribers, text: \"Present.\", ts: now() }); return this.subscribers; }",
+          "source": "verb :who() rxd { let roster = this:room_roster(); observe({ type: \"who\", actor: actor, to: actor, room: this, roster: roster, text: \"Present.\", ts: now() }); return roster; }",
           "implementation": {
             "kind": "native",
             "handler": "room_who"
@@ -800,7 +800,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { if (isa(item, $actor)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }",
+          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { if (isa(item, $player)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }",
           "implementation": {
             "kind": "native",
             "handler": "embodied_room_roster"
@@ -834,7 +834,7 @@
             ],
             "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
           },
-          "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old != $nowhere) { try { observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } except err { } } moveto(actor, this); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
+          "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old != $nowhere) { try { observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } except err { } } moveto(actor, this); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
         },
         {
           "name": "leave",
@@ -846,7 +846,7 @@
               "actor?"
             ]
           },
-          "source": "verb :leave(who) rxd { let dest = actor.home; if (dest == null) { dest = $nowhere; } moveto(actor, dest); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); let remaining = []; for s in this.subscribers { if (s != actor) { remaining = remaining + [s]; } } return { room: dest, present_actors: remaining, here_request: true, look_deferred: true }; }"
+          "source": "verb :leave(who) rxd { let dest = actor.home; if (dest == null) { dest = $nowhere; } moveto(actor, dest); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); return { room: dest, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
         },
         {
           "name": "huh",
@@ -905,7 +905,8 @@
           "arg_spec": {
             "args": [
               "text"
-            ]
+            ],
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :command_plan(input) rxd { return $match:plan_command(input, this); }"
         },
@@ -947,14 +948,14 @@
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text", "origin?"] },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
         },
         {
           "name": "hear_parent_announce",
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
+          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
         },
         {
           "name": "say",
@@ -1017,7 +1018,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in this.subscribers { if (!(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
+          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
         }
       ]
     }
@@ -1143,7 +1144,7 @@
         "actor": "obj",
         "to": "obj",
         "room": "obj",
-        "present_actors": "list<obj>",
+        "roster": "list<map>",
         "text": "str"
       }
     },

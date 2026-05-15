@@ -2,9 +2,8 @@
 
 A plug is an external process that authenticates as a block's actor,
 pushes data into the block's properties, and answers calls to the
-block's verbs. From woah's perspective, a plug is just an
-authenticated WebSocket client — there's no special "plug" type in
-the substrate.
+block's verbs. From woah's perspective, a plug is just an authenticated
+agent for a block — there's no special "plug" type in the substrate.
 
 This page covers what a plug needs to do. The two demo plugs
 ([`weather`](../../catalogs/weather/) and
@@ -13,24 +12,12 @@ implementations.
 
 ## Connect
 
-Plugs use the WebSocket wire protocol
-([`../../spec/protocol/wire.md`](../../spec/protocol/wire.md)) with
-an apikey credential. Not REST; the WebSocket is the right shape
-because plugs send unsolicited property writes and receive verb-call
-events.
-
-```
-ws://<deployment>/ws
-```
-
-After connecting, send an `auth` frame:
-
-```json
-{"type": "auth", "token": "apikey:<id>:<secret>"}
-```
-
-The server responds with a `session` frame. Save the session id; you
-use it for the rest of the connection.
+The legacy `/ws` plug transport has been removed. Production plug
+integrations should use the catalog-specific HTTP/MCP surface for the
+block they drive until the v2 plug transport is specified. Keep using an
+apikey credential for non-human agents; authenticate by posting it to
+`/api/auth` and use the returned session with the relevant REST or MCP
+calls.
 
 ## What apikey to use
 
@@ -153,10 +140,10 @@ While disconnected, the block holds the last-pushed data. `:ask`
 calls fail with "block is unplugged" or fall back to cached data
 depending on the class.
 
-**Persistent.** The plug holds an open WebSocket forever, reconnecting
-on drops. Right for high-frequency data (a ticker, a sensor) or for
-blocks that need to answer queries on demand (an LLM-backed
-research agent).
+**Persistent.** The plug runs as a long-lived service with reconnect and
+retry logic. Right for high-frequency data (a ticker, a sensor) or for
+blocks that need to answer queries on demand (an LLM-backed research
+agent).
 
 A class can support either; the same `$weather_block` runs in
 scheduled mode for the basic forecast and could run in persistent
@@ -195,19 +182,13 @@ In rough pseudo-code (real implementations have reconnection,
 backoff, observability):
 
 ```python
-ws = connect("wss://deployment/ws")
-ws.send({"type": "auth", "token": "apikey:..."})
-session = ws.recv()  # type: "session"
+session = post("https://deployment/api/auth", {"token": "apikey:..."})["session"]
 
 while True:
     data = fetch_external()
-    ws.send({
-        "type": "call",
-        "id": new_id(),
-        "target": "the_my_block",
-        "verb": "set_properties",
+    post("https://deployment/api/objects/the_my_block/calls/set_properties", {
         "args": [{"current": data, "last_pushed_at": now_ms()}]
-    })
+    }, session=session)
     sleep_until_next_schedule()
 ```
 

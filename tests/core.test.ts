@@ -1902,7 +1902,9 @@ describe("woo core", () => {
 
     const who = await world.directCall("who", first.actor, "the_chatroom", "who", []);
     expect(who.op).toBe("result");
-    if (who.op === "result") expect(who.result).toEqual([first.actor, second.actor]);
+    if (who.op === "result") {
+      expect((who.result as Array<{ id: string }>).map((row) => row.id)).toEqual([first.actor, second.actor]);
+    }
 
     const say = await world.directCall("say", first.actor, "the_chatroom", "say", ["hello room"]);
     expect(say.op).toBe("result");
@@ -1920,7 +1922,9 @@ describe("woo core", () => {
     await world.directCall("leave-second", second.actor, "the_chatroom", "leave", []);
     await world.directCall("enter-other", first.actor, "the_chatroom", "enter", [second.actor]);
     const afterEnter = await world.directCall("who-2", first.actor, "the_chatroom", "who", []);
-    if (afterEnter.op === "result") expect(afterEnter.result).toEqual([first.actor]);
+    if (afterEnter.op === "result") {
+      expect((afterEnter.result as Array<{ id: string }>).map((row) => row.id)).toEqual([first.actor]);
+    }
 
     expect(world.getProp("the_chatroom", "next_seq")).toBe(1);
     expect(world.replay("the_chatroom", 1, 10)).toEqual([]);

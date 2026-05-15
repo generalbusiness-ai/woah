@@ -24,7 +24,7 @@ DO instances fall into three classes, all of which use the same `PersistentObjec
 | Class | Naming | Hosts |
 |---|---|---|
 | **Self-hosted-instance DO** | `env.WOO.idFromName(<obj_id>)` | One DO per instance of a class declaring `instances_self_host` (per [semantics/objects.md §4.2](../semantics/objects.md#42-host-placement)). Rooms, players, anchor spaces (`the_dubspace`, `the_taskboard`), and operational singletons (`$catalog_registry`) each get their own DO. |
-| **Gateway DO** | `env.WOO.idFromName("world")` | The default home for objects whose class does not self-host. Universal `$`-classes, ad-hoc objects with no anchor, and runtime-created objects whose creator is the gateway itself live here. The Worker entry uses the gateway DO for global routes (`/api/auth`, `/healthz`, `/ws` upgrade) and as the catch-all when no other host claims an id. |
+| **Gateway DO** | `env.WOO.idFromName("world")` | The default home for objects whose class does not self-host. Universal `$`-classes, ad-hoc objects with no anchor, and runtime-created objects whose creator is the gateway itself live here. The Worker entry uses the gateway DO for global routes (`/api/auth`, `/healthz`, `/v2/turn-network/ws` upgrade) and as the catch-all when no other host claims an id. |
 | **Service DO** | `env.DIRECTORY.idFromName("directory")` and similar | Singletons for routing and bookkeeping. See [§R2](#r2-singleton-dos). |
 
 **Routing precedence.** The runtime resolves an object id to a host in order:
@@ -596,11 +596,11 @@ The Worker is a thin router. Business logic lives in DOs.
 GET  /                                  → static asset (index.html)
 GET  /api/objects/<id>                  → DO RPC (describe)
 GET  /api/objects/<id>/properties/<n>   → DO RPC (getProp)
-POST /api/objects/<id>/calls/<verb>     → DO RPC (call or directCall)
+POST /api/objects/<id>/calls/<verb>     → gateway v2 executor + CommitScopeDO
 GET  /api/objects/<id>/log              → DO RPC (readLog)
-GET  /api/objects/<id>/stream           → DO RPC + SSE upgrade
+GET  /api/objects/<id>/stream           → 410 E_GONE (retired)
 POST /api/auth                          → Sessions handler (mints/resumes session)
-GET  /ws                                → WS upgrade → gateway/player host
+GET  /v2/turn-network/ws                → v2 WS upgrade → gateway host
 ```
 
 ### R11.2 ID resolution

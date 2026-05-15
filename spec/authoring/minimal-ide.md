@@ -93,15 +93,13 @@ the main integration path:
 
 ```js
 {
-  op: "call",
+  route: "sequenced",
   id: "test-1",
-  space: "$mix",
-  message: {
-    actor: "$me",
-    target: "#delay",
-    verb: "set_feedback",
-    args: [0.72]
-  }
+  scope: "$mix",
+  actor: "$me",
+  target: "#delay",
+  verb: "set_feedback",
+  args: [0.72]
 }
 ```
 

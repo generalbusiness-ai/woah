@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
-import { handleRestProtocolRequest, handleWsProtocolFrame, statusForError, type RestProtocolRequest } from "../src/core/protocol";
-import { publicAppliedFrame, wooError, type ObjRef, type Session } from "../src/core/types";
+import { handleRestProtocolRequest, statusForError, type RestProtocolRequest } from "../src/core/protocol";
+import { publicAppliedFrame, wooError, type ObjRef, type Session, type WooValue } from "../src/core/types";
 import type { DeferredHostEffect, RoomSnapshot, WooWorld } from "../src/core/world";
 import { LocalHostBridge } from "./core-support";
 
@@ -25,14 +25,21 @@ function getWithQuery(pathname: string, query: Record<string, string>, headers: 
   };
 }
 
+function post(pathname: string, body: Record<string, unknown>, headers: Record<string, string> = {}): RestProtocolRequest {
+  return {
+    method: "POST",
+    pathname,
+    query: () => null,
+    header: (name) => headers[name.toLowerCase()] ?? null,
+    readJson: async () => body
+  };
+}
+
 async function apiMe(world: WooWorld, session: Session) {
   const result = await handleRestProtocolRequest(get("/api/me"), {
     world,
     requireSession: () => session,
     authenticateToken: () => session,
-    state: () => {
-      throw new Error("/api/me must not call full world state");
-    },
     broadcastApplied: async () => undefined,
     broadcastLiveEvents: async () => undefined
   });
@@ -50,9 +57,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/catalogs/ui must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -69,9 +73,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/catalogs/ui must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -87,9 +88,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/objects/:id/summary must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -105,189 +103,54 @@ describe("scoped client projection", () => {
     expect((result.body as any).props).toBeDefined();
   });
 
-  it("gates the legacy full world state endpoint to wizard sessions", async () => {
+  it("retires REST object SSE streams", async () => {
     const world = createWorld();
-    const guest = world.auth("guest:legacy-state-denied");
-    const denied = await handleRestProtocolRequest(get("/api/state"), {
+    const session = world.auth("guest:retired-stream");
+    const result = await handleRestProtocolRequest(get("/api/objects/the_chatroom/stream"), {
       world,
-      requireSession: () => guest,
-      authenticateToken: () => guest,
-      state: () => {
-        throw new Error("non-wizard /api/state must fail before reading state");
-      },
+      requireSession: () => session,
+      authenticateToken: () => session,
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
-    expect(denied.handled).toBe(true);
-    if (!denied.handled || "raw" in denied) throw new Error("unexpected raw protocol result");
-    expect(denied.status).toBe(403);
 
-    const wizard = world.createSessionForActor("$wiz", "bearer");
-    const allowed = await handleRestProtocolRequest(get("/api/state"), {
-      world,
-      requireSession: () => wizard,
-      authenticateToken: () => wizard,
-      state: (actor) => world.state(actor),
-      broadcastApplied: async () => undefined,
-      broadcastLiveEvents: async () => undefined
-    });
-    expect(allowed.handled).toBe(true);
-    if (!allowed.handled || "raw" in allowed) throw new Error("unexpected raw protocol result");
-    expect(allowed.status).toBe(200);
-    expect((allowed.body as any).objects).toBeDefined();
+    expect(result.handled).toBe(true);
+    if (!result.handled || "raw" in result) throw new Error("unexpected raw protocol result");
+    expect(result.status).toBe(410);
+    expect(result.body).toMatchObject({ error: { code: "E_GONE" } });
   });
 
-  it("accepts a scoped replay cursor on websocket auth but requires hydrate in v1", async () => {
+  it("passes REST body maps through to the v2 turn executor", async () => {
     const world = createWorld();
-    const session = world.auth("guest:scoped-ws-cursor");
-    const sent: any[] = [];
-    await handleWsProtocolFrame("conn", {
-      op: "auth",
-      token: `session:${session.id}`,
-      cursor: { spaces: { the_chatroom: { next_seq: 3 } }, live: { resumable: false } }
-    }, {
-      authenticate: () => session,
-      attach: () => undefined,
-      session: () => null,
-      send: (_connection, frame) => sent.push(frame),
-      call: async () => { throw new Error("unexpected call"); },
-      direct: async () => { throw new Error("unexpected direct"); },
-      replay: async () => { throw new Error("unexpected replay"); },
-      deliverInput: async () => null,
-      broadcastApplied: async () => undefined,
-      broadcastTaskResult: async () => undefined,
-      broadcastLiveEvents: async () => undefined
-    });
+    const session = world.auth("guest:rest-body-map");
+    let capturedBody: Record<string, WooValue> | undefined;
 
-    expect(sent[0]).toMatchObject({ op: "session", actor: session.actor, session: session.id, resumed: false });
-  });
-
-  it("routes websocket command frames through the host command executor", async () => {
-    const world = createWorld();
-    const session = world.auth("guest:ws-command");
-    const sent: any[] = [];
-    const live: Array<{ result: any; originator?: string }> = [];
-    await handleWsProtocolFrame("conn", {
-      op: "command",
-      id: "ws-command-1",
-      space: "the_chatroom",
-      text: "hello"
-    }, {
-      authenticate: () => session,
-      attach: () => undefined,
-      session: () => ({ sessionId: session.id, actor: session.actor }),
-      send: (_connection, frame) => sent.push(frame),
-      call: async () => { throw new Error("unexpected call"); },
-      command: async (frameId, wsSession, space, text) => {
-        expect(frameId).toBe("ws-command-1");
-        expect(wsSession).toMatchObject({ sessionId: session.id, actor: session.actor });
-        expect(space).toBe("the_chatroom");
-        expect(text).toBe("hello");
+    const result = await handleRestProtocolRequest(post("/api/objects/the_chatroom/calls/look", {
+      args: [],
+      body: { format: "compact", depth: 2 }
+    }), {
+      world,
+      requireSession: () => session,
+      authenticateToken: () => session,
+      executeTurn: async (input) => {
+        capturedBody = input.body;
         return {
           op: "result",
-          id: frameId,
-          result: true,
-          observations: [{ type: "said", source: space, actor: session.actor, text }],
-          audience: space,
-          command: { route: "direct", target: space, verb: "say", args: [text] }
-        } as any;
-      },
-      direct: async () => { throw new Error("unexpected direct"); },
-      replay: async () => { throw new Error("unexpected replay"); },
-      deliverInput: async () => null,
-      broadcastApplied: async () => { throw new Error("unexpected applied"); },
-      broadcastTaskResult: async () => undefined,
-      broadcastLiveEvents: async (result, originator) => { live.push({ result, originator }); }
-    });
-
-    expect(sent[0]).toMatchObject({
-      op: "result",
-      id: "ws-command-1",
-      result: true,
-      observations: [{ type: "said", source: "the_chatroom", actor: session.actor, text: "hello" }],
-      command: { route: "direct", target: "the_chatroom", verb: "say", args: ["hello"] }
-    });
-    expect(live).toHaveLength(1);
-    expect(live[0].originator).toBe("conn");
-  });
-
-  it("returns websocket direct observations on the caller result frame", async () => {
-    const world = createWorld();
-    const session = world.auth("guest:ws-direct-observations");
-    const sent: any[] = [];
-    const live: Array<{ result: any; originator?: string }> = [];
-    await handleWsProtocolFrame("conn", {
-      op: "direct",
-      id: "ws-direct-1",
-      target: session.actor,
-      verb: "inventory",
-      args: []
-    }, {
-      authenticate: () => session,
-      attach: () => undefined,
-      session: () => ({ sessionId: session.id, actor: session.actor }),
-      send: (_connection, frame) => sent.push(frame),
-      call: async () => { throw new Error("unexpected call"); },
-      direct: async (frameId, wsSession, target, verb, args) => {
-        expect(frameId).toBe("ws-direct-1");
-        expect(wsSession).toMatchObject({ sessionId: session.id, actor: session.actor });
-        expect(target).toBe(session.actor);
-        expect(verb).toBe("inventory");
-        expect(args).toEqual([]);
-        return {
-          op: "result",
-          id: frameId,
-          result: { text: "You are empty-handed." },
-          observations: [{ type: "text", target: session.actor, actor: session.actor, text: "You are empty-handed.", source: session.actor }],
-          audience: session.actor
+          id: input.id,
+          command: { actor: input.actor, target: input.target, verb: input.verb, args: input.args, body: input.body },
+          result: "ok",
+          observations: [],
+          audience: input.scope
         };
       },
-      replay: async () => { throw new Error("unexpected replay"); },
-      deliverInput: async () => null,
-      broadcastApplied: async () => { throw new Error("unexpected applied"); },
-      broadcastTaskResult: async () => undefined,
-      broadcastLiveEvents: async (result, originator) => { live.push({ result, originator }); }
+      broadcastApplied: async () => undefined,
+      broadcastLiveEvents: async () => undefined
     });
 
-    expect(sent[0]).toMatchObject({
-      op: "result",
-      id: "ws-direct-1",
-      result: { text: "You are empty-handed." },
-      observations: [{ type: "text", target: session.actor, actor: session.actor, text: "You are empty-handed.", source: session.actor }]
-    });
-    expect(live).toHaveLength(1);
-    expect(live[0].originator).toBe("conn");
-  });
-
-  it("returns websocket command errors from invalid command spaces", async () => {
-    const world = createWorld();
-    const session = world.auth("guest:ws-command-bad-space");
-    const sent: any[] = [];
-    await handleWsProtocolFrame("conn", {
-      op: "command",
-      id: "ws-command-bad-space",
-      space: "the_lamp",
-      text: "hello"
-    }, {
-      authenticate: () => session,
-      attach: () => undefined,
-      session: () => ({ sessionId: session.id, actor: session.actor }),
-      send: (_connection, frame) => sent.push(frame),
-      call: async () => { throw new Error("unexpected call"); },
-      command: (frameId, wsSession, space, text) => world.command(frameId, wsSession.sessionId, space, text),
-      direct: async () => { throw new Error("unexpected direct"); },
-      replay: async () => { throw new Error("unexpected replay"); },
-      deliverInput: async () => null,
-      broadcastApplied: async () => { throw new Error("unexpected applied"); },
-      broadcastTaskResult: async () => undefined,
-      broadcastLiveEvents: async () => { throw new Error("unexpected live"); }
-    });
-
-    expect(sent[0]).toMatchObject({
-      op: "error",
-      id: "ws-command-bad-space",
-      error: { code: "E_TYPE" }
-    });
+    expect(result.handled).toBe(true);
+    if (!result.handled || "raw" in result) throw new Error("unexpected raw protocol result");
+    expect(result.status).toBe(200);
+    expect(capturedBody).toEqual({ format: "compact", depth: 2 });
   });
 
   it("includes enriched movement results on sequenced applied frames", async () => {
@@ -313,7 +176,7 @@ describe("scoped client projection", () => {
       }
     });
     const here = (frame.result as Record<string, any>).here;
-    expect(here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(here.roster.map((actor: { id: string }) => actor.id)).toContain(session.actor);
     expect(here.exits.some((exit: { direction?: string }) => exit.direction === "west")).toBe(true);
   });
 
@@ -386,12 +249,12 @@ describe("scoped client projection", () => {
       id: "the_chatroom",
       name: "Living Room"
     });
-    expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(body.here.roster.map((actor: { id: string }) => actor.id)).toContain(session.actor);
     expect(body.here.exits.some((exit: { direction?: string }) => exit.direction === "south")).toBe(true);
     expect(new Set(body.here.exits.map((exit: { id: string }) => exit.id)).size).toBe(body.here.exits.length);
     expect(body.here.props.secret_room_note).toBeNull();
     expect(body.here.props.session_subscribers).toBeUndefined();
-    expect(body.here.present_actors.every((actor: { props?: unknown }) => actor.props === undefined)).toBe(true);
+    expect(body.here.roster.every((actor: { props?: unknown }) => actor.props === undefined)).toBe(true);
     expect(Array.isArray(body.inventory)).toBe(true);
   });
 
@@ -428,9 +291,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("overlay snapshots must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -484,9 +344,10 @@ describe("scoped client projection", () => {
     if (entered.op !== "result") return;
     expect(entered.result).toMatchObject({
       room: "the_pinboard",
-      present: expect.arrayContaining([session.actor]),
-      present_actors: expect.arrayContaining([session.actor])
+      roster: expect.arrayContaining([expect.objectContaining({ id: session.actor })])
     });
+    expect((entered.result as Record<string, unknown>).present).toBeUndefined();
+    expect((entered.result as Record<string, unknown>).present_actors).toBeUndefined();
     expect((entered.result as Record<string, unknown>).here_request).toBeUndefined();
     expect((entered.result as Record<string, unknown>).look_deferred).toBeUndefined();
     expect((entered.result as Record<string, unknown>).here).toBeUndefined();
@@ -542,7 +403,7 @@ describe("scoped client projection", () => {
     expect(moved.op).toBe("result");
     if (moved.op !== "result") return;
     expect(roomB.getProp("the_deck", "subscribers")).not.toContain(actor);
-    expect((moved.result as any).here.present_actors.map((item: { id: string }) => item.id)).toContain(actor);
+    expect((moved.result as any).here.roster.map((item: { id: string }) => item.id)).toContain(actor);
     expect(effects.map((effect) => effect.kind)).toContain("space_subscriber");
   });
 
@@ -556,6 +417,8 @@ describe("scoped client projection", () => {
     remote.ensureSessionForActor(session.id, session.actor, session.tokenClass, session.expiresAt, "the_deck");
     remote.setSpaceSubscriber("the_deck", session.actor, true, session.id);
     remote.setActorPresence(session.actor, "the_deck", true, session.id);
+    remote.object(session.actor).location = "the_deck";
+    remote.object("the_deck").contents.add(session.actor);
     home.sessions.get(session.id)!.activeScope = "the_deck";
     const worlds = new Map<string, WooWorld>([
       ["home", home],
@@ -573,7 +436,7 @@ describe("scoped client projection", () => {
     expect(body.session.current_location).toBe("the_deck");
     expect(body.cursor.spaces.the_deck.next_seq).toBe(1);
     expect(body.here).toMatchObject({ id: "the_deck", name: "Deck" });
-    expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(body.here.roster.map((actor: { id: string }) => actor.id)).toContain(session.actor);
   });
 
   it("only degrades /api/me remote here snapshots for read availability errors", async () => {
@@ -623,9 +486,6 @@ describe("scoped client projection", () => {
       world: home,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/me must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -657,7 +517,7 @@ describe("scoped client projection", () => {
     actorHost.setHostBridge(new LocalHostBridge("actor-host", worlds, routes));
 
     const snapshot = await roomHost.roomSnapshotForActor("$wiz", "the_deck");
-    expect(snapshot.present_actors.map((actor: { id: string }) => actor.id)).not.toContain(remoteActor);
+    expect(snapshot.roster.map((actor: { id: string }) => actor.id)).not.toContain(remoteActor);
     expect(roomHost.propOrNull("the_deck", "subscribers")).toContain(remoteActor);
   });
 

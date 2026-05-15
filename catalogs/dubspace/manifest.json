@@ -24,7 +24,7 @@
         "surface": "main",
         "subject": "$dubspace",
         "neighborhood": {
-          "include": ["subject", "contents", "subscribers", "actor"]
+          "include": ["subject", "contents", "session_subscribers", "actor"]
         }
       }
     ],
@@ -347,7 +347,7 @@
             "args": [],
             "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [] }
           },
-          "source": "verb :enter() rxd { moveto(actor, this); if (!(actor in this.operators)) { this.operators = this.operators + [actor]; } let text = actor.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: this, operators: this.operators, present_actors: this.subscribers, here_request: true, look_deferred: true }; }"
+          "source": "verb :enter() rxd { moveto(actor, this); if (!(actor in this.operators)) { this.operators = this.operators + [actor]; } let text = actor.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: this, operators: this.operators, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
         },
         {
           "name": "leave",
@@ -387,7 +387,7 @@
               "value"
             ]
           },
-          "source": "verb :set_control(target, name, value) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let allowed = [\"loop_id\", \"playing\", \"gain\", \"freq\", \"send\", \"time\", \"feedback\", \"wet\", \"cutoff\"]; if (!(target in contents(this)) || !(name in allowed)) { raise { code: \"E_PERM\", message: \"control is not writable through this dubspace\", value: { target: target, name: name } }; } target.(name) = value; observe({ type: \"control_changed\", target: target, name: name, value: value }); return value; }"
+          "source": "verb :set_control(target, name, value) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let allowed = [\"loop_id\", \"playing\", \"gain\", \"freq\", \"send\", \"time\", \"feedback\", \"wet\", \"cutoff\"]; if (!(target in contents(this)) || !(name in allowed)) { raise { code: \"E_PERM\", message: \"control is not writable through this dubspace\", value: { target: target, name: name } }; } target.(name) = value; observe({ type: \"control_changed\", target: target, name: name, value: value }); return value; }"
         },
         {
           "name": "preview_control",
@@ -424,7 +424,7 @@
               "slot"
             ]
           },
-          "source": "verb :start_loop(slot) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } if (!(slot in contents(this))) { raise { code: \"E_PERM\", message: \"loop slot is not in this dubspace\", value: slot }; } slot.playing = true; observe({ type: \"loop_started\", slot: slot, loop_id: slot.loop_id }); return true; }"
+          "source": "verb :start_loop(slot) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } if (!(slot in contents(this))) { raise { code: \"E_PERM\", message: \"loop slot is not in this dubspace\", value: slot }; } slot.playing = true; observe({ type: \"loop_started\", slot: slot, loop_id: slot.loop_id }); return true; }"
         },
         {
           "name": "stop_loop",
@@ -436,7 +436,7 @@
               "slot"
             ]
           },
-          "source": "verb :stop_loop(slot) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } if (!(slot in contents(this))) { raise { code: \"E_PERM\", message: \"loop slot is not in this dubspace\", value: slot }; } slot.playing = false; observe({ type: \"loop_stopped\", slot: slot }); return true; }"
+          "source": "verb :stop_loop(slot) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } if (!(slot in contents(this))) { raise { code: \"E_PERM\", message: \"loop slot is not in this dubspace\", value: slot }; } slot.playing = false; observe({ type: \"loop_stopped\", slot: slot }); return true; }"
         },
         {
           "name": "set_drum_step",
@@ -450,7 +450,7 @@
               "enabled"
             ]
           },
-          "source": "verb :set_drum_step(voice, step, enabled) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let voices = [\"kick\", \"snare\", \"hat\", \"tone\"]; if (!(voice in voices)) { raise { code: \"E_INVARG\", message: \"unknown drum voice\", value: voice }; } if (typeof(enabled) != \"boolean\") { raise { code: \"E_TYPE\", message: \"enabled must be boolean\", value: enabled }; } let pattern = \"drum_1\".pattern; let row = pattern[voice]; if (step < 0 || step >= length(row)) { raise { code: \"E_RANGE\", message: \"drum step out of range\", value: step }; } let next = []; let i = 0; for item in row { if (i == step) { next = next + [enabled]; } else { next = next + [item]; } i = i + 1; } pattern[voice] = next; \"drum_1\".pattern = pattern; observe({ type: \"drum_step_changed\", target: \"drum_1\", voice: voice, step: step, enabled: enabled, pattern: pattern }); return enabled; }"
+          "source": "verb :set_drum_step(voice, step, enabled) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let voices = [\"kick\", \"snare\", \"hat\", \"tone\"]; if (!(voice in voices)) { raise { code: \"E_INVARG\", message: \"unknown drum voice\", value: voice }; } if (typeof(enabled) != \"boolean\") { raise { code: \"E_TYPE\", message: \"enabled must be boolean\", value: enabled }; } let pattern = \"drum_1\".pattern; let row = pattern[voice]; if (step < 0 || step >= length(row)) { raise { code: \"E_RANGE\", message: \"drum step out of range\", value: step }; } let next = []; let i = 0; for item in row { if (i == step) { next = next + [enabled]; } else { next = next + [item]; } i = i + 1; } pattern[voice] = next; \"drum_1\".pattern = pattern; observe({ type: \"drum_step_changed\", target: \"drum_1\", voice: voice, step: step, enabled: enabled, pattern: pattern }); return enabled; }"
         },
         {
           "name": "set_tempo",
@@ -467,7 +467,7 @@
             ],
             "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
           },
-          "source": "verb :set_tempo(raw_bpm) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let bpm = raw_bpm; if (typeof(raw_bpm) == \"string\") { let trimmed = str_trim(raw_bpm); bpm = to_int(trimmed); if (bpm == 0 && trimmed != \"0\") { raise { code: \"E_INVARG\", message: \"BPM expects digits.\", value: raw_bpm }; } } if (typeof(bpm) != \"number\") { raise { code: \"E_TYPE\", message: \"tempo must be numeric\", value: raw_bpm }; } bpm = round(bpm); if (bpm < 60) { bpm = 60; } if (bpm > 200) { bpm = 200; } \"drum_1\".bpm = bpm; observe({ type: \"tempo_changed\", target: \"drum_1\", bpm: bpm }); return bpm; }"
+          "source": "verb :set_tempo(raw_bpm) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let bpm = raw_bpm; if (typeof(raw_bpm) == \"string\") { let trimmed = str_trim(raw_bpm); bpm = to_int(trimmed); if (bpm == 0 && trimmed != \"0\") { raise { code: \"E_INVARG\", message: \"BPM expects digits.\", value: raw_bpm }; } } if (typeof(bpm) != \"number\") { raise { code: \"E_TYPE\", message: \"tempo must be numeric\", value: raw_bpm }; } bpm = round(bpm); if (bpm < 60) { bpm = 60; } if (bpm > 200) { bpm = 200; } \"drum_1\".bpm = bpm; observe({ type: \"tempo_changed\", target: \"drum_1\", bpm: bpm }); return bpm; }"
         },
         {
           "name": "start_transport",
@@ -477,7 +477,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :start_transport() rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let started = now(); \"drum_1\".playing = true; \"drum_1\".started_at = started; observe({ type: \"transport_started\", target: \"drum_1\", started_at: started, bpm: \"drum_1\".bpm }); return started; }"
+          "source": "verb :start_transport() rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let started = now(); \"drum_1\".playing = true; \"drum_1\".started_at = started; observe({ type: \"transport_started\", target: \"drum_1\", started_at: started, bpm: \"drum_1\".bpm }); return started; }"
         },
         {
           "name": "stop_transport",
@@ -487,7 +487,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :stop_transport() rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } \"drum_1\".playing = false; observe({ type: \"transport_stopped\", target: \"drum_1\" }); return true; }"
+          "source": "verb :stop_transport() rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } \"drum_1\".playing = false; observe({ type: \"transport_stopped\", target: \"drum_1\" }); return true; }"
         },
         {
           "name": "save_scene",
@@ -499,7 +499,7 @@
               "name"
             ]
           },
-          "source": "verb :save_scene(name) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let scene = \"default_scene\"; scene.name = name; scene.controls = { slot_1: { loop_id: \"slot_1\".loop_id, playing: \"slot_1\".playing, gain: \"slot_1\".gain, freq: \"slot_1\".freq }, slot_2: { loop_id: \"slot_2\".loop_id, playing: \"slot_2\".playing, gain: \"slot_2\".gain, freq: \"slot_2\".freq }, slot_3: { loop_id: \"slot_3\".loop_id, playing: \"slot_3\".playing, gain: \"slot_3\".gain, freq: \"slot_3\".freq }, slot_4: { loop_id: \"slot_4\".loop_id, playing: \"slot_4\".playing, gain: \"slot_4\".gain, freq: \"slot_4\".freq }, channel_1: { gain: \"channel_1\".gain }, filter_1: { cutoff: \"filter_1\".cutoff }, delay_1: { send: \"delay_1\".send, time: \"delay_1\".time, feedback: \"delay_1\".feedback, wet: \"delay_1\".wet }, drum_1: { bpm: \"drum_1\".bpm, playing: \"drum_1\".playing, started_at: \"drum_1\".started_at, step_count: \"drum_1\".step_count, pattern: \"drum_1\".pattern } }; observe({ type: \"scene_saved\", scene: scene, name: name }); return scene; }"
+          "source": "verb :save_scene(name) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let scene = \"default_scene\"; scene.name = name; scene.controls = { slot_1: { loop_id: \"slot_1\".loop_id, playing: \"slot_1\".playing, gain: \"slot_1\".gain, freq: \"slot_1\".freq }, slot_2: { loop_id: \"slot_2\".loop_id, playing: \"slot_2\".playing, gain: \"slot_2\".gain, freq: \"slot_2\".freq }, slot_3: { loop_id: \"slot_3\".loop_id, playing: \"slot_3\".playing, gain: \"slot_3\".gain, freq: \"slot_3\".freq }, slot_4: { loop_id: \"slot_4\".loop_id, playing: \"slot_4\".playing, gain: \"slot_4\".gain, freq: \"slot_4\".freq }, channel_1: { gain: \"channel_1\".gain }, filter_1: { cutoff: \"filter_1\".cutoff }, delay_1: { send: \"delay_1\".send, time: \"delay_1\".time, feedback: \"delay_1\".feedback, wet: \"delay_1\".wet }, drum_1: { bpm: \"drum_1\".bpm, playing: \"drum_1\".playing, started_at: \"drum_1\".started_at, step_count: \"drum_1\".step_count, pattern: \"drum_1\".pattern } }; observe({ type: \"scene_saved\", scene: scene, name: name }); return scene; }"
         },
         {
           "name": "recall_scene",
@@ -511,7 +511,7 @@
               "scene"
             ]
           },
-          "source": "verb :recall_scene(scene) rx { if (!(actor in this.operators) && !(actor in this.subscribers) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let controls = scene.controls; let s1 = controls[\"slot_1\"]; \"slot_1\".loop_id = s1[\"loop_id\"]; \"slot_1\".playing = s1[\"playing\"]; \"slot_1\".gain = s1[\"gain\"]; \"slot_1\".freq = s1[\"freq\"]; let s2 = controls[\"slot_2\"]; \"slot_2\".loop_id = s2[\"loop_id\"]; \"slot_2\".playing = s2[\"playing\"]; \"slot_2\".gain = s2[\"gain\"]; \"slot_2\".freq = s2[\"freq\"]; let s3 = controls[\"slot_3\"]; \"slot_3\".loop_id = s3[\"loop_id\"]; \"slot_3\".playing = s3[\"playing\"]; \"slot_3\".gain = s3[\"gain\"]; \"slot_3\".freq = s3[\"freq\"]; let s4 = controls[\"slot_4\"]; \"slot_4\".loop_id = s4[\"loop_id\"]; \"slot_4\".playing = s4[\"playing\"]; \"slot_4\".gain = s4[\"gain\"]; \"slot_4\".freq = s4[\"freq\"]; let channel = controls[\"channel_1\"]; \"channel_1\".gain = channel[\"gain\"]; let filter = controls[\"filter_1\"]; \"filter_1\".cutoff = filter[\"cutoff\"]; let delay = controls[\"delay_1\"]; \"delay_1\".send = delay[\"send\"]; \"delay_1\".time = delay[\"time\"]; \"delay_1\".feedback = delay[\"feedback\"]; \"delay_1\".wet = delay[\"wet\"]; let drum = controls[\"drum_1\"]; \"drum_1\".bpm = drum[\"bpm\"]; \"drum_1\".playing = drum[\"playing\"]; \"drum_1\".started_at = drum[\"started_at\"]; \"drum_1\".step_count = drum[\"step_count\"]; \"drum_1\".pattern = drum[\"pattern\"]; observe({ type: \"scene_recalled\", scene: scene, controls: controls }); return true; }"
+          "source": "verb :recall_scene(scene) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let controls = scene.controls; let s1 = controls[\"slot_1\"]; \"slot_1\".loop_id = s1[\"loop_id\"]; \"slot_1\".playing = s1[\"playing\"]; \"slot_1\".gain = s1[\"gain\"]; \"slot_1\".freq = s1[\"freq\"]; let s2 = controls[\"slot_2\"]; \"slot_2\".loop_id = s2[\"loop_id\"]; \"slot_2\".playing = s2[\"playing\"]; \"slot_2\".gain = s2[\"gain\"]; \"slot_2\".freq = s2[\"freq\"]; let s3 = controls[\"slot_3\"]; \"slot_3\".loop_id = s3[\"loop_id\"]; \"slot_3\".playing = s3[\"playing\"]; \"slot_3\".gain = s3[\"gain\"]; \"slot_3\".freq = s3[\"freq\"]; let s4 = controls[\"slot_4\"]; \"slot_4\".loop_id = s4[\"loop_id\"]; \"slot_4\".playing = s4[\"playing\"]; \"slot_4\".gain = s4[\"gain\"]; \"slot_4\".freq = s4[\"freq\"]; let channel = controls[\"channel_1\"]; \"channel_1\".gain = channel[\"gain\"]; let filter = controls[\"filter_1\"]; \"filter_1\".cutoff = filter[\"cutoff\"]; let delay = controls[\"delay_1\"]; \"delay_1\".send = delay[\"send\"]; \"delay_1\".time = delay[\"time\"]; \"delay_1\".feedback = delay[\"feedback\"]; \"delay_1\".wet = delay[\"wet\"]; let drum = controls[\"drum_1\"]; \"drum_1\".bpm = drum[\"bpm\"]; \"drum_1\".playing = drum[\"playing\"]; \"drum_1\".started_at = drum[\"started_at\"]; \"drum_1\".step_count = drum[\"step_count\"]; \"drum_1\".pattern = drum[\"pattern\"]; observe({ type: \"scene_recalled\", scene: scene, controls: controls }); return true; }"
         }
       ]
     }

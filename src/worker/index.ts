@@ -1,7 +1,8 @@
 // Worker entry — splits routing between Durable Objects and Workers Assets.
 //
-// Global API, /healthz, /ws, /v2/turn-network/ws → world/gateway DO.
-// Object REST routes                             → Directory-resolved host DO.
+// Global API, /healthz, /v2/turn-network/ws      → world/gateway DO.
+// Object REST calls                             → world/gateway DO v2 executor.
+// Object REST reads                             → Directory-resolved host DO.
 // Everything else                                → env.ASSETS.fetch (the bundled SPA from ./dist).
 
 import type { Env } from "./persistent-object-do";
@@ -49,7 +50,12 @@ export default {
 
     const objectRoute = parseObjectRoute(url.pathname);
     if (objectRoute) {
-      const host = await resolveHostForObjectRoute(env, request, objectRoute);
+      // v2 REST calls execute from the gateway snapshot and commit through
+      // CommitScopeDO. Routing calls to the target host would reintroduce v1's
+      // stale per-host cache problem for cross-host inventory and movement.
+      const host = objectRoute.rest[0] === "calls"
+        ? WORLD_HOST
+        : await resolveHostForObjectRoute(env, request, objectRoute);
       const routed = await withDirectorySession(env, request);
       const response = await forwardToHost(env, host, routed);
       if (host !== WORLD_HOST && request.method === "POST" && objectRoute.rest[0] === "calls") {
@@ -59,7 +65,7 @@ export default {
     }
 
     if (isApiPath(url.pathname)) {
-      return forwardToHost(env, WORLD_HOST, request);
+      return forwardToHost(env, WORLD_HOST, await withDirectorySession(env, request));
     }
 
     if (env.ASSETS) {

@@ -1287,7 +1287,7 @@ overlapping ownership of projection state.
 
 The client framework MUST provide a consistent projected view of each
 component's neighborhood. Components read through `observe()`; they SHOULD NOT
-fetch `/api/state`, read raw wire frames, or maintain duplicate canonical
+fetch full-world snapshots, read raw wire frames, or maintain duplicate canonical
 object models for objects the framework has in scope.
 
 The projection has ordered layers:
@@ -1308,9 +1308,9 @@ dubspace control therefore sees the new position/value immediately through
 the same `observe()` path it uses after the server reply arrives.
 
 Refreshing the canonical snapshot layer MUST NOT by itself overwrite a higher
-layer. A stale `/api/state` response can update the canonical base, but active
-live-preview or pending optimistic patches continue to win until they are
-reconciled, superseded, or expired.
+layer. A stale scoped snapshot response can update the canonical base, but
+active live-preview or pending optimistic patches continue to win until they
+are reconciled, superseded, or expired.
 
 Room snapshots and other neighborhood payloads MAY ship thin object summaries
 that omit `props` to keep the projection wire small. When a component declares

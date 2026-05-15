@@ -7,10 +7,9 @@ declared location — and exposes the external system's data and
 behavior as ordinary woah properties and verbs.
 
 The external side is the **plug**. A plug is a process — Python,
-TypeScript, anything that speaks WebSocket — running outside woah.
-It authenticates as the block's actor (via apikey), pushes data into
-the block's properties, and answers verb calls (`:ask`, `:order`,
-custom).
+TypeScript, or another service runtime — running outside woah. It
+authenticates as the block's actor (via apikey), pushes data into the
+block's properties, and answers verb calls (`:ask`, `:order`, custom).
 
 This section describes the architecture, how to use blocks that
 exist, and how to write a plug for a new block.

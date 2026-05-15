@@ -377,7 +377,7 @@ The bad pattern this rules out: a sequenced state mutation that also emits trans
 
 ### C12.2 External direct-call gate
 
-External clients and agents may not invoke arbitrary verbs directly just because direct dispatch exists. Verb metadata includes `direct_callable: bool`, default `false`. External ingress surfaces — WebSocket `op: "direct"`, REST calls with no `space`, and similar APIs — reject direct calls to verbs without this annotation with `E_DIRECT_DENIED`.
+External clients and agents may not invoke arbitrary verbs directly just because direct dispatch exists. Verb metadata includes `direct_callable: bool`, default `false`. External ingress surfaces — v2 direct turn intents, REST calls with no `space`, and similar APIs — reject direct calls to verbs without this annotation with `E_DIRECT_DENIED`.
 
 Spec tables use `rxd` as shorthand for "readable/executable and externally
 direct-callable" — equivalent to `direct_callable: true` on the verb metadata.

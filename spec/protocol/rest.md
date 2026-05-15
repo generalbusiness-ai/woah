@@ -7,9 +7,9 @@ status: implemented
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
-An HTTP+SSE alternative to the WebSocket wire ([wire.md](wire.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
+An HTTP alternative to the browser turn network ([v2-turn-network.md](v2-turn-network.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
 
-The two wire formats target the same model. WebSocket is the right shape for clients that maintain long-lived presence and want push observations. REST is the right shape for agents and tooling that operate in iterations, scripts that want a single request-response, and integrations behind HTTP gateways. Either or both may be exposed by an implementation.
+The two protocol surfaces target the same model. The browser turn network is the right shape for clients that maintain long-lived presence and want push observations. REST is the right shape for agents and tooling that operate in iterations, scripts that want a single request-response, and integrations behind HTTP gateways. Either or both may be exposed by an implementation.
 
 ---
 
@@ -18,7 +18,6 @@ The two wire formats target the same model. WebSocket is the right shape for cli
 ```
 POST  /api/auth
 DELETE /api/session
-GET   /api/state
 GET   /api/me
 GET   /api/catalogs/ui
 GET   /api/objects/{id-or-name}
@@ -27,10 +26,9 @@ GET   /api/objects/{id-or-name}/ui-snapshot?surface=S
 GET   /api/objects/{id-or-name}/properties/{name}
 POST  /api/objects/{id-or-name}/calls/{verb}
 GET   /api/objects/{id-or-name}/log?from=N&limit=M
-GET   /api/objects/{id-or-name}/stream
 ```
 
-Twelve endpoints. Everything is an object; identifiers are object refs,
+Ten endpoints. Everything is an object; identifiers are object refs,
 corenames, or implementation-local object ids.
 
 ---
@@ -72,16 +70,6 @@ Subsequent requests carry the session id as `Authorization: Session <id>`. The s
 local session store before returning. Distributed implementations SHOULD also
 remove any session-routing record used for cross-host dispatch; stale best-effort
 routes must fail closed through the normal session validation path.
-
-`GET /api/state` is the legacy full-world debug projection. It is wizard-only.
-It returns the actor-readable world projection plus
-`session: { id, actor, active_scope }` for the presented session. Transitional
-implementations may include the legacy alias `current_location` with the same
-value. The
-projection's object graph may include compatibility presence mirrors, but
-ordinary clients MUST NOT use it for boot, movement, route resolution, or live
-updates. Use `/api/me`, `/api/objects/{id-or-name}/summary`, and overlay
-snapshots instead.
 
 `GET /api/me` returns the scoped browser projection for the presented session:
 `{ server_time, cursor, self, session, here, inventory }`. It is the ordinary
@@ -128,8 +116,8 @@ map.
 permission-filtered object summary used by scoped projections. It includes the
 same identity fields and actor-filtered `props` as `/api/me` summaries,
 including `ancestors` for client-side UI frame resolution. It is the narrow
-route/debug lookup for one object; clients MUST NOT use `/api/state` merely to
-resolve a route target's display name or class chain.
+route/debug lookup for one object; clients MUST NOT request a full-world
+snapshot merely to resolve a route target's display name or class chain.
 
 Credentialed auth extends the vocabulary per [auth.md §A3](../identity/auth.md#a3-token-vocabulary-extended): `bearer:<jwt>`, `apikey:<id>:<secret>`, `oauth_code:<provider>:<code>`, `recovery:<token>`. Bearer tokens use `Authorization: Bearer <jwt>` with signature/claims validation. The endpoint shape is unchanged; only the accepted vocabulary expands.
 
@@ -161,7 +149,7 @@ The value is V2-encoded ([values.md §V2](../semantics/values.md#v2-canonical-js
 - `403 E_PERM` if the caller can't read.
 - `404 E_PROPNF` if the property doesn't exist.
 
-Property *writes* are not exposed as REST. Mutations go through verb calls (R6). Same discipline as the WebSocket wire: properties are read-only at the API; verbs are how mutation happens.
+Property *writes* are not exposed as REST. Mutations go through verb calls (R6). Same discipline as the browser turn network: properties are read-only at the API; verbs are how mutation happens.
 
 ---
 
@@ -178,6 +166,12 @@ The body-level `space` field determines whether the call is sequenced — this i
 - **`space` is set** → sequenced through that `$space`. The runtime constructs the message `{ actor, target: id-or-name, verb, args }` and dispatches it through `space:call`. Returns `{ space, seq, message, observations, ts, result }`.
 - **`space` is null** → direct dispatch on the target. Allowed only for verbs annotated `direct_callable: true` (§R12). For verbs without this annotation, returns `403 E_DIRECT_DENIED`. Returns `{ result, observations }`.
 
+Direct REST calls run through the same v2 turn executor as browser clients.
+Their persistence class is catalog metadata: verbs that are read-only or
+live-observation-only declare `arg_spec.command.persistence: "live"`; verbs
+without that declaration are treated as durable so arbitrary catalog mutations
+are committed instead of silently simulated.
+
 The natural agent shape is sequenced: `POST /api/objects/$task_42/calls/transition` with body `{ args: ["design-review"], space: "$task_registry" }`. The same call without `space` is rejected because `:transition` is not direct-callable. This makes "mutate through a space" the obvious path, not something callers must remember to wrap.
 
 For backward compatibility with the wire format, calling `:call` directly on a `$space`-descended object (`POST /api/objects/$task_registry/calls/call` with body `{ args: [{target, verb, args}] }`) is also sequenced — equivalent to setting `space` on the body of the inner target. The body-level `space` form is preferred in agent code.
@@ -192,7 +186,7 @@ entry receives a pre-sequence `403 E_PERM`.
 
 In both cases:
 - `actor` defaults to `$me`. Wizards may pass a different actor (logged); regular callers presenting an actor different from their session's binding get `403 E_PERM`.
-- `id` is a client-chosen correlation token; idempotent retry returns the same response within the cache window (5 min, per [wire.md §17.4](wire.md#174-the-applied-push-model)).
+- `id` is a client-chosen correlation token; idempotent retry returns the same response within the cache window (5 min, per [v2-turn-network.md §VTN4](v2-turn-network.md#vtn4-message-envelope)).
 - `body` is an optional map carrying additional named arguments per the verb's `arg_spec`.
 
 Movement/entry verbs that return an object-shaped `{ room, here_request: true,
@@ -241,35 +235,22 @@ GET /api/objects/{id-or-name}/log?from=N&limit=M
 returns: { messages: [...], next_seq, has_more }
 ```
 
-If `{id-or-name}` is a `$space`-descended object, returns the message log per [events.md §12.8](../semantics/events.md#128-sequenced-calls-with-gap-recovery). Each entry carries the accepted message, final outcome, and applied observations so an HTTP/SSE client can reconstruct the same applied frames it would have received live. Pagination via `from` (default 1) and `limit` (default 100, max 1000).
+If `{id-or-name}` is a `$space`-descended object, returns the message log per [events.md §12.8](../semantics/events.md#128-sequenced-calls-with-gap-recovery). Each entry carries the accepted message, final outcome, and applied observations so an HTTP client can reconstruct applied history after reconnect or polling gaps. Pagination via `from` (default 1) and `limit` (default 100, max 1000).
 
 If the target is not a space, returns `404 E_NOTAPPLICABLE`.
 
 ---
 
-## R8. Stream (SSE)
+## R8. Retired object streams
 
 ```
 GET /api/objects/{id-or-name}/stream
-returns: text/event-stream
+returns: 410 { error: { code: "E_GONE", ... } }
 ```
 
-Server-sent events. Two SSE event types are emitted:
-
-- **`event: applied`** — a sequenced applied frame. Replayable; carries `seq`. JSON body has the same shape as wire.md `op: "applied"`.
-- **`event: event`** — a live observation from a direct call. Not replayable; no `seq`. JSON body is `{observation: Map}` per wire.md `op: "event"`. Per [events.md §12.6](../semantics/events.md#126-observation-durability-follows-invocation-route), these are best-effort: rate-limited, coalesced, dropped on backpressure.
-
-Stream semantics:
-
-- For a `$space`: applied frames + live observations the requesting actor is authorized to see (presence-derived, per [wire.md §17.4](wire.md#174-the-applied-push-model)).
-- For a `$player` (or `$actor`): observations where the object appears as `source` or `target`, including applied frames of spaces the player is observing.
-- For `$me`: the calling actor's full observation feed across all observed spaces.
-
-The SSE event id is `<space-id>:<seq>` for applied frames; live `event` SSE entries omit the id (they have no resume point — by design, they are not replayable). **`Last-Event-ID` resume is supported only for single-space streams** (`/objects/{space}/stream`) and only resumes the applied stream. Live observations between disconnect and reconnect are lost; they are live-only by contract. The server resumes applied from the requested seq, or returns `410 E_SSE_TOO_OLD` directing the client to use `/log` for backfill before restarting.
-
-For multi-space streams (`/objects/$me/stream` and any `/objects/{actor}/stream`), `Last-Event-ID` is ignored on reconnect — a single id cannot encode cursors across N spaces. A reconnecting multi-space client must fetch `/log` per space it cares about (using locally tracked per-space `last_seq` values) before resuming the live stream. This trades resume convenience for correctness; per-space gap recovery is the right granularity anyway.
-
-A future variant may define a cursor-map header (e.g., `X-Woo-Cursors: <base64-encoded {space: seq} map>`) for multi-space resume; not part of the baseline REST contract.
+The historical object-scoped SSE endpoint is retired. Implementations return
+`410 E_GONE`. Long-lived live delivery belongs to the v2 browser turn network;
+durable gap recovery belongs to `/api/objects/{id-or-name}/log`.
 
 ---
 
