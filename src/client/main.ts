@@ -28,14 +28,12 @@ type AuthStatus = "checking" | "anonymous" | "authenticated";
 type AuthMethod = "guest" | "apikey";
 
 type AppState = {
-  socket?: WebSocket;
   actor?: string;
   session?: string;
   authStatus: AuthStatus;
   loginError?: string;
   loginPending?: boolean;
   tab: "chat" | "dubspace" | "pinboard" | "tasks" | "ide";
-  world?: any;
   scopedProjection?: ScopedProjectionStateModel;
   v2Projection?: V2ProjectionMessage;
   scopedObjectSummaries: Record<string, any>;
@@ -59,7 +57,6 @@ type AppState = {
   pinboardNewColor: string;
   pinboardView: PinboardView;
   pinboardViewports: Record<string, PinboardViewportPresence>;
-  compileResult?: any;
 };
 
 type ChatRoomPin = {
@@ -177,11 +174,6 @@ const spaceChatHeightsKey = "woo.spaceChat.heights";
 const spaceChatCollapsedKey = "woo.spaceChat.collapsed";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
-let scopedProjectionEnabled = (() => {
-  const params = new URLSearchParams(location.search);
-  if (params.get("api") === "state" || params.has("legacyState")) return false;
-  return true;
-})();
 const chatHistoryLimit = 80;
 const drumVoices = [
   { id: "kick", label: "Kick" },
@@ -203,9 +195,9 @@ const pendingCommands = new Map<string, { space: string; text: string; action?: 
 let pinboardNotesRefreshPending = false;
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
+let connectInFlight: Promise<void> | null = null;
 const reconnectBaseDelayMs = 500;
 const reconnectMaxDelayMs = 5000;
-const heartbeatIntervalMs = 25_000;
 const observationDisplayLimit = 20;
 const PINBOARD_MIN_ZOOM = 0.35;
 const PINBOARD_MAX_ZOOM = 2.75;
@@ -229,8 +221,6 @@ const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
 };
 let reconnectDelayMs = reconnectBaseDelayMs;
 let reconnectTimer: number | undefined;
-let heartbeatTimer: number | undefined;
-let lastPongAt = 0;
 let pinboardViewportTimer: number | undefined;
 let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
@@ -271,83 +261,29 @@ window.addEventListener("popstate", () => {
 
 function connect() {
   if (state.authStatus !== "authenticated") return;
-  if (state.socket?.readyState === WebSocket.OPEN || state.socket?.readyState === WebSocket.CONNECTING) return;
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${location.host}/ws`);
-  state.socket = socket;
-  socket.addEventListener("open", () => {
-    reconnectDelayMs = reconnectBaseDelayMs;
-    lastPongAt = Date.now();
-    const token = authToken();
-    if (!token) {
-      socket.close();
-      return;
-    }
-    const cursor = scopedProjectionEnabled ? state.scopedProjection?.cursor : undefined;
-    sendSocket(socket, cursor ? { op: "auth", token, cursor } : { op: "auth", token });
-    startHeartbeat(socket);
-  });
-  socket.addEventListener("message", async (event) => {
-    const frame = JSON.parse(event.data);
-    if (frame.op === "pong") {
-      lastPongAt = Date.now();
-      if (typeof frame.server_time === "number") state.clockOffset = frame.server_time - Date.now();
-      return;
-    }
-    if (frame.op === "session") {
-      state.actor = frame.actor;
-      state.session = frame.session;
-      storeSession(frame.session);
-      projectionFiller.reset();
+  if (connectInFlight) return;
+  connectInFlight = (async () => {
+    const session = readStorage(sessionKey);
+    if (!session) {
+      clearSession();
+      state.authStatus = "anonymous";
       render();
-      try {
-        await refresh();
-      } catch {
-        render();
-      }
-      requestReplay(socket);
+      return;
+    }
+    state.session = session;
+    projectionFiller.reset();
+    render();
+    try {
+      await refresh();
       ensureV2BrowserWorker();
-      if (!scopedProjectionEnabled && shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
+      syncV2BrowserWorkerScope();
+      reconnectDelayMs = reconnectBaseDelayMs;
+    } catch (err) {
+      console.warn("initial v2 projection failed", err);
+      scheduleReconnect();
     }
-    if (frame.op === "applied") {
-      receiveAppliedFrame(frame);
-    }
-    if (frame.op === "event") {
-      ui.ingestLiveObservation(frame.observation);
-      receiveLiveEvent(frame.observation);
-    }
-    if (frame.op === "result") receiveDirectResultFrame(frame);
-    if (frame.op === "task") {
-      state.observations.unshift({ task: frame.task, space: frame.space, observations: frame.observations });
-      trimObservations();
-      scheduleLegacyStateRefresh();
-      render();
-    }
-    if (frame.op === "replay") {
-      for (const entry of frame.entries ?? []) {
-        if (scopedProjectionEnabled && Array.isArray(entry?.observations)) {
-          ui.ingestAppliedFrame({ op: "applied", seq: entry.seq, space: frame.space, observations: entry.observations });
-          for (const observation of entry.observations) if (isChatObservation(observation)) receiveChatEvent(observation, false);
-        }
-        state.observations.unshift({ seq: entry.seq, space: frame.space, replay: true, message: entry.message, error: entry.error ?? null });
-        rememberSeq(frame.space, entry.seq);
-      }
-      trimObservations();
-      scheduleLegacyStateRefresh();
-      render();
-    }
-    if (frame.op === "error") receiveErrorFrame(frame, socket);
-  });
-  socket.addEventListener("close", () => {
-    if (state.socket !== socket) return;
-    stopHeartbeat();
-    pendingDirect.clear();
-    pendingCommands.clear();
-    pendingFrameErrors.clear();
-    scheduleReconnect();
-  });
-  socket.addEventListener("error", () => {
-    if (state.socket === socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+  })().finally(() => {
+    connectInFlight = null;
   });
 }
 
@@ -360,8 +296,7 @@ function ensureV2BrowserWorker() {
   if (!("Worker" in window) || !("indexedDB" in window)) return;
   const token = authToken();
   if (!token) return;
-  // The v2 worker owns the durable browser-side cache and reconnect loop. The
-  // legacy `/ws` UI path remains active while v2 reaches feature parity.
+  // The v2 worker owns the durable browser-side cache and reconnect loop.
   v2BrowserWorker = new Worker(new URL("./v2-browser-worker.ts", import.meta.url), { type: "module" });
   if (v2TestHooksEnabled) (window as unknown as { __wooV2BrowserWorker?: Worker }).__wooV2BrowserWorker = v2BrowserWorker;
   v2BrowserWorker.addEventListener("message", (event) => {
@@ -392,9 +327,8 @@ function ensureV2BrowserWorker() {
         receiveLiveEvent(observation);
       }
     }
-    // Frame/error messages are exposed now so the worker-cache wire path can be
-    // inspected during the migration; UI reducers will consume them directly
-    // once the legacy `/ws` path is retired.
+    // Frame/error messages are exposed so the worker-cache wire path can be
+    // inspected without depending on transport-specific browser code.
     if (event.data?.kind === "frame") {
       window.dispatchEvent(new CustomEvent("woo.v2.frame", { detail: event.data.envelope }));
       console.debug("woo.v2.frame", event.data.envelope);
@@ -474,8 +408,7 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
 function receiveAppliedFrame(frame: any) {
   ui.ingestAppliedFrame(frame);
   applyScopedMoveResult(frame.result);
-  const needsScopedDeferredLook = scopedProjectionEnabled
-    && frame.result
+  const needsScopedDeferredLook = frame.result
     && typeof frame.result === "object"
     && !Array.isArray(frame.result)
     && frame.result.look_deferred === true
@@ -501,18 +434,6 @@ function receiveAppliedFrame(frame: any) {
   const pinboardAnimations = capturePinboardAnimations(observations);
   const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
   if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
-  if (!scopedProjectionEnabled) {
-    // Legacy /api/state mode still folds confirmed placement observations
-    // into its pinboard note array. Scoped mode gets the same fields through
-    // the framework reducer above.
-    for (const observation of observations) {
-      const type = String(observation?.type ?? "");
-      if (type === "pin_moved" || type === "pin_resized" || type === "note_moved" || type === "note_resized") {
-        const pinId = String(observation?.pin ?? observation?.id ?? "");
-        if (pinId) applyPinboardPlacementObservation(observation);
-      }
-    }
-  }
   forgetLiveControls(observations);
   for (const observation of observations) applyDubspaceObservationSideEffects(observation);
   if (observations.some((observation: any) => isDubspaceStateObservation(observation))) syncDubspaceProjectionEffects();
@@ -520,7 +441,6 @@ function receiveAppliedFrame(frame: any) {
   state.observations.unshift({ seq: frame.seq, space: frame.space, observations, message: frame.message });
   trimObservations();
   rememberSeq(frame.space, frame.seq);
-  scheduleLegacyStateRefresh();
   render();
   if (needsScopedDeferredLook) void refresh().then(() => focusChatInput());
   if (needsPinboardNotesRefresh) refreshPinboardNotes();
@@ -550,21 +470,6 @@ function desiredV2BrowserScope(): string {
   return activeChatRoom() || state.actor || "";
 }
 
-function sendSocket(socket: WebSocket, frame: Record<string, unknown>) {
-  if (socket.readyState !== WebSocket.OPEN) return false;
-  socket.send(JSON.stringify(frame));
-  return true;
-}
-
-function sendFrame(frame: Record<string, unknown>) {
-  const socket = state.socket;
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    scheduleReconnect();
-    return false;
-  }
-  return sendSocket(socket, frame);
-}
-
 function scheduleReconnect() {
   if (state.authStatus !== "authenticated") return;
   if (reconnectTimer !== undefined) return;
@@ -573,30 +478,6 @@ function scheduleReconnect() {
     connect();
   }, reconnectDelayMs);
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, reconnectMaxDelayMs);
-}
-
-function startHeartbeat(socket: WebSocket) {
-  stopHeartbeat();
-  heartbeatTimer = window.setInterval(() => {
-    if (state.socket !== socket) {
-      stopHeartbeat();
-      return;
-    }
-    if (Date.now() - lastPongAt > heartbeatIntervalMs * 3) {
-      socket.close();
-      return;
-    }
-    if (!sendSocket(socket, { op: "ping" })) {
-      stopHeartbeat();
-      scheduleReconnect();
-    }
-  }, heartbeatIntervalMs);
-}
-
-function stopHeartbeat() {
-  if (heartbeatTimer === undefined) return;
-  window.clearInterval(heartbeatTimer);
-  heartbeatTimer = undefined;
 }
 
 function authToken(): string | null {
@@ -723,8 +604,6 @@ async function loginWithApiKey(username: string, secret: string) {
 
 async function logout() {
   const sessionId = state.session;
-  state.socket?.close();
-  state.socket = undefined;
   v2BrowserWorker?.postMessage({ kind: "disconnect" });
   v2BrowserWorker?.terminate();
   v2BrowserWorker = undefined;
@@ -770,23 +649,8 @@ function clearAccountScopedStorage() {
   }
 }
 
-function requestReplay(socket: WebSocket) {
-  if (scopedProjectionEnabled) {
-    const cursorSpaces = state.scopedProjection?.cursor?.spaces ?? {};
-    for (const [space, cursor] of Object.entries(cursorSpaces)) {
-      const from = Number(cursor?.next_seq ?? 0);
-      if (from > 0) sendSocket(socket, { op: "replay", id: crypto.randomUUID(), space, from, limit: 100 });
-    }
-    return;
-  }
-  for (const space of Object.keys(state.world?.spaces ?? {})) {
-    const from = Number(readStorage(`woo.lastSeq.${space}`) ?? "0") + 1;
-    if (from > 1) sendSocket(socket, { op: "replay", id: crypto.randomUUID(), space, from, limit: 100 });
-  }
-}
-
 function rememberSeq(space: string, seq: number) {
-  if (scopedProjectionEnabled && state.scopedProjection) {
+  if (state.scopedProjection) {
     state.scopedProjection = {
       ...state.scopedProjection,
       cursor: advanceProjectionCursor(state.scopedProjection.cursor, space, seq)
@@ -877,32 +741,23 @@ function syncUrlFromCurrentState(mode: "replace" | "push" = "replace") {
 }
 
 function routeForObjectId(objectId: string, summary?: any): AppState["tab"] {
-  if (scopedProjectionEnabled) {
-    if (objectId === activeChatRoom()) return "chat";
-    if (objectId === dubspaceSpace()) return "dubspace";
-    if (objectId === pinboardSpace()) return "pinboard";
-    if (objectId === tasksSpace()) return "tasks";
-    const summaryTab = tabForScopedSummary(objectId, summary ?? scopedObjectSummary(objectId));
-    if (summaryTab) return summaryTab;
-    return "ide";
-  }
   if (objectId === activeChatRoom()) return "chat";
   if (objectId === dubspaceSpace()) return "dubspace";
   if (objectId === pinboardSpace()) return "pinboard";
   if (objectId === tasksSpace()) return "tasks";
-  if (state.world?.objects?.[objectId]) return "ide";
-  return "chat";
+  const summaryTab = tabForScopedSummary(objectId, summary ?? scopedObjectSummary(objectId));
+  if (summaryTab) return summaryTab;
+  return "ide";
 }
 
 function pinRoutedSubject(tab: AppState["tab"], subject: string) {
-  if (!scopedProjectionEnabled || !subject) return;
+  if (!subject) return;
   if (tab === "dubspace" || tab === "pinboard" || tab === "tasks") {
     state.routedSubjects = { ...state.routedSubjects, [tab]: subject };
   }
 }
 
 function routeSubjectForTab(tab: AppState["tab"], routedObject: string, _summary: any): string {
-  if (!scopedProjectionEnabled) return "";
   if (tab === "dubspace" || tab === "pinboard" || tab === "tasks") return routedObject;
   return "";
 }
@@ -918,8 +773,8 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
   };
   const viewTab = tabFromViewHint(route.view);
   if (viewTab) {
-    const summary = scopedProjectionEnabled ? await fetchScopedObjectSummary(route.objectId).catch(() => undefined) : undefined;
-    if (viewTab === "ide" && (scopedProjectionEnabled || state.world?.objects?.[route.objectId])) setSelectedObject(route.objectId, { apply: false });
+    const summary = await fetchScopedObjectSummary(route.objectId).catch(() => undefined);
+    if (viewTab === "ide") setSelectedObject(route.objectId, { apply: false });
     pinRoutedSubject(viewTab, routeSubjectForTab(viewTab, route.objectId, summary));
     setTab(viewTab, { mode, leaveCurrent: true }, () => {
       ensureTabPresence(viewTab);
@@ -927,9 +782,9 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
     return;
   }
 
-  const summary = scopedProjectionEnabled ? await fetchScopedObjectSummary(route.objectId).catch(() => undefined) : undefined;
+  const summary = await fetchScopedObjectSummary(route.objectId).catch(() => undefined);
   const inferredTab = routeForObjectId(route.objectId, summary);
-  if (inferredTab === "ide" && (scopedProjectionEnabled || state.world?.objects?.[route.objectId])) {
+  if (inferredTab === "ide") {
     setSelectedObject(route.objectId, { apply: false });
     setTab(inferredTab, { mode, leaveCurrent: true }, () => {
       ensureTabPresence(inferredTab);
@@ -958,7 +813,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
     syncV2BrowserWorkerScope();
     render();
     requestTasksChatFocusIfPending();
-    if (scopedProjectionEnabled && tab !== "chat" && tab !== "ide") {
+    if (tab !== "chat" && tab !== "ide") {
       void ensureScopedOverlayForTab(tab).then(() => {
         if (state.tab === tab) render();
       }).catch((err) => {
@@ -990,7 +845,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
 
 function setSelectedObject(id: string, options: { apply?: boolean } = {}) {
   state.selectedObject = id;
-  if (scopedProjectionEnabled && id) {
+  if (id) {
     void fetchScopedObjectSummary(id).then(() => {
       if (state.tab === "ide" && state.selectedObject === id) render();
     }).catch((err) => {
@@ -1009,44 +864,7 @@ const chatSeparatorMinIntervalMs = 2_000;
 const lastChatSeparatorAtBySource = new Map<string, number>();
 
 async function refresh() {
-  if (scopedProjectionEnabled) {
-    await refreshScopedProjection();
-    return;
-  }
-  refreshDebounceTimer = null;
-  refreshDebouncePending = false;
-  const response = await fetch("/api/state", { headers: authHeaders() });
-  if (!response.ok) return;
-  const previousChatRoom = lastObservedChatRoom;
-  state.world = adaptWorld(await response.json());
-  ui.ingestWorld(state.world);
-  const currentChatRoom = chatRoom();
-  if (previousChatRoom && previousChatRoom !== currentChatRoom) {
-    // Mark the bottom of the room the actor just left, so when they return
-    // the room's prior chat (including their `> enter tub` input echo) is
-    // visually behind a "you were away" boundary.
-    pushChatSeparator(previousChatRoom, false);
-  }
-  lastObservedChatRoom = currentChatRoom;
-  if (!state.selectedObject || !state.world.objects?.[state.selectedObject]) state.selectedObject = defaultSelectedObject();
-  state.clockOffset = Number(state.world.server_time ?? Date.now()) - Date.now();
-  state.chatPresent = Array.isArray(state.world?.chat?.present) ? state.world.chat.present : state.chatPresent;
-  if (scopedProjectionSmokeEnabled) await refreshScopedProjectionSmoke();
-  if (!routeInitialized) {
-    routeInitialized = true;
-    if (startupRoute) {
-      void applyLocationRoute("replace", startupRoute);
-      startupRoute = null;
-    } else {
-      syncUrlFromCurrentState("replace");
-    }
-  } else {
-    syncUrlFromCurrentState("replace");
-  }
-  audio?.sync(effectiveDubspace(), state.clockOffset);
-  hydratePinboardNotesTextIfNeeded(pinboardModel());
-  syncV2BrowserWorkerScope();
-  render();
+  await refreshScopedProjection();
 }
 
 async function refreshScopedProjectionSmoke() {
@@ -1067,8 +885,6 @@ async function refreshScopedProjectionSmoke() {
 }
 
 async function refreshScopedProjection() {
-  refreshDebounceTimer = null;
-  refreshDebouncePending = false;
   const startedRevision = scopedProjectionLocalRevision;
   try {
     const [meResponse, catalogs] = await Promise.all([
@@ -1128,7 +944,6 @@ function installCatalogUiIndex(index: any) {
 }
 
 async function ensureScopedOverlayForTab(tab: AppState["tab"], options: { force?: boolean } = {}): Promise<void> {
-  if (!scopedProjectionEnabled) return;
   const subject = overlaySubjectForTab(tab);
   if (!subject) return;
   const key = `${tab}:${subject}`;
@@ -1155,7 +970,6 @@ function overlaySubjectForTab(tab: AppState["tab"]): string {
 }
 
 function scopedToolSubject(surface: "dubspace" | "pinboard" | "tasks"): string {
-  if (!scopedProjectionEnabled) return "";
   const className = surface === "dubspace" ? "$dubspace" : surface === "pinboard" ? "$pinboard" : "$task_registry";
   const overlays = state.scopedProjection?.overlays ?? {};
   for (const handle of Object.values(overlays)) {
@@ -1176,7 +990,7 @@ function sessionActiveScope(session: any): string | undefined {
 }
 
 function applyScopedOverlaySnapshot(key: string, snapshot: any) {
-  if (!scopedProjectionEnabled || !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   const overlaySnapshots = { ...(state.scopedProjection.overlaySnapshots ?? {}), [key]: snapshot };
   const subject = typeof snapshot.subject === "string" ? snapshot.subject : "";
@@ -1200,14 +1014,13 @@ function applyScopedOverlaySnapshot(key: string, snapshot: any) {
 }
 
 function applyV2ProjectionMessage(message: V2ProjectionMessage) {
-  if (!scopedProjectionEnabled) return;
   const snapshot = v2ProjectionSnapshotFromMessage(message);
   if (!snapshot) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   if (snapshot.objects.length > 0) {
     // v2 projection objects follow the same catalog-neutral summary contract as
     // `/api/me`. Ingest them into the client projection cache, but keep the
-    // legacy scoped model as the rendering authority until the v2 worker owns
+    // scoped model remains the rendering authority until the v2 worker owns
     // turn submission and committed-frame reduction.
     ui.ingestSnapshot(`v2:${snapshot.scope}:${message.head.seq}`, snapshot.objects);
   }
@@ -1293,7 +1106,7 @@ function scopedObjectSummary(id: string | undefined): any | undefined {
 }
 
 async function fetchScopedObjectSummary(id: string): Promise<any | undefined> {
-  if (!scopedProjectionEnabled || !id) return undefined;
+  if (!id) return undefined;
   const cached = state.scopedObjectSummaries[id] ?? (isCompleteScopedSummary(ui.observe(id)) ? ui.observe(id) : undefined);
   if (cached) return cached;
   const response = await fetch(`/api/objects/${encodeURIComponent(id)}/summary`, { headers: authHeaders() });
@@ -1339,7 +1152,6 @@ const projectionFiller = new ProjectionFieldFiller(
 );
 
 function ensureProjectionFields(subject: string, fields: readonly string[]): void {
-  if (!scopedProjectionEnabled) return;
   projectionFiller.ensure(subject, fields);
 }
 
@@ -1362,7 +1174,7 @@ function roomSnapshotObjects(here: any): any[] {
   if (!here || typeof here !== "object") return [];
   return [
     roomSnapshotAsObjectSummary(here),
-    ...arrayOfObjects(here.present_actors),
+    ...arrayOfObjects(Array.isArray(here.roster) ? here.roster : here.present_actors),
     ...arrayOfObjects(here.contents),
     ...arrayOfObjects(here.exits)
   ];
@@ -1370,6 +1182,14 @@ function roomSnapshotObjects(here: any): any[] {
 
 function arrayOfObjects(value: any): any[] {
   return Array.isArray(value) ? value.filter((item) => item && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function idsFromSessionSubscriberRows(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => item.actor)
+    .filter((actor): actor is string => typeof actor === "string")));
 }
 
 function scopedSummaryForObject(id: string, fallbackName?: string, location?: string): any {
@@ -1419,7 +1239,7 @@ function roomSnapshotAsObjectSummary(here: any): any {
     description: typeof here.description === "string" ? here.description : null,
     contents: [
       ...idsFromRefsOrSummaries(Array.isArray(here.contents) ? here.contents : []),
-      ...idsFromRefsOrSummaries(Array.isArray(here.present_actors) ? here.present_actors : [])
+      ...idsFromRefsOrSummaries(Array.isArray(here.roster) ? here.roster : Array.isArray(here.present_actors) ? here.present_actors : [])
     ],
     props: {
       ...(here.props && typeof here.props === "object" && !Array.isArray(here.props) ? here.props : {}),
@@ -1463,48 +1283,11 @@ function overlaySnapshotProjectionObjects(snapshot: any): any[] {
   });
 }
 
-// Legacy `/api/state` refresh used only when the page is explicitly booted in
-// state-projection mode. Scoped mode applies frame observations locally and
-// hydrates through `/api/me` or overlay snapshots.
-const REFRESH_DEBOUNCE_MS = 750;
-let refreshDebounceTimer: number | null = null;
-let refreshDebouncePending = false;
-function scheduleLegacyStateRefresh() {
-  if (scopedProjectionEnabled) return;
-  if (refreshDebounceTimer != null) return;
-  refreshDebouncePending = true;
-  refreshDebounceTimer = window.setTimeout(() => {
-    refreshDebounceTimer = null;
-    if (!refreshDebouncePending) return;
-    void refresh();
-  }, REFRESH_DEBOUNCE_MS);
-}
-
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
   return state.session ? { ...extra, authorization: `Session ${state.session}` } : extra;
 }
 
-function adaptWorld(raw: any) {
-  const world = raw && typeof raw === "object" ? { ...raw } : {};
-  world.objects = raw?.objects ?? {};
-  world.catalogs = raw?.catalogs ?? { installed: [] };
-  world.dubspaceMeta = buildDubspaceMeta(world);
-  world.dubspace = projectDubspace(world, world.dubspaceMeta);
-  world.pinboardMeta = buildPinboardMeta(world);
-  world.pinboard = projectPinboard(world, world.pinboardMeta);
-  world.chatMeta = buildChatMeta(world);
-  world.chat = projectChat(world, world.chatMeta);
-  return world;
-}
-
-function installedCatalog(world: any, name: string): any | undefined {
-  const installed = Array.isArray(world?.catalogs?.installed) ? world.catalogs.installed : [];
-  const record = installed.find((item: any) => item?.alias === name || item?.catalog === name);
-  return record ?? (world?.scoped ? bundledCatalogRecord(name) : undefined);
-}
-
 function activeInstalledCatalog(name: string): any | undefined {
-  if (!scopedProjectionEnabled) return installedCatalog(state.world, name);
   const installed = Array.isArray(state.scopedProjection?.catalogs?.catalogs)
     ? state.scopedProjection.catalogs.catalogs
     : Array.isArray(catalogUiCache?.catalogs)
@@ -1537,17 +1320,6 @@ function bundledCatalogRecord(name: string): any | undefined {
   };
 }
 
-function installedCatalogSeed(world: any, catalogName: string, fallback: string): string | undefined {
-  const catalog = installedCatalog(world, catalogName);
-  if (!catalog) return undefined;
-  const seeds = catalog?.seeds && typeof catalog.seeds === "object" && !Array.isArray(catalog.seeds) ? catalog.seeds : {};
-  const values = Object.values(seeds).filter((item): item is string => typeof item === "string");
-  // Transitional scoped renderer fallback: bundled demo catalogs have one
-  // canonical tool seed each. Real multi-instance selection belongs in frame
-  // resolution/route state, not this compatibility metadata path.
-  return values.find((id) => id === fallback) ?? values[0] ?? (fallback || undefined);
-}
-
 function activeInstalledCatalogSeed(catalogName: string, fallback: string): string {
   const catalog = activeInstalledCatalog(catalogName);
   if (!catalog) return fallback || "";
@@ -1559,25 +1331,6 @@ function activeInstalledCatalogSeed(catalogName: string, fallback: string): stri
 function catalogClass(catalog: any, localName: string): string | undefined {
   const value = catalog?.objects?.[localName];
   return typeof value === "string" ? value : undefined;
-}
-
-function objectsByParent(world: any, parent: string | undefined, anchor?: string | null): string[] {
-  if (!parent) return [];
-  return Object.entries(world.objects ?? {})
-    .filter(([, obj]: [string, any]) => obj?.parent === parent && (anchor === undefined || obj?.anchor === anchor || obj?.location === anchor))
-    .map(([id]) => id)
-    .sort((a, b) => objectName(world, a).localeCompare(objectName(world, b)) || a.localeCompare(b));
-}
-
-function firstObjectByParent(world: any, parent: string | undefined): string | undefined {
-  return objectsByParent(world, parent)[0];
-}
-
-function objectView(world: any, id: string | undefined) {
-  if (!id) return null;
-  const obj = world.objects?.[id];
-  if (!obj) return null;
-  return { id, name: obj.name ?? id, owner: obj.owner, parent: obj.parent, location: obj.location, props: obj.props ?? {} };
 }
 
 function projectedObjectView(id: string | undefined) {
@@ -1593,70 +1346,34 @@ function projectedObjectView(id: string | undefined) {
       props: { ...(projected.props ?? {}) }
     };
   }
-  if (scopedProjectionEnabled) {
-    const here = state.scopedProjection?.here;
-    if (String(here?.id ?? "") === id) {
-      const summary = roomSnapshotAsObjectSummary(here);
-      return {
-        id,
-        name: summary.name ?? id,
-        owner: summary.owner,
-        parent: summary.parent,
-        location: summary.location,
-        props: { ...(summary.props ?? {}) }
-      };
-    }
-    const summary = state.scopedObjectSummaries[id];
-    if (summary) {
-      return {
-        id,
-        name: summary.name ?? id,
-        owner: summary.owner,
-        parent: summary.parent,
-        location: summary.location,
-        props: { ...(summary.props ?? {}) }
-      };
-    }
-    return null;
+  const here = state.scopedProjection?.here;
+  if (String(here?.id ?? "") === id) {
+    const summary = roomSnapshotAsObjectSummary(here);
+    return {
+      id,
+      name: summary.name ?? id,
+      owner: summary.owner,
+      parent: summary.parent,
+      location: summary.location,
+      props: { ...(summary.props ?? {}) }
+    };
   }
-  const fallback = state.world?.dubspace?.[id] ?? objectView(state.world, id);
-  if (!fallback) return null;
-  return {
-    id,
-    name: fallback.name ?? id,
-    owner: fallback.owner,
-    parent: fallback.parent,
-    location: fallback.location,
-    props: { ...(fallback.props ?? {}) }
-  };
+  const summary = state.scopedObjectSummaries[id];
+  if (summary) {
+    return {
+      id,
+      name: summary.name ?? id,
+      owner: summary.owner,
+      parent: summary.parent,
+      location: summary.location,
+      props: { ...(summary.props ?? {}) }
+    };
+  }
+  return null;
 }
 
-function objectName(world: any, id: string) {
-  if (scopedProjectionEnabled) return String(projectedObjectView(id)?.name ?? id);
-  return String(world.objects?.[id]?.name ?? id);
-}
-
-function buildDubspaceMeta(world: any) {
-  const catalog = installedCatalog(world, "dubspace");
-  const space = firstObjectByParent(world, catalogClass(catalog, "$dubspace")) ?? installedCatalogSeed(world, "dubspace", bundledToolSeeds.dubspace);
-  const byClass = (localName: string) => {
-    const ids = objectsByParent(world, catalogClass(catalog, localName), space);
-    return ids.length > 0 ? ids : bundledSeedRefs(dubspaceManifest, localName);
-  };
-  return {
-    space,
-    slots: byClass("$loop_slot"),
-    channel: byClass("$channel")[0],
-    filter: byClass("$filter")[0],
-    delay: byClass("$delay")[0],
-    drum: byClass("$drum_loop")[0],
-    scene: byClass("$scene")[0]
-  };
-}
-
-function projectDubspace(world: any, meta: any) {
-  const ids = dubspaceObjectIds(meta);
-  return Object.fromEntries(ids.map((id: string) => [id, objectView(world, id)]).filter(([, view]) => view));
+function objectName(id: string) {
+  return String(projectedObjectView(id)?.name ?? id);
 }
 
 function dubspaceObjectIds(meta: any): string[] {
@@ -1669,7 +1386,6 @@ function projectedDubspace(meta: any = dubspaceMeta()) {
 }
 
 function dubspaceMeta(): any {
-  if (!scopedProjectionEnabled) return state.world?.dubspaceMeta ?? {};
   const space = dubspaceSpace();
   const objects = overlaySnapshotObjects(dubspaceOverlaySnapshot());
   const byClass = (localName: string) => {
@@ -1704,31 +1420,7 @@ function isCatalogObjectSummary(item: any, catalogName: string, localName: strin
   return item?.parent === classRef || item?.parent === localName || ancestors.includes(classRef) || ancestors.includes(localName);
 }
 
-function buildPinboardMeta(world: any) {
-  const catalog = installedCatalog(world, "pinboard");
-  return {
-    board: firstObjectByParent(world, catalogClass(catalog, "$pinboard")) ?? installedCatalogSeed(world, "pinboard", bundledToolSeeds.pinboard)
-  };
-}
-
-function projectPinboard(world: any, meta: any) {
-  const board = objectView(world, meta.board);
-  const props = board?.props ?? {};
-  const legacyNotes = Array.isArray(props.notes) && props.notes.length > 0 ? props.notes : undefined;
-  const notes = legacyNotes ?? pinboardNotesFromContents(world, meta.board, props.layout);
-  const palette = Array.isArray(props.palette) ? props.palette.map(String) : ["yellow", "blue", "green", "pink", "white"];
-  state.pinboardNewColor = normalizePinboardStickyColor(state.pinboardNewColor, palette);
-  return {
-    board,
-    notes: normalizePinboardNotes(notes, state.world?.pinboard?.notes),
-    present: Array.isArray(props.subscribers) ? props.subscribers.map(String) : [],
-    palette,
-    viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : { w: 960, h: 560 }
-  };
-}
-
 function pinboardModel(): PinboardRenderModel | undefined {
-  if (!scopedProjectionEnabled) return state.world?.pinboard;
   const boardId = pinboardSpace();
   if (!boardId) return undefined;
   const projected = ui.observe(boardId);
@@ -1757,7 +1449,7 @@ function pinboardModel(): PinboardRenderModel | undefined {
 }
 
 function scopedPinboardPresentActors(boardId: string, props: Record<string, unknown>): string[] {
-  const present = new Set(Array.isArray(props.subscribers) ? props.subscribers.map(String) : []);
+  const present = new Set(idsFromSessionSubscriberRows(props.session_subscribers));
   const presence = ui.observe(boardId)?.catalogState.pinboard_presence;
   if (presence && typeof presence === "object" && !Array.isArray(presence)) {
     for (const [actor, value] of Object.entries(presence)) {
@@ -1767,7 +1459,7 @@ function scopedPinboardPresentActors(boardId: string, props: Record<string, unkn
   }
   if (present.size > 0) return [...present];
   const room = pinboardOverlaySnapshot()?.room;
-  const fromRoom = idsFromRefsOrSummaries(Array.isArray(room?.present_actors) ? room.present_actors : []);
+  const fromRoom = idsFromRefsOrSummaries(Array.isArray(room?.roster) ? room.roster : Array.isArray(room?.present_actors) ? room.present_actors : []);
   if (fromRoom.length > 0) return fromRoom;
   // Last-resort local fallback: before the first overlay/presence frame lands,
   // show the user in their own active pinboard rather than an empty presence
@@ -1823,7 +1515,7 @@ function pinboardProjectedNote(id: string, layoutEntry: any, legacyNotes: any[] 
   if (!projected && !previous && Object.keys(entry).length === 0) return undefined;
   // Priority is deliberate: observation-reduced catalogState is the current
   // UI model; projection props carry static readable note fields; the optional
-  // legacy cache is used only by `/api/state` mode; board layout fills
+  // non-scoped cache is used only by compatibility mode; board layout fills
   // placement defaults.
   return {
     id,
@@ -1874,33 +1566,6 @@ function pinboardNoteStateFromSummary(item: any, layoutEntry: any): Record<strin
     out.author = item.owner;
   }
   return out;
-}
-
-function pinboardNotesFromContents(world: any, boardId: string | undefined, layoutValue: any) {
-  const contents = Array.isArray(world.objects?.[boardId ?? ""]?.contents) ? world.objects[boardId ?? ""].contents : [];
-  const layout = layoutValue && typeof layoutValue === "object" && !Array.isArray(layoutValue) ? layoutValue : {};
-  // pinboard:enter moves the active session to the board, so contents includes guests as
-  // well as pins. Server-side `:list_notes` filters by `isa(pin, $note)`;
-  // we approximate that here with a parent check on the bundled $pin class.
-  return contents.filter((id: string) => world.objects?.[id]?.parent === "$pin").map((id: string) => {
-    const obj = world.objects?.[id] ?? {};
-    const props = obj.props ?? {};
-    const entry = layout[id] && typeof layout[id] === "object" && !Array.isArray(layout[id]) ? layout[id] : {};
-    return {
-      id,
-      name: obj.name ?? id,
-      text: props.text,
-      color: props.color,
-      writers: props.writers,
-      owner: obj.owner,
-      author: obj.owner,
-      x: entry.x,
-      y: entry.y,
-      w: entry.w,
-      h: entry.h,
-      z: entry.z
-    };
-  });
 }
 
 function pinboardNotesHaveMissingText(notes: any[]) {
@@ -1954,83 +1619,42 @@ function normalizePinboardNotes(notes: any[], previousNotes: any[] = []) {
   });
 }
 
-function buildChatMeta(world: any) {
-  const chat = installedCatalog(world, "chat");
-  const demo = installedCatalog(world, "demoworld");
-  const rooms = objectsByParent(world, catalogClass(chat, "$chatroom"));
-  const pinned = chatRoomPin && chatRoomPin.expiresAt > Date.now() && rooms.includes(chatRoomPin.room) ? chatRoomPin.room : undefined;
-  if (chatRoomPin && !pinned) chatRoomPin = null;
-  const sessionScope = sessionActiveScope(world?.session);
-  const activeScope = typeof sessionScope === "string" && rooms.includes(sessionScope) ? sessionScope : undefined;
-  const occupied = rooms.find((id) => Array.isArray(world.objects?.[id]?.props?.subscribers) && world.objects[id].props.subscribers.includes(state.actor));
-  const seededEntry = Object.values(demo?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
-  const defaultRoom = seededEntry ?? rooms[0];
-  const current = pinned ?? activeScope ?? occupied ?? seededEntry ?? rooms[0];
-  return { room: current, rooms, defaultRoom };
-}
-
-function projectChat(world: any, meta: any) {
-  const room = objectView(world, meta.room);
-  const rooms = Array.isArray(meta.rooms) ? meta.rooms.map((id: string) => objectView(world, id)).filter(Boolean) : [];
-  return {
-    room: room ? { id: room.id, name: room.name, description: room.props.description ?? "" } : null,
-    rooms,
-    present: Array.isArray(room?.props?.subscribers) ? room.props.subscribers : []
-  };
-}
-
 function defaultSelectedObject() {
-  if (scopedProjectionEnabled) return dubspaceMeta().delay ?? state.scopedProjection?.here?.id ?? state.actor ?? "";
-  return dubspaceMeta().delay ?? Object.keys(state.world?.objects ?? {}).sort()[0] ?? "";
+  return dubspaceMeta().delay ?? state.scopedProjection?.here?.id ?? state.actor ?? "";
 }
 
 function dubspaceSpace() {
-  if (scopedProjectionEnabled) {
-    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-    if (route?.view === "dubspace" && route.objectId) return route.objectId;
-    if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
-    const scoped = scopedToolSubject("dubspace");
-    return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
-  }
-  return String(state.world?.dubspaceMeta?.space ?? "");
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if (route?.view === "dubspace" && route.objectId) return route.objectId;
+  if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
+  const scoped = scopedToolSubject("dubspace");
+  return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
 }
 
 function pinboardSpace() {
-  if (scopedProjectionEnabled) {
-    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-    if (route?.view === "pinboard" && route.objectId) return route.objectId;
-    if (state.routedSubjects.pinboard) return state.routedSubjects.pinboard;
-    const scoped = scopedToolSubject("pinboard");
-    return scoped || activeInstalledCatalogSeed("pinboard", bundledToolSeeds.pinboard);
-  }
-  return String(state.world?.pinboardMeta?.board ?? "");
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if (route?.view === "pinboard" && route.objectId) return route.objectId;
+  if (state.routedSubjects.pinboard) return state.routedSubjects.pinboard;
+  const scoped = scopedToolSubject("pinboard");
+  return scoped || activeInstalledCatalogSeed("pinboard", bundledToolSeeds.pinboard);
 }
 
 function tasksSpace() {
-  if (scopedProjectionEnabled) {
-    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-    if ((route?.view === "tasks" || route?.view === "kanban") && route.objectId) return route.objectId;
-    if (state.routedSubjects.tasks) return state.routedSubjects.tasks;
-    const scoped = scopedToolSubject("tasks");
-    return scoped || activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
-  }
-  return activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if ((route?.view === "tasks" || route?.view === "kanban") && route.objectId) return route.objectId;
+  if (state.routedSubjects.tasks) return state.routedSubjects.tasks;
+  const scoped = scopedToolSubject("tasks");
+  return scoped || activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
 }
 
 function chatRoom() {
-  // Migration note: new selectors should make the scoped branch primary.
-  // The `state.world` branch is the temporary `/api/state` compatibility tail.
-  if (scopedProjectionEnabled) {
-    const here = String(state.scopedProjection?.here?.id ?? "");
-    if (here) return here;
-    return String(state.scopedProjection?.session?.current_location ?? "");
-  }
-  return String(state.world?.chatMeta?.room ?? "");
+  const here = String(state.scopedProjection?.here?.id ?? "");
+  if (here) return here;
+  return String(state.scopedProjection?.session?.current_location ?? "");
 }
 
 function defaultChatRoom() {
-  if (scopedProjectionEnabled) return chatRoom();
-  return String(state.world?.chatMeta?.defaultRoom ?? "");
+  return chatRoom();
 }
 
 function activeChatRoom() {
@@ -2042,8 +1666,7 @@ function activeChatRoom() {
 function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
-  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) ui.failOptimisticCall(id);
+  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) ui.failOptimisticCall(id);
   return id;
 }
 
@@ -2163,8 +1786,7 @@ function callWithError(space: string, target: string, verb: string, args: unknow
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   if (onError) pendingFrameErrors.set(id, onError);
-  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
-  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) {
+  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) {
     ui.failOptimisticCall(id);
     pendingFrameErrors.delete(id);
   }
@@ -2172,13 +1794,9 @@ function callWithError(space: string, target: string, verb: string, args: unknow
 }
 
 function actorPresenceList(actor: string): string[] {
-  if (scopedProjectionEnabled && actor === state.actor) {
+  if (actor === state.actor) {
     const locations = state.scopedProjection?.session?.all_locations;
     return Array.isArray(locations) ? locations.filter((id): id is string => typeof id === "string") : [];
-  }
-  if (actor === state.actor) {
-    const locations = state.world?.session?.all_locations;
-    if (Array.isArray(locations)) return locations.filter((id): id is string => typeof id === "string");
   }
   return [];
 }
@@ -2186,28 +1804,13 @@ function actorPresenceList(actor: string): string[] {
 function actorPresentInSpace(space: string) {
   const actor = state.actor;
   if (!actor) return false;
-  if (scopedProjectionEnabled) {
-    if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
-    if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
-    return actorPresenceList(actor).includes(space);
-  }
-  if (sessionActiveScope(state.world?.session) === space) return true;
+  if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
+  if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
   return actorPresenceList(actor).includes(space);
 }
 
-function shouldAutoEnterDefaultChatRoom() {
-  if (scopedProjectionEnabled) return false;
-  const location = sessionActiveScope(state.world?.session);
-  if (typeof location === "string" && location && location !== "$nowhere") {
-    const room = chatRoom();
-    const subscribers = state.world?.objects?.[room]?.props?.subscribers;
-    return Boolean(room && location === room && state.actor && Array.isArray(subscribers) && !subscribers.includes(state.actor));
-  }
-  return actorPresenceList(state.actor ?? "").length === 0;
-}
-
 function ensureSpacePresence(space: string, onReady: () => void, onError?: (error: any) => void) {
-  if (!space || !canSendDirect()) {
+  if (!space || !canSendV2Browser()) {
     onReady();
     return;
   }
@@ -2219,39 +1822,24 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
 }
 
 function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
-  const id = crypto.randomUUID();
-  ui.applyOptimisticCall(id, options);
-  if (onResult) pendingDirect.set(id, onResult);
-  if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendFrame({ op: "direct", id, target, verb, args })) {
-    ui.failOptimisticCall(id);
-    pendingDirect.delete(id);
-    pendingFrameErrors.delete(id);
-  }
-  return id;
+  const persistence = verb === "enter" || verb === "leave" || verb === "out" ? "durable" : "live";
+  const scope = target || activeChatRoom() || desiredV2BrowserScope();
+  return v2Turn({ scope, route: "direct", target, verb, args, persistence, onResult, onError, options });
 }
 
 function command(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
-  const id = crypto.randomUUID();
-  ui.applyOptimisticCall(id, options);
-  pendingCommands.set(id, { space, text });
-  if (onResult) pendingDirect.set(id, onResult);
-  if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendFrame({ op: "command", id, space, text })) {
-    ui.failOptimisticCall(id);
-    pendingCommands.delete(id);
-    pendingDirect.delete(id);
-    pendingFrameErrors.delete(id);
-  }
+  const id = v2PlanAndExecuteCommand(space, text, onError);
+  if (id && onResult) pendingDirect.set(id, onResult);
+  void options;
   return id;
 }
 
 function canSendDirect() {
-  return Boolean(state.actor && state.session && state.socket?.readyState === WebSocket.OPEN);
+  return canSendV2Browser();
 }
 
 function canSendChat() {
-  return canSendChatV2() || canSendDirect();
+  return canSendChatV2();
 }
 
 function canSendV2Browser() {
@@ -2321,10 +1909,6 @@ function dubspaceOptimisticProps(target: string, props: Record<string, unknown>,
 function patchDubspaceProjectionProps(target: string, props: Record<string, unknown>) {
   if (!target || Object.keys(props).length === 0) return;
   ui.applyCanonical([{ subject: target, props }]);
-  if (!scopedProjectionEnabled) {
-    if (state.world?.objects?.[target]?.props) Object.assign(state.world.objects[target].props, props);
-    if (state.world?.dubspace?.[target]?.props) Object.assign(state.world.dubspace[target].props, props);
-  }
 }
 
 function callDubspaceMutation(verb: string, args: unknown[], options?: ProjectionCallOptions) {
@@ -2382,7 +1966,7 @@ function receiveLiveEvent(observation: any) {
     receivePinboardViewport(observation);
     return;
   }
-  // Pinboard side effects (window auto-open/close, plus legacy refresh) must fire
+  // Pinboard side effects (window auto-open/close) must fire
   // before the chat-observation branch, because pinboard_* types appear in
   // both observation lists and the chat branch returns early. The board is a
   // focus surface, not a place you travel to (catalogs/pinboard/DESIGN.md);
@@ -2392,7 +1976,6 @@ function receiveLiveEvent(observation: any) {
     const pinboardType = String(observation?.type ?? "");
     const needsNoteRefresh = pinboardObservationNeedsNotesRefresh(pinboardType);
     if (needsNoteRefresh) pinboardNotesRefreshPending = false;
-    const placementChanged = applyPinboardPlacementObservation(observation);
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
     if (String(observation?.actor ?? "") === state.actor) {
       if (observation?.type === "pinboard_entered") {
@@ -2404,8 +1987,6 @@ function receiveLiveEvent(observation: any) {
         setTab("chat", { mode: "push", leaveCurrent: false });
       }
     }
-    scheduleLegacyStateRefresh();
-    if (placementChanged) render();
     if (needsNoteRefresh) refreshPinboardNotes();
     animatePinboardNotes(pinboardAnimations);
   }
@@ -2423,7 +2004,6 @@ function receiveLiveEvent(observation: any) {
         }
       }
     }
-    scheduleLegacyStateRefresh();
   }
   if (isChatObservation(observation)) {
     receiveChatEvent(observation);
@@ -2431,7 +2011,6 @@ function receiveLiveEvent(observation: any) {
   }
   if (isDubspaceStateObservation(observation)) {
     syncDubspaceProjectionEffects(observation);
-    if (!scopedProjectionEnabled && String(observation?.type ?? "") === "control_changed") scheduleLegacyStateRefresh();
     return;
   }
   if (observation?.type === "gesture_progress") {
@@ -2740,7 +2319,6 @@ function bindCommon() {
     button.addEventListener("click", async () => {
       const next = button.dataset.tab as AppState["tab"];
       if (next !== "ide") {
-        scopedProjectionEnabled = true;
         await ensureScopedProjectionReady();
         await ensureScopedOverlayForTab(next);
       }
@@ -2825,7 +2403,7 @@ function mountToolSpaceChat(element: HTMLElement, space: string) {
     existing.woo = createChatWooContext(space, chatLineActorRefs(lines));
     setCustomElementData(existing, {
       space,
-      spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
+      spaceName: projectedObjectView(space)?.name ?? objectName(space),
       lines,
       draft: spaceChatDraft(space),
       height: Math.round(spaceChatHeight(space)),
@@ -3133,7 +2711,6 @@ function enterChat() {
     applyScopedMoveResult(result);
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result?.look_deferred === true) direct(room, "look", [], applyLookResult, onError);
     if (state.tab === "chat") render();
   };
   if (canSendChatV2()) {
@@ -3190,35 +2767,6 @@ function pinboardObservationNeedsNotesRefresh(type: string) {
     "note_deleted",
     "notes_cleared"
   ].includes(type);
-}
-
-function applyPinboardPlacementObservation(observation: any): boolean {
-  const type = String(observation?.type ?? "");
-  if (type !== "pin_moved" && type !== "pin_resized" && type !== "note_moved" && type !== "note_resized") return false;
-  if (scopedProjectionEnabled) return false;
-  const id = String(observation?.pin ?? observation?.id ?? "");
-  const notes = state.world?.pinboard?.notes;
-  if (!id || !Array.isArray(notes)) return false;
-  const note = notes.find((item: any) => String(item?.id ?? "") === id);
-  if (!note) return false;
-  let changed = false;
-  const assignNumber = (field: "x" | "y" | "w" | "h" | "z") => {
-    const value = Number(observation?.[field]);
-    if (!Number.isFinite(value)) return;
-    if (note[field] === value) return;
-    note[field] = value;
-    changed = true;
-  };
-  if (type === "pin_moved" || type === "note_moved") {
-    assignNumber("x");
-    assignNumber("y");
-    assignNumber("z");
-  }
-  if (type === "pin_resized" || type === "note_resized") {
-    assignNumber("w");
-    assignNumber("h");
-  }
-  return changed;
 }
 
 function receivePinboardViewport(observation: any) {
@@ -3365,10 +2913,9 @@ function receiveChatEvent(observation: any, shouldRender = true) {
   // Side-effect branches below stay keyed on observation.type, not on the
   // formatter-supplied kind. The formatter's kind is for rendering only.
   const presentActors = presentActorsFromObservation(observation);
-  // Only adopt present_actors as the chat sidebar list when the observation
-  // came from the actor's current chat room; a `look at pinboard` from the
-  // deck would otherwise overwrite the deck's presence list with the
-  // pinboard's subscribers.
+  // Only adopt roster as the chat sidebar list when the observation came from
+  // the actor's current chat room; a `look at pinboard` from the deck would
+  // otherwise overwrite the deck's presence list with the pinboard's roster.
   const observationRoom = typeof observation.room === "string" ? observation.room : "";
   const fromCurrentRoom = !observationRoom || observationRoom === chatRoom();
   if ((type === "looked" || type === "who") && presentActors.length > 0 && fromCurrentRoom) state.chatPresent = presentActors;
@@ -3409,7 +2956,7 @@ function receiveChatEvent(observation: any, shouldRender = true) {
 }
 
 function applyScopedMoveResult(result: any) {
-  if (!scopedProjectionEnabled || !result || typeof result !== "object" || Array.isArray(result)) return;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   state.scopedProjection = scopedModelWithMoveResult(state.scopedProjection, result);
   if (typeof result.room === "string" || (result.here && typeof result.here === "object" && !Array.isArray(result.here))) {
@@ -3428,7 +2975,7 @@ function applyScopedProjectionModel() {
 }
 
 function applyScopedChatObservation(observation: any) {
-  if (!scopedProjectionEnabled || !state.scopedProjection?.here || !observation || typeof observation !== "object" || Array.isArray(observation)) return;
+  if (!state.scopedProjection?.here || !observation || typeof observation !== "object" || Array.isArray(observation)) return;
   const room = typeof observation.room === "string" ? observation.room : typeof observation.source === "string" ? observation.source : "";
   if (room && room !== state.scopedProjection.here.id) return;
   const actor = typeof observation.actor === "string" ? observation.actor : "";
@@ -3463,11 +3010,12 @@ function applyScopedChatObservation(observation: any) {
   if (type === "entered") present.add(actor);
   if (type === "left") present.delete(actor);
   if (type !== "entered" && type !== "left") return;
-  const summaries = new Map(arrayOfObjects(state.scopedProjection.here.present_actors).map((item) => [String(item.id ?? ""), item]));
+  const summaries = new Map(arrayOfObjects(Array.isArray(state.scopedProjection.here.roster) ? state.scopedProjection.here.roster : state.scopedProjection.here.present_actors).map((item) => [String(item.id ?? ""), item]));
   if (type === "entered" && !summaries.has(actor)) summaries.set(actor, ui.observe(actor) ?? { id: actor, name: actor, props: {}, catalogState: {} });
+  const roster = [...present].map((id) => summaries.get(id) ?? { id, name: id });
   state.scopedProjection.here = {
     ...state.scopedProjection.here,
-    present_actors: [...present].map((id) => summaries.get(id) ?? { id, name: id })
+    roster
   };
   state.chatPresent = [...present];
   ui.ingestSnapshot("here", roomSnapshotObjects(state.scopedProjection.here));
@@ -3632,7 +3180,7 @@ function setSpaceChatCollapsed(collapsed: boolean) {
     panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
     setCustomElementData(panel, {
       space,
-      spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
+      spaceName: projectedObjectView(space)?.name ?? objectName(space),
       lines,
       draft: spaceChatDraft(space),
       height: Math.round(spaceChatHeight(space)),
@@ -3679,15 +3227,12 @@ function navigateChatHistory(event: KeyboardEvent, input: HTMLInputElement) {
 
 function setChatPresent(result: any) {
   if (Array.isArray(result)) state.chatPresent = result.map(String);
-  if (Array.isArray(result?.present_actors)) state.chatPresent = idsFromRefsOrSummaries(result.present_actors);
+  else if (Array.isArray(result?.roster)) state.chatPresent = idsFromRefsOrSummaries(result.roster);
+  else if (Array.isArray(result?.present_actors)) state.chatPresent = idsFromRefsOrSummaries(result.present_actors);
 }
 
 function setCurrentChatRoom(room: string) {
   if (room) chatRoomPin = { room, expiresAt: Date.now() + 2_500 };
-  if (!scopedProjectionEnabled && state.world?.chatMeta) {
-    state.world.chatMeta.room = room;
-    state.world.chat = projectChat(state.world, state.world.chatMeta);
-  }
   if (state.actor && !state.chatPresent.includes(state.actor)) state.chatPresent = [...state.chatPresent, state.actor];
   syncUrlFromCurrentState("replace");
 }
@@ -3747,7 +3292,7 @@ function roomTitleBadges(room: string): ChatTitleBadge[] {
 
 function currentRoomContents(room: string): any[] {
   if (!room) return [];
-  if (scopedProjectionEnabled && String(state.scopedProjection?.here?.id ?? "") === room) {
+  if (String(state.scopedProjection?.here?.id ?? "") === room) {
     return arrayOfObjects(state.scopedProjection?.here?.contents)
       .map((item) => {
         const id = String(item?.id ?? "");
@@ -3755,10 +3300,7 @@ function currentRoomContents(room: string): any[] {
       })
       .filter((item): item is any => Boolean(item));
   }
-  const contentIds = Array.isArray(state.world?.objects?.[room]?.contents) ? state.world.objects[room].contents : [];
-  return contentIds
-    .map((id: unknown) => projectedObjectView(String(id)))
-    .filter((item: any): item is any => Boolean(item));
+  return [];
 }
 
 function chatFrameComponentTag(): string | null {
@@ -3789,20 +3331,11 @@ function setCustomElementData<T>(element: HTMLElement & { data?: T }, data: T, a
 }
 
 function clientClassDistance(subject: string, classRef: string): number | false {
-  if (scopedProjectionEnabled) {
-    const object = ui.observe(subject);
-    if (subject === classRef || object?.parent === classRef) return subject === classRef ? 0 : 1;
-    const ancestors = Array.isArray(object?.ancestors) ? object.ancestors.map(String) : [];
-    const index = ancestors.indexOf(classRef);
-    return index >= 0 ? Math.max(1, ancestors.length - index) : false;
-  }
-  let current: string | undefined = subject;
-  for (let distance = 0; current; distance += 1) {
-    if (current === classRef) return distance;
-    const parent: unknown = state.world?.objects?.[current]?.parent;
-    current = typeof parent === "string" && parent !== current ? parent : undefined;
-  }
-  return false;
+  const object = ui.observe(subject);
+  if (subject === classRef || object?.parent === classRef) return subject === classRef ? 0 : 1;
+  const ancestors = Array.isArray(object?.ancestors) ? object.ancestors.map(String) : [];
+  const index = ancestors.indexOf(classRef);
+  return index >= 0 ? Math.max(1, ancestors.length - index) : false;
 }
 
 function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData }) {
@@ -3957,14 +3490,12 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setDubspaceOperators(result);
     setTab("dubspace", { mode: "push", leaveCurrent: false });
     void ensureScopedOverlayForTab("dubspace");
-    if (!scopedProjectionEnabled) void refresh().then(() => requestSpaceChatFocus(target));
     requestSpaceChatFocus(target);
     return;
   }
   if ((verb === "leave" || verb === "out") && target === dubspaceSpace()) {
     setDubspaceOperators(result);
     setTab("chat", { mode: "push", leaveCurrent: false });
-    if (!scopedProjectionEnabled) void refresh();
     focusChatInput();
     return;
   }
@@ -3972,7 +3503,6 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setPinboardPresent(result);
     clearPinboardViewports();
     setTab("chat", { mode: "push", leaveCurrent: false });
-    if (!scopedProjectionEnabled) void refresh();
     focusChatInput();
     return;
   }
@@ -3981,7 +3511,6 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setTab("pinboard", { mode: "push", leaveCurrent: false });
     void ensureScopedOverlayForTab("pinboard", { force: true });
     refreshPinboardNotes({ force: true });
-    if (!scopedProjectionEnabled) void refresh().then(() => requestSpaceChatFocus(target));
     requestSpaceChatFocus(target);
     return;
   }
@@ -4005,24 +3534,19 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     const room = result.room;
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result.look_deferred === true) direct(room, "look", [], applyLookResult, chatErrorHandler(room));
-    if (!scopedProjectionEnabled) void refresh();
-    else if (result.look_deferred === true) void refresh().then(() => focusChatInput());
+    if (result.look_deferred === true) void refresh().then(() => focusChatInput());
     else render();
     return;
   }
   if (verb === "enter") {
     if (target) setCurrentChatRoom(target);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result?.look_deferred === true && target) direct(target, "look", [], applyLookResult, chatErrorHandler(target));
-    if (!scopedProjectionEnabled) void refresh();
-    else if (result?.look_deferred === true) void refresh().then(() => focusChatInput());
+    if (result?.look_deferred === true) void refresh().then(() => focusChatInput());
     else render();
     return;
   }
   if (verb === "take" || verb === "drop") {
-    if (!scopedProjectionEnabled) void refresh();
-    else render();
+    render();
     return;
   }
   void originalText;
@@ -4030,11 +3554,10 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
 }
 
 function applyLookResult(result: any) {
-  const present = Array.isArray(result?.present_actors) ? result.present_actors.map(String) : [];
+  const present = idsFromRefsOrSummaries(Array.isArray(result?.roster) ? result.roster : Array.isArray(result?.present_actors) ? result.present_actors : []);
   if (present.length === 0) return;
-  // `look pinboard` returns the board's own subscribers; clobbering chatPresent
-  // with them hides the chat UI for anyone not also inside the board, since
-  // renderChat treats !present.includes(state.actor) as "you must enter".
+  // `look pinboard` returns the board's own roster; clobbering chatPresent
+  // with it hides the chat UI for anyone not also inside the board.
   const lookedId = typeof result?.id === "string" ? result.id : "";
   if (lookedId && lookedId !== activeChatRoom()) return;
   state.chatPresent = present;
@@ -4042,8 +3565,7 @@ function applyLookResult(result: any) {
 
 function actorLabel(id: string | undefined) {
   if (!id) return "unknown";
-  if (scopedProjectionEnabled) return String(projectedObjectView(id)?.name ?? id);
-  return String(state.world?.objects?.[id]?.name ?? id);
+  return String(projectedObjectView(id)?.name ?? id);
 }
 
 function renderPinboard() {
@@ -4406,7 +3928,7 @@ function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChat
   panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
   setCustomElementData(panel, {
     space,
-    spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
+    spaceName: projectedObjectView(space)?.name ?? objectName(space),
     lines,
     draft: spaceChatDraft(space),
     height: Math.round(spaceChatHeight(space)),
@@ -4777,7 +4299,7 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  const activeScope = scopedProjectionEnabled ? sessionActiveScope(state.scopedProjection?.session) : sessionActiveScope(state.world?.session);
+  const activeScope = sessionActiveScope(state.scopedProjection?.session);
   return Boolean(state.actor && board && activeScope === board);
 }
 
@@ -4965,9 +4487,6 @@ function leavePinboard(done?: () => void) {
       setPinboardPresent(result);
       clearPinboardViewports();
       done?.();
-      // Legacy mode still needs a projection refresh after feature-space leave;
-      // scoped mode consumes the move-shaped `here` result above.
-      if (!scopedProjectionEnabled) void refresh();
       void ensureScopedOverlayForTab("pinboard", { force: true });
       if (state.tab === "pinboard") render();
     },
@@ -4983,23 +4502,21 @@ function setPinboardPresent(result: any) {
     ? result
     : Array.isArray(result?.present)
       ? result.present
-      : Array.isArray(result?.present_actors)
-        ? result.present_actors
+      : Array.isArray(result?.roster)
+        ? result.roster
+        : Array.isArray(result?.present_actors)
+          ? result.present_actors
         : [];
   const presentIds = idsFromRefsOrSummaries(present);
   const boardId = pinboardSpace();
-  if (boardId) ui.applyCanonical([{ subject: boardId, props: { subscribers: presentIds } }]);
+  if (boardId) ui.applyCanonical([{
+    subject: boardId,
+    catalogState: { pinboard_presence: Object.fromEntries(presentIds.map((id) => [id, true])) }
+  }]);
   const presentActors = new Set(presentIds);
   for (const actor of Object.keys(state.pinboardViewports)) {
     if (!presentActors.has(actor)) removePinboardViewport(actor);
   }
-  if (scopedProjectionEnabled) return;
-  // Compatibility write for the legacy `/api/state` pinboard branch. The
-  // projection write above is the scoped-model update.
-  if (!state.world?.pinboard) return;
-  state.world.pinboard.present = presentIds;
-  const board = state.world.pinboard.board;
-  if (board?.props) board.props.subscribers = state.world.pinboard.present;
 }
 
 function pinboardCall(verb: string, args: any[] = [], options?: ProjectionCallOptions) {
@@ -5043,7 +4560,7 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
 }
 
 function applyPinboardNotesCanonical(board: string, result: any[]) {
-  const previous = pinboardModel()?.notes ?? (!scopedProjectionEnabled ? state.world?.pinboard?.notes : []) ?? [];
+  const previous = pinboardModel()?.notes ?? [];
   const notes = normalizePinboardNotes(result, previous);
   const nextIds = new Set<string>();
   const previousIds = new Set((Array.isArray(previous) ? previous : []).map((note: any) => String(note?.id ?? "")).filter(Boolean));
@@ -5074,7 +4591,6 @@ function applyPinboardNotesCanonical(board: string, result: any[]) {
   }
   ui.applyCanonical([{ subject: board, props: { layout } }]);
   ui.applyCanonical(notePatches, { mode: "replace" });
-  if (!scopedProjectionEnabled && state.world?.pinboard) state.world.pinboard.notes = notes;
 }
 
 function pinboardNoteState(note: any): Record<string, unknown> {
@@ -5096,36 +4612,6 @@ function pinboardPalette(palette: any): string[] {
 }
 
 function renderIde() {
-  if (scopedProjectionEnabled) return renderScopedIde();
-  const objects = Object.keys(state.world?.objects ?? {}).sort();
-  const installTarget = state.selectedObject || defaultSelectedObject();
-  const scopedSmoke = scopedProjectionSmokeEnabled
-    ? `<div class="card"><h2>Scoped projection smoke</h2><pre>${escapeHtml(JSON.stringify(state.scopedProjectionSmoke ?? {}, null, 2))}</pre></div>`
-    : "";
-  return `
-    <section class="toolbar">
-      <h1>Inspector</h1>
-      <select data-object-select>${objects.map((id) => `<option value="${escapeHtml(id)}" ${id === state.selectedObject ? "selected" : ""}>${escapeHtml(id)}</option>`).join("")}</select>
-      <button data-refresh-object>Inspect</button>
-    </section>
-    <section class="split">
-      <div class="card"><pre>${escapeHtml(JSON.stringify(state.world?.objects?.[state.selectedObject] ?? {}, null, 2))}</pre></div>
-      <div class="card editor">
-        <input data-verb-name value="set_feedback" />
-        <textarea data-source>${escapeHtml(defaultSource())}</textarea>
-        <div class="button-row">
-          <button data-compile>Compile</button>
-          <button data-install>Install on ${escapeHtml(installTarget)}</button>
-          <button data-test-verb>Test</button>
-        </div>
-        <pre>${escapeHtml(JSON.stringify(state.compileResult ?? {}, null, 2))}</pre>
-      </div>
-    </section>
-    ${scopedSmoke}
-  `;
-}
-
-function renderScopedIde() {
   const object = state.selectedObject || defaultSelectedObject();
   const summary = scopedObjectSummary(object);
   const scopedSmoke = scopedProjectionSmokeEnabled
@@ -5145,61 +4631,15 @@ function renderScopedIde() {
 }
 
 function bindIde() {
-  if (scopedProjectionEnabled) {
-    const inspect = () => {
-      const input = document.querySelector<HTMLInputElement>("[data-scoped-object-ref]");
-      const id = input?.value.trim() ?? "";
-      if (id) setSelectedObject(id);
-    };
-    document.querySelector<HTMLButtonElement>("[data-scoped-object-inspect]")?.addEventListener("click", inspect);
-    document.querySelector<HTMLInputElement>("[data-scoped-object-ref]")?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") inspect();
-    });
-    return;
-  }
-  document.querySelector<HTMLSelectElement>("[data-object-select]")?.addEventListener("change", (event) => {
-    setSelectedObject((event.target as HTMLSelectElement).value);
+  const inspect = () => {
+    const input = document.querySelector<HTMLInputElement>("[data-scoped-object-ref]");
+    const id = input?.value.trim() ?? "";
+    if (id) setSelectedObject(id);
+  };
+  document.querySelector<HTMLButtonElement>("[data-scoped-object-inspect]")?.addEventListener("click", inspect);
+  document.querySelector<HTMLInputElement>("[data-scoped-object-ref]")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") inspect();
   });
-  document.querySelector<HTMLButtonElement>("[data-compile]")?.addEventListener("click", async () => {
-    const source = document.querySelector<HTMLTextAreaElement>("[data-source]")!.value;
-    const response = await fetch("/api/compile", { method: "POST", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify({ source }) });
-    state.compileResult = await response.json();
-    render();
-  });
-  document.querySelector<HTMLButtonElement>("[data-install]")?.addEventListener("click", async () => {
-    const source = document.querySelector<HTMLTextAreaElement>("[data-source]")!.value;
-    const name = document.querySelector<HTMLInputElement>("[data-verb-name]")!.value.trim();
-    const object = state.selectedObject;
-    const info = await fetch(`/api/object?id=${encodeURIComponent(object)}`, { headers: authHeaders() }).then((response) => response.json());
-    const current = info.verbs?.find((verb: any) => verb.name === name);
-    const response = await fetch("/api/install", {
-      method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ object, name, source, expected_version: current?.version ?? null })
-    });
-    state.compileResult = await response.json();
-    await refresh();
-  });
-  document.querySelector<HTMLButtonElement>("[data-test-verb]")?.addEventListener("click", () => {
-    const name = document.querySelector<HTMLInputElement>("[data-verb-name]")!.value.trim();
-    const space = dubspaceSpace();
-    if (space) call(space, state.selectedObject, name, [0.62]);
-  });
-}
-
-function defaultSource() {
-  return `verb :set_feedback(value) rx {
-  this.feedback = value;
-  observe({
-    "type": "control_changed",
-    "target": this,
-    "name": "feedback",
-    "value": value,
-    "actor": actor,
-    "seq": seq
-  });
-  return value;
-}`;
 }
 
 function clamp(value: number, min: number, max: number) {

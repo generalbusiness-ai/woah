@@ -265,6 +265,7 @@ export type ShadowBrowserTurnInput = {
   target: ObjRef;
   verb: string;
   args?: WooValue[];
+  body?: Record<string, WooValue>;
   persistence?: ShadowTurnExecRequest["persistence"];
 };
 
@@ -276,8 +277,66 @@ export type ShadowTurnIntentRequest = {
   target: ObjRef;
   verb: string;
   args?: WooValue[];
+  body?: Record<string, WooValue>;
   persistence?: ShadowTurnExecRequest["persistence"];
 };
+
+export function buildShadowTurnIntentEnvelope(input: {
+  node: string;
+  actor: ObjRef;
+  session: string;
+  token: string;
+  id?: string;
+  route: ShadowTurnCall["route"];
+  scope: ObjRef;
+  target: ObjRef;
+  verb: string;
+  args: WooValue[];
+  body?: Record<string, WooValue>;
+  persistence?: ShadowTurnExecRequest["persistence"];
+}): ShadowEnvelope<ShadowTurnIntentRequest> {
+  const body: ShadowTurnIntentRequest = {
+    kind: "woo.turn.intent.request.shadow.v1",
+    id: input.id,
+    route: input.route,
+    scope: input.scope,
+    target: input.target,
+    verb: input.verb,
+    args: input.args,
+    body: input.body,
+    persistence: input.persistence
+  };
+  return {
+    v: 2,
+    type: body.kind,
+    id: input.id ?? `${input.node}:turn`,
+    from: input.node,
+    actor: input.actor,
+    session: input.session,
+    auth: { mode: "session", token: input.token },
+    body
+  };
+}
+
+export function buildShadowTurnExecEnvelope(input: {
+  node: string;
+  actor: ObjRef;
+  session: string;
+  token: string;
+  id?: string;
+  body: ShadowTurnExecRequest;
+}): ShadowEnvelope<ShadowTurnExecRequest> {
+  return {
+    v: 2,
+    type: input.body.kind,
+    id: input.id ?? `${input.node}:turn`,
+    from: input.node,
+    actor: input.actor,
+    session: input.session,
+    auth: { mode: "session", token: input.token },
+    body: input.body
+  };
+}
 
 export type ShadowBrowserTurnResult = {
   id: string;
@@ -598,7 +657,8 @@ export async function executeShadowBrowserTurn(
     actor: browser.actor,
     target: input.target,
     verb: input.verb,
-    args: input.args ?? []
+    args: input.args ?? [],
+    body: input.body
   };
   const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
@@ -933,7 +993,8 @@ async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, inten
     actor: browser.actor,
     target: intent.target,
     verb: intent.verb,
-    args: intent.args ?? []
+    args: intent.args ?? [],
+    body: intent.body
   };
   const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? browser.relay.commit_scope.serialized

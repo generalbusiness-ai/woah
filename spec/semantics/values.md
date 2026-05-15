@@ -36,7 +36,7 @@ A value is exactly one of these. There is no "any" or "object" union beyond the 
 
 ## V2. Canonical JSON encoding
 
-woo values serialize to JSON via the rules below. The encoding is the same on the wire (`op: "call"`, `op: "applied"`, etc.) and in persistent storage (`property_value.value`, sequenced message body, etc.).
+woo values serialize to JSON via the rules below. The encoding is the same on the v2/REST wire and in persistent storage (`property_value.value`, sequenced message body, etc.).
 
 | Value | JSON form |
 |---|---|

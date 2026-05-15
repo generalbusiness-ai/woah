@@ -58,8 +58,8 @@ docs/
   directly.
 - `obj:verb(args)` — a verb call, the way woocode itself talks. The
   same call goes over MCP as `woo_call("obj", "verb", [args])`, over
-  REST as `POST /api/objects/obj/calls/verb`, and over the WebSocket
-  wire as a `call` frame.
+  REST as `POST /api/objects/obj/calls/verb`, and from the browser as a
+  v2 turn-network intent.
 - `;expr` — programmer-only inline eval (`$programmer:eval(expr)`,
   expression mode). `;;stmts` is the statement-block form. Don't
   type the leading `;` in ordinary command input. See

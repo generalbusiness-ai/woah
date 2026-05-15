@@ -2476,7 +2476,14 @@ describe("local catalogs", () => {
         expect.objectContaining({ player: first.actor, location: "the_chatroom", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) }),
         expect.objectContaining({ player: second.actor, location: "the_deck", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) })
       ]));
-      expect(who.observations).toContainEqual(expect.objectContaining({ type: "who", actor: first.actor, present_actors: expect.arrayContaining([first.actor, second.actor]) }));
+      expect(who.observations).toContainEqual(expect.objectContaining({
+        type: "who",
+        actor: first.actor,
+        roster: expect.arrayContaining([
+          expect.objectContaining({ id: first.actor }),
+          expect.objectContaining({ id: second.actor })
+        ])
+      }));
     }
     const directWhoNoArgs = await world.directCall("lambda-who-no-args", first.actor, first.actor, "who_all", []);
     expect(directWhoNoArgs.op).toBe("result");
@@ -2626,7 +2633,7 @@ describe("local catalogs", () => {
       expect((staring.result as Record<string, unknown>).description).toMatch(/staring off into space for 1 minute/);
     }
 
-    // /api/state-equivalent reads MUST NOT reset idle. Simulating the projection:
+    // Projection reads MUST NOT reset idle. Simulating the read:
     void world.state(actor);
     expect(world.actorLastInputAt(actor)).toBe(session.lastInputAt);
 
@@ -4069,10 +4076,10 @@ describe("local catalogs", () => {
       const looked = await world.directCall("actor-display-look", presentPlayer, roomId, "look_self", []);
       expect(looked.op).toBe("result");
       if (looked.op !== "result") return;
-      const view = looked.result as { contents: Array<{ id: string }>; present_actors?: string[] };
+      const view = looked.result as { contents: Array<{ id: string }>; roster?: Array<{ id: string }> };
       expect(view.contents.map((c) => c.id)).toContain(objectActor);
-      if (Array.isArray(view.present_actors)) {
-        expect(view.present_actors).not.toContain(objectActor);
+      if (Array.isArray(view.roster)) {
+        expect(view.roster.map((row) => row.id)).not.toContain(objectActor);
       }
     });
 

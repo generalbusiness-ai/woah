@@ -57,7 +57,7 @@ export type EffectTranscript = {
   scope: ObjRef;
   seq: number;
   session?: string | null;
-  call: Pick<TurnStart, "actor" | "target" | "verb" | "args">;
+  call: Pick<TurnStart, "actor" | "target" | "verb" | "args" | "body">;
   reads: TranscriptRead[];
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];
@@ -205,7 +205,8 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
       actor: turn.start.actor,
       target: turn.start.target,
       verb: turn.start.verb,
-      args: turn.start.args
+      args: turn.start.args,
+      ...(turn.start.body !== undefined ? { body: turn.start.body } : {})
     },
     reads,
     writes,

@@ -1,21 +1,17 @@
 import {
   wooError,
   type AppliedFrame,
-  type CommandFrame,
   type DirectResultFrame,
   type ErrorFrame,
   type ErrorValue,
   type Message,
   type ObjRef,
   type Session,
-  type SpaceLogEntry,
-  type Observation,
   type WooValue
 } from "./types";
 import { localCatalogStatuses, localCatalogUiIndex } from "./local-catalogs";
-import { normalizeError, type DirectCallOptions, type ParkedTaskRun, type WooWorld } from "./world";
-
-const MAX_WS_FRAME_BYTES = 256 * 1024;
+import { normalizeError, type WooWorld } from "./world";
+import type { ShadowTurnExecReply } from "./shadow-turn-exec";
 
 export type RestProtocolRequest = {
   method: string;
@@ -38,20 +34,24 @@ export type RestProtocolHost = {
   onAuthenticated?(session: Session): void | Promise<void>;
   onSessionEnded?(session: Session): void | Promise<void>;
   onSessionsEnded?(sessions: Session[]): void | Promise<void>;
-  state(actor: ObjRef): unknown | Promise<unknown>;
   installTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
   updateTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
-  openStream?(request: RestProtocolRequest, rawTarget: string, target: ObjRef, session: Session): RestProtocolResult | Promise<RestProtocolResult>;
   resolveObject?(id: string, session: Session, request: RestProtocolRequest): ObjRef;
   resolveActor?(request: RestProtocolRequest, actorValue: unknown, session: Session): ObjRef;
-  directCall?(
-    id: string | undefined,
-    actor: ObjRef,
-    target: ObjRef,
-    verb: string,
-    args: WooValue[],
-    options: DirectCallOptions
-  ): Promise<DirectResultFrame | ErrorFrame>;
+  executeTurn?(
+    input: {
+      id?: string;
+      session: Session;
+      actor: ObjRef;
+      scope: ObjRef;
+      target: ObjRef;
+      verb: string;
+      args: WooValue[];
+      body?: Record<string, WooValue>;
+      route: "direct" | "sequenced";
+      persistence: "durable" | "live";
+    }
+  ): Promise<AppliedFrame | DirectResultFrame | ErrorFrame>;
   broadcastApplied(frame: AppliedFrame): void | Promise<void>;
   broadcastLiveEvents(result: DirectResultFrame): void | Promise<void>;
 };
@@ -118,12 +118,6 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
       if (!session) return jsonProtocol({ ok: false, login_required: true }, 302, { Location: `/signup?return=${encodeURIComponent(connectReturnPath(request))}` });
       const result = world.connectHermes(session.actor, request.query("return") ?? "", request.query("state") ?? "", request.query("profile_id") ?? "");
       return jsonProtocol(result, 302, { Location: result.redirect_url });
-    }
-
-    if (request.method === "GET" && request.pathname === "/api/state") {
-      const session = host.requireSession(request);
-      requireWizard(world, session.actor);
-      return jsonProtocol(withSessionProjection(await host.state(session.actor), world, session));
     }
 
     if (request.method === "GET" && request.pathname === "/api/me") {
@@ -229,9 +223,20 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
         const inner = Array.isArray(body.args) ? body.args[0] : null;
         if (!inner || typeof inner !== "object" || Array.isArray(inner)) throw wooError("E_INVARG", "$space:call expects args[0] to be a message map");
         const message = messageFromRestMap(host, request, inner as Record<string, WooValue>, actor, session);
-        const result = await world.call(id, session.id, target, message);
+        const result = await executeRestTurn(host, {
+          id,
+          session,
+          actor: message.actor,
+          scope: target,
+          target: message.target,
+          verb: message.verb,
+          args: message.args ?? [],
+          body: message.body,
+          route: "sequenced",
+          persistence: "durable"
+        });
         if (result.op === "error") return errorProtocol(result.error);
-        await host.broadcastApplied(result);
+        if (result.op === "applied") await host.broadcastApplied(result);
         return jsonProtocol(result);
       }
 
@@ -244,22 +249,41 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
           args,
           body: body.body && typeof body.body === "object" && !Array.isArray(body.body) ? body.body as Record<string, WooValue> : undefined
         };
-        const result = await world.call(id, session.id, space, message);
+        const result = await executeRestTurn(host, {
+          id,
+          session,
+          actor: message.actor,
+          scope: space,
+          target: message.target,
+          verb: message.verb,
+          args: message.args ?? [],
+          body: message.body,
+          route: "sequenced",
+          persistence: "durable"
+        });
         if (result.op === "error") return errorProtocol(result.error);
-        await host.broadcastApplied(result);
+        if (result.op === "applied") await host.broadcastApplied(result);
         return jsonProtocol(result);
       }
 
-      const forceDirect = request.header("x-woo-force-direct") === "1";
-      const direct = host.directCall ?? ((frameId, directActor, directTarget, directVerb, directArgs, directOptions) =>
-        world.directCall(frameId, directActor, directTarget, directVerb, directArgs, directOptions));
-      const result = await direct(id, actor, target, verb, args, {
-        forceDirect,
-        forceReason: "REST X-Woo-Force-Direct",
-        sessionId: session.id,
-        onSessionsEnded: host.onSessionsEnded
+      const persistence = restDirectPersistence(world, target, verb);
+      const result = await executeRestTurn(host, {
+        id,
+        session,
+        actor,
+        scope: target,
+        target,
+        verb,
+        args,
+        body: body.body && typeof body.body === "object" && !Array.isArray(body.body) ? body.body as Record<string, WooValue> : undefined,
+        route: "direct",
+        persistence
       });
       if (result.op === "error") return errorProtocol(result.error);
+      if (result.op === "applied") {
+        await host.broadcastApplied(result);
+        return jsonProtocol(result);
+      }
       await host.broadcastLiveEvents(result);
       return jsonProtocol({
           result: result.result,
@@ -283,14 +307,45 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
     }
 
     if (request.method === "GET" && route.rest.length === 1 && route.rest[0] === "stream") {
-      if (host.openStream) return host.openStream(request, route.id, target, session);
-      return jsonProtocol({ error: { code: "E_NOT_IMPLEMENTED", message: "SSE streams are not available on this host" } }, 501);
+      return jsonProtocol({
+        error: {
+          code: "E_GONE",
+          message: "Object SSE streams have been retired; use the v2 browser turn network for live frames and /log for durable backfill."
+        }
+      }, 410);
     }
   } catch (err) {
     return errorProtocol(normalizeError(err));
   }
 
   return { handled: false };
+}
+
+async function executeRestTurn(
+  host: RestProtocolHost,
+  input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]
+): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+  if (!host.executeTurn) throw wooError("E_NOT_IMPLEMENTED", "REST verb calls require a v2 turn executor");
+  return await host.executeTurn(input);
+}
+
+function restDirectPersistence(world: WooWorld, target: ObjRef, verb: string): "durable" | "live" {
+  try {
+    const info = world.verbInfo(target, verb);
+    const command = info.arg_spec && typeof info.arg_spec === "object" && !Array.isArray(info.arg_spec)
+      ? (info.arg_spec as Record<string, WooValue>).command
+      : undefined;
+    if (command && typeof command === "object" && !Array.isArray(command)) {
+      const persistence = (command as Record<string, WooValue>).persistence;
+      if (persistence === "live" || persistence === "durable") return persistence;
+    }
+  } catch {
+    // Permission and missing-verb errors are raised by the v2 executor below.
+  }
+  // REST direct calls default durable because the runtime cannot infer whether
+  // an arbitrary catalog verb mutates state. Read-only/live verbs declare the
+  // exception in arg_spec.command.persistence.
+  return "durable";
 }
 
 export function objectRoute(pathname: string): { id: string; rest: string[] } | null {
@@ -360,15 +415,6 @@ export function restPropertyInfo(world: WooWorld, obj: ObjRef, name: string): Re
   }
 }
 
-export function appliedFromLogEntry(entry: SpaceLogEntry): AppliedFrame & { ts: number } {
-  const observations: Observation[] = entry.observations?.length
-    ? entry.observations
-    : entry.applied_ok
-      ? []
-      : [{ type: "$error", code: entry.error?.code ?? "E_INTERNAL", message: entry.error?.message ?? entry.error?.code ?? "error", value: entry.error?.value ?? null }];
-  return { op: "applied", space: entry.space, seq: entry.seq, message: entry.message, observations, ts: entry.ts };
-}
-
 export function statusForError(error: ErrorValue): number {
   switch (error.code) {
     case "E_INVARG":
@@ -377,6 +423,7 @@ export function statusForError(error: ErrorValue): number {
     case "E_TOKEN_CONSUMED":
       return 401;
     case "E_BOOTSTRAP_TOKEN_MISSING":
+    case "E_RETRY":
       return 503;
     case "E_PERM":
     case "E_DIRECT_DENIED":
@@ -405,6 +452,50 @@ export function statusForError(error: ErrorValue): number {
     default:
       return 500;
   }
+}
+
+export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply): AppliedFrame | DirectResultFrame {
+  if (reply.ok !== true) throw turnReplyError(reply);
+  if (reply.commit) {
+    return {
+      op: "applied",
+      id: reply.id,
+      space: reply.commit.position.scope,
+      seq: Number(reply.commit.position.seq),
+      ts: Date.now(),
+      message: {
+        actor: reply.transcript.call.actor,
+        target: reply.transcript.call.target,
+        verb: reply.transcript.call.verb,
+        args: reply.transcript.call.args
+      },
+      observations: reply.transcript.observations,
+      ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
+    };
+  }
+  return {
+    op: "result",
+    id: reply.id,
+    command: reply.transcript.call,
+    result: reply.outcome.result ?? null,
+    observations: reply.transcript.observations,
+    audience: scope
+  };
+}
+
+function turnReplyError(reply: ShadowTurnExecReply): ErrorValue {
+  if (reply.ok === true) return wooError("E_INTERNAL", "v2 REST turn failed unexpectedly after success");
+  if (reply.reason === "missing_state") {
+    return wooError("E_RETRY", "v2 REST turn requires state refresh before retry", { reason: reply.reason });
+  }
+  const commitReason = reply.reason === "commit_rejected" ? reply.commit?.reason : undefined;
+  if (commitReason === "incomplete_transcript") {
+    return wooError("E_RETRY", "v2 REST turn transcript was incomplete; retry after state refresh", { reason: commitReason });
+  }
+  if (commitReason === "stale_head") {
+    return wooError("E_CONFLICT", "v2 REST turn conflicted with the current scope head", { reason: commitReason });
+  }
+  return wooError("E_INTERNAL", `v2 REST turn failed: ${reply.reason}`, { reason: reply.reason, commit_reason: commitReason ?? null });
 }
 
 function jsonProtocol(body: unknown, status = 200, headers?: Record<string, string>): RestProtocolResult {
@@ -477,179 +568,6 @@ function messageFromRestMap(host: RestProtocolHost, request: RestProtocolRequest
     verb: value.verb,
     args: Array.isArray(value.args) ? value.args : [],
     body: value.body && typeof value.body === "object" && !Array.isArray(value.body) ? value.body as Record<string, WooValue> : undefined
-  };
-}
-
-export type WsProtocolSession = {
-  sessionId: string;
-  actor: ObjRef;
-};
-
-export type WsProtocolHost<Connection> = {
-  defaultAuthToken?: string;
-  authenticate(token: string, connection: Connection): Session | Promise<Session>;
-  attach(connection: Connection, session: Session): void | Promise<void>;
-  session(connection: Connection): WsProtocolSession | null;
-  send(connection: Connection, frame: unknown): void;
-  call(frameId: string | undefined, session: WsProtocolSession, space: ObjRef, message: Message): AppliedFrame | ErrorFrame | Promise<AppliedFrame | ErrorFrame>;
-  command?(
-    frameId: string | undefined,
-    session: WsProtocolSession,
-    space: ObjRef,
-    text: string
-  ): CommandFrame | Promise<CommandFrame>;
-  direct(
-    frameId: string | undefined,
-    session: WsProtocolSession,
-    target: ObjRef,
-    verb: string,
-    args: WooValue[]
-  ): DirectResultFrame | ErrorFrame | Promise<DirectResultFrame | ErrorFrame>;
-  replay(frameId: string | undefined, session: WsProtocolSession, space: ObjRef, from: unknown, limit: unknown): unknown | Promise<unknown>;
-  deliverInput(session: WsProtocolSession, input: WooValue): ParkedTaskRun | null | Promise<ParkedTaskRun | null>;
-  broadcastApplied(frame: AppliedFrame, originator?: Connection): void | Promise<void>;
-  broadcastTaskResult(result: ParkedTaskRun): void | Promise<void>;
-  broadcastLiveEvents(result: DirectResultFrame, originator?: Connection): void | Promise<void>;
-};
-
-export async function handleWsProtocolFrame<Connection>(
-  connection: Connection,
-  frame: Record<string, unknown>,
-  host: WsProtocolHost<Connection>
-): Promise<void> {
-  try {
-    const op = String(frame.op ?? "");
-
-    if (op === "auth") {
-      const session = await host.authenticate(String(frame.token ?? host.defaultAuthToken ?? ""), connection);
-      await host.attach(connection, session);
-      host.send(connection, { op: "session", actor: session.actor, session: session.id, resumed: false });
-      return;
-    }
-
-    if (op === "ping") {
-      host.send(connection, { op: "pong", server_time: Date.now() });
-      return;
-    }
-
-    const session = host.session(connection);
-    if (!session) {
-      host.send(connection, { op: "error", id: frame.id, error: wooError("E_NOSESSION", "auth required before this op") });
-      return;
-    }
-
-    if (op === "call") {
-      const m = frame.message && typeof frame.message === "object" && !Array.isArray(frame.message)
-        ? frame.message as Record<string, unknown>
-        : {};
-      const message: Message = {
-        actor: session.actor,
-        target: String(m.target ?? "") as ObjRef,
-        verb: String(m.verb ?? ""),
-        args: Array.isArray(m.args) ? m.args as WooValue[] : [],
-        body: m.body && typeof m.body === "object" && !Array.isArray(m.body)
-          ? m.body as Record<string, WooValue>
-          : undefined
-      };
-      const result = await host.call(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, message);
-      if (result.op === "applied") await host.broadcastApplied(result, connection);
-      else host.send(connection, result);
-      return;
-    }
-
-    if (op === "command") {
-      if (!host.command) {
-        host.send(connection, { op: "error", id: frame.id, error: wooError("E_NOTSUPPORTED", "command op is not supported by this host") });
-        return;
-      }
-      const result = await host.command(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, String(frame.text ?? ""));
-      if (result.op === "applied") await host.broadcastApplied(result, connection);
-      else if (result.op === "result") {
-        const command = (result as DirectResultFrame & { command?: WooValue }).command;
-        host.send(connection, command === undefined
-          ? { op: "result", id: result.id, result: result.result, observations: result.observations }
-          : { op: "result", id: result.id, result: result.result, command, observations: result.observations });
-        await host.broadcastLiveEvents(result, connection);
-      } else {
-        host.send(connection, result);
-      }
-      return;
-    }
-
-    if (op === "direct") {
-      const result = await host.direct(
-        frameId(frame.id),
-        session,
-        String(frame.target ?? "") as ObjRef,
-        String(frame.verb ?? ""),
-        Array.isArray(frame.args) ? frame.args as WooValue[] : []
-      );
-      if (result.op === "result") {
-        host.send(connection, { op: "result", id: result.id, result: result.result, observations: result.observations });
-        await host.broadcastLiveEvents(result, connection);
-      } else {
-        host.send(connection, result);
-      }
-      return;
-    }
-
-    if (op === "input") {
-      const input = Object.prototype.hasOwnProperty.call(frame, "value") ? frame.value : frame.text ?? "";
-      const result = await host.deliverInput(session, input as WooValue);
-      if (!result) {
-        host.send(connection, { op: "input", id: frame.id, accepted: false });
-        return;
-      }
-      if (result.frame?.op === "applied") await host.broadcastApplied(result.frame, connection);
-      else {
-        host.send(connection, { op: "input", id: frame.id, accepted: true, task: result.task.id, observations: result.observations });
-        await host.broadcastTaskResult(result);
-      }
-      return;
-    }
-
-    if (op === "replay") {
-      host.send(connection, await host.replay(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, frame.from, frame.limit));
-      return;
-    }
-
-    host.send(connection, { op: "error", error: { code: "E_INVARG", message: `unknown op ${op}` } });
-  } catch (err) {
-    host.send(connection, { op: "error", error: normalizeError(err) });
-  }
-}
-
-export function parseWsProtocolFrame(raw: string | ArrayBuffer | ArrayBufferView): Record<string, unknown> | ErrorFrame {
-  try {
-    if (rawFrameBytes(raw) > MAX_WS_FRAME_BYTES) {
-      return { op: "error", error: wooError("E_RATE", `websocket frame exceeds ${MAX_WS_FRAME_BYTES} bytes`) };
-    }
-    const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-    return { op: "error", error: wooError("E_INVARG", "invalid JSON frame") };
-  } catch {
-    return { op: "error", error: wooError("E_INVARG", "invalid JSON frame") };
-  }
-}
-
-function rawFrameBytes(raw: string | ArrayBuffer | ArrayBufferView): number {
-  if (typeof raw === "string") return new TextEncoder().encode(raw).byteLength;
-  return raw.byteLength;
-}
-
-function withSessionProjection(payload: unknown, world: WooWorld, session: Session): unknown {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  const activeScope = world.activeScopeForSession(session.id);
-  return {
-    ...(payload as Record<string, unknown>),
-    session: {
-      id: session.id,
-      actor: session.actor,
-      active_scope: activeScope,
-      current_location: activeScope,
-      all_locations: world.allLocationsForActor(session.actor)
-    }
   };
 }
 

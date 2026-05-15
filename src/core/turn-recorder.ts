@@ -32,6 +32,7 @@ export type TurnStart = {
   target: ObjRef;
   verb: string;
   args: WooValue[];
+  body?: Record<string, WooValue>;
 };
 
 export type TurnRecorderEvent =
@@ -82,9 +83,14 @@ export class InMemoryTurnRecorder implements TurnRecorder {
   readonly turns: RecordedTurn[] = [];
 
   startTurn(turn: TurnStart): ActiveTurnRecorder {
+    const start = {
+      ...turn,
+      args: structuredClone(turn.args) as WooValue[],
+      ...(turn.body !== undefined ? { body: structuredClone(turn.body) as Record<string, WooValue> } : {})
+    };
     const recorded: RecordedTurn = {
-      start: { ...turn, args: structuredClone(turn.args) as WooValue[] },
-      events: [{ kind: "turn_start", turn: { ...turn, args: structuredClone(turn.args) as WooValue[] } }]
+      start,
+      events: [{ kind: "turn_start", turn: start }]
     };
     this.turns.push(recorded);
     return {

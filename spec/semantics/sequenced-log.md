@@ -12,7 +12,7 @@ status: implemented
 This split exists for three reasons:
 
 - **Custom sequencers** (event-sourced documents, CRDT-based shared state, replicated logs for v2 federation) become possible without runtime changes.
-- **Wire and REST contracts** can speak in terms of "sequenced log read/append," not specifically "space" — any subclass that exposes the primitive participates in REST log paging and SSE streams.
+- **Wire and REST contracts** can speak in terms of "sequenced log read/append," not specifically "space" — any subclass that exposes the primitive participates in REST log paging.
 - **For v1, `$space` remains the workhorse subclass.** The split is a layering, not a behavior change. Existing call lifecycle, snapshot, and replay rules carry forward, just attributed to the right layer.
 
 ---
@@ -72,7 +72,7 @@ Snapshots are also outside the log. A subclass may store snapshots in a parallel
 
 The REST `/api/objects/{id-or-name}/log` endpoint ([rest.md §R7](../protocol/rest.md#r7-log)) uses the host log read operation for any `$sequenced_log` descendant. A subclass may expose an object-visible read wrapper, but the REST path does not require one and the runtime does not special-case `$space`.
 
-The body-level `space?` field on calls ([rest.md §R6](../protocol/rest.md#r6-verb-calls)) accepts any `$sequenced_log` descendant. The field name remains `space` for v1 wire-format stability; `log` is the more precise name and may be aliased in a later vocabulary revision.
+The body-level `space?` field on calls ([rest.md §R6](../protocol/rest.md#r6-verb-calls)) accepts any `$sequenced_log` descendant. The field name remains `space` as the compatibility spelling; `log` is the more precise name and may be aliased in a later vocabulary revision.
 
 SSE event ids (`<log-id>:<seq>`) likewise reference `$sequenced_log` descendants generally. Single-log resume per [rest.md §R8](../protocol/rest.md#r8-stream-sse) works for any subclass.
 
@@ -135,7 +135,7 @@ Subclass dispatch errors (`E_VERBNF`, `E_PERM`, `E_INVARG`, `E_TRANSITION`, etc.
 A reasonable alternative is to expose only an `ATOMIC_INCR(prop)` opcode and let user code manage its own log storage. The reason `$sequenced_log` is a primitive instead:
 
 - **Durability + counter must be coordinated.** A user-managed log appended *after* the increment loses messages on storage failure between steps. Bundling them into a single host primitive closes the seam.
-- **Read paging is wire-contract.** Standardizing it on a class avoids per-subclass schema divergence in REST and SSE.
+- **Read paging is wire-contract.** Standardizing it on a class avoids per-subclass schema divergence in REST.
 - **Storage shape is implementation-private.** Implementations may store the log in a host-specific way (per-DO SQLite table, per-anchor-cluster file, eventually CRDT) without changing semantics. A user-managed log would lock the storage shape into user code.
 
 `ATOMIC_INCR` may still appear as a separate opcode for non-log uses (rate-limit counters, distributed IDs, gensym) but is not how seq allocation works for a log.

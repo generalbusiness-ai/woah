@@ -296,7 +296,7 @@ export type RoomSnapshot = {
     direction?: string;
     dest?: ObjRef | null;
   }>;
-  present_actors: ScopedObjectSummary[];
+  roster: ScopedObjectSummary[];
   contents: ScopedObjectSummary[];
   props?: Record<string, WooValue>;
 };
@@ -467,8 +467,8 @@ export class WooWorld {
   private metricsHook: ((event: MetricEvent) => void) | null = null;
   // O(1) presence lookup. `session_subscribers` is authoritative for live
   // sessions; `subscribers` remains a compatibility actor projection for
-  // catalog state and older worlds. Built lazily; kept in sync from
-  // setPropLocal so writes through the verb path stay coherent.
+  // older persisted worlds only. Built lazily; kept in sync from setPropLocal
+  // so writes through the verb path stay coherent.
   private subscribersIndex = new Map<ObjRef, Set<ObjRef>>();
   private actorPresenceIndex = new Map<ObjRef, Set<ObjRef>>();
   private sessionSubscribersIndex = new Map<ObjRef, Map<string, ObjRef>>();
@@ -1069,6 +1069,9 @@ export class WooWorld {
     let spaces = this.sessionSpacesIndex.get(sessionId);
     if (!spaces) { spaces = new Set(); this.sessionSpacesIndex.set(sessionId, spaces); }
     spaces.add(space);
+    let actorSpaces = this.actorPresenceIndex.get(actor);
+    if (!actorSpaces) { actorSpaces = new Set(); this.actorPresenceIndex.set(actor, actorSpaces); }
+    actorSpaces.add(space);
   }
 
   deleteProp(objRef: ObjRef, name: string): boolean {
@@ -2983,8 +2986,6 @@ export class WooWorld {
 
   hasPresence(actor: ObjRef, space: ObjRef): boolean {
     this.ensurePresenceIndex();
-    const subs = this.subscribersIndex.get(space);
-    if (subs && subs.has(actor)) return true;
     const spaces = this.actorPresenceIndex.get(actor);
     return spaces ? spaces.has(space) : false;
   }
@@ -2995,6 +2996,8 @@ export class WooWorld {
   // Returns `null` when no actor is recorded as present.
   presenceActorsIn(space: ObjRef): ReadonlySet<ObjRef> | null {
     this.ensurePresenceIndex();
+    const sessions = this.sessionSubscribersIndex.get(space);
+    if (sessions) return new Set(sessions.values());
     return this.subscribersIndex.get(space) ?? null;
   }
 
@@ -3354,14 +3357,14 @@ export class WooWorld {
   }
 
   private async includeMovingActorInHere(ctx: CallContext, here: RoomSnapshot, memo: HostOperationMemo): Promise<RoomSnapshot> {
-    if (!ctx.session || here.present_actors.some((actor) => actor.id === ctx.actor)) return here;
+    if (!ctx.session || here.roster.some((actor) => actor.id === ctx.actor)) return here;
     const activeScope = this.activeScopeForSession(ctx.session);
     if (!activeScope) return here;
     const currentHere = await this.primaryRoomForLocation(activeScope, memo);
     if (currentHere !== here.id) return here;
     return {
       ...here,
-      present_actors: [...here.present_actors, this.thinScopedObjectSummary(await this.scopedObjectSummary(ctx.actor, ctx.actor, memo))]
+      roster: [...here.roster, this.thinScopedObjectSummary(await this.scopedObjectSummary(ctx.actor, ctx.actor, memo))]
     };
   }
 
@@ -3435,7 +3438,7 @@ export class WooWorld {
 
       try {
         await this.withTurnRecording(
-          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args },
+          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
           async (activeRecorder) => {
             if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
             await this.withBehaviorSavepoint(async () => {
@@ -3540,7 +3543,7 @@ export class WooWorld {
 
         try {
           await this.withTurnRecording(
-            { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args },
+          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
             async (activeRecorder) => {
               if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
               await this.withBehaviorSavepoint(async () => {
@@ -3743,6 +3746,7 @@ export class WooWorld {
     const contentRefs = (await this.objectContents(room, memo)).filter((item) => !this.isActorForLook(item, presentRefs));
     const exits = await this.exitSummariesForRoom(actor, room, memo);
     const present = await this.scopedObjectSummaries(actor, presentRefs, memo);
+    const roster = presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item));
     const contents = await this.scopedObjectSummaries(actor, contentRefs, memo);
     return {
       id: room,
@@ -3751,7 +3755,7 @@ export class WooWorld {
       features: roomSummary.features,
       description: roomSummary.description,
       exits,
-      present_actors: presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item)),
+      roster,
       contents: contentRefs.map((id) => contents[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item)),
       props: roomSummary.props
     };
@@ -3769,7 +3773,7 @@ export class WooWorld {
     const refs = new Set<ObjRef>([subject]);
     for (const id of await this.objectContents(subject, memo)) refs.add(id);
     if (room) {
-      for (const item of room.present_actors) refs.add(item.id);
+      for (const item of room.roster) refs.add(item.id);
       for (const item of room.contents) refs.add(item.id);
       for (const item of room.exits) refs.add(item.id);
     }
@@ -5502,9 +5506,17 @@ export class WooWorld {
       if (!this.inheritsFrom(space, "$space")) throw wooError("E_TYPE", `${space} is not a space`, space);
     } else {
       try {
-        const subscribers = await this.getPropChecked(ctx.progr, space, "subscribers", ctx.hostMemo);
-        if (Array.isArray(subscribers)) {
-          (observation as Record<string, WooValue>)._audience_override = subscribers.filter((item): item is ObjRef => typeof item === "string");
+        const sessionSubscribers = await this.getPropChecked(ctx.progr, space, "session_subscribers", ctx.hostMemo);
+        if (Array.isArray(sessionSubscribers)) {
+          (observation as Record<string, WooValue>)._audience_override = Array.from(new Set(sessionSubscribers
+            .filter((item): item is Record<string, WooValue> => !!item && typeof item === "object" && !Array.isArray(item))
+            .map((item) => item.actor)
+            .filter((item): item is ObjRef => typeof item === "string")));
+        } else {
+          const subscribers = await this.getPropChecked(ctx.progr, space, "subscribers", ctx.hostMemo);
+          if (Array.isArray(subscribers)) {
+            (observation as Record<string, WooValue>)._audience_override = subscribers.filter((item): item is ObjRef => typeof item === "string");
+          }
         }
       } catch {
         (observation as Record<string, WooValue>)._audience_override = [];
@@ -7500,11 +7512,16 @@ export class WooWorld {
   }
 
   private liveAudienceActors(space: ObjRef): ObjRef[] | undefined {
-    // Existence check is via the property: an absent `subscribers` list is
-    // not the same as an empty subscriber list (the former returns
-    // undefined; broadcast then falls back). The index can't distinguish.
-    const raw = this.propOrNull(space, "subscribers");
-    if (!Array.isArray(raw)) return undefined;
+    // New worlds route live delivery through session_subscribers. Fall back
+    // to the legacy actor projection only for old worlds that do not have the
+    // session-keyed property yet.
+    const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
+    if (Array.isArray(rawSessionSubscribers)) {
+      const sessions = this.presenceSessionsIn(space);
+      return sessions ? Array.from(new Set(sessions.values())) : [];
+    }
+    const rawLegacySubscribers = this.propOrNull(space, "subscribers");
+    if (!Array.isArray(rawLegacySubscribers)) return undefined;
     this.ensurePresenceIndex();
     const subs = this.subscribersIndex.get(space);
     return subs ? Array.from(subs) : [];
@@ -8725,14 +8742,21 @@ export class WooWorld {
   }
 
   private chatPresent(room: ObjRef): ObjRef[] {
-    const present = this.getProp(room, "subscribers");
-    return Array.isArray(present) ? present.filter((item): item is ObjRef => typeof item === "string") : [];
+    return this.contentsOf(room).filter((item) => this.objects.has(item) && this.inheritsFrom(item, "$player"));
   }
 
-  private async chatPresentAsync(room: ObjRef, progr: ObjRef): Promise<ObjRef[]> {
-    const present = await this.propOrNullForActorAsync(progr, room, "subscribers");
-    const subscribers = Array.isArray(present) ? present.filter((item): item is ObjRef => typeof item === "string") : [];
-    return await this.scrubStaleSubscribersForSpace(room, progr, subscribers);
+  private async chatPresentAsync(room: ObjRef, progr: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]> {
+    void progr;
+    const contents = await this.objectContents(room, memo);
+    const actors: ObjRef[] = [];
+    for (const item of contents) {
+      try {
+        if (await this.isDescendantOfCheckedOrFalse(item, "$player", memo)) actors.push(item);
+      } catch {
+        // A stale content ref should not break room presentation.
+      }
+    }
+    return actors;
   }
 
   private async scrubStaleSubscribersForSpace(space: ObjRef, progr: ObjRef, subscribers: ObjRef[], memo?: HostOperationMemo): Promise<ObjRef[]> {
@@ -8959,7 +8983,7 @@ export class WooWorld {
 
   private async composeRoomLook(ctx: CallContext, room: ObjRef): Promise<Record<string, WooValue>> {
     const startedAt = Date.now();
-    const present = await this.chatPresentAsync(room, ctx.progr);
+    const present = await this.chatPresentAsync(room, ctx.progr, ctx.hostMemo);
     const items = (await this.objectContents(room, ctx.hostMemo)).filter((item) => !this.isActorForLook(item, present));
     const remoteSummaries = await this.objectSummariesForLook(ctx, items);
     const contents = await Promise.all(items.map(async (item) => {
@@ -8969,7 +8993,7 @@ export class WooWorld {
       id: room,
       title: await this.titleForLook(ctx, ctx.caller, room),
       description: this.propOrNullForActor(ctx.actor, room, "description"),
-      present_actors: present,
+      roster: await this.rosterRowsForActors(ctx, present) as WooValue,
       contents
     } as unknown as Record<string, WooValue>;
     this.recordMetric({
@@ -9067,7 +9091,7 @@ export class WooWorld {
   }
 
   private async roomWho(ctx: CallContext): Promise<WooValue> {
-    const present = this.chatPresent(ctx.thisObj);
+    const present = await this.chatPresentAsync(ctx.thisObj, ctx.progr, ctx.hostMemo);
     const roster = await this.rosterRowsForActors(ctx, present);
     const presentNames = (await this.collectPropChecked(ctx.progr, present, "name", ctx.hostMemo)).map((name) => valueToText(name));
     ctx.observe({
@@ -9076,12 +9100,11 @@ export class WooWorld {
       actor: ctx.actor,
       to: ctx.actor,
       room: ctx.thisObj,
-      present_actors: present,
       roster,
       text: `Present: ${presentNames.join(", ") || "nobody"}.`,
       ts: Date.now()
     });
-    return present;
+    return roster;
   }
 
   private async embodiedRoomRoster(ctx: CallContext): Promise<WooValue> {
@@ -9195,13 +9218,23 @@ export class WooWorld {
       lines.push(`${row.name.padEnd(22).slice(0, 22)} ${connection.padEnd(9).slice(0, 9)} ${idle.padEnd(6).slice(0, 6)} ${row.location_name}`);
     }
     for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
+    const roster = rows.map((row) => ({
+      id: row.player,
+      name: row.name,
+      presence: row.connected
+        ? row.idle_seconds === null || row.idle_seconds < IDLE_PRESENCE_IDLE_THRESHOLD_SECONDS
+          ? "awake"
+          : "idle"
+        : "sleeping",
+      ...(typeof row.idle_seconds === "number" ? { idle_seconds: row.idle_seconds } : {})
+    }));
     ctx.observe({
       type: "who",
       source: ctx.thisObj,
       actor: ctx.actor,
       to: ctx.actor,
       room: this.objects.get(ctx.actor)?.location ?? null,
-      present_actors: unique,
+      roster,
       text: lines.join("\n"),
       ts: Date.now()
     });
@@ -9990,8 +10023,6 @@ export class WooWorld {
     if (location) {
       add(location, false);
       for (const id of await this.objectContents(location, ctx.hostMemo)) add(id, false);
-      const present = await this.propOrNullForActorAsync(ctx.progr, location, "subscribers", ctx.hostMemo);
-      if (Array.isArray(present)) for (const id of present) add(id, false);
     }
     try {
       for (const id of await this.objectContents(actor, ctx.hostMemo)) add(id, true);
