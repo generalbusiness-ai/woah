@@ -52,6 +52,19 @@ export type RestProtocolHost = {
     args: WooValue[],
     options: DirectCallOptions
   ): Promise<DirectResultFrame | ErrorFrame>;
+  executeTurn?(
+    input: {
+      id?: string;
+      session: Session;
+      actor: ObjRef;
+      scope: ObjRef;
+      target: ObjRef;
+      verb: string;
+      args: WooValue[];
+      route: "direct" | "sequenced";
+      persistence: "durable" | "live";
+    }
+  ): Promise<AppliedFrame | DirectResultFrame | ErrorFrame>;
   broadcastApplied(frame: AppliedFrame): void | Promise<void>;
   broadcastLiveEvents(result: DirectResultFrame): void | Promise<void>;
 };
@@ -229,14 +242,27 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
         const inner = Array.isArray(body.args) ? body.args[0] : null;
         if (!inner || typeof inner !== "object" || Array.isArray(inner)) throw wooError("E_INVARG", "$space:call expects args[0] to be a message map");
         const message = messageFromRestMap(host, request, inner as Record<string, WooValue>, actor, session);
-        const result = await world.call(id, session.id, target, message);
+        const result = await executeRestTurn(host, {
+          id,
+          session,
+          actor: message.actor,
+          scope: target,
+          target: message.target,
+          verb: message.verb,
+          args: message.args ?? [],
+          route: "sequenced",
+          persistence: "durable"
+        });
         if (result.op === "error") return errorProtocol(result.error);
-        await host.broadcastApplied(result);
+        if (result.op === "applied") await host.broadcastApplied(result);
         return jsonProtocol(result);
       }
 
       if (Object.prototype.hasOwnProperty.call(body, "space") && body.space !== null) {
         const space = resolveRestObject(host, String(body.space), session, request);
+        if (body.body && typeof body.body === "object" && !Array.isArray(body.body) && Object.keys(body.body as Record<string, unknown>).length > 0) {
+          throw wooError("E_NOT_IMPLEMENTED", "REST v2 calls do not support message body maps");
+        }
         const message: Message = {
           actor,
           target,
@@ -244,22 +270,39 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
           args,
           body: body.body && typeof body.body === "object" && !Array.isArray(body.body) ? body.body as Record<string, WooValue> : undefined
         };
-        const result = await world.call(id, session.id, space, message);
+        const result = await executeRestTurn(host, {
+          id,
+          session,
+          actor: message.actor,
+          scope: space,
+          target: message.target,
+          verb: message.verb,
+          args: message.args ?? [],
+          route: "sequenced",
+          persistence: "durable"
+        });
         if (result.op === "error") return errorProtocol(result.error);
-        await host.broadcastApplied(result);
+        if (result.op === "applied") await host.broadcastApplied(result);
         return jsonProtocol(result);
       }
 
-      const forceDirect = request.header("x-woo-force-direct") === "1";
-      const direct = host.directCall ?? ((frameId, directActor, directTarget, directVerb, directArgs, directOptions) =>
-        world.directCall(frameId, directActor, directTarget, directVerb, directArgs, directOptions));
-      const result = await direct(id, actor, target, verb, args, {
-        forceDirect,
-        forceReason: "REST X-Woo-Force-Direct",
-        sessionId: session.id,
-        onSessionsEnded: host.onSessionsEnded
+      const persistence = restDirectPersistence(world, target, verb);
+      const result = await executeRestTurn(host, {
+        id,
+        session,
+        actor,
+        scope: target,
+        target,
+        verb,
+        args,
+        route: "direct",
+        persistence
       });
       if (result.op === "error") return errorProtocol(result.error);
+      if (result.op === "applied") {
+        await host.broadcastApplied(result);
+        return jsonProtocol(result);
+      }
       await host.broadcastLiveEvents(result);
       return jsonProtocol({
           result: result.result,
@@ -291,6 +334,31 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
   }
 
   return { handled: false };
+}
+
+async function executeRestTurn(
+  host: RestProtocolHost,
+  input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]
+): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+  if (!host.executeTurn) throw wooError("E_NOT_IMPLEMENTED", "REST verb calls require a v2 turn executor");
+  return await host.executeTurn(input);
+}
+
+function restDirectPersistence(world: WooWorld, target: ObjRef, verb: string): "durable" | "live" {
+  if (["command_plan", "look", "examine", "read", "who", "say", "tell", "emote", "pose"].includes(verb)) return "live";
+  try {
+    const info = world.verbInfo(target, verb);
+    const command = info.arg_spec && typeof info.arg_spec === "object" && !Array.isArray(info.arg_spec)
+      ? (info.arg_spec as Record<string, WooValue>).command
+      : undefined;
+    if (command && typeof command === "object" && !Array.isArray(command)) {
+      const persistence = (command as Record<string, WooValue>).persistence;
+      if (persistence === "live" || persistence === "durable") return persistence;
+    }
+  } catch {
+    // Permission and missing-verb errors are raised by the v2 executor below.
+  }
+  return "durable";
 }
 
 export function objectRoute(pathname: string): { id: string; rest: string[] } | null {

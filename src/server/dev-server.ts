@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
 import { createWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
-import { appliedFromLogEntry, handleRestProtocolRequest, handleWsProtocolFrame, isSpaceLike, parseWsProtocolFrame, type RestProtocolRequest } from "../core/protocol";
+import { appliedFromLogEntry, handleRestProtocolRequest, handleWsProtocolFrame, isSpaceLike, parseWsProtocolFrame, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
 import { normalizeError, type ParkedTaskRun } from "../core/world";
 import {
   directedRecipients,
@@ -36,10 +36,12 @@ import {
   shadowBrowserSessionClaimsValue,
   shadowLiveEventsForTranscript,
   shadowBrowserTransportHello,
+  type ShadowTurnIntentRequest,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 
 // Local dev server only: HTTP authoring endpoints require a session and then
@@ -98,6 +100,7 @@ const server = http.createServer(async (req, res) => {
       authenticateToken,
       requireSession: () => requireRestSession(req),
       state: (actor) => world.state(actor),
+      executeTurn: (input) => devRestV2Turn(input),
       installTap: (actor, body) => installGitHubTap(world, actor, {
         tap: String(body.tap ?? ""),
         catalog: String(body.catalog ?? ""),
@@ -492,6 +495,72 @@ function refreshDevV2SerializedSessionActor(relay: ShadowBrowserRelayShim, actor
     return;
   }
   relay.commit_scope.serialized.objects[index] = record;
+}
+
+async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame> {
+  const token = shadowBrowserSessionBearer(input.session);
+  const browser = v2ShadowBrowser(`node:dev:rest:${input.id ?? randomUUID()}`, token, input.session, input.scope);
+  refreshDevV2RelaySessions(browser.relay);
+  ensureDevV2SerializedSession(browser.relay, input.session);
+  const body: ShadowTurnIntentRequest = {
+    kind: "woo.turn.intent.request.shadow.v1",
+    id: input.id,
+    route: input.route,
+    scope: input.scope,
+    target: input.target,
+    verb: input.verb,
+    args: input.args,
+    persistence: input.persistence
+  };
+  const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
+    v: 2,
+    type: body.kind,
+    id: input.id ?? `${browser.node}:turn:rest`,
+    from: browser.node,
+    actor: input.actor,
+    session: input.session.id,
+    auth: { mode: "session", token },
+    body
+  };
+  const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope));
+  const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+  if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
+  if (reply.body.ok !== true) throw wooError("E_INTERNAL", `v2 REST turn failed: ${reply.body.reason}`);
+  if (reply.body.commit && reply.body.transcript) {
+    world.applyCommittedShadowTranscript(reply.body.transcript);
+  }
+  sendDevV2Fanout(browser, reply);
+  return restFrameFromV2Reply(input.scope, reply.body);
+}
+
+function restFrameFromV2Reply(scope: ObjRef, reply: ShadowTurnExecReply): AppliedFrame | DirectResultFrame {
+  if (reply.ok !== true) throw wooError("E_INTERNAL", "v2 REST turn did not commit");
+  if (reply.commit) {
+    const seq = Number(reply.commit.position.seq);
+    return {
+      op: "applied",
+      id: reply.id,
+      space: reply.commit.position.scope,
+      seq,
+      ts: Date.now(),
+      message: {
+        actor: reply.transcript.call.actor,
+        target: reply.transcript.call.target,
+        verb: reply.transcript.call.verb,
+        args: reply.transcript.call.args
+      },
+      observations: reply.transcript.observations,
+      ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
+    };
+  }
+  return {
+    op: "result",
+    id: reply.id,
+    command: reply.transcript.call,
+    result: reply.outcome.result ?? null,
+    observations: reply.transcript.observations,
+    audience: scope
+  };
 }
 
 async function handleV2ShadowFrame(

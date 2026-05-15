@@ -66,6 +66,18 @@ function makeCfHarness(): Harness {
   };
 }
 
+function fakeCommitScopeNamespace(secret = "cf-test-secret"): DurableObjectNamespace {
+  const states = new Map<string, FakeDurableObjectState>();
+  return new FakeDurableObjectNamespace((name) => {
+    let state = states.get(name);
+    if (!state) {
+      state = new FakeDurableObjectState(name);
+      states.set(name, state);
+    }
+    return new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+  }) as unknown as DurableObjectNamespace;
+}
+
 function message(actor: string, target: string, verb: string, args: WooValue[] = []): Message {
   return { actor, target, verb, args };
 }
@@ -1092,7 +1104,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1161,7 +1174,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1232,7 +1246,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1423,7 +1438,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1527,7 +1543,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
       }),
-      WOO: wooNamespace
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1746,7 +1763,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       WOO_INTERNAL_SECRET: "cf-test-secret",
       WOO_AUTO_INSTALL_CATALOGS: "",
       DIRECTORY: undefined,
-      WOO: undefined
+      WOO: undefined,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
     } as unknown as Env;
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, env);
     (env as any).DIRECTORY = new FakeDurableObjectNamespace((name) => {
