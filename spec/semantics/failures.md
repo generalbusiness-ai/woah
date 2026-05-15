@@ -42,13 +42,13 @@ Each row cites its primary doc. This document only adds context not already cove
 | Receiver crash mid-call | host crashes during behavior | `E_TIMEOUT` to originator | receiver tasks not in `task` table are lost; in-table tasks survive | possibly partial mutations on target | tooling-driven cleanup | [hosts.md §3.4 (5)](../protocol/hosts.md#34-host-rpc-invariants) |
 | Originator crash/hibernation mid-RPC | host disappears while awaiting reply | n/a | uncheckpointed running task is lost; no applied frame returned | local pre-commit state restored by restart | caller retry | [tasks.md §16.3](tasks.md#163-cross-host-rpc) |
 | Network partition | originator can't reach receiver | `E_TIMEOUT` | originator times out; receiver may still apply | receiver may complete | retry; gap recovery covers any duplicate | [hosts.md §3.4 (6)](../protocol/hosts.md#34-host-rpc-invariants) |
-| Duplicate RPC retry | client retries with same `id` | identical `applied` frame | correlation-id cache hit; no new seq | nothing | automatic | [wire.md §17.4](../protocol/wire.md#174-the-applied-push-model) |
+| Duplicate RPC retry | client retries with same `id` | identical `applied` frame | correlation-id cache hit; no new seq | nothing | automatic | [v2-turn-network.md §VTN4](../protocol/v2-turn-network.md#vtn4-message-envelope) |
 | Bytecode version skew | task resumes against incompatible bytecode | `E_VERSION` in applied | task aborts cleanly; never silently runs old code | applied with error | re-issue against current code | [hosts.md §3.4 (4)](../protocol/hosts.md#34-host-rpc-invariants) |
 | Storage write failure (call commit) | persistent storage rejects before the final call commit completes | `op:"error"` w/ `E_STORAGE` | call rejected; **no durable seq advance**; nothing committed to log | nothing | client retry; investigate operator-side | (this doc, §F6) |
 | Storage write failure (during behavior) | storage fails during verb body | `op:"applied"` w/ `$error E_STORAGE` | mutations rolled back; seq stays in log | applied with error | behavior-failure semantics; investigate operator-side | (this doc, §F6) |
 | Quota exceeded | per-task / per-owner / per-space cap hit | `E_QUOTA` in applied | call rejected before behavior runs | nothing | wait, request more quota | [permissions.md §11.7](permissions.md#117-storage-quotas-and-accounting), [tasks.md §16.7](tasks.md#167-fork-and-suspend-caps) |
-| Inbound rate limit | client over `connection_*` budget | `op:"error"` w/ `E_RATE` | excess frames dropped at WS | nothing | client backoff | [wire.md §17.5](../protocol/wire.md#175-backpressure-and-rate-limiting) |
-| Outbound overflow | client can't keep up with applied stream | `op:"error"` w/ `E_OVERFLOW`, dropped count | oldest applied frames dropped from queue | nothing | client uses `space:replay` | [wire.md §17.5](../protocol/wire.md#175-backpressure-and-rate-limiting) |
+| Inbound rate limit | client over `connection_*` budget | `op:"error"` w/ `E_RATE` | excess frames dropped at the transport | nothing | client backoff | [v2-turn-network.md §VTN19.3](../protocol/v2-turn-network.md#vtn193-ping-idle-and-backpressure) |
+| Outbound overflow | client can't keep up with applied stream | transport gap/error | accepted-frame queue overflow | nothing | client reconnects and uses `space:replay` / VTN9 catch-up | [v2-turn-network.md §VTN19.3](../protocol/v2-turn-network.md#vtn193-ping-idle-and-backpressure) |
 | Recycled object reference | call to a now-recycled object | `E_OBJNF` | rejected at routing | nothing | use a different ref; remove stale ref from caller | (this doc, §F7) |
 | Cycle in `task:move` | parent ∈ descendants(task) | `E_RECMOVE` | rejected before mutation | nothing | check first; rebuild path | [tasks DESIGN.md](../../catalogs/tasks/DESIGN.md) |
 | Federation disabled (v1) | non-local origin in single-world build | `E_FED_DISABLED` | rejected at parse/dispatch | nothing | use local refs | [federation.md §24.11](../deferred/federation.md#2411-v1-reservations) |
@@ -150,7 +150,7 @@ The wire layer surfaces these directly:
 - `E_NOSESSION` — client presented a `session:<id>` token that's no longer valid; treat as a fresh login.
 - Authentication-token rejections — surface via `op:"error"` with the underlying err code (`E_PERM` or `E_INVARG`).
 
-Reconnect: the client always uses `space:replay(from, limit)` for gap recovery rather than relying on a separate sync/history protocol frame ([wire.md §17.4](../protocol/wire.md#174-the-applied-push-model)).
+Reconnect: the client uses VTN9 catch-up and, for REST/SSE surfaces, `space:replay(from, limit)` for gap recovery rather than relying on the removed v1 sync/history protocol frame ([v2-turn-network.md §VTN9](../protocol/v2-turn-network.md#vtn9-catch-up-and-applied-frames)).
 
 ---
 

@@ -2471,7 +2471,10 @@ export class PersistentObjectDO {
   }
 
   private async restV2Turn(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
-    if (!this.env.COMMIT_SCOPE) return await this.restV2TurnInProcess(world, input);
+    if (!this.env.COMMIT_SCOPE) {
+      this.emitRestV2InProcessFallback(input, "no_commit_scope");
+      return await this.restV2TurnInProcess(world, input);
+    }
     const node = `${this.durableHostKey()}:rest:${input.id ?? crypto.randomUUID()}`;
     const token = shadowBrowserSessionBearer(input.session);
     if (input.persistence === "live") {
@@ -2562,9 +2565,27 @@ export class PersistentObjectDO {
     if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
     const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
     if (reply.body.ok !== true && reply.body.reason === "commit_rejected" && reply.body.commit?.reason === "incomplete_transcript") {
+      this.emitRestV2InProcessFallback(input, "incomplete_transcript");
       return await this.restV2TurnInProcess(world, input);
     }
     return this.restFrameFromV2Reply(input.scope, reply.body);
+  }
+
+  private emitRestV2InProcessFallback(
+    input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0],
+    reason: "no_commit_scope" | "incomplete_transcript"
+  ): void {
+    const event = {
+      kind: "rest_v2_in_process_fallback" as const,
+      reason,
+      scope: input.scope,
+      target: input.target,
+      verb: input.verb,
+      route: input.route,
+      persistence: input.persistence
+    };
+    this.emitMetric(event, this.durableHostKey());
+    console.warn("woo.rest.v2_in_process_fallback", event);
   }
 
   private async restV2TurnInProcess(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {

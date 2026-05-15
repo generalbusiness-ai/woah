@@ -7,9 +7,9 @@ status: implemented
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
-An HTTP+SSE alternative to the WebSocket wire ([wire.md](wire.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
+An HTTP+SSE alternative to the browser turn network ([v2-turn-network.md](v2-turn-network.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
 
-The two wire formats target the same model. WebSocket is the right shape for clients that maintain long-lived presence and want push observations. REST is the right shape for agents and tooling that operate in iterations, scripts that want a single request-response, and integrations behind HTTP gateways. Either or both may be exposed by an implementation.
+The two protocol surfaces target the same model. The browser turn network is the right shape for clients that maintain long-lived presence and want push observations. REST is the right shape for agents and tooling that operate in iterations, scripts that want a single request-response, and integrations behind HTTP gateways. Either or both may be exposed by an implementation.
 
 ---
 
@@ -150,7 +150,7 @@ The value is V2-encoded ([values.md §V2](../semantics/values.md#v2-canonical-js
 - `403 E_PERM` if the caller can't read.
 - `404 E_PROPNF` if the property doesn't exist.
 
-Property *writes* are not exposed as REST. Mutations go through verb calls (R6). Same discipline as the WebSocket wire: properties are read-only at the API; verbs are how mutation happens.
+Property *writes* are not exposed as REST. Mutations go through verb calls (R6). Same discipline as the browser turn network: properties are read-only at the API; verbs are how mutation happens.
 
 ---
 
@@ -187,7 +187,7 @@ entry receives a pre-sequence `403 E_PERM`.
 
 In both cases:
 - `actor` defaults to `$me`. Wizards may pass a different actor (logged); regular callers presenting an actor different from their session's binding get `403 E_PERM`.
-- `id` is a client-chosen correlation token; idempotent retry returns the same response within the cache window (5 min, per [wire.md §17.4](wire.md#174-the-applied-push-model)).
+- `id` is a client-chosen correlation token; idempotent retry returns the same response within the cache window (5 min, per [v2-turn-network.md §VTN4](v2-turn-network.md#vtn4-message-envelope)).
 - `body` is an optional map carrying additional named arguments per the verb's `arg_spec`.
 
 Movement/entry verbs that return an object-shaped `{ room, here_request: true,
@@ -251,12 +251,12 @@ returns: text/event-stream
 
 Server-sent events. Two SSE event types are emitted:
 
-- **`event: applied`** — a sequenced applied frame. Replayable; carries `seq`. JSON body has the same shape as wire.md `op: "applied"`.
-- **`event: event`** — a live observation from a direct call. Not replayable; no `seq`. JSON body is `{observation: Map}` per wire.md `op: "event"`. Per [events.md §12.6](../semantics/events.md#126-observation-durability-follows-invocation-route), these are best-effort: rate-limited, coalesced, dropped on backpressure.
+- **`event: applied`** — a sequenced applied frame. Replayable; carries `seq`. JSON body has the same public applied-frame shape delivered on the v2 applied-frame plane.
+- **`event: event`** — a live observation from a direct call. Not replayable; no `seq`. JSON body is `{observation: Map}` per the v2 live plane. Per [events.md §12.6](../semantics/events.md#126-observation-durability-follows-invocation-route), these are best-effort: rate-limited, coalesced, dropped on backpressure.
 
 Stream semantics:
 
-- For a `$space`: applied frames + live observations the requesting actor is authorized to see (presence-derived, per [wire.md §17.4](wire.md#174-the-applied-push-model)).
+- For a `$space`: applied frames + live observations the requesting actor is authorized to see (presence-derived, per [v2-turn-network.md §VTN9](v2-turn-network.md#vtn9-catch-up-and-applied-frames) and [§VTN13](v2-turn-network.md#vtn13-live-plane)).
 - For a `$player` (or `$actor`): observations where the object appears as `source` or `target`, including applied frames of spaces the player is observing.
 - For `$me`: the calling actor's full observation feed across all observed spaces.
 
