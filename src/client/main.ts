@@ -34,7 +34,6 @@ type AppState = {
   loginError?: string;
   loginPending?: boolean;
   tab: "chat" | "dubspace" | "pinboard" | "tasks" | "ide";
-  world?: any;
   scopedProjection?: ScopedProjectionStateModel;
   v2Projection?: V2ProjectionMessage;
   scopedObjectSummaries: Record<string, any>;
@@ -58,7 +57,6 @@ type AppState = {
   pinboardNewColor: string;
   pinboardView: PinboardView;
   pinboardViewports: Record<string, PinboardViewportPresence>;
-  compileResult?: any;
 };
 
 type ChatRoomPin = {
@@ -176,7 +174,6 @@ const spaceChatHeightsKey = "woo.spaceChat.heights";
 const spaceChatCollapsedKey = "woo.spaceChat.collapsed";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
-const scopedProjectionEnabled = true;
 const chatHistoryLimit = 80;
 const drumVoices = [
   { id: "kick", label: "Kick" },
@@ -411,8 +408,7 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
 function receiveAppliedFrame(frame: any) {
   ui.ingestAppliedFrame(frame);
   applyScopedMoveResult(frame.result);
-  const needsScopedDeferredLook = scopedProjectionEnabled
-    && frame.result
+  const needsScopedDeferredLook = frame.result
     && typeof frame.result === "object"
     && !Array.isArray(frame.result)
     && frame.result.look_deferred === true
@@ -654,7 +650,7 @@ function clearAccountScopedStorage() {
 }
 
 function rememberSeq(space: string, seq: number) {
-  if (scopedProjectionEnabled && state.scopedProjection) {
+  if (state.scopedProjection) {
     state.scopedProjection = {
       ...state.scopedProjection,
       cursor: advanceProjectionCursor(state.scopedProjection.cursor, space, seq)
@@ -745,32 +741,23 @@ function syncUrlFromCurrentState(mode: "replace" | "push" = "replace") {
 }
 
 function routeForObjectId(objectId: string, summary?: any): AppState["tab"] {
-  if (scopedProjectionEnabled) {
-    if (objectId === activeChatRoom()) return "chat";
-    if (objectId === dubspaceSpace()) return "dubspace";
-    if (objectId === pinboardSpace()) return "pinboard";
-    if (objectId === tasksSpace()) return "tasks";
-    const summaryTab = tabForScopedSummary(objectId, summary ?? scopedObjectSummary(objectId));
-    if (summaryTab) return summaryTab;
-    return "ide";
-  }
   if (objectId === activeChatRoom()) return "chat";
   if (objectId === dubspaceSpace()) return "dubspace";
   if (objectId === pinboardSpace()) return "pinboard";
   if (objectId === tasksSpace()) return "tasks";
-  if (state.world?.objects?.[objectId]) return "ide";
-  return "chat";
+  const summaryTab = tabForScopedSummary(objectId, summary ?? scopedObjectSummary(objectId));
+  if (summaryTab) return summaryTab;
+  return "ide";
 }
 
 function pinRoutedSubject(tab: AppState["tab"], subject: string) {
-  if (!scopedProjectionEnabled || !subject) return;
+  if (!subject) return;
   if (tab === "dubspace" || tab === "pinboard" || tab === "tasks") {
     state.routedSubjects = { ...state.routedSubjects, [tab]: subject };
   }
 }
 
 function routeSubjectForTab(tab: AppState["tab"], routedObject: string, _summary: any): string {
-  if (!scopedProjectionEnabled) return "";
   if (tab === "dubspace" || tab === "pinboard" || tab === "tasks") return routedObject;
   return "";
 }
@@ -786,8 +773,8 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
   };
   const viewTab = tabFromViewHint(route.view);
   if (viewTab) {
-    const summary = scopedProjectionEnabled ? await fetchScopedObjectSummary(route.objectId).catch(() => undefined) : undefined;
-    if (viewTab === "ide" && (scopedProjectionEnabled || state.world?.objects?.[route.objectId])) setSelectedObject(route.objectId, { apply: false });
+    const summary = await fetchScopedObjectSummary(route.objectId).catch(() => undefined);
+    if (viewTab === "ide") setSelectedObject(route.objectId, { apply: false });
     pinRoutedSubject(viewTab, routeSubjectForTab(viewTab, route.objectId, summary));
     setTab(viewTab, { mode, leaveCurrent: true }, () => {
       ensureTabPresence(viewTab);
@@ -795,9 +782,9 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
     return;
   }
 
-  const summary = scopedProjectionEnabled ? await fetchScopedObjectSummary(route.objectId).catch(() => undefined) : undefined;
+  const summary = await fetchScopedObjectSummary(route.objectId).catch(() => undefined);
   const inferredTab = routeForObjectId(route.objectId, summary);
-  if (inferredTab === "ide" && (scopedProjectionEnabled || state.world?.objects?.[route.objectId])) {
+  if (inferredTab === "ide") {
     setSelectedObject(route.objectId, { apply: false });
     setTab(inferredTab, { mode, leaveCurrent: true }, () => {
       ensureTabPresence(inferredTab);
@@ -826,7 +813,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
     syncV2BrowserWorkerScope();
     render();
     requestTasksChatFocusIfPending();
-    if (scopedProjectionEnabled && tab !== "chat" && tab !== "ide") {
+    if (tab !== "chat" && tab !== "ide") {
       void ensureScopedOverlayForTab(tab).then(() => {
         if (state.tab === tab) render();
       }).catch((err) => {
@@ -858,7 +845,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
 
 function setSelectedObject(id: string, options: { apply?: boolean } = {}) {
   state.selectedObject = id;
-  if (scopedProjectionEnabled && id) {
+  if (id) {
     void fetchScopedObjectSummary(id).then(() => {
       if (state.tab === "ide" && state.selectedObject === id) render();
     }).catch((err) => {
@@ -957,7 +944,6 @@ function installCatalogUiIndex(index: any) {
 }
 
 async function ensureScopedOverlayForTab(tab: AppState["tab"], options: { force?: boolean } = {}): Promise<void> {
-  if (!scopedProjectionEnabled) return;
   const subject = overlaySubjectForTab(tab);
   if (!subject) return;
   const key = `${tab}:${subject}`;
@@ -984,7 +970,6 @@ function overlaySubjectForTab(tab: AppState["tab"]): string {
 }
 
 function scopedToolSubject(surface: "dubspace" | "pinboard" | "tasks"): string {
-  if (!scopedProjectionEnabled) return "";
   const className = surface === "dubspace" ? "$dubspace" : surface === "pinboard" ? "$pinboard" : "$task_registry";
   const overlays = state.scopedProjection?.overlays ?? {};
   for (const handle of Object.values(overlays)) {
@@ -1005,7 +990,7 @@ function sessionActiveScope(session: any): string | undefined {
 }
 
 function applyScopedOverlaySnapshot(key: string, snapshot: any) {
-  if (!scopedProjectionEnabled || !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   const overlaySnapshots = { ...(state.scopedProjection.overlaySnapshots ?? {}), [key]: snapshot };
   const subject = typeof snapshot.subject === "string" ? snapshot.subject : "";
@@ -1029,14 +1014,13 @@ function applyScopedOverlaySnapshot(key: string, snapshot: any) {
 }
 
 function applyV2ProjectionMessage(message: V2ProjectionMessage) {
-  if (!scopedProjectionEnabled) return;
   const snapshot = v2ProjectionSnapshotFromMessage(message);
   if (!snapshot) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   if (snapshot.objects.length > 0) {
     // v2 projection objects follow the same catalog-neutral summary contract as
     // `/api/me`. Ingest them into the client projection cache, but keep the
-    // legacy scoped model as the rendering authority until the v2 worker owns
+    // scoped model remains the rendering authority until the v2 worker owns
     // turn submission and committed-frame reduction.
     ui.ingestSnapshot(`v2:${snapshot.scope}:${message.head.seq}`, snapshot.objects);
   }
@@ -1122,7 +1106,7 @@ function scopedObjectSummary(id: string | undefined): any | undefined {
 }
 
 async function fetchScopedObjectSummary(id: string): Promise<any | undefined> {
-  if (!scopedProjectionEnabled || !id) return undefined;
+  if (!id) return undefined;
   const cached = state.scopedObjectSummaries[id] ?? (isCompleteScopedSummary(ui.observe(id)) ? ui.observe(id) : undefined);
   if (cached) return cached;
   const response = await fetch(`/api/objects/${encodeURIComponent(id)}/summary`, { headers: authHeaders() });
@@ -1168,7 +1152,6 @@ const projectionFiller = new ProjectionFieldFiller(
 );
 
 function ensureProjectionFields(subject: string, fields: readonly string[]): void {
-  if (!scopedProjectionEnabled) return;
   projectionFiller.ensure(subject, fields);
 }
 
@@ -1975,7 +1958,7 @@ function receiveLiveEvent(observation: any) {
     receivePinboardViewport(observation);
     return;
   }
-  // Pinboard side effects (window auto-open/close, plus legacy refresh) must fire
+  // Pinboard side effects (window auto-open/close) must fire
   // before the chat-observation branch, because pinboard_* types appear in
   // both observation lists and the chat branch returns early. The board is a
   // focus surface, not a place you travel to (catalogs/pinboard/DESIGN.md);
@@ -1985,7 +1968,6 @@ function receiveLiveEvent(observation: any) {
     const pinboardType = String(observation?.type ?? "");
     const needsNoteRefresh = pinboardObservationNeedsNotesRefresh(pinboardType);
     if (needsNoteRefresh) pinboardNotesRefreshPending = false;
-    const placementChanged = applyPinboardPlacementObservation(observation);
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
     if (String(observation?.actor ?? "") === state.actor) {
       if (observation?.type === "pinboard_entered") {
@@ -1997,7 +1979,6 @@ function receiveLiveEvent(observation: any) {
         setTab("chat", { mode: "push", leaveCurrent: false });
       }
     }
-    if (placementChanged) render();
     if (needsNoteRefresh) refreshPinboardNotes();
     animatePinboardNotes(pinboardAnimations);
   }
@@ -2722,7 +2703,6 @@ function enterChat() {
     applyScopedMoveResult(result);
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result?.look_deferred === true) direct(room, "look", [], applyLookResult, onError);
     if (state.tab === "chat") render();
   };
   if (canSendChatV2()) {
@@ -2779,35 +2759,6 @@ function pinboardObservationNeedsNotesRefresh(type: string) {
     "note_deleted",
     "notes_cleared"
   ].includes(type);
-}
-
-function applyPinboardPlacementObservation(observation: any): boolean {
-  const type = String(observation?.type ?? "");
-  if (type !== "pin_moved" && type !== "pin_resized" && type !== "note_moved" && type !== "note_resized") return false;
-  if (scopedProjectionEnabled) return false;
-  const id = String(observation?.pin ?? observation?.id ?? "");
-  const notes = state.world?.pinboard?.notes;
-  if (!id || !Array.isArray(notes)) return false;
-  const note = notes.find((item: any) => String(item?.id ?? "") === id);
-  if (!note) return false;
-  let changed = false;
-  const assignNumber = (field: "x" | "y" | "w" | "h" | "z") => {
-    const value = Number(observation?.[field]);
-    if (!Number.isFinite(value)) return;
-    if (note[field] === value) return;
-    note[field] = value;
-    changed = true;
-  };
-  if (type === "pin_moved" || type === "note_moved") {
-    assignNumber("x");
-    assignNumber("y");
-    assignNumber("z");
-  }
-  if (type === "pin_resized" || type === "note_resized") {
-    assignNumber("w");
-    assignNumber("h");
-  }
-  return changed;
 }
 
 function receivePinboardViewport(observation: any) {
@@ -2998,7 +2949,7 @@ function receiveChatEvent(observation: any, shouldRender = true) {
 }
 
 function applyScopedMoveResult(result: any) {
-  if (!scopedProjectionEnabled || !result || typeof result !== "object" || Array.isArray(result)) return;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   state.scopedProjection = scopedModelWithMoveResult(state.scopedProjection, result);
   if (typeof result.room === "string" || (result.here && typeof result.here === "object" && !Array.isArray(result.here))) {
@@ -3017,7 +2968,7 @@ function applyScopedProjectionModel() {
 }
 
 function applyScopedChatObservation(observation: any) {
-  if (!scopedProjectionEnabled || !state.scopedProjection?.here || !observation || typeof observation !== "object" || Array.isArray(observation)) return;
+  if (!state.scopedProjection?.here || !observation || typeof observation !== "object" || Array.isArray(observation)) return;
   const room = typeof observation.room === "string" ? observation.room : typeof observation.source === "string" ? observation.source : "";
   if (room && room !== state.scopedProjection.here.id) return;
   const actor = typeof observation.actor === "string" ? observation.actor : "";
@@ -3332,7 +3283,7 @@ function roomTitleBadges(room: string): ChatTitleBadge[] {
 
 function currentRoomContents(room: string): any[] {
   if (!room) return [];
-  if (scopedProjectionEnabled && String(state.scopedProjection?.here?.id ?? "") === room) {
+  if (String(state.scopedProjection?.here?.id ?? "") === room) {
     return arrayOfObjects(state.scopedProjection?.here?.contents)
       .map((item) => {
         const id = String(item?.id ?? "");
@@ -3340,10 +3291,7 @@ function currentRoomContents(room: string): any[] {
       })
       .filter((item): item is any => Boolean(item));
   }
-  const contentIds = Array.isArray(state.world?.objects?.[room]?.contents) ? state.world.objects[room].contents : [];
-  return contentIds
-    .map((id: unknown) => projectedObjectView(String(id)))
-    .filter((item: any): item is any => Boolean(item));
+  return [];
 }
 
 function chatFrameComponentTag(): string | null {
@@ -3374,20 +3322,11 @@ function setCustomElementData<T>(element: HTMLElement & { data?: T }, data: T, a
 }
 
 function clientClassDistance(subject: string, classRef: string): number | false {
-  if (scopedProjectionEnabled) {
-    const object = ui.observe(subject);
-    if (subject === classRef || object?.parent === classRef) return subject === classRef ? 0 : 1;
-    const ancestors = Array.isArray(object?.ancestors) ? object.ancestors.map(String) : [];
-    const index = ancestors.indexOf(classRef);
-    return index >= 0 ? Math.max(1, ancestors.length - index) : false;
-  }
-  let current: string | undefined = subject;
-  for (let distance = 0; current; distance += 1) {
-    if (current === classRef) return distance;
-    const parent: unknown = state.world?.objects?.[current]?.parent;
-    current = typeof parent === "string" && parent !== current ? parent : undefined;
-  }
-  return false;
+  const object = ui.observe(subject);
+  if (subject === classRef || object?.parent === classRef) return subject === classRef ? 0 : 1;
+  const ancestors = Array.isArray(object?.ancestors) ? object.ancestors.map(String) : [];
+  const index = ancestors.indexOf(classRef);
+  return index >= 0 ? Math.max(1, ancestors.length - index) : false;
 }
 
 function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData }) {
@@ -3542,14 +3481,12 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setDubspaceOperators(result);
     setTab("dubspace", { mode: "push", leaveCurrent: false });
     void ensureScopedOverlayForTab("dubspace");
-    if (!scopedProjectionEnabled) void refresh().then(() => requestSpaceChatFocus(target));
     requestSpaceChatFocus(target);
     return;
   }
   if ((verb === "leave" || verb === "out") && target === dubspaceSpace()) {
     setDubspaceOperators(result);
     setTab("chat", { mode: "push", leaveCurrent: false });
-    if (!scopedProjectionEnabled) void refresh();
     focusChatInput();
     return;
   }
@@ -3557,7 +3494,6 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setPinboardPresent(result);
     clearPinboardViewports();
     setTab("chat", { mode: "push", leaveCurrent: false });
-    if (!scopedProjectionEnabled) void refresh();
     focusChatInput();
     return;
   }
@@ -3566,7 +3502,6 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setTab("pinboard", { mode: "push", leaveCurrent: false });
     void ensureScopedOverlayForTab("pinboard", { force: true });
     refreshPinboardNotes({ force: true });
-    if (!scopedProjectionEnabled) void refresh().then(() => requestSpaceChatFocus(target));
     requestSpaceChatFocus(target);
     return;
   }
@@ -3590,24 +3525,19 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     const room = result.room;
     setCurrentChatRoom(room);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result.look_deferred === true) direct(room, "look", [], applyLookResult, chatErrorHandler(room));
-    if (!scopedProjectionEnabled) void refresh();
-    else if (result.look_deferred === true) void refresh().then(() => focusChatInput());
+    if (result.look_deferred === true) void refresh().then(() => focusChatInput());
     else render();
     return;
   }
   if (verb === "enter") {
     if (target) setCurrentChatRoom(target);
     setChatPresent(result);
-    if (!scopedProjectionEnabled && result?.look_deferred === true && target) direct(target, "look", [], applyLookResult, chatErrorHandler(target));
-    if (!scopedProjectionEnabled) void refresh();
-    else if (result?.look_deferred === true) void refresh().then(() => focusChatInput());
+    if (result?.look_deferred === true) void refresh().then(() => focusChatInput());
     else render();
     return;
   }
   if (verb === "take" || verb === "drop") {
-    if (!scopedProjectionEnabled) void refresh();
-    else render();
+    render();
     return;
   }
   void originalText;
@@ -4361,7 +4291,7 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  const activeScope = scopedProjectionEnabled ? sessionActiveScope(state.scopedProjection?.session) : sessionActiveScope(state.world?.session);
+  const activeScope = sessionActiveScope(state.scopedProjection?.session);
   return Boolean(state.actor && board && activeScope === board);
 }
 
@@ -4549,9 +4479,6 @@ function leavePinboard(done?: () => void) {
       setPinboardPresent(result);
       clearPinboardViewports();
       done?.();
-      // Legacy mode still needs a projection refresh after feature-space leave;
-      // scoped mode consumes the move-shaped `here` result above.
-      if (!scopedProjectionEnabled) void refresh();
       void ensureScopedOverlayForTab("pinboard", { force: true });
       if (state.tab === "pinboard") render();
     },
@@ -4620,7 +4547,7 @@ function refreshPinboardNotes(options: { force?: boolean } = {}) {
 }
 
 function applyPinboardNotesCanonical(board: string, result: any[]) {
-  const previous = pinboardModel()?.notes ?? (!scopedProjectionEnabled ? state.world?.pinboard?.notes : []) ?? [];
+  const previous = pinboardModel()?.notes ?? [];
   const notes = normalizePinboardNotes(result, previous);
   const nextIds = new Set<string>();
   const previousIds = new Set((Array.isArray(previous) ? previous : []).map((note: any) => String(note?.id ?? "")).filter(Boolean));
@@ -4651,7 +4578,6 @@ function applyPinboardNotesCanonical(board: string, result: any[]) {
   }
   ui.applyCanonical([{ subject: board, props: { layout } }]);
   ui.applyCanonical(notePatches, { mode: "replace" });
-  if (!scopedProjectionEnabled && state.world?.pinboard) state.world.pinboard.notes = notes;
 }
 
 function pinboardNoteState(note: any): Record<string, unknown> {
