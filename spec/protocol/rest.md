@@ -182,6 +182,14 @@ The natural agent shape is sequenced: `POST /api/objects/$task_42/calls/transiti
 
 For backward compatibility with the wire format, calling `:call` directly on a `$space`-descended object (`POST /api/objects/$taskspace/calls/call` with body `{ args: [{target, verb, args}] }`) is also sequenced — equivalent to setting `space` on the body of the inner target. The body-level `space` form is preferred in agent code.
 
+REST calls do not bypass the same verb authority checks used by WebSocket and
+v2 turn-network clients. If a catalog verb requires presence in the enclosing
+space, the presented session's actor MUST enter or otherwise acquire that
+presence before the REST call. For example, taskspace mutating verbs such as
+`:create_task`, `:add_subtask`, and `:set_status` are sequenced through
+`$taskspace` and require taskspace presence; a client that calls them before
+entry receives a pre-sequence `403 E_PERM`.
+
 In both cases:
 - `actor` defaults to `$me`. Wizards may pass a different actor (logged); regular callers presenting an actor different from their session's binding get `403 E_PERM`.
 - `id` is a client-chosen correlation token; idempotent retry returns the same response within the cache window (5 min, per [wire.md §17.4](wire.md#174-the-applied-push-model)).
