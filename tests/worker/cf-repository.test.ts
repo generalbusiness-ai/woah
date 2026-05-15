@@ -273,6 +273,39 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("rejects the removed legacy WebSocket endpoint", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-legacy-ws-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/ws", {
+        headers: { upgrade: "websocket" }
+      }));
+
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "E_NOTSUPPORTED" }
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("rejects v2 WebSocket upgrades without the required subprotocol", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");

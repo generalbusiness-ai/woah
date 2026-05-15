@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
 import { createWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
-import { appliedFromLogEntry, handleRestProtocolRequest, handleWsProtocolFrame, isSpaceLike, parseWsProtocolFrame, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
+import { appliedFromLogEntry, handleRestProtocolRequest, isSpaceLike, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
 import { normalizeError, type ParkedTaskRun } from "../core/world";
 import {
   directedRecipients,
@@ -70,7 +70,6 @@ let streamCounter = 1;
 const port = Number(process.env.PORT ?? 5173);
 const hmrPort = Number(process.env.VITE_HMR_PORT ?? port + 10_000);
 const MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024;
-const MAX_WS_FRAME_BYTES = 256 * 1024;
 
 const vite = await createViteServer({
   server: { middlewareMode: true, hmr: { port: hmrPort } },
@@ -199,7 +198,6 @@ const server = http.createServer(async (req, res) => {
   vite.middlewares(req, res);
 });
 
-const wss = new WebSocketServer({ noServer: true });
 const v2wss = new WebSocketServer({
   noServer: true,
   handleProtocols: (protocols) => protocols.has("woo-v2.turn-network.json") ? "woo-v2.turn-network.json" : false
@@ -207,70 +205,12 @@ const v2wss = new WebSocketServer({
 
 server.on("upgrade", (req, socket, head) => {
   const pathname = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`).pathname;
-  const target = pathname === "/ws" ? wss : pathname === "/v2/turn-network/ws" ? v2wss : null;
+  const target = pathname === "/v2/turn-network/ws" ? v2wss : null;
   if (!target) {
     socket.destroy();
     return;
   }
   target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
-});
-
-wss.on("connection", (ws) => {
-  const socketId = `ws-${socketCounter++}`;
-  ws.on("message", (raw) => {
-    if (rawDataSize(raw) > MAX_WS_FRAME_BYTES) {
-      ws.close(1009, "frame too large");
-      return;
-    }
-    const frame = parseWsProtocolFrame(String(raw));
-    if (frame.op === "error") {
-      ws.send(JSON.stringify(frame));
-      return;
-    }
-    void handleWsProtocolFrame(ws, frame, {
-      defaultAuthToken: "guest:dev",
-      authenticate: (token) => authenticateToken(token),
-      attach: (_connection, session) => {
-        const previous = sockets.get(ws);
-        if (previous) world.detachSocket(previous.sessionId, previous.socketId);
-        world.attachSocket(session.id, socketId);
-        sockets.set(ws, { sessionId: session.id, actor: session.actor, socketId });
-      },
-      session: () => attachedSession(ws),
-      send: (_connection, frameValue) => ws.send(JSON.stringify(frameValue)),
-      call: (frameId, session, space, message) => {
-        world.touchSessionInput(session.sessionId);
-        return world.call(frameId, session.sessionId, space, message);
-      },
-      command: (frameId, session, space, text) => {
-        world.touchSessionInput(session.sessionId);
-        return world.command(frameId, session.sessionId, space, text);
-      },
-      direct: (frameId, session, target, verb, args) => {
-        world.touchSessionInput(session.sessionId);
-        return world.directCall(frameId, session.actor, target, verb, args, { sessionId: session.sessionId });
-      },
-      replay: (frameId, session, space, fromValue, limitValue) => {
-        // Replay is recovery, not user input — does NOT touch lastInputAt.
-        if (!world.hasPresence(session.actor, space)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
-        const from = Math.max(1, Number(fromValue ?? 1));
-        const limit = Math.min(Math.max(1, Number(limitValue ?? 100)), 500);
-        return { op: "replay", id: frameId, space, from, entries: world.replay(space, from, limit) };
-      },
-      deliverInput: (session, input) => {
-        world.touchSessionInput(session.sessionId);
-        return world.deliverInput(session.actor, input);
-      },
-      broadcastApplied: (frameValue, originator) => broadcastApplied(frameValue, originator),
-      broadcastTaskResult,
-      broadcastLiveEvents: (result, originator) => broadcastLiveEvents(result, null, originator)
-    });
-  });
-  ws.on("close", () => {
-    const session = sockets.get(ws);
-    if (session) world.detachSocket(session.sessionId, session.socketId);
-    sockets.delete(ws);
-  });
 });
 
 v2wss.on("connection", (ws, req) => {
@@ -391,14 +331,6 @@ function ensureLocaldevWizardApiKey(): void {
   console.log(`  Password: ${secret}`);
   console.log("  Actor: $wiz");
   console.log("");
-}
-
-function attachedSession(ws: WebSocket): AttachedSocket | null {
-  const session = sockets.get(ws);
-  if (!session) return null;
-  if (world.sessionAlive(session.sessionId)) return session;
-  expireAttachedSessions([session.sessionId]);
-  return null;
 }
 
 function v2ShadowBrowser(node: string, token: string, session: Session, scope: ObjRef): ReturnType<typeof createShadowBrowserClient> {

@@ -1,13 +1,16 @@
 ---
 date: 2026-04-30
-status: implemented
+status: legacy
 ---
 
-# Wire protocol
+# Legacy v1 Wire protocol
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
-The JSON message format on the WebSocket between client and player host. Baseline scope: enough frames to drive a sequenced message dispatch loop, direct live interactions, durable task input, and their observations.
+The removed v1 JSON message format that used to run on `/ws` between client
+and player host. New clients use the v2 turn network
+([v2-turn-network.md](v2-turn-network.md)); this document remains as a
+historical reference for old frame shapes and migration tests.
 
 Browser bootstrap details (transient host installation, host-to-host RPC) are in [browser-host.md](browser-host.md). Cross-world federation frames are in [../deferred/federation.md §24](../deferred/federation.md#24-federation).
 

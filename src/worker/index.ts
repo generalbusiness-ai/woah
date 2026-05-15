@@ -1,6 +1,6 @@
 // Worker entry — splits routing between Durable Objects and Workers Assets.
 //
-// Global API, /healthz, /ws, /v2/turn-network/ws → world/gateway DO.
+// Global API, /healthz, /v2/turn-network/ws      → world/gateway DO.
 // Object REST calls                             → world/gateway DO v2 executor.
 // Object REST reads                             → Directory-resolved host DO.
 // Everything else                                → env.ASSETS.fetch (the bundled SPA from ./dist).
