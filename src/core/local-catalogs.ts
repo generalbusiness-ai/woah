@@ -116,6 +116,7 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION = "2026-05-13-chat-v2-
 const LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION = "2026-05-14-chat-room-roster";
 const LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION = "2026-05-14-pinboard-room-roster";
 const LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION = "2026-05-14-dubspace-room-roster";
+const LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION = "2026-05-15-rest-live-persistence-metadata";
 // Repair pass: deployed satellites recorded
 // LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION as applied while the
 // reconciler was still emitting the pre-rename `commit_policy` field, so the
@@ -189,6 +190,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, only: "pinboard" },
   { id: LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, only: "dubspace" },
+  { id: LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" }
 ];
 
@@ -434,6 +436,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   run(LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
+  run(LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
   run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   return covered;
 }

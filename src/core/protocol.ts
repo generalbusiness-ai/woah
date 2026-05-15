@@ -327,7 +327,6 @@ async function executeRestTurn(
 }
 
 function restDirectPersistence(world: WooWorld, target: ObjRef, verb: string): "durable" | "live" {
-  if (["command_plan", "look", "examine", "read", "who", "say", "tell", "emote", "pose"].includes(verb)) return "live";
   try {
     const info = world.verbInfo(target, verb);
     const command = info.arg_spec && typeof info.arg_spec === "object" && !Array.isArray(info.arg_spec)
@@ -340,6 +339,9 @@ function restDirectPersistence(world: WooWorld, target: ObjRef, verb: string): "
   } catch {
     // Permission and missing-verb errors are raised by the v2 executor below.
   }
+  // REST direct calls default durable because the runtime cannot infer whether
+  // an arbitrary catalog verb mutates state. Read-only/live verbs declare the
+  // exception in arg_spec.command.persistence.
   return "durable";
 }
 

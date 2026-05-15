@@ -64,7 +64,7 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "this", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "this", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
           "source": "verb :read() rxd { let text = this:text(); observe({ type: \"note_read\", actor: actor, note: this, text: text, ts: now() }); return text; }"
         },

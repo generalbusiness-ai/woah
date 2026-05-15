@@ -167,6 +167,12 @@ The body-level `space` field determines whether the call is sequenced — this i
 - **`space` is set** → sequenced through that `$space`. The runtime constructs the message `{ actor, target: id-or-name, verb, args }` and dispatches it through `space:call`. Returns `{ space, seq, message, observations, ts, result }`.
 - **`space` is null** → direct dispatch on the target. Allowed only for verbs annotated `direct_callable: true` (§R12). For verbs without this annotation, returns `403 E_DIRECT_DENIED`. Returns `{ result, observations }`.
 
+Direct REST calls run through the same v2 turn executor as browser clients.
+Their persistence class is catalog metadata: verbs that are read-only or
+live-observation-only declare `arg_spec.command.persistence: "live"`; verbs
+without that declaration are treated as durable so arbitrary catalog mutations
+are committed instead of silently simulated.
+
 The natural agent shape is sequenced: `POST /api/objects/$task_42/calls/transition` with body `{ args: ["design-review"], space: "$task_registry" }`. The same call without `space` is rejected because `:transition` is not direct-callable. This makes "mutate through a space" the obvious path, not something callers must remember to wrap.
 
 For backward compatibility with the wire format, calling `:call` directly on a `$space`-descended object (`POST /api/objects/$task_registry/calls/call` with body `{ args: [{target, verb, args}] }`) is also sequenced — equivalent to setting `space` on the body of the inner target. The body-level `space` form is preferred in agent code.
