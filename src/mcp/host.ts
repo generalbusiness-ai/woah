@@ -701,11 +701,18 @@ export class McpHost {
       // through a module-scoped slot; the registered native handler reads it.
       const previous = CURRENT_WAIT_SESSION_ID;
       CURRENT_WAIT_SESSION_ID = sessionId;
+      // tool.enclosingSpace was resolved at listTools time and is only a hint;
+      // it becomes stale when the actor (or the tool's host object) moves
+      // between rooms. Re-resolve from the live object graph so each invocation
+      // routes to the actor's current scope — otherwise an actor verb dispatched
+      // after a cross-scope move (e.g. `ways` after `southeast`) hits the old
+      // scope's stale serialized world and returns missing_state.
+      const liveEnclosing = this.enclosingSpaceFor(tool.object) ?? tool.enclosingSpace;
       try {
         const result = this.isMcpControlTool(actor, tool)
           ? await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId })
           : this.dispatchHooks.direct
-          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, tool.enclosingSpace)
+          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing)
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
         // Self observations are returned in the call result; do NOT route them
@@ -721,7 +728,11 @@ export class McpHost {
         CURRENT_WAIT_SESSION_ID = previous;
       }
     }
-    const space = tool.enclosingSpace ?? this.enclosingSpaceFor(tool.object);
+    // Same staleness reasoning as the direct-call path above: re-resolve the
+    // enclosing space from the live graph at invocation time so a sequenced
+    // call after a cross-scope move (e.g. `take` from a new room) routes to
+    // the actor's current scope rather than the registration-time hint.
+    const space = this.enclosingSpaceFor(tool.object) ?? tool.enclosingSpace;
     if (!space) throw wooError("E_INVARG", `verb ${tool.object}:${tool.verb} has no enclosing space for sequenced dispatch`);
     const message = { actor, target: tool.object, verb: tool.verb, args };
     const frame = this.dispatchHooks.call

@@ -309,6 +309,29 @@ describe("shadow browser node shim", () => {
     if (token) expect(browser.relay.session_auth.has(token)).toBe(false);
   });
 
+  it("treats session token replacement as idempotent on reused relays", async () => {
+    const { browser, actor } = await browserForScope("the_pinboard", "guest:browser-token-reconnect");
+    const session = browser.session;
+    if (!session) throw new Error("expected browser session");
+    const localBearer = shadowBrowserSessionBearer({ id: session, actor });
+    setShadowBrowserSessionToken(browser, "wire:browser-token-reconnect");
+    expect(browser.relay.session_auth.has(localBearer)).toBe(false);
+    expect(browser.relay.session_auth.has("wire:browser-token-reconnect")).toBe(true);
+
+    const reconnect = createShadowBrowserNode({
+      node: "browser-token-reconnect",
+      scope: "the_pinboard",
+      actor,
+      session,
+      relay: browser.relay
+    });
+    setShadowBrowserSessionToken(reconnect, "wire:browser-token-reconnect");
+
+    expect(reconnect.session_token).toBe("wire:browser-token-reconnect");
+    expect(browser.relay.session_auth.has(localBearer)).toBe(false);
+    expect(browser.relay.session_auth.has("wire:browser-token-reconnect")).toBe(true);
+  });
+
   it("refreshes a reused relay executor before planning a new session turn", async () => {
     const anchor = createWorld();
     const firstSession = anchor.auth("guest:browser-reused-executor-a");

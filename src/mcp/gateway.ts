@@ -51,6 +51,7 @@ export type McpV2OpenBody = {
   session: string;
   actor: ObjRef;
   sessions: ReturnType<WooWorld["exportSessions"]>;
+  session_objects: ReturnType<WooWorld["exportObjects"]>;
   serialized: ReturnType<WooWorld["exportWorld"]>;
 };
 
@@ -390,13 +391,15 @@ export class McpGateway {
       this.v2Scopes.set(scope, client);
     }
     if (!client.openedSessions.has(entry.woo.id)) {
+      const sessions = this.world.exportSessions();
       const opened = await hooks.open(scope, {
         scope,
         node: this.v2NodeFor(entry),
         token: entry.v2Token,
         session: entry.woo.id,
         actor: entry.woo.actor,
-        sessions: this.world.exportSessions(),
+        sessions,
+        session_objects: this.world.exportObjects(sessions.map((session) => session.actor)),
         serialized: this.world.exportWorld()
       });
       if (opened.head) client.relay.commit_scope.head = opened.head;

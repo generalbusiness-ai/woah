@@ -35,6 +35,88 @@ import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 
+// CommitScopeDO persists the full SerializedWorld snapshot in a single
+// `v2_commit_scope_meta.serialized` column. Cloudflare Durable Object SQL
+// rejects individual values larger than ~2 MiB with SQLITE_TOOBIG, and a
+// world with the bundled catalogs installed crosses that boundary. Storage
+// is gzipped + base64-encoded so it stays comfortably under the limit; the
+// `GZB1:` prefix is the format marker and load detects legacy uncompressed
+// JSON rows (which start with `{`) so existing scopes upgrade without a
+// migration step.
+const COMPRESSED_BLOB_PREFIX = "GZB1:";
+
+async function encodeSerializedWorld(serialized: SerializedWorld): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(serialized));
+  // Drive CompressionStream directly through its writable/readable interface;
+  // wrapping in `new Response(...)` is convenient but fails in tests that stub
+  // the global Response constructor (e.g. cf-repository's WebSocket upgrade
+  // test), and we never need a Response object here.
+  const cs = new CompressionStream("gzip");
+  const writer = cs.writable.getWriter();
+  const writeDone = writer.write(bytes).then(() => writer.close());
+  const chunks = await readAllChunks(cs.readable);
+  await writeDone;
+  return COMPRESSED_BLOB_PREFIX + base64FromBytes(concatBytes(chunks));
+}
+
+async function decodeSerializedWorld(blob: string): Promise<SerializedWorld> {
+  if (!blob.startsWith(COMPRESSED_BLOB_PREFIX)) {
+    // Legacy uncompressed JSON row from before the gzip change. Parse as-is
+    // so existing CommitScopeDOs (e.g. the_chatroom in production) keep
+    // loading until their next write rewrites the row in compressed form.
+    return JSON.parse(blob) as SerializedWorld;
+  }
+  const compressed = bytesFromBase64(blob.slice(COMPRESSED_BLOB_PREFIX.length));
+  const ds = new DecompressionStream("gzip");
+  const writer = ds.writable.getWriter();
+  // Cast to BufferSource: lib.dom TS types narrow Uint8Array's backing buffer
+  // to `ArrayBuffer` and Node's TextEncoder returns the wider `ArrayBufferLike`.
+  const writeDone = writer.write(compressed as unknown as BufferSource).then(() => writer.close());
+  const chunks = await readAllChunks(ds.readable);
+  await writeDone;
+  return JSON.parse(new TextDecoder().decode(concatBytes(chunks))) as SerializedWorld;
+}
+
+async function readAllChunks(readable: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
+  const reader = readable.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(value);
+  }
+  return chunks;
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+function base64FromBytes(bytes: Uint8Array): string {
+  // btoa needs a binary string; String.fromCharCode(...arr) stack-overflows on
+  // payloads larger than ~100 KB, so chunk the conversion.
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function bytesFromBase64(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
   private snapshotLoaded = false;
@@ -192,7 +274,7 @@ export class CommitScopeDO {
 
   private async relayFor(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
     if (!this.snapshotLoaded) {
-      this.relay = this.loadSnapshot(input);
+      this.relay = await this.loadSnapshot(input);
       this.snapshotLoaded = true;
     }
     if (!this.relay) {
@@ -383,11 +465,11 @@ export class CommitScopeDO {
     return String(scope ?? (this.state.id as { name?: string }).name ?? "commit_scope");
   }
 
-  private loadSnapshot(input: CommitScopeBaseRequest): ShadowBrowserRelayShim | null {
-    return this.loadRowSnapshot(input);
+  private async loadSnapshot(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim | null> {
+    return await this.loadRowSnapshot(input);
   }
 
-  private loadRowSnapshot(input: CommitScopeBaseRequest): ShadowBrowserRelayShim | null {
+  private async loadRowSnapshot(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim | null> {
     const rows = sqlRows<CommitScopeMetaRow>(this.state.storage.sql.exec(
       "SELECT scope, relay_node, serialized, head, idempotency_window_ms FROM v2_commit_scope_meta WHERE id = 'current'"
     ));
@@ -396,7 +478,7 @@ export class CommitScopeDO {
     const relay = createShadowBrowserRelayShim({
       node: meta.relay_node,
       scope: meta.scope as ObjRef,
-      serialized: JSON.parse(meta.serialized) as SerializedWorld,
+      serialized: await decodeSerializedWorld(meta.serialized),
       idempotency_window_ms: Number(meta.idempotency_window_ms)
     });
     relay.commit_scope.head = JSON.parse(meta.head) as ShadowScopeHead;
@@ -423,8 +505,11 @@ export class CommitScopeDO {
     // Full saves are reserved for cold initialization and one-time migration
     // from the legacy blob table. Hot envelopes use saveEnvelopeDelta instead.
     const now = Date.now();
+    // Gzip-encode the serialized world before opening the storage transaction,
+    // since CompressionStream is async and transactionSync requires sync work.
+    const serializedBlob = await encodeSerializedWorld(relay.commit_scope.serialized);
     this.state.storage.transactionSync(() => {
-      this.saveMeta(relay, now);
+      this.saveMeta(relay, now, serializedBlob);
       this.saveAcceptedFrames(relay, now);
       this.saveTranscriptTail(relay, now);
       this.saveSeenKeys(relay);
@@ -444,6 +529,15 @@ export class CommitScopeDO {
     const seenAt = relay.recently_seen.get(receipt.idempotency_key);
     if (seenAt === undefined) return;
     const now = Date.now();
+    // The delta path only rewrites the meta row when a turn actually committed.
+    // Skip the (async, ~100 ms on 2 MiB) gzip pass when the reply was rejected
+    // or carries no commit, so write-amplification stays proportional to real
+    // commits rather than every envelope retry.
+    const body = reply?.body;
+    const willSaveMeta = body?.ok === true && Boolean(body.commit) && Boolean(body.transcript);
+    const serializedBlob = willSaveMeta
+      ? await encodeSerializedWorld(relay.commit_scope.serialized)
+      : null;
     this.state.storage.transactionSync(() => {
       this.saveSeenKey(receipt.idempotency_key, seenAt);
       this.pruneSeenAndReplies(relay, now);
@@ -451,9 +545,8 @@ export class CommitScopeDO {
         this.saveRecentReply(receipt.idempotency_key, reply, now);
         this.pruneRecentReplies();
       }
-      const body = reply?.body;
-      if (body?.ok === true && body.commit && body.transcript) {
-        this.saveMeta(relay, now);
+      if (willSaveMeta && serializedBlob !== null && body && body.ok === true && body.commit && body.transcript) {
+        this.saveMeta(relay, now, serializedBlob);
         this.saveAcceptedFrame(body.commit, now);
         this.saveTranscript(body.transcript, now);
         this.pruneAcceptedFrames(relay);
@@ -462,12 +555,12 @@ export class CommitScopeDO {
     });
   }
 
-  private saveMeta(relay: ShadowBrowserRelayShim, now: number): void {
+  private saveMeta(relay: ShadowBrowserRelayShim, now: number, serializedBlob: string): void {
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?)",
       relay.commit_scope.scope,
       relay.node,
-      JSON.stringify(relay.commit_scope.serialized),
+      serializedBlob,
       JSON.stringify(relay.commit_scope.head),
       relay.idempotency_window_ms,
       now

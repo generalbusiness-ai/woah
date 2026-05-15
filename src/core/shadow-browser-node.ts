@@ -481,9 +481,12 @@ export function setShadowBrowserSessionToken(browser: ShadowBrowserNode, token: 
   // Wire handshakes authenticate with the caller's bearer token, while the
   // shadow shim starts with a local dev token. Replace the registered bearer so
   // subsequent envelope auth has exactly one valid token for this session.
+  // Reused relays can already hold the wire token after a previous open; keep
+  // this operation idempotent so reconnects do not depend on a local bearer
+  // entry being rebuilt first.
   if (!browser.session_token) throw new Error("shadow browser session auth token is required");
   if (browser.session_token === token) return;
-  const claims = browser.relay.session_auth.get(browser.session_token);
+  const claims = browser.relay.session_auth.get(browser.session_token) ?? browser.relay.session_auth.get(token);
   if (!claims) throw new Error(`shadow browser session auth token is unknown: ${browser.session_token} session=${browser.session ?? "none"}`);
   browser.relay.session_auth.delete(browser.session_token);
   browser.relay.session_auth.set(token, claims);

@@ -53,6 +53,26 @@ describe("v2 MCP e2e", () => {
         observations: expect.arrayContaining([expect.objectContaining({ type: "said" })])
       });
 
+      const aliceActor = world.sessions.get(alice)?.actor;
+      const bobActor = world.sessions.get(bob)?.actor;
+      expect(aliceActor).toBeTruthy();
+      expect(bobActor).toBeTruthy();
+      const nativeCalls = [
+        { object: "the_chatroom", verb: "look", args: [] },
+        { object: aliceActor!, verb: "who_all", args: [] },
+        { object: aliceActor!, verb: "help", args: ["look"] },
+        { object: aliceActor!, verb: "examine_detailed", args: ["the_chatroom"] },
+        { object: aliceActor!, verb: "join_player", args: [world.object(bobActor!).name] }
+      ];
+      for (let i = 0; i < nativeCalls.length; i += 1) {
+        const call = nativeCalls[i];
+        const result = await mcp(gateway, alice, 30 + i, "tools/call", {
+          name: "woo_call",
+          arguments: call
+        });
+        expect(result.result.isError, `${call.object}:${call.verb} failed: ${JSON.stringify(result.result.structuredContent)}`).not.toBe(true);
+      }
+
       const charlie = await initializeMcp(gateway, "guest:v2-mcp-charlie", 20);
       const entered = await mcp(gateway, charlie, 21, "tools/call", {
         name: "woo_call",
@@ -69,6 +89,60 @@ describe("v2 MCP e2e", () => {
       expect(afterWait).toBe(beforeWait);
     } finally {
       scopeState.close();
+    }
+  });
+
+  it("keeps MCP session auth usable after a cross-scope room move", async () => {
+    const world = createWorld();
+    const scopeStates = new Map<string, FakeDurableObjectState>();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopes = new Map<string, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
+      }
+    });
+
+    try {
+      const alice = await initializeMcp(gateway, "guest:v2-mcp-cross-scope", 1);
+      const aliceActor = world.sessions.get(alice)!.actor;
+      const sessions = world.exportSessions();
+      await postCommitScope(scopeFor("the_deck"), env, "the_deck", "/v2/open", {
+        scope: "the_deck",
+        node: `mcp:${alice}`,
+        token: `mcp-v2:${alice}:${aliceActor}`,
+        session: alice,
+        actor: aliceActor,
+        sessions,
+        session_objects: world.exportObjects(sessions.map((session) => session.actor)),
+        serialized: world.exportWorld()
+      });
+      const move = await mcp(gateway, alice, 3, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+      });
+      expect(move.result.isError).not.toBe(true);
+      expect(world.activeScopeForSession(alice)).toBe("the_deck");
+
+      const look = await mcp(gateway, alice, 4, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_deck", verb: "look", args: [] }
+      });
+      expect(look.result.isError, JSON.stringify(look.result.structuredContent)).not.toBe(true);
+      expect(world.object(world.sessions.get(alice)!.actor).location).toBe("the_deck");
+    } finally {
+      for (const state of scopeStates.values()) state.close();
     }
   });
 });

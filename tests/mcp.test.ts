@@ -507,6 +507,55 @@ describe("McpHost", () => {
     ]);
   });
 
+  it("re-resolves enclosing space at invocation time so cross-scope moves route correctly", async () => {
+    // The MCP tool cache records `enclosingSpace` at tools/list time. When an
+    // actor moves to another room before the next invocation, the cached hint
+    // is stale and would otherwise route the call to the actor's old scope —
+    // the bug behind `missing_state` on `${A}__ways` after `southeast` in the
+    // production walkthrough. The host re-resolves the enclosing space from
+    // the live object graph on every invocation so the call lands on the
+    // current scope without the client having to refresh tools/list first.
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-enclosing-space-restore");
+    const passedScopes: Array<{ verb: string; scope: ObjRef | null | undefined }> = [];
+    const host = new McpHost(world, {
+      direct: async (_sessionId, actor, target, verb, _args, scope) => {
+        passedScopes.push({ verb, scope });
+        return { op: "result", result: null, observations: [], audience: null };
+      },
+      call: async (_sessionId, actor, space, message) => {
+        passedScopes.push({ verb: message.verb, scope: space });
+        return { op: "applied", space, seq: 1, ts: 0, message, observations: [] };
+      }
+    });
+    host.bindSession(session.id, session.actor);
+
+    // Build two side-by-side $room objects and a cached tool whose stored
+    // enclosingSpace points at the actor's starting room. Then physically
+    // move the actor and reissue the call — the second dispatch should hit
+    // the second room rather than the cached one.
+    world.createObject({ id: "host_test_room_a", name: "Room A", parent: "$room", owner: "$wiz" });
+    world.createObject({ id: "host_test_room_b", name: "Room B", parent: "$room", owner: "$wiz" });
+    world.object(session.actor).location = "host_test_room_a";
+
+    const directTool: McpTool = {
+      name: `${session.actor}__ways`,
+      object: session.actor,
+      verb: "ways",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      enclosingSpace: "host_test_room_a"
+    };
+    await host.invokeTool(session.actor, session.id, directTool, []);
+    expect(passedScopes[passedScopes.length - 1].scope).toBe("host_test_room_a");
+
+    world.object(session.actor).location = "host_test_room_b";
+    await host.invokeTool(session.actor, session.id, directTool, []);
+    expect(passedScopes[passedScopes.length - 1].scope).toBe("host_test_room_b");
+  });
+
   it("focus upgrades visible room contents from obvious affordances to explicit tools", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-focused-room-content");
