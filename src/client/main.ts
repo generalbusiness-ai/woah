@@ -439,7 +439,7 @@ function receiveAppliedFrame(frame: any) {
   const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
   if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
   if (!scopedProjectionEnabled) {
-    // Legacy /api/state mode still folds confirmed placement observations
+    // Non-scoped compatibility mode still folds confirmed placement observations
     // into its pinboard note array. Scoped mode gets the same fields through
     // the framework reducer above.
     for (const observation of observations) {
@@ -1307,9 +1307,9 @@ function overlaySnapshotProjectionObjects(snapshot: any): any[] {
   });
 }
 
-// Legacy `/api/state` refresh used only when the page is explicitly booted in
-// state-projection mode. Scoped mode applies frame observations locally and
-// hydrates through `/api/me` or overlay snapshots.
+// Non-scoped compatibility refresh used only when the page is explicitly
+// booted in state-projection mode. Scoped mode applies frame observations
+// locally and hydrates through `/api/me` or overlay snapshots.
 const REFRESH_DEBOUNCE_MS = 750;
 let refreshDebounceTimer: number | null = null;
 let refreshDebouncePending = false;
@@ -1667,7 +1667,7 @@ function pinboardProjectedNote(id: string, layoutEntry: any, legacyNotes: any[] 
   if (!projected && !previous && Object.keys(entry).length === 0) return undefined;
   // Priority is deliberate: observation-reduced catalogState is the current
   // UI model; projection props carry static readable note fields; the optional
-  // legacy cache is used only by `/api/state` mode; board layout fills
+  // non-scoped cache is used only by compatibility mode; board layout fills
   // placement defaults.
   return {
     id,
@@ -1863,7 +1863,7 @@ function tasksSpace() {
 
 function chatRoom() {
   // Migration note: new selectors should make the scoped branch primary.
-  // The `state.world` branch is the temporary `/api/state` compatibility tail.
+  // The `state.world` branch is the remaining non-scoped compatibility tail.
   if (scopedProjectionEnabled) {
     const here = String(state.scopedProjection?.here?.id ?? "");
     if (here) return here;
@@ -4820,7 +4820,7 @@ function setPinboardPresent(result: any) {
     if (!presentActors.has(actor)) removePinboardViewport(actor);
   }
   if (scopedProjectionEnabled) return;
-  // Compatibility write for the legacy `/api/state` pinboard branch. The
+  // Compatibility write for the non-scoped pinboard branch. The
   // projection write above is the scoped-model update.
   if (!state.world?.pinboard) return;
   state.world.pinboard.present = presentIds;

@@ -2626,7 +2626,7 @@ describe("local catalogs", () => {
       expect((staring.result as Record<string, unknown>).description).toMatch(/staring off into space for 1 minute/);
     }
 
-    // /api/state-equivalent reads MUST NOT reset idle. Simulating the projection:
+    // Projection reads MUST NOT reset idle. Simulating the read:
     void world.state(actor);
     expect(world.actorLastInputAt(actor)).toBe(session.lastInputAt);
 

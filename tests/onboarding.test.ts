@@ -23,7 +23,6 @@ function host(world: WooWorld, session: Session | null = null): RestProtocolHost
     },
     authenticateToken: (token) => world.auth(token),
     onAuthenticated: () => undefined,
-    state: (actor) => world.state(actor),
     broadcastApplied: async () => undefined,
     broadcastLiveEvents: async () => undefined
   };

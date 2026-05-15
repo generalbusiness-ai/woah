@@ -30,9 +30,6 @@ async function apiMe(world: WooWorld, session: Session) {
     world,
     requireSession: () => session,
     authenticateToken: () => session,
-    state: () => {
-      throw new Error("/api/me must not call full world state");
-    },
     broadcastApplied: async () => undefined,
     broadcastLiveEvents: async () => undefined
   });
@@ -50,9 +47,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/catalogs/ui must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -69,9 +63,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/catalogs/ui must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -87,9 +78,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/objects/:id/summary must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -103,38 +91,6 @@ describe("scoped client projection", () => {
     });
     expect((result.body as any).ancestors).toContain("$room");
     expect((result.body as any).props).toBeDefined();
-  });
-
-  it("gates the legacy full world state endpoint to wizard sessions", async () => {
-    const world = createWorld();
-    const guest = world.auth("guest:legacy-state-denied");
-    const denied = await handleRestProtocolRequest(get("/api/state"), {
-      world,
-      requireSession: () => guest,
-      authenticateToken: () => guest,
-      state: () => {
-        throw new Error("non-wizard /api/state must fail before reading state");
-      },
-      broadcastApplied: async () => undefined,
-      broadcastLiveEvents: async () => undefined
-    });
-    expect(denied.handled).toBe(true);
-    if (!denied.handled || "raw" in denied) throw new Error("unexpected raw protocol result");
-    expect(denied.status).toBe(403);
-
-    const wizard = world.createSessionForActor("$wiz", "bearer");
-    const allowed = await handleRestProtocolRequest(get("/api/state"), {
-      world,
-      requireSession: () => wizard,
-      authenticateToken: () => wizard,
-      state: (actor) => world.state(actor),
-      broadcastApplied: async () => undefined,
-      broadcastLiveEvents: async () => undefined
-    });
-    expect(allowed.handled).toBe(true);
-    if (!allowed.handled || "raw" in allowed) throw new Error("unexpected raw protocol result");
-    expect(allowed.status).toBe(200);
-    expect((allowed.body as any).objects).toBeDefined();
   });
 
   it("accepts a scoped replay cursor on websocket auth but requires hydrate in v1", async () => {
@@ -428,9 +384,6 @@ describe("scoped client projection", () => {
       world,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("overlay snapshots must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
@@ -623,9 +576,6 @@ describe("scoped client projection", () => {
       world: home,
       requireSession: () => session,
       authenticateToken: () => session,
-      state: () => {
-        throw new Error("/api/me must not call full world state");
-      },
       broadcastApplied: async () => undefined,
       broadcastLiveEvents: async () => undefined
     });
