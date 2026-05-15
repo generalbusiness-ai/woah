@@ -72,7 +72,7 @@ Snapshots are also outside the log. A subclass may store snapshots in a parallel
 
 The REST `/api/objects/{id-or-name}/log` endpoint ([rest.md §R7](../protocol/rest.md#r7-log)) uses the host log read operation for any `$sequenced_log` descendant. A subclass may expose an object-visible read wrapper, but the REST path does not require one and the runtime does not special-case `$space`.
 
-The body-level `space?` field on calls ([rest.md §R6](../protocol/rest.md#r6-verb-calls)) accepts any `$sequenced_log` descendant. The field name remains `space` for v1 wire-format stability; `log` is the more precise name and may be aliased in a later vocabulary revision.
+The body-level `space?` field on calls ([rest.md §R6](../protocol/rest.md#r6-verb-calls)) accepts any `$sequenced_log` descendant. The field name remains `space` as the compatibility spelling; `log` is the more precise name and may be aliased in a later vocabulary revision.
 
 SSE event ids (`<log-id>:<seq>`) likewise reference `$sequenced_log` descendants generally. Single-log resume per [rest.md §R8](../protocol/rest.md#r8-stream-sse) works for any subclass.
 

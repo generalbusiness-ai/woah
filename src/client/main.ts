@@ -438,18 +438,6 @@ function receiveAppliedFrame(frame: any) {
   const pinboardAnimations = capturePinboardAnimations(observations);
   const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
   if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
-  if (!scopedProjectionEnabled) {
-    // Non-scoped compatibility mode still folds confirmed placement observations
-    // into its pinboard note array. Scoped mode gets the same fields through
-    // the framework reducer above.
-    for (const observation of observations) {
-      const type = String(observation?.type ?? "");
-      if (type === "pin_moved" || type === "pin_resized" || type === "note_moved" || type === "note_resized") {
-        const pinId = String(observation?.pin ?? observation?.id ?? "");
-        if (pinId) applyPinboardPlacementObservation(observation);
-      }
-    }
-  }
   forgetLiveControls(observations);
   for (const observation of observations) applyDubspaceObservationSideEffects(observation);
   if (observations.some((observation: any) => isDubspaceStateObservation(observation))) syncDubspaceProjectionEffects();
@@ -457,7 +445,6 @@ function receiveAppliedFrame(frame: any) {
   state.observations.unshift({ seq: frame.seq, space: frame.space, observations, message: frame.message });
   trimObservations();
   rememberSeq(frame.space, frame.seq);
-  scheduleLegacyStateRefresh();
   render();
   if (needsScopedDeferredLook) void refresh().then(() => focusChatInput());
   if (needsPinboardNotesRefresh) refreshPinboardNotes();
@@ -911,8 +898,6 @@ async function refreshScopedProjectionSmoke() {
 }
 
 async function refreshScopedProjection() {
-  refreshDebounceTimer = null;
-  refreshDebouncePending = false;
   const startedRevision = scopedProjectionLocalRevision;
   try {
     const [meResponse, catalogs] = await Promise.all([
@@ -1305,23 +1290,6 @@ function overlaySnapshotProjectionObjects(snapshot: any): any[] {
       }
     };
   });
-}
-
-// Non-scoped compatibility refresh used only when the page is explicitly
-// booted in state-projection mode. Scoped mode applies frame observations
-// locally and hydrates through `/api/me` or overlay snapshots.
-const REFRESH_DEBOUNCE_MS = 750;
-let refreshDebounceTimer: number | null = null;
-let refreshDebouncePending = false;
-function scheduleLegacyStateRefresh() {
-  if (scopedProjectionEnabled) return;
-  if (refreshDebounceTimer != null) return;
-  refreshDebouncePending = true;
-  refreshDebounceTimer = window.setTimeout(() => {
-    refreshDebounceTimer = null;
-    if (!refreshDebouncePending) return;
-    void refresh();
-  }, REFRESH_DEBOUNCE_MS);
 }
 
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -2037,17 +2005,6 @@ function actorPresentInSpace(space: string) {
   return actorPresenceList(actor).includes(space);
 }
 
-function shouldAutoEnterDefaultChatRoom() {
-  if (scopedProjectionEnabled) return false;
-  const location = sessionActiveScope(state.world?.session);
-  if (typeof location === "string" && location && location !== "$nowhere") {
-    const room = chatRoom();
-    const subscribers = state.world?.objects?.[room]?.props?.subscribers;
-    return Boolean(room && location === room && state.actor && Array.isArray(subscribers) && !subscribers.includes(state.actor));
-  }
-  return actorPresenceList(state.actor ?? "").length === 0;
-}
-
 function ensureSpacePresence(space: string, onReady: () => void, onError?: (error: any) => void) {
   if (!space || !canSendV2Browser()) {
     onReady();
@@ -2231,7 +2188,6 @@ function receiveLiveEvent(observation: any) {
         setTab("chat", { mode: "push", leaveCurrent: false });
       }
     }
-    scheduleLegacyStateRefresh();
     if (placementChanged) render();
     if (needsNoteRefresh) refreshPinboardNotes();
     animatePinboardNotes(pinboardAnimations);
@@ -2250,7 +2206,6 @@ function receiveLiveEvent(observation: any) {
         }
       }
     }
-    scheduleLegacyStateRefresh();
   }
   if (isChatObservation(observation)) {
     receiveChatEvent(observation);
@@ -2258,7 +2213,6 @@ function receiveLiveEvent(observation: any) {
   }
   if (isDubspaceStateObservation(observation)) {
     syncDubspaceProjectionEffects(observation);
-    if (!scopedProjectionEnabled && String(observation?.type ?? "") === "control_changed") scheduleLegacyStateRefresh();
     return;
   }
   if (observation?.type === "gesture_progress") {
