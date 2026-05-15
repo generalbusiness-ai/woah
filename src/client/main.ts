@@ -1296,27 +1296,7 @@ function authHeaders(extra: Record<string, string> = {}): Record<string, string>
   return state.session ? { ...extra, authorization: `Session ${state.session}` } : extra;
 }
 
-function adaptWorld(raw: any) {
-  const world = raw && typeof raw === "object" ? { ...raw } : {};
-  world.objects = raw?.objects ?? {};
-  world.catalogs = raw?.catalogs ?? { installed: [] };
-  world.dubspaceMeta = buildDubspaceMeta(world);
-  world.dubspace = projectDubspace(world, world.dubspaceMeta);
-  world.pinboardMeta = buildPinboardMeta(world);
-  world.pinboard = projectPinboard(world, world.pinboardMeta);
-  world.chatMeta = buildChatMeta(world);
-  world.chat = projectChat(world, world.chatMeta);
-  return world;
-}
-
-function installedCatalog(world: any, name: string): any | undefined {
-  const installed = Array.isArray(world?.catalogs?.installed) ? world.catalogs.installed : [];
-  const record = installed.find((item: any) => item?.alias === name || item?.catalog === name);
-  return record ?? (world?.scoped ? bundledCatalogRecord(name) : undefined);
-}
-
 function activeInstalledCatalog(name: string): any | undefined {
-  if (!scopedProjectionEnabled) return installedCatalog(state.world, name);
   const installed = Array.isArray(state.scopedProjection?.catalogs?.catalogs)
     ? state.scopedProjection.catalogs.catalogs
     : Array.isArray(catalogUiCache?.catalogs)
@@ -1349,17 +1329,6 @@ function bundledCatalogRecord(name: string): any | undefined {
   };
 }
 
-function installedCatalogSeed(world: any, catalogName: string, fallback: string): string | undefined {
-  const catalog = installedCatalog(world, catalogName);
-  if (!catalog) return undefined;
-  const seeds = catalog?.seeds && typeof catalog.seeds === "object" && !Array.isArray(catalog.seeds) ? catalog.seeds : {};
-  const values = Object.values(seeds).filter((item): item is string => typeof item === "string");
-  // Transitional scoped renderer fallback: bundled demo catalogs have one
-  // canonical tool seed each. Real multi-instance selection belongs in frame
-  // resolution/route state, not this compatibility metadata path.
-  return values.find((id) => id === fallback) ?? values[0] ?? (fallback || undefined);
-}
-
 function activeInstalledCatalogSeed(catalogName: string, fallback: string): string {
   const catalog = activeInstalledCatalog(catalogName);
   if (!catalog) return fallback || "";
@@ -1371,25 +1340,6 @@ function activeInstalledCatalogSeed(catalogName: string, fallback: string): stri
 function catalogClass(catalog: any, localName: string): string | undefined {
   const value = catalog?.objects?.[localName];
   return typeof value === "string" ? value : undefined;
-}
-
-function objectsByParent(world: any, parent: string | undefined, anchor?: string | null): string[] {
-  if (!parent) return [];
-  return Object.entries(world.objects ?? {})
-    .filter(([, obj]: [string, any]) => obj?.parent === parent && (anchor === undefined || obj?.anchor === anchor || obj?.location === anchor))
-    .map(([id]) => id)
-    .sort((a, b) => objectName(world, a).localeCompare(objectName(world, b)) || a.localeCompare(b));
-}
-
-function firstObjectByParent(world: any, parent: string | undefined): string | undefined {
-  return objectsByParent(world, parent)[0];
-}
-
-function objectView(world: any, id: string | undefined) {
-  if (!id) return null;
-  const obj = world.objects?.[id];
-  if (!obj) return null;
-  return { id, name: obj.name ?? id, owner: obj.owner, parent: obj.parent, location: obj.location, props: obj.props ?? {} };
 }
 
 function projectedObjectView(id: string | undefined) {
@@ -1405,70 +1355,34 @@ function projectedObjectView(id: string | undefined) {
       props: { ...(projected.props ?? {}) }
     };
   }
-  if (scopedProjectionEnabled) {
-    const here = state.scopedProjection?.here;
-    if (String(here?.id ?? "") === id) {
-      const summary = roomSnapshotAsObjectSummary(here);
-      return {
-        id,
-        name: summary.name ?? id,
-        owner: summary.owner,
-        parent: summary.parent,
-        location: summary.location,
-        props: { ...(summary.props ?? {}) }
-      };
-    }
-    const summary = state.scopedObjectSummaries[id];
-    if (summary) {
-      return {
-        id,
-        name: summary.name ?? id,
-        owner: summary.owner,
-        parent: summary.parent,
-        location: summary.location,
-        props: { ...(summary.props ?? {}) }
-      };
-    }
-    return null;
+  const here = state.scopedProjection?.here;
+  if (String(here?.id ?? "") === id) {
+    const summary = roomSnapshotAsObjectSummary(here);
+    return {
+      id,
+      name: summary.name ?? id,
+      owner: summary.owner,
+      parent: summary.parent,
+      location: summary.location,
+      props: { ...(summary.props ?? {}) }
+    };
   }
-  const fallback = state.world?.dubspace?.[id] ?? objectView(state.world, id);
-  if (!fallback) return null;
-  return {
-    id,
-    name: fallback.name ?? id,
-    owner: fallback.owner,
-    parent: fallback.parent,
-    location: fallback.location,
-    props: { ...(fallback.props ?? {}) }
-  };
+  const summary = state.scopedObjectSummaries[id];
+  if (summary) {
+    return {
+      id,
+      name: summary.name ?? id,
+      owner: summary.owner,
+      parent: summary.parent,
+      location: summary.location,
+      props: { ...(summary.props ?? {}) }
+    };
+  }
+  return null;
 }
 
-function objectName(world: any, id: string) {
-  if (scopedProjectionEnabled) return String(projectedObjectView(id)?.name ?? id);
-  return String(world.objects?.[id]?.name ?? id);
-}
-
-function buildDubspaceMeta(world: any) {
-  const catalog = installedCatalog(world, "dubspace");
-  const space = firstObjectByParent(world, catalogClass(catalog, "$dubspace")) ?? installedCatalogSeed(world, "dubspace", bundledToolSeeds.dubspace);
-  const byClass = (localName: string) => {
-    const ids = objectsByParent(world, catalogClass(catalog, localName), space);
-    return ids.length > 0 ? ids : bundledSeedRefs(dubspaceManifest, localName);
-  };
-  return {
-    space,
-    slots: byClass("$loop_slot"),
-    channel: byClass("$channel")[0],
-    filter: byClass("$filter")[0],
-    delay: byClass("$delay")[0],
-    drum: byClass("$drum_loop")[0],
-    scene: byClass("$scene")[0]
-  };
-}
-
-function projectDubspace(world: any, meta: any) {
-  const ids = dubspaceObjectIds(meta);
-  return Object.fromEntries(ids.map((id: string) => [id, objectView(world, id)]).filter(([, view]) => view));
+function objectName(id: string) {
+  return String(projectedObjectView(id)?.name ?? id);
 }
 
 function dubspaceObjectIds(meta: any): string[] {
@@ -1481,7 +1395,6 @@ function projectedDubspace(meta: any = dubspaceMeta()) {
 }
 
 function dubspaceMeta(): any {
-  if (!scopedProjectionEnabled) return state.world?.dubspaceMeta ?? {};
   const space = dubspaceSpace();
   const objects = overlaySnapshotObjects(dubspaceOverlaySnapshot());
   const byClass = (localName: string) => {
@@ -1516,31 +1429,7 @@ function isCatalogObjectSummary(item: any, catalogName: string, localName: strin
   return item?.parent === classRef || item?.parent === localName || ancestors.includes(classRef) || ancestors.includes(localName);
 }
 
-function buildPinboardMeta(world: any) {
-  const catalog = installedCatalog(world, "pinboard");
-  return {
-    board: firstObjectByParent(world, catalogClass(catalog, "$pinboard")) ?? installedCatalogSeed(world, "pinboard", bundledToolSeeds.pinboard)
-  };
-}
-
-function projectPinboard(world: any, meta: any) {
-  const board = objectView(world, meta.board);
-  const props = board?.props ?? {};
-  const legacyNotes = Array.isArray(props.notes) && props.notes.length > 0 ? props.notes : undefined;
-  const notes = legacyNotes ?? pinboardNotesFromContents(world, meta.board, props.layout);
-  const palette = Array.isArray(props.palette) ? props.palette.map(String) : ["yellow", "blue", "green", "pink", "white"];
-  state.pinboardNewColor = normalizePinboardStickyColor(state.pinboardNewColor, palette);
-  return {
-    board,
-    notes: normalizePinboardNotes(notes, state.world?.pinboard?.notes),
-    present: Array.isArray(props.subscribers) ? props.subscribers.map(String) : [],
-    palette,
-    viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : { w: 960, h: 560 }
-  };
-}
-
 function pinboardModel(): PinboardRenderModel | undefined {
-  if (!scopedProjectionEnabled) return state.world?.pinboard;
   const boardId = pinboardSpace();
   if (!boardId) return undefined;
   const projected = ui.observe(boardId);
@@ -1688,33 +1577,6 @@ function pinboardNoteStateFromSummary(item: any, layoutEntry: any): Record<strin
   return out;
 }
 
-function pinboardNotesFromContents(world: any, boardId: string | undefined, layoutValue: any) {
-  const contents = Array.isArray(world.objects?.[boardId ?? ""]?.contents) ? world.objects[boardId ?? ""].contents : [];
-  const layout = layoutValue && typeof layoutValue === "object" && !Array.isArray(layoutValue) ? layoutValue : {};
-  // pinboard:enter moves the active session to the board, so contents includes guests as
-  // well as pins. Server-side `:list_notes` filters by `isa(pin, $note)`;
-  // we approximate that here with a parent check on the bundled $pin class.
-  return contents.filter((id: string) => world.objects?.[id]?.parent === "$pin").map((id: string) => {
-    const obj = world.objects?.[id] ?? {};
-    const props = obj.props ?? {};
-    const entry = layout[id] && typeof layout[id] === "object" && !Array.isArray(layout[id]) ? layout[id] : {};
-    return {
-      id,
-      name: obj.name ?? id,
-      text: props.text,
-      color: props.color,
-      writers: props.writers,
-      owner: obj.owner,
-      author: obj.owner,
-      x: entry.x,
-      y: entry.y,
-      w: entry.w,
-      h: entry.h,
-      z: entry.z
-    };
-  });
-}
-
 function pinboardNotesHaveMissingText(notes: any[]) {
   return (Array.isArray(notes) ? notes : []).some((note) => {
     const text = note?.text;
@@ -1766,83 +1628,42 @@ function normalizePinboardNotes(notes: any[], previousNotes: any[] = []) {
   });
 }
 
-function buildChatMeta(world: any) {
-  const chat = installedCatalog(world, "chat");
-  const demo = installedCatalog(world, "demoworld");
-  const rooms = objectsByParent(world, catalogClass(chat, "$chatroom"));
-  const pinned = chatRoomPin && chatRoomPin.expiresAt > Date.now() && rooms.includes(chatRoomPin.room) ? chatRoomPin.room : undefined;
-  if (chatRoomPin && !pinned) chatRoomPin = null;
-  const sessionScope = sessionActiveScope(world?.session);
-  const activeScope = typeof sessionScope === "string" && rooms.includes(sessionScope) ? sessionScope : undefined;
-  const occupied = rooms.find((id) => Array.isArray(world.objects?.[id]?.props?.subscribers) && world.objects[id].props.subscribers.includes(state.actor));
-  const seededEntry = Object.values(demo?.seeds ?? {}).find((id) => typeof id === "string" && rooms.includes(id));
-  const defaultRoom = seededEntry ?? rooms[0];
-  const current = pinned ?? activeScope ?? occupied ?? seededEntry ?? rooms[0];
-  return { room: current, rooms, defaultRoom };
-}
-
-function projectChat(world: any, meta: any) {
-  const room = objectView(world, meta.room);
-  const rooms = Array.isArray(meta.rooms) ? meta.rooms.map((id: string) => objectView(world, id)).filter(Boolean) : [];
-  return {
-    room: room ? { id: room.id, name: room.name, description: room.props.description ?? "" } : null,
-    rooms,
-    present: Array.isArray(room?.props?.subscribers) ? room.props.subscribers : []
-  };
-}
-
 function defaultSelectedObject() {
-  if (scopedProjectionEnabled) return dubspaceMeta().delay ?? state.scopedProjection?.here?.id ?? state.actor ?? "";
-  return dubspaceMeta().delay ?? Object.keys(state.world?.objects ?? {}).sort()[0] ?? "";
+  return dubspaceMeta().delay ?? state.scopedProjection?.here?.id ?? state.actor ?? "";
 }
 
 function dubspaceSpace() {
-  if (scopedProjectionEnabled) {
-    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-    if (route?.view === "dubspace" && route.objectId) return route.objectId;
-    if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
-    const scoped = scopedToolSubject("dubspace");
-    return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
-  }
-  return String(state.world?.dubspaceMeta?.space ?? "");
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if (route?.view === "dubspace" && route.objectId) return route.objectId;
+  if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
+  const scoped = scopedToolSubject("dubspace");
+  return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
 }
 
 function pinboardSpace() {
-  if (scopedProjectionEnabled) {
-    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-    if (route?.view === "pinboard" && route.objectId) return route.objectId;
-    if (state.routedSubjects.pinboard) return state.routedSubjects.pinboard;
-    const scoped = scopedToolSubject("pinboard");
-    return scoped || activeInstalledCatalogSeed("pinboard", bundledToolSeeds.pinboard);
-  }
-  return String(state.world?.pinboardMeta?.board ?? "");
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if (route?.view === "pinboard" && route.objectId) return route.objectId;
+  if (state.routedSubjects.pinboard) return state.routedSubjects.pinboard;
+  const scoped = scopedToolSubject("pinboard");
+  return scoped || activeInstalledCatalogSeed("pinboard", bundledToolSeeds.pinboard);
 }
 
 function tasksSpace() {
-  if (scopedProjectionEnabled) {
-    const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-    if ((route?.view === "tasks" || route?.view === "kanban") && route.objectId) return route.objectId;
-    if (state.routedSubjects.tasks) return state.routedSubjects.tasks;
-    const scoped = scopedToolSubject("tasks");
-    return scoped || activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
-  }
-  return activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if ((route?.view === "tasks" || route?.view === "kanban") && route.objectId) return route.objectId;
+  if (state.routedSubjects.tasks) return state.routedSubjects.tasks;
+  const scoped = scopedToolSubject("tasks");
+  return scoped || activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
 }
 
 function chatRoom() {
-  // Migration note: new selectors should make the scoped branch primary.
-  // The `state.world` branch is the remaining non-scoped compatibility tail.
-  if (scopedProjectionEnabled) {
-    const here = String(state.scopedProjection?.here?.id ?? "");
-    if (here) return here;
-    return String(state.scopedProjection?.session?.current_location ?? "");
-  }
-  return String(state.world?.chatMeta?.room ?? "");
+  const here = String(state.scopedProjection?.here?.id ?? "");
+  if (here) return here;
+  return String(state.scopedProjection?.session?.current_location ?? "");
 }
 
 function defaultChatRoom() {
-  if (scopedProjectionEnabled) return chatRoom();
-  return String(state.world?.chatMeta?.defaultRoom ?? "");
+  return chatRoom();
 }
 
 function activeChatRoom() {
@@ -1982,13 +1803,9 @@ function callWithError(space: string, target: string, verb: string, args: unknow
 }
 
 function actorPresenceList(actor: string): string[] {
-  if (scopedProjectionEnabled && actor === state.actor) {
+  if (actor === state.actor) {
     const locations = state.scopedProjection?.session?.all_locations;
     return Array.isArray(locations) ? locations.filter((id): id is string => typeof id === "string") : [];
-  }
-  if (actor === state.actor) {
-    const locations = state.world?.session?.all_locations;
-    if (Array.isArray(locations)) return locations.filter((id): id is string => typeof id === "string");
   }
   return [];
 }
@@ -1996,12 +1813,8 @@ function actorPresenceList(actor: string): string[] {
 function actorPresentInSpace(space: string) {
   const actor = state.actor;
   if (!actor) return false;
-  if (scopedProjectionEnabled) {
-    if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
-    if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
-    return actorPresenceList(actor).includes(space);
-  }
-  if (sessionActiveScope(state.world?.session) === space) return true;
+  if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
+  if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
   return actorPresenceList(actor).includes(space);
 }
 
@@ -2105,10 +1918,6 @@ function dubspaceOptimisticProps(target: string, props: Record<string, unknown>,
 function patchDubspaceProjectionProps(target: string, props: Record<string, unknown>) {
   if (!target || Object.keys(props).length === 0) return;
   ui.applyCanonical([{ subject: target, props }]);
-  if (!scopedProjectionEnabled) {
-    if (state.world?.objects?.[target]?.props) Object.assign(state.world.objects[target].props, props);
-    if (state.world?.dubspace?.[target]?.props) Object.assign(state.world.dubspace[target].props, props);
-  }
 }
 
 function callDubspaceMutation(verb: string, args: unknown[], options?: ProjectionCallOptions) {
@@ -2605,7 +2414,7 @@ function mountToolSpaceChat(element: HTMLElement, space: string) {
     existing.woo = createChatWooContext(space, chatLineActorRefs(lines));
     setCustomElementData(existing, {
       space,
-      spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
+      spaceName: projectedObjectView(space)?.name ?? objectName(space),
       lines,
       draft: spaceChatDraft(space),
       height: Math.round(spaceChatHeight(space)),
@@ -3412,7 +3221,7 @@ function setSpaceChatCollapsed(collapsed: boolean) {
     panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
     setCustomElementData(panel, {
       space,
-      spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
+      spaceName: projectedObjectView(space)?.name ?? objectName(space),
       lines,
       draft: spaceChatDraft(space),
       height: Math.round(spaceChatHeight(space)),
@@ -3464,10 +3273,6 @@ function setChatPresent(result: any) {
 
 function setCurrentChatRoom(room: string) {
   if (room) chatRoomPin = { room, expiresAt: Date.now() + 2_500 };
-  if (!scopedProjectionEnabled && state.world?.chatMeta) {
-    state.world.chatMeta.room = room;
-    state.world.chat = projectChat(state.world, state.world.chatMeta);
-  }
   if (state.actor && !state.chatPresent.includes(state.actor)) state.chatPresent = [...state.chatPresent, state.actor];
   syncUrlFromCurrentState("replace");
 }
@@ -3822,8 +3627,7 @@ function applyLookResult(result: any) {
 
 function actorLabel(id: string | undefined) {
   if (!id) return "unknown";
-  if (scopedProjectionEnabled) return String(projectedObjectView(id)?.name ?? id);
-  return String(state.world?.objects?.[id]?.name ?? id);
+  return String(projectedObjectView(id)?.name ?? id);
 }
 
 function renderPinboard() {
@@ -4186,7 +3990,7 @@ function bindSpaceChatPanel(panel: HTMLElement & WooElement & { data?: SpaceChat
   panel.woo = createChatWooContext(space, chatLineActorRefs(lines));
   setCustomElementData(panel, {
     space,
-    spaceName: projectedObjectView(space)?.name ?? objectName(state.world, space),
+    spaceName: projectedObjectView(space)?.name ?? objectName(space),
     lines,
     draft: spaceChatDraft(space),
     height: Math.round(spaceChatHeight(space)),
@@ -4773,13 +4577,6 @@ function setPinboardPresent(result: any) {
   for (const actor of Object.keys(state.pinboardViewports)) {
     if (!presentActors.has(actor)) removePinboardViewport(actor);
   }
-  if (scopedProjectionEnabled) return;
-  // Compatibility write for the non-scoped pinboard branch. The
-  // projection write above is the scoped-model update.
-  if (!state.world?.pinboard) return;
-  state.world.pinboard.present = presentIds;
-  const board = state.world.pinboard.board;
-  if (board?.props) board.props.subscribers = state.world.pinboard.present;
 }
 
 function pinboardCall(verb: string, args: any[] = [], options?: ProjectionCallOptions) {
@@ -4876,36 +4673,6 @@ function pinboardPalette(palette: any): string[] {
 }
 
 function renderIde() {
-  if (scopedProjectionEnabled) return renderScopedIde();
-  const objects = Object.keys(state.world?.objects ?? {}).sort();
-  const installTarget = state.selectedObject || defaultSelectedObject();
-  const scopedSmoke = scopedProjectionSmokeEnabled
-    ? `<div class="card"><h2>Scoped projection smoke</h2><pre>${escapeHtml(JSON.stringify(state.scopedProjectionSmoke ?? {}, null, 2))}</pre></div>`
-    : "";
-  return `
-    <section class="toolbar">
-      <h1>Inspector</h1>
-      <select data-object-select>${objects.map((id) => `<option value="${escapeHtml(id)}" ${id === state.selectedObject ? "selected" : ""}>${escapeHtml(id)}</option>`).join("")}</select>
-      <button data-refresh-object>Inspect</button>
-    </section>
-    <section class="split">
-      <div class="card"><pre>${escapeHtml(JSON.stringify(state.world?.objects?.[state.selectedObject] ?? {}, null, 2))}</pre></div>
-      <div class="card editor">
-        <input data-verb-name value="set_feedback" />
-        <textarea data-source>${escapeHtml(defaultSource())}</textarea>
-        <div class="button-row">
-          <button data-compile>Compile</button>
-          <button data-install>Install on ${escapeHtml(installTarget)}</button>
-          <button data-test-verb>Test</button>
-        </div>
-        <pre>${escapeHtml(JSON.stringify(state.compileResult ?? {}, null, 2))}</pre>
-      </div>
-    </section>
-    ${scopedSmoke}
-  `;
-}
-
-function renderScopedIde() {
   const object = state.selectedObject || defaultSelectedObject();
   const summary = scopedObjectSummary(object);
   const scopedSmoke = scopedProjectionSmokeEnabled
@@ -4925,61 +4692,15 @@ function renderScopedIde() {
 }
 
 function bindIde() {
-  if (scopedProjectionEnabled) {
-    const inspect = () => {
-      const input = document.querySelector<HTMLInputElement>("[data-scoped-object-ref]");
-      const id = input?.value.trim() ?? "";
-      if (id) setSelectedObject(id);
-    };
-    document.querySelector<HTMLButtonElement>("[data-scoped-object-inspect]")?.addEventListener("click", inspect);
-    document.querySelector<HTMLInputElement>("[data-scoped-object-ref]")?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") inspect();
-    });
-    return;
-  }
-  document.querySelector<HTMLSelectElement>("[data-object-select]")?.addEventListener("change", (event) => {
-    setSelectedObject((event.target as HTMLSelectElement).value);
+  const inspect = () => {
+    const input = document.querySelector<HTMLInputElement>("[data-scoped-object-ref]");
+    const id = input?.value.trim() ?? "";
+    if (id) setSelectedObject(id);
+  };
+  document.querySelector<HTMLButtonElement>("[data-scoped-object-inspect]")?.addEventListener("click", inspect);
+  document.querySelector<HTMLInputElement>("[data-scoped-object-ref]")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") inspect();
   });
-  document.querySelector<HTMLButtonElement>("[data-compile]")?.addEventListener("click", async () => {
-    const source = document.querySelector<HTMLTextAreaElement>("[data-source]")!.value;
-    const response = await fetch("/api/compile", { method: "POST", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify({ source }) });
-    state.compileResult = await response.json();
-    render();
-  });
-  document.querySelector<HTMLButtonElement>("[data-install]")?.addEventListener("click", async () => {
-    const source = document.querySelector<HTMLTextAreaElement>("[data-source]")!.value;
-    const name = document.querySelector<HTMLInputElement>("[data-verb-name]")!.value.trim();
-    const object = state.selectedObject;
-    const info = await fetch(`/api/object?id=${encodeURIComponent(object)}`, { headers: authHeaders() }).then((response) => response.json());
-    const current = info.verbs?.find((verb: any) => verb.name === name);
-    const response = await fetch("/api/install", {
-      method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ object, name, source, expected_version: current?.version ?? null })
-    });
-    state.compileResult = await response.json();
-    await refresh();
-  });
-  document.querySelector<HTMLButtonElement>("[data-test-verb]")?.addEventListener("click", () => {
-    const name = document.querySelector<HTMLInputElement>("[data-verb-name]")!.value.trim();
-    const space = dubspaceSpace();
-    if (space) call(space, state.selectedObject, name, [0.62]);
-  });
-}
-
-function defaultSource() {
-  return `verb :set_feedback(value) rx {
-  this.feedback = value;
-  observe({
-    "type": "control_changed",
-    "target": this,
-    "name": "feedback",
-    "value": value,
-    "actor": actor,
-    "seq": seq
-  });
-  return value;
-}`;
 }
 
 function clamp(value: number, min: number, max: number) {
