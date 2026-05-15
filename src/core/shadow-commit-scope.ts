@@ -231,7 +231,7 @@ function validateShadowPostState(serializedAfter: SerializedWorld, transcript: E
   return errors;
 }
 
-function finalWritesByCell(transcript: EffectTranscript): TranscriptWrite[] {
+export function finalWritesByCell(transcript: EffectTranscript): TranscriptWrite[] {
   const byCell = new Map<string, TranscriptWrite>();
   for (const write of transcript.writes) byCell.set(cellKey(write.cell), write);
   return Array.from(byCell.values());
@@ -355,17 +355,19 @@ export function applyShadowTranscriptToCommittedState(
   return next;
 }
 
-function applyTranscriptSessionLocation(next: SerializedWorld, transcript: EffectTranscript): void {
-  if (!transcript.session) return;
+export function transcriptSessionActiveScope(transcript: EffectTranscript): { session: string; actor: ObjRef; activeScope: ObjRef } | null {
+  if (!transcript.session) return null;
   const actorMove = lastMoveForObject(transcript, transcript.call.actor);
-  if (!actorMove) return;
-  // Session location is transport/session authority, not an object cell, so it
-  // is not represented as a transcript write. Actor moveto calls still need the
-  // committed session view to advance, otherwise the next presence scrub drops
-  // freshly-committed subscriber rows as stale.
+  if (!actorMove) return null;
+  return { session: transcript.session, actor: transcript.call.actor, activeScope: actorMove.to };
+}
+
+function applyTranscriptSessionLocation(next: SerializedWorld, transcript: EffectTranscript): void {
+  const update = transcriptSessionActiveScope(transcript);
+  if (!update) return;
   for (const session of next.sessions) {
-    if (session.id === transcript.session && session.actor === transcript.call.actor) {
-      session.activeScope = actorMove.to;
+    if (session.id === update.session && session.actor === update.actor) {
+      session.activeScope = update.activeScope;
       return;
     }
   }
@@ -373,6 +375,10 @@ function applyTranscriptSessionLocation(next: SerializedWorld, transcript: Effec
 
 function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: number | undefined): SerializedObject {
   const timestamp = objectTimestamp ?? 0;
+  return serializedObjectForTranscriptCreate(create, timestamp);
+}
+
+export function serializedObjectForTranscriptCreate(create: TranscriptCreate, timestamp: number): SerializedObject {
   return {
     id: create.object,
     name: create.name,
@@ -393,20 +399,15 @@ function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: n
   };
 }
 
-function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: EffectTranscript): SerializedWorld["logs"] {
-  if (transcript.route !== "sequenced") return logEntries;
-  const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(
-    logEntries.map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]])
-  );
-  const entries = logs.get(transcript.scope) ?? [];
+export function transcriptLogEntry(transcript: EffectTranscript): SerializedWorld["logs"][number][1][number] | null {
+  if (transcript.route !== "sequenced") return null;
   const message = {
     actor: transcript.call.actor,
     target: transcript.call.target,
     verb: transcript.call.verb,
     args: structuredClone(transcript.call.args) as WooValue[]
   };
-  const existing = entries.findIndex((entry) => entry.seq === transcript.seq);
-  const entry = {
+  return {
     space: transcript.scope,
     seq: transcript.seq,
     ts: 0,
@@ -416,20 +417,37 @@ function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: Eff
     applied_ok: transcript.error === undefined,
     ...(transcript.error ? { error: structuredClone(transcript.error) } : {})
   };
-  if (existing >= 0) entries[existing] = entry;
-  else entries.push(entry);
-  entries.sort((a, b) => a.seq - b.seq);
+}
+
+function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: EffectTranscript): SerializedWorld["logs"] {
+  const entry = transcriptLogEntry(transcript);
+  if (!entry) return logEntries;
+  const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(
+    logEntries.map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]])
+  );
+  const entries = logs.get(transcript.scope) ?? [];
+  mergeTranscriptLogEntry(entries, entry);
   logs.set(transcript.scope, entries);
   return Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b));
 }
 
-function applyTranscriptWrite(
-  currentObjects: Map<ObjRef, SerializedObject>,
+export function mergeTranscriptLogEntry(entries: SpaceLogEntryLike[], entry: SpaceLogEntryLike): void {
+  const existing = entries.findIndex((item) => item.seq === entry.seq);
+  if (existing >= 0) entries[existing] = entry;
+  else entries.push(entry);
+  entries.sort((a, b) => a.seq - b.seq);
+}
+
+type SpaceLogEntryLike = SerializedWorld["logs"][number][1][number];
+
+export function applyTranscriptWriteToSerializedObject(
+  target: SerializedObject,
   write: TranscriptWrite,
   objectTimestamp: number | undefined
 ): void {
-  const target = currentObjects.get(write.cell.object);
-  if (!target) return;
+  // Keep this serialized-object materializer parallel with
+  // WooWorld.applyTranscriptWriteInPlace. The storage shapes differ, but the
+  // accepted transcript semantics must stay identical.
   switch (write.cell.kind) {
     case "prop":
       applyPropWrite(target, write);
@@ -456,11 +474,22 @@ function applyTranscriptWrite(
   }
 }
 
+function applyTranscriptWrite(
+  currentObjects: Map<ObjRef, SerializedObject>,
+  write: TranscriptWrite,
+  objectTimestamp: number | undefined
+): void {
+  const target = currentObjects.get(write.cell.object);
+  if (!target) return;
+  applyTranscriptWriteToSerializedObject(target, write, objectTimestamp);
+}
+
 function touchSerializedObject(target: SerializedObject, objectTimestamp: number | undefined): void {
   if (objectTimestamp !== undefined) target.modified = objectTimestamp;
 }
 
 function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void {
+  // Keep this parallel with WooWorld.applyTranscriptPropWriteInPlace.
   if (write.cell.kind !== "prop") return;
   const propName = write.cell.name;
   if (write.op === "remove") {
@@ -498,7 +527,7 @@ function addUniqueObjectRef(list: ObjRef[] | undefined, id: ObjRef): void {
   list.sort();
 }
 
-function nextObjectCounterForCreates(current: number, creates: TranscriptCreate[]): number {
+export function nextObjectCounterForCreates(current: number, creates: TranscriptCreate[]): number {
   let next = current;
   for (const create of creates) {
     const match = create.object.match(/_(\d+)$/);

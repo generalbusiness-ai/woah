@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { installVerb, installVerbAs } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
 import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
 import type { EffectTranscript } from "../src/core/effect-transcript";
+import { applyShadowTranscriptToCommittedState } from "../src/core/shadow-commit-scope";
 import type { MetricEvent, Observation, ObjRef, RemoteToolDescriptor, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 
@@ -684,11 +685,25 @@ describe("McpHost", () => {
       incompleteReasons: [],
       hash: "mcp-v2-cache-apply"
     };
+    const beforeApply = world.exportWorld();
+    const timestamp = Date.now() + 1_000;
+    let expected = applyShadowTranscriptToCommittedState(beforeApply, transcript, { objectTimestamp: timestamp });
+    expected = applyShadowTranscriptToCommittedState(expected, transcript, { objectTimestamp: timestamp });
 
-    world.applyCommittedShadowTranscript(transcript);
-    world.applyCommittedShadowTranscript(transcript);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(timestamp);
+      world.applyCommittedShadowTranscript(transcript);
+      world.applyCommittedShadowTranscript(transcript);
+    } finally {
+      vi.useRealTimers();
+    }
 
     const after = world.exportWorld();
+    expect(after.objects).toEqual(expected.objects);
+    expect(after.sessions).toEqual(expected.sessions);
+    expect(after.logs).toEqual(expected.logs);
+    expect(after.objectCounter).toBe(expected.objectCounter);
     const chatLog = after.logs.find(([space]) => space === "the_chatroom")?.[1] ?? [];
     expect(chatLog.filter((entry) => entry.seq === 3)).toHaveLength(1);
     expect(after.objectCounter).toBeGreaterThanOrEqual(before + 11);
@@ -702,11 +717,13 @@ describe("McpHost", () => {
     expect(world.object(session.actor).modified).toBeGreaterThanOrEqual(modifiedBefore);
     const gatewayApplyMetrics = metrics.filter((event) => event.kind === "shadow_gateway_apply_step");
     expect(gatewayApplyMetrics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "export_world", scope: "the_chatroom", route: "sequenced" }),
-      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "clone_world", scope: "the_chatroom", route: "sequenced" }),
-      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "apply_serialized", scope: "the_chatroom", route: "sequenced" }),
-      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "import_world", scope: "the_chatroom", route: "sequenced" }),
-      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "restore_runtime", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "apply_creates", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "collect_writes", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "apply_writes", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "sort_objects", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "apply_session", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "apply_log", scope: "the_chatroom", route: "sequenced" }),
+      expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "counters", scope: "the_chatroom", route: "sequenced" }),
       expect.objectContaining({ kind: "shadow_gateway_apply_step", phase: "total", scope: "the_chatroom", route: "sequenced" })
     ]));
     expect(gatewayApplyMetrics.find((event) => event.phase === "total")).toMatchObject({
@@ -717,6 +734,53 @@ describe("McpHost", () => {
       creates: 1,
       writes: 1
     });
+  });
+
+  it("matches the serialized applier for write-only v2 accepted transcripts", () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const session = world.auth("guest:mcp-v2-cache-write-only");
+    const beforeApply = world.exportWorld();
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "mcp-v2-cache-write-only",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 4,
+      session: session.id,
+      call: { actor: session.actor, target: "the_chatroom", verb: "cache_write_only_probe", args: [] },
+      reads: [],
+      writes: [
+        { cell: { kind: "prop", object: session.actor, name: "cache_probe" }, value: "write-only", op: "set" },
+        { cell: { kind: "location", object: session.actor }, value: "the_lobby", op: "set" },
+        { cell: { kind: "contents", object: "the_chatroom" }, value: ["$wiz", session.actor], op: "set" }
+      ],
+      creates: [],
+      moves: [],
+      observations: [{ type: "cache_write_only_probe", actor: session.actor, source: "the_chatroom", text: "write-only", ts: 1 }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: "mcp-v2-cache-write-only"
+    };
+    const timestamp = Date.now() + 1_000;
+    const expected = applyShadowTranscriptToCommittedState(beforeApply, transcript, { objectTimestamp: timestamp });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(timestamp);
+      world.applyCommittedShadowTranscript(transcript);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const after = world.exportWorld();
+    expect(after.objects).toEqual(expected.objects);
+    expect(after.sessions).toEqual(expected.sessions);
+    expect(after.logs).toEqual(expected.logs);
+    expect(after.objectCounter).toBe(expected.objectCounter);
   });
 
   it("does not enumerate remote tools while sending post-call list_changed hints", async () => {

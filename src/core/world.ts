@@ -32,8 +32,15 @@ import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
-import type { EffectTranscript } from "./effect-transcript";
-import { applyShadowTranscriptToCommittedState } from "./shadow-commit-scope";
+import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
+import {
+  finalWritesByCell,
+  mergeTranscriptLogEntry,
+  nextObjectCounterForCreates,
+  serializedObjectForTranscriptCreate,
+  transcriptLogEntry,
+  transcriptSessionActiveScope
+} from "./shadow-commit-scope";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -46,10 +53,6 @@ const SUBSCRIBER_SCRUB_FLOOR_MS = 5_000;
 // reads as "sleeping" — same as a WS user whose connection has dropped.
 const IDLE_PRESENCE_LIVE_WINDOW_MS = 5 * 60_000;
 const IDLE_PRESENCE_IDLE_THRESHOLD_SECONDS = 60;
-
-type RuntimeSessionState = Pick<Session, "lastDetachAt" | "lastInputAt"> & {
-  attachedSockets: Set<string>;
-};
 
 type ShadowGatewayApplyStats = {
   objects: number;
@@ -6170,16 +6173,13 @@ export class WooWorld {
 
   applyCommittedShadowTranscript(transcript: EffectTranscript): void {
     // CommitScopeDO is the authority for v2 shadow commits. The gateway keeps
-    // this WooWorld as a routing/tool-list cache. Use the same transcript
-    // applier as the commit scope so object state, logs, counters, and
-    // session-location side effects cannot drift between the two views. This is
-    // a full cache rehydrate; if MCP v2 commit volume becomes hot, keep this
-    // shared semantic path but add a WooWorld adapter that applies the same
-    // transcript operations in place. This intentionally does not persist to
-    // the gateway DO.
+    // this WooWorld as a routing/tool-list cache. Apply the same transcript
+    // materialization semantics in-place so hot v2/MCP commits scale with the
+    // accepted transcript instead of export/clone/import of the whole world.
+    // This intentionally does not persist to the gateway DO.
     const totalStartedAt = Date.now();
-    let stats = this.shadowGatewayLiveMetricStats();
     const profile = (phase: (MetricEvent & { kind: "shadow_gateway_apply_step" })["phase"], startedAt: number) => {
+      const stats = this.shadowGatewayLiveMetricStats();
       this.recordMetric({
         kind: "shadow_gateway_apply_step",
         phase,
@@ -6191,37 +6191,7 @@ export class WooWorld {
         writes: transcript.writes.length
       });
     };
-    let stepStartedAt = Date.now();
-    const runtimeSessions = this.captureRuntimeSessionStates();
-    profile("capture_runtime", stepStartedAt);
-    stepStartedAt = Date.now();
-    const exported = this.exportWorld();
-    stats = this.shadowGatewaySerializedMetricStats(exported);
-    profile("export_world", stepStartedAt);
-    stepStartedAt = Date.now();
-    const next = applyShadowTranscriptToCommittedState(exported, transcript, {
-      objectTimestamp: Date.now(),
-      profile: (event) => {
-        this.recordMetric({
-          kind: "shadow_gateway_apply_step",
-          phase: event.phase,
-          scope: transcript.scope,
-          route: transcript.route,
-          ms: event.ms,
-          ...stats,
-          creates: transcript.creates.length,
-          writes: transcript.writes.length
-        });
-      }
-    });
-    stats = this.shadowGatewaySerializedMetricStats(next);
-    profile("apply_serialized", stepStartedAt);
-    stepStartedAt = Date.now();
-    this.importWorld(next);
-    profile("import_world", stepStartedAt);
-    stepStartedAt = Date.now();
-    this.restoreRuntimeSessionStates(runtimeSessions);
-    profile("restore_runtime", stepStartedAt);
+    this.applyCommittedShadowTranscriptInPlace(transcript, Date.now(), profile);
     profile("total", totalStartedAt);
   }
 
@@ -6238,37 +6208,143 @@ export class WooWorld {
     };
   }
 
-  private shadowGatewaySerializedMetricStats(world: SerializedWorld): ShadowGatewayApplyStats {
+  private applyCommittedShadowTranscriptInPlace(
+    transcript: EffectTranscript,
+    objectTimestamp: number,
+    profile?: (phase: (MetricEvent & { kind: "shadow_gateway_apply_step" })["phase"], startedAt: number) => void
+  ): void {
+    this.bumpMutationVersion();
+    this.hostSeedCache.clear();
+    let stepStartedAt = Date.now();
+    for (const create of transcript.creates) {
+      const serialized = serializedObjectForTranscriptCreate(create, objectTimestamp);
+      this.objects.set(create.object, this.objectFromSerializedCreate(serialized));
+      if (serialized.parent) addSortedSetValue(this.objects.get(serialized.parent)?.children, serialized.id);
+      if (serialized.location) addSortedSetValue(this.objects.get(serialized.location)?.contents, serialized.id);
+    }
+    profile?.("apply_creates", stepStartedAt);
+
+    stepStartedAt = Date.now();
+    const writes = finalWritesByCell(transcript);
+    profile?.("collect_writes", stepStartedAt);
+
+    stepStartedAt = Date.now();
+    for (const write of writes) {
+      this.applyTranscriptWriteInPlace(write, objectTimestamp);
+    }
+    profile?.("apply_writes", stepStartedAt);
+
+    // The serialized commit-scope applier sorts objects on every accepted
+    // transcript. Keep the gateway cache export-equivalent even for write-only
+    // commits, where insertion order would otherwise remain whatever the live
+    // world happened to have before the transcript arrived.
+    stepStartedAt = Date.now();
+    this.sortObjectMap();
+    profile?.("sort_objects", stepStartedAt);
+
+    stepStartedAt = Date.now();
+    const sessionUpdate = transcriptSessionActiveScope(transcript);
+    if (sessionUpdate) {
+      const session = this.sessions.get(sessionUpdate.session);
+      if (session?.actor === sessionUpdate.actor) session.activeScope = sessionUpdate.activeScope;
+    }
+    profile?.("apply_session", stepStartedAt);
+
+    stepStartedAt = Date.now();
+    const logEntry = transcriptLogEntry(transcript);
+    if (logEntry) {
+      const entries = this.logs.get(transcript.scope) ?? [];
+      mergeTranscriptLogEntry(entries, logEntry);
+      this.logs.set(transcript.scope, entries);
+      this.sortLogsMap();
+    }
+    profile?.("apply_log", stepStartedAt);
+
+    stepStartedAt = Date.now();
+    this.objectCounter = nextObjectCounterForCreates(this.objectCounter, transcript.creates);
+    profile?.("counters", stepStartedAt);
+  }
+
+  private objectFromSerializedCreate(item: SerializedObject): WooObject {
     return {
-      objects: world.objects.length,
-      properties: world.objects.reduce((sum, object) => sum + object.properties.length, 0),
-      sessions: world.sessions.length,
-      logs: world.logs.reduce((sum, [, entries]) => sum + entries.length, 0)
+      id: item.id,
+      name: item.name,
+      parent: item.parent,
+      owner: item.owner,
+      location: item.location,
+      anchor: item.anchor,
+      flags: item.flags ?? {},
+      created: item.created,
+      modified: item.modified,
+      propertyDefs: new Map(),
+      properties: new Map(),
+      propertyVersions: new Map(),
+      verbs: [],
+      children: new Set(),
+      contents: new Set(),
+      eventSchemas: new Map()
     };
   }
 
-  private captureRuntimeSessionStates(): Map<string, RuntimeSessionState> {
-    // Keep this helper aligned with all transport-only Session fields. Durable
-    // serialized fields such as activeScope must come from the transcript;
-    // socket/input state must survive cache rehydrates. Sessions created by the
-    // transcript have no prior transport state, so they intentionally keep the
-    // import defaults until a transport attaches or sends input.
-    return new Map(Array.from(this.sessions.entries()).map(([id, session]) => [id, {
-      attachedSockets: new Set(session.attachedSockets),
-      lastInputAt: session.lastInputAt,
-      lastDetachAt: session.lastDetachAt
-    }]));
+  private applyTranscriptWriteInPlace(write: TranscriptWrite, objectTimestamp: number): void {
+    const target = this.objects.get(write.cell.object);
+    if (!target) return;
+    // Keep this live-object materializer parallel with
+    // applyTranscriptWriteToSerializedObject in shadow-commit-scope.ts. The
+    // Map/Set storage shapes differ, but transcript semantics must not.
+    switch (write.cell.kind) {
+      case "prop":
+        this.applyTranscriptPropWriteInPlace(target, write, objectTimestamp);
+        return;
+      case "location":
+        if (typeof write.value === "string" || write.value === null) {
+          target.location = write.value;
+          target.modified = objectTimestamp;
+        }
+        return;
+      case "contents":
+        if (Array.isArray(write.value)) {
+          target.contents = new Set(write.value.filter((item): item is ObjRef => typeof item === "string"));
+          target.modified = objectTimestamp;
+        }
+        return;
+      case "lifecycle":
+      case "verb":
+        return;
+    }
   }
 
-  private restoreRuntimeSessionStates(runtimeSessions: Map<string, RuntimeSessionState>): void {
-    for (const [id, runtime] of runtimeSessions) {
-      const session = this.sessions.get(id);
-      if (!session) continue;
-      session.attachedSockets = runtime.attachedSockets;
-      session.lastInputAt = runtime.lastInputAt;
-      if (runtime.attachedSockets.size > 0) session.lastDetachAt = null;
-      else session.lastDetachAt = runtime.lastDetachAt;
+  private applyTranscriptPropWriteInPlace(target: WooObject, write: TranscriptWrite, objectTimestamp: number): void {
+    // Keep this parallel with applyPropWrite in shadow-commit-scope.ts.
+    if (write.cell.kind !== "prop") return;
+    const propName = write.cell.name;
+    if (write.op === "remove") {
+      target.properties.delete(propName);
+      target.propertyVersions.delete(propName);
+      target.modified = objectTimestamp;
+      if (propName === "subscribers" || propName === "session_subscribers") this.invalidatePresenceIndex();
+      return;
     }
+    const value = cloneValue(write.value);
+    target.properties.set(propName, value);
+    target.properties = sortedMap(target.properties);
+    if (propName === "name" && typeof value === "string") target.name = value;
+    const parsedVersion = write.next === undefined ? null : Number(write.next);
+    const version = parsedVersion !== null && Number.isInteger(parsedVersion) && parsedVersion >= 0
+      ? parsedVersion
+      : (target.propertyVersions.get(propName) ?? 0) + 1;
+    target.propertyVersions.set(propName, version);
+    target.propertyVersions = sortedMap(target.propertyVersions);
+    target.modified = objectTimestamp;
+    if (propName === "subscribers" || propName === "session_subscribers") this.invalidatePresenceIndex();
+  }
+
+  private sortObjectMap(): void {
+    this.objects = sortedMap(this.objects);
+  }
+
+  private sortLogsMap(): void {
+    this.logs = sortedMap(this.logs);
   }
 
   private serializeObject(obj: WooObject): SerializedObject {
@@ -10633,6 +10709,21 @@ function appendQuery(base: string, params: Record<string, string>): string {
 }
 
 const STORAGE_FLUSH_TOP_N = 5;
+
+function sortedMap<K extends string, V>(map: Map<K, V>): Map<K, V> {
+  return new Map(Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function addSortedSetValue(set: Set<ObjRef> | undefined, value: ObjRef): void {
+  // Creates per accepted transcript are expected to be small. If this becomes
+  // hot for bulk-create transcripts, batch additions by parent/location and
+  // sort each affected Set once at the end.
+  if (!set || set.has(value)) return;
+  set.add(value);
+  const sorted = Array.from(set).sort();
+  set.clear();
+  for (const item of sorted) set.add(item);
+}
 
 // Group identical strings, return the K most-frequent as [name, count] pairs.
 // Used by storage_flush to surface which property names / object IDs dominate
