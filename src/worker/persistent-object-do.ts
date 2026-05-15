@@ -409,15 +409,6 @@ export class PersistentObjectDO {
         },
         resolveObject: (id, session) => this.resolveRestObject(world, id, session),
         resolveActor: (_protocolRequest, actorValue, session) => this.resolveRestActor(world, request, actorValue, session),
-        directCall: async (id, actor, target, verb, args, options) => {
-          const deferredHostEffects: DeferredHostEffect[] = [];
-          const result = await world.directCall(id, actor, target, verb, args, {
-            ...options,
-            deferHostEffect: (effect) => deferredHostEffects.push(effect)
-          });
-          if (deferredHostEffects.length > 0) await world.applyDeferredHostEffects(deferredHostEffects);
-          return result;
-        },
         broadcastApplied: (frame) => this.handleAppliedFrame(world, frame),
         broadcastLiveEvents: (result) => this.broadcastLiveEvents(world, result)
       });

@@ -1,7 +1,6 @@
 import {
   wooError,
   type AppliedFrame,
-  type CommandFrame,
   type DirectResultFrame,
   type ErrorFrame,
   type ErrorValue,
@@ -13,9 +12,7 @@ import {
   type WooValue
 } from "./types";
 import { localCatalogStatuses, localCatalogUiIndex } from "./local-catalogs";
-import { normalizeError, type DirectCallOptions, type ParkedTaskRun, type WooWorld } from "./world";
-
-const MAX_WS_FRAME_BYTES = 256 * 1024;
+import { normalizeError, type WooWorld } from "./world";
 
 export type RestProtocolRequest = {
   method: string;
@@ -43,14 +40,6 @@ export type RestProtocolHost = {
   openStream?(request: RestProtocolRequest, rawTarget: string, target: ObjRef, session: Session): RestProtocolResult | Promise<RestProtocolResult>;
   resolveObject?(id: string, session: Session, request: RestProtocolRequest): ObjRef;
   resolveActor?(request: RestProtocolRequest, actorValue: unknown, session: Session): ObjRef;
-  directCall?(
-    id: string | undefined,
-    actor: ObjRef,
-    target: ObjRef,
-    verb: string,
-    args: WooValue[],
-    options: DirectCallOptions
-  ): Promise<DirectResultFrame | ErrorFrame>;
   executeTurn?(
     input: {
       id?: string;
@@ -539,164 +528,6 @@ function messageFromRestMap(host: RestProtocolHost, request: RestProtocolRequest
     args: Array.isArray(value.args) ? value.args : [],
     body: value.body && typeof value.body === "object" && !Array.isArray(value.body) ? value.body as Record<string, WooValue> : undefined
   };
-}
-
-export type WsProtocolSession = {
-  sessionId: string;
-  actor: ObjRef;
-};
-
-export type WsProtocolHost<Connection> = {
-  defaultAuthToken?: string;
-  authenticate(token: string, connection: Connection): Session | Promise<Session>;
-  attach(connection: Connection, session: Session): void | Promise<void>;
-  session(connection: Connection): WsProtocolSession | null;
-  send(connection: Connection, frame: unknown): void;
-  call(frameId: string | undefined, session: WsProtocolSession, space: ObjRef, message: Message): AppliedFrame | ErrorFrame | Promise<AppliedFrame | ErrorFrame>;
-  command?(
-    frameId: string | undefined,
-    session: WsProtocolSession,
-    space: ObjRef,
-    text: string
-  ): CommandFrame | Promise<CommandFrame>;
-  direct(
-    frameId: string | undefined,
-    session: WsProtocolSession,
-    target: ObjRef,
-    verb: string,
-    args: WooValue[]
-  ): DirectResultFrame | ErrorFrame | Promise<DirectResultFrame | ErrorFrame>;
-  replay(frameId: string | undefined, session: WsProtocolSession, space: ObjRef, from: unknown, limit: unknown): unknown | Promise<unknown>;
-  deliverInput(session: WsProtocolSession, input: WooValue): ParkedTaskRun | null | Promise<ParkedTaskRun | null>;
-  broadcastApplied(frame: AppliedFrame, originator?: Connection): void | Promise<void>;
-  broadcastTaskResult(result: ParkedTaskRun): void | Promise<void>;
-  broadcastLiveEvents(result: DirectResultFrame, originator?: Connection): void | Promise<void>;
-};
-
-export async function handleWsProtocolFrame<Connection>(
-  connection: Connection,
-  frame: Record<string, unknown>,
-  host: WsProtocolHost<Connection>
-): Promise<void> {
-  try {
-    const op = String(frame.op ?? "");
-
-    if (op === "auth") {
-      const session = await host.authenticate(String(frame.token ?? host.defaultAuthToken ?? ""), connection);
-      await host.attach(connection, session);
-      host.send(connection, { op: "session", actor: session.actor, session: session.id, resumed: false });
-      return;
-    }
-
-    if (op === "ping") {
-      host.send(connection, { op: "pong", server_time: Date.now() });
-      return;
-    }
-
-    const session = host.session(connection);
-    if (!session) {
-      host.send(connection, { op: "error", id: frame.id, error: wooError("E_NOSESSION", "auth required before this op") });
-      return;
-    }
-
-    if (op === "call") {
-      const m = frame.message && typeof frame.message === "object" && !Array.isArray(frame.message)
-        ? frame.message as Record<string, unknown>
-        : {};
-      const message: Message = {
-        actor: session.actor,
-        target: String(m.target ?? "") as ObjRef,
-        verb: String(m.verb ?? ""),
-        args: Array.isArray(m.args) ? m.args as WooValue[] : [],
-        body: m.body && typeof m.body === "object" && !Array.isArray(m.body)
-          ? m.body as Record<string, WooValue>
-          : undefined
-      };
-      const result = await host.call(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, message);
-      if (result.op === "applied") await host.broadcastApplied(result, connection);
-      else host.send(connection, result);
-      return;
-    }
-
-    if (op === "command") {
-      if (!host.command) {
-        host.send(connection, { op: "error", id: frame.id, error: wooError("E_NOTSUPPORTED", "command op is not supported by this host") });
-        return;
-      }
-      const result = await host.command(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, String(frame.text ?? ""));
-      if (result.op === "applied") await host.broadcastApplied(result, connection);
-      else if (result.op === "result") {
-        const command = (result as DirectResultFrame & { command?: WooValue }).command;
-        host.send(connection, command === undefined
-          ? { op: "result", id: result.id, result: result.result, observations: result.observations }
-          : { op: "result", id: result.id, result: result.result, command, observations: result.observations });
-        await host.broadcastLiveEvents(result, connection);
-      } else {
-        host.send(connection, result);
-      }
-      return;
-    }
-
-    if (op === "direct") {
-      const result = await host.direct(
-        frameId(frame.id),
-        session,
-        String(frame.target ?? "") as ObjRef,
-        String(frame.verb ?? ""),
-        Array.isArray(frame.args) ? frame.args as WooValue[] : []
-      );
-      if (result.op === "result") {
-        host.send(connection, { op: "result", id: result.id, result: result.result, observations: result.observations });
-        await host.broadcastLiveEvents(result, connection);
-      } else {
-        host.send(connection, result);
-      }
-      return;
-    }
-
-    if (op === "input") {
-      const input = Object.prototype.hasOwnProperty.call(frame, "value") ? frame.value : frame.text ?? "";
-      const result = await host.deliverInput(session, input as WooValue);
-      if (!result) {
-        host.send(connection, { op: "input", id: frame.id, accepted: false });
-        return;
-      }
-      if (result.frame?.op === "applied") await host.broadcastApplied(result.frame, connection);
-      else {
-        host.send(connection, { op: "input", id: frame.id, accepted: true, task: result.task.id, observations: result.observations });
-        await host.broadcastTaskResult(result);
-      }
-      return;
-    }
-
-    if (op === "replay") {
-      host.send(connection, await host.replay(frameId(frame.id), session, String(frame.space ?? "") as ObjRef, frame.from, frame.limit));
-      return;
-    }
-
-    host.send(connection, { op: "error", error: { code: "E_INVARG", message: `unknown op ${op}` } });
-  } catch (err) {
-    host.send(connection, { op: "error", error: normalizeError(err) });
-  }
-}
-
-export function parseWsProtocolFrame(raw: string | ArrayBuffer | ArrayBufferView): Record<string, unknown> | ErrorFrame {
-  try {
-    if (rawFrameBytes(raw) > MAX_WS_FRAME_BYTES) {
-      return { op: "error", error: wooError("E_RATE", `websocket frame exceeds ${MAX_WS_FRAME_BYTES} bytes`) };
-    }
-    const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-    return { op: "error", error: wooError("E_INVARG", "invalid JSON frame") };
-  } catch {
-    return { op: "error", error: wooError("E_INVARG", "invalid JSON frame") };
-  }
-}
-
-function rawFrameBytes(raw: string | ArrayBuffer | ArrayBufferView): number {
-  if (typeof raw === "string") return new TextEncoder().encode(raw).byteLength;
-  return raw.byteLength;
 }
 
 function frameId(value: unknown): string | undefined {
