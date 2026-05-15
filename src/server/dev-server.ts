@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
 import { createWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
-import { appliedFromLogEntry, handleRestProtocolRequest, isSpaceLike, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
+import { handleRestProtocolRequest, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
 import { normalizeError, type ParkedTaskRun } from "../core/world";
 import {
   directedRecipients,
@@ -63,10 +63,7 @@ const mcpGateway = new McpGateway(world, {
 });
 type AttachedSocket = { sessionId: string; actor: string; socketId: string };
 const sockets = new Map<WebSocket, AttachedSocket>();
-type RestStream = { id: string; res: http.ServerResponse; actor: ObjRef; target: ObjRef; scope: "space" | "actor" };
-const restStreams = new Set<RestStream>();
 let socketCounter = 1;
-let streamCounter = 1;
 const port = Number(process.env.PORT ?? 5173);
 const hmrPort = Number(process.env.VITE_HMR_PORT ?? port + 10_000);
 const MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024;
@@ -112,7 +109,6 @@ const server = http.createServer(async (req, res) => {
         as: typeof body.as === "string" ? body.as : undefined,
         accept_major: body.accept_major === true
       }, { hashText: nodeHashText }),
-      openStream: (_request, rawTarget, target, session) => openRestStream(req, res, rawTarget, target, session) ? { handled: true, raw: true } : { handled: false },
       broadcastApplied,
       broadcastLiveEvents
     });
@@ -622,7 +618,6 @@ function broadcastApplied(frame: AppliedFrame, originator?: WebSocket, originMcp
     if (audienceSessions ? !audienceSessions.has(session.sessionId) : !world.hasPresence(session.actor, frame.space)) continue;
     ws.send(JSON.stringify(publicFrame));
   }
-  broadcastAppliedSse(publicFrame);
   mcpGateway.routeAppliedFrame(publicFrame, originMcpSessionId ?? null);
 }
 
@@ -671,36 +666,6 @@ function broadcastLiveEvent(frame: LiveEventFrame, audience: ObjRef | null, audi
     }
     ws.send(data);
   }
-  broadcastLiveEventSse(frame, audience, audienceActors);
-}
-
-function broadcastAppliedSse(frame: AppliedFrame): void {
-  for (const stream of Array.from(restStreams)) {
-    if (stream.scope === "space") {
-      if (stream.target !== frame.space || !world.hasPresence(stream.actor, frame.space)) continue;
-    } else if (!world.hasPresence(stream.actor, frame.space)) {
-      continue;
-    }
-    writeSse(stream, "applied", frame, `${frame.space}:${frame.seq}`);
-  }
-}
-
-function broadcastLiveEventSse(frame: LiveEventFrame, audience: ObjRef | null, audienceActors?: ObjRef[]): void {
-  const { to: directedTo, from: directedFrom } = directedRecipients(frame.observation);
-  const audienceSet = audienceActors ? new Set(audienceActors) : null;
-  for (const stream of Array.from(restStreams)) {
-    if (directedTo || directedFrom) {
-      if (stream.actor !== directedTo && stream.actor !== directedFrom) continue;
-    } else if (stream.scope === "space") {
-      if (!audience || stream.target !== audience) continue;
-      if (audienceSet ? !audienceSet.has(stream.actor) : !world.hasPresence(stream.actor, audience)) continue;
-    } else if (audienceSet) {
-      if (!audienceSet.has(stream.actor)) continue;
-    } else if (!audience || !world.hasPresence(stream.actor, audience)) {
-      continue;
-    }
-    writeSse(stream, "event", frame);
-  }
 }
 
 function taskResultSpace(result: ParkedTaskRun): ObjRef {
@@ -723,53 +688,6 @@ function requireRestSession(req: http.IncomingMessage): Session {
   const match = Array.isArray(header) ? null : /^Session\s+(.+)$/i.exec(header.trim());
   if (!match) throw wooError("E_NOSESSION", "Authorization: Session <id> required");
   return world.auth(`session:${match[1]}`);
-}
-
-function openRestStream(req: http.IncomingMessage, res: http.ServerResponse, rawTarget: string, target: ObjRef, session: Session): boolean {
-  const scope: RestStream["scope"] = rawTarget === "$me" || !isSpaceLike(world, target) ? "actor" : "space";
-  if (scope === "space" && !world.hasPresence(session.actor, target)) throw wooError("E_PERM", `${session.actor} is not present in ${target}`);
-
-  res.statusCode = 200;
-  res.setHeader("content-type", "text/event-stream; charset=utf-8");
-  res.setHeader("cache-control", "no-cache, no-transform");
-  res.setHeader("connection", "keep-alive");
-  res.flushHeaders?.();
-
-  const stream: RestStream = { id: `sse-${streamCounter++}`, res, actor: session.actor, target, scope };
-  restStreams.add(stream);
-  res.write("retry: 1000\n\n");
-
-  const lastEventId = req.headers["last-event-id"];
-  if (scope === "space" && typeof lastEventId === "string") {
-    const lastSeq = parseLastEventSeq(lastEventId, target);
-    if (lastSeq !== null) {
-      for (const entry of world.replay(target, lastSeq + 1, 1000)) {
-        writeSse(stream, "applied", appliedFromLogEntry(entry), `${entry.space}:${entry.seq}`);
-      }
-    }
-  }
-
-  req.on("close", () => {
-    restStreams.delete(stream);
-  });
-  return true;
-}
-
-function parseLastEventSeq(value: string, space: ObjRef): number | null {
-  const prefix = `${space}:`;
-  if (!value.startsWith(prefix)) return null;
-  const seq = Number(value.slice(prefix.length));
-  return Number.isFinite(seq) && seq >= 0 ? seq : null;
-}
-
-function writeSse(stream: RestStream, event: "applied" | "event", data: unknown, id?: string): void {
-  if (stream.res.writableEnded) {
-    restStreams.delete(stream);
-    return;
-  }
-  if (id) stream.res.write(`id: ${id}\n`);
-  stream.res.write(`event: ${event}\n`);
-  stream.res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
 async function readJson(req: http.IncomingMessage): Promise<Record<string, any>> {

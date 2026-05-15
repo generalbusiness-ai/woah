@@ -25,7 +25,7 @@
         "surface": "main",
         "subject": "$pinboard",
         "neighborhood": {
-          "include": ["subject", "contents", "subscribers", "actor"]
+          "include": ["subject", "contents", "session_subscribers", "actor"]
         }
       }
     ],
@@ -183,7 +183,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { let pins = this:list_notes(); let note_count = length(pins); let other = []; for item in contents(this) { if (!isa(item, $note) && !isa(item, $actor)) { other = other + [{ id: item, title: item.name, description: item.description }]; } } let summary = this.name + \" has \" + to_string(note_count) + \" note\"; if (note_count != 1) { summary = summary + \"s\"; } summary = summary + \" on it\"; if (length(other) > 0) { summary = summary + \" and \" + to_string(length(other)) + \" other thing\"; if (length(other) != 1) { summary = summary + \"s\"; } summary = summary + \" here\"; } summary = summary + \".\"; return { id: this, title: this.name, description: this.description, summary: summary, note_count: note_count, notes: pins, contents: other, present_actors: this.subscribers, viewport: this.viewport }; }"
+          "source": "verb :look_self() rxd { let pins = this:list_notes(); let note_count = length(pins); let other = []; for item in contents(this) { if (!isa(item, $note) && !isa(item, $actor)) { other = other + [{ id: item, title: item.name, description: item.description }]; } } let summary = this.name + \" has \" + to_string(note_count) + \" note\"; if (note_count != 1) { summary = summary + \"s\"; } summary = summary + \" on it\"; if (length(other) > 0) { summary = summary + \" and \" + to_string(length(other)) + \" other thing\"; if (length(other) != 1) { summary = summary + \"s\"; } summary = summary + \" here\"; } summary = summary + \".\"; return { id: this, title: this.name, description: this.description, summary: summary, note_count: note_count, notes: pins, contents: other, roster: this:room_roster(), viewport: this.viewport }; }"
         },
         {
           "name": "room_roster",
@@ -225,7 +225,7 @@
             "args": [],
             "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced" }
           },
-          "source": "verb :enter() rxd { let old = location(actor); moveto(actor, this); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: this, present: this.subscribers, present_actors: this.subscribers }; }"
+          "source": "verb :enter() rxd { let old = location(actor); moveto(actor, this); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: this, roster: this:room_roster() }; }"
         },
         {
           "name": "leave",
@@ -235,7 +235,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: dest, present: this.subscribers, present_actors: this.subscribers }; }"
+          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: dest, roster: this:room_roster() }; }"
         },
         {
           "name": "out",

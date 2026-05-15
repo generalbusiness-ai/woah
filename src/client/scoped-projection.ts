@@ -25,25 +25,28 @@ export function idsFromRefsOrSummaries(value: any[]): string[] {
 }
 
 export function scopedHerePresentActors(here: any): string[] {
-  return idsFromRefsOrSummaries(Array.isArray(here?.present_actors) ? here.present_actors : []);
+  return idsFromRefsOrSummaries(Array.isArray(here?.roster) ? here.roster : Array.isArray(here?.present_actors) ? here.present_actors : []);
 }
 
-// `who` puts present_actors at the top level of the observation; `looked`
-// (built by chat's `:look_at`) nests the room view — including its
-// present_actors — under `look`. The look-derived list is only meaningful
+// `who` puts roster at the top level of the observation; `looked` (built by
+// chat's `:look_at`) nests the room view — including its roster — under
+// `look`. The look-derived list is only meaningful
 // when the looker was looking at the room itself; `look at <object>`
-// dispatches to the target's own `look_self`, whose present_actors (if
-// any) belongs to that target, not the looker's room.
+// dispatches to the target's own `look_self`, whose roster (if any) belongs
+// to that target, not the looker's room. present_actors is accepted only as
+// an input compatibility fallback while old catalog snapshots drain.
 export function presentActorsFromObservation(observation: any): string[] {
   if (!observation || typeof observation !== "object" || Array.isArray(observation)) return [];
+  if (Array.isArray(observation.roster)) return idsFromRefsOrSummaries(observation.roster);
   if (Array.isArray(observation.present_actors)) return idsFromRefsOrSummaries(observation.present_actors);
   if (String(observation.type ?? "") !== "looked") return [];
   const room = typeof observation.room === "string" ? observation.room : "";
   const target = typeof observation.target === "string" ? observation.target : "";
   if (target && target !== room) return [];
   const view = observation.look;
-  if (!view || typeof view !== "object" || Array.isArray(view) || !Array.isArray(view.present_actors)) return [];
-  return idsFromRefsOrSummaries(view.present_actors);
+  if (!view || typeof view !== "object" || Array.isArray(view)) return [];
+  const roster = Array.isArray(view.roster) ? view.roster : Array.isArray(view.present_actors) ? view.present_actors : [];
+  return idsFromRefsOrSummaries(roster);
 }
 
 export function scopedModelWithHere(model: ScopedProjectionStateModel, here: any): ScopedProjectionStateModel {

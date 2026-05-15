@@ -1174,7 +1174,7 @@ function roomSnapshotObjects(here: any): any[] {
   if (!here || typeof here !== "object") return [];
   return [
     roomSnapshotAsObjectSummary(here),
-    ...arrayOfObjects(here.present_actors),
+    ...arrayOfObjects(Array.isArray(here.roster) ? here.roster : here.present_actors),
     ...arrayOfObjects(here.contents),
     ...arrayOfObjects(here.exits)
   ];
@@ -1182,6 +1182,14 @@ function roomSnapshotObjects(here: any): any[] {
 
 function arrayOfObjects(value: any): any[] {
   return Array.isArray(value) ? value.filter((item) => item && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function idsFromSessionSubscriberRows(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => item.actor)
+    .filter((actor): actor is string => typeof actor === "string")));
 }
 
 function scopedSummaryForObject(id: string, fallbackName?: string, location?: string): any {
@@ -1231,7 +1239,7 @@ function roomSnapshotAsObjectSummary(here: any): any {
     description: typeof here.description === "string" ? here.description : null,
     contents: [
       ...idsFromRefsOrSummaries(Array.isArray(here.contents) ? here.contents : []),
-      ...idsFromRefsOrSummaries(Array.isArray(here.present_actors) ? here.present_actors : [])
+      ...idsFromRefsOrSummaries(Array.isArray(here.roster) ? here.roster : Array.isArray(here.present_actors) ? here.present_actors : [])
     ],
     props: {
       ...(here.props && typeof here.props === "object" && !Array.isArray(here.props) ? here.props : {}),
@@ -1441,7 +1449,7 @@ function pinboardModel(): PinboardRenderModel | undefined {
 }
 
 function scopedPinboardPresentActors(boardId: string, props: Record<string, unknown>): string[] {
-  const present = new Set(Array.isArray(props.subscribers) ? props.subscribers.map(String) : []);
+  const present = new Set(idsFromSessionSubscriberRows(props.session_subscribers));
   const presence = ui.observe(boardId)?.catalogState.pinboard_presence;
   if (presence && typeof presence === "object" && !Array.isArray(presence)) {
     for (const [actor, value] of Object.entries(presence)) {
@@ -1451,7 +1459,7 @@ function scopedPinboardPresentActors(boardId: string, props: Record<string, unkn
   }
   if (present.size > 0) return [...present];
   const room = pinboardOverlaySnapshot()?.room;
-  const fromRoom = idsFromRefsOrSummaries(Array.isArray(room?.present_actors) ? room.present_actors : []);
+  const fromRoom = idsFromRefsOrSummaries(Array.isArray(room?.roster) ? room.roster : Array.isArray(room?.present_actors) ? room.present_actors : []);
   if (fromRoom.length > 0) return fromRoom;
   // Last-resort local fallback: before the first overlay/presence frame lands,
   // show the user in their own active pinboard rather than an empty presence
@@ -2905,10 +2913,9 @@ function receiveChatEvent(observation: any, shouldRender = true) {
   // Side-effect branches below stay keyed on observation.type, not on the
   // formatter-supplied kind. The formatter's kind is for rendering only.
   const presentActors = presentActorsFromObservation(observation);
-  // Only adopt present_actors as the chat sidebar list when the observation
-  // came from the actor's current chat room; a `look at pinboard` from the
-  // deck would otherwise overwrite the deck's presence list with the
-  // pinboard's subscribers.
+  // Only adopt roster as the chat sidebar list when the observation came from
+  // the actor's current chat room; a `look at pinboard` from the deck would
+  // otherwise overwrite the deck's presence list with the pinboard's roster.
   const observationRoom = typeof observation.room === "string" ? observation.room : "";
   const fromCurrentRoom = !observationRoom || observationRoom === chatRoom();
   if ((type === "looked" || type === "who") && presentActors.length > 0 && fromCurrentRoom) state.chatPresent = presentActors;
@@ -3003,11 +3010,12 @@ function applyScopedChatObservation(observation: any) {
   if (type === "entered") present.add(actor);
   if (type === "left") present.delete(actor);
   if (type !== "entered" && type !== "left") return;
-  const summaries = new Map(arrayOfObjects(state.scopedProjection.here.present_actors).map((item) => [String(item.id ?? ""), item]));
+  const summaries = new Map(arrayOfObjects(Array.isArray(state.scopedProjection.here.roster) ? state.scopedProjection.here.roster : state.scopedProjection.here.present_actors).map((item) => [String(item.id ?? ""), item]));
   if (type === "entered" && !summaries.has(actor)) summaries.set(actor, ui.observe(actor) ?? { id: actor, name: actor, props: {}, catalogState: {} });
+  const roster = [...present].map((id) => summaries.get(id) ?? { id, name: id });
   state.scopedProjection.here = {
     ...state.scopedProjection.here,
-    present_actors: [...present].map((id) => summaries.get(id) ?? { id, name: id })
+    roster
   };
   state.chatPresent = [...present];
   ui.ingestSnapshot("here", roomSnapshotObjects(state.scopedProjection.here));
@@ -3219,7 +3227,8 @@ function navigateChatHistory(event: KeyboardEvent, input: HTMLInputElement) {
 
 function setChatPresent(result: any) {
   if (Array.isArray(result)) state.chatPresent = result.map(String);
-  if (Array.isArray(result?.present_actors)) state.chatPresent = idsFromRefsOrSummaries(result.present_actors);
+  else if (Array.isArray(result?.roster)) state.chatPresent = idsFromRefsOrSummaries(result.roster);
+  else if (Array.isArray(result?.present_actors)) state.chatPresent = idsFromRefsOrSummaries(result.present_actors);
 }
 
 function setCurrentChatRoom(room: string) {
@@ -3545,11 +3554,10 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
 }
 
 function applyLookResult(result: any) {
-  const present = Array.isArray(result?.present_actors) ? result.present_actors.map(String) : [];
+  const present = idsFromRefsOrSummaries(Array.isArray(result?.roster) ? result.roster : Array.isArray(result?.present_actors) ? result.present_actors : []);
   if (present.length === 0) return;
-  // `look pinboard` returns the board's own subscribers; clobbering chatPresent
-  // with them hides the chat UI for anyone not also inside the board, since
-  // renderChat treats !present.includes(state.actor) as "you must enter".
+  // `look pinboard` returns the board's own roster; clobbering chatPresent
+  // with it hides the chat UI for anyone not also inside the board.
   const lookedId = typeof result?.id === "string" ? result.id : "";
   if (lookedId && lookedId !== activeChatRoom()) return;
   state.chatPresent = present;
@@ -4494,12 +4502,17 @@ function setPinboardPresent(result: any) {
     ? result
     : Array.isArray(result?.present)
       ? result.present
-      : Array.isArray(result?.present_actors)
-        ? result.present_actors
+      : Array.isArray(result?.roster)
+        ? result.roster
+        : Array.isArray(result?.present_actors)
+          ? result.present_actors
         : [];
   const presentIds = idsFromRefsOrSummaries(present);
   const boardId = pinboardSpace();
-  if (boardId) ui.applyCanonical([{ subject: boardId, props: { subscribers: presentIds } }]);
+  if (boardId) ui.applyCanonical([{
+    subject: boardId,
+    catalogState: { pinboard_presence: Object.fromEntries(presentIds.map((id) => [id, true])) }
+  }]);
   const presentActors = new Set(presentIds);
   for (const actor of Object.keys(state.pinboardViewports)) {
     if (!presentActors.has(actor)) removePinboardViewport(actor);

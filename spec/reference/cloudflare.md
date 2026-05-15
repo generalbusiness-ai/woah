@@ -598,7 +598,7 @@ GET  /api/objects/<id>                  → DO RPC (describe)
 GET  /api/objects/<id>/properties/<n>   → DO RPC (getProp)
 POST /api/objects/<id>/calls/<verb>     → gateway v2 executor + CommitScopeDO
 GET  /api/objects/<id>/log              → DO RPC (readLog)
-GET  /api/objects/<id>/stream           → DO RPC + SSE upgrade
+GET  /api/objects/<id>/stream           → 410 E_GONE (retired)
 POST /api/auth                          → Sessions handler (mints/resumes session)
 GET  /v2/turn-network/ws                → v2 WS upgrade → gateway host
 ```

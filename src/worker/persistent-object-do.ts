@@ -21,8 +21,6 @@
 // What's still deferred to later phases:
 // - Alarms for parked tasks (Phase 4): state.storage.setAlarm + alarm()
 //   handler. Needed for FORK/SUSPEND wakeups on CF.
-// - SSE streams (/api/objects/{id}/stream) — return 501. Browser uses WS;
-//   SSE matters for HTTP-only agent integrations.
 // - Authoring REST endpoints (/api/compile, /api/install, /api/property,
 //   /api/property/value, /api/authoring/objects/{create,move,chparent}) — the
 //   IDE tab can read on CF but not author.

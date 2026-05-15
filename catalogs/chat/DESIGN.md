@@ -88,7 +88,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:tell(recipient, text)` | obj, str | Directed message; emits `told {from: actor, to: recipient, text}` to recipient only. |
 | `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
 | `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
-| `:who()` rxd | — | Returns the present-actor list and emits a private `who` observation to the caller, including both compatibility `present_actors` and canonical `roster` rows. |
+| `:who()` rxd | — | Returns canonical roster rows and emits a private `who` observation to the caller with `roster`. |
 | `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: physical occupants plus awake/idle/sleeping status. |
 | `:live_audience(observation?)` rxd | map? | Returns the live session audience for delivery using the substrate observation routing rules. |
 | `:enter(actor?)` | obj? | Moves the calling session into the room; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
@@ -172,7 +172,7 @@ declare_event $conversational "told"    { source: obj, from:  obj, to:   obj, te
 declare_event $conversational "entered" { source: obj, actor: obj, room: obj, origin?: obj, exit?: str, text: str };
 declare_event $conversational "left"    { source: obj, actor: obj, room: obj, destination?: obj, exit?: str, text: str };
 declare_event $conversational "looked"  { source: obj, actor: obj, to: obj, room: obj, text: str, look: map };
-declare_event $conversational "who"     { source: obj, actor: obj, to: obj, room: obj, present_actors: list<obj>, text: str };
+declare_event $conversational "who"     { source: obj, actor: obj, to: obj, room: obj, roster: list<map>, text: str };
 declare_event $conversational "huh"     { source: obj, actor: obj, text: str, reason?: str };
 ```
 
@@ -281,7 +281,7 @@ A transient browser host that:
 
 1. Authenticates as a `$player` (existing flow, [identity.md](../../spec/semantics/identity.md)).
 2. Calls `target_room:enter()` to join.
-3. Subscribes to the room's stream (`/api/objects/{room}/stream`).
+3. Opens the v2 browser turn network for live frames and uses `/api/objects/{room}/log` for durable backfill.
 4. Renders observations as text lines:
    - `said {actor, text}` → `actor.name says, "text"`
    - `emoted {actor, text}` → `actor.name text`

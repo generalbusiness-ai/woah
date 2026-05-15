@@ -93,6 +93,23 @@ describe("scoped client projection", () => {
     expect((result.body as any).props).toBeDefined();
   });
 
+  it("retires REST object SSE streams", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:retired-stream");
+    const result = await handleRestProtocolRequest(get("/api/objects/the_chatroom/stream"), {
+      world,
+      requireSession: () => session,
+      authenticateToken: () => session,
+      broadcastApplied: async () => undefined,
+      broadcastLiveEvents: async () => undefined
+    });
+
+    expect(result.handled).toBe(true);
+    if (!result.handled || "raw" in result) throw new Error("unexpected raw protocol result");
+    expect(result.status).toBe(410);
+    expect(result.body).toMatchObject({ error: { code: "E_GONE" } });
+  });
+
   it("includes enriched movement results on sequenced applied frames", async () => {
     const world = createWorld();
     const session = world.auth("guest:scoped-sequenced-move");
@@ -116,7 +133,7 @@ describe("scoped client projection", () => {
       }
     });
     const here = (frame.result as Record<string, any>).here;
-    expect(here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(here.roster.map((actor: { id: string }) => actor.id)).toContain(session.actor);
     expect(here.exits.some((exit: { direction?: string }) => exit.direction === "west")).toBe(true);
   });
 
@@ -189,12 +206,12 @@ describe("scoped client projection", () => {
       id: "the_chatroom",
       name: "Living Room"
     });
-    expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(body.here.roster.map((actor: { id: string }) => actor.id)).toContain(session.actor);
     expect(body.here.exits.some((exit: { direction?: string }) => exit.direction === "south")).toBe(true);
     expect(new Set(body.here.exits.map((exit: { id: string }) => exit.id)).size).toBe(body.here.exits.length);
     expect(body.here.props.secret_room_note).toBeNull();
     expect(body.here.props.session_subscribers).toBeUndefined();
-    expect(body.here.present_actors.every((actor: { props?: unknown }) => actor.props === undefined)).toBe(true);
+    expect(body.here.roster.every((actor: { props?: unknown }) => actor.props === undefined)).toBe(true);
     expect(Array.isArray(body.inventory)).toBe(true);
   });
 
@@ -284,9 +301,10 @@ describe("scoped client projection", () => {
     if (entered.op !== "result") return;
     expect(entered.result).toMatchObject({
       room: "the_pinboard",
-      present: expect.arrayContaining([session.actor]),
-      present_actors: expect.arrayContaining([session.actor])
+      roster: expect.arrayContaining([expect.objectContaining({ id: session.actor })])
     });
+    expect((entered.result as Record<string, unknown>).present).toBeUndefined();
+    expect((entered.result as Record<string, unknown>).present_actors).toBeUndefined();
     expect((entered.result as Record<string, unknown>).here_request).toBeUndefined();
     expect((entered.result as Record<string, unknown>).look_deferred).toBeUndefined();
     expect((entered.result as Record<string, unknown>).here).toBeUndefined();
@@ -342,7 +360,7 @@ describe("scoped client projection", () => {
     expect(moved.op).toBe("result");
     if (moved.op !== "result") return;
     expect(roomB.getProp("the_deck", "subscribers")).not.toContain(actor);
-    expect((moved.result as any).here.present_actors.map((item: { id: string }) => item.id)).toContain(actor);
+    expect((moved.result as any).here.roster.map((item: { id: string }) => item.id)).toContain(actor);
     expect(effects.map((effect) => effect.kind)).toContain("space_subscriber");
   });
 
@@ -356,6 +374,8 @@ describe("scoped client projection", () => {
     remote.ensureSessionForActor(session.id, session.actor, session.tokenClass, session.expiresAt, "the_deck");
     remote.setSpaceSubscriber("the_deck", session.actor, true, session.id);
     remote.setActorPresence(session.actor, "the_deck", true, session.id);
+    remote.object(session.actor).location = "the_deck";
+    remote.object("the_deck").contents.add(session.actor);
     home.sessions.get(session.id)!.activeScope = "the_deck";
     const worlds = new Map<string, WooWorld>([
       ["home", home],
@@ -373,7 +393,7 @@ describe("scoped client projection", () => {
     expect(body.session.current_location).toBe("the_deck");
     expect(body.cursor.spaces.the_deck.next_seq).toBe(1);
     expect(body.here).toMatchObject({ id: "the_deck", name: "Deck" });
-    expect(body.here.present_actors.map((actor: { id: string }) => actor.id)).toContain(session.actor);
+    expect(body.here.roster.map((actor: { id: string }) => actor.id)).toContain(session.actor);
   });
 
   it("only degrades /api/me remote here snapshots for read availability errors", async () => {
@@ -454,7 +474,7 @@ describe("scoped client projection", () => {
     actorHost.setHostBridge(new LocalHostBridge("actor-host", worlds, routes));
 
     const snapshot = await roomHost.roomSnapshotForActor("$wiz", "the_deck");
-    expect(snapshot.present_actors.map((actor: { id: string }) => actor.id)).not.toContain(remoteActor);
+    expect(snapshot.roster.map((actor: { id: string }) => actor.id)).not.toContain(remoteActor);
     expect(roomHost.propOrNull("the_deck", "subscribers")).toContain(remoteActor);
   });
 

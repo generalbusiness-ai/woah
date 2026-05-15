@@ -7,8 +7,6 @@ import {
   type Message,
   type ObjRef,
   type Session,
-  type SpaceLogEntry,
-  type Observation,
   type WooValue
 } from "./types";
 import { localCatalogStatuses, localCatalogUiIndex } from "./local-catalogs";
@@ -37,7 +35,6 @@ export type RestProtocolHost = {
   onSessionsEnded?(sessions: Session[]): void | Promise<void>;
   installTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
   updateTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
-  openStream?(request: RestProtocolRequest, rawTarget: string, target: ObjRef, session: Session): RestProtocolResult | Promise<RestProtocolResult>;
   resolveObject?(id: string, session: Session, request: RestProtocolRequest): ObjRef;
   resolveActor?(request: RestProtocolRequest, actorValue: unknown, session: Session): ObjRef;
   executeTurn?(
@@ -308,8 +305,12 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
     }
 
     if (request.method === "GET" && route.rest.length === 1 && route.rest[0] === "stream") {
-      if (host.openStream) return host.openStream(request, route.id, target, session);
-      return jsonProtocol({ error: { code: "E_NOT_IMPLEMENTED", message: "SSE streams are not available on this host" } }, 501);
+      return jsonProtocol({
+        error: {
+          code: "E_GONE",
+          message: "Object SSE streams have been retired; use the v2 browser turn network for live frames and /log for durable backfill."
+        }
+      }, 410);
     }
   } catch (err) {
     return errorProtocol(normalizeError(err));
@@ -410,15 +411,6 @@ export function restPropertyInfo(world: WooWorld, obj: ObjRef, name: string): Re
       has_value: true
     };
   }
-}
-
-export function appliedFromLogEntry(entry: SpaceLogEntry): AppliedFrame & { ts: number } {
-  const observations: Observation[] = entry.observations?.length
-    ? entry.observations
-    : entry.applied_ok
-      ? []
-      : [{ type: "$error", code: entry.error?.code ?? "E_INTERNAL", message: entry.error?.message ?? entry.error?.code ?? "error", value: entry.error?.value ?? null }];
-  return { op: "applied", space: entry.space, seq: entry.seq, message: entry.message, observations, ts: entry.ts };
 }
 
 export function statusForError(error: ErrorValue): number {

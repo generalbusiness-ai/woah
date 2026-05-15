@@ -7,7 +7,7 @@ status: implemented
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
-An HTTP+SSE alternative to the browser turn network ([v2-turn-network.md](v2-turn-network.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
+An HTTP alternative to the browser turn network ([v2-turn-network.md](v2-turn-network.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
 
 The two protocol surfaces target the same model. The browser turn network is the right shape for clients that maintain long-lived presence and want push observations. REST is the right shape for agents and tooling that operate in iterations, scripts that want a single request-response, and integrations behind HTTP gateways. Either or both may be exposed by an implementation.
 
@@ -26,10 +26,9 @@ GET   /api/objects/{id-or-name}/ui-snapshot?surface=S
 GET   /api/objects/{id-or-name}/properties/{name}
 POST  /api/objects/{id-or-name}/calls/{verb}
 GET   /api/objects/{id-or-name}/log?from=N&limit=M
-GET   /api/objects/{id-or-name}/stream
 ```
 
-Eleven endpoints. Everything is an object; identifiers are object refs,
+Ten endpoints. Everything is an object; identifiers are object refs,
 corenames, or implementation-local object ids.
 
 ---
@@ -236,35 +235,22 @@ GET /api/objects/{id-or-name}/log?from=N&limit=M
 returns: { messages: [...], next_seq, has_more }
 ```
 
-If `{id-or-name}` is a `$space`-descended object, returns the message log per [events.md §12.8](../semantics/events.md#128-sequenced-calls-with-gap-recovery). Each entry carries the accepted message, final outcome, and applied observations so an HTTP/SSE client can reconstruct the same applied frames it would have received live. Pagination via `from` (default 1) and `limit` (default 100, max 1000).
+If `{id-or-name}` is a `$space`-descended object, returns the message log per [events.md §12.8](../semantics/events.md#128-sequenced-calls-with-gap-recovery). Each entry carries the accepted message, final outcome, and applied observations so an HTTP client can reconstruct applied history after reconnect or polling gaps. Pagination via `from` (default 1) and `limit` (default 100, max 1000).
 
 If the target is not a space, returns `404 E_NOTAPPLICABLE`.
 
 ---
 
-## R8. Stream (SSE)
+## R8. Retired object streams
 
 ```
 GET /api/objects/{id-or-name}/stream
-returns: text/event-stream
+returns: 410 { error: { code: "E_GONE", ... } }
 ```
 
-Server-sent events. Two SSE event types are emitted:
-
-- **`event: applied`** — a sequenced applied frame. Replayable; carries `seq`. JSON body has the same public applied-frame shape delivered on the v2 applied-frame plane.
-- **`event: event`** — a live observation from a direct call. Not replayable; no `seq`. JSON body is `{observation: Map}` per the v2 live plane. Per [events.md §12.6](../semantics/events.md#126-observation-durability-follows-invocation-route), these are best-effort: rate-limited, coalesced, dropped on backpressure.
-
-Stream semantics:
-
-- For a `$space`: applied frames + live observations the requesting actor is authorized to see (presence-derived, per [v2-turn-network.md §VTN9](v2-turn-network.md#vtn9-catch-up-and-applied-frames) and [§VTN13](v2-turn-network.md#vtn13-live-plane)).
-- For a `$player` (or `$actor`): observations where the object appears as `source` or `target`, including applied frames of spaces the player is observing.
-- For `$me`: the calling actor's full observation feed across all observed spaces.
-
-The SSE event id is `<space-id>:<seq>` for applied frames; live `event` SSE entries omit the id (they have no resume point — by design, they are not replayable). **`Last-Event-ID` resume is supported only for single-space streams** (`/objects/{space}/stream`) and only resumes the applied stream. Live observations between disconnect and reconnect are lost; they are live-only by contract. The server resumes applied from the requested seq, or returns `410 E_SSE_TOO_OLD` directing the client to use `/log` for backfill before restarting.
-
-For multi-space streams (`/objects/$me/stream` and any `/objects/{actor}/stream`), `Last-Event-ID` is ignored on reconnect — a single id cannot encode cursors across N spaces. A reconnecting multi-space client must fetch `/log` per space it cares about (using locally tracked per-space `last_seq` values) before resuming the live stream. This trades resume convenience for correctness; per-space gap recovery is the right granularity anyway.
-
-A future variant may define a cursor-map header (e.g., `X-Woo-Cursors: <base64-encoded {space: seq} map>`) for multi-space resume; not part of the baseline REST contract.
+The historical object-scoped SSE endpoint is retired. Implementations return
+`410 E_GONE`. Long-lived live delivery belongs to the v2 browser turn network;
+durable gap recovery belongs to `/api/objects/{id-or-name}/log`.
 
 ---
 

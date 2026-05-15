@@ -12,7 +12,7 @@ status: implemented
 This split exists for three reasons:
 
 - **Custom sequencers** (event-sourced documents, CRDT-based shared state, replicated logs for v2 federation) become possible without runtime changes.
-- **Wire and REST contracts** can speak in terms of "sequenced log read/append," not specifically "space" — any subclass that exposes the primitive participates in REST log paging and SSE streams.
+- **Wire and REST contracts** can speak in terms of "sequenced log read/append," not specifically "space" — any subclass that exposes the primitive participates in REST log paging.
 - **For v1, `$space` remains the workhorse subclass.** The split is a layering, not a behavior change. Existing call lifecycle, snapshot, and replay rules carry forward, just attributed to the right layer.
 
 ---
@@ -135,7 +135,7 @@ Subclass dispatch errors (`E_VERBNF`, `E_PERM`, `E_INVARG`, `E_TRANSITION`, etc.
 A reasonable alternative is to expose only an `ATOMIC_INCR(prop)` opcode and let user code manage its own log storage. The reason `$sequenced_log` is a primitive instead:
 
 - **Durability + counter must be coordinated.** A user-managed log appended *after* the increment loses messages on storage failure between steps. Bundling them into a single host primitive closes the seam.
-- **Read paging is wire-contract.** Standardizing it on a class avoids per-subclass schema divergence in REST and SSE.
+- **Read paging is wire-contract.** Standardizing it on a class avoids per-subclass schema divergence in REST.
 - **Storage shape is implementation-private.** Implementations may store the log in a host-specific way (per-DO SQLite table, per-anchor-cluster file, eventually CRDT) without changing semantics. A user-managed log would lock the storage shape into user code.
 
 `ATOMIC_INCR` may still appear as a separate opcode for non-log uses (rate-limit counters, distributed IDs, gensym) but is not how seq allocation works for a log.
