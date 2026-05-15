@@ -74,7 +74,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": [] } },
+          "arg_spec": { "args": [], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": [], "persistence": "live" } },
           "source": "verb :look() rxd { let view = this:look_self(); let text = \"\"; if (typeof(view) == \"map\" && has(view, \"description\")) { text = to_string(view[\"description\"]); } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: location(this), target: this, text: text, look: view, ts: now() }); return view; }"
         },
         {

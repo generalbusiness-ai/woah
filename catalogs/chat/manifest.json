@@ -753,7 +753,7 @@
           "arg_spec": {
             "args": []
             ,
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
           "source": "verb :look() rxd { return this:look_at(this); }"
         },
@@ -772,7 +772,7 @@
             "args": [
               "target"
             ],
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"] }
+            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "live" }
           },
           "source": "verb :look_at(target) rxd { set_task_perms(caller_perms()); let view = dispatch(target, \"look_self\", []); let text = \"\"; if (typeof(view) == \"map\") { if (has(view, \"description\") && view[\"description\"]) { text = view[\"description\"]; } if (has(view, \"present_actors\")) { let names = \"\"; try { let present = []; for who in view[\"present_actors\"] { if (who != actor) { present = present + [who]; } } names = str_join(collect_prop(present, \"name\"), \", \"); } except err { names = \"\"; } if (!names) { names = \"nobody\"; } if (text) { text = text + \" \"; } text = text + \"Present: \" + names + \".\"; } if (has(view, \"contents\")) { let things = \"\"; /* contents are preformatted by look_self */ for item in view[\"contents\"] { if (things) { things = things + \", \"; } if (typeof(item) == \"map\" && has(item, \"title\")) { things = things + item[\"title\"]; } else { things = things + to_string(item); } } if (things) { if (text) { text = text + \" \"; } text = text + \"You see \" + things + \".\"; } } if (has(view, \"mood\") && view[\"mood\"]) { if (text) { text = text + \" \"; } text = text + \"Mood: \" + view[\"mood\"] + \".\"; } } else { text = to_string(view); } observe({ type: \"looked\", actor: actor, to: actor, room: this, target: target, text: text, look: view, ts: now() }); return view; }"
         },
@@ -784,7 +784,7 @@
           "arg_spec": {
             "args": []
             ,
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
           "source": "verb :who() rxd { observe({ type: \"who\", actor: actor, to: actor, room: this, present_actors: this.subscribers, text: \"Present.\", ts: now() }); return this.subscribers; }",
           "implementation": {
@@ -905,7 +905,8 @@
           "arg_spec": {
             "args": [
               "text"
-            ]
+            ],
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "live" }
           },
           "source": "verb :command_plan(input) rxd { return $match:plan_command(input, this); }"
         },
