@@ -18,6 +18,7 @@ import {
   receiveShadowBrowserEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
   setShadowBrowserSessionToken,
+  shadowLiveEventsForTranscript,
   shadowBrowserEnvelope,
   shadowBrowserSessionBearer,
   shadowBrowserTransportHello,
@@ -460,6 +461,38 @@ describe("shadow browser node shim", () => {
     });
     expect(first.cache.applied_frames).toHaveLength(0);
     expect(second.cache.applied_frames).toHaveLength(0);
+  });
+
+  it("routes movement transcript live events to each observation source room", () => {
+    const anchor = createWorld();
+    const moverSession = anchor.auth("guest:browser-move-source");
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-move-relay",
+      scope: "the_chatroom",
+      serialized: anchor.exportWorld()
+    });
+    const mover = createShadowBrowserNode({
+      node: "browser-move-source",
+      scope: "the_chatroom",
+      actor: moverSession.actor,
+      session: moverSession.id,
+      relay
+    });
+    const events = shadowLiveEventsForTranscript(mover, {
+      hash: "browser-move-transcript",
+      scope: "the_deck",
+      call: { id: "browser-move-west", actor: moverSession.actor, target: "the_deck", verb: "west", args: [] },
+      observations: [
+        { type: "left", source: "the_deck", actor: moverSession.actor },
+        { type: "entered", source: "the_chatroom", actor: moverSession.actor }
+      ],
+      creates: [],
+      writes: [],
+      log: []
+    } as any);
+
+    expect(events.map((event) => event.audience)).toEqual([{ scope: "the_deck" }, { scope: "the_chatroom" }]);
+    expect(events.map((event) => event.scope)).toEqual(["the_deck", "the_deck"]);
   });
 
   it("delivers accepted commits to subscribed browser nodes as state-plane deltas", async () => {

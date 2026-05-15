@@ -518,14 +518,18 @@ export function shadowLiveEventsForTranscript(browser: ShadowBrowserNode, transc
   return transcript.observations.map((observation, index) => {
     const actor = typeof observation?.actor === "string" ? observation.actor : transcript.call.actor;
     const scope = transcript.scope;
+    const source = shadowLiveEventSource(observation, transcript);
     const coalesce = typeof observation?.coalesce_key === "string" ? observation.coalesce_key : undefined;
     return {
       kind: "woo.live.event.shadow.v1",
       id: `${browser.relay.node}:live:${transcript.hash}:${index}`,
-      source: shadowLiveEventSource(observation, transcript),
+      source,
       actor,
       scope,
-      audience: { scope },
+      // A single movement transcript can emit observations for both the source
+      // and destination rooms. Route live delivery by observation source while
+      // keeping the original transcript scope for ordering/debug metadata.
+      audience: { scope: source },
       observation,
       ...(coalesce ? { coalesce } : {})
     };
