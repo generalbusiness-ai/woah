@@ -28,18 +28,19 @@ function testWooContext(names: Record<string, string> = {}): WooContext {
 }
 
 describe("bundled catalog UI components", () => {
-  it("keeps the chat-shell-enabled layouts vertically consistent across tools", () => {
-    // Chat-shell sizing now goes through the shared `.split.has-space-chat`
-    // primitive (used by dubspace + pinboard via `.split.split--side-fixed`)
-    // and the tasks workspace's own `.woo-tasks-workspace.has-space-chat`
-    // rule. Both must resolve to `height: 100%` so the layout fills the
-    // grid row that `.space-chat-shell` reserves for it.
+  it("keeps the ambient-companion-shell-enabled layouts vertically consistent across tools", () => {
+    // Ambient-companion-shell sizing now goes through the shared
+    // `.split.has-ambient-companion` primitive (used by dubspace + pinboard
+    // via `.split.split--side-fixed`) and the tasks workspace's own
+    // `.woo-tasks-workspace.has-ambient-companion` rule. Both must resolve
+    // to `height: 100%` so the layout fills the grid row that
+    // `.ambient-companion-shell` reserves for it.
     const css = readFileSync(resolve(process.cwd(), "src/client/styles.css"), "utf8");
-    const splitMatch = css.match(/\.split\.has-space-chat\s*\{([\s\S]*?)\}/);
-    const tasksMatch = css.match(/\.woo-tasks-workspace\.has-space-chat\s*\{([\s\S]*?)\}/);
+    const splitMatch = css.match(/\.split\.has-ambient-companion\s*\{([\s\S]*?)\}/);
+    const tasksMatch = css.match(/\.woo-tasks-workspace\.has-ambient-companion\s*\{([\s\S]*?)\}/);
 
-    expect(splitMatch, "split has-space-chat primitive present").not.toBeNull();
-    expect(tasksMatch, "tasks has-space-chat rule present").not.toBeNull();
+    expect(splitMatch, "split has-ambient-companion primitive present").not.toBeNull();
+    expect(tasksMatch, "tasks has-ambient-companion rule present").not.toBeNull();
 
     const splitBlock = splitMatch?.[1] ?? "";
     const tasksBlock = tasksMatch?.[1] ?? "";
@@ -1493,8 +1494,8 @@ describe("bundled catalog UI components", () => {
     };
 
     expect(element.querySelector("h1")?.textContent).toBe("Taskboard");
-    expect(element.querySelector('[data-space-chat-shell="the_taskboard"]')).not.toBeNull();
-    expect(element.querySelector("[data-tool-space-chat]")).not.toBeNull();
+    expect(element.querySelector('[data-ambient-companion-shell="the_taskboard"]')).not.toBeNull();
+    expect(element.querySelector("[data-ambient-companion]")).not.toBeNull();
     // The status-filter lozenges live in the kanban-scoped filter bar, not
     // in the registry header — they apply only to the kanban view.
     expect(element.querySelector(".woo-tasks-kanban-header .woo-tasks-status-nav")).toBeNull();
@@ -1650,7 +1651,7 @@ describe("bundled catalog UI components", () => {
       policiesMap: {}
     };
 
-    const slot = element.querySelector<HTMLElement>("[data-tool-space-chat]");
+    const slot = element.querySelector<HTMLElement>("[data-ambient-companion]");
     const existingPanel = document.createElement("woo-space-chat-panel");
     existingPanel.setAttribute("data-space-chat-panel", "true");
     existingPanel.setAttribute("data-space-chat-space", "the_taskboard");

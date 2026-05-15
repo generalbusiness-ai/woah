@@ -115,6 +115,52 @@
   --shadow-pin: 0 4px 10px rgba(0, 0, 0, 0.55);
   --shadow-tooltip: 0 6px 16px rgba(0, 0, 0, 0.6);
   --shadow-zoom: 0 4px 12px rgba(0, 0, 0, 0.5);
+
+  /* ---- structural tokens (additive, see notes/2026-05-15-ui-shell-brief.md §4) */
+  /* Scales below are derived from the audit of inline literals across catalog */
+  /* UIs and styles.css. Newly-written rules should consume these tokens       */
+  /* instead of inlining literal values. Existing rules will migrate in a     */
+  /* later pass (no mass replace in this commit).                              */
+
+  /* spacing — derived clusters: 0.25 / 0.45-0.55 / 0.7-0.8 / 1 / 1.5 / 2 rem */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  /* type scale — derived clusters: 0.72 / 0.82 / 1 / 1.25 / 1.5 rem */
+  --text-xs: 0.72rem;
+  --text-sm: 0.82rem;
+  --text-md: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5rem;
+
+  /* weights — dominant body/medium are 400/600; 700 reserved for emphasis */
+  --weight-regular: 400;
+  --weight-medium: 600;
+  --weight-bold: 700;
+
+  /* line height */
+  --leading-tight: 1;
+  --leading-snug: 1.25;
+  --leading-relaxed: 1.45;
+
+  /* radii — dominant: 6px cards, 4px inputs, 10px panels, 999px pills */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+  --radius-circle: 50%;
+
+  /* motion */
+  --motion-fast: 120ms;
+  --motion-medium: 240ms;
+  --motion-slow: 480ms;
+  --ease-default: ease;
+  --ease-decelerate: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 :root[data-theme="light"] {
@@ -359,7 +405,8 @@ a:hover {
 /*   --split-gap    column gap                                               */
 /*   --split-align  align-items                                              */
 /* `.split--side-fixed` switches to a 1fr + fixed sidebar (use --split-side).*/
-/* `.has-space-chat` lets the layout fill its parent for chat-anchored views.*/
+/* `.has-ambient-companion` lets the layout fill its parent when a workspace
+   declares an ambient-companion slot below it (e.g. the chat mini-panel).   */
 .split {
   display: grid;
   grid-template-columns: var(--split-cols, minmax(260px, 0.9fr) minmax(360px, 1.1fr));
@@ -372,7 +419,7 @@ a:hover {
   --split-align: stretch;
 }
 
-.split.has-space-chat {
+.split.has-ambient-companion {
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -1443,11 +1490,11 @@ input[type="range"] {
   min-height: 0;
 }
 
-.pinboard-layout.has-space-chat {
+.pinboard-layout.has-ambient-companion {
   height: auto;
 }
 
-.space-chat-shell {
+.ambient-companion-shell {
   height: calc(100dvh - 5.25rem);
   min-height: 0;
   display: grid;
@@ -1582,7 +1629,7 @@ input[type="range"] {
   grid-template-rows: auto;
 }
 
-.space-chat-shell:has(.space-chat-panel.is-collapsed) {
+.ambient-companion-shell:has(.space-chat-panel.is-collapsed) {
   grid-template-rows: minmax(0, 1fr) auto;
 }
 
@@ -1616,7 +1663,7 @@ input[type="range"] {
   min-height: 420px;
 }
 
-.pinboard-layout:not(.has-space-chat) .pinboard-stage-panel {
+.pinboard-layout:not(.has-ambient-companion) .pinboard-stage-panel {
   min-height: 0;
   height: calc(100dvh - 5.25rem - var(--space-chat-h, 280px) - 0.8rem - 2.85rem - 0.25rem);
 }
@@ -1892,7 +1939,7 @@ input[type="range"] {
   overflow: hidden;
 }
 
-.woo-tasks-workspace.has-space-chat {
+.woo-tasks-workspace.has-ambient-companion {
   height: 100%;
 }
 

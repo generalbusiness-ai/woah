@@ -1539,7 +1539,7 @@ export class WooTasksKanbanElement extends HTMLElement {
             <div class="woo-tasks-kanban-columns">${columnsHtml}</div>
           </section>`;
     const workspace = `
-      <section class="woo-tasks-workspace has-space-chat" data-space-chat-layout="${escapeHtml(registryId)}">
+      <section class="woo-tasks-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(registryId)}">
         <div class="woo-tasks-workarea">
           <div class="woo-tasks-board${this.adminOpen ? " has-admin" : ""}">
             ${boardContent}
@@ -1549,28 +1549,28 @@ export class WooTasksKanbanElement extends HTMLElement {
       </section>
     `;
     const existingChatPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap; remove: () => void }>(
-      "[data-space-chat-shell] [data-space-chat-panel]"
+      "[data-ambient-companion-shell] [data-space-chat-panel]"
     );
     if (existingChatPanel && existingChatPanel.dataset.spaceChatSpace !== registryId) {
       existingChatPanel.remove();
     }
     const preservedPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap; remove: () => void }>(
-      "[data-space-chat-shell] [data-space-chat-panel]"
+      "[data-ambient-companion-shell] [data-space-chat-panel]"
     );
-    // Toolbar lives at the top of the custom element, outside the chat shell
-    // — same structure as pinboard (`<section class="toolbar pinboard-toolbar">`
-    // before `<section class="space-chat-shell">`). Putting it inside the
-    // shell would push the toolbar inside the chat-grid and shift y-position
+    // Toolbar lives at the top of the custom element, outside the ambient-companion
+    // shell — same structure as pinboard (`<section class="toolbar pinboard-toolbar">`
+    // before `<section class="ambient-companion-shell">`). Putting it inside the
+    // shell would push the toolbar inside the companion-grid and shift y-position
     // versus other tools.
     this.innerHTML = `
       ${this.renderHeader(registryName || "Tasks")}
-      <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(registryId)}">
+      <section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(registryId)}">
         ${workspace}
-        <div data-tool-space-chat></div>
+        <div data-ambient-companion></div>
       </section>
     `;
     if (preservedPanel) {
-      const slot = this.querySelector<HTMLElement>("[data-tool-space-chat]");
+      const slot = this.querySelector<HTMLElement>("[data-ambient-companion]");
       if (slot) slot.append(preservedPanel);
     }
     this.dispatchEvent(new CustomEvent("woo-tasks-rendered", { bubbles: true }));
