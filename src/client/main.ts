@@ -28,7 +28,6 @@ type AuthStatus = "checking" | "anonymous" | "authenticated";
 type AuthMethod = "guest" | "apikey";
 
 type AppState = {
-  socket?: WebSocket;
   actor?: string;
   session?: string;
   authStatus: AuthStatus;
@@ -177,11 +176,7 @@ const spaceChatHeightsKey = "woo.spaceChat.heights";
 const spaceChatCollapsedKey = "woo.spaceChat.collapsed";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
-let scopedProjectionEnabled = (() => {
-  const params = new URLSearchParams(location.search);
-  if (params.get("api") === "state" || params.has("legacyState")) return false;
-  return true;
-})();
+const scopedProjectionEnabled = true;
 const chatHistoryLimit = 80;
 const drumVoices = [
   { id: "kick", label: "Kick" },
@@ -203,9 +198,9 @@ const pendingCommands = new Map<string, { space: string; text: string; action?: 
 let pinboardNotesRefreshPending = false;
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
+let connectInFlight: Promise<void> | null = null;
 const reconnectBaseDelayMs = 500;
 const reconnectMaxDelayMs = 5000;
-const heartbeatIntervalMs = 25_000;
 const observationDisplayLimit = 20;
 const PINBOARD_MIN_ZOOM = 0.35;
 const PINBOARD_MAX_ZOOM = 2.75;
@@ -229,8 +224,6 @@ const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
 };
 let reconnectDelayMs = reconnectBaseDelayMs;
 let reconnectTimer: number | undefined;
-let heartbeatTimer: number | undefined;
-let lastPongAt = 0;
 let pinboardViewportTimer: number | undefined;
 let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
@@ -271,83 +264,29 @@ window.addEventListener("popstate", () => {
 
 function connect() {
   if (state.authStatus !== "authenticated") return;
-  if (state.socket?.readyState === WebSocket.OPEN || state.socket?.readyState === WebSocket.CONNECTING) return;
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${location.host}/ws`);
-  state.socket = socket;
-  socket.addEventListener("open", () => {
-    reconnectDelayMs = reconnectBaseDelayMs;
-    lastPongAt = Date.now();
-    const token = authToken();
-    if (!token) {
-      socket.close();
-      return;
-    }
-    const cursor = scopedProjectionEnabled ? state.scopedProjection?.cursor : undefined;
-    sendSocket(socket, cursor ? { op: "auth", token, cursor } : { op: "auth", token });
-    startHeartbeat(socket);
-  });
-  socket.addEventListener("message", async (event) => {
-    const frame = JSON.parse(event.data);
-    if (frame.op === "pong") {
-      lastPongAt = Date.now();
-      if (typeof frame.server_time === "number") state.clockOffset = frame.server_time - Date.now();
-      return;
-    }
-    if (frame.op === "session") {
-      state.actor = frame.actor;
-      state.session = frame.session;
-      storeSession(frame.session);
-      projectionFiller.reset();
+  if (connectInFlight) return;
+  connectInFlight = (async () => {
+    const session = readStorage(sessionKey);
+    if (!session) {
+      clearSession();
+      state.authStatus = "anonymous";
       render();
-      try {
-        await refresh();
-      } catch {
-        render();
-      }
-      requestReplay(socket);
+      return;
+    }
+    state.session = session;
+    projectionFiller.reset();
+    render();
+    try {
+      await refresh();
       ensureV2BrowserWorker();
-      if (!scopedProjectionEnabled && shouldAutoEnterDefaultChatRoom()) ensureSpacePresence(chatRoom(), () => render(), () => render());
+      syncV2BrowserWorkerScope();
+      reconnectDelayMs = reconnectBaseDelayMs;
+    } catch (err) {
+      console.warn("initial v2 projection failed", err);
+      scheduleReconnect();
     }
-    if (frame.op === "applied") {
-      receiveAppliedFrame(frame);
-    }
-    if (frame.op === "event") {
-      ui.ingestLiveObservation(frame.observation);
-      receiveLiveEvent(frame.observation);
-    }
-    if (frame.op === "result") receiveDirectResultFrame(frame);
-    if (frame.op === "task") {
-      state.observations.unshift({ task: frame.task, space: frame.space, observations: frame.observations });
-      trimObservations();
-      scheduleLegacyStateRefresh();
-      render();
-    }
-    if (frame.op === "replay") {
-      for (const entry of frame.entries ?? []) {
-        if (scopedProjectionEnabled && Array.isArray(entry?.observations)) {
-          ui.ingestAppliedFrame({ op: "applied", seq: entry.seq, space: frame.space, observations: entry.observations });
-          for (const observation of entry.observations) if (isChatObservation(observation)) receiveChatEvent(observation, false);
-        }
-        state.observations.unshift({ seq: entry.seq, space: frame.space, replay: true, message: entry.message, error: entry.error ?? null });
-        rememberSeq(frame.space, entry.seq);
-      }
-      trimObservations();
-      scheduleLegacyStateRefresh();
-      render();
-    }
-    if (frame.op === "error") receiveErrorFrame(frame, socket);
-  });
-  socket.addEventListener("close", () => {
-    if (state.socket !== socket) return;
-    stopHeartbeat();
-    pendingDirect.clear();
-    pendingCommands.clear();
-    pendingFrameErrors.clear();
-    scheduleReconnect();
-  });
-  socket.addEventListener("error", () => {
-    if (state.socket === socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+  })().finally(() => {
+    connectInFlight = null;
   });
 }
 
@@ -360,8 +299,7 @@ function ensureV2BrowserWorker() {
   if (!("Worker" in window) || !("indexedDB" in window)) return;
   const token = authToken();
   if (!token) return;
-  // The v2 worker owns the durable browser-side cache and reconnect loop. The
-  // legacy `/ws` UI path remains active while v2 reaches feature parity.
+  // The v2 worker owns the durable browser-side cache and reconnect loop.
   v2BrowserWorker = new Worker(new URL("./v2-browser-worker.ts", import.meta.url), { type: "module" });
   if (v2TestHooksEnabled) (window as unknown as { __wooV2BrowserWorker?: Worker }).__wooV2BrowserWorker = v2BrowserWorker;
   v2BrowserWorker.addEventListener("message", (event) => {
@@ -392,9 +330,8 @@ function ensureV2BrowserWorker() {
         receiveLiveEvent(observation);
       }
     }
-    // Frame/error messages are exposed now so the worker-cache wire path can be
-    // inspected during the migration; UI reducers will consume them directly
-    // once the legacy `/ws` path is retired.
+    // Frame/error messages are exposed so the worker-cache wire path can be
+    // inspected without depending on transport-specific browser code.
     if (event.data?.kind === "frame") {
       window.dispatchEvent(new CustomEvent("woo.v2.frame", { detail: event.data.envelope }));
       console.debug("woo.v2.frame", event.data.envelope);
@@ -550,21 +487,6 @@ function desiredV2BrowserScope(): string {
   return activeChatRoom() || state.actor || "";
 }
 
-function sendSocket(socket: WebSocket, frame: Record<string, unknown>) {
-  if (socket.readyState !== WebSocket.OPEN) return false;
-  socket.send(JSON.stringify(frame));
-  return true;
-}
-
-function sendFrame(frame: Record<string, unknown>) {
-  const socket = state.socket;
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    scheduleReconnect();
-    return false;
-  }
-  return sendSocket(socket, frame);
-}
-
 function scheduleReconnect() {
   if (state.authStatus !== "authenticated") return;
   if (reconnectTimer !== undefined) return;
@@ -573,30 +495,6 @@ function scheduleReconnect() {
     connect();
   }, reconnectDelayMs);
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, reconnectMaxDelayMs);
-}
-
-function startHeartbeat(socket: WebSocket) {
-  stopHeartbeat();
-  heartbeatTimer = window.setInterval(() => {
-    if (state.socket !== socket) {
-      stopHeartbeat();
-      return;
-    }
-    if (Date.now() - lastPongAt > heartbeatIntervalMs * 3) {
-      socket.close();
-      return;
-    }
-    if (!sendSocket(socket, { op: "ping" })) {
-      stopHeartbeat();
-      scheduleReconnect();
-    }
-  }, heartbeatIntervalMs);
-}
-
-function stopHeartbeat() {
-  if (heartbeatTimer === undefined) return;
-  window.clearInterval(heartbeatTimer);
-  heartbeatTimer = undefined;
 }
 
 function authToken(): string | null {
@@ -723,8 +621,6 @@ async function loginWithApiKey(username: string, secret: string) {
 
 async function logout() {
   const sessionId = state.session;
-  state.socket?.close();
-  state.socket = undefined;
   v2BrowserWorker?.postMessage({ kind: "disconnect" });
   v2BrowserWorker?.terminate();
   v2BrowserWorker = undefined;
@@ -767,21 +663,6 @@ function clearAccountScopedStorage() {
     sessionStorage.clear();
   } catch {
     // ignore
-  }
-}
-
-function requestReplay(socket: WebSocket) {
-  if (scopedProjectionEnabled) {
-    const cursorSpaces = state.scopedProjection?.cursor?.spaces ?? {};
-    for (const [space, cursor] of Object.entries(cursorSpaces)) {
-      const from = Number(cursor?.next_seq ?? 0);
-      if (from > 0) sendSocket(socket, { op: "replay", id: crypto.randomUUID(), space, from, limit: 100 });
-    }
-    return;
-  }
-  for (const space of Object.keys(state.world?.spaces ?? {})) {
-    const from = Number(readStorage(`woo.lastSeq.${space}`) ?? "0") + 1;
-    if (from > 1) sendSocket(socket, { op: "replay", id: crypto.randomUUID(), space, from, limit: 100 });
   }
 }
 
@@ -1009,44 +890,7 @@ const chatSeparatorMinIntervalMs = 2_000;
 const lastChatSeparatorAtBySource = new Map<string, number>();
 
 async function refresh() {
-  if (scopedProjectionEnabled) {
-    await refreshScopedProjection();
-    return;
-  }
-  refreshDebounceTimer = null;
-  refreshDebouncePending = false;
-  const response = await fetch("/api/state", { headers: authHeaders() });
-  if (!response.ok) return;
-  const previousChatRoom = lastObservedChatRoom;
-  state.world = adaptWorld(await response.json());
-  ui.ingestWorld(state.world);
-  const currentChatRoom = chatRoom();
-  if (previousChatRoom && previousChatRoom !== currentChatRoom) {
-    // Mark the bottom of the room the actor just left, so when they return
-    // the room's prior chat (including their `> enter tub` input echo) is
-    // visually behind a "you were away" boundary.
-    pushChatSeparator(previousChatRoom, false);
-  }
-  lastObservedChatRoom = currentChatRoom;
-  if (!state.selectedObject || !state.world.objects?.[state.selectedObject]) state.selectedObject = defaultSelectedObject();
-  state.clockOffset = Number(state.world.server_time ?? Date.now()) - Date.now();
-  state.chatPresent = Array.isArray(state.world?.chat?.present) ? state.world.chat.present : state.chatPresent;
-  if (scopedProjectionSmokeEnabled) await refreshScopedProjectionSmoke();
-  if (!routeInitialized) {
-    routeInitialized = true;
-    if (startupRoute) {
-      void applyLocationRoute("replace", startupRoute);
-      startupRoute = null;
-    } else {
-      syncUrlFromCurrentState("replace");
-    }
-  } else {
-    syncUrlFromCurrentState("replace");
-  }
-  audio?.sync(effectiveDubspace(), state.clockOffset);
-  hydratePinboardNotesTextIfNeeded(pinboardModel());
-  syncV2BrowserWorkerScope();
-  render();
+  await refreshScopedProjection();
 }
 
 async function refreshScopedProjectionSmoke() {
@@ -2042,8 +1886,7 @@ function activeChatRoom() {
 function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
-  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) ui.failOptimisticCall(id);
+  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) ui.failOptimisticCall(id);
   return id;
 }
 
@@ -2163,8 +2006,7 @@ function callWithError(space: string, target: string, verb: string, args: unknow
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   if (onError) pendingFrameErrors.set(id, onError);
-  if (canSendV2Browser() && sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args })) return id;
-  if (!sendFrame({ op: "call", id, space, message: { target, verb, args } })) {
+  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) {
     ui.failOptimisticCall(id);
     pendingFrameErrors.delete(id);
   }
@@ -2207,7 +2049,7 @@ function shouldAutoEnterDefaultChatRoom() {
 }
 
 function ensureSpacePresence(space: string, onReady: () => void, onError?: (error: any) => void) {
-  if (!space || !canSendDirect()) {
+  if (!space || !canSendV2Browser()) {
     onReady();
     return;
   }
@@ -2219,39 +2061,24 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
 }
 
 function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
-  const id = crypto.randomUUID();
-  ui.applyOptimisticCall(id, options);
-  if (onResult) pendingDirect.set(id, onResult);
-  if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendFrame({ op: "direct", id, target, verb, args })) {
-    ui.failOptimisticCall(id);
-    pendingDirect.delete(id);
-    pendingFrameErrors.delete(id);
-  }
-  return id;
+  const persistence = verb === "enter" || verb === "leave" || verb === "out" ? "durable" : "live";
+  const scope = target || activeChatRoom() || desiredV2BrowserScope();
+  return v2Turn({ scope, route: "direct", target, verb, args, persistence, onResult, onError, options });
 }
 
 function command(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
-  const id = crypto.randomUUID();
-  ui.applyOptimisticCall(id, options);
-  pendingCommands.set(id, { space, text });
-  if (onResult) pendingDirect.set(id, onResult);
-  if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendFrame({ op: "command", id, space, text })) {
-    ui.failOptimisticCall(id);
-    pendingCommands.delete(id);
-    pendingDirect.delete(id);
-    pendingFrameErrors.delete(id);
-  }
+  const id = v2PlanAndExecuteCommand(space, text, onError);
+  if (id && onResult) pendingDirect.set(id, onResult);
+  void options;
   return id;
 }
 
 function canSendDirect() {
-  return Boolean(state.actor && state.session && state.socket?.readyState === WebSocket.OPEN);
+  return canSendV2Browser();
 }
 
 function canSendChat() {
-  return canSendChatV2() || canSendDirect();
+  return canSendChatV2();
 }
 
 function canSendV2Browser() {
@@ -2740,7 +2567,6 @@ function bindCommon() {
     button.addEventListener("click", async () => {
       const next = button.dataset.tab as AppState["tab"];
       if (next !== "ide") {
-        scopedProjectionEnabled = true;
         await ensureScopedProjectionReady();
         await ensureScopedOverlayForTab(next);
       }

@@ -38,6 +38,7 @@ import {
   handleWsProtocolFrame,
   parseWsProtocolFrame,
   statusForError,
+  type RestProtocolHost,
   type RestProtocolRequest
 } from "../core/protocol";
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, Session, WooValue } from "../core/types";
@@ -46,10 +47,12 @@ import type { AppliedFrame, CommandFrame, DirectResultFrame, ErrorFrame, LiveEve
 import type { SeedWorld, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
-import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer } from "../core/shadow-browser-node";
+import { shadowBrowserSessionBearer, shadowBrowserSessionClaimsValue, type ShadowBrowserStateTransfer, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
+import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
+import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -402,6 +405,7 @@ export class PersistentObjectDO {
           for (const session of sessions) await this.unregisterSessionRoute(session.id);
         },
         state: (actor) => this.aggregateState(world, actor),
+        executeTurn: (input) => this.restV2Turn(world, input),
         installTap: async (actor, body) => {
           if (!gatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap install is only available on the world gateway host");
           return await installGitHubTap(world, actor, {
@@ -2749,6 +2753,167 @@ export class PersistentObjectDO {
     const payload = await response.json() as Record<string, unknown>;
     if (!response.ok) throw wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
     return payload as T;
+  }
+
+  private async restV2Turn(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    if (!this.env.COMMIT_SCOPE) return await this.restV2TurnInProcess(world, input);
+    const node = `${this.durableHostKey()}:rest:${input.id ?? crypto.randomUUID()}`;
+    const token = shadowBrowserSessionBearer(input.session);
+    if (input.persistence === "live") {
+      const body: ShadowTurnIntentRequest = {
+        kind: "woo.turn.intent.request.shadow.v1",
+        id: input.id,
+        route: input.route,
+        scope: input.scope,
+        target: input.target,
+        verb: input.verb,
+        args: input.args,
+        persistence: "live"
+      };
+      const envelope = encodeEnvelope({
+        v: 2,
+        type: body.kind,
+        id: input.id ?? `${node}:turn`,
+        from: node,
+        actor: input.actor,
+        session: input.session.id,
+        auth: { mode: "session", token },
+        body
+      } satisfies ShadowEnvelope<ShadowTurnIntentRequest>);
+      const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(input.scope, "/v2/envelope", {
+        ...v2SessionAuthorityPayload(world),
+        scope: input.scope,
+        node,
+        token,
+        session: input.session.id,
+        actor: input.actor,
+        serialized: world.exportWorld(),
+        envelope
+      });
+      this.sendV2Fanout(result.fanout ?? []);
+      if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
+      const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
+      return this.restFrameFromV2Reply(input.scope, reply.body);
+    }
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: input.id,
+      route: input.route,
+      scope: input.scope,
+      session: input.session.id,
+      actor: input.actor,
+      target: input.target,
+      verb: input.verb,
+      args: input.args
+    };
+    const planned = await runShadowTurnCall(world.exportWorld(), call);
+    if (planned.frame.op === "error") return planned.frame;
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    const body: ShadowTurnExecRequest = {
+      kind: "woo.turn.exec.request.shadow.v1",
+      id: input.id,
+      call,
+      key,
+      auth: {
+        mode: "shadow_local",
+        actor: input.actor,
+        session: input.session.id
+      },
+      persistence: input.persistence
+    };
+    const envelope = encodeEnvelope({
+      v: 2,
+      type: body.kind,
+      id: input.id ?? `${node}:turn`,
+      from: node,
+      actor: input.actor,
+      session: input.session.id,
+      auth: { mode: "session", token },
+      body
+    } satisfies ShadowEnvelope<ShadowTurnExecRequest>);
+    const commitScope = key.scope;
+    const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(commitScope, "/v2/envelope", {
+      ...v2SessionAuthorityPayload(world),
+      scope: commitScope,
+      node,
+      token,
+      session: input.session.id,
+      actor: input.actor,
+      serialized: world.exportWorld(),
+      envelope
+    });
+    await this.applyV2CommittedTranscript(world, result.reply, input.session.id);
+    this.sendV2Fanout(result.fanout ?? []);
+    if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
+    const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
+    if (reply.body.ok !== true && reply.body.reason === "commit_rejected" && reply.body.commit?.reason === "incomplete_transcript") {
+      return await this.restV2TurnInProcess(world, input);
+    }
+    return this.restFrameFromV2Reply(input.scope, reply.body);
+  }
+
+  private async restV2TurnInProcess(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
+    const run = await runShadowTurnCall(world.exportWorld(), {
+      kind: "woo.turn_call.shadow.v1",
+      id: input.id,
+      route: input.route,
+      scope: input.scope,
+      session: input.session.id,
+      actor: input.actor,
+      target: input.target,
+      verb: input.verb,
+      args: input.args
+    });
+    if (run.frame.op === "error") return run.frame;
+    if (input.persistence === "durable") {
+      world.applyCommittedShadowTranscript(run.transcript);
+      const seq = Number(world.getProp(input.scope, "next_seq") ?? 1) - 1;
+      return {
+        op: "applied",
+        id: input.id,
+        space: input.scope,
+        seq,
+        ts: Date.now(),
+        message: {
+          actor: input.actor,
+          target: input.target,
+          verb: input.verb,
+          args: input.args
+        },
+        observations: run.transcript.observations,
+        ...(run.transcript.result !== undefined ? { result: run.transcript.result } : {})
+      };
+    }
+    return run.frame;
+  }
+
+  private restFrameFromV2Reply(scope: ObjRef, reply: ShadowTurnExecReply): AppliedFrame | DirectResultFrame {
+    if (reply.ok !== true) throw wooError("E_INTERNAL", `v2 REST turn failed: ${reply.reason}`);
+    if (reply.commit) {
+      return {
+        op: "applied",
+        id: reply.id,
+        space: reply.commit.position.scope,
+        seq: Number(reply.commit.position.seq),
+        ts: Date.now(),
+        message: {
+          actor: reply.transcript.call.actor,
+          target: reply.transcript.call.target,
+          verb: reply.transcript.call.verb,
+          args: reply.transcript.call.args
+        },
+        observations: reply.transcript.observations,
+        ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
+      };
+    }
+    return {
+      op: "result",
+      id: reply.id,
+      command: reply.transcript.call,
+      result: reply.outcome.result ?? null,
+      observations: reply.transcript.observations,
+      audience: scope
+    };
   }
 
   private async applyV2CommittedTranscript(world: WooWorld, replyText: string | null, sessionId: string): Promise<void> {
