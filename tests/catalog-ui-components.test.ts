@@ -656,7 +656,10 @@ describe("bundled catalog UI components", () => {
     expect(editorHelp).toMatch(/workflow/i);
     expect(editorHelp).toMatch(/checklist/i);
     const hints = Array.from(element.querySelectorAll<HTMLElement>(".woo-tasks-form-hint")).map((h) => h.textContent ?? "");
-    expect(hints.some((h) => /comma-separated step names/i.test(h))).toBe(true);
+    // At least one hint explains the per-step selection / ordering model of the
+    // workflow editor — the picker uses buttons + a draggable ordered list, so
+    // "order" appears in the hint of the selected-steps reorder list.
+    expect(hints.some((h) => /order/i.test(h))).toBe(true);
     element.querySelector<HTMLButtonElement>("[data-tasks-admin-edit-cancel]")!.click();
     await flush();
     element.querySelector<HTMLButtonElement>("[data-tasks-admin-toggle]")!.click();
@@ -730,13 +733,13 @@ describe("bundled catalog UI components", () => {
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="role"]')!.click();
     const roleForm = element.querySelector("[data-tasks-admin-form='role']") as HTMLFormElement;
     roleForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = "reviewer";
-    roleForm.querySelector<HTMLInputElement>('input[name="description"]')!.value = "Reviews work";
+    roleForm.querySelector<HTMLTextAreaElement>('textarea[name="description"]')!.value = "Reviews work";
     roleForm.querySelector<HTMLInputElement>('input[name="owners"]')!.value = "guest_a, guest_b";
     roleForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
     await flush();
     const setRole = calls.find((c) => c.verb === "set_role");
     expect(setRole?.args).toEqual(["reviewer", { description: "Reviews work", owners: ["guest_a", "guest_b"] }]);
-    expect(element.textContent).toContain('Saved role "reviewer".');
+    expect(element.textContent).toContain('Added role "reviewer".');
 
     // Add an obligation.
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="obligation"]')!.click();
@@ -744,29 +747,37 @@ describe("bundled catalog UI components", () => {
     const obForm = element.querySelector("[data-tasks-admin-form='obligation']") as HTMLFormElement;
     obForm.querySelector<HTMLInputElement>('input[name="key"]')!.value = "review:approve";
     obForm.querySelector<HTMLSelectElement>('select[name="role"]')!.value = "doer";
-    obForm.querySelector<HTMLInputElement>('input[name="criterion"]')!.value = "Reviewer approves.";
+    obForm.querySelector<HTMLTextAreaElement>('textarea[name="criterion"]')!.value = "Reviewer approves.";
     obForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
     await flush();
     const setOb = calls.find((c) => c.verb === "set_obligation");
     expect(setOb?.args).toEqual(["review:approve", { role: "doer", criterion: "Reviewer approves." }]);
-    expect(element.textContent).toContain('Saved obligation "review:approve".');
+    expect(element.textContent).toContain('Added step "review:approve".');
 
-    // Add a policy.
+    // Add a policy. The workflow editor uses a button picker for available
+    // steps; click the step we want to include, then submit. The click
+    // triggers a re-render, so re-query the form before reading the kind
+    // input and dispatching submit.
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="policy"]')!.click();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-new="policy"]')!.click();
+    await flush();
+    element.querySelector<HTMLButtonElement>('[data-tasks-policy-add-step="do:it"]')!.click();
+    await flush();
     const polForm = element.querySelector("[data-tasks-admin-form='policy']") as HTMLFormElement;
     polForm.querySelector<HTMLInputElement>('input[name="kind"]')!.value = "review";
-    polForm.querySelector<HTMLInputElement>('input[name="keys"]')!.value = "do:it, review:approve";
     polForm.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
     await flush();
     const setPol = calls.find((c) => c.verb === "set_policy");
-    expect(setPol?.args).toEqual(["review", ["do:it", "review:approve"]]);
+    expect(setPol?.args).toEqual(["review", ["do:it"]]);
     expect(element.textContent).toContain('Saved policy "review".');
 
-    // Remove buttons confirm first, then fire the matching remove_* verbs with the targeted key.
+    // Remove buttons confirm first, then fire the matching remove_* verbs
+    // with the targeted key. Clicking a table row opens the edit editor,
+    // which exposes the Remove button for that entry.
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="role"]')!.click();
+    await flush();
     element.querySelector<HTMLElement>('tr[data-tasks-admin-section="role"][data-key="doer"]')!.click();
-    element.querySelector<HTMLButtonElement>('[data-tasks-admin-edit="role"][data-key="doer"]')!.click();
+    await flush();
     expect(element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')).not.toBeNull();
     confirmSpy.mockReturnValueOnce(false);
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')!.click();
@@ -775,13 +786,17 @@ describe("bundled catalog UI components", () => {
 
     confirmSpy.mockReturnValue(true);
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="role"][data-key="doer"]')!.click();
+    await flush();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="obligation"]')!.click();
+    await flush();
     element.querySelector<HTMLElement>('tr[data-tasks-admin-section="obligation"][data-key="do:it"]')!.click();
-    element.querySelector<HTMLButtonElement>('[data-tasks-admin-edit="obligation"][data-key="do:it"]')!.click();
+    await flush();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="obligation"][data-key="do:it"]')!.click();
+    await flush();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-tab="policy"]')!.click();
+    await flush();
     element.querySelector<HTMLElement>('tr[data-tasks-admin-section="policy"][data-key="task"]')!.click();
-    element.querySelector<HTMLButtonElement>('[data-tasks-admin-edit="policy"][data-key="task"]')!.click();
+    await flush();
     element.querySelector<HTMLButtonElement>('[data-tasks-admin-remove="policy"][data-key="task"]')!.click();
     await flush();
     expect(calls.find((c) => c.verb === "remove_role")?.args).toEqual(["doer"]);
@@ -836,7 +851,7 @@ describe("bundled catalog UI components", () => {
     await flush();
 
     const status = element.querySelector(".woo-tasks-admin-status.error");
-    expect(status?.textContent).toContain('Could not save role "reviewer": not allowed');
+    expect(status?.textContent).toContain('Could not add role "reviewer": not allowed');
   });
 
   it("preserves create and admin drafts across task refresh renders", async () => {
