@@ -344,6 +344,13 @@ export function localCatalogUiIndex(world: WooWorld): { catalogs: WooValue[] } {
 export function runHostScopedLocalCatalogLifecycle(world: WooWorld, host = "host", options: { freshSeed?: boolean } = {}): void {
   runHostScopedSchemaPlans(world, host, options.freshSeed === true);
   runHostScopedDataMigrations(world, host);
+  // TEMP diag: report satellite's view of $room.southeast at end of cold-load
+  if (world.objects.has("$room")) {
+    const v = world.ownVerbExact("$room", "southeast");
+    console.log("woo.diag", JSON.stringify({ tag: "satellite-coldload-room-southeast", host, freshSeed: options.freshSeed === true, arg_spec: v?.arg_spec ?? null }));
+  } else {
+    console.log("woo.diag", JSON.stringify({ tag: "satellite-coldload-no-room", host }));
+  }
 }
 
 function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cleanInstalled: ReadonlySet<string>): Set<string> {
