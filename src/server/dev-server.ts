@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
 import { createWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
-import { handleRestProtocolRequest, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
+import { handleRestProtocolRequest, restFrameFromTurnReply, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
 import { normalizeError, type ParkedTaskRun } from "../core/world";
 import {
   directedRecipients,
@@ -25,6 +25,7 @@ import { McpGateway } from "../mcp/gateway";
 import {
   buildShadowBrowserSessionAuth,
   buildShadowBrowserDeltaTransfer,
+  buildShadowTurnIntentEnvelope,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
@@ -36,12 +37,10 @@ import {
   shadowBrowserSessionClaimsValue,
   shadowLiveEventsForTranscript,
   shadowBrowserTransportHello,
-  type ShadowTurnIntentRequest,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 
 // Local dev server only: HTTP authoring endpoints require a session and then
@@ -429,65 +428,15 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
   const browser = v2ShadowBrowser(`node:dev:rest:${input.id ?? randomUUID()}`, token, input.session, input.scope);
   refreshDevV2RelaySessions(browser.relay);
   ensureDevV2SerializedSession(browser.relay, input.session);
-  const body: ShadowTurnIntentRequest = {
-    kind: "woo.turn.intent.request.shadow.v1",
-    id: input.id,
-    route: input.route,
-    scope: input.scope,
-    target: input.target,
-    verb: input.verb,
-    args: input.args,
-    persistence: input.persistence
-  };
-  const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
-    v: 2,
-    type: body.kind,
-    id: input.id ?? `${browser.node}:turn:rest`,
-    from: browser.node,
-    actor: input.actor,
-    session: input.session.id,
-    auth: { mode: "session", token },
-    body
-  };
+  const envelope = buildShadowTurnIntentEnvelope({ ...input, node: browser.node, session: input.session.id, token });
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope));
   const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
   if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-  if (reply.body.ok !== true) throw wooError("E_INTERNAL", `v2 REST turn failed: ${reply.body.reason}`);
   if (reply.body.commit && reply.body.transcript) {
     world.applyCommittedShadowTranscript(reply.body.transcript);
   }
   sendDevV2Fanout(browser, reply);
-  return restFrameFromV2Reply(input.scope, reply.body);
-}
-
-function restFrameFromV2Reply(scope: ObjRef, reply: ShadowTurnExecReply): AppliedFrame | DirectResultFrame {
-  if (reply.ok !== true) throw wooError("E_INTERNAL", "v2 REST turn did not commit");
-  if (reply.commit) {
-    const seq = Number(reply.commit.position.seq);
-    return {
-      op: "applied",
-      id: reply.id,
-      space: reply.commit.position.scope,
-      seq,
-      ts: Date.now(),
-      message: {
-        actor: reply.transcript.call.actor,
-        target: reply.transcript.call.target,
-        verb: reply.transcript.call.verb,
-        args: reply.transcript.call.args
-      },
-      observations: reply.transcript.observations,
-      ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
-    };
-  }
-  return {
-    op: "result",
-    id: reply.id,
-    command: reply.transcript.call,
-    result: reply.outcome.result ?? null,
-    observations: reply.transcript.observations,
-    audience: scope
-  };
+  return restFrameFromTurnReply(input.scope, reply.body);
 }
 
 async function handleV2ShadowFrame(

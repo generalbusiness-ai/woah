@@ -11,6 +11,7 @@ import {
 } from "./types";
 import { localCatalogStatuses, localCatalogUiIndex } from "./local-catalogs";
 import { normalizeError, type WooWorld } from "./world";
+import type { ShadowTurnExecReply } from "./shadow-turn-exec";
 
 export type RestProtocolRequest = {
   method: string;
@@ -46,6 +47,7 @@ export type RestProtocolHost = {
       target: ObjRef;
       verb: string;
       args: WooValue[];
+      body?: Record<string, WooValue>;
       route: "direct" | "sequenced";
       persistence: "durable" | "live";
     }
@@ -229,6 +231,7 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
           target: message.target,
           verb: message.verb,
           args: message.args ?? [],
+          body: message.body,
           route: "sequenced",
           persistence: "durable"
         });
@@ -239,9 +242,6 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
 
       if (Object.prototype.hasOwnProperty.call(body, "space") && body.space !== null) {
         const space = resolveRestObject(host, String(body.space), session, request);
-        if (body.body && typeof body.body === "object" && !Array.isArray(body.body) && Object.keys(body.body as Record<string, unknown>).length > 0) {
-          throw wooError("E_NOT_IMPLEMENTED", "REST v2 calls do not support message body maps");
-        }
         const message: Message = {
           actor,
           target,
@@ -257,6 +257,7 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
           target: message.target,
           verb: message.verb,
           args: message.args ?? [],
+          body: message.body,
           route: "sequenced",
           persistence: "durable"
         });
@@ -274,6 +275,7 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
         target,
         verb,
         args,
+        body: body.body && typeof body.body === "object" && !Array.isArray(body.body) ? body.body as Record<string, WooValue> : undefined,
         route: "direct",
         persistence
       });
@@ -421,6 +423,7 @@ export function statusForError(error: ErrorValue): number {
     case "E_TOKEN_CONSUMED":
       return 401;
     case "E_BOOTSTRAP_TOKEN_MISSING":
+    case "E_RETRY":
       return 503;
     case "E_PERM":
     case "E_DIRECT_DENIED":
@@ -449,6 +452,50 @@ export function statusForError(error: ErrorValue): number {
     default:
       return 500;
   }
+}
+
+export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply): AppliedFrame | DirectResultFrame {
+  if (reply.ok !== true) throw turnReplyError(reply);
+  if (reply.commit) {
+    return {
+      op: "applied",
+      id: reply.id,
+      space: reply.commit.position.scope,
+      seq: Number(reply.commit.position.seq),
+      ts: Date.now(),
+      message: {
+        actor: reply.transcript.call.actor,
+        target: reply.transcript.call.target,
+        verb: reply.transcript.call.verb,
+        args: reply.transcript.call.args
+      },
+      observations: reply.transcript.observations,
+      ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
+    };
+  }
+  return {
+    op: "result",
+    id: reply.id,
+    command: reply.transcript.call,
+    result: reply.outcome.result ?? null,
+    observations: reply.transcript.observations,
+    audience: scope
+  };
+}
+
+function turnReplyError(reply: ShadowTurnExecReply): ErrorValue {
+  if (reply.ok === true) return wooError("E_INTERNAL", "v2 REST turn failed unexpectedly after success");
+  if (reply.reason === "missing_state") {
+    return wooError("E_RETRY", "v2 REST turn requires state refresh before retry", { reason: reply.reason });
+  }
+  const commitReason = reply.reason === "commit_rejected" ? reply.commit?.reason : undefined;
+  if (commitReason === "incomplete_transcript") {
+    return wooError("E_RETRY", "v2 REST turn transcript was incomplete; retry after state refresh", { reason: commitReason });
+  }
+  if (commitReason === "stale_head") {
+    return wooError("E_CONFLICT", "v2 REST turn conflicted with the current scope head", { reason: commitReason });
+  }
+  return wooError("E_INTERNAL", `v2 REST turn failed: ${reply.reason}`, { reason: reply.reason, commit_reason: commitReason ?? null });
 }
 
 function jsonProtocol(body: unknown, status = 200, headers?: Record<string, string>): RestProtocolResult {

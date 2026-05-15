@@ -3438,7 +3438,7 @@ export class WooWorld {
 
       try {
         await this.withTurnRecording(
-          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args },
+          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
           async (activeRecorder) => {
             if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
             await this.withBehaviorSavepoint(async () => {
@@ -3543,7 +3543,7 @@ export class WooWorld {
 
         try {
           await this.withTurnRecording(
-            { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args },
+          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
             async (activeRecorder) => {
               if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
               await this.withBehaviorSavepoint(async () => {

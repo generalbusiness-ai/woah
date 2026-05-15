@@ -25,6 +25,7 @@ export type ShadowTurnCall = {
   target: ObjRef;
   verb: string;
   args: WooValue[];
+  body?: Record<string, WooValue>;
 };
 
 export type ShadowTurnCallRun = {
@@ -65,7 +66,8 @@ export async function runShadowTurnCallOnWorld(
       actor: call.actor,
       target: call.target,
       verb: call.verb,
-      args: call.args
+      args: call.args,
+      body: call.body
     };
     frame = call.session
       ? await world.call(call.id, call.session, call.scope, message)

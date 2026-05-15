@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { handleRestProtocolRequest, statusForError, type RestProtocolRequest } from "../src/core/protocol";
-import { publicAppliedFrame, wooError, type ObjRef, type Session } from "../src/core/types";
+import { publicAppliedFrame, wooError, type ObjRef, type Session, type WooValue } from "../src/core/types";
 import type { DeferredHostEffect, RoomSnapshot, WooWorld } from "../src/core/world";
 import { LocalHostBridge } from "./core-support";
 
@@ -22,6 +22,16 @@ function getWithQuery(pathname: string, query: Record<string, string>, headers: 
     query: (name) => query[name] ?? null,
     header: (name) => headers[name.toLowerCase()] ?? null,
     readJson: async () => ({})
+  };
+}
+
+function post(pathname: string, body: Record<string, unknown>, headers: Record<string, string> = {}): RestProtocolRequest {
+  return {
+    method: "POST",
+    pathname,
+    query: () => null,
+    header: (name) => headers[name.toLowerCase()] ?? null,
+    readJson: async () => body
   };
 }
 
@@ -108,6 +118,39 @@ describe("scoped client projection", () => {
     if (!result.handled || "raw" in result) throw new Error("unexpected raw protocol result");
     expect(result.status).toBe(410);
     expect(result.body).toMatchObject({ error: { code: "E_GONE" } });
+  });
+
+  it("passes REST body maps through to the v2 turn executor", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:rest-body-map");
+    let capturedBody: Record<string, WooValue> | undefined;
+
+    const result = await handleRestProtocolRequest(post("/api/objects/the_chatroom/calls/look", {
+      args: [],
+      body: { format: "compact", depth: 2 }
+    }), {
+      world,
+      requireSession: () => session,
+      authenticateToken: () => session,
+      executeTurn: async (input) => {
+        capturedBody = input.body;
+        return {
+          op: "result",
+          id: input.id,
+          command: { actor: input.actor, target: input.target, verb: input.verb, args: input.args, body: input.body },
+          result: "ok",
+          observations: [],
+          audience: input.scope
+        };
+      },
+      broadcastApplied: async () => undefined,
+      broadcastLiveEvents: async () => undefined
+    });
+
+    expect(result.handled).toBe(true);
+    if (!result.handled || "raw" in result) throw new Error("unexpected raw protocol result");
+    expect(result.status).toBe(200);
+    expect(capturedBody).toEqual({ format: "compact", depth: 2 });
   });
 
   it("includes enriched movement results on sequenced applied frames", async () => {

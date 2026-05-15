@@ -1729,9 +1729,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(auth.status).toBe(200);
       const wizardSession = String(auth.body.session);
 
-      const created = await post("/api/objects/%24system/calls/create_api_key", { args: ["$wiz", "revoke-route"] }, wizardSession);
-      expect(created.status).toBe(200);
-      const key = created.body.result as { id: string; secret: string };
+      const gatewayWorld = await (gateway as any).getWorld("world") as WooWorld;
+      const key = gatewayWorld.ensureApiKey("$wiz", "$wiz", "revoke-route-key", "revoke-route-secret", "revoke-route");
 
       const apiAuth = await post("/api/auth", { token: `apikey:${key.id}:${key.secret}` });
       expect(apiAuth.status).toBe(200);
@@ -1747,6 +1746,15 @@ describe("CFObjectRepository production-shape coverage", () => {
       const stale = await post("/api/objects/%24system/calls/list_api_keys", { args: [] }, apiSession);
       expect(stale.status).toBe(401);
       expect(stale.body.error).toMatchObject({ code: "E_NOSESSION" });
+
+      const resolveRequest = await signInternalRequest({ WOO_INTERNAL_SECRET: "cf-test-secret" }, new Request("https://woo.test/resolve-session", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-woo-host-key": "world" },
+        body: JSON.stringify({ session_id: apiSession })
+      }));
+      const resolved = await directory.fetch(resolveRequest);
+      expect(resolved.status).toBe(200);
+      expect(await resolved.json()).toMatchObject({ session: null });
     } finally {
       directoryState.close();
       gatewayState.close();
