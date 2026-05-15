@@ -22,9 +22,23 @@ export type TaskspaceData = {
 
 const TASK_STATUSES = ["open", "claimed", "in_progress", "blocked", "done"] as const;
 
+type TaskspaceDraftState = {
+  rootTitle: string;
+  rootDescription: string;
+  subtaskDrafts: Map<string, { title: string; description: string }>;
+};
+
 export class WooTaskspaceWorkspaceElement extends HTMLElement {
+  // Draft state is intentionally session-lifetime. A browser can visit many
+  // taskspaces, but each draft is tiny and preserving it across element remounts
+  // is more important than evicting a few strings during one app session.
+  private static draftsBySpace = new Map<string, TaskspaceDraftState>();
   woo?: WooContext;
   subject?: string;
+  // The app can replace this custom element after v2 enter/projection frames
+  // while a user is typing. Keep form drafts in a per-taskspace cache so those
+  // renders do not turn a legitimate create click into an empty "Untitled"
+  // task or erase focused inspector edits.
   private model: TaskspaceData = {
     space: "",
     tasks: {},
@@ -50,6 +64,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     const active = activeTaskStatuses(this.model.statusFilter);
     const visibleCount = allTasks.filter((task) => taskMatchesStatus(task, active)).length;
     const statusCounts = countTasksByStatus(allTasks);
+    const draft = this.draftState();
     this.innerHTML = `
       <section class="toolbar task-toolbar">
         <h1>Taskspace</h1>
@@ -62,8 +77,8 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
         <section class="split taskspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(this.model.space)}">
           <div class="card tree">
             <div class="task-create">
-              <input data-new-title placeholder="Root task title" />
-              <input data-new-description placeholder="Description" />
+              <input data-new-title placeholder="Root task title" value="${escapeHtml(draft.rootTitle)}" />
+              <input data-new-description placeholder="Description" value="${escapeHtml(draft.rootDescription)}" />
               <button data-create-task>Create</button>
             </div>
             <div class="task-tree-list">
@@ -123,6 +138,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
     const artifacts = Array.isArray(props.artifacts) ? props.artifacts : [];
     const subtasks = Array.isArray(props.subtasks) ? props.subtasks.map(String) : [];
     const reqStats = requirementStats(requirements);
+    const subtaskDraft = this.draftState().subtaskDrafts.get(task.id) ?? { title: "", description: "" };
     return `
       <div class="task-inspector-head">
         <div>
@@ -144,7 +160,7 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
       </div>
       <section class="task-section">
         <h3>Subtasks</h3>
-        <div class="inline-form"><input data-subtask-title placeholder="Subtask title"><input data-subtask-description placeholder="Description"><button data-add-subtask>Add</button></div>
+        <div class="inline-form"><input data-subtask-title placeholder="Subtask title" value="${escapeHtml(subtaskDraft.title)}"><input data-subtask-description placeholder="Description" value="${escapeHtml(subtaskDraft.description)}"><button data-add-subtask>Add</button></div>
         <div class="related-list">${subtasks.map((id) => this.renderRelatedTask(id, tasks)).join("") || `<div class="empty-state">No subtasks.</div>`}</div>
       </section>
       <section class="task-section">
@@ -192,19 +208,55 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
 
   private bind(): void {
     this.querySelectorAll<HTMLButtonElement>("[data-task-status]").forEach((button) => button.addEventListener("click", () => this.dispatch("status-filter", { status: button.dataset.taskStatus ?? "" })));
+    this.querySelector<HTMLInputElement>("[data-new-title]")?.addEventListener("input", (event) => {
+      this.draftState().rootTitle = (event.currentTarget as HTMLInputElement).value;
+    });
+    this.querySelector<HTMLInputElement>("[data-new-description]")?.addEventListener("input", (event) => {
+      this.draftState().rootDescription = (event.currentTarget as HTMLInputElement).value;
+    });
     this.querySelector<HTMLButtonElement>("[data-create-task]")?.addEventListener("click", () => {
+      const draft = this.draftState();
+      // The live DOM value is authoritative at click time. Programmatic
+      // .value assignments (autofill, paste-via-clipboard, test fixtures) do
+      // not fire `input`, so the draft cache can lag behind the field the
+      // user is actually staring at. Fall back to the cache only when the
+      // input itself is missing.
+      const titleInput = this.querySelector<HTMLInputElement>("[data-new-title]");
+      const descInput = this.querySelector<HTMLInputElement>("[data-new-description]");
+      const name = titleInput?.value ?? draft.rootTitle;
+      const text = descInput?.value ?? draft.rootDescription;
+      draft.rootTitle = "";
+      draft.rootDescription = "";
       this.dispatch("create", {
-        name: this.querySelector<HTMLInputElement>("[data-new-title]")?.value ?? "",
-        text: this.querySelector<HTMLInputElement>("[data-new-description]")?.value ?? ""
+        name,
+        text
       });
     });
     this.querySelectorAll<HTMLButtonElement>("[data-toggle-task]").forEach((button) => button.addEventListener("click", () => this.dispatch("toggle", { id: button.dataset.toggleTask ?? "" })));
     this.querySelectorAll<HTMLButtonElement>("[data-select-task]").forEach((button) => button.addEventListener("click", () => this.dispatch("select", { id: button.dataset.selectTask ?? "" })));
     this.querySelectorAll<HTMLButtonElement>("[data-task-action]").forEach((button) => button.addEventListener("click", () => this.dispatch("task-action", { action: button.dataset.taskAction ?? "" })));
-    this.querySelector<HTMLButtonElement>("[data-add-subtask]")?.addEventListener("click", () => this.dispatch("add-subtask", {
-      name: this.querySelector<HTMLInputElement>("[data-subtask-title]")?.value ?? "",
-      text: this.querySelector<HTMLInputElement>("[data-subtask-description]")?.value ?? ""
-    }));
+    const selectedTask = this.model.selectedTask ?? "";
+    this.querySelector<HTMLInputElement>("[data-subtask-title]")?.addEventListener("input", (event) => {
+      this.updateSubtaskDraft(selectedTask, { title: (event.currentTarget as HTMLInputElement).value });
+    });
+    this.querySelector<HTMLInputElement>("[data-subtask-description]")?.addEventListener("input", (event) => {
+      this.updateSubtaskDraft(selectedTask, { description: (event.currentTarget as HTMLInputElement).value });
+    });
+    this.querySelector<HTMLButtonElement>("[data-add-subtask]")?.addEventListener("click", () => {
+      const drafts = this.draftState().subtaskDrafts;
+      const draft = drafts.get(selectedTask) ?? { title: "", description: "" };
+      // Prefer the live DOM value at click time — see the [data-create-task]
+      // handler for why the cache alone is not enough.
+      const titleInput = this.querySelector<HTMLInputElement>("[data-subtask-title]");
+      const descInput = this.querySelector<HTMLInputElement>("[data-subtask-description]");
+      const name = titleInput?.value ?? draft.title;
+      const text = descInput?.value ?? draft.description;
+      drafts.delete(selectedTask);
+      this.dispatch("add-subtask", {
+        name,
+        text
+      });
+    });
     this.querySelector<HTMLButtonElement>("[data-add-requirement]")?.addEventListener("click", () => this.dispatch("add-requirement", { text: this.querySelector<HTMLInputElement>("[data-requirement]")?.value ?? "" }));
     this.querySelectorAll<HTMLInputElement>("[data-check-req]").forEach((input) => input.addEventListener("change", () => this.dispatch("check-requirement", { index: Number(input.dataset.checkReq), checked: input.checked })));
     this.querySelector<HTMLButtonElement>("[data-add-message]")?.addEventListener("click", () => this.dispatch("add-message", { body: this.querySelector<HTMLInputElement>("[data-message]")?.value ?? "" }));
@@ -213,6 +265,22 @@ export class WooTaskspaceWorkspaceElement extends HTMLElement {
 
   private dispatch(kind: string, detail: Record<string, unknown> = {}): void {
     this.dispatchEvent(new CustomEvent(`woo-taskspace-${kind}`, { bubbles: true, detail }));
+  }
+
+  private updateSubtaskDraft(task: string, patch: Partial<{ title: string; description: string }>): void {
+    if (!task) return;
+    const drafts = this.draftState().subtaskDrafts;
+    const current = drafts.get(task) ?? { title: "", description: "" };
+    drafts.set(task, { ...current, ...patch });
+  }
+
+  private draftState(): TaskspaceDraftState {
+    const key = this.model.space || this.subject || "";
+    const existing = WooTaskspaceWorkspaceElement.draftsBySpace.get(key);
+    if (existing) return existing;
+    const created = { rootTitle: "", rootDescription: "", subtaskDrafts: new Map<string, { title: string; description: string }>() };
+    WooTaskspaceWorkspaceElement.draftsBySpace.set(key, created);
+    return created;
   }
 
   private actorLabel(id: string | undefined): string {
