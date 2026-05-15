@@ -98,7 +98,6 @@ const server = http.createServer(async (req, res) => {
       world,
       authenticateToken,
       requireSession: () => requireRestSession(req),
-      state: (actor) => world.state(actor),
       executeTurn: (input) => devRestV2Turn(input),
       installTap: (actor, body) => installGitHubTap(world, actor, {
         tap: String(body.tap ?? ""),

@@ -449,7 +449,7 @@ this is a one-time local state repair.
 
 The current UI renderer still lives in the SPA, but scoped clients consume the
 catalog's observations and `list_notes`/snapshot shapes through the shared
-client projection rather than through a full-world `/api/state` model.
+client projection rather than through a full-world snapshot model.
 
 - `list_notes` shape is unchanged on the wire (still
   `[{ id, text, color, x, y, w, h, z, author? }]` — minor field renames),

@@ -18,7 +18,6 @@ The two wire formats target the same model. WebSocket is the right shape for cli
 ```
 POST  /api/auth
 DELETE /api/session
-GET   /api/state
 GET   /api/me
 GET   /api/catalogs/ui
 GET   /api/objects/{id-or-name}
@@ -30,7 +29,7 @@ GET   /api/objects/{id-or-name}/log?from=N&limit=M
 GET   /api/objects/{id-or-name}/stream
 ```
 
-Twelve endpoints. Everything is an object; identifiers are object refs,
+Eleven endpoints. Everything is an object; identifiers are object refs,
 corenames, or implementation-local object ids.
 
 ---
@@ -72,16 +71,6 @@ Subsequent requests carry the session id as `Authorization: Session <id>`. The s
 local session store before returning. Distributed implementations SHOULD also
 remove any session-routing record used for cross-host dispatch; stale best-effort
 routes must fail closed through the normal session validation path.
-
-`GET /api/state` is the legacy full-world debug projection. It is wizard-only.
-It returns the actor-readable world projection plus
-`session: { id, actor, active_scope }` for the presented session. Transitional
-implementations may include the legacy alias `current_location` with the same
-value. The
-projection's object graph may include compatibility presence mirrors, but
-ordinary clients MUST NOT use it for boot, movement, route resolution, or live
-updates. Use `/api/me`, `/api/objects/{id-or-name}/summary`, and overlay
-snapshots instead.
 
 `GET /api/me` returns the scoped browser projection for the presented session:
 `{ server_time, cursor, self, session, here, inventory }`. It is the ordinary
@@ -128,8 +117,8 @@ map.
 permission-filtered object summary used by scoped projections. It includes the
 same identity fields and actor-filtered `props` as `/api/me` summaries,
 including `ancestors` for client-side UI frame resolution. It is the narrow
-route/debug lookup for one object; clients MUST NOT use `/api/state` merely to
-resolve a route target's display name or class chain.
+route/debug lookup for one object; clients MUST NOT request a full-world
+snapshot merely to resolve a route target's display name or class chain.
 
 Credentialed auth extends the vocabulary per [auth.md §A3](../identity/auth.md#a3-token-vocabulary-extended): `bearer:<jwt>`, `apikey:<id>:<secret>`, `oauth_code:<provider>:<code>`, `recovery:<token>`. Bearer tokens use `Authorization: Bearer <jwt>` with signature/claims validation. The endpoint shape is unchanged; only the accepted vocabulary expands.
 

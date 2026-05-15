@@ -1638,108 +1638,6 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
-  it("serves gateway state when a cold remote host state request stalls", async () => {
-    const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
-    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    let gateway: PersistentObjectDO;
-    const stalledHost = {
-      fetch: async () => await new Promise<Response>(() => {})
-    };
-    const env = {
-      WOO_INITIAL_WIZARD_TOKEN: "cf-cold-state-token",
-      WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
-      DIRECTORY: new FakeDurableObjectNamespace((name) => {
-        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-        return directory;
-      }),
-      WOO: new FakeDurableObjectNamespace((name) => {
-        if (name === "world") return gateway;
-        return stalledHost;
-      })
-    } as unknown as Env;
-    gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
-    const logs: string[] = [];
-    const logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {
-      logs.push(args.map(String).join(" "));
-    });
-
-    try {
-      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token: "wizard:cf-cold-state-token" })
-      }));
-      expect(auth.ok).toBe(true);
-      const { session } = await auth.json() as { session: string };
-
-      const state = await Promise.race([
-        gateway.fetch(new Request("https://woo.test/api/state", {
-          headers: { authorization: `Session ${session}` }
-        })),
-        new Promise<Response>((_, reject) => setTimeout(() => reject(new Error("gateway /api/state did not return")), 4_000))
-      ]);
-      expect(state.ok).toBe(true);
-      const body = await state.json() as Record<string, unknown>;
-      expect(body.objects).toBeTruthy();
-      expect(body.object_routes).toEqual(expect.arrayContaining([expect.objectContaining({ host: "the_chatroom" })]));
-      expect(logs.some((line) => line.includes("woo.metric") && line.includes("\"kind\":\"cross_host_rpc\"") && line.includes("\"route\":\"/__internal/state\"") && line.includes("\"status\":\"timeout\""))).toBe(true);
-    } finally {
-      logSpy.mockRestore();
-      directoryState.close();
-      gatewayState.close();
-    }
-  });
-
-  it("keeps cached api state clock fresh", async () => {
-    const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
-    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    const env = {
-      WOO_INITIAL_WIZARD_TOKEN: "cf-state-token",
-      WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "",
-      DIRECTORY: new FakeDurableObjectNamespace((name) => {
-        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-        return directory;
-      }),
-      WOO: new FakeDurableObjectNamespace((name) => {
-        throw new Error(`unexpected Woo DO ${name}`);
-      })
-    } as unknown as Env;
-    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
-
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(1_000_000);
-      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token: "wizard:cf-state-token" })
-      }));
-      expect(auth.ok).toBe(true);
-      const { session } = await auth.json() as { session: string };
-
-      const first = await gateway.fetch(new Request("https://woo.test/api/state", {
-        headers: { authorization: `Session ${session}` }
-      }));
-      expect(first.ok).toBe(true);
-      expect((await first.json() as Record<string, unknown>).server_time).toBe(1_000_000);
-
-      vi.setSystemTime(1_005_000);
-      const second = await gateway.fetch(new Request("https://woo.test/api/state", {
-        headers: { authorization: `Session ${session}` }
-      }));
-      expect(second.ok).toBe(true);
-      expect((await second.json() as Record<string, unknown>).server_time).toBe(1_005_000);
-    } finally {
-      vi.useRealTimers();
-      directoryState.close();
-      gatewayState.close();
-    }
-  });
-
   it("ends REST sessions and removes Directory session routes", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
@@ -1782,10 +1680,10 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(await ended.json()).toMatchObject({ ok: true, session });
       expect(await directoryHealth()).toMatchObject({ sessions: 0 });
 
-      const staleState = await gateway.fetch(new Request("https://woo.test/api/state", {
+      const staleMe = await gateway.fetch(new Request("https://woo.test/api/me", {
         headers: { authorization: `Session ${session}` }
       }));
-      expect(staleState.status).toBe(401);
+      expect(staleMe.status).toBe(401);
     } finally {
       directoryState.close();
       gatewayState.close();

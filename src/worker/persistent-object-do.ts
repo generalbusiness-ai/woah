@@ -12,8 +12,7 @@
 // What's wired through fetch() / the v2 WS handlers:
 // - REST routing ported from src/server/dev-server.ts: auth, describe (with
 //   actor-permission filtering), property reads (filtered), sequenced and
-//   direct verb calls (with broadcast to connected WS clients), log paging,
-//   /api/state (authenticated demo aggregate).
+//   direct verb calls (with broadcast to connected WS clients), log paging.
 // - v2 turn-network WebSocket upgrade with the CF hibernation API:
 //   state.acceptWebSocket, serializeAttachment, and webSocketMessage/Close/Error
 //   handlers. Legacy /ws returns 410; v2 sockets carry protocol-scoped
@@ -117,8 +116,6 @@ const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
 const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
-const HOST_STATE_CACHE_LIMIT = 32;
-const HOST_STATE_FETCH_TIMEOUT_MS = 2500;
 // Read-only cross-host RPCs (room-snapshot, remote-get-prop, contents, etc.)
 // are deadlined tightly so a wedge surfaces fast and the local task chain
 // can fall back to a degraded reply. 5s is the working ceiling: a hot
@@ -200,7 +197,6 @@ const COALESCEABLE_INTERNAL_PATHS: ReadonlySet<string> = new Set([
   "/__internal/remote-describe-many",
   "/__internal/remote-get-prop",
   "/__internal/replay",
-  "/__internal/state",
   "/__internal/actor-session-locations-batch",
   "/__internal/space-audience-sessions",
   "/__internal/room-snapshot",
@@ -242,11 +238,6 @@ export class PersistentObjectDO {
   // Throttle to one round-trip per host per `REMOTE_ROUTE_SYNC_TTL_MS`.
   private remoteRouteSyncAt = new Map<string, number>();
   private mcpGateway: McpGateway | null = null;
-  // Per-actor cache of `world.state(actor)` keyed by world.mutationVersion().
-  // Both /__internal/state and the local-host slice inside aggregateState
-  // hit this; a cache hit returns instantly without re-walking the object
-  // graph. Cleared implicitly on DO restart (cold init wipes the Map).
-  private hostStateCache = new Map<ObjRef, { version: number; payload: Record<string, unknown> }>();
   // Cross-host property cache for stable, hot-path property reads
   // (actor.name in a verb that runs on a different host's DO is a common
   // case). Keyed by `${host}|${objRef}|${name}`. Only entries for
@@ -390,7 +381,6 @@ export class PersistentObjectDO {
         onSessionsEnded: async (sessions) => {
           for (const session of sessions) await this.unregisterSessionRoute(session.id);
         },
-        state: (actor) => this.aggregateState(world, actor),
         executeTurn: (input) => this.restV2Turn(world, input),
         installTap: async (actor, body) => {
           if (!gatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap install is only available on the world gateway host");
@@ -1122,7 +1112,6 @@ export class PersistentObjectDO {
     if (merged.changed) {
       world.importWorld(merged.world);
       world.persistFullSnapshot("host_seed_apply");
-      this.hostStateCache.clear();
       this.crossHostPropCache.clear();
     }
     // Mirror the cold-load path: any successful merge of a freshly
@@ -1834,156 +1823,8 @@ export class PersistentObjectDO {
     }
   }
 
-  private cachedHostState(world: WooWorld, actor: ObjRef): Record<string, unknown> {
-    const version = world.mutationVersion();
-    const hit = this.hostStateCache.get(actor);
-    // Clone on read so callers (notably aggregateState, which reassigns
-    // state.object_routes / state.spaces / state.objects) can't mutate the
-    // cached copy. structuredClone on a ~127KB plain object is much cheaper
-    // than rebuilding state via the full object-graph walk.
-    if (hit && hit.version === version) {
-      this.hostStateCache.delete(actor);
-      this.hostStateCache.set(actor, hit);
-      return this.withFreshStateClock(structuredClone(hit.payload));
-    }
-    const payload = world.state(actor) as unknown as Record<string, unknown>;
-    this.hostStateCache.delete(actor);
-    this.hostStateCache.set(actor, { version, payload: structuredClone(payload) });
-    while (this.hostStateCache.size > HOST_STATE_CACHE_LIMIT) {
-      const oldest = this.hostStateCache.keys().next().value as ObjRef | undefined;
-      if (!oldest) break;
-      this.hostStateCache.delete(oldest);
-    }
-    return this.withFreshStateClock(payload);
-  }
-
-  private withFreshStateClock(payload: Record<string, unknown>): Record<string, unknown> {
-    // Mutates only the response object being returned. On cache hits that is a
-    // clone of the cached payload; on misses the cache already stored its own
-    // clone before this clock field is stamped.
-    payload.server_time = Date.now();
-    return payload;
-  }
-
-  private async aggregateState(world: WooWorld, actor: ObjRef): Promise<Record<string, unknown>> {
-    const startedAt = Date.now();
-    const result = await this.aggregateStateInner(world, actor);
-    world.recordMetric({
-      kind: "state_projection",
-      ms: Date.now() - startedAt,
-      objects: Object.keys((result.objects ?? {}) as Record<string, unknown>).length,
-      remote_hosts: Array.isArray(result.object_routes) ? new Set((result.object_routes as Array<{ host?: string }>).map((r) => r.host ?? "").filter(Boolean)).size : 0
-    });
-    return result;
-  }
-
-  private async aggregateStateInner(world: WooWorld, actor: ObjRef): Promise<Record<string, unknown>> {
-    const state = this.cachedHostState(world, actor);
-    const routes = Array.isArray(state.object_routes)
-      ? state.object_routes.filter((route): route is { id: string; host: string; anchor: string | null } => (
-          route !== null &&
-          typeof route === "object" &&
-          !Array.isArray(route) &&
-          typeof (route as Record<string, unknown>).id === "string" &&
-          typeof (route as Record<string, unknown>).host === "string"
-        ))
-      : [];
-    const remoteHosts = Array.from(new Set(routes.map((route) => route.host).filter((host) => host && host !== WORLD_HOST)));
-    // Fan out to every remote host in parallel; each /__internal/state takes
-    // O(per-host-state-compose) so a serial loop turns into O(N × that). The
-    // per-host timeout keeps a cold or wedged remote host from blocking the
-    // gateway's first state projection indefinitely.
-    const fetched = await Promise.all(
-      remoteHosts.map((host) => this.fetchHostState(world, host, actor).then((remote) => ({ host, remote })))
-    );
-    for (const { host, remote } of fetched) {
-      if (!remote) continue;
-      const remoteRoutes = Array.isArray(remote.object_routes)
-        ? remote.object_routes.filter((route): route is { id: string; host: string; anchor: string | null } => (
-            route !== null &&
-            typeof route === "object" &&
-            !Array.isArray(route) &&
-            typeof (route as Record<string, unknown>).id === "string" &&
-            (route as Record<string, unknown>).host === host
-          ))
-        : [];
-      const hostRoutes = [...routes.filter((route) => route.host === host), ...remoteRoutes];
-      state.object_routes = uniqueRoutes([...(Array.isArray(state.object_routes) ? state.object_routes as Array<{ id: string; host: string; anchor: string | null }> : []), ...remoteRoutes]);
-      const routeIds = new Set(hostRoutes.map((route) => route.id));
-      const spaces = { ...readMap(state.spaces) };
-      for (const id of routeIds) {
-        const remoteSpace = readMap(remote.spaces)[id];
-        if (remoteSpace) spaces[id] = remoteSpace;
-      }
-      state.spaces = spaces;
-      const objects = { ...readMap(state.objects) };
-      const remoteObjects = readMap(remote.objects);
-      for (const id of routeIds) {
-        if (remoteObjects[id]) objects[id] = remoteObjects[id];
-      }
-      state.objects = objects;
-    }
-    return state;
-  }
-
-  private async fetchHostState(world: WooWorld, host: string, actor: ObjRef): Promise<Record<string, unknown> | null> {
-    let settled = false;
-    const startedAt = Date.now();
-    // The deadline now drives an AbortController, so on timeout the inner
-    // fetch — and the queue waiter behind it — both wind down rather than
-    // running on in the background after the outer race rejects.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "timeout" });
-      }
-      controller.abort(wooError("E_TIMEOUT", `host state fetch timed out: ${host}`, { host, timeout_ms: HOST_STATE_FETCH_TIMEOUT_MS }));
-    }, HOST_STATE_FETCH_TIMEOUT_MS);
-    try {
-      const remote = await this.fetchHostStateInner(host, actor, controller.signal);
-      if (!settled) {
-        settled = true;
-        world.recordMetric({
-          kind: "cross_host_rpc",
-          route: "/__internal/state",
-          host,
-          ms: Date.now() - startedAt,
-          status: remote ? "ok" : "error",
-          ...(remote ? {} : { error: "E_BAD_RESPONSE" })
-        });
-      }
-      return remote;
-    } catch (err) {
-      if (!settled) {
-        settled = true;
-        const error = normalizeError(err);
-        world.recordMetric({ kind: "cross_host_rpc", route: "/__internal/state", host, ms: Date.now() - startedAt, status: "error", error: error.code });
-      }
-      return null;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  private async fetchHostStateInner(host: string, actor: ObjRef, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
-    const id = this.env.WOO.idFromName(host);
-    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/state`, {
-      headers: { "x-woo-host-key": host, "x-woo-internal-actor": actor }
-    }));
-    const { response } = await this.outboundFetch(id, request, signal);
-    if (!response.ok) return null;
-    const body = await response.json();
-    return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
-  }
-
   private async handleInternal(request: Request, world: WooWorld, pathname: string, hostKey: string): Promise<Response> {
     try {
-      if (request.method === "GET" && pathname === "/__internal/state") {
-        const actor = request.headers.get("x-woo-internal-actor");
-        return jsonResponse(actor ? this.cachedHostState(world, actor as ObjRef) : world.state());
-      }
-
       const body = await readJsonBody(request);
       if (request.method === "POST" && pathname === "/__internal/object-routes") {
         return jsonResponse(world.objectRoutes());
@@ -3298,10 +3139,6 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   }
 }
 
-function readMap(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
 function isSerializedWorld(value: unknown): value is SerializedWorld {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<Record<keyof SerializedWorld, unknown>>;
@@ -3343,15 +3180,6 @@ function isSeedWorld(value: unknown): value is SeedWorld {
     if (typeof objectHosts[obj.id] !== "string" || (objectHosts[obj.id] as string).length === 0) return false;
   }
   return true;
-}
-
-function uniqueRoutes(routes: Array<{ id: string; host: string; anchor: string | null }>): Array<{ id: string; host: string; anchor: string | null }> {
-  const byId = new Map<string, { id: string; host: string; anchor: string | null }>();
-  for (const route of routes) {
-    if (!route?.id || !route.host) continue;
-    byId.set(route.id, route);
-  }
-  return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function isReadAvailabilityError(err: unknown): boolean {

@@ -38,7 +38,6 @@ export type RestProtocolHost = {
   onAuthenticated?(session: Session): void | Promise<void>;
   onSessionEnded?(session: Session): void | Promise<void>;
   onSessionsEnded?(sessions: Session[]): void | Promise<void>;
-  state(actor: ObjRef): unknown | Promise<unknown>;
   installTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
   updateTap?(actor: ObjRef, body: Record<string, unknown>): Promise<AppliedFrame>;
   openStream?(request: RestProtocolRequest, rawTarget: string, target: ObjRef, session: Session): RestProtocolResult | Promise<RestProtocolResult>;
@@ -131,12 +130,6 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
       if (!session) return jsonProtocol({ ok: false, login_required: true }, 302, { Location: `/signup?return=${encodeURIComponent(connectReturnPath(request))}` });
       const result = world.connectHermes(session.actor, request.query("return") ?? "", request.query("state") ?? "", request.query("profile_id") ?? "");
       return jsonProtocol(result, 302, { Location: result.redirect_url });
-    }
-
-    if (request.method === "GET" && request.pathname === "/api/state") {
-      const session = host.requireSession(request);
-      requireWizard(world, session.actor);
-      return jsonProtocol(withSessionProjection(await host.state(session.actor), world, session));
     }
 
     if (request.method === "GET" && request.pathname === "/api/me") {
@@ -704,21 +697,6 @@ export function parseWsProtocolFrame(raw: string | ArrayBuffer | ArrayBufferView
 function rawFrameBytes(raw: string | ArrayBuffer | ArrayBufferView): number {
   if (typeof raw === "string") return new TextEncoder().encode(raw).byteLength;
   return raw.byteLength;
-}
-
-function withSessionProjection(payload: unknown, world: WooWorld, session: Session): unknown {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  const activeScope = world.activeScopeForSession(session.id);
-  return {
-    ...(payload as Record<string, unknown>),
-    session: {
-      id: session.id,
-      actor: session.actor,
-      active_scope: activeScope,
-      current_location: activeScope,
-      all_locations: world.allLocationsForActor(session.actor)
-    }
-  };
 }
 
 function frameId(value: unknown): string | undefined {
