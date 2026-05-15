@@ -5703,7 +5703,7 @@ export class WooWorld {
     if (!topic) return false;
     const existing = this.propOrNull(ctx.thisObj, "missed_topics");
     const misses = Array.isArray(existing) ? existing : [];
-    const entry: WooValue = { topic, actor: ctx.actor, ts: Date.now() };
+    const entry: WooValue = { topic, actor: ctx.actor, ts: this.logicalNow("help_miss.now") };
     this.setProp(ctx.thisObj, "missed_topics", [...misses.slice(-99), entry]);
     return true;
   }
@@ -9094,6 +9094,7 @@ export class WooWorld {
     const present = await this.chatPresentAsync(ctx.thisObj, ctx.progr, ctx.hostMemo);
     const roster = await this.rosterRowsForActors(ctx, present);
     const presentNames = (await this.collectPropChecked(ctx.progr, present, "name", ctx.hostMemo)).map((name) => valueToText(name));
+    const now = this.logicalNow("room_who.now");
     ctx.observe({
       type: "who",
       source: ctx.thisObj,
@@ -9102,7 +9103,7 @@ export class WooWorld {
       room: ctx.thisObj,
       roster,
       text: `Present: ${presentNames.join(", ") || "nobody"}.`,
-      ts: Date.now()
+      ts: now
     });
     return roster;
   }
@@ -9188,10 +9189,11 @@ export class WooWorld {
       return [] as unknown as WooValue;
     }
 
+    const now = this.logicalNow("player_who.now");
     const rows = await Promise.all(unique.map(async (player) => {
       const location = this.objects.has(player) ? this.object(player).location : null;
       const locationName = location && this.objects.has(location) ? await this.objectDisplayNameAsync(ctx.progr, location, ctx.hostMemo) : "Nowhere";
-      const stats = this.playerSessionStats(player);
+      const stats = this.playerSessionStats(player, now);
       return {
         player,
         name: await this.objectDisplayNameAsync(ctx.progr, player, ctx.hostMemo),
@@ -9236,7 +9238,7 @@ export class WooWorld {
       room: this.objects.get(ctx.actor)?.location ?? null,
       roster,
       text: lines.join("\n"),
-      ts: Date.now()
+      ts: now
     });
     return rows as unknown as WooValue;
   }
@@ -9274,10 +9276,11 @@ export class WooWorld {
       this.tellPlayer(ctx, ctx.actor, ["Either that place doesn't want you, or you don't really want to go."]);
       return null;
     }
+    const now = this.logicalNow("player_join.now");
     if (old && old !== dest && old !== "$nowhere") {
-      ctx.observe({ type: "left", source: old, actor: ctx.actor, room: old, destination: dest, text: `${this.object(ctx.actor).name} leaves.`, ts: Date.now() });
+      ctx.observe({ type: "left", source: old, actor: ctx.actor, room: old, destination: dest, text: `${this.object(ctx.actor).name} leaves.`, ts: now });
     }
-    ctx.observe({ type: "entered", source: dest, actor: ctx.actor, room: dest, origin: old, text: `${this.object(ctx.actor).name} arrives.`, ts: Date.now() });
+    ctx.observe({ type: "entered", source: dest, actor: ctx.actor, room: dest, origin: old, text: `${this.object(ctx.actor).name} arrives.`, ts: now });
     return { room: dest, from: old, target, here_request: true, look_deferred: true } as unknown as WooValue;
   }
 
@@ -9351,8 +9354,7 @@ export class WooWorld {
     });
   }
 
-  private playerSessionStats(actor: ObjRef): { connected: boolean; connectedAt: number | null; connectedSeconds: number | null; idleSeconds: number | null; lastLoginAt: number | null } {
-    const now = Date.now();
+  private playerSessionStats(actor: ObjRef, now: number): { connected: boolean; connectedAt: number | null; connectedSeconds: number | null; idleSeconds: number | null; lastLoginAt: number | null } {
     const liveCutoff = now - IDLE_PRESENCE_LIVE_WINDOW_MS;
     let connectedAt: number | null = null;
     let lastInputAt: number | null = null;

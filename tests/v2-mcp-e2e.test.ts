@@ -53,6 +53,26 @@ describe("v2 MCP e2e", () => {
         observations: expect.arrayContaining([expect.objectContaining({ type: "said" })])
       });
 
+      const aliceActor = world.sessions.get(alice)?.actor;
+      const bobActor = world.sessions.get(bob)?.actor;
+      expect(aliceActor).toBeTruthy();
+      expect(bobActor).toBeTruthy();
+      const nativeCalls = [
+        { object: "the_chatroom", verb: "look", args: [] },
+        { object: aliceActor!, verb: "who_all", args: [] },
+        { object: aliceActor!, verb: "help", args: ["look"] },
+        { object: aliceActor!, verb: "examine_detailed", args: ["the_chatroom"] },
+        { object: aliceActor!, verb: "join_player", args: [world.object(bobActor!).name] }
+      ];
+      for (let i = 0; i < nativeCalls.length; i += 1) {
+        const call = nativeCalls[i];
+        const result = await mcp(gateway, alice, 30 + i, "tools/call", {
+          name: "woo_call",
+          arguments: call
+        });
+        expect(result.result.isError, `${call.object}:${call.verb} failed: ${JSON.stringify(result.result.structuredContent)}`).not.toBe(true);
+      }
+
       const charlie = await initializeMcp(gateway, "guest:v2-mcp-charlie", 20);
       const entered = await mcp(gateway, charlie, 21, "tools/call", {
         name: "woo_call",
