@@ -197,6 +197,39 @@ describe("turn recorder", () => {
     }
   });
 
+  it("keeps Tier 2 read/output verbs in bytecode transcripts", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-tier2");
+    const actor = session.actor;
+    await world.directCall("tier2-enter", actor, "the_chatroom", "enter", [], { sessionId: session.id });
+
+    const calls = [
+      { id: "tier2-tell", target: actor, verb: "tell", args: ["hello"] },
+      { id: "tier2-tell-lines", target: actor, verb: "tell_lines", args: [["one", "two"]] },
+      { id: "tier2-who-all", target: actor, verb: "who_all", args: [] },
+      { id: "tier2-help", target: actor, verb: "help", args: ["look"] },
+      { id: "tier2-examine", target: actor, verb: "examine_detailed", args: ["the_chatroom"] },
+      { id: "tier2-room-who", target: "the_chatroom", verb: "who", args: [] }
+    ];
+    for (const call of calls) {
+      const before = world.exportWorld();
+      const recorder = new InMemoryTurnRecorder();
+      world.setTurnRecorder(recorder);
+
+      const result = await world.directCall(call.id, actor, call.target, call.verb, call.args, { sessionId: session.id });
+
+      expect(result.op).toBe("result");
+      const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+      expect(transcript.complete, `${call.target}:${call.verb} incomplete: ${transcript.incompleteReasons.join(",")}`).toBe(true);
+      expect(transcript.incompleteReasons).toEqual([]);
+      expect(transcript.reads).toContainEqual(expect.objectContaining({
+        cell: expect.objectContaining({ kind: "verb", name: call.verb }),
+        value: expect.objectContaining({ implementation: "bytecode", native: null })
+      }));
+      expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    }
+  });
+
   it("marks native verb dispatch as incomplete while preserving dispatch metadata", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-native");

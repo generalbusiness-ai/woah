@@ -163,28 +163,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: [],
     note: "Revocation records the authoritative property mutation in the transcript; gateway and Directory session cleanup runs only after an accepted commit."
   },
-  room_who: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "room_who",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["room contents", "present actor names", "actor session activity"],
-    writes: [],
-    emits: ["who observation", "logical_input"],
-    note: "Room who is read-only and records its observation timestamp as a logical input."
-  },
-  player_help: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "player_help",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["actor help search path", "room help search path", "$system.help_dbs", "help database topics"],
-    writes: ["help database missed_topics when no topic resolves"],
-    emits: ["text observations"],
-    note: "Help lookup and miss recording use tracked property reads/writes and logical timestamps."
-  },
   help_db_find_topics: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "help_db_find_topics",
@@ -229,17 +207,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: ["logical_input"],
     note: "Help miss recording writes only the bounded missed_topics list and records its timestamp as a logical input."
   },
-  player_who: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "player_who",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["session rows", "player names", "player locations"],
-    writes: [],
-    emits: ["text observations", "who observation", "logical_input"],
-    note: "Who output is read-only over the serialized session table and tracked display-name/location reads."
-  },
   player_join: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "player_join",
@@ -250,17 +217,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     writes: ["actor location", "room contents", "presence mirrors through movement hooks"],
     emits: ["text observations", "left observation", "entered observation", "object_move", "cell_write", "logical_input"],
     note: "Join is transcript-safe through movetoChecked plus logical timestamps for emitted movement observations."
-  },
-  player_examine: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "player_examine",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["visible object match", "owner", "aliases", "description", "contents", "obvious command verb metadata"],
-    writes: [],
-    emits: ["text observations"],
-    note: "Detailed examine is read-only for local objects; remote summaries remain untracked by the remote-bridge policy."
   }
 };
 

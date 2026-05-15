@@ -106,6 +106,39 @@ const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   return base;
 }`;
 
+const PLAYER_WHO_ALL_SOURCE = `verb :who_all(names) rxd {
+  let projection = player_listing(names);
+  if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
+  if (has(projection, "observation") && projection["observation"] != null) { observe(projection["observation"]); }
+  return projection["rows"];
+}`;
+
+const PLAYER_EXAMINE_DETAILED_SOURCE = `verb :examine_detailed(name) rxd {
+  let projection = object_examine_projection(name);
+  if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
+  return projection["result"];
+}`;
+
+const PLAYER_TELL_SOURCE = `verb :tell(text) rxd {
+  let out = "";
+  for part in args { out = out + to_string(part); }
+  tell(this, out);
+  return true;
+}`;
+
+const PLAYER_TELL_LINES_SOURCE = `verb :tell_lines(lines) rxd {
+  let out = lines;
+  if (typeof(out) != "list") { out = args; }
+  for line in out { tell(this, line); }
+  return true;
+}`;
+
+const PLAYER_HELP_SOURCE = `verb :help(topic) rxd {
+  let projection = help_topic_projection(topic);
+  if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
+  return projection["result"];
+}`;
+
 const ROOT_DESCRIBE_SOURCE = `verb :describe() rxd {
   return describe_object(this);
 }`;
@@ -884,7 +917,7 @@ function seedUniversal(world: WooWorld): void {
     aliases: ["@home"],
     argSpec: { args: [], command: { dobj: "none", prep: "none", iobj: "none", args_from: [] } }
   });
-  native(world, "$player", "who_all", "player_who", "verb :who_all(names?) rxd { /* native: LambdaCore-style @who over connected players. */ }", {
+  sourceVerb(world, "$player", "who_all", PLAYER_WHO_ALL_SOURCE, {
     directCallable: true,
     toolExposed: true,
     aliases: ["@who"],
@@ -902,7 +935,7 @@ function seedUniversal(world: WooWorld): void {
     aliases: ["@ways"],
     argSpec: { args: ["room?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
   });
-  native(world, "$player", "examine_detailed", "player_examine", "verb :examine_detailed(name) rxd { /* native: LambdaCore-style @examine with names, owner, description, contents, and obvious command verbs. */ }", {
+  sourceVerb(world, "$player", "examine_detailed", PLAYER_EXAMINE_DETAILED_SOURCE, {
     directCallable: true,
     toolExposed: true,
     aliases: ["@exam*ine"],
@@ -910,9 +943,9 @@ function seedUniversal(world: WooWorld): void {
   });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
   native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });
-  native(world, "$player", "tell", "player_tell", "verb :tell(text) rxd { ... }", { directCallable: true });
-  native(world, "$player", "tell_lines", "player_tell_lines", "verb :tell_lines(lines) rxd { ... }", { directCallable: true });
-  native(world, "$player", "help", "player_help", "verb :help(topic?) rxd { return null; /* native: see player_help */ }", {
+  sourceVerb(world, "$player", "tell", PLAYER_TELL_SOURCE, { directCallable: true });
+  sourceVerb(world, "$player", "tell_lines", PLAYER_TELL_LINES_SOURCE, { directCallable: true });
+  sourceVerb(world, "$player", "help", PLAYER_HELP_SOURCE, {
     directCallable: true,
     skipPresenceCheck: true,
     toolExposed: true,
