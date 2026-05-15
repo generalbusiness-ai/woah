@@ -40,7 +40,7 @@ The runtime distinguishes three things that look similar but have different life
 Concretely:
 
 - An actor exists whether anyone is connected to it. A guest sitting in the pool is still a `$player` in the world.
-- A session exists from `op: "auth"` until reap. Across that window, zero or more connections may be attached.
+- A session exists from HTTP/v2 authentication until reap. Across that window, zero or more connections may be attached.
 - A connection exists from socket-open to socket-close. One session may have multiple concurrent connections (one per browser tab); see §I5.
 
 **`is_connected(actor)`** is derived: "any live connection has `actor_ref == actor`." Not a stored property. Implementations may cache it, but the truth is the connection registry.
@@ -64,18 +64,17 @@ It does **not** carry a list of attached sockets — those live in the in-memory
 
 Guest auth is intentionally minimal:
 
-```
-client → server: { op: "auth", token: string }
-server → client: { op: "session", actor: ObjRef }
-```
+The client presents a token to the HTTP authentication endpoint or v2 session
+minting flow. The server returns a session id, actor objref, active scope, and
+expiry metadata.
 
 The token is a string; the server interprets it. Guest-baseline vocabulary:
 
 - **`guest:<random>`** — server creates a fresh `$player` (or pulls one from a pre-seeded guest pool), binds it to a new session, and returns the actor's objref. Guest actors persist for the session and the guest grace period after the last connection detaches (defaults in §I6.2).
-- **`session:<session_id>`** — if the session is alive in the server's session table, auth resumes it. If expired, the server replies with `op: "error"` code `E_NOSESSION`; the client must establish a new session.
+- **`session:<session_id>`** — if the session is alive in the server's session table, auth resumes it. If expired, the server replies with `E_NOSESSION`; the client must establish a new session.
 - **`bearer:<...>`** — reserved for credentialed auth.
 
-The token vocabulary is server policy; the wire format is `string`. The contract is "the server tells the client what token to present next" — typically by surfacing a `session:<id>` token in the initial `op: "session"` frame's payload (when this is added) or via a side channel.
+The token vocabulary is server policy; the wire format is `string`. The contract is "the server tells the client what token to present next" — typically by surfacing a `session:<id>` token in the HTTP/v2 auth response or via a side channel.
 
 ---
 
@@ -84,7 +83,7 @@ The token vocabulary is server policy; the wire format is `string`. The contract
 A client that loses its websocket reconnects with the same `session:<session_id>` token. If the session is alive:
 
 - Actor binding is restored.
-- Client receives a fresh `op: "session"`.
+- Client receives fresh session metadata.
 - Server resumes pushing `applied` frames for the spaces the actor is observing.
 - Client uses gap recovery ([events.md §12.8](events.md#128-sequenced-calls-with-gap-recovery)) to backfill missed seqs per space.
 

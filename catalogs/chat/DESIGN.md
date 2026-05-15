@@ -95,7 +95,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |
 | `:huh(text, reason?)` | str, str? | Compatibility wrapper that delegates parse-failure output to `actor:huh(text, reason, this)`. |
 | `:command_plan(text)` | str | Parses text into `{route, space?, target, verb, args, cmd}`. |
-| `:command(text)` | str | Compatibility command surface. Executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients normally use wire `op:"command"` instead. |
+| `:command(text)` | str | Compatibility command surface. Executes direct plans inline and sequenced plans through the resolved command space, returning the applied/error frame. Browser clients normally use v2 command intents instead. |
 
 Most `$conversational` verbs are portable source, including the command planner. `$match` still uses trusted local native implementation hints for tokenizer/object-matcher primitives. Public tap installs ignore those hints and still compile the source fallback.
 
@@ -289,7 +289,7 @@ A transient browser host that:
    - `entered/left` → render the room-supplied `text`.
    - `looked/who` → render the room-supplied `text`.
    - `huh {text}` → `I don't understand that.`
-5. Sends free-text input as wire `op:"command"` with the active command space and raw text. The server plans and dispatches the command; direct plans return `op:"result"` and sequenced plans return `op:"applied"`. The catalog-level `:command_plan` / `:command` verbs remain for direct callers and compatibility.
+5. Sends free-text input as a v2 command intent with the active command scope and raw text. The server plans and dispatches the command; direct plans return a turn result and sequenced plans return an applied frame. The catalog-level `:command_plan` / `:command` verbs remain for direct callers and compatibility.
 
 Same client speaks against `$chatroom` and against `$task_registry` — the verb set is identical, the renderer doesn't care.
 

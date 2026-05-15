@@ -1,13 +1,16 @@
 ---
 date: 2026-04-30
-status: implemented
+status: legacy
 ---
 
 # Browser host bootstrap
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
-Wire-level interaction between a player host and a browser tab hosting transient objects.
+Historical v1 wire-level interaction between a player host and a browser tab
+hosting transient objects. The current browser transport is
+[v2-turn-network.md](v2-turn-network.md); browser-hosted execution nodes will be
+respecified on that substrate before implementation.
 
 ---
 
