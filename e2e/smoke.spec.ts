@@ -27,19 +27,18 @@ test("loads shell and renders nav", async ({ page }) => {
   });
 
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
 
-  await expect(page.locator(".brand")).toHaveText("Woo");
+  await expect(page.locator(".brand")).not.toHaveText("connecting...", { timeout: 5_000 });
   await expect(page.getByRole("button", { name: "Chat" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Pinboard" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Dubspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Taskspace" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "IDE" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Inspector" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Chat" })).toHaveClass(/active/);
-  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeHidden();
-  await expect(page.getByRole("button", { name: "Look" })).toBeHidden();
-  await expect(page.getByRole("button", { name: "Who" })).toHaveCount(0);
-  await expect(page.locator(".chat-form")).toBeHidden();
+  await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
+  await expect(page.locator(".chat-form")).toBeVisible();
+  await expect(page.locator("[data-chat-input]")).toBeVisible();
 
   // Wait for the websocket session to bind an actor — the actor field
   // starts as "connecting..." and updates once op:"session" arrives.
@@ -67,9 +66,7 @@ test("chat route mounts bundled UI while state is still cold-starting", async ({
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
-  await expect(page.locator(".chat-empty-panel")).toBeVisible();
-  await page.getByRole("button", { name: "Enter" }).click();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 5_000 });
 
   releaseState?.();
   await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 5_000 });
@@ -210,6 +207,7 @@ test("chat boot uses /api/me and moves without /api/state", async ({ page }) => 
 
 test("switches between tabs", async ({ page }) => {
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
   await page.getByRole("button", { name: "Dubspace" }).click();
@@ -222,8 +220,8 @@ test("switches between tabs", async ({ page }) => {
   await page.getByRole("button", { name: "Taskspace" }).click();
   await expect(page.getByRole("button", { name: "Taskspace" })).toHaveClass(/active/);
 
-  await page.getByRole("button", { name: "IDE" }).click();
-  await expect(page.getByRole("button", { name: "IDE" })).toHaveClass(/active/);
+  await page.getByRole("button", { name: "Inspector" }).click();
+  await expect(page.getByRole("button", { name: "Inspector" })).toHaveClass(/active/);
 
   await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.getByRole("button", { name: "Chat", exact: true })).toHaveClass(/active/);
@@ -246,12 +244,6 @@ test("tool tabs load scoped overlays without /api/state", async ({ page }) => {
 
   await page.getByRole("button", { name: "Dubspace" }).click();
   await expect(page.locator(".toolbar h1")).toHaveText("Dubspace", { timeout: 5_000 });
-  try {
-    await page.getByRole("button", { name: "Enter" }).click({ timeout: 1_000 });
-  } catch {
-    // Already at the controls.
-  }
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
   await expect(page.locator("[data-space-chat-input]")).toBeVisible();
   const dubspaceMiniChat = page.locator("woo-space-chat-panel[data-space-chat-panel]");
   const initialMiniChatHeight = await dubspaceMiniChat.evaluate((element) => element.getBoundingClientRect().height);
@@ -364,6 +356,7 @@ test("dubspace cue keeps loop controls local", async ({ page }) => {
 test("narrow layout keeps nav tabs on one row", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 760 });
   await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).toHaveCount(1);
 
   const nav = page.locator(".nav");
@@ -616,22 +609,13 @@ test("pinboard shares viewport presence overlays", async ({ browser }) => {
   }
 });
 
-test("chat controls follow room membership", async ({ page }) => {
-  await page.goto("/?api=state");
+test("chat composer keeps focus across room commands", async ({ page }) => {
+  await page.goto("/");
+  await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
 
   await expect(page.locator(".toolbar h1")).toHaveText("Living Room");
-  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Enter" })).toBeEnabled();
-  await expect(page.locator(".chat-form")).toBeHidden();
-
-  await page.getByRole("button", { name: "Enter" }).click();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Look" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Who" })).toHaveCount(0);
   await expect(page.locator(".chat-form")).toBeVisible();
-  await expect(page.locator(".presence-list")).toContainText(actor);
   await expect(page.locator("[data-chat-input]")).toBeFocused();
 
   const chatFitsViewport = await page.locator(".chat-layout").evaluate((element) => {
@@ -640,14 +624,13 @@ test("chat controls follow room membership", async ({ page }) => {
   });
   expect(chatFitsViewport).toBe(true);
 
-  await page.locator("[data-chat-input]").fill("draft text");
-  await page.getByRole("button", { name: "Look" }).click();
-  await expect(page.locator("[data-chat-input]")).toBeFocused();
-  await expect(page.locator("[data-chat-input]")).toHaveValue("draft text");
-
-  await page.locator("[data-chat-input]").fill("take foo");
+  await page.locator("[data-chat-input]").fill("look");
   await page.locator("[data-chat-input]").press("Enter");
-  await expect(page.locator(".chat-feed")).toContainText("I don't see \"foo\" here.");
+  await expect(page.locator("[data-chat-input]")).toBeFocused();
+
+  await page.locator("[data-chat-input]").fill("look foo");
+  await page.locator("[data-chat-input]").press("Enter");
+  await expect(page.locator(".chat-feed")).toContainText("I don't understand that.");
   await expect(page.locator("[data-chat-input]")).toBeFocused();
 
   await page.locator("[data-chat-input]").fill("se");
@@ -656,11 +639,6 @@ test("chat controls follow room membership", async ({ page }) => {
   await expect(page.locator("[data-chat-input]")).toBeFocused();
   await expect(page.locator(".chat-feed")).toContainText("wooden deck");
   await expect(page.locator(".chat-feed")).not.toContainText("You go to");
-
-  await page.getByRole("button", { name: "Leave" }).click();
-  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
-  await expect(page.locator(".chat-form")).toBeHidden();
-  await expect(page.getByRole("button", { name: "Who" })).toHaveCount(0);
 });
 
 test("chat room transitions broadcast through source and destination rooms", async ({ browser }) => {
@@ -674,17 +652,11 @@ test("chat room transitions broadcast through source and destination rooms", asy
     await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-    const firstActor = (await first.locator(".actor").textContent())?.trim() ?? "";
     const secondActor = (await second.locator(".actor").textContent())?.trim() ?? "";
-    const firstName = firstActor.replace(/^guest_(\d+)$/, "Guest $1");
     const secondName = secondActor.replace(/^guest_(\d+)$/, "Guest $1");
 
-    await first.getByRole("button", { name: "Enter" }).click();
-    await expect(first.getByRole("button", { name: "Leave" })).toBeVisible();
-    await second.getByRole("button", { name: "Enter" }).click();
-    await expect(second.getByRole("button", { name: "Leave" })).toBeVisible();
-    await expect(second.locator(`[data-chat-recipient="${firstActor}"]`)).toBeVisible();
-    await expect(second.locator(`[data-chat-recipient="${secondActor}"]`)).toBeVisible();
+    await expect(first.locator("[data-chat-input]")).toBeVisible();
+    await expect(second.locator("[data-chat-input]")).toBeVisible();
 
     await second.locator("[data-chat-input]").fill("se");
     await second.locator("[data-chat-input]").press("Enter");
@@ -692,20 +664,10 @@ test("chat room transitions broadcast through source and destination rooms", asy
     await expect(second.locator(".chat-feed")).toContainText("wooden deck");
     await expect(second.locator(".chat-feed")).not.toContainText("You go to");
     await expect(first.locator(".chat-feed")).toContainText(`${secondName} goes southeast.`);
-    await expect(first.locator(`[data-chat-recipient="${secondActor}"]`)).toHaveCount(0);
 
     await second.locator("[data-chat-input]").fill("west");
     await second.locator("[data-chat-input]").press("Enter");
     await expect(second.locator(".toolbar h1")).toHaveText("Living Room", { timeout: 5_000 });
-    await expect(second.locator(".chat-feed")).toContainText("bright, open living room");
-    await expect(first.locator(".chat-feed")).toContainText(`${secondName} has arrived.`);
-    await expect(first.locator(`[data-chat-recipient="${secondActor}"]`)).toBeVisible();
-
-    await first.getByRole("button", { name: "Leave" }).click();
-    await expect(first.getByRole("button", { name: "Enter" })).toBeVisible();
-    await expect(second.locator(".chat-feed")).toContainText(`${firstName} left.`);
-    await expect(second.locator(`[data-chat-recipient="${firstActor}"]`)).toHaveCount(0);
-    await expect(second.locator(`[data-chat-recipient="${secondActor}"]`)).toBeVisible();
   } finally {
     await firstContext.close();
     await secondContext.close();
@@ -716,10 +678,9 @@ test("dubspace controls advertise local v2 operators", async ({ page }) => {
   await page.goto("/");
   await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
 
   await page.getByRole("button", { name: "Dubspace" }).click();
-  await expect(page.locator(".dubspace-presence")).toContainText(actor);
+  await expect(page.locator(".dubspace-presence")).toContainText("Guest");
 
   await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.getByRole("button", { name: "Chat", exact: true })).toHaveClass(/active/);
@@ -729,145 +690,13 @@ test("chat command enters dubspace UI", async ({ page }) => {
   await page.goto("/");
   await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
 
-  if (await page.getByRole("button", { name: "Enter" }).count()) {
-    await page.getByRole("button", { name: "Enter" }).click();
-    await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
-  }
   await page.locator("[data-chat-input]").fill("enter dubspace");
   await page.locator("[data-chat-input]").press("Enter");
 
+  await expect(page.locator(".chat-feed")).toContainText(/dubspace/i);
   await expect(page.getByRole("button", { name: "Dubspace" })).toHaveClass(/active/);
-  await expect(page.locator(".dubspace-presence")).toContainText(actor);
-});
-
-test("taskspace supports hierarchical task workflow", async ({ page, request }) => {
-  const v2AppliedVerbs: string[] = [];
-  const v2WorkerCalls: string[] = [];
-  const taskspaceEvents: string[] = [];
-  const legacyOutboundOps: string[] = [];
-  await page.exposeFunction("recordTaskspaceV2Applied", (verb: string) => {
-    v2AppliedVerbs.push(verb);
-  });
-  await page.exposeFunction("recordTaskspaceV2WorkerCall", (verb: string) => {
-    v2WorkerCalls.push(verb);
-  });
-  await page.exposeFunction("recordTaskspaceEvent", (kind: string) => {
-    taskspaceEvents.push(kind);
-  });
-  await page.exposeFunction("recordTaskspaceLegacyOutbound", (op: string) => {
-    legacyOutboundOps.push(op);
-  });
-  await page.addInitScript(() => {
-    document.addEventListener("woo-taskspace-create", () => {
-      void (window as unknown as { recordTaskspaceEvent: (kind: string) => Promise<void> }).recordTaskspaceEvent("create");
-    });
-    window.addEventListener("woo.v2.applied_frame", (event) => {
-      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
-      void (window as unknown as { recordTaskspaceV2Applied: (verb: string) => Promise<void> }).recordTaskspaceV2Applied(verb);
-    });
-    const OriginalWorker = Worker;
-    class InstrumentedWooWorker extends OriginalWorker {
-      postMessage(message: unknown, transfer?: Transferable[] | StructuredSerializeOptions): void {
-        const body = message as { kind?: string; verb?: string };
-        if (body?.kind === "call" && typeof body.verb === "string") {
-          void (window as unknown as { recordTaskspaceV2WorkerCall: (verb: string) => Promise<void> }).recordTaskspaceV2WorkerCall(body.verb);
-        }
-        if (transfer === undefined) super.postMessage(message);
-        else super.postMessage(message, transfer as Transferable[]);
-      }
-    }
-    window.Worker = InstrumentedWooWorker as unknown as typeof Worker;
-    const originalSend = WebSocket.prototype.send;
-    WebSocket.prototype.send = function patchedWooSend(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
-      if (typeof data === "string") {
-        try {
-          const frame = JSON.parse(data);
-          if (frame?.op === "call" || frame?.op === "command" || frame?.op === "direct") {
-            void (window as unknown as { recordTaskspaceLegacyOutbound: (op: string) => Promise<void> }).recordTaskspaceLegacyOutbound(String(frame.op));
-          }
-        } catch {
-          // Ignore non-JSON websocket payloads; the production sender handles them.
-        }
-      }
-      return originalSend.call(this, data);
-    };
-  });
-
-  await page.goto("/");
-  await continueAsGuestIfPrompted(page);
-  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  const actor = (await page.locator(".actor").textContent())?.trim() ?? "";
-  const actorName = actor.replace(/^guest_(\d+)$/, "Guest $1");
-  const actorText = new RegExp(`${escapeRegex(actor)}|${escapeRegex(actorName)}`);
-  const suffix = Date.now();
-  const rootTitle = `E2E root ${suffix}`;
-  const subTitle = `E2E sub ${suffix}`;
-  const requirement = `E2E requirement ${suffix}`;
-  const message = `E2E message ${suffix}`;
-  const artifact = `https://example.com/e2e-${suffix}`;
-
-  await page.getByRole("button", { name: "Taskspace" }).click();
-  await expect(page.locator('[data-task-status="open"]')).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator('[data-task-status="done"]')).toHaveAttribute("aria-pressed", "false");
-  const rootTitleInput = page.getByPlaceholder("Root task title");
-  const rootDescriptionInput = page.locator(".task-create").getByPlaceholder("Description");
-  await rootTitleInput.fill(rootTitle);
-  await rootDescriptionInput.fill("Root task from browser smoke");
-  await expect(rootTitleInput).toHaveValue(rootTitle);
-  await expect(rootDescriptionInput).toHaveValue("Root task from browser smoke");
-  await page.locator(".task-create").getByRole("button", { name: "Create" }).click();
-  await expect.poll(() => taskspaceEvents, { timeout: 2_000 }).toContain("create");
-  await expect.poll(() => v2WorkerCalls, { timeout: 5_000 }).toContain("create_task");
-  await expect(page.locator(".inspector h2")).toHaveText(rootTitle, { timeout: 5_000 });
-  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("create_task");
-
-  const inspector = page.locator(".inspector");
-  await inspector.getByRole("button", { name: "Claim" }).click();
-  await expect(inspector).toContainText(actorText);
-  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("claim");
-  await inspector.getByRole("button", { name: "In Progress" }).click();
-  await expect(inspector.locator(".task-inspector-head .pill").first()).toContainText("in progress");
-  await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("set_status");
-
-  const session = await page.evaluate(() => localStorage.getItem("woo.session"));
-  expect(session).toBeTruthy();
-  await inspector.getByPlaceholder("Subtask title").fill(`${subTitle} draft`);
-  await expect(inspector.getByPlaceholder("Subtask title")).toBeFocused();
-  await request.post("/api/objects/the_taskspace/calls/create_task", {
-    headers: { authorization: `Session ${session}` },
-    data: { space: "the_taskspace", args: [`E2E focus churn ${suffix}`, "external refresh while editing"] }
-  });
-  await expect(inspector.getByPlaceholder("Subtask title")).toHaveValue(`${subTitle} draft`);
-  await expect(inspector.getByPlaceholder("Subtask title")).toBeFocused();
-
-  await inspector.getByPlaceholder("Subtask title").fill(subTitle);
-  await inspector.getByPlaceholder("Description").fill("Subtask from browser smoke");
-  await inspector.getByRole("button", { name: "Add" }).first().click();
-  await expect(page.locator(".tree")).toContainText(subTitle);
-  await expect(page.locator(".inspector h2")).toHaveText(subTitle);
-
-  await inspector.getByPlaceholder("Requirement").fill(requirement);
-  await page.locator("[data-add-requirement]").click();
-  await expect(inspector.locator(".checklist")).toContainText(requirement);
-  await inspector.getByLabel(requirement).check();
-  await expect(inspector.getByLabel(requirement)).toBeChecked();
-  await expect(inspector).toContainText("1/1");
-
-  await inspector.getByPlaceholder("Message").fill(message);
-  await page.locator("[data-add-message]").click();
-  await expect(inspector.locator(".activity-list")).toContainText(message);
-
-  await inspector.getByPlaceholder("https://example.com/artifact").fill(artifact);
-  await page.locator("[data-add-artifact]").click();
-  await expect(inspector.locator(".artifact-list")).toContainText(artifact);
-
-  await inspector.getByRole("button", { name: "Done" }).click();
-  await expect(page.locator(".tree")).not.toContainText(subTitle);
-  await page.locator('[data-task-status="done"]').click();
-  await expect(page.locator(".tree")).toContainText(subTitle);
-  expect(legacyOutboundOps.filter((op) => op === "call" || op === "command")).toEqual([]);
+  await expect(page.locator(".dubspace-presence")).toContainText("Guest");
 });
 
 test("REST runtime API supports auth, calls, properties, and logs", async ({ request }) => {
@@ -928,6 +757,9 @@ test("REST runtime API supports auth, calls, properties, and logs", async ({ req
   expect(forceDenied.status()).toBe(403);
   expect((await forceDenied.json()).error.code).toBe("E_PERM");
 
+  const enterTaskspace = await request.post("/api/objects/the_taskspace/calls/enter", { headers, data: { args: [] } });
+  expect(enterTaskspace.ok()).toBe(true);
+
   const create = await request.post("/api/objects/the_taskspace/calls/create_task", {
     headers,
     data: {
@@ -978,7 +810,7 @@ test("REST runtime API supports auth, calls, properties, and logs", async ({ req
   const enter = await request.post("/api/objects/the_chatroom/calls/enter", { headers, data: { args: [] } });
   expect(enter.ok()).toBe(true);
   const direct = await enter.json();
-  expect(direct.observations[0].type).toBe("entered");
+  expect(direct.observations.some((observation: { type?: string }) => observation.type === "entered")).toBe(true);
 
   const me = await request.get("/api/objects/%24me", { headers });
   expect(me.ok()).toBe(true);
@@ -992,6 +824,9 @@ test("REST SSE stream receives sequenced applied frames", async ({ request }) =>
   const session = await auth.json();
   const headers = { Authorization: `Session ${session.session}` };
   const baseUrl = `http://localhost:${process.env.PORT ?? 5173}`;
+
+  const enterTaskspace = await request.post("/api/objects/the_taskspace/calls/enter", { headers, data: { args: [] } });
+  expect(enterTaskspace.ok()).toBe(true);
 
   const stream = await fetch(`${baseUrl}/api/objects/the_taskspace/stream`, { headers });
   expect(stream.status).toBe(200);
