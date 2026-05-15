@@ -139,6 +139,7 @@ const BUILTINS = new Set([
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
+  "describe_object", "room_look_projection",
   // builder_create_object and builder_chparent stay native. The other
   // builder_*/programmer_* surface builtins were removed (see
   // tiny-vm.ts BUILTIN_NAMES tombstones); their logic lives in

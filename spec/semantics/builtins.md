@@ -42,6 +42,7 @@ convert values explicitly before joining.
 
 `create(parent, owner_or_options?)`, `recycle(obj)`, `chparent(obj, new_parent)`,
 `has_flag(obj, name)`, `parents(obj)`, `children(obj)`, `valid(obj)`,
+`describe_object(obj)`,
 `compile_verb(source)`,
 `add_verb(obj, info)`, `delete_verb(obj, descriptor)`,
 `set_verb_code(obj, descriptor, source)`, `set_verb_info(obj, descriptor, info)`,
@@ -185,6 +186,11 @@ intents instead of calling it indirectly.
 ordinary behavior checks such as wizard bypasses; it is not a substitute for the
 permission system.
 
+`describe_object(obj)` returns the same structured introspection map as
+`$root:describe()`. The builtin is substrate introspection for catalog source,
+not a user-facing verb. It reads the target's metadata, visible properties,
+verbs, schemas, children, and contents using the caller actor's authority.
+
 There is intentionally no "list all objects in the world" builtin. Instance enumeration is by class via recursive `children($class)`; per-owner enumeration is by convention (creator maintains a list). Ops-level host enumeration uses the runtime's management plane, not the runtime API.
 
 ### 19.5 Task / scheduling
@@ -210,6 +216,12 @@ but routes live delivery to the session audience of `space`. It is for ordinary
 object behavior such as a mounted pinboard or control surface emitting visible
 activity to its containing room; it does not make the containing-room relation a
 core property.
+
+`room_look_projection(room)` returns the substrate-provided structured room
+view used by the bundled chat catalog's `$room:look_self()`: room id, title,
+description, roster rows, and visible contents. It exists because that view is a
+cross-host projection over room contents and remote object summaries; the
+English command and observation policy still live in catalog source.
 
 `set_presence(space, present)` updates the current actor/session's presence in a
 space through the host-safe presence primitive. The authoritative storage is

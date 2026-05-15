@@ -9,7 +9,7 @@ import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { comparableTurnEvents, replayRecordedTurn } from "../src/core/turn-replay";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import type { HostBridge } from "../src/core/world";
-import { message } from "./core-support";
+import { message, nativeVerb } from "./core-support";
 
 describe("turn recorder", () => {
   it("records a direct VM turn's central reads, writes, observations, and logical inputs", async () => {
@@ -157,25 +157,71 @@ describe("turn recorder", () => {
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
+  it("keeps Tier 1 look and describe verbs in bytecode transcripts", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-tier1");
+    const actor = session.actor;
+    world.createObject({ id: "tier1_box", name: "Tier One Box", parent: "$thing", owner: actor });
+    world.setProp("tier1_box", "description", "A box for transcript coverage.");
+
+    const calls = [
+      { id: "tier1-describe", target: "tier1_box", verb: "describe" },
+      { id: "tier1-look-self", target: "tier1_box", verb: "look_self" },
+      { id: "tier1-look", target: "tier1_box", verb: "look" },
+      { id: "tier1-room-look-self", target: "the_chatroom", verb: "look_self" }
+    ];
+    for (const call of calls) {
+      const before = world.exportWorld();
+      const recorder = new InMemoryTurnRecorder();
+      world.setTurnRecorder(recorder);
+
+      const result = await world.directCall(call.id, actor, call.target, call.verb, []);
+
+      expect(result.op).toBe("result");
+      const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+      expect(transcript.complete, `${call.target}:${call.verb} incomplete: ${transcript.incompleteReasons.join(",")}`).toBe(true);
+      expect(transcript.incompleteReasons).toEqual([]);
+      expect(transcript.reads).toContainEqual(expect.objectContaining({
+        cell: expect.objectContaining({ kind: "verb", name: call.verb }),
+        value: expect.objectContaining({ implementation: "bytecode", native: null })
+      }));
+      expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    }
+
+    world.createObject({ id: "private_desc_box", name: "Private Desc Box", parent: "$thing", owner: "$wiz" });
+    world.defineProperty("private_desc_box", { name: "description", defaultValue: "not for guests", owner: "$wiz", perms: "", typeHint: "str" });
+    const privateLook = await world.directCall("tier1-private-look-self", actor, "private_desc_box", "look_self", []);
+    expect(privateLook.op).toBe("result");
+    if (privateLook.op === "result") {
+      expect((privateLook.result as Record<string, unknown>).description).toBe(null);
+    }
+  });
+
   it("marks native verb dispatch as incomplete while preserving dispatch metadata", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-native");
     const actor = session.actor;
 
     world.createObject({ id: "native_box", name: "Native Box", parent: "$thing", owner: actor });
+    world.registerNativeHandler("test_untracked_native", () => true);
+    world.addVerb("native_box", {
+      ...nativeVerb("native_probe", "test_untracked_native", actor),
+      perms: "rxd",
+      direct_callable: true
+    });
     const before = world.exportWorld();
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);
 
-    const result = await world.directCall("native-describe", actor, "native_box", "describe", []);
+    const result = await world.directCall("native-probe", actor, "native_box", "native_probe", []);
 
     expect(result.op).toBe("result");
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     expect(transcript.complete).toBe(false);
-    expect(transcript.incompleteReasons).toContain("native:native_box:describe");
+    expect(transcript.incompleteReasons).toContain("native:native_box:native_probe");
     expect(transcript.reads).toContainEqual(expect.objectContaining({
-      cell: { kind: "verb", object: "$root", name: "describe" },
-      value: expect.objectContaining({ implementation: "native", owner: "$wiz", direct_callable: true, native_contract: null })
+      cell: { kind: "verb", object: "native_box", name: "native_probe" },
+      value: expect.objectContaining({ implementation: "native", owner: actor, direct_callable: true, native_contract: null })
     }));
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
     const receipt = shadowCommitReceipt(before, world.exportWorld(), transcript);
@@ -184,7 +230,7 @@ describe("turn recorder", () => {
       accepted: false,
       transcript_hash: transcript.hash
     });
-    expect(receipt.errors).toContain("incomplete:native:native_box:describe");
+    expect(receipt.errors).toContain("incomplete:native:native_box:native_probe");
   });
 
   it("keeps contracted native primitive dispatches complete and records the contract", async () => {

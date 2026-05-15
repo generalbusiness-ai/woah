@@ -197,17 +197,12 @@
       "verbs": [
         {
           "name": "look_self",
-          "pure": true,
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { return { id: this, title: this.name, description: this.description }; }",
-          "implementation": {
-            "kind": "native",
-            "handler": "room_look_self"
-          }
+          "source": "verb :look_self() rxd { return room_look_projection(this); }"
         },
         {
           "name": "announce",

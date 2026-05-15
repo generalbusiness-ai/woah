@@ -101,9 +101,9 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 
 | Verb | Returns | Purpose |
 |---|---|---|
-| `:describe()` rxd | map | Introspection (see [introspection.md](introspection.md)). |
+| `:describe()` rxd | map | Introspection (see [introspection.md](introspection.md)). Seeded as woocode over the generic `describe_object(this)` builtin. |
 | `:title()` rxd | str | Short identifying phrase for `:look`-style composition; default returns `this.name`. Subclasses override to add flair (e.g. `$cockatoo:title()` decorates with *"a sulphur-crested cockatoo perched on the mantelpiece"*). MOO/LambdaCore convention. |
-| `:look_self()` rxd | map | Generic object view. Default returns the object's `:title()` and actor-readable `description`. MOO/LambdaCore convention adapted to structured return values. Actor and catalog classes may override for richer presentation. |
+| `:look_self()` rxd | map | Generic object view. Default woocode returns the object's `:title()` and actor-readable `description`. MOO/LambdaCore convention adapted to structured return values. Actor and catalog classes may override for richer presentation. |
 | `:set_description(desc)` rxd | bool | LambdaCore-shaped self-describe. Returns `true` on success. Allowed when `actor == this` (self-describe), `actor` owns `this`, or `actor` is a wizard. The verb is owned by `$wiz` so its `this.description = desc` write naturally bypasses the property's `r` perms; the explicit perm gate in the body keeps non-wizard callers from describing arbitrary objects. Tells the actor "Description set." on success. |
 | `:set_value(value)` | any | T0 fixture-style helper for simple property update verbs. |
 | `:set_prop(name, value)` | str, any | T0 fixture-style helper for simple named property update verbs. |
@@ -531,7 +531,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:look_self()` | — | Compose room title, description, present actors, and visible contents. Present actors are excluded from the contents list; `$block` descendants are the explicit exception because they are actor-backed appliances and should remain visible in-room. Pure view producer; the chat dispatcher emits private `looked`. |
+| `:look_self()` | — | Catalog woocode over `room_look_projection(this)`, composing room title, description, present actors, and visible contents. Present actors are excluded from the contents list; `$block` descendants are the explicit exception because they are actor-backed appliances and should remain visible in-room. Pure view producer; the chat dispatcher emits private `looked`. |
 | `:announce(text)` | str | Tell everyone in the room except `actor`. |
 | `:announce_all(text)` | str | Tell every subscribed actor in the room. |
 | `:announce_all_but(ignore, text, origin?)` | list, str, obj? | Tell every subscribed actor except those listed. `origin` is used by transparent nested spaces so parent announcement fan-out does not loop back into the originating child. |

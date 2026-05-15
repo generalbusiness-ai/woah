@@ -8380,7 +8380,6 @@ export class WooWorld {
 
   private registerNativeHandlers(): void {
     this.nativeHandlers.set("describe", (ctx) => this.describeForActor(ctx.thisObj, ctx.actor));
-    this.nativeHandlers.set("default_look_self", (ctx) => this.defaultLookSelf(ctx));
     this.nativeHandlers.set("player_on_disfunc", () => true);
     this.nativeHandlers.set("player_moveto", async (ctx, args) => {
       if (ctx.thisObj !== ctx.actor && !this.isWizard(ctx.actor)) throw wooError("E_PERM", "players may only move themselves", { actor: ctx.actor, target: ctx.thisObj });
@@ -8631,9 +8630,6 @@ export class WooWorld {
       const target = assertObj(args[0] ?? "$nowhere");
       return await this.movetoChecked(ctx, ctx.thisObj, target);
     });
-    this.nativeHandlers.set("thing_look", async (ctx) => {
-      return await this.dispatch({ ...ctx, caller: ctx.thisObj }, ctx.thisObj, "look_self", []);
-    });
     this.nativeHandlers.set("add_feature", (ctx, args) => this.addFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
     this.nativeHandlers.set("remove_feature", (ctx, args) => this.removeFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
     this.nativeHandlers.set("has_feature", (ctx, args) => this.featureList(ctx.thisObj).includes(assertObj(args[0])));
@@ -8729,8 +8725,6 @@ export class WooWorld {
       const location = await this.publicCommandLocation(ctx, actor, args[2]);
       return await this.parseCommandMap(assertString(args[0] ?? ""), ctx, location, actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("room_look_self", (ctx) => this.spaceLookSelf(ctx));
-    this.nativeHandlers.set("space_look_self", (ctx) => this.spaceLookSelf(ctx));
     this.nativeHandlers.set("room_who", (ctx) => this.roomWho(ctx));
     this.nativeHandlers.set("embodied_room_roster", (ctx) => this.embodiedRoomRoster(ctx));
     this.nativeHandlers.set("workspace_room_roster", (ctx) => this.workspaceRoomRoster(ctx));
@@ -8965,19 +8959,8 @@ export class WooWorld {
     });
   }
 
-  private async defaultLookSelf(ctx: CallContext): Promise<WooValue> {
-    const title = await this.titleForLook(ctx, ctx.caller, ctx.thisObj);
-    const description = this.propOrNullForActor(ctx.actor, ctx.thisObj, "description");
-    return {
-      id: ctx.thisObj,
-      title,
-      description
-    } as unknown as WooValue;
-  }
-
-  private async spaceLookSelf(ctx: CallContext): Promise<WooValue> {
-    const room = ctx.thisObj;
-    const look = await this.composeRoomLook(ctx, room);
+  async roomLookProjection(ctx: CallContext, room: ObjRef): Promise<WooValue> {
+    const look = await this.composeRoomLook({ ...ctx, thisObj: room }, room);
     return look as unknown as WooValue;
   }
 

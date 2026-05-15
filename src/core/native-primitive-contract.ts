@@ -163,50 +163,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: [],
     note: "Revocation records the authoritative property mutation in the transcript; gateway and Directory session cleanup runs only after an accepted commit."
   },
-  default_look_self: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "default_look_self",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["object.name", "object.description"],
-    writes: [],
-    emits: [],
-    note: "Default look_self is a read-only projection over tracked display properties."
-  },
-  thing_look: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "thing_look",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["target look_self dispatch"],
-    writes: [],
-    emits: ["nested look_self transcript events"],
-    note: "Generic look delegates to the target's tracked look_self implementation."
-  },
-  room_look_self: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "room_look_self",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["room contents", "room title", "room description", "present actor names", "visible item summaries"],
-    writes: [],
-    emits: ["logical_input"],
-    note: "Room look_self composes a read-only room projection from tracked contents, property, and title reads."
-  },
-  space_look_self: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "space_look_self",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: ["space contents", "space title", "space description", "present actor names", "visible item summaries"],
-    writes: [],
-    emits: ["logical_input"],
-    note: "Generic space look_self uses the same tracked projection path as room look_self."
-  },
   room_who: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "room_who",

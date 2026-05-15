@@ -928,6 +928,8 @@ const VALID_BUILTINS = new Set([
   "primary_session",
   "is_connected",
   "idle_seconds",
+  "describe_object",
+  "room_look_projection",
   // builder_create_object and builder_chparent stay native; see
   // tiny-vm.ts BUILTIN_NAMES for the removal note on the other
   // builder_*/programmer_* surface builtins.

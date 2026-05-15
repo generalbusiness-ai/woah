@@ -106,8 +106,19 @@ const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
   return base;
 }`;
 
+const ROOT_DESCRIBE_SOURCE = `verb :describe() rxd {
+  return describe_object(this);
+}`;
+
 const ROOT_TITLE_SOURCE = `verb :title() rxd {
   return this.name;
+}`;
+
+const ROOT_LOOK_SELF_SOURCE = `verb :look_self() rxd {
+  set_task_perms(actor);
+  let description = null;
+  try { description = this.description; } except err { description = null; }
+  return { id: this, title: this:title(), description: description };
 }`;
 
 const ROOT_SET_DESCRIPTION_SOURCE = `verb :set_description(desc) rxd {
@@ -156,6 +167,18 @@ const PLAYER_HOME_SOURCE = `verb :home() rxd {
   }
   tell(this, "You go home.");
   return dest;
+}`;
+
+const THING_LOOK_SOURCE = `verb :look() rxd {
+  let view = this:look_self();
+  let text = "";
+  if (typeof(view) == "map" && has(view, "description") && view["description"]) {
+    text = to_string(view["description"]);
+  } else {
+    text = to_string(view);
+  }
+  observe({ type: "looked", actor: actor, to: actor, room: location(this), target: this, text: text, look: view, ts: now() });
+  return view;
 }`;
 
 const PLAYER_WAYS_SOURCE = `verb :ways(room_name) rxd {
@@ -837,9 +860,9 @@ function seedUniversal(world: WooWorld): void {
 
   bytecode(world, "$root", "set_value", setValueBytecode, "verb :set_value(value) r { ... }", { perms: "r" });
   bytecode(world, "$root", "set_prop", setPropBytecode, "verb :set_prop(name, value) r { ... }", { perms: "r" });
-  native(world, "$root", "describe", "describe", "verb :describe() rxd { ... }", { directCallable: true });
+  sourceVerb(world, "$root", "describe", ROOT_DESCRIBE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "title", ROOT_TITLE_SOURCE, { directCallable: true });
-  native(world, "$root", "look_self", "default_look_self", "verb :look_self() rxd { return { title: this:title(), description: this.description }; }", { directCallable: true });
+  sourceVerb(world, "$root", "look_self", ROOT_LOOK_SELF_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "set_description", ROOT_SET_DESCRIPTION_SOURCE, {
     directCallable: true,
     toolExposed: true,
@@ -922,7 +945,7 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$human", "rotate_agent_key", "human_rotate_agent_key", "verb :rotate_agent_key(actor_id, force?) rxd { /* native: rotate an owned agent key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "force?"] } });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });
   native(world, "$thing", "moveto", "thing_moveto", "verb :moveto(target) rxd { return moveto(this, target); }");
-  native(world, "$thing", "look", "thing_look", "verb :look() rxd { let r = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: this, text: r.description, look: r, ts: now() }); return r; }", { directCallable: true, aliases: ["l@ook", "ex@amine"] });
+  sourceVerb(world, "$thing", "look", THING_LOOK_SOURCE, { directCallable: true, aliases: ["l@ook", "ex@amine"] });
   for (const obj of ["$actor", "$space"]) {
     native(world, obj, "add_feature", "add_feature", "verb :add_feature(f) rx { ... }");
     native(world, obj, "remove_feature", "remove_feature", "verb :remove_feature(f) rx { ... }");
