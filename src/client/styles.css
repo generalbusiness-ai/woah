@@ -359,7 +359,8 @@ a:hover {
 /*   --split-gap    column gap                                               */
 /*   --split-align  align-items                                              */
 /* `.split--side-fixed` switches to a 1fr + fixed sidebar (use --split-side).*/
-/* `.has-space-chat` lets the layout fill its parent for chat-anchored views.*/
+/* `.has-ambient-companion` lets the layout fill its parent when a workspace
+   declares an ambient-companion slot below it (e.g. the chat mini-panel).   */
 .split {
   display: grid;
   grid-template-columns: var(--split-cols, minmax(260px, 0.9fr) minmax(360px, 1.1fr));
@@ -372,7 +373,7 @@ a:hover {
   --split-align: stretch;
 }
 
-.split.has-space-chat {
+.split.has-ambient-companion {
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -1443,11 +1444,11 @@ input[type="range"] {
   min-height: 0;
 }
 
-.pinboard-layout.has-space-chat {
+.pinboard-layout.has-ambient-companion {
   height: auto;
 }
 
-.space-chat-shell {
+.ambient-companion-shell {
   height: calc(100dvh - 5.25rem);
   min-height: 0;
   display: grid;
@@ -1582,7 +1583,7 @@ input[type="range"] {
   grid-template-rows: auto;
 }
 
-.space-chat-shell:has(.space-chat-panel.is-collapsed) {
+.ambient-companion-shell:has(.space-chat-panel.is-collapsed) {
   grid-template-rows: minmax(0, 1fr) auto;
 }
 
@@ -1616,7 +1617,7 @@ input[type="range"] {
   min-height: 420px;
 }
 
-.pinboard-layout:not(.has-space-chat) .pinboard-stage-panel {
+.pinboard-layout:not(.has-ambient-companion) .pinboard-stage-panel {
   min-height: 0;
   height: calc(100dvh - 5.25rem - var(--space-chat-h, 280px) - 0.8rem - 2.85rem - 0.25rem);
 }
@@ -1892,7 +1893,7 @@ input[type="range"] {
   overflow: hidden;
 }
 
-.woo-tasks-workspace.has-space-chat {
+.woo-tasks-workspace.has-ambient-companion {
   height: 100%;
 }
 

@@ -2816,7 +2816,7 @@ function dubspaceOperators(): string[] {
 }
 
 function mountToolSpaceChat(element: HTMLElement, space: string) {
-  const slot = element.querySelector<HTMLElement>("[data-tool-space-chat]");
+  const slot = element.querySelector<HTMLElement>("[data-ambient-companion]");
   if (!slot || !space) return;
   const existing = slot.querySelector<HTMLElement & WooElement & { data?: SpaceChatPanelData }>(`[data-space-chat-panel]`);
   if (existing && existing.dataset.spaceChatSpace === space) {
@@ -2838,7 +2838,7 @@ function mountToolSpaceChat(element: HTMLElement, space: string) {
     return;
   }
   if (existing) existing.remove();
-  slot.innerHTML = renderSpaceChatPanel(space);
+  slot.innerHTML = renderAmbientCompanion(space);
   bindSpaceChatPanels();
 }
 
@@ -3554,7 +3554,7 @@ function markNestedSpaceDeparture(space: string) {
 }
 
 function currentTabHasChatPanel(): boolean {
-  // Tabs whose layout embeds a `.space-chat-shell` and therefore needs
+  // Tabs whose layout embeds a `.ambient-companion-shell` and therefore needs
   // a live repaint when chat lines arrive. Tasks renders chat alongside
   // the kanban board via the shared `space-chat-mini` component, same
   // shape as dubspace/pinboard.
@@ -4070,7 +4070,7 @@ function renderTasks() {
   return `<${tag} data-tasks-board data-tasks-registry="${escapeHtml(boardId)}"></${tag}>`;
 }
 
-function renderSpaceChatPanel(space: string) {
+function renderAmbientCompanion(space: string) {
   const height = Math.round(spaceChatHeight(space));
   const component = ui.catalogUi.component("chat.space-mini", "chat");
   const tag = component?.declaration.tag;
@@ -4483,7 +4483,7 @@ function applySpaceChatHeight(panel: HTMLElement, height: number) {
   const isCollapsed = panel.classList.contains("is-collapsed");
   if (isCollapsed) {
     panel.style.removeProperty("height");
-    const shell = panel.closest<HTMLElement>("[data-space-chat-shell]");
+    const shell = panel.closest<HTMLElement>("[data-ambient-companion-shell]");
     if (shell) shell.style.removeProperty("--space-chat-h");
     if (panel.parentElement instanceof HTMLElement) {
       panel.parentElement.style.removeProperty("--space-chat-h");
@@ -4496,11 +4496,11 @@ function applySpaceChatHeight(panel: HTMLElement, height: number) {
   if (space) state.spaceChatHeights = { ...state.spaceChatHeights, [space]: normalizedHeight };
   const rounded = `${Math.round(normalizedHeight)}px`;
   panel.style.height = rounded;
-  // The grid container (.space-chat-shell) is what reads --space-chat-h to size
+  // The grid container (.ambient-companion-shell) is what reads --space-chat-h to size
   // the chat row vs the workarea row. CSS vars only propagate down the tree, so
   // the var must land on the shell itself — not just on a child of it — for the
   // divider to actually move when the user drags the resizer.
-  const shell = panel.closest<HTMLElement>("[data-space-chat-shell]");
+  const shell = panel.closest<HTMLElement>("[data-ambient-companion-shell]");
   if (shell) shell.style.setProperty("--space-chat-h", rounded);
   if (!(panel.parentElement instanceof HTMLElement)) return;
   panel.parentElement.style.setProperty("--space-chat-h", rounded);

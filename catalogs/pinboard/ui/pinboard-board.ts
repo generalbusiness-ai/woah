@@ -111,7 +111,7 @@ export class WooPinboardBoardElement extends HTMLElement {
       </section>
     `;
     const layout = `
-      <section class="split split--side-fixed pinboard-layout ${this.model.inBoard ? "has-space-chat" : ""}" data-space-chat-layout="${escapeHtml(boardId)}">
+      <section class="split split--side-fixed pinboard-layout ${this.model.inBoard ? "has-ambient-companion" : ""}" data-space-chat-layout="${escapeHtml(boardId)}">
         <div class="pinboard-work">
           ${this.model.inBoard ? this.renderCreate() : `<div class="card pinboard-create pinboard-create-placeholder" aria-hidden="true"></div>`}
           <div class="card pinboard-stage-panel">
@@ -134,7 +134,7 @@ export class WooPinboardBoardElement extends HTMLElement {
       </section>
     `;
     this.innerHTML = this.model.inBoard
-      ? `${toolbar}<section class="space-chat-shell" data-space-chat-shell="${escapeHtml(boardId)}">${layout}<div data-tool-space-chat></div></section>`
+      ? `${toolbar}<section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(boardId)}">${layout}<div data-ambient-companion></div></section>`
       : `${toolbar}${layout}`;
     this.bind();
   }

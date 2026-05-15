@@ -108,8 +108,8 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
         <button data-save-scene>Save Scene</button>
         <button data-recall-scene>Recall Scene</button>
       </section>
-      <section class="space-chat-shell" data-space-chat-shell="${escapeHtml(spaceId)}">
-        <section class="split split--side-fixed dubspace-layout has-space-chat" data-space-chat-layout="${escapeHtml(spaceId)}">
+      <section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(spaceId)}">
+        <section class="split split--side-fixed dubspace-layout has-ambient-companion" data-space-chat-layout="${escapeHtml(spaceId)}">
           <div class="dubspace-work">
             <div class="grid">
               <article class="card sequencer">
@@ -137,7 +137,7 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
           </div>
           ${this.renderPresence()}
         </section>
-        <div data-tool-space-chat></div>
+        <div data-ambient-companion></div>
       </section>
     `;
     this.bind();
