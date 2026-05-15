@@ -251,7 +251,6 @@ let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, l
 let routeInitialized = false;
 let v2BrowserWorker: Worker | undefined;
 let v2BrowserWorkerScope = "";
-let taskspaceComponentEventsBound = false;
 state.spaceChatHeights = loadSpaceChatHeights();
 const persistedSpaceChatCollapsed = readStorage(spaceChatCollapsedKey);
 state.spaceChatCollapsed = persistedSpaceChatCollapsed === "1" || persistedSpaceChatCollapsed === "true";
