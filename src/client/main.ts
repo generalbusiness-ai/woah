@@ -2393,7 +2393,7 @@ function dubspaceOperators(): string[] {
   return Array.isArray(raw) ? raw.map(String) : [];
 }
 
-function mountToolSpaceChat(element: HTMLElement, space: string) {
+function mountAmbientCompanion(element: HTMLElement, space: string) {
   const slot = element.querySelector<HTMLElement>("[data-ambient-companion]");
   if (!slot || !space) return;
   const existing = slot.querySelector<HTMLElement & WooElement & { data?: SpaceChatPanelData }>(`[data-space-chat-panel]`);
@@ -2448,7 +2448,7 @@ function mountDubspaceComponent() {
     cueSlots: state.cueSlots,
     cuePlaying: state.cuePlaying
   }, () => {
-    if (spaceId && operators.includes(state.actor ?? "")) mountToolSpaceChat(element, spaceId);
+    if (spaceId && operators.includes(state.actor ?? "")) mountAmbientCompanion(element, spaceId);
   });
   bindDubspaceComponentEvents(element);
 }
@@ -3819,7 +3819,7 @@ function mountPinboardComponent() {
     newColor: state.pinboardNewColor,
     viewports: state.pinboardViewports
   }, () => {
-    if (boardId && pinboardActorPresent()) mountToolSpaceChat(element, boardId);
+    if (boardId && pinboardActorPresent()) mountAmbientCompanion(element, boardId);
   });
   bindPinboardComponentEvents(element);
 }
@@ -3896,10 +3896,10 @@ function mountTasksKanbanComponent() {
     element.dataset.tasksEventsBound = "true";
     element.addEventListener("woo-tasks-rendered", () => {
       const nextBoardId = tasksSpace();
-      if (nextBoardId) mountToolSpaceChat(element, nextBoardId);
+      if (nextBoardId) mountAmbientCompanion(element, nextBoardId);
     });
   }
-  mountToolSpaceChat(element, boardId);
+  mountAmbientCompanion(element, boardId);
   requestTasksChatFocusIfPending();
 }
 
