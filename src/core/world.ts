@@ -9817,7 +9817,19 @@ export class WooWorld {
   }
 
   private async commandPlanRequiresDurablePresence(ctx: CallContext, target: ObjRef, verbName: string): Promise<boolean> {
-    if (verbName !== "enter" && verbName !== "leave" && verbName !== "out") return false;
+    // Substrate fallback for when the matched verb's arg_spec.command has no
+    // explicit `persistence` hint. Catalog manifests are the source of truth
+    // for per-verb persistence (see spec/semantics/match.md), but a deployed
+    // satellite slice can carry stale verb metadata when a manifest bump
+    // happens after the satellite's last bootstrap-style migration ID — the
+    // class-verb reconcile is now self-healing on cold-load (see
+    // local-catalogs.ts) but propagation is bounded by hibernation cadence.
+    // This list is the LambdaMOO-canonical movement-and-handling verb set;
+    // any command-style direct call to one of these on a $space descendant
+    // is treated as durable so the v2 commit fires even when the satellite's
+    // arg_spec hint is missing. Catalog code can still override by setting
+    // `arg_spec.command.persistence: "live"` explicitly.
+    if (!COMMAND_PLAN_DEFAULT_DURABLE_VERBS.has(verbName)) return false;
     return await this.isDescendantOfChecked(target, "$space", ctx.hostMemo);
   }
 
@@ -10434,6 +10446,24 @@ function commandPlanFromValue(value: WooValue): CommandPlan | null {
     ...(map.persistence === "durable" || map.persistence === "live" ? { persistence: map.persistence } : {})
   };
 }
+
+// Substrate fallback set for `commandPlanRequiresDurablePresence`. The
+// canonical movement-and-handling verb names that mutate $space-rooted
+// durable cells (actor location, room contents, presence) when they have no
+// explicit `arg_spec.command.persistence` hint. Keeping this list in the
+// substrate is a deliberate (small) layering compromise: catalog metadata
+// remains the source of truth, but a satellite slice carrying stale verb
+// shape after a manifest bump still gets the v2 commit fired here. When all
+// deployed satellites have reconciled to the current manifest, this list
+// becomes a redundant safety net.
+const COMMAND_PLAN_DEFAULT_DURABLE_VERBS = new Set<string>([
+  "enter", "leave", "out",
+  "go",
+  "north", "south", "east", "west",
+  "northeast", "northwest", "southeast", "southwest",
+  "up", "down", "in",
+  "take", "drop", "give"
+]);
 
 function commandRouteHint(argSpec: Record<string, WooValue> | undefined): "direct" | "sequenced" | null {
   // Catalogs own command routing hints; the client should not learn that a
