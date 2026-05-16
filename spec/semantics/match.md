@@ -192,6 +192,12 @@ live-only commands use `live`, while direct commands that intentionally
 mutate durable cells can request `durable` without pretending to be
 sequenced-log traffic.
 
+`parse: false`, when present, removes the verb from text-command planning
+while preserving the command shape for affordance discovery and examine-style
+documentation. Use it for verbs that should be directly callable as structured
+tools but whose typed command form is intentionally handled by another catalog
+wrapper.
+
 Command metadata is per verb definition. Aliases share the same command pattern; a different pattern requires a separate verb.
 Source-install authoring APIs MAY attach the same metadata out-of-band as
 `argSpec.command` while the source language lacks first-class `args_from` and

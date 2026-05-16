@@ -1181,7 +1181,12 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$human", "rotate_agent_key", "human_rotate_agent_key", "verb :rotate_agent_key(actor_id, force?) rxd { /* native: rotate an owned agent key. */ }", { directCallable: true, toolExposed: true, perms: "rxd", argSpec: { args: ["actor_id", "force?"] } });
   native(world, "$thing", "can_be_attached_by", "feature_can_be_attached_by", "verb :can_be_attached_by(actor) rxd { ... }", { directCallable: true });
   native(world, "$thing", "moveto", "thing_moveto", "verb :moveto(target) rxd { return moveto(this, target); }");
-  sourceVerb(world, "$thing", "look", THING_LOOK_SOURCE, { directCallable: true, aliases: ["l@ook", "ex@amine"] });
+  sourceVerb(world, "$thing", "look", THING_LOOK_SOURCE, {
+    directCallable: true,
+    toolExposed: true,
+    aliases: ["l@ook", "ex@amine"],
+    argSpec: { args: [], command: { dobj: "this", prep: "none", iobj: "none", args_from: [], parse: false } }
+  });
   for (const obj of ["$actor", "$space"]) {
     native(world, obj, "add_feature", "add_feature", "verb :add_feature(f) rx { ... }");
     native(world, obj, "remove_feature", "remove_feature", "verb :remove_feature(f) rx { ... }");

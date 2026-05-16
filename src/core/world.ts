@@ -105,6 +105,7 @@ type CommandPattern = {
   prep?: WooValue;
   iobj?: WooValue;
   args_from?: WooValue;
+  parse?: WooValue;
 };
 
 type CommandPlan = {
@@ -10220,7 +10221,8 @@ function verbNameMatches(verb: VerbDef, name: string): boolean {
 function commandPattern(argSpec: Record<string, WooValue> | undefined): CommandPattern | null {
   const raw = argSpec?.command;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  return raw as CommandPattern;
+  const pattern = raw as CommandPattern;
+  return pattern.parse === false ? null : pattern;
 }
 
 function commandMapFromValue(value: WooValue | undefined): CommandMap {

@@ -231,6 +231,30 @@ describe("McpHost", () => {
     await expect(host.resolveReachableTool(session.actor, "mcp_weather", "focus")).resolves.toBeNull();
   });
 
+  it("exposes inherited default look on ordinary visible contents", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-default-look");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+
+    await world.directCall(undefined, session.actor, "the_chatroom", "enter", []);
+    const tools = await host.enumerateTools(session.actor, { scope: "here" });
+    const couchLook = tools.find((tool) => tool.object === "the_couch" && tool.verb === "look");
+    expect(couchLook).toBeDefined();
+    expect(couchLook?.direct).toBe(true);
+    expect(couchLook?.inputSchema).toMatchObject({ properties: {} });
+    expect((couchLook?.inputSchema as { required?: unknown[] }).required ?? []).toEqual([]);
+    expect(tools.some((tool) => tool.object === "the_couch" && tool.verb === "moveto")).toBe(false);
+
+    const resolved = await host.resolveReachableTool(session.actor, "the_couch", "look");
+    expect(resolved).toBeDefined();
+    const result = await host.invokeTool(session.actor, session.id, resolved!, []);
+    expect(result.result).toMatchObject({ id: "the_couch", title: "Couch" });
+    expect(result.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "looked", target: "the_couch", room: "the_chatroom" })
+    ]));
+  });
+
   it("enumerates tools reachable from the actor with route classification", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-list");
