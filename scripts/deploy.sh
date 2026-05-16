@@ -25,6 +25,11 @@ DRY_RUN=0
 EXPECTED_BRANCH="main"
 WORKER_URL="${WOO_WORKER_URL:-https://woah.generalbusiness.ai}"
 POSTFLIGHT_TIMEOUT="${WOO_POSTFLIGHT_TIMEOUT:-45}"
+# --no-install forces resolution to the project-local wrangler pinned in
+# package.json/package-lock.json. Without it, npx silently downloads whatever
+# wrangler version is current at execution time, which can change deploy
+# validation, migration handling, or output parsing independent of this repo.
+WRANGLER=(npx --no-install wrangler)
 
 usage() {
   sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -117,6 +122,12 @@ elif [[ "$local_head" != "$remote_head" ]]; then
 fi
 ok "git: HEAD=${local_head:0:10} pushed"
 
+# wrangler must resolve to the project-local pinned version. `npx --no-install`
+# refuses to download; if this fails the operator hasn't run `npm install`.
+wrangler_version=$("${WRANGLER[@]}" --version 2>&1) \
+  || fail "local wrangler not installed — run: npm install"
+ok "wrangler: $(echo "$wrangler_version" | tail -1) (project-local)"
+
 # CF token + secrets are only needed for a real upload.
 if [[ $DRY_RUN -eq 1 ]]; then
   warn "dry-run: skipping cf token + secret-list checks"
@@ -129,11 +140,11 @@ else
     || fail "CLOUDFLARE_API_TOKEN unset and ~/.config/cloudflare/woo.token missing"
   ok "cf token present"
 
-  secret_list=$(npx wrangler secret list 2>&1) \
+  secret_list=$("${WRANGLER[@]}" secret list 2>&1) \
     || fail "wrangler secret list failed:\n$secret_list"
   for required in WOO_INITIAL_WIZARD_TOKEN WOO_INTERNAL_SECRET; do
     echo "$secret_list" | grep -q "\"$required\"" \
-      || fail "wrangler secret '$required' not set — run: npx wrangler secret put $required"
+      || fail "wrangler secret '$required' not set — run: npx --no-install wrangler secret put $required"
     ok "secret: $required set"
   done
 fi
@@ -169,7 +180,7 @@ banner "Deploy"
 # ===========================================================================
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  deploy_out=$(npx wrangler deploy --dry-run 2>&1) \
+  deploy_out=$("${WRANGLER[@]}" deploy --dry-run 2>&1) \
     || { echo "$deploy_out" | tail -30; fail "wrangler deploy --dry-run failed"; }
   echo "$deploy_out" | tail -10 | sed "s/^/  ${DIM}|${NC} /"
   ok "wrangler dry-run validated bundle + bindings (no upload)"
@@ -178,7 +189,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-deploy_out=$(npx wrangler deploy 2>&1) \
+deploy_out=$("${WRANGLER[@]}" deploy 2>&1) \
   || { echo "$deploy_out" | tail -30; fail "wrangler deploy failed"; }
 echo "$deploy_out" | tail -8 | sed "s/^/  ${DIM}|${NC} /"
 version_id=$(echo "$deploy_out" | grep -oE 'Current Version ID: [a-f0-9-]+' | awk '{print $4}')
