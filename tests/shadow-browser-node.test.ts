@@ -13,6 +13,7 @@ import {
   executeShadowBrowserTurn,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
+  mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   purgeShadowBrowserRelayHistory,
@@ -292,6 +293,21 @@ describe("shadow browser node shim", () => {
 
     expect(merged.map((session) => session.id).sort()).toEqual([fresh.id, kept.id].sort());
     expect(merged.find((session) => session.id === kept.id)?.activeScope).toBe("the_pinboard");
+  });
+
+  it("lets authority slices replace stale per-scope session locations", () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-session-authority-location");
+    const current = anchor.exportSessions();
+    current[0].activeScope = "the_deck";
+    const fresh = anchor.exportSessions();
+    fresh[0].activeScope = "the_chatroom";
+
+    const merged = mergeShadowBrowserAuthoritySessionState(current, fresh);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe(session.id);
+    expect(merged[0].activeScope).toBe("the_chatroom");
   });
 
   it("unsubscribes browser nodes without leaving stale relay auth entries", async () => {

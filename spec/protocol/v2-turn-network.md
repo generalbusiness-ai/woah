@@ -834,6 +834,28 @@ this as server-assisted planning, not as proof that local closure execution is
 complete; production v2 returns to browser-built keys once the worker can
 reconstruct executable state from verified pages.
 
+Every internal open/envelope forwarded to a CommitScopeDO SHOULD carry an
+authority slice:
+
+```ts
+type AuthoritySlice = {
+  kind: "woo.authority_slice.shadow.v1";
+  sessions: SerializedSession[];
+  objects: SerializedObject[];
+};
+```
+
+The slice is not a full-world snapshot. It is the gateway/owner-provided
+working set that is authoritative for planning this message: live session
+rows, the session actors, the sessions' active rooms, and any explicit
+turn-scope/target rows the gateway knows are relevant. A CommitScopeDO MUST
+refresh these rows before planning an intent. When an authority slice is
+present, its `sessions[*].activeScope` replaces any older per-scope value in
+the CommitScopeDO snapshot; otherwise a cross-scope move accepted in one scope
+can leave another scope planning against stale presence. Legacy
+`session_objects` remains a compatibility projection of `AuthoritySlice.objects`
+for older relays.
+
 `covers` means "this node probably has the state, code, metadata, and log tail."
 `accepts` means "this node is willing to run this target/verb/scope shape."
 

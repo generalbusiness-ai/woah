@@ -24,7 +24,7 @@ import {
   type WooValue,
   wooError
 } from "./types";
-import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
+import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -5986,6 +5986,27 @@ export class WooWorld {
       if (obj) out.push(this.serializeObject(obj));
     }
     return out;
+  }
+
+  exportAuthoritySlice(sessions: SerializedSession[] = this.exportSessions(), extraObjectIds: Iterable<ObjRef> = []): SerializedAuthoritySlice {
+    // V2 commit scopes plan against durable, long-lived snapshots. On every
+    // open/envelope the gateway sends the authoritative live cells needed to
+    // validate and plan the next turn: session rows, session actor objects,
+    // and the rooms those sessions currently occupy. Room rows carry the
+    // contents/session_subscribers materialized indexes, so cross-scope moves
+    // do not leave another CommitScopeDO planning against stale presence.
+    const ids: ObjRef[] = Array.from(extraObjectIds);
+    for (const session of sessions) {
+      ids.push(session.actor);
+      if (session.activeScope) ids.push(session.activeScope);
+      const actor = this.objects.get(session.actor);
+      if (actor?.location) ids.push(actor.location);
+    }
+    return {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: structuredClone(sessions) as SerializedSession[],
+      objects: this.exportObjects(ids)
+    };
   }
 
   /**

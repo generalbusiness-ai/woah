@@ -31,7 +31,7 @@ import {
   disposeShadowBrowserNode,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
-  mergeShadowBrowserSessionState,
+  mergeShadowBrowserAuthoritySessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserSessionBearer,
@@ -354,16 +354,16 @@ function v2RelayForScope(scope: ObjRef): ShadowBrowserRelayShim {
     return relay;
   }
   // Dev mirrors the Worker/CommitScopeDO lifetime: one relay per commit scope,
-  // many browser sockets. Refresh session auth from the live gateway world
-  // without replacing scope-local committed state such as v2-entered session
-  // locations.
+  // many browser sockets. Refresh the same authority slice the Worker sends
+  // to CommitScopeDO so local testing catches cross-scope drift.
   refreshDevV2RelaySessions(relay);
   return relay;
 }
 
-function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim): void {
+function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds: Iterable<ObjRef> = []): void {
+  const authority = world.exportAuthoritySlice(world.exportSessions(), extraObjectIds);
   const auth = buildShadowBrowserSessionAuth({
-    sessions: world.exportSessions(),
+    sessions: authority.sessions,
     scope: relay.commit_scope.scope,
     deployment: relay.deployment
   });
@@ -374,11 +374,12 @@ function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim): void {
     const claims = relay.session_auth.get(shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor }));
     if (claims) relay.session_auth.set(browser.session_token, claims);
   }
-  const mergedSessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, world.exportSessions());
+  const mergedSessions = mergeShadowBrowserAuthoritySessionState(relay.commit_scope.serialized.sessions, authority.sessions);
   if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
     relay.commit_scope.serialized.sessions = mergedSessions;
     markShadowBrowserRelaySerializedChanged(relay);
   }
+  refreshDevV2SerializedObjects(relay, authority.objects);
 }
 
 function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Session): void {
@@ -388,9 +389,8 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
   // useful transcript.
   //
   // Do not merely check for presence: a reused commit-scope relay can already
-  // have a row for this session with stale detach/expiry metadata. Refresh the
-  // gateway-owned liveness fields while preserving the scope-owned committed
-  // session location when one has already been advanced by a v2 turn.
+  // have a row for this session with stale detach/expiry/location metadata.
+  // Dev receives the live gateway session as authority before planning.
   const serialized = {
     id: session.id,
     actor: session.actor,
@@ -409,12 +409,7 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
     return;
   }
   const existing = relay.commit_scope.serialized.sessions[index];
-  const next = {
-    ...serialized,
-    activeScope: existing.actor === session.actor && existing.activeScope !== undefined
-      ? existing.activeScope
-      : serialized.activeScope
-  };
+  const next = serialized;
   if (stableShadowJson(next as unknown as WooValue) !== stableShadowJson(existing as unknown as WooValue)) {
     relay.commit_scope.serialized.sessions[index] = next;
     markShadowBrowserRelaySerializedChanged(relay);
@@ -425,21 +420,31 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
 function refreshDevV2SerializedSessionActor(relay: ShadowBrowserRelayShim, actor: ObjRef): void {
   const [record] = world.exportObjects([actor]);
   if (!record) return;
-  const index = relay.commit_scope.serialized.objects.findIndex((obj) => obj.id === actor);
-  if (index < 0) {
-    relay.commit_scope.serialized.objects.push(record);
-    relay.commit_scope.serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
-    markShadowBrowserRelaySerializedChanged(relay);
-    return;
+  refreshDevV2SerializedObjects(relay, [record]);
+}
+
+function refreshDevV2SerializedObjects(relay: ShadowBrowserRelayShim, objects: ReturnType<typeof world.exportObjects>): void {
+  if (objects.length === 0) return;
+  const byId = new Map(relay.commit_scope.serialized.objects.map((obj, index) => [obj.id, index] as const));
+  let changed = false;
+  for (const record of objects) {
+    const index = byId.get(record.id);
+    if (index === undefined) {
+      byId.set(record.id, relay.commit_scope.serialized.objects.length);
+      relay.commit_scope.serialized.objects.push(record);
+      changed = true;
+      continue;
+    }
+    relay.commit_scope.serialized.objects[index] = record;
+    changed = true;
   }
-  relay.commit_scope.serialized.objects[index] = record;
-  markShadowBrowserRelaySerializedChanged(relay);
+  if (changed) markShadowBrowserRelaySerializedChanged(relay);
 }
 
 async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame> {
   const token = shadowBrowserSessionBearer(input.session);
   const browser = v2ShadowBrowser(`node:dev:rest:${input.id ?? randomUUID()}`, token, input.session, input.scope);
-  refreshDevV2RelaySessions(browser.relay);
+  refreshDevV2RelaySessions(browser.relay, [input.scope, input.target, input.actor]);
   ensureDevV2SerializedSession(browser.relay, input.session);
   const envelope = buildShadowTurnIntentEnvelope({ ...input, node: browser.node, session: input.session.id, token });
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope));

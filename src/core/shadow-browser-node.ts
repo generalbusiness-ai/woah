@@ -433,6 +433,20 @@ export function mergeShadowBrowserSessionState(current: SerializedSession[], fre
   return Array.from(mergedById.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
+export function mergeShadowBrowserAuthoritySessionState(current: SerializedSession[], fresh: SerializedSession[]): SerializedSession[] {
+  const mergedById = new Map<string, SerializedSession>(
+    current.map((session) => [session.id, structuredClone(session) as SerializedSession])
+  );
+  for (const session of fresh) {
+    // Authority slices are produced by the session/object owner immediately
+    // before an envelope is submitted. Unlike the legacy auth refresh above,
+    // their activeScope is intentional input to planning and must replace any
+    // stale per-scope value left by another CommitScopeDO.
+    mergedById.set(session.id, structuredClone(session) as SerializedSession);
+  }
+  return Array.from(mergedById.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
 export function markShadowBrowserRelaySerializedChanged(relay: ShadowBrowserRelayShim): void {
   relay.serialized_generation++;
   SHADOW_SERIALIZED_INDEX_CACHE.delete(relay.commit_scope.serialized);

@@ -37,6 +37,12 @@ export type SerializedSession = {
   apikeyId?: string;
 };
 
+export type SerializedAuthoritySlice = {
+  kind: "woo.authority_slice.shadow.v1";
+  sessions: SerializedSession[];
+  objects: SerializedObject[];
+};
+
 export type SpaceSnapshotRecord = {
   space_id: ObjRef;
   seq: number;

@@ -92,7 +92,7 @@ describe("v2 MCP e2e", () => {
     }
   });
 
-  it("keeps MCP session auth usable after a cross-scope room move", async () => {
+  it("keeps MCP session authority coherent after cross-scope room moves", async () => {
     const world = createWorld();
     const scopeStates = new Map<string, FakeDurableObjectState>();
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
@@ -117,17 +117,6 @@ describe("v2 MCP e2e", () => {
     try {
       const alice = await initializeMcp(gateway, "guest:v2-mcp-cross-scope", 1);
       const aliceActor = world.sessions.get(alice)!.actor;
-      const sessions = world.exportSessions();
-      await postCommitScope(scopeFor("the_deck"), env, "the_deck", "/v2/open", {
-        scope: "the_deck",
-        node: `mcp:${alice}`,
-        token: `mcp-v2:${alice}:${aliceActor}`,
-        session: alice,
-        actor: aliceActor,
-        sessions,
-        session_objects: world.exportObjects(sessions.map((session) => session.actor)),
-        serialized: world.exportWorld()
-      });
       const move = await mcp(gateway, alice, 3, "tools/call", {
         name: "woo_call",
         arguments: { object: "the_chatroom", verb: "southeast", args: [] }
@@ -141,6 +130,25 @@ describe("v2 MCP e2e", () => {
       });
       expect(look.result.isError, JSON.stringify(look.result.structuredContent)).not.toBe(true);
       expect(world.object(world.sessions.get(alice)!.actor).location).toBe("the_deck");
+
+      const back = await mcp(gateway, alice, 5, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_deck", verb: "west", args: [] }
+      });
+      expect(back.result.isError, JSON.stringify(back.result.structuredContent)).not.toBe(true);
+      expect(world.activeScopeForSession(alice)).toBe("the_chatroom");
+      expect(world.object(world.sessions.get(alice)!.actor).location).toBe("the_chatroom");
+
+      // Regression for production drift: the chatroom CommitScopeDO already
+      // had a durable snapshot from the first move, where the actor had left.
+      // The deck CommitScopeDO accepted the return move, so the next chatroom
+      // call must refresh enough session/room authority to plan against the
+      // actor's actual current room instead of the stale chatroom snapshot.
+      const ways = await mcp(gateway, alice, 6, "tools/call", {
+        name: "woo_call",
+        arguments: { object: aliceActor, verb: "ways", args: [] }
+      });
+      expect(ways.result.isError, JSON.stringify(ways.result.structuredContent)).not.toBe(true);
     } finally {
       for (const state of scopeStates.values()) state.close();
     }

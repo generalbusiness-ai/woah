@@ -7,7 +7,7 @@
 // hot envelope retries rewrite only the state families that actually changed.
 
 import type { EffectTranscript } from "../core/effect-transcript";
-import type { SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
+import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   buildShadowBrowserSessionAuth,
   buildShadowBrowserDeltaTransfer,
@@ -19,6 +19,7 @@ import {
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
   MAX_SHADOW_TRANSCRIPT_TAIL,
   markShadowBrowserRelaySerializedChanged,
+  mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -234,27 +235,29 @@ export class CommitScopeDO {
   }
 
   private refreshSessionAuth(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
-    // Sessions can be refreshed by the gateway between messages. Refresh only
-    // the auth maps and session actor records from the narrow session export;
-    // the committed state and projection snapshot remain owned by this scope DO.
+    // Sessions can be refreshed by the gateway between messages. Auth maps are
+    // always rebuilt from the live session export; when the request carries an
+    // authority slice, its session/object rows also refresh the planning
+    // working set before the envelope is decoded.
+    const authority = input.authority;
+    const sessionRows = authority?.sessions ?? input.sessions;
+    const objectRows = authority?.objects ?? input.session_objects ?? [];
     const auth = buildShadowBrowserSessionAuth({
-      sessions: input.sessions,
+      sessions: sessionRows,
       scope: input.scope,
       deployment: relay.deployment,
       session_revs: input.session_revs
     });
     relay.session_auth = auth.session_auth;
     relay.session_revs = auth.session_revs;
-    // Commit validation reads session authority from the committed serialized
-    // state, not only from the transport auth map. Keep that narrow session
-    // slice fresh so a new MCP/browser session can commit into a scope whose
-    // durable snapshot was opened by an earlier session.
-    const mergedSessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, input.sessions);
+    const mergedSessions = authority
+      ? mergeShadowBrowserAuthoritySessionState(relay.commit_scope.serialized.sessions, sessionRows)
+      : mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, sessionRows);
     if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
       relay.commit_scope.serialized.sessions = mergedSessions;
       markShadowBrowserRelaySerializedChanged(relay);
     }
-    this.refreshSerializedObjects(relay, input.session_objects ?? []);
+    this.refreshSerializedObjects(relay, objectRows);
   }
 
   private ensureSerializedSession(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
@@ -262,7 +265,7 @@ export class CommitScopeDO {
     // serialized world, not only from the transport auth maps. Keep the socket's
     // accepted session row present even when the gateway's narrow session export
     // and this long-lived scope snapshot briefly diverge.
-    const current = input.sessions.find((session) => session.id === input.session && session.actor === input.actor);
+    const current = (input.authority?.sessions ?? input.sessions).find((session) => session.id === input.session && session.actor === input.actor);
     if (!current) return;
     const serialized = structuredClone(current) as SerializedSession;
     const index = relay.commit_scope.serialized.sessions.findIndex((session) => session.id === serialized.id);
@@ -273,12 +276,14 @@ export class CommitScopeDO {
       return;
     }
     const existing = relay.commit_scope.serialized.sessions[index];
-    const next = {
-      ...serialized,
-      activeScope: existing.actor === serialized.actor && existing.activeScope !== undefined
-        ? existing.activeScope
-        : serialized.activeScope
-    };
+    const next = input.authority
+      ? serialized
+      : {
+        ...serialized,
+        activeScope: existing.actor === serialized.actor && existing.activeScope !== undefined
+          ? existing.activeScope
+          : serialized.activeScope
+      };
     if (stableShadowJson(next as unknown as WooValue) !== stableShadowJson(existing as unknown as WooValue)) {
       relay.commit_scope.serialized.sessions[index] = next;
       markShadowBrowserRelaySerializedChanged(relay);
@@ -794,6 +799,7 @@ type CommitScopeBaseRequest = {
   actor: ObjRef;
   sessions: SerializedSession[];
   session_objects?: SerializedObject[];
+  authority?: SerializedAuthoritySlice;
   session_revs?: Record<string, number>;
 };
 

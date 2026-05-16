@@ -622,6 +622,14 @@ replies. The legacy single `v2_commit_scope_meta.serialized` blob column is a
 read-only migration source; after a legacy scope opens successfully, the DO
 rewrites the state into row tables and clears the blob value.
 
+CommitScopeDO snapshots are materialized planning caches, not independent
+owners of live session presence. Each signed `/v2/open` and `/v2/envelope`
+request carries a narrow `woo.authority_slice.shadow.v1` containing current
+session rows, session actor objects, the sessions' active rooms, and any
+explicit turn scope/target rows. The DO refreshes those rows before planning so
+cross-scope movement accepted by one CommitScopeDO is visible to the next
+scope without a full-world transfer.
+
 Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to the in-memory relay, then the storage transaction upserts only
 object rows named by transcript creates/writes plus any changed session active

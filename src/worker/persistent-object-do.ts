@@ -40,7 +40,7 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SeedWorld, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import {
@@ -180,16 +180,14 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function sessionActorObjects(world: WooWorld, sessions: SerializedSession[]): SerializedObject[] {
-  return world.exportObjects(sessions.map((session) => session.actor));
-}
-
-function v2SessionAuthorityPayload(world: WooWorld): { sessions: SerializedSession[]; session_objects: SerializedObject[] } {
-  // CommitScopeDO only needs fresh bearer authority and actor records on the
-  // hot path. Keep this payload narrow so WebSocket envelopes do not smuggle a
-  // full world snapshot back across the DO boundary.
+function v2SessionAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef> = []): { sessions: SerializedSession[]; session_objects: SerializedObject[]; authority: SerializedAuthoritySlice } {
+  // CommitScopeDO needs fresh bearer authority plus the live session working
+  // set before planning. The explicit authority slice stays narrow — session
+  // actors, active rooms, and caller-supplied turn objects — without smuggling
+  // a full world snapshot back across the DO boundary.
   const sessions = world.exportSessions();
-  return { sessions, session_objects: sessionActorObjects(world, sessions) };
+  const authority = world.exportAuthoritySlice(sessions, extraObjectIds);
+  return { sessions: authority.sessions, session_objects: authority.objects, authority };
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -2504,16 +2502,14 @@ export class PersistentObjectDO {
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
 
-    const sessions = world.exportSessions();
-    const sessionObjects = sessionActorObjects(world, sessions);
+    const authority = v2SessionAuthorityPayload(world, [commitScope, session.actor]);
     const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
       scope: commitScope,
       node,
       token,
       session: session.id,
       actor: session.actor,
-      sessions,
-      session_objects: sessionObjects,
+      ...authority,
       serialized: world.exportWorld(),
       ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
     });
@@ -2558,7 +2554,7 @@ export class PersistentObjectDO {
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
       const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
-        ...v2SessionAuthorityPayload(world),
+        ...v2SessionAuthorityPayload(world, [att.scope, att.actor]),
         scope: att.scope,
         node: att.node,
         token: att.token,
@@ -2609,7 +2605,7 @@ export class PersistentObjectDO {
   ): Promise<RestV2RelayClient> {
     if (forceReopen) this.restV2Relays.delete(scope);
     let client = this.restV2Relays.get(scope);
-    const authority = v2SessionAuthorityPayload(world);
+    const authorityPayload = v2SessionAuthorityPayload(world, [scope, input.target, input.actor]);
     if (!client) {
       const snapshot = world.exportWorld();
       client = {
@@ -2624,7 +2620,7 @@ export class PersistentObjectDO {
         nextTurn: 0
       };
       const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", {
-        ...authority,
+        ...authorityPayload,
         scope,
         node: client.node,
         token,
@@ -2637,7 +2633,7 @@ export class PersistentObjectDO {
       return client;
     }
     this.rememberRestV2Relay(scope, client);
-    this.refreshRestV2RelayAuthority(client, authority.sessions, authority.session_objects);
+    this.refreshRestV2RelayAuthority(client, authorityPayload.authority);
     return client;
   }
 
@@ -2658,16 +2654,15 @@ export class PersistentObjectDO {
     return attempt === 0 ? id : `${id}:repair:${crypto.randomUUID()}`;
   }
 
-  private refreshRestV2RelayAuthority(client: RestV2RelayClient, sessions: SerializedSession[], sessionObjects: SerializedObject[]): void {
+  private refreshRestV2RelayAuthority(client: RestV2RelayClient, authority: SerializedAuthoritySlice): void {
     const serialized = client.relay.commit_scope.serialized;
     // Gateway-local REST planning must see the latest session location from
-    // the gateway world. CommitScopeDO preserves scope-owned activeScope when
-    // refreshing auth for validation, but that rule is wrong for this planning
-    // cache: one REST call may move the session in a different scope, and a
-    // later command planner must not consult stale per-scope session rows.
-    serialized.sessions = structuredClone(sessions) as SerializedSession[];
+    // the gateway world. One REST call may move the session in a different
+    // scope, and a later command planner must not consult stale per-scope
+    // session or room rows.
+    serialized.sessions = structuredClone(authority.sessions) as SerializedSession[];
     const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
-    for (const obj of sessionObjects) {
+    for (const obj of authority.objects) {
       const clone = structuredClone(obj) as SerializedObject;
       const index = byId.get(clone.id);
       if (index === undefined) {
@@ -2706,7 +2701,7 @@ export class PersistentObjectDO {
           persistence: "live"
         }));
         const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(input.scope, "/v2/envelope", {
-          ...v2SessionAuthorityPayload(world),
+          ...v2SessionAuthorityPayload(world, [input.scope, input.target, input.actor]),
           scope: input.scope,
           node: client.node,
           token,
@@ -2770,7 +2765,7 @@ export class PersistentObjectDO {
         body
       }));
       const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(commitScope, "/v2/envelope", {
-        ...v2SessionAuthorityPayload(world),
+        ...v2SessionAuthorityPayload(world, [commitScope, planningScope, input.target, input.actor]),
         scope: commitScope,
         node: commitClient.node,
         token,

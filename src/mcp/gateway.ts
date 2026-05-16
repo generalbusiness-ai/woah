@@ -15,7 +15,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, ErrorValue, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
-import type { SerializedObject } from "../core/repository";
+import type { SerializedAuthoritySlice, SerializedObject } from "../core/repository";
 import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
 import { encodeEnvelope, decodeEnvelope } from "../core/shadow-envelope";
@@ -56,6 +56,7 @@ export type McpV2OpenBody = {
   actor: ObjRef;
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
+  authority?: SerializedAuthoritySlice;
   serialized: ReturnType<WooWorld["exportWorld"]>;
 };
 
@@ -73,6 +74,7 @@ export type McpV2EnvelopeBody = {
   actor: ObjRef;
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
+  authority?: SerializedAuthoritySlice;
   envelope: string;
 };
 
@@ -438,8 +440,8 @@ export class McpGateway {
     // head. Keep the local relay's session authority fresh for applying the
     // accepted transcript and serving later local cache reads.
     const sessions = this.world.exportSessions();
-    const sessionObjects = this.world.exportObjects(sessions.map((session) => session.actor));
-    refreshSerializedSessionAuthority(client.relay.commit_scope.serialized, sessions, sessionObjects);
+    const authority = this.world.exportAuthoritySlice(sessions, [scope, target]);
+    refreshSerializedSessionAuthority(client.relay.commit_scope.serialized, authority.sessions, authority.objects);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     const envelope = buildShadowTurnIntentEnvelope({
       node: this.v2NodeFor(entry),
@@ -460,8 +462,9 @@ export class McpGateway {
       token: entry.v2Token,
       session: entry.woo.id,
       actor,
-      sessions,
-      session_objects: sessionObjects,
+      sessions: authority.sessions,
+      session_objects: authority.objects,
+      authority,
       envelope: encodeEnvelope(envelope)
     });
     const replyEnvelope = result.reply ? decodeEnvelope<ShadowTurnExecReply>(result.reply) : null;
@@ -498,14 +501,16 @@ export class McpGateway {
     }
     if (!client.openedSessions.has(entry.woo.id)) {
       const sessions = this.world.exportSessions();
+      const authority = this.world.exportAuthoritySlice(sessions, [scope, entry.woo.actor]);
       const opened = await hooks.open(scope, {
         scope,
         node: this.v2NodeFor(entry),
         token: entry.v2Token,
         session: entry.woo.id,
         actor: entry.woo.actor,
-        sessions,
-        session_objects: this.world.exportObjects(sessions.map((session) => session.actor)),
+        sessions: authority.sessions,
+        session_objects: authority.objects,
+        authority,
         serialized: this.world.exportWorld()
       });
       if (opened.head) client.relay.commit_scope.head = opened.head;
@@ -572,11 +577,13 @@ function remoteAcceptedKey(commit: ShadowCommitAccepted): string {
 function refreshSerializedSessionAuthority(
   serialized: { sessions: ReturnType<WooWorld["exportSessions"]>; objects: SerializedObject[] },
   sessions: ReturnType<WooWorld["exportSessions"]>,
-  sessionObjects: SerializedObject[]
+  authorityObjects: SerializedObject[]
 ): void {
   serialized.sessions = sessions;
+  // Despite the historical helper name, authority objects now include session
+  // actors plus active rooms and explicit turn rows needed for planning.
   const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
-  for (const obj of sessionObjects) {
+  for (const obj of authorityObjects) {
     const index = byId.get(obj.id);
     if (index === undefined) {
       byId.set(obj.id, serialized.objects.length);
