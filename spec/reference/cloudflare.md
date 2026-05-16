@@ -601,7 +601,42 @@ GET  /api/objects/<id>/log              → DO RPC (readLog)
 GET  /api/objects/<id>/stream           → 410 E_GONE (retired)
 POST /api/auth                          → Sessions handler (mints/resumes session)
 GET  /v2/turn-network/ws                → v2 WS upgrade → gateway host
+POST /mcp                               → first request on gateway host; established sessions route to MCP gateway shard
 ```
+
+MCP streamable-HTTP traffic is deliberately not pinned to the singleton
+`world` gateway after initialization. The first request has no MCP session id
+yet and may mint a woo session, so it runs on `world`. Once the client presents
+`Mcp-Session-Id`, the Worker resolves the Directory session record, forwards
+that authority in signed internal headers, and stable-hashes the MCP session id
+to `mcp-gateway-<n>`. A shard cold-loads a signed gateway snapshot from `world`
+and resumes the MCP transport from the forwarded session, while actual durable
+turn execution still commits through `CommitScopeDO`.
+
+The Directory `session_route` row records the active MCP shard in `mcp_shard`
+after that shard has actually handled the session. Directory exposes the active
+set through signed `POST /mcp-shards`, returning `{shards: ["mcp-gateway-N",
+...]}`. Origin hosts cache that active-shard list briefly; the cache is an
+optimization only, because the session route is still the authority.
+
+When a turn is accepted, the origin delivers normal local WebSocket fanout and
+also POSTs to active MCP shards through signed
+`POST /__internal/mcp-commit-fanout` with `{scope, origin_session, commit,
+transcript}`. `commit` is a `woo.commit.accepted.shadow.v1`; `transcript` is
+the matching `woo.effect_transcript.shadow.v1`. Remote shards apply the
+accepted transcript to their non-persistent snapshot and route the accepted
+observations into their own MCP wait queues. This keeps co-present MCP sessions
+observable across shard boundaries without making any shard authoritative for
+durable world state.
+
+Remote shards deduplicate accepted fanout by `(scope, seq)` using a bounded LRU.
+For scopes the shard has opened through its v2 relay, accepted commits are
+applied in relay-head order only: a commit with `seq == head.seq + 1` applies,
+newer commits wait in a bounded per-scope pending buffer, and already-applied
+older commits are dropped. Pending entries are aged and capped so a hot shard
+cannot grow without bound if an earlier frame never arrives. Scopes that the
+shard has not opened have no local relay head, so they fall back to immediate
+best-effort cache apply.
 
 ### R11.2 ID resolution
 

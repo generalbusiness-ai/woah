@@ -28,6 +28,7 @@
 //   private repos and content-hash caching are deferred.
 
 import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld } from "../core/bootstrap";
+import type { EffectTranscript } from "../core/effect-transcript";
 import { parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
@@ -56,7 +57,7 @@ import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type Shado
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../core/turn-key";
-import { applyAcceptedShadowFrame, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -78,6 +79,7 @@ export interface Env {
   WOO_HOST_READ_TIMEOUT_MS?: string;
   WOO_HOST_WRITE_TIMEOUT_MS?: string;
   WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
+  WOO_MCP_GATEWAY_SHARDS?: string;
 }
 
 type CommitScopeOpenResponse = {
@@ -114,6 +116,9 @@ type RestV2RelayClient = {
 };
 
 const WORLD_HOST = "world";
+const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
+const DEFAULT_MCP_GATEWAY_SHARDS = 32;
+const MCP_GATEWAY_SHARD_CACHE_TTL_MS = 2_000;
 const REMOTE_ROUTE_SYNC_TTL_MS = 60_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
@@ -243,6 +248,7 @@ export class PersistentObjectDO {
   // Throttle to one round-trip per host per `REMOTE_ROUTE_SYNC_TTL_MS`.
   private remoteRouteSyncAt = new Map<string, number>();
   private mcpGateway: McpGateway | null = null;
+  private activeMcpShardCache: { expiresAt: number; hosts: string[] } | null = null;
   // Gateway-owned REST relays mirror the browser/MCP open-once shape. Keep a
   // bounded per-DO LRU so agents that touch many scopes do not retain full
   // serialized snapshots for the lifetime of a hot Durable Object instance.
@@ -312,7 +318,9 @@ export class PersistentObjectDO {
       const url = new URL(request.url);
       pathname = url.pathname;
       hostKey = request.headers.get("x-woo-host-key") || this.durableHostKey();
-      const gatewayHost = hostKey === WORLD_HOST;
+      const worldGatewayHost = hostKey === WORLD_HOST;
+      const mcpGatewayShard = isMcpGatewayShardHost(hostKey);
+      const gatewayHost = worldGatewayHost || mcpGatewayShard;
       const internalRequest = pathname.startsWith("/__internal/");
 
       if (internalRequest) await verifyInternalRequest(this.env, request);
@@ -330,7 +338,7 @@ export class PersistentObjectDO {
         );
       }
 
-      if (!gatewayHost && (pathname === "/api/auth" || pathname === "/v2/turn-network/ws")) {
+      if (!worldGatewayHost && (pathname === "/api/auth" || pathname === "/v2/turn-network/ws")) {
         return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
       }
 
@@ -347,7 +355,7 @@ export class PersistentObjectDO {
         return jsonResponse({ error: { code: "E_NOTSUPPORTED", message: "legacy /ws protocol has been removed; use /v2/turn-network/ws" } }, 410);
       }
 
-      if (gatewayHost && pathname === "/v2/turn-network/ws") {
+      if (worldGatewayHost && pathname === "/v2/turn-network/ws") {
         return await this.acceptV2TurnNetworkWebSocket(request, world);
       }
 
@@ -356,13 +364,18 @@ export class PersistentObjectDO {
       }
 
       // MCP streamable-HTTP transport (spec/protocol/mcp.md). Only on the
-      // gateway host: agent sessions live here alongside human WebSockets.
+      // gateway host or a gateway shard. Shards receive Directory session
+      // headers from the Worker so they can resume SDK transport state without
+      // becoming the canonical session store.
       if (gatewayHost && pathname === "/mcp") {
+        this.ensureForwardedMcpSession(world, request);
         const gateway = this.getMcpGateway(world);
-        return await gateway.handle(request);
+        const response = await gateway.handle(request);
+        await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
+        return response;
       }
 
-      if (gatewayHost && request.method === "POST" && pathname === "/v2/session/mint") {
+      if (worldGatewayHost && request.method === "POST" && pathname === "/v2/session/mint") {
         const body = await readJsonBody(request);
         const session = this.authenticateToken(world, String(body.token ?? ""));
         await this.registerSessionRoute(session);
@@ -372,7 +385,7 @@ export class PersistentObjectDO {
         });
       }
 
-      if (gatewayHost && request.method === "POST" && pathname === "/api/admin/refresh-host-seeds") {
+      if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/refresh-host-seeds") {
         const session = this.requireRestSession(world, request);
         if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
         const body = await readJsonBody(request);
@@ -392,7 +405,7 @@ export class PersistentObjectDO {
         },
         executeTurn: (input) => this.restV2Turn(world, input),
         installTap: async (actor, body) => {
-          if (!gatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap install is only available on the world gateway host");
+          if (!worldGatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap install is only available on the world gateway host");
           return await installGitHubTap(world, actor, {
             tap: String(body.tap ?? ""),
             catalog: String(body.catalog ?? ""),
@@ -404,7 +417,7 @@ export class PersistentObjectDO {
           });
         },
         updateTap: async (actor, body) => {
-          if (!gatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap update is only available on the world gateway host");
+          if (!worldGatewayHost) throw wooError("E_NOTAPPLICABLE", "GitHub tap update is only available on the world gateway host");
           return await updateGitHubTap(world, actor, {
             tap: String(body.tap ?? ""),
             catalog: String(body.catalog ?? ""),
@@ -647,7 +660,7 @@ export class PersistentObjectDO {
     }
   }
 
-    private getMcpGateway(world: WooWorld): McpGateway {
+  private getMcpGateway(world: WooWorld): McpGateway {
     if (!this.mcpGateway) {
       const initStart = Date.now();
       this.mcpGateway = new McpGateway(world, {
@@ -659,7 +672,9 @@ export class PersistentObjectDO {
           },
           envelope: async (scope, body): Promise<McpV2EnvelopeResult> => {
             world.touchSessionInput(body.session);
-            return await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
+            const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
+            await this.deliverV2Fanout(world, scope, result, body.session);
+            return result;
           }
         },
         broadcasts: {}
@@ -667,26 +682,26 @@ export class PersistentObjectDO {
       world.recordMetric({ kind: "init", phase: "mcp_gateway", ms: Date.now() - initStart });
     }
     return this.mcpGateway;
-    }
+  }
 
-    private async verifyTurnstile(token: string, request: RestProtocolRequest): Promise<boolean> {
-      const secret = this.env.TURNSTILE_SECRET_KEY;
-      if (!secret) throw wooError("E_PERM", "TURNSTILE_SECRET_KEY is required for signup");
-      const body = new FormData();
-      body.set("secret", secret);
-      body.set("response", token);
-      const remoteIp = request.header("cf-connecting-ip") ?? request.header("x-forwarded-for")?.split(",")[0]?.trim();
-      if (remoteIp) body.set("remoteip", remoteIp);
-      const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-        method: "POST",
-        body
-      });
-      if (!response.ok) return false;
-      const parsed = await response.json().catch(() => null);
-      return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { success?: unknown }).success === true);
-    }
+  private async verifyTurnstile(token: string, request: RestProtocolRequest): Promise<boolean> {
+    const secret = this.env.TURNSTILE_SECRET_KEY;
+    if (!secret) throw wooError("E_PERM", "TURNSTILE_SECRET_KEY is required for signup");
+    const body = new FormData();
+    body.set("secret", secret);
+    body.set("response", token);
+    const remoteIp = request.header("cf-connecting-ip") ?? request.header("x-forwarded-for")?.split(",")[0]?.trim();
+    if (remoteIp) body.set("remoteip", remoteIp);
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      body
+    });
+    if (!response.ok) return false;
+    const parsed = await response.json().catch(() => null);
+    return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { success?: unknown }).success === true);
+  }
 
-    private async getWorld(hostKey = this.durableHostKey()): Promise<WooWorld> {
+  private async getWorld(hostKey = this.durableHostKey()): Promise<WooWorld> {
     if (this.world) {
       if (hostKey === WORLD_HOST) await this.registerObjectRoutes(this.world);
       return this.world;
@@ -702,6 +717,8 @@ export class PersistentObjectDO {
       const metricsHook = (event: MetricEvent) => this.emitMetric(event, hostKey);
       const world = hostKey === WORLD_HOST
         ? createWorld({ repository: this.repo, catalogs: parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS), metricsHook })
+        : isMcpGatewayShardHost(hostKey)
+          ? await this.createMcpGatewayShardWorld(hostKey, metricsHook)
         : await this.createHostScopedWorld(hostKey as ObjRef, metricsHook);
       this.installHostBridge(world, hostKey);
       // Rehydrate live WebSocket attachments. After DO wake-from-hibernation,
@@ -729,6 +746,10 @@ export class PersistentObjectDO {
     }
     if (hostKey === WORLD_HOST) {
       await this.registerObjectRoutes(world);
+    } else if (isMcpGatewayShardHost(hostKey)) {
+      for (const route of world.objectRoutes()) {
+        this.routeCache.set(route.id, route.host);
+      }
     } else {
       // Satellite cold-load: prime `routeCache` from the local slice so
       // `resolveObjectHostForWorld` can answer locally without firing a
@@ -746,6 +767,26 @@ export class PersistentObjectDO {
       }
     }
     return world;
+  }
+
+  private async createMcpGatewayShardWorld(hostKey: string, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
+    const startedAt = Date.now();
+    const id = this.env.WOO.idFromName(WORLD_HOST);
+    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/mcp-gateway-world`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "x-woo-host-key": WORLD_HOST
+      },
+      body: JSON.stringify({ shard: hostKey })
+    }));
+    const response = await this.env.WOO.get(id).fetch(request);
+    const body = await response.json().catch(() => null);
+    if (!response.ok || !isSerializedWorld(body)) {
+      throw wooError("E_STORAGE", `failed to load MCP gateway shard snapshot for ${hostKey}`, body as WooValue);
+    }
+    this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - startedAt, status: "ok", objects: body.objects.length }, hostKey);
+    return createWorldFromSerialized(body, { repository: this.repo, metricsHook, persist: false });
   }
 
   private async createHostScopedWorld(hostKey: ObjRef, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
@@ -1830,6 +1871,23 @@ export class PersistentObjectDO {
         return jsonResponse(world.objectRoutes());
       }
 
+      if (request.method === "POST" && pathname === "/__internal/mcp-gateway-world") {
+        if (hostKey !== WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "MCP gateway snapshots are served only by the world host");
+        return jsonResponse(world.exportWorld());
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/mcp-commit-fanout") {
+        const scope = String(body.scope ?? "") as ObjRef;
+        if (!scope) throw wooError("E_INVARG", "mcp-commit-fanout requires scope");
+        if (!isShadowCommitAccepted(body.commit)) throw wooError("E_INVARG", "mcp-commit-fanout requires accepted commit");
+        if (!body.transcript || typeof body.transcript !== "object" || Array.isArray(body.transcript)) {
+          throw wooError("E_INVARG", "mcp-commit-fanout requires transcript");
+        }
+        const originSession = typeof body.origin_session === "string" ? body.origin_session : null;
+        this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession);
+        return jsonResponse({ ok: true });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/host-seed") {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
@@ -2185,6 +2243,24 @@ export class PersistentObjectDO {
     return world.ensureSessionForActor(sessionId, actor, tokenClass, Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined, activeScope, apikeyIdValue);
   }
 
+  private ensureForwardedMcpSession(world: WooWorld, request: Request): void {
+    const sessionId = request.headers.get("x-woo-internal-session");
+    const actor = request.headers.get("x-woo-internal-actor");
+    if (!sessionId || !actor) return;
+    this.ensureInternalSession(
+      world,
+      sessionId,
+      actor as ObjRef,
+      Number(request.headers.get("x-woo-internal-expires-at") ?? 0),
+      request.headers.get("x-woo-internal-token-class"),
+      sessionActiveScope({
+        active_scope: request.headers.get("x-woo-internal-active-scope"),
+        current_location: request.headers.get("x-woo-internal-current-location")
+      }),
+      request.headers.get("x-woo-internal-apikey-id")
+    );
+  }
+
   private ensureInternalActor(world: WooWorld, actor: ObjRef): void {
     if (world.objects.has(actor)) return;
     const parent = world.objects.has("$player") ? "$player" : world.objects.has("$actor") ? "$actor" : null;
@@ -2202,7 +2278,7 @@ export class PersistentObjectDO {
     return world.auth(token);
   }
 
-  private async registerSessionRoute(session: Session): Promise<void> {
+  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null } = {}): Promise<void> {
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-session`, {
@@ -2215,7 +2291,8 @@ export class PersistentObjectDO {
           token_class: session.tokenClass,
           active_scope: session.activeScope,
           current_location: session.activeScope,
-          apikey_id: session.apikeyId ?? null
+          apikey_id: session.apikeyId ?? null,
+          mcp_shard: options.mcpShard ?? null
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
@@ -2225,6 +2302,14 @@ export class PersistentObjectDO {
       // result remains authoritative for this host; routed object calls fail
       // closed if the Directory cannot resolve the session.
     }
+  }
+
+  private async registerMcpSessionRoute(world: WooWorld, request: Request, response: Response, mcpShard: string | null): Promise<void> {
+    if (!response.ok) return;
+    const sessionId = response.headers.get("mcp-session-id") ?? request.headers.get("mcp-session-id");
+    if (!sessionId) return;
+    const session = world.sessions.get(sessionId);
+    if (session) await this.registerSessionRoute(session, { mcpShard });
   }
 
   private async unregisterSessionRoute(sessionId: string): Promise<void> {
@@ -2467,7 +2552,7 @@ export class PersistentObjectDO {
       });
       await this.applyV2CommittedTranscript(world, result.reply, att.sessionId);
       if (result.reply) ws.send(result.reply);
-      this.sendV2Fanout(result.fanout ?? []);
+      await this.deliverV2Fanout(world, att.scope, result, att.sessionId);
     } catch (err) {
       ws.send(encodeEnvelope(buildTransportErrorEnvelope({
         id: `${this.durableHostKey()}:error:${Date.now()}`,
@@ -2613,7 +2698,7 @@ export class PersistentObjectDO {
           actor: input.actor,
           envelope
         });
-        this.sendV2Fanout(result.fanout ?? []);
+        await this.deliverV2Fanout(world, input.scope, result, input.session.id);
         if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
         const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
         if (attempt === 0 && this.restV2ReplyNeedsRelayRepair(reply.body)) continue;
@@ -2677,7 +2762,7 @@ export class PersistentObjectDO {
         actor: input.actor,
         envelope
       });
-      this.sendV2Fanout(result.fanout ?? []);
+      await this.deliverV2Fanout(world, commitScope, result, input.session.id);
       if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
       const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
       if (attempt === 0 && this.restV2ReplyNeedsRelayRepair(reply.body)) continue;
@@ -2807,6 +2892,75 @@ export class PersistentObjectDO {
         }
       }
     }
+  }
+
+  private async deliverV2Fanout(
+    world: WooWorld,
+    scope: ObjRef,
+    result: CommitScopeEnvelopeResponse,
+    originSessionId?: string | null
+  ): Promise<void> {
+    const fanout = result.fanout ?? [];
+    this.sendV2Fanout(fanout);
+    if (!result.reply) return;
+    const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply).body;
+    if (reply.ok !== true || !reply.commit || !reply.transcript) return;
+    const frame = restFrameFromTurnReply(scope, reply);
+    const observations = "observations" in frame && frame.observations.length > 0
+      ? frame.observations
+      : reply.commit.observations;
+    await this.deliverMcpCommitFanout(world, scope, fanout, { ...reply.commit, observations }, reply.transcript, originSessionId ?? null);
+  }
+
+  private async deliverMcpCommitFanout(
+    world: WooWorld,
+    scope: ObjRef,
+    fanout: Array<{ node: string; envelope: string }>,
+    commit: ShadowCommitAccepted,
+    transcript: EffectTranscript,
+    originSessionId: string | null
+  ): Promise<void> {
+    const hosts = new Set(await this.activeMcpShardHosts());
+    for (const item of fanout) {
+      const sessionId = mcpSessionIdFromNode(item.node);
+      if (!sessionId) continue;
+      hosts.add(mcpGatewayShardHost(this.env, sessionId));
+    }
+    hosts.delete(this.durableHostKey());
+    if (hosts.size === 0) return;
+    const body = {
+      scope,
+      origin_session: originSessionId,
+      commit: commit as unknown as WooValue,
+      transcript: transcript as unknown as WooValue
+    };
+    await Promise.all(Array.from(hosts, async (host) => {
+      try {
+        await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
+      } catch (err) {
+        console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
+      }
+    }));
+    world.recordMetric({ kind: "mcp_fanout", scope, shards: hosts.size, observations: commit.observations.length });
+  }
+
+  private async activeMcpShardHosts(): Promise<string[]> {
+    const now = Date.now();
+    if (this.activeMcpShardCache && this.activeMcpShardCache.expiresAt > now) {
+      return this.activeMcpShardCache.hosts;
+    }
+    const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/mcp-shards`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: "{}"
+    }));
+    const response = await this.env.DIRECTORY.get(id).fetch(request);
+    const body = await response.json().catch(() => null) as { shards?: unknown } | null;
+    if (!response.ok || !body || !Array.isArray(body.shards)) return [];
+    const hosts = body.shards.filter((item): item is string => typeof item === "string" && item.startsWith(MCP_GATEWAY_SHARD_PREFIX));
+    this.activeMcpShardCache = { hosts, expiresAt: now + MCP_GATEWAY_SHARD_CACHE_TTL_MS };
+    return hosts;
   }
 
     private indexAddSocket(sessionId: string, actor: ObjRef, ws: WebSocket): void {
@@ -3299,6 +3453,44 @@ function isReadAvailabilityError(err: unknown): boolean {
 
 function sessionActiveScope(record: Record<string, unknown>): ObjRef | undefined {
   return (sessionActiveScopeFromRecord(record) as ObjRef | null) ?? undefined;
+}
+
+function isMcpGatewayShardHost(hostKey: string): boolean {
+  return hostKey.startsWith(MCP_GATEWAY_SHARD_PREFIX);
+}
+
+function mcpSessionIdFromNode(node: string): string | null {
+  return node.startsWith("mcp:") ? node.slice("mcp:".length) || null : null;
+}
+
+function mcpGatewayShardHost(env: Env, sessionId: string): string {
+  const shards = mcpGatewayShardCount(env);
+  return `${MCP_GATEWAY_SHARD_PREFIX}${stableHash(sessionId) % shards}`;
+}
+
+function mcpGatewayShardCount(env: Env): number {
+  const raw = Number(env.WOO_MCP_GATEWAY_SHARDS ?? DEFAULT_MCP_GATEWAY_SHARDS);
+  return Number.isInteger(raw) && raw > 0 && raw <= 256 ? raw : DEFAULT_MCP_GATEWAY_SHARDS;
+}
+
+function stableHash(input: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function isShadowCommitAccepted(value: unknown): value is ShadowCommitAccepted {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<ShadowCommitAccepted>;
+  return candidate.kind === "woo.commit.accepted.shadow.v1" &&
+    !!candidate.position &&
+    typeof candidate.position === "object" &&
+    typeof candidate.position.scope === "string" &&
+    typeof candidate.position.seq === "number" &&
+    Array.isArray(candidate.observations);
 }
 
 async function workerHashText(text: string): Promise<string> {
