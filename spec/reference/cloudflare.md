@@ -613,6 +613,22 @@ to `mcp-gateway-<n>`. A shard cold-loads a signed gateway snapshot from `world`
 and resumes the MCP transport from the forwarded session, while actual durable
 turn execution still commits through `CommitScopeDO`.
 
+`CommitScopeDO` is the durable authority for v2 scope heads. On first open for
+a scope it materializes the gateway-supplied `SerializedWorld` into
+row-shaped DO SQLite state: one row per serialized object, one row per session,
+one row per sequenced log entry, and small metadata/tail tables for the head,
+counters, accepted frames, transcript tail, idempotency keys, and cached
+replies. The legacy single `v2_commit_scope_meta.serialized` blob column is a
+read-only migration source; after a legacy scope opens successfully, the DO
+rewrites the state into row tables and clears the blob value.
+
+Accepted v2 commits do not rewrite the full world. The commit applies the
+transcript to the in-memory relay, then the storage transaction upserts only
+object rows named by transcript creates/writes plus any changed session active
+scope and sequenced log row. This keeps steady-state commit storage cost
+proportional to the turn delta, not to the scope's world size. Cold opens still
+write O(world-size) rows once for a new or migrated scope.
+
 The Directory `session_route` row records the active MCP shard in `mcp_shard`
 after that shard has actually handled the session. Directory exposes the active
 set through signed `POST /mcp-shards`, returning `{shards: ["mcp-gateway-N",
@@ -723,6 +739,7 @@ Logpush configuration is per-account, not in wrangler — `wrangler logpush crea
 - AE writes are inexpensive; one per call site is well under cost concern at v1 traffic.
 - DO storage cost is per-object SQLite size; small objects (~few KB) are nearly free.
 - DO SQLite billing counts rows written, including deletes and index updates. Runtime commits must therefore flush only dirty object/property/session/task slices, not the whole host graph, and should emit `storage_flush` metrics so operators can find write-amplified verbs.
+- `CommitScopeDO` follows the same cost discipline for v2 authority state: a cold scope open writes the initial row-shaped world, while accepted envelopes write only the transcript-touched object rows and small commit-tail/idempotency rows. A return to full-world blob rewrites on each commit is non-conforming for the Cloudflare reference.
 - Continuous UI gestures should use direct live observations for previews and coalesce durable writes at the application edge. Generic sequenced calls are never debounced by the host: once a call returns an applied frame, its log outcome and dirty state are durable.
 - Real deployment cost numbers are tracked in operator notes as traffic grows.
 

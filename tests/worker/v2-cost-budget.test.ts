@@ -11,6 +11,7 @@ import {
 } from "../../src/core/shadow-browser-node";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
+import type { SerializedWorld } from "../../src/core/repository";
 import type { WooWorld } from "../../src/core/world";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
@@ -127,15 +128,18 @@ describe("v2 CommitScopeDO cost budget", () => {
 
       const writes = rowWrites(harness.scopeState);
       // Expected row writes for one committed turn:
-      // meta + accepted_frame + transcript_tail + seen + reply = 5.
+      // meta + touched object + accepted_frame + transcript_tail + seen +
+      // reply = 6. The object row is the committed state delta; it replaces
+      // the old full-world blob rewrite in v2_commit_scope_meta.serialized.
       // Reply envelopes stay durable so retries remain reply-idempotent across
       // CommitScopeDO hibernation; the separate reply cap prevents unbounded
       // growth inside the idempotency window.
       // Budget allows two small retention/accounting additions, but rejects the
       // old retained-tail rewrite pattern that produced thousands of writes.
-      expect(writes).toBeLessThanOrEqual(7);
+      expect(writes).toBeLessThanOrEqual(8);
       expect(writeRowsByTable(harness.scopeState)).toEqual({
         v2_commit_scope_meta: 1,
+        v2_commit_scope_object: 1,
         v2_commit_scope_accepted_frame: 1,
         v2_commit_scope_transcript_tail: 1,
         v2_commit_scope_seen: 1,
@@ -153,20 +157,84 @@ describe("v2 CommitScopeDO cost budget", () => {
     }
   });
 
-  it("keeps cold-start plus first envelope inside the write budget", async () => {
+  it("stores cold-start state as object rows, then keeps the first envelope delta-sized", async () => {
     const harness = await makeCostHarness();
     try {
       await harness.openScope();
+      const openWrites = writeRowsByTable(harness.scopeState);
+      expect(openWrites).toMatchObject({
+        v2_commit_scope_meta: 1,
+        v2_commit_scope_object: harness.world.exportWorld().objects.length,
+        v2_commit_scope_session: harness.world.exportWorld().sessions.length
+      });
+      expect(sqlRows(harness.scopeState.storage.sql.exec(
+        "SELECT serialized IS NULL AS cleared FROM v2_commit_scope_meta WHERE id = 'current'"
+      ))[0]).toMatchObject({ cleared: 1 });
+      resetCostLog(harness);
+
       await harness.sendTurn(1);
 
-      // Cold scope initialization does CREATE TABLE IF NOT EXISTS work, but DDL
-      // changes no rows in this harness. Expected row writes are open meta (1)
-      // plus the first committed turn (5). Budget 10 catches any return to
-      // full retained-row save() on the first envelope after wake.
-      expect(rowWrites(harness.scopeState)).toBeLessThanOrEqual(10);
+      // After open, the first committed envelope should write only the changed
+      // object plus small authority/idempotency rows. A return to full-state
+      // rewrites would show up as one object write per object here.
+      expect(rowWrites(harness.scopeState)).toBeLessThanOrEqual(8);
+      expect(writeRowsByTable(harness.scopeState)).toMatchObject({
+        v2_commit_scope_object: 1
+      });
     } finally {
       harness.cleanup();
     }
+  });
+
+  it.each([
+    ["raw JSON", async (serialized: SerializedWorld) => JSON.stringify(serialized)],
+    ["GZB1 gzip", encodeLegacyGzipSerializedWorld]
+  ])("migrates a legacy %s single-blob scope into row-shaped storage on open", async (_name, encodeLegacy) => {
+    const state = new FakeDurableObjectState("#-1");
+    const world = createWorld();
+    const session = world.auth("guest:legacy-commit-scope");
+    const serialized = world.exportWorld();
+    const legacyBlob = await encodeLegacy(serialized);
+    const legacyRelay = createShadowBrowserRelayShim({
+      node: "node:commit-scope:#-1",
+      scope: "#-1",
+      serialized
+    });
+    state.storage.sql.exec(
+      "CREATE TABLE v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT NOT NULL, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+    );
+    state.storage.sql.exec(
+      "INSERT INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?)",
+      "#-1",
+      legacyRelay.node,
+      legacyBlob,
+      JSON.stringify(legacyRelay.commit_scope.head),
+      legacyRelay.idempotency_window_ms,
+      Date.now()
+    );
+
+    const scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const request = await signInternalRequest({ WOO_INTERNAL_SECRET: "cf-test-secret" }, new Request("https://woo.internal/v2/open", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        scope: "#-1",
+        node: "browser:legacy-migration",
+        token: "guest:legacy-commit-scope",
+        session: session.id,
+        actor: session.actor,
+        sessions: world.exportSessions(),
+        serialized
+      })
+    }));
+
+    const response = await scope.fetch(request);
+    expect(response.ok).toBe(true);
+    expect(sqlRows<{ n: number }>(state.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_object"))[0]?.n).toBe(serialized.objects.length);
+    expect(sqlRows<{ n: number }>(state.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_session"))[0]?.n).toBe(serialized.sessions.length);
+    expect(sqlRows<{ cleared: number }>(state.storage.sql.exec(
+      "SELECT serialized IS NULL AS cleared FROM v2_commit_scope_meta WHERE id = 'current'"
+    ))[0]).toMatchObject({ cleared: 1 });
   });
 
   it("performs exactly zero durable writes on duplicate envelope replay", async () => {
@@ -202,9 +270,9 @@ describe("v2 CommitScopeDO cost budget", () => {
       const writesAfterSecondBatch = rowWrites(harness.scopeState);
       const secondBatchPerTurn = (writesAfterSecondBatch - writesAfterFirstBatch) / 20;
 
-      // Expected remains about 5 writes/turn regardless of retained tail size.
+      // Expected remains about 6 writes/turn regardless of retained tail size.
       // O(retained) rewrites grow this number as history accumulates.
-      expect(secondBatchPerTurn).toBeLessThanOrEqual(7);
+      expect(secondBatchPerTurn).toBeLessThanOrEqual(8);
     } finally {
       harness.cleanup();
     }
@@ -339,6 +407,43 @@ function resetStateCostLog(state: FakeDurableObjectState): void {
   state.storage.sql.execLog.length = 0;
 }
 
+async function encodeLegacyGzipSerializedWorld(serialized: SerializedWorld): Promise<string> {
+  const cs = new CompressionStream("gzip");
+  const writer = cs.writable.getWriter();
+  const writeDone = writer.write(new TextEncoder().encode(JSON.stringify(serialized))).then(() => writer.close());
+  const chunks = await readAllChunks(cs.readable);
+  await writeDone;
+  return `GZB1:${base64FromBytes(concatBytes(chunks))}`;
+}
+
+async function readAllChunks(readable: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
+  const reader = readable.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(value);
+  }
+  return chunks;
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 async function initializeMcp(gateway: PersistentObjectDO, token: string, id: number): Promise<string> {
   const init = await gateway.fetch(jsonRpcRequest({
     jsonrpc: "2.0",
@@ -399,6 +504,10 @@ function writeRowsByTable(state: FakeDurableObjectState): Record<string, number>
     counts[table] = (counts[table] ?? 0) + entry.changes;
   }
   return counts;
+}
+
+function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
+  return cursor.toArray() as T[];
 }
 
 function writeTable(query: string): string | null {
