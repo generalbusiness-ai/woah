@@ -155,8 +155,18 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
         required: ["target"]
       },
       invoke: async (params) => {
+        const target = stringParam(params, "target") as ObjRef;
+        // MCP focus promotes objects already in the actor's working context; it
+        // is not a global lookup escape hatch for readable substrate objects.
+        // Use the tool surface rather than local reachability so remote active-
+        // scope contents exposed by `woo_list_reachable_tools` are accepted.
+        const reachable = (await host.enumerateTools(actor, { scope: "all" })).some((tool) => tool.object === target);
+        if (!reachable) {
+          if (!options.world.objects.has(target)) throw wooError("E_OBJNF", `focus target not found: ${target}`, target);
+          throw wooError("E_PERM", `focus target is not reachable: ${target}`, target);
+        }
         const tool = actorControlTool(actor, "focus");
-        return invokeDynamicToolWithArgs(tool, [stringParam(params, "target")]);
+        return invokeDynamicToolWithArgs(tool, [target]);
       }
     }],
     ["woo_unfocus", {

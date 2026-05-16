@@ -905,13 +905,14 @@ describe("McpHost", () => {
     }));
   });
 
-  it("skips refresh after transcript-less focus_list control reads", async () => {
+  it("routes actor focus-list reads through direct dispatch hooks", async () => {
     const world = bootstrapWorld();
-    const session = world.auth("guest:mcp-focus-list-no-refresh");
+    const session = world.auth("guest:mcp-focus-list-dispatch");
     const metrics: MetricEvent[] = [];
     world.setMetricsHook((event) => metrics.push(event));
+    const direct = vi.fn(async () => ({ op: "result" as const, result: [], observations: [], audience: null }));
     const host = new McpHost(world, {
-      direct: async () => ({ op: "result", result: [], observations: [], audience: null })
+      direct
     });
     host.bindSession(session.id, session.actor);
     const refreshSpy = vi.spyOn(host, "refreshToolList").mockResolvedValue(false);
@@ -928,11 +929,12 @@ describe("McpHost", () => {
 
     await host.invokeTool(session.actor, session.id, tool, []);
 
-    expect(refreshSpy).not.toHaveBeenCalled();
+    expect(direct).toHaveBeenCalledWith(session.id, session.actor, session.actor, "focus_list", [], "the_chatroom");
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
     expect(metrics).toContainEqual(expect.objectContaining({
-      kind: "mcp_tool_refresh_skipped",
+      kind: "mcp_tool_refresh_taken",
       source: "invoke",
-      reason: "control_focus_list_read",
+      reason: "no_transcript",
       transcript: false
     }));
   });
@@ -1491,6 +1493,17 @@ describe("McpGateway", () => {
     const callBody = await call.json() as { result: { isError?: boolean; structuredContent?: { result?: unknown } } };
     expect(callBody.result.isError).not.toBe(true);
     expect(callBody.result.structuredContent?.result).toBe("pong");
+
+    const focused = await gateway.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "woo_focus", arguments: { target: "remote_widget" } }
+    }, { "mcp-session-id": sessionId! }));
+    expect(focused.ok).toBe(true);
+    const focusedBody = await focused.json() as { result: { isError?: boolean; structuredContent?: { result?: unknown } } };
+    expect(focusedBody.result.isError).not.toBe(true);
+    expect(focusedBody.result.structuredContent?.result).toContain("remote_widget");
   });
 
   it("treats a remote current location as reachable even without a local stub", async () => {
@@ -1659,11 +1672,70 @@ describe("McpGateway", () => {
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
-      params: { name: "woo_focus", arguments: { target: "the_dubspace" } }
+      params: { name: "woo_focus", arguments: { target: "the_chatroom" } }
     }, { "mcp-session-id": sessionId! }));
     const focusedBody = (await focused.json()) as { result: { isError?: boolean; structuredContent?: { result?: unknown } } };
     expect(focusedBody.result.isError).not.toBe(true);
-    expect(focusedBody.result.structuredContent?.result).toContain("the_dubspace");
+    expect(focusedBody.result.structuredContent?.result).toContain("the_chatroom");
+  });
+
+  it("rejects woo_focus targets that are missing or not currently reachable", async () => {
+    const world = bootstrapWorld();
+    const gateway = new McpGateway(world);
+
+    const init = await gateway.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "vitest", version: "0.0.0" }
+      }
+    }, { "mcp-token": "guest:mcp-focus-reachable" }));
+    const sessionId = init.headers.get("mcp-session-id");
+    expect(sessionId).toBeTruthy();
+    const actor = world.sessions.get(sessionId!)?.actor;
+    expect(actor).toBeTruthy();
+
+    await gateway.handle(jsonRpcRequest("http://t/mcp", {
+      jsonrpc: "2.0",
+      method: "notifications/initialized"
+    }, { "mcp-session-id": sessionId! }));
+
+    const callFocus = async (id: number, target: string) => {
+      const response = await gateway.handle(jsonRpcRequest("http://t/mcp", {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "woo_focus", arguments: { target } }
+      }, { "mcp-session-id": sessionId! }));
+      expect(response.ok).toBe(true);
+      return await response.json() as { result: { isError?: boolean; structuredContent?: { error?: { code?: string }; result?: unknown } } };
+    };
+
+    const missingNative = await world.directCall(undefined, actor!, actor!, "focus", ["no_such_object"], { sessionId: sessionId! });
+    expect(missingNative.op).toBe("error");
+    if (missingNative.op === "error") expect(missingNative.error.code).toBe("E_OBJNF");
+
+    const missing = await callFocus(2, "no_such_object");
+    expect(missing.result.isError).toBe(true);
+    expect(missing.result.structuredContent?.error?.code).toBe("E_OBJNF");
+
+    const remoteRoomObject = await callFocus(3, "the_pinboard");
+    expect(remoteRoomObject.result.isError).toBe(true);
+    expect(remoteRoomObject.result.structuredContent?.error?.code).toBe("E_PERM");
+
+    const substrateObject = await callFocus(4, "$system");
+    expect(substrateObject.result.isError).toBe(true);
+    expect(substrateObject.result.structuredContent?.error?.code).toBe("E_PERM");
+
+    const moved = await world.directCall(undefined, actor!, "the_chatroom", "southeast", [], { sessionId: sessionId! });
+    expect(moved.op).toBe("result");
+
+    const reachable = await callFocus(5, "the_pinboard");
+    expect(reachable.result.isError).not.toBe(true);
+    expect(reachable.result.structuredContent?.result).toContain("the_pinboard");
   });
 
   it("normalizes missing Accept headers for Codex-style initialize requests", async () => {

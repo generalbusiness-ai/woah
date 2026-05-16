@@ -8590,14 +8590,13 @@ export class WooWorld {
     this.nativeHandlers.set("actor_focus", (ctx, args) => {
       const target = String(args[0] ?? "");
       if (!target) throw wooError("E_INVARG", `focus target not found: ${target}`);
+      if (!this.objects.has(target)) throw wooError("E_OBJNF", `focus target not found: ${target}`, target);
       const actor = ctx.thisObj;
-      if (this.objects.has(target)) {
-        if (target !== actor && this.inheritsFrom(target, "$actor") && !this.inheritsFrom(target, "$block")) {
-          throw wooError("E_PERM", `cannot focus another actor: ${target}`);
-        }
-        if (!this.canReadProperty(actor, target, "name")) {
-          throw wooError("E_PERM", `focus target not visible: ${target}`);
-        }
+      if (target !== actor && this.inheritsFrom(target, "$actor") && !this.inheritsFrom(target, "$block")) {
+        throw wooError("E_PERM", `cannot focus another actor: ${target}`);
+      }
+      if (!this.canReadProperty(actor, target, "name")) {
+        throw wooError("E_PERM", `focus target not visible: ${target}`);
       }
       const list = this.focusListOf(actor);
       if (!list.includes(target)) {

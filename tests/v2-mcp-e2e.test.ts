@@ -146,6 +146,45 @@ describe("v2 MCP e2e", () => {
     }
   });
 
+  it("commits woo_focus through the v2 authority instead of mutating only the gateway", async () => {
+    const world = createWorld();
+    const scopeState = new FakeDurableObjectState("the_chatroom");
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/open", body),
+        envelope: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/envelope", body)
+      }
+    });
+
+    try {
+      const session = await initializeMcp(gateway, "guest:v2-mcp-focus-authority", 1);
+      const actor = world.sessions.get(session)!.actor;
+      const focused = await mcp(gateway, session, 2, "tools/call", {
+        name: "woo_focus",
+        arguments: { target: "the_chatroom" }
+      });
+
+      expect(focused.result.isError, JSON.stringify(focused.result.structuredContent)).not.toBe(true);
+      expect(world.getProp(actor, "focus_list")).toEqual(["the_chatroom"]);
+      const accepted = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
+      expect(accepted).toHaveLength(1);
+      expect(JSON.parse(accepted[0].body)).toMatchObject({
+        kind: "woo.commit.accepted.shadow.v1",
+        position: { scope: "the_chatroom", seq: 1 }
+      });
+      const transcriptRows = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_transcript_tail ORDER BY seq"));
+      expect(transcriptRows).toHaveLength(1);
+      expect(JSON.parse(transcriptRows[0].body)).toMatchObject({
+        call: { actor, target: actor, verb: "focus", args: ["the_chatroom"] },
+        writes: [expect.objectContaining({ cell: { kind: "prop", object: actor, name: "focus_list" }, value: ["the_chatroom"] })]
+      });
+    } finally {
+      scopeState.close();
+    }
+  });
+
   it("serializes concurrent MCP v2 intents without stale-head rejects", async () => {
     const world = createWorld();
     const scopeState = new FakeDurableObjectState("the_chatroom");

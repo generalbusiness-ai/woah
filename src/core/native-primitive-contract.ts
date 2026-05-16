@@ -183,6 +183,39 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     writes: ["actor location", "room contents", "presence mirrors through movement hooks"],
     emits: ["text observations", "left observation", "entered observation", "object_move", "cell_write", "logical_input"],
     note: "Join is transcript-safe through movetoChecked plus logical timestamps for emitted movement observations."
+  },
+  actor_focus: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "actor_focus",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["target existence", "target actor ancestry", "target name visibility", "actor focus_list"],
+    writes: ["actor focus_list"],
+    emits: ["cell_write"],
+    note: "Focus is transcript-safe because it only appends a validated object ref to the bounded actor-owned focus_list property."
+  },
+  actor_unfocus: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "actor_unfocus",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["actor focus_list"],
+    writes: ["actor focus_list"],
+    emits: ["cell_write"],
+    note: "Unfocus is transcript-safe because it only removes an object ref from the actor-owned focus_list property."
+  },
+  actor_focus_list: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "actor_focus_list",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["actor focus_list"],
+    writes: [],
+    emits: [],
+    note: "Focus-list reads are deterministic actor-local property reads."
   }
 };
 

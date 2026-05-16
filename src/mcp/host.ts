@@ -754,9 +754,7 @@ export class McpHost {
         if (this.isMcpWaitTool(actor, tool)) {
           return { result: await this.drainWait(sessionId, args), observations: [] };
         }
-        const result = this.isMcpControlTool(actor, tool)
-          ? await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId })
-          : this.dispatchHooks.direct
+        const result = this.dispatchHooks.direct
           ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing)
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
@@ -808,19 +806,12 @@ export class McpHost {
     return tool.object === actor && tool.verb === "wait";
   }
 
-  private isMcpControlTool(actor: ObjRef, tool: McpTool): boolean {
-    return tool.object === actor && ["wait", "focus", "unfocus", "focus_list"].includes(tool.verb);
-  }
-
   private async toolRefreshDecisionAfterInvoke(
     actor: ObjRef,
     tool: McpTool,
     transcript: EffectTranscript | undefined,
     baseline: McpToolRefreshBaseline
   ): Promise<McpToolRefreshDecision> {
-    if (this.isMcpControlTool(actor, tool) && tool.verb === "focus_list" && !transcript) {
-      return await this.refineToolRefreshDecision(actor, { refresh: false, reason: "control_focus_list_read", transcript: false }, baseline);
-    }
     return await this.refineToolRefreshDecision(actor, this.toolRefreshDecisionAfterTranscript(actor, transcript), baseline);
   }
 

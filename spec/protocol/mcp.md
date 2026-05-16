@@ -180,7 +180,7 @@ $actor:unfocus(target: obj) -> { focus_list: [obj, ...] }
 $actor:focus_list() -> [obj, ...]
 ```
 
-`focus(t)` adds `t` to the actor's `focus_list` property if the actor passes basic visibility checks (the target exists and the actor can `:describe` it). Focusing another actor is rejected; otherwise the target actor's inherited maintenance verbs would become callable by the focuser. `unfocus(t)` removes. `focus_list()` reads. The list is capped server-side; on overflow, oldest entry is evicted.
+`focus(t)` adds `t` to the actor's `focus_list` property if the actor passes basic visibility checks (the target exists and the actor can `:describe` it). Focusing another actor is rejected; otherwise the target actor's inherited maintenance verbs would become callable by the focuser. The stable MCP wrapper `woo_focus(t)` is stricter: it is a reachability promotion, not a global object lookup, so `t` MUST already be in the actor's current reachable set (location, visible contents, inventory, ambient presence, or existing focus). Missing objects and readable-but-unreachable global/catalog objects are rejected. `unfocus(t)` removes. `focus_list()` reads. The list is capped server-side; on overflow, oldest entry is evicted.
 
 The list persists with the actor across connections (it's a property on the actor object). Reconnect retains scope. `focus_list` is also visible via `actor:describe()` for agents that want to introspect their own context.
 

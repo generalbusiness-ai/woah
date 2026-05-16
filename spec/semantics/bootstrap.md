@@ -126,7 +126,7 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `:look_self()` rxd | — | Actor-authored view. Returns the generic title/description plus `carrying`, and appends the current inventory sentence to `description`. This is woocode seeded on `$actor`, not a substrate special case. |
 | `:huh(text, reason?, source?)` rxd | str, str?, obj? | Actor-owned parse-miss output. Emits a private `huh` observation to `this` with `source` naming the command surface when available. Default reason is `I don't understand that.` |
 | `:wait(timeout_ms?, limit?)` rxd | int?, int? | MCP observation drain for the actor's session queue. Tool-exposed. |
-| `:focus(target)` rxd | obj | Add an object/space to `focus_list`. Tool-exposed. |
+| `:focus(target)` rxd | obj | Add an existing, readable object/space to `focus_list`. Tool-exposed; MCP's stable `woo_focus` wrapper additionally requires the target to be currently reachable. |
 | `:unfocus(target)` rxd | obj | Remove an object/space from `focus_list`. Tool-exposed. |
 | `:focus_list()` rxd | — | Return the current focus list. Tool-exposed. |
 
