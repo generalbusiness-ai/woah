@@ -42,6 +42,7 @@ convert values explicitly before joining.
 
 `create(parent, owner_or_options?)`, `recycle(obj)`, `chparent(obj, new_parent)`,
 `has_flag(obj, name)`, `parents(obj)`, `children(obj)`, `valid(obj)`,
+`describe_object(obj)`,
 `compile_verb(source)`,
 `add_verb(obj, info)`, `delete_verb(obj, descriptor)`,
 `set_verb_code(obj, descriptor, source)`, `set_verb_info(obj, descriptor, info)`,
@@ -185,6 +186,16 @@ intents instead of calling it indirectly.
 ordinary behavior checks such as wizard bypasses; it is not a substitute for the
 permission system.
 
+`describe_object(obj)` returns the same structured introspection map as
+`$root:describe()`. The builtin is substrate introspection for catalog source,
+not a user-facing verb. It reads the target's metadata, visible properties,
+verbs, schemas, children, and contents using the caller actor's authority.
+
+`object_examine_projection(name)` resolves a visible object name from the
+current actor's command scope and returns `{result, lines}` for
+LambdaCore-shaped examination. It is a data projection for catalog code:
+catalog source owns the user-facing verb, direct text delivery, and aliases.
+
 There is intentionally no "list all objects in the world" builtin. Instance enumeration is by class via recursive `children($class)`; per-owner enumeration is by convention (creator maintains a list). Ops-level host enumeration uses the runtime's management plane, not the runtime API.
 
 ### 19.5 Task / scheduling
@@ -210,6 +221,24 @@ but routes live delivery to the session audience of `space`. It is for ordinary
 object behavior such as a mounted pinboard or control surface emitting visible
 activity to its containing room; it does not make the containing-room relation a
 core property.
+
+`room_look_projection(room)` is a public builtin that returns the
+substrate-provided structured room view used by the bundled chat catalog's
+`$room:look_self()`: room id, title, description, roster rows, and visible
+contents. It exists because that view is a cross-host projection over room
+contents and remote object summaries; the English command and observation
+policy still live in catalog source. Visibility is evaluated with the calling
+actor's authority, so third-party catalogs may reuse the projection without
+gaining read access beyond what ordinary room look would reveal to that actor.
+
+`room_who_projection(room)` returns `{roster, observation}` for a room's
+present actors. Catalog `$room:who()` emits the observation and returns the
+roster; the builtin only centralizes session/presence projection.
+
+`help_topic_projection(topic?)` returns `{result, lines}` for the contextual
+help search path rooted at the current actor and room, including global
+`$system.help_dbs`. Catalog `$player:help()` delivers the lines and returns
+the result.
 
 `set_presence(space, present)` updates the current actor/session's presence in a
 space through the host-safe presence primitive. The authoritative storage is
@@ -251,6 +280,10 @@ override uses these to surface `is sleeping` / `awake and looks alert` /
 same connection and idle policy as `is_connected` and `idle_seconds`. The idle
 threshold is a substrate constant (currently 60 seconds) so catalog roster
 implementations do not each choose their own cutoff.
+
+`player_listing_projection(names?)` returns `{rows, lines, observation?}` for the
+LambdaCore-shaped player listing. It reads live session state and actor
+locations without exposing global object enumeration to catalog code.
 
 ### 19.8 Wizard-only
 

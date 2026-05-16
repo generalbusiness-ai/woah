@@ -68,7 +68,7 @@ function nativeVerb(name: string): VerbDef {
     source_hash: `hash-${name}`,
     version: 1,
     line_map: {},
-    native: "describe"
+    native: "player_on_disfunc"
   };
 }
 

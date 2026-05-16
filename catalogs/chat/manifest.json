@@ -197,17 +197,12 @@
       "verbs": [
         {
           "name": "look_self",
-          "pure": true,
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { return { id: this, title: this.name, description: this.description }; }",
-          "implementation": {
-            "kind": "native",
-            "handler": "room_look_self"
-          }
+          "source": "verb :look_self() rxd { return room_look_projection(this); }"
         },
         {
           "name": "announce",
@@ -786,11 +781,7 @@
             ,
             "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
-          "source": "verb :who() rxd { let roster = this:room_roster(); observe({ type: \"who\", actor: actor, to: actor, room: this, roster: roster, text: \"Present.\", ts: now() }); return roster; }",
-          "implementation": {
-            "kind": "native",
-            "handler": "room_who"
-          }
+          "source": "verb :who() rxd { let projection = room_who_projection(this); observe(projection[\"observation\"]); return projection[\"roster\"]; }"
         },
         {
           "name": "room_roster",

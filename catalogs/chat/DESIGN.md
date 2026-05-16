@@ -87,7 +87,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:pose(text)` / `:quote(text)` / `:self(text)` | str | Small LambdaCore-flavored speech forms for `]`, `|`, and `<`. |
 | `:tell(recipient, text)` | obj, str | Directed message; emits `told {from: actor, to: recipient, text}` to recipient only. |
 | `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
-| `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
+| `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. |
 | `:who()` rxd | — | Returns canonical roster rows and emits a private `who` observation to the caller with `roster`. |
 | `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: physical occupants plus awake/idle/sleeping status. |
 | `:live_audience(observation?)` rxd | map? | Returns the live session audience for delivery using the substrate observation routing rules. |

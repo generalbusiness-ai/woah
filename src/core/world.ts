@@ -5537,15 +5537,14 @@ export class WooWorld {
     });
   }
 
-  private async playerHelp(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
-    const topic = helpTopic(args[0]) || "index";
+  async helpTopicProjection(ctx: CallContext, topicValue: WooValue): Promise<WooValue> {
+    const topic = helpTopic(topicValue) || "index";
     const dbs = await this.helpSearchPath(ctx);
     const result = await this.resolveHelpTopic(ctx, topic, dbs);
     const lines = result && typeof result === "object" && !Array.isArray(result) && Array.isArray(result.lines)
       ? result.lines.map((line) => valueToText(line))
       : [valueToText(result)];
-    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
-    return result;
+    return { result: result as WooValue, lines: lines as unknown as WooValue } as unknown as WooValue;
   }
 
   private async helpSearchPath(ctx: CallContext): Promise<ObjRef[]> {
@@ -8379,27 +8378,13 @@ export class WooWorld {
   }
 
   private registerNativeHandlers(): void {
-    this.nativeHandlers.set("describe", (ctx) => this.describeForActor(ctx.thisObj, ctx.actor));
-    this.nativeHandlers.set("default_look_self", (ctx) => this.defaultLookSelf(ctx));
     this.nativeHandlers.set("player_on_disfunc", () => true);
     this.nativeHandlers.set("player_moveto", async (ctx, args) => {
       if (ctx.thisObj !== ctx.actor && !this.isWizard(ctx.actor)) throw wooError("E_PERM", "players may only move themselves", { actor: ctx.actor, target: ctx.thisObj });
       const target = assertObj(args[0] ?? "$nowhere");
       return await this.movetoChecked(ctx, ctx.thisObj, target);
     });
-    this.nativeHandlers.set("player_tell", (ctx, args) => {
-      this.tellPlayer(ctx, ctx.thisObj, args);
-      return true;
-    });
-    this.nativeHandlers.set("player_tell_lines", (ctx, args) => {
-      const lines = Array.isArray(args[0]) ? args[0] : args;
-      for (const line of lines) this.tellPlayer(ctx, ctx.thisObj, [line]);
-      return true;
-    });
-    this.nativeHandlers.set("player_help", (ctx, args) => this.playerHelp(ctx, args));
-    this.nativeHandlers.set("player_who", (ctx, args) => this.playerWho(ctx, args));
     this.nativeHandlers.set("player_join", (ctx, args) => this.playerJoin(ctx, args));
-    this.nativeHandlers.set("player_examine", (ctx, args) => this.playerExamine(ctx, args));
     this.nativeHandlers.set("guest_on_disfunc", async (ctx) => {
       const homeValue = this.propOrNull(ctx.thisObj, "home");
       const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
@@ -8631,9 +8616,6 @@ export class WooWorld {
       const target = assertObj(args[0] ?? "$nowhere");
       return await this.movetoChecked(ctx, ctx.thisObj, target);
     });
-    this.nativeHandlers.set("thing_look", async (ctx) => {
-      return await this.dispatch({ ...ctx, caller: ctx.thisObj }, ctx.thisObj, "look_self", []);
-    });
     this.nativeHandlers.set("add_feature", (ctx, args) => this.addFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
     this.nativeHandlers.set("remove_feature", (ctx, args) => this.removeFeature(ctx.thisObj, assertObj(args[0]), ctx.actor, ctx.observations));
     this.nativeHandlers.set("has_feature", (ctx, args) => this.featureList(ctx.thisObj).includes(assertObj(args[0])));
@@ -8729,9 +8711,6 @@ export class WooWorld {
       const location = await this.publicCommandLocation(ctx, actor, args[2]);
       return await this.parseCommandMap(assertString(args[0] ?? ""), ctx, location, actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("room_look_self", (ctx) => this.spaceLookSelf(ctx));
-    this.nativeHandlers.set("space_look_self", (ctx) => this.spaceLookSelf(ctx));
-    this.nativeHandlers.set("room_who", (ctx) => this.roomWho(ctx));
     this.nativeHandlers.set("embodied_room_roster", (ctx) => this.embodiedRoomRoster(ctx));
     this.nativeHandlers.set("workspace_room_roster", (ctx) => this.workspaceRoomRoster(ctx));
     this.nativeHandlers.set("space_live_audience", (ctx, args) => this.spaceLiveAudience(ctx, args));
@@ -8965,19 +8944,8 @@ export class WooWorld {
     });
   }
 
-  private async defaultLookSelf(ctx: CallContext): Promise<WooValue> {
-    const title = await this.titleForLook(ctx, ctx.caller, ctx.thisObj);
-    const description = this.propOrNullForActor(ctx.actor, ctx.thisObj, "description");
-    return {
-      id: ctx.thisObj,
-      title,
-      description
-    } as unknown as WooValue;
-  }
-
-  private async spaceLookSelf(ctx: CallContext): Promise<WooValue> {
-    const room = ctx.thisObj;
-    const look = await this.composeRoomLook(ctx, room);
+  async roomLookProjection(ctx: CallContext, room: ObjRef): Promise<WooValue> {
+    const look = await this.composeRoomLook({ ...ctx, thisObj: room }, room);
     return look as unknown as WooValue;
   }
 
@@ -9090,22 +9058,24 @@ export class WooWorld {
     return { summaries, remoteCount: remoteIds.length, batchCount: remoteIds.length };
   }
 
-  private async roomWho(ctx: CallContext): Promise<WooValue> {
-    const present = await this.chatPresentAsync(ctx.thisObj, ctx.progr, ctx.hostMemo);
+  async roomWhoProjection(ctx: CallContext, room: ObjRef): Promise<WooValue> {
+    const present = await this.chatPresentAsync(room, ctx.progr, ctx.hostMemo);
     const roster = await this.rosterRowsForActors(ctx, present);
     const presentNames = (await this.collectPropChecked(ctx.progr, present, "name", ctx.hostMemo)).map((name) => valueToText(name));
     const now = this.logicalNow("room_who.now");
-    ctx.observe({
+    return {
+      roster,
+      observation: {
       type: "who",
-      source: ctx.thisObj,
+      source: room,
       actor: ctx.actor,
       to: ctx.actor,
-      room: ctx.thisObj,
+      room,
       roster,
       text: `Present: ${presentNames.join(", ") || "nobody"}.`,
       ts: now
-    });
-    return roster;
+      }
+    } as unknown as WooValue;
   }
 
   private async embodiedRoomRoster(ctx: CallContext): Promise<WooValue> {
@@ -9168,25 +9138,22 @@ export class WooWorld {
     return out.sort();
   }
 
-  private async playerWho(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
-    const requested = valueToText(args[0] ?? null).trim();
+  async playerListingProjection(ctx: CallContext, names: WooValue): Promise<WooValue> {
+    const requested = valueToText(names ?? null).trim();
     const players = requested
       ? this.playerNameTokens(requested).map((name) => this.matchPlayerForCommand(name))
       : this.connectedPlayers();
     const missing = requested ? players.find((item) => !item) : null;
     if (missing === null && requested) {
-      this.tellPlayer(ctx, ctx.actor, ["I don't recognize one of those players."]);
-      return [] as unknown as WooValue;
+      return { rows: [], lines: ["I don't recognize one of those players."] } as unknown as WooValue;
     }
     const unique = Array.from(new Set(players.filter((item): item is ObjRef => typeof item === "string")));
-    if (unique.length === 0) return [] as unknown as WooValue;
+    if (unique.length === 0) return { rows: [], lines: [] } as unknown as WooValue;
     if (unique.length > 100) {
-      this.tellPlayer(ctx, ctx.actor, [
-        "You have requested a listing of ",
-        unique.length,
-        " players. Please specify fewer players or use a broader user listing."
-      ]);
-      return [] as unknown as WooValue;
+      return {
+        rows: [],
+        lines: [`You have requested a listing of ${unique.length} players. Please specify fewer players or use a broader user listing.`]
+      } as unknown as WooValue;
     }
 
     const now = this.logicalNow("player_who.now");
@@ -9219,7 +9186,6 @@ export class WooWorld {
         : this.formatWhoLastLogin(row.last_login_at);
       lines.push(`${row.name.padEnd(22).slice(0, 22)} ${connection.padEnd(9).slice(0, 9)} ${idle.padEnd(6).slice(0, 6)} ${row.location_name}`);
     }
-    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
     const roster = rows.map((row) => ({
       id: row.player,
       name: row.name,
@@ -9230,17 +9196,20 @@ export class WooWorld {
         : "sleeping",
       ...(typeof row.idle_seconds === "number" ? { idle_seconds: row.idle_seconds } : {})
     }));
-    ctx.observe({
-      type: "who",
-      source: ctx.thisObj,
-      actor: ctx.actor,
-      to: ctx.actor,
-      room: this.objects.get(ctx.actor)?.location ?? null,
-      roster,
-      text: lines.join("\n"),
-      ts: now
-    });
-    return rows as unknown as WooValue;
+    return {
+      rows,
+      lines,
+      observation: {
+        type: "who",
+        source: ctx.thisObj,
+        actor: ctx.actor,
+        to: ctx.actor,
+        room: this.objects.get(ctx.actor)?.location ?? null,
+        roster,
+        text: lines.join("\n"),
+        ts: now
+      }
+    } as unknown as WooValue;
   }
 
   private async playerJoin(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
@@ -9284,24 +9253,21 @@ export class WooWorld {
     return { room: dest, from: old, target, here_request: true, look_deferred: true } as unknown as WooValue;
   }
 
-  private async playerExamine(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
-    const name = valueToText(args[0]).trim();
+  async objectExamineProjection(ctx: CallContext, nameValue: WooValue): Promise<WooValue> {
+    const name = valueToText(nameValue).trim();
     if (!name) {
-      this.tellPlayer(ctx, ctx.actor, ["Usage: @examine <object>"]);
-      return null;
+      return { result: null, lines: ["Usage: @examine <object>"] } as unknown as WooValue;
     }
     const location = this.objects.get(ctx.actor)?.location ?? null;
     const match = await this.matchObjectForActorAsync(name, ctx, location, ctx.actor);
     if (match.status === "ambiguous") {
-      this.tellPlayer(ctx, ctx.actor, ["I don't know which ", name, " you mean."]);
-      return null;
+      return { result: null, lines: [`I don't know which ${name} you mean.`] } as unknown as WooValue;
     }
     if (match.status !== "ok") {
-      this.tellPlayer(ctx, ctx.actor, ["I don't see ", name, " here."]);
-      return null;
+      return { result: null, lines: [`I don't see ${name} here.`] } as unknown as WooValue;
     }
     const target = match.value;
-    if (await this.remoteHostForObject(target, ctx.hostMemo)) return await this.playerExamineRemote(ctx, target, name);
+    if (await this.remoteHostForObject(target, ctx.hostMemo)) return await this.objectExamineRemoteProjection(ctx, target, name);
     const obj = this.object(target);
     const owner = obj.owner;
     const aliasesValue = this.propOrNullForActor(ctx.actor, target, "aliases");
@@ -9328,8 +9294,7 @@ export class WooWorld {
       lines.push("Obvious verbs:");
       lines.push(...obviousVerbs);
     }
-    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
-    return {
+    const result = {
       target,
       owner,
       aliases,
@@ -9338,6 +9303,7 @@ export class WooWorld {
       obvious_verbs: obviousVerbs,
       text: lines.join("\n")
     } as unknown as WooValue;
+    return { result, lines: lines as unknown as WooValue } as unknown as WooValue;
   }
 
   private connectedPlayers(): ObjRef[] {
@@ -9390,7 +9356,7 @@ export class WooWorld {
     return new Date(at).toISOString().slice(0, 10);
   }
 
-  private async playerExamineRemote(ctx: CallContext, target: ObjRef, matchedName: string): Promise<WooValue> {
+  private async objectExamineRemoteProjection(ctx: CallContext, target: ObjRef, matchedName: string): Promise<WooValue> {
     const summary = await this.hostBridge?.describeObject?.(ctx.progr, ctx.actor, target, ctx.hostMemo).catch((err) => {
       if (isReadAvailabilityError(err)) return null;
       throw err;
@@ -9425,8 +9391,7 @@ export class WooWorld {
       lines.push("Obvious verbs:");
       lines.push(...rewrittenObviousVerbs);
     }
-    for (const line of lines) this.tellPlayer(ctx, ctx.actor, [line]);
-    return {
+    const result = {
       target,
       owner,
       aliases,
@@ -9436,6 +9401,7 @@ export class WooWorld {
       remote: true,
       text: lines.join("\n")
     } as unknown as WooValue;
+    return { result, lines: lines as unknown as WooValue } as unknown as WooValue;
   }
 
   private rewriteObviousSyntaxObjectName(syntax: string, remoteName: string, matchedName: string): string {

@@ -1020,7 +1020,12 @@ describe("local catalogs", () => {
     expect(looked.op).toBe("result");
     if (looked.op === "result") {
       expect(looked.result).toMatchObject({ note_count: 1, summary: "Pinboard has 1 note on it." });
-      expect(looked.observations).toContainEqual(expect.objectContaining({ type: "looked", room: "the_pinboard", text: "Pinboard has 1 note on it." }));
+      expect(looked.observations).toContainEqual(expect.objectContaining({
+        type: "looked",
+        room: "the_deck",
+        target: "the_pinboard",
+        text: "Pinboard has 1 note on it."
+      }));
     }
 
     const outPlan = await world.directCall("pinboard-out-plan", session.actor, "the_pinboard", "command_plan", ["out"]);
@@ -2033,7 +2038,7 @@ describe("local catalogs", () => {
       source_hash: "test-preen",
       version: 1,
       line_map: {},
-      native: "describe",
+      native: "player_on_disfunc",
       direct_callable: true
     } satisfies VerbDef);
     const middleStarPlan = await world.directCall("plan-middle-star-alias", first.actor, "the_chatroom", "command_plan", ["p bird"]);

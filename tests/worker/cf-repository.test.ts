@@ -1030,7 +1030,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         source_hash: "cf-remote-command-ping",
         version: 1,
         line_map: {},
-        native: "describe",
+        native: "player_on_disfunc",
         direct_callable: true
       });
       roomHost.mirrorContents("cf_remote_room", actor, true);

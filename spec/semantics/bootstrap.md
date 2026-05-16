@@ -101,9 +101,9 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 
 | Verb | Returns | Purpose |
 |---|---|---|
-| `:describe()` rxd | map | Introspection (see [introspection.md](introspection.md)). |
+| `:describe()` rxd | map | Introspection (see [introspection.md](introspection.md)). Seeded as woocode over the generic `describe_object(this)` builtin. |
 | `:title()` rxd | str | Short identifying phrase for `:look`-style composition; default returns `this.name`. Subclasses override to add flair (e.g. `$cockatoo:title()` decorates with *"a sulphur-crested cockatoo perched on the mantelpiece"*). MOO/LambdaCore convention. |
-| `:look_self()` rxd | map | Generic object view. Default returns the object's `:title()` and actor-readable `description`. MOO/LambdaCore convention adapted to structured return values. Actor and catalog classes may override for richer presentation. |
+| `:look_self()` rxd | map | Generic object view. Default woocode returns the object's `:title()` and actor-readable `description`. MOO/LambdaCore convention adapted to structured return values. Actor and catalog classes may override for richer presentation. |
 | `:set_description(desc)` rxd | bool | LambdaCore-shaped self-describe. Returns `true` on success. Allowed when `actor == this` (self-describe), `actor` owns `this`, or `actor` is a wizard. The verb is owned by `$wiz` so its `this.description = desc` write naturally bypasses the property's `r` perms; the explicit perm gate in the body keeps non-wizard callers from describing arbitrary objects. Tells the actor "Description set." on success. |
 | `:set_value(value)` | any | T0 fixture-style helper for simple property update verbs. |
 | `:set_prop(name, value)` | str, any | T0 fixture-style helper for simple named property update verbs. |
@@ -145,15 +145,15 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 | `:look_self()` rxd | — | Player view. Calls `pass()` to inherit `$actor:look_self`'s carrying-aware shape, then appends one of three idle-status sentences modeled on LambdaCore: `<name> is sleeping.` when `is_connected(this)` is false; `<name> is awake and looks alert.` when connected and `idle_seconds(this) < 60`; otherwise `<name> is awake, but has been staring off into space for N minutes.` Connection and idle state come from `is_connected` / `idle_seconds` substrate builtins (see [builtins.md §19.7](builtins.md#197-sessions)). |
 | `:on_disfunc()` | — | Disfunc hook called at session reap. Default body is a no-op; `$guest` overrides. See [identity.md §I6.4](identity.md#i64-guest-reset-the-on_disfunc-convention). |
 | `:moveto(target)` | obj | Move this player to `target.contents`. Used by disfunc bodies. |
-| `:tell(text...)` rxd | any... | Deliver text output directly to this player. This is the LambdaCore `notify`/`:tell` output path adapted to observations. |
-| `:tell_lines(lines)` rxd | list | Deliver a sequence of text lines to this player. |
-| `:help(topic?)` rxd | str? | Search contextual help DBs and global `$system.help_dbs`, then deliver rendered help lines to the player. Aliases: `?`, `info`, `information`, `@help`. |
+| `:tell(text...)` rxd | any... | Woocode wrapper over the generic `tell(actor, text...)` builtin. Delivers text output directly to this player. This is the LambdaCore `notify`/`:tell` output path adapted to observations. |
+| `:tell_lines(lines)` rxd | list | Woocode loop over `tell`. Delivers a sequence of text lines to this player. |
+| `:help(topic?)` rxd | str? | Woocode over `help_topic_projection(topic)`. Searches contextual help DBs and global `$system.help_dbs`, then delivers rendered help lines to the player. Aliases: `?`, `info`, `information`, `@help`. |
 | `:inventory()` rxd | — | Tell the player a one-line summary of `contents(this)` (LambdaMOO's "You are empty-handed." / "You are carrying X, Y, and Z.") and return `{items, text}`. Woocode seeded on `$player`. Aliases: `i`, `inv`, `inventory`. Tool-exposed. |
 | `:home()` rxd | — | Send the player to `this.home` via `home:enter(this)`, so the destination's `enterfunc` and presence handling fire. No-ops with a tell when home is unset or already current. Woocode seeded on `$player`. Alias: `@home`. Tool-exposed. |
-| `:who_all(names?)` rxd | str? | LambdaCore-shaped `@who`. With no args, lists connected players from live sessions; with args, resolves player names and reports those players, including sleeping players with best-available last-login time. Emits private text lines and a `who` observation, and returns structured rows with player, `connected`, `connected_at`, `connected_seconds`, `idle_seconds`, `last_login_at`, and location fields. Native until connected-player enumeration is DSL-exposed. Alias: `@who`. Tool-exposed. |
+| `:who_all(names?)` rxd | str? | Woocode over `player_listing_projection(names)`. LambdaCore-shaped `@who`. With no args, lists connected players from live sessions; with args, resolves player names and reports those players, including sleeping players with best-available last-login time. Emits private text lines and a `who` observation, and returns structured rows with player, `connected`, `connected_at`, `connected_seconds`, `idle_seconds`, `last_login_at`, and location fields. Alias: `@who`. Tool-exposed. |
 | `:join_player(name)` rxd | str | LambdaCore-shaped `@join <player>`. Resolves a player name globally, tells the caller a join message, moves the caller to that player's current location through `moveto`, emits leave/enter observations, and returns a move result with `look_deferred`. Native until global player matching is DSL-exposed. Alias: `@join`. Tool-exposed. |
 | `:ways(room?)` rxd | str? | LambdaCore-shaped `@ways`. Lists obvious exits from the current room, or from a visible room named by the argument. Reads the room's `exits` map, filters unique exits whose `obvious` property is truthy, tells the caller a formatted "Obvious exits" line, and returns `{room, exits, text}`. Woocode seeded on `$player`. Alias: `@ways`. Tool-exposed. |
-| `:examine_detailed(name)` rxd | str | LambdaCore-shaped `@examine <object>`. Resolves a visible object from the caller's command scope, tells name/owner/aliases/description/contents plus obvious command verbs, and returns the same data in structured form. Obvious verbs are readable verbs with command metadata, skipping dull base classes, matching the LambdaCore model of command-shaped affordances rather than a dump of all callable verbs. MCP uses the same obvious-verb projection for visible room contents. For visible remote objects, returns the host-summary subset available across the host bridge (`owner=null`, no obvious verbs) instead of failing local lookup. Native until verb-slot introspection and global formatting helpers are DSL-exposed. Alias: `@exam*ine`. Tool-exposed. |
+| `:examine_detailed(name)` rxd | str | Woocode over `object_examine_projection(name)`. LambdaCore-shaped `@examine <object>`. Resolves a visible object from the caller's command scope, tells name/owner/aliases/description/contents plus obvious command verbs, and returns the same data in structured form. Obvious verbs are readable verbs with command metadata, skipping dull base classes, matching the LambdaCore model of command-shaped affordances rather than a dump of all callable verbs. MCP uses the same obvious-verb projection for visible room contents. For visible remote objects, returns the host-summary subset available across the host bridge (`owner=null`, no obvious verbs) instead of failing local lookup. Alias: `@exam*ine`. Tool-exposed. |
 
 ### B2.8 `$guest` verbs
 
@@ -515,8 +515,8 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:emote(text)` | str | Emits `emoted`. |
 | `:tell(recipient, text)` | obj, str | Emits `told` to `recipient`. |
 | `:look()` | — | Thin chat command wrapper over `this:look_at(this)`. |
-| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
-| `:who()` | — | Returns the present-actor list. |
+| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. |
+| `:who()` | — | Woocode over `room_who_projection(this)`. Emits a private `who` observation and returns the present-actor roster. |
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |
 | `:huh(text, reason?)` | str, str? | Compatibility wrapper. Delegates to `actor:huh(text, reason, this)` so parse-miss output remains actor-owned while old space-level callers continue to work. |
@@ -531,7 +531,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:look_self()` | — | Compose room title, description, present actors, and visible contents. Present actors are excluded from the contents list; `$block` descendants are the explicit exception because they are actor-backed appliances and should remain visible in-room. Pure view producer; the chat dispatcher emits private `looked`. |
+| `:look_self()` | — | Catalog woocode over `room_look_projection(this)`, composing room title, description, present actors, and visible contents. Present actors are excluded from the contents list; `$block` descendants are the explicit exception because they are actor-backed appliances and should remain visible in-room. Pure view producer; the chat dispatcher emits private `looked`. |
 | `:announce(text)` | str | Tell everyone in the room except `actor`. |
 | `:announce_all(text)` | str | Tell every subscribed actor in the room. |
 | `:announce_all_but(ignore, text, origin?)` | list, str, obj? | Tell every subscribed actor except those listed. `origin` is used by transparent nested spaces so parent announcement fan-out does not loop back into the originating child. |

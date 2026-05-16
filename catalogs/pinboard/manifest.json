@@ -173,7 +173,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look() rxd { let view = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: this, target: this, text: view[\"summary\"], look: view, ts: now() }); return view; }"
+          "source": "verb :look() rxd { let view = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: location(this), target: this, text: view[\"summary\"], look: view, ts: now() }); return view; }"
         },
         {
           "name": "look_self",
