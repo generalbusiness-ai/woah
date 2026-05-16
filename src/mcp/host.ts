@@ -7,6 +7,7 @@
 // (stdio/HTTP) lives in src/mcp/server.ts; this module is transport-agnostic.
 
 import type { CallContext, NativeHandler, WooWorld } from "../core/world";
+import type { EffectTranscript } from "../core/effect-transcript";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Observation, RemoteToolDescriptor, WooValue } from "../core/types";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { directedRecipients, wooError } from "../core/types";
@@ -81,9 +82,15 @@ export type McpInvocationResult = {
 };
 
 export type McpDispatchHooks = {
-  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null) => DirectResultFrame | ErrorFrame | Promise<DirectResultFrame | ErrorFrame>;
-  call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) => AppliedFrame | ErrorFrame | Promise<AppliedFrame | ErrorFrame>;
+  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null) => McpDirectDispatchFrame | ErrorFrame | Promise<McpDirectDispatchFrame | ErrorFrame>;
+  call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) => McpAppliedDispatchFrame | ErrorFrame | Promise<McpAppliedDispatchFrame | ErrorFrame>;
 };
+
+type McpTranscriptBearing = { transcript?: EffectTranscript };
+type McpDirectDispatchFrame = DirectResultFrame & McpTranscriptBearing;
+type McpAppliedDispatchFrame = AppliedFrame & McpTranscriptBearing;
+type McpToolRefreshDecision = { refresh: boolean; reason: string; transcript: boolean };
+type McpToolRefreshSource = "invoke" | "accepted_frame";
 
 // `actor_wait` runs through the standard verb-dispatch path, which doesn't
 // thread the MCP session id through CallContext. McpHost.invokeTool sets this
@@ -179,9 +186,18 @@ export class McpHost {
   // v2 commit-scope accepted frames are the pure-v2 observation source. They
   // do not carry legacy AppliedFrame audience metadata, so route by directed
   // observation recipients first and then by scope subscription/presence.
-  routeShadowAcceptedFrame(frame: ShadowCommitAccepted, originSessionId?: string | null): void {
+  routeShadowAcceptedFrame(frame: ShadowCommitAccepted, originSessionId?: string | null, transcript?: EffectTranscript): void {
     if (!frame.observations.length) return;
     const refreshSessions = new Set<string>();
+    const refreshDecisionByActor = new Map<ObjRef, McpToolRefreshDecision>();
+    const refreshDecisionForActor = (actor: ObjRef): McpToolRefreshDecision => {
+      const cached = refreshDecisionByActor.get(actor);
+      if (cached) return cached;
+      const decision = this.toolRefreshDecisionAfterTranscript(actor, transcript);
+      refreshDecisionByActor.set(actor, decision);
+      this.recordToolRefreshDecision(actor, "accepted_frame", decision);
+      return decision;
+    };
     for (const observation of frame.observations) {
       const directed = directedRecipients(observation);
       const directedActors = new Set<ObjRef>();
@@ -198,7 +214,7 @@ export class McpHost {
             (sourceScope !== null && (this.actorSubscribes(queue.actor, sourceScope) || sessionLocation === sourceScope));
         if (shouldDeliver) {
           this.enqueueFor(sessionId, observation);
-          refreshSessions.add(sessionId);
+          if (refreshDecisionForActor(queue.actor).refresh) refreshSessions.add(sessionId);
         }
       }
     }
@@ -728,7 +744,11 @@ export class McpHost {
         if (this.broadcasts.broadcastLiveEvents && result.audience) {
           await this.broadcasts.broadcastLiveEvents(result, sessionId);
         }
-        await this.refreshToolList(sessionId, actor);
+        const decision = this.toolRefreshDecisionAfterInvoke(actor, tool, (result as McpTranscriptBearing).transcript);
+        this.recordToolRefreshDecision(actor, "invoke", decision);
+        if (decision.refresh) {
+          await this.refreshToolList(sessionId, actor);
+        }
         return { result: result.result, observations: result.observations };
       } finally {
         CURRENT_WAIT_SESSION_ID = previous;
@@ -748,7 +768,11 @@ export class McpHost {
     if (this.broadcasts.broadcastApplied) {
       await this.broadcasts.broadcastApplied(frame, sessionId);
     }
-    await this.refreshToolList(sessionId, actor);
+    const decision = this.toolRefreshDecisionAfterInvoke(actor, tool, (frame as McpTranscriptBearing).transcript);
+    this.recordToolRefreshDecision(actor, "invoke", decision);
+    if (decision.refresh) {
+      await this.refreshToolList(sessionId, actor);
+    }
     const errObs = frame.observations.find((o) => o.type === "$error");
     return {
       result: errObs ? null : true,
@@ -763,6 +787,50 @@ export class McpHost {
 
   private isMcpControlTool(actor: ObjRef, tool: McpTool): boolean {
     return tool.object === actor && ["wait", "focus", "unfocus", "focus_list"].includes(tool.verb);
+  }
+
+  private toolRefreshDecisionAfterInvoke(actor: ObjRef, tool: McpTool, transcript: EffectTranscript | undefined): McpToolRefreshDecision {
+    if (this.isMcpControlTool(actor, tool) && tool.verb === "focus_list" && !transcript) {
+      return { refresh: false, reason: "control_focus_list_read", transcript: false };
+    }
+    return this.toolRefreshDecisionAfterTranscript(actor, transcript);
+  }
+
+  private toolRefreshDecisionAfterTranscript(actor: ObjRef, transcript: EffectTranscript | undefined): McpToolRefreshDecision {
+    // Older non-v2 dispatch paths do not expose an effect transcript. Preserve
+    // the historical conservative refresh there; the optimization only applies
+    // when shadow execution tells us exactly which reachability cells changed.
+    if (!transcript) return { refresh: true, reason: "no_transcript", transcript: false };
+    if (transcript.writes.some((write) => write.cell.kind === "verb")) {
+      return { refresh: true, reason: "verb_shape", transcript: true };
+    }
+    if (transcript.moves.some((move) => move.object === actor)) return { refresh: true, reason: "actor_location", transcript: true };
+    if (transcript.moves.some((move) => move.from === actor || move.to === actor)) return { refresh: true, reason: "actor_contents", transcript: true };
+    if (transcript.creates.some((create) => create.location === actor)) return { refresh: true, reason: "actor_contents", transcript: true };
+    for (const write of transcript.writes) {
+      const cell = write.cell;
+      if (cell.kind === "prop" && cell.object === actor && cell.name === "focus_list") return { refresh: true, reason: "focus_list", transcript: true };
+      if (cell.kind === "location" && cell.object === actor) return { refresh: true, reason: "actor_location", transcript: true };
+      if (cell.kind === "contents" && cell.object === actor) return { refresh: true, reason: "actor_contents", transcript: true };
+    }
+    const enclosing = this.enclosingSpaceFor(actor);
+    if (!enclosing) return { refresh: false, reason: "no_reachability_change", transcript: true };
+    if (transcript.moves.some((move) => move.from === enclosing || move.to === enclosing)) return { refresh: true, reason: "room_contents", transcript: true };
+    if (transcript.creates.some((create) => create.location === enclosing)) return { refresh: true, reason: "room_contents", transcript: true };
+    if (transcript.writes.some((write) => write.cell.kind === "contents" && write.cell.object === enclosing)) {
+      return { refresh: true, reason: "room_contents", transcript: true };
+    }
+    return { refresh: false, reason: "no_reachability_change", transcript: true };
+  }
+
+  private recordToolRefreshDecision(actor: ObjRef, source: McpToolRefreshSource, decision: McpToolRefreshDecision): void {
+    this.world.recordMetric({
+      kind: decision.refresh ? "mcp_tool_refresh_taken" : "mcp_tool_refresh_skipped",
+      actor,
+      source,
+      reason: decision.reason,
+      transcript: decision.transcript
+    });
   }
 
   // ----- $actor:wait / focus / unfocus / focus_list handlers -----

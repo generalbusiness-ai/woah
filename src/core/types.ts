@@ -263,6 +263,8 @@ export type MetricEvent =
   | { kind: "applied"; space: ObjRef; seq: number; verb: string; ms: number }
   | { kind: "direct_call"; target: ObjRef; verb: string; audience: ObjRef | null; observations: number; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
+  | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean }
+  | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean }
   | { kind: "do_constructor"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; ms: number }
   | { kind: "do_handler"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; method: string; route: string; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "shadow_apply_step"; phase: "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "total"; scope: ObjRef; route: string; ms: number; objects: number; creates: number; writes: number }

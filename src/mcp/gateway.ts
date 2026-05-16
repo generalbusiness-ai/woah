@@ -260,7 +260,7 @@ export class McpGateway {
     const client = this.v2Scopes.get(scope);
     if (client) applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
     this.world.applyCommittedShadowTranscript(entry.transcript);
-    this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId);
+    this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript);
   }
 
   private drainRemoteAccepted(scope: ObjRef, commitScope: ObjRef): void {
@@ -517,7 +517,7 @@ export class McpGateway {
     if (!reply.commit || !reply.transcript) return;
     applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
     this.world.applyCommittedShadowTranscript(reply.transcript);
-    this.host.routeShadowAcceptedFrame(reply.commit, originSessionId);
+    this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript);
   }
 
   private scopeForV2Call(actor: ObjRef, target: ObjRef): ObjRef {
@@ -568,14 +568,14 @@ function refreshSerializedSessionAuthority(
 
 function mcpFrameFromTurnReply(scope: ObjRef, reply: Extract<ShadowTurnExecReply, { ok: true }>): AppliedFrame | DirectResultFrame | ErrorFrame {
   if (reply.outcome.error) {
-    return {
+    return attachTranscript({
       op: "error",
       id: reply.id,
       error: reply.transcript.error ?? wooValueAsError(reply.outcome.error, "v2 MCP turn failed")
-    };
+    }, reply.transcript);
   }
   if (reply.transcript.route === "direct") {
-    return {
+    return attachTranscript({
       op: "result",
       id: reply.id,
       command: reply.transcript.call,
@@ -584,12 +584,12 @@ function mcpFrameFromTurnReply(scope: ObjRef, reply: Extract<ShadowTurnExecReply
       result: reply.outcome.result ?? null,
       observations: reply.transcript.observations,
       audience: scope
-    };
+    }, reply.transcript);
   }
   // ShadowCommitAccepted.position is the authority head, not log metadata; it
   // currently carries no accepted-at timestamp. Keep the old planned-frame
   // wall clock until commit replies grow an explicit authoritative timestamp.
-  return {
+  return attachTranscript({
     op: "applied",
     id: reply.id,
     space: reply.commit?.position.scope ?? reply.transcript.scope,
@@ -605,7 +605,15 @@ function mcpFrameFromTurnReply(scope: ObjRef, reply: Extract<ShadowTurnExecReply
     // AppliedFrame.result is optional. Preserve null when the verb returned
     // null, and omit undefined so JSON output matches normal applied frames.
     ...(reply.transcript.result !== undefined ? { result: reply.transcript.result } : {})
-  };
+  }, reply.transcript);
+}
+
+function attachTranscript<T extends AppliedFrame | DirectResultFrame | ErrorFrame>(frame: T, transcript: EffectTranscript): T {
+  // MCP host uses this internal hint to decide whether a post-call tool-list
+  // refresh is necessary. Keep it non-enumerable so public frame JSON and
+  // broadcast payloads remain unchanged.
+  Object.defineProperty(frame, "transcript", { value: transcript, enumerable: false });
+  return frame;
 }
 
 function wooValueAsError(value: WooValue, fallbackMessage: string): ErrorValue {

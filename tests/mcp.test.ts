@@ -14,6 +14,34 @@ function bootstrapWorld() {
   return createWorld();
 }
 
+function mcpTestTranscript(overrides: Partial<EffectTranscript> & { call: EffectTranscript["call"] }): EffectTranscript {
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    id: "mcp-test-transcript",
+    route: "direct",
+    scope: "the_chatroom",
+    seq: -1,
+    session: null,
+    reads: [],
+    writes: [],
+    creates: [],
+    moves: [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    result: true,
+    complete: true,
+    incompleteReasons: [],
+    hash: "mcp-test-transcript",
+    ...overrides
+  };
+}
+
+function attachTranscriptForTest<T extends object>(frame: T, transcript: EffectTranscript): T {
+  Object.defineProperty(frame, "transcript", { value: transcript, enumerable: false });
+  return frame;
+}
+
 function nativeToolVerb(name: string, native: string): VerbDef {
   return {
     kind: "native",
@@ -614,6 +642,242 @@ describe("McpHost", () => {
     await host.refreshToolList(bob.id, bob.actor);
     expect(bobNotifications).toBe(0);
     aliceInstance.dispose();
+  });
+
+  it("skips post-call tool-list refresh when the v2 transcript cannot affect reachability", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-skip-refresh-say");
+    world.object(session.actor).location = "the_chatroom";
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const transcript = mcpTestTranscript({
+      id: "mcp-skip-refresh-say",
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "say", args: ["hi"] },
+      observations: [{ type: "said", actor: session.actor, source: "the_chatroom", text: "hi", ts: 1 }],
+      hash: "mcp-skip-refresh-say"
+    });
+    const host = new McpHost(world, {
+      direct: async () => {
+        return attachTranscriptForTest(
+          { op: "result" as const, result: true, observations: transcript.observations, audience: "the_chatroom" },
+          transcript
+        );
+      }
+    });
+    host.bindSession(session.id, session.actor);
+    const refreshSpy = vi.spyOn(host, "refreshToolList");
+    const tool: McpTool = {
+      name: `${session.actor}__say`,
+      object: session.actor,
+      verb: "say",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      enclosingSpace: "the_chatroom"
+    };
+
+    await host.invokeTool(session.actor, session.id, tool, ["hi"]);
+
+    expect(refreshSpy).not.toHaveBeenCalled();
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "mcp_tool_refresh_skipped",
+      source: "invoke",
+      reason: "no_reachability_change",
+      transcript: true
+    }));
+  });
+
+  it("refreshes post-call tools when the v2 transcript changes actor focus or room contents", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-refresh-reachability");
+    world.object(session.actor).location = "the_chatroom";
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    let transcript = mcpTestTranscript({
+      id: "mcp-refresh-focus",
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "focus", args: ["the_pinboard"] },
+      writes: [{ cell: { kind: "prop", object: session.actor, name: "focus_list" }, value: ["the_pinboard"], op: "set" }],
+      hash: "mcp-refresh-focus"
+    });
+    const host = new McpHost(world, {
+      direct: async () => {
+        return attachTranscriptForTest(
+          { op: "result" as const, result: true, observations: [], audience: null },
+          transcript
+        );
+      }
+    });
+    host.bindSession(session.id, session.actor);
+    const refreshSpy = vi.spyOn(host, "refreshToolList").mockResolvedValue(true);
+    const tool: McpTool = {
+      name: `${session.actor}__probe`,
+      object: session.actor,
+      verb: "probe",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      enclosingSpace: "the_chatroom"
+    };
+
+    await host.invokeTool(session.actor, session.id, tool, ["the_pinboard"]);
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+    transcript = mcpTestTranscript({
+      id: "mcp-refresh-room-contents",
+      session: session.id,
+      call: { actor: session.actor, target: "the_chatroom", verb: "drop", args: ["widget"] },
+      moves: [{ object: "widget", from: session.actor, to: "the_chatroom" }],
+      writes: [
+        { cell: { kind: "location", object: "widget" }, value: "the_chatroom", op: "move" },
+        { cell: { kind: "contents", object: "the_chatroom" }, value: ["widget"], op: "set" }
+      ],
+      hash: "mcp-refresh-room-contents"
+    });
+    await host.invokeTool(session.actor, session.id, tool, ["widget"]);
+    expect(refreshSpy).toHaveBeenCalledTimes(2);
+    expect(metrics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "mcp_tool_refresh_taken", source: "invoke", reason: "focus_list", transcript: true }),
+      expect.objectContaining({ kind: "mcp_tool_refresh_taken", source: "invoke", reason: "actor_contents", transcript: true })
+    ]));
+  });
+
+  it("refreshes post-call tools when the v2 transcript writes verb shape", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-refresh-verb-shape");
+    world.object(session.actor).location = "the_chatroom";
+    const transcript = mcpTestTranscript({
+      id: "mcp-refresh-verb-shape",
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "program", args: [] },
+      writes: [{ cell: { kind: "verb", object: "$thing", name: "new_tool" }, value: { tool_exposed: true }, op: "set" }],
+      hash: "mcp-refresh-verb-shape"
+    });
+    const host = new McpHost(world, {
+      direct: async () => attachTranscriptForTest(
+        { op: "result" as const, result: true, observations: [], audience: null },
+        transcript
+      )
+    });
+    host.bindSession(session.id, session.actor);
+    const refreshSpy = vi.spyOn(host, "refreshToolList").mockResolvedValue(true);
+    const tool: McpTool = {
+      name: `${session.actor}__program`,
+      object: session.actor,
+      verb: "program",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      enclosingSpace: "the_chatroom"
+    };
+
+    await host.invokeTool(session.actor, session.id, tool, []);
+
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips accepted-frame observer refresh when the transcript only emits observations", async () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const alice = world.auth("guest:mcp-observer-no-refresh-alice");
+    const bob = world.auth("guest:mcp-observer-no-refresh-bob");
+    world.object(alice.actor).location = "the_chatroom";
+    world.object(bob.actor).location = "the_chatroom";
+    world.object("the_chatroom").contents.add(alice.actor);
+    world.object("the_chatroom").contents.add(bob.actor);
+    world.setProp("the_chatroom", "subscribers", [alice.actor, bob.actor]);
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const host = new McpHost(world);
+    host.bindSession(alice.id, alice.actor);
+    host.bindSession(bob.id, bob.actor);
+    const refreshSpy = vi.spyOn(host, "refreshToolList").mockResolvedValue(false);
+    const transcript = mcpTestTranscript({
+      id: "mcp-observer-no-refresh",
+      session: alice.id,
+      call: { actor: alice.actor, target: alice.actor, verb: "say", args: ["hi"] },
+      observations: [{ type: "said", actor: alice.actor, source: "the_chatroom", text: "hi", ts: 1 }],
+      hash: "mcp-observer-no-refresh"
+    });
+
+    host.routeShadowAcceptedFrame({
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-observer-no-refresh",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 1, hash: "head" },
+      transcript_hash: "mcp-observer-no-refresh",
+      post_state_hash: "post",
+      observations: transcript.observations,
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: "mcp-observer-no-refresh",
+        route: "direct",
+        scope: "the_chatroom",
+        seq: -1,
+        transcript_hash: "mcp-observer-no-refresh",
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      }
+    }, alice.id, transcript);
+
+    const waitTool: McpTool = {
+      name: `${bob.actor}__wait`,
+      object: bob.actor,
+      verb: "wait",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      enclosingSpace: "the_chatroom"
+    };
+    const drained = await host.invokeTool(bob.actor, bob.id, waitTool, [0, 10]);
+
+    expect(refreshSpy).not.toHaveBeenCalled();
+    expect((drained.result as { observations?: Observation[] }).observations).toEqual(transcript.observations);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "mcp_tool_refresh_skipped",
+      source: "accepted_frame",
+      actor: bob.actor,
+      reason: "no_reachability_change",
+      transcript: true
+    }));
+  });
+
+  it("skips refresh after transcript-less focus_list control reads", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-focus-list-no-refresh");
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const host = new McpHost(world, {
+      direct: async () => ({ op: "result", result: [], observations: [], audience: null })
+    });
+    host.bindSession(session.id, session.actor);
+    const refreshSpy = vi.spyOn(host, "refreshToolList").mockResolvedValue(false);
+    const tool: McpTool = {
+      name: `${session.actor}__focus_list`,
+      object: session.actor,
+      verb: "focus_list",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      enclosingSpace: "the_chatroom"
+    };
+
+    await host.invokeTool(session.actor, session.id, tool, []);
+
+    expect(refreshSpy).not.toHaveBeenCalled();
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "mcp_tool_refresh_skipped",
+      source: "invoke",
+      reason: "control_focus_list_read",
+      transcript: false
+    }));
   });
 
   it("refreshes tool lists for v2 accepted-frame observers", async () => {
