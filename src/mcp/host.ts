@@ -89,6 +89,7 @@ type McpTranscriptBearing = { transcript?: EffectTranscript };
 type McpDirectDispatchFrame = DirectResultFrame & McpTranscriptBearing;
 type McpAppliedDispatchFrame = AppliedFrame & McpTranscriptBearing;
 type McpToolRefreshDecision = { refresh: boolean; reason: string; transcript: boolean };
+type McpToolRefreshBaseline = { digest: string; location: ObjRef | null; activeScopes: string };
 type McpToolRefreshSource = "invoke" | "accepted_frame";
 
 // `actor_wait` runs through the standard verb-dispatch path, which doesn't
@@ -616,6 +617,14 @@ export class McpHost {
     return true;
   }
 
+  async markToolListSeen(sessionId: string, actor: ObjRef): Promise<void> {
+    // The transport just handed this actor a concrete tools/list result.
+    // Record that digest as the notification baseline so the next real
+    // reachability change emits list_changed even if the fire-and-forget
+    // initial seed from createMcpServer is still racing.
+    this.toolListSnapshot.set(sessionId, await this.toolListDigest(actor));
+  }
+
   async resolveReachableTool(actor: ObjRef, object: ObjRef, verbName: string): Promise<McpTool | null> {
     const locallyReachable = this.reachable(actor).some((entry) => entry.id === object);
     const bridge = this.world.getHostBridge();
@@ -728,6 +737,7 @@ export class McpHost {
   // ----- tool invocation -----
 
   async invokeTool(actor: ObjRef, sessionId: string, tool: McpTool, args: WooValue[]): Promise<McpInvocationResult> {
+    const refreshBaseline = await this.toolRefreshBaseline(actor);
     if (tool.direct) {
       // For wait we need session-scoped queue access. Thread the sessionId
       // through a module-scoped slot; the registered native handler reads it.
@@ -757,7 +767,7 @@ export class McpHost {
         if (this.broadcasts.broadcastLiveEvents && result.audience) {
           await this.broadcasts.broadcastLiveEvents(result, sessionId);
         }
-        const decision = this.toolRefreshDecisionAfterInvoke(actor, tool, (result as McpTranscriptBearing).transcript);
+        const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (result as McpTranscriptBearing).transcript, refreshBaseline);
         this.recordToolRefreshDecision(actor, "invoke", decision);
         if (decision.refresh) {
           await this.refreshToolList(sessionId, actor);
@@ -781,7 +791,7 @@ export class McpHost {
     if (this.broadcasts.broadcastApplied) {
       await this.broadcasts.broadcastApplied(frame, sessionId);
     }
-    const decision = this.toolRefreshDecisionAfterInvoke(actor, tool, (frame as McpTranscriptBearing).transcript);
+    const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (frame as McpTranscriptBearing).transcript, refreshBaseline);
     this.recordToolRefreshDecision(actor, "invoke", decision);
     if (decision.refresh) {
       await this.refreshToolList(sessionId, actor);
@@ -802,11 +812,16 @@ export class McpHost {
     return tool.object === actor && ["wait", "focus", "unfocus", "focus_list"].includes(tool.verb);
   }
 
-  private toolRefreshDecisionAfterInvoke(actor: ObjRef, tool: McpTool, transcript: EffectTranscript | undefined): McpToolRefreshDecision {
+  private async toolRefreshDecisionAfterInvoke(
+    actor: ObjRef,
+    tool: McpTool,
+    transcript: EffectTranscript | undefined,
+    baseline: McpToolRefreshBaseline
+  ): Promise<McpToolRefreshDecision> {
     if (this.isMcpControlTool(actor, tool) && tool.verb === "focus_list" && !transcript) {
-      return { refresh: false, reason: "control_focus_list_read", transcript: false };
+      return await this.refineToolRefreshDecision(actor, { refresh: false, reason: "control_focus_list_read", transcript: false }, baseline);
     }
-    return this.toolRefreshDecisionAfterTranscript(actor, transcript);
+    return await this.refineToolRefreshDecision(actor, this.toolRefreshDecisionAfterTranscript(actor, transcript), baseline);
   }
 
   private toolRefreshDecisionAfterTranscript(actor: ObjRef, transcript: EffectTranscript | undefined): McpToolRefreshDecision {
@@ -834,6 +849,33 @@ export class McpHost {
       return { refresh: true, reason: "room_contents", transcript: true };
     }
     return { refresh: false, reason: "no_reachability_change", transcript: true };
+  }
+
+  private async toolRefreshBaseline(actor: ObjRef): Promise<McpToolRefreshBaseline> {
+    return {
+      digest: await this.toolListDigest(actor),
+      location: this.world.objects.get(actor)?.location ?? null,
+      activeScopes: this.world.allLocationsForActor(actor).sort().join("|")
+    };
+  }
+
+  private async refineToolRefreshDecision(
+    actor: ObjRef,
+    decision: McpToolRefreshDecision,
+    baseline: McpToolRefreshBaseline
+  ): Promise<McpToolRefreshDecision> {
+    if (decision.refresh) return decision;
+    // Transcripts are the fast path, but reachability is cheap to digest
+    // locally. If a native/remote path under-reports an actor move, this
+    // catches the changed tool surface before we suppress list_changed.
+    const digest = await this.toolListDigest(actor);
+    if (digest === baseline.digest) return decision;
+    const location = this.world.objects.get(actor)?.location ?? null;
+    const activeScopes = this.world.allLocationsForActor(actor).sort().join("|");
+    if (location !== baseline.location || activeScopes !== baseline.activeScopes) {
+      return { refresh: true, reason: "actor_location", transcript: decision.transcript };
+    }
+    return { refresh: true, reason: "reachability_digest", transcript: decision.transcript };
   }
 
   private recordToolRefreshDecision(actor: ObjRef, source: McpToolRefreshSource, decision: McpToolRefreshDecision): void {

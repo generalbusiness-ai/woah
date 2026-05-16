@@ -668,6 +668,24 @@ describe("McpHost", () => {
     aliceInstance.dispose();
   });
 
+  it("marks tools/list snapshots as seen so the next move notifies", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-list-seen");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+    let notifications = 0;
+    const unregister = host.onToolListChanged((actor) => {
+      if (actor === session.actor) notifications += 1;
+    });
+
+    await host.markToolListSeen(session.id, session.actor);
+    await world.directCall(undefined, session.actor, "the_chatroom", "southeast", [], { sessionId: session.id });
+    await host.refreshToolList(session.id, session.actor);
+
+    expect(notifications).toBe(1);
+    unregister();
+  });
+
   it("skips post-call tool-list refresh when the v2 transcript cannot affect reachability", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-skip-refresh-say");
@@ -728,6 +746,10 @@ describe("McpHost", () => {
     });
     const host = new McpHost(world, {
       direct: async () => {
+        if (transcript.id === "mcp-refresh-digest-fallback") {
+          const before = world.object(session.actor).location;
+          world.object(session.actor).location = before === "the_chatroom" ? "the_deck" : "the_chatroom";
+        }
         return attachTranscriptForTest(
           { op: "result" as const, result: true, observations: [], audience: null },
           transcript
@@ -763,9 +785,20 @@ describe("McpHost", () => {
     });
     await host.invokeTool(session.actor, session.id, tool, ["widget"]);
     expect(refreshSpy).toHaveBeenCalledTimes(2);
+
+    transcript = mcpTestTranscript({
+      id: "mcp-refresh-digest-fallback",
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "probe", args: [] },
+      hash: "mcp-refresh-digest-fallback"
+    });
+    await host.invokeTool(session.actor, session.id, tool, []);
+    expect(refreshSpy).toHaveBeenCalledTimes(3);
+
     expect(metrics).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "mcp_tool_refresh_taken", source: "invoke", reason: "focus_list", transcript: true }),
-      expect.objectContaining({ kind: "mcp_tool_refresh_taken", source: "invoke", reason: "actor_contents", transcript: true })
+      expect.objectContaining({ kind: "mcp_tool_refresh_taken", source: "invoke", reason: "actor_contents", transcript: true }),
+      expect.objectContaining({ kind: "mcp_tool_refresh_taken", source: "invoke", reason: "actor_location", transcript: true })
     ]));
   });
 

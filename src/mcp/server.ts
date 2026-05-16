@@ -193,6 +193,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools = await refreshTools();
+    await host.markToolListSeen(sessionId, actor);
     return {
       tools: [
         ...Array.from(stableTools.values(), (tool) => ({
