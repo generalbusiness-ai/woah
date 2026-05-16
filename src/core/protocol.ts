@@ -5,6 +5,7 @@ import {
   type ErrorFrame,
   type ErrorValue,
   type Message,
+  type Observation,
   type ObjRef,
   type Session,
   type WooValue
@@ -461,8 +462,10 @@ export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply
       op: "applied",
       id: reply.id,
       space: reply.commit.position.scope,
-      seq: Number(reply.commit.position.seq),
-      ts: Date.now(),
+      // REST AppliedFrame.seq names the user-visible sequenced log row, not
+      // the v2 commit-scope head. Clients use it with /api/objects/:id/log.
+      seq: Number(reply.transcript.seq),
+      ts: reply.commit.ts ?? firstObservationTimestamp(reply.transcript.observations) ?? Date.now(),
       message: {
         actor: reply.transcript.call.actor,
         target: reply.transcript.call.target,
@@ -481,6 +484,11 @@ export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply
     observations: reply.transcript.observations,
     audience: scope
   };
+}
+
+function firstObservationTimestamp(observations: Observation[]): number | undefined {
+  const ts = observations.find((observation) => typeof observation.ts === "number")?.ts;
+  return typeof ts === "number" ? ts : undefined;
 }
 
 function turnReplyError(reply: ShadowTurnExecReply): ErrorValue {

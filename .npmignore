@@ -8,6 +8,7 @@ coverage/
 .mcp.json
 .woo/
 .claude/
+.clawpatch/
 test-results/
 playwright-report/
 playwright/.cache/

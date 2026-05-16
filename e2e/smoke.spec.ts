@@ -39,6 +39,20 @@ test("loads shell and renders nav", async ({ page }) => {
   expect(consoleErrors, `console/page errors: ${consoleErrors.join(" | ")}`).toEqual([]);
 });
 
+test("stale stored guest session recovers instead of staying on connecting", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    localStorage.setItem("woo.session", `stale-${crypto.randomUUID()}`);
+    localStorage.setItem("woo.authMethod", "guest");
+  });
+
+  await page.goto("/");
+
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.getByRole("button", { name: "Continue as guest" })).toHaveCount(0);
+  await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
+});
+
 test("chat route mounts bundled UI while state is still cold-starting", async ({ page }) => {
   let releaseState: (() => void) | undefined;
   let delayedState = false;
@@ -890,78 +904,16 @@ test("REST runtime API supports auth, calls, properties, and logs", async ({ req
   expect((await me.json()).id).toBe(session.actor);
 });
 
-test("REST SSE stream receives sequenced applied frames", async ({ request }) => {
+test("REST object stream endpoint is retired", async ({ request }) => {
   const suffix = Date.now();
   const auth = await request.post("/api/auth", { data: { token: `guest:sse-${suffix}` } });
   expect(auth.ok()).toBe(true);
   const session = await auth.json();
   const headers = { Authorization: `Session ${session.session}` };
-  const wizardAuth = await request.post("/api/auth", { data: { token: `wizard:${process.env.WOO_INITIAL_WIZARD_TOKEN ?? "e2e-wizard"}` } });
-  if (wizardAuth.ok()) {
-    const wizardSession = await wizardAuth.json();
-    const wizardHeaders = { Authorization: `Session ${wizardSession.session}` };
-    // Tolerate "already populated" — the REST runtime test above may have
-    // already seeded this registry on the same dev server instance.
-    const seed = await request.post("/api/objects/the_taskboard/calls/seed_minimal_policy", {
-      headers: wizardHeaders,
-      data: { space: "the_taskboard", args: [wizardSession.actor] }
-    });
-    if (!seed.ok()) {
-      const err = await seed.json();
-      expect(err.error?.code === "E_INVARG" || err.error?.code === undefined, JSON.stringify(err)).toBe(true);
-    }
-  }
   const baseUrl = `http://localhost:${process.env.PORT ?? 5173}`;
 
-  const enter = await request.post("/api/objects/the_taskboard/calls/enter", { headers, data: { args: [] } });
-  expect(enter.ok()).toBe(true);
-
   const stream = await fetch(`${baseUrl}/api/objects/the_taskboard/stream`, { headers });
-  expect(stream.status).toBe(200);
-  expect(stream.body).not.toBeNull();
-  const reader = stream.body!.getReader();
-  const streamText = readSseUntil(reader, "event: applied", 5_000);
-
-  const create = await request.post("/api/objects/the_taskboard/calls/create_task", {
-    headers,
-    data: {
-      id: `rest-sse-${suffix}`,
-      space: "the_taskboard",
-      args: ["task", `REST SSE ${suffix}`, "created while streaming", [], null]
-    }
-  });
-  expect(create.ok()).toBe(true);
-  const frame = await create.json();
-  const text = await streamText;
-  await reader.cancel();
-
-  expect(text).toContain(`id: the_taskboard:${frame.seq}`);
-  expect(text).toContain("event: applied");
-  expect(text).toContain(`REST SSE ${suffix}`);
-
-  const replay = await fetch(`${baseUrl}/api/objects/the_taskboard/stream`, { headers: { ...headers, "Last-Event-ID": `the_taskboard:${frame.seq - 1}` } });
-  expect(replay.status).toBe(200);
-  expect(replay.body).not.toBeNull();
-  const replayReader = replay.body!.getReader();
-  const replayText = await readSseUntil(replayReader, `id: the_taskboard:${frame.seq}`, 5_000);
-  await replayReader.cancel();
-  expect(replayText).toContain("event: applied");
-  expect(replayText).toContain("task_created");
+  expect(stream.status).toBe(410);
+  const body = await stream.json();
+  expect(body.error?.code).toBe("E_GONE");
 });
-
-async function readSseUntil(reader: ReadableStreamDefaultReader<Uint8Array>, pattern: string, timeoutMs: number): Promise<string> {
-  const decoder = new TextDecoder();
-  const deadline = Date.now() + timeoutMs;
-  let text = "";
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
-    const result = await Promise.race([
-      reader.read(),
-      new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => setTimeout(() => reject(new Error("SSE read timed out")), remaining))
-    ]);
-    if (result.done) break;
-    text += decoder.decode(result.value, { stream: true });
-    if (text.includes(pattern)) return text;
-  }
-  throw new Error(`Timed out waiting for SSE pattern ${pattern}. Received: ${text}`);
-}

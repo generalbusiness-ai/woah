@@ -609,7 +609,9 @@ constructs authoritative post-state from transcript creates, writes, moves, and
 sequenced-log outcome. Accepted frames carry commit position, transcript hash,
 receipt, and observations; current projection state is derived from the commit
 scope's authoritative serialized state or from explicit state transfers, never
-from a per-frame full-world snapshot.
+from a per-frame full-world snapshot. Accepted frames also carry the authority's
+acceptance timestamp so transport-specific frame projections can be
+reply-idempotent without minting a fresh wall-clock value on retry.
 
 The current transcript applier materializes object creation, property writes,
 location writes, contents writes, session-location side effects, and sequenced

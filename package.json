@@ -21,6 +21,7 @@
     "test": "vitest run --reporter=dot",
     "smoke:onboarding": "tsx scripts/smoke-onboarding.ts",
     "smoke:mcp": "vitest run tests/smoke/v2-mcp-smoke.test.ts --reporter=dot",
+    "smoke:mcp:stdio": "tsx scripts/smoke-mcp-stdio.ts",
     "smoke:browser": "playwright test e2e/smoke.spec.ts -g \"chat boot uses /api/me\"",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",

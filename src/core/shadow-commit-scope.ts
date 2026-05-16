@@ -37,6 +37,7 @@ export type ShadowCommitAccepted = {
   kind: "woo.commit.accepted.shadow.v1";
   id?: string;
   position: ShadowScopeHead;
+  ts?: number;
   transcript_hash: string;
   post_state_hash: string;
   observations: EffectTranscript["observations"];
@@ -157,6 +158,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     kind: "woo.commit.accepted.shadow.v1",
     id: submissionId,
     position: scope.head,
+    ts: Date.now(),
     transcript_hash: submit.transcript.hash,
     post_state_hash: receipt.post_state_hash,
     observations: submit.transcript.observations,

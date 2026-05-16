@@ -27,6 +27,13 @@ import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
 type AuthStatus = "checking" | "anonymous" | "authenticated";
 type AuthMethod = "guest" | "apikey";
 
+class SessionExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionExpiredError";
+  }
+}
+
 type AppState = {
   actor?: string;
   session?: string;
@@ -246,9 +253,6 @@ const persistedSpaceChatCollapsed = readStorage(spaceChatCollapsedKey);
 state.spaceChatCollapsed = persistedSpaceChatCollapsed === "1" || persistedSpaceChatCollapsed === "true";
 
 installBundledCatalogUi();
-state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
-if (state.authStatus === "authenticated") connect();
-else render();
 window.setInterval(pruneLiveControls, 700);
 window.addEventListener("resize", () => {
   normalizeSpaceChatHeights();
@@ -513,6 +517,41 @@ function clearAuthMethod() {
   } catch {
     // Ignore.
   }
+}
+
+function isSessionExpiredError(err: unknown): err is SessionExpiredError {
+  return err instanceof SessionExpiredError;
+}
+
+function throwIfAuthExpired(response: Response, label: string) {
+  if (response.status === 401 || response.status === 403) {
+    throw new SessionExpiredError(`${label} ${response.status}`);
+  }
+}
+
+function handleExpiredStoredSession(message: string) {
+  const method = readAuthMethod();
+  clearSession();
+  state.actor = undefined;
+  state.session = undefined;
+  state.scopedProjection = undefined;
+  state.v2Projection = undefined;
+  v2BrowserWorker?.postMessage({ kind: "disconnect" });
+  v2BrowserWorker?.terminate();
+  v2BrowserWorker = undefined;
+  v2BrowserWorkerScope = "";
+  if (method === "guest") {
+    state.authStatus = "anonymous";
+    render();
+    void loginAsGuest({ silent: true });
+    return;
+  }
+  // A stale saved API-key session cannot be refreshed without the password.
+  // Drop back to the login form instead of retrying forever as "connecting".
+  state.authStatus = "anonymous";
+  state.loginError = method === "apikey" ? "Your saved session expired. Please sign in again." : undefined;
+  console.warn("stored session expired", message);
+  render();
 }
 
 function readUsername(): string {
@@ -873,6 +912,8 @@ async function refreshScopedProjectionSmoke() {
       fetch("/api/me", { headers: authHeaders() }),
       fetch("/api/catalogs/ui", { headers: authHeaders() })
     ]);
+    throwIfAuthExpired(meResponse, "/api/me");
+    throwIfAuthExpired(catalogsResponse, "/api/catalogs/ui");
     if (!meResponse.ok) throw new Error(`/api/me ${meResponse.status}`);
     if (!catalogsResponse.ok) throw new Error(`/api/catalogs/ui ${catalogsResponse.status}`);
     state.scopedProjectionSmoke = {
@@ -891,6 +932,7 @@ async function refreshScopedProjection() {
       fetch("/api/me", { headers: authHeaders() }),
       fetchCatalogUiIndex()
     ]);
+    throwIfAuthExpired(meResponse, "/api/me");
     if (!meResponse.ok) throw new Error(`/api/me ${meResponse.status}`);
     const me = await meResponse.json();
     if (scopedProjectionLocalRevision !== startedRevision) {
@@ -904,6 +946,10 @@ async function refreshScopedProjection() {
     await applyScopedProjectionSnapshot(me, catalogs);
     state.scopedProjectionSmoke = scopedProjectionSmokeEnabled ? { me, catalogs } : state.scopedProjectionSmoke;
   } catch (err) {
+    if (isSessionExpiredError(err)) {
+      handleExpiredStoredSession(err.message);
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     state.scopedProjection = {
       ...(state.scopedProjection ?? { inventory: [], overlays: {} }),
@@ -921,6 +967,7 @@ async function fetchCatalogUiIndex() {
   const headers = catalogUiEtag ? authHeaders({ "if-none-match": catalogUiEtag }) : authHeaders();
   const response = await fetch("/api/catalogs/ui", { headers });
   if (response.status === 304 && catalogUiCache) return catalogUiCache;
+  throwIfAuthExpired(response, "/api/catalogs/ui");
   if (!response.ok) throw new Error(`/api/catalogs/ui ${response.status}`);
   const body = await response.json();
   const nextEtag = response.headers.get("etag") ?? "";
@@ -1150,6 +1197,15 @@ const projectionFiller = new ProjectionFieldFiller(
     });
   }
 );
+
+// Initial connect must run AFTER `projectionFiller` is declared above:
+// `connect()` → `refreshScopedProjection` → `applyScopedProjectionSnapshot`
+// reaches the filler, and `const` initialization is in temporal dead zone
+// until this point. Moving this block earlier reintroduces a hard-to-spot
+// ReferenceError under specific stored-session shapes.
+state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
+if (state.authStatus === "authenticated") connect();
+else render();
 
 function ensureProjectionFields(subject: string, fields: readonly string[]): void {
   projectionFiller.ensure(subject, fields);
@@ -2841,11 +2897,17 @@ function animatePinboardNote(animation: PinNoteAnimation) {
     note.style.transition = "";
     note.style.transform = "translate(0, 0) scale(1, 1)";
     const cleanup = () => {
+      note.removeEventListener("transitionend", onTransitionEnd);
       note.classList.remove("pin-note-animating");
       note.style.transform = "";
       note.style.transformOrigin = "";
     };
-    note.addEventListener("transitionend", cleanup, { once: true });
+    const onTransitionEnd = (event: TransitionEvent) => {
+      // Child controls inside a note also have transitions; only the note's
+      // own transform transition marks the layout animation as complete.
+      if (event.target === note && event.propertyName === "transform") cleanup();
+    };
+    note.addEventListener("transitionend", onTransitionEnd);
     window.setTimeout(cleanup, 520);
   });
 }
@@ -3060,6 +3122,12 @@ function chatFormatterContext() {
 function chatObservationSource(observation: any): string | undefined {
   if (String(observation?.type ?? "") === "text" && typeof observation?.target === "string") {
     if (!state.actor || observation.target === state.actor) return currentChatOutputSpace();
+  }
+  if (String(observation?.type ?? "") === "looked" && (!state.actor || observation?.to === state.actor)) {
+    const outputSpace = currentChatOutputSpace();
+    for (const key of ["target", "source", "board", "space", "room"]) {
+      if (observation?.[key] === outputSpace) return outputSpace;
+    }
   }
   // Prefer fields that name the room/space the observation belongs in (for the
   // chat panel filter). `source` is the emitter (e.g. the cockatoo), which
