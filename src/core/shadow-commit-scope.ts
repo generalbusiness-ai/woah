@@ -1,10 +1,12 @@
 import type { SerializedObject, SerializedWorld } from "./repository";
 import {
-  readTranscriptCellFromSerializedWorld,
+  createTranscriptCellReader,
+  readTranscriptCell,
   validateTranscriptAgainstSerializedWorld,
   type EffectTranscript,
   type TranscriptCell,
   type TranscriptCreate,
+  type TranscriptValidation,
   type TranscriptWrite
 } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -125,12 +127,13 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     if (existing) return existing;
   }
 
+  const validation = validateTranscriptAgainstSerializedWorld(scope.serialized, submit.transcript);
   const mergedAfter = applyShadowTranscriptToCommittedState(scope.serialized, submit.transcript, { profile: submit.profile });
-  const extraErrors = shadowCommitEnvelopeErrors(scope, submit);
+  const extraErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
   extraErrors.push(...validateShadowPostState(mergedAfter, submit.transcript));
   extraErrors.push(...validateShadowWriteAuthority(scope.serialized, submit.transcript));
 
-  const receipt = shadowCommitReceipt(scope.serialized, mergedAfter, submit.transcript, extraErrors);
+  const receipt = shadowCommitReceipt(scope.serialized, mergedAfter, submit.transcript, extraErrors, validation);
   if (!receipt.accepted) {
     const conflict: ShadowCommitConflict = {
       kind: "woo.commit.conflict.shadow.v1",
@@ -176,7 +179,7 @@ export function applyAcceptedShadowFrame(
   if (accepted.id) scope.submissions.set(accepted.id, structuredClone(accepted) as ShadowCommitAccepted);
 }
 
-function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowCommitSubmit): string[] {
+function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowCommitSubmit, validation?: TranscriptValidation): string[] {
   const errors: string[] = [];
   if (submit.scope !== scope.scope || submit.transcript.scope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} transcript=${submit.transcript.scope} scope=${scope.scope}`);
@@ -187,16 +190,17 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   if (!submit.transcript.complete) {
     errors.push("incomplete_transcript");
   }
-  const validation = validateTranscriptAgainstSerializedWorld(scope.serialized, submit.transcript);
-  for (const error of validation.errors) errors.push(error);
+  const checked = validation ?? validateTranscriptAgainstSerializedWorld(scope.serialized, submit.transcript);
+  for (const error of checked.errors) errors.push(error);
   return errors;
 }
 
 function validateShadowPostState(serializedAfter: SerializedWorld, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
   const finalWrites = finalWritesByCell(transcript);
+  const reader = createTranscriptCellReader(serializedAfter);
   for (const write of finalWrites) {
-    const actual = readTranscriptCellFromSerializedWorld(serializedAfter, write.cell);
+    const actual = readTranscriptCell(reader, write.cell);
     if (!actual.ok) {
       errors.push(`post_state_mismatch ${cellLabel(write.cell)}: ${actual.error}`);
       continue;
@@ -210,7 +214,7 @@ function validateShadowPostState(serializedAfter: SerializedWorld, transcript: E
   }
 
   for (const create of transcript.creates) {
-    const obj = serializedObject(serializedAfter, create.object);
+    const obj = reader.objectById.get(create.object);
     if (!obj) {
       errors.push(`post_state_mismatch create ${create.object}: object missing`);
       continue;
@@ -223,7 +227,7 @@ function validateShadowPostState(serializedAfter: SerializedWorld, transcript: E
   }
 
   for (const move of transcript.moves) {
-    const obj = serializedObject(serializedAfter, move.object);
+    const obj = reader.objectById.get(move.object);
     if (!obj || obj.location !== move.to) {
       errors.push(`post_state_mismatch move ${move.object}: location`);
     }
@@ -239,6 +243,7 @@ export function finalWritesByCell(transcript: EffectTranscript): TranscriptWrite
 
 function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
+  const index = serializedAuthorityIndex(serializedBefore);
   const validWriters = new Map<string, boolean>();
   const authorizedCreates = new Map<ObjRef, TranscriptCreate>();
   if (transcript.session) {
@@ -246,7 +251,7 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
     if (!session) errors.push(`permission_denied: session not found ${transcript.session}`);
     else if (session.actor !== transcript.call.actor) errors.push(`permission_denied: session actor mismatch ${transcript.session}`);
   }
-  if (!serializedObject(serializedBefore, transcript.call.actor)) {
+  if (!serializedObject(index, transcript.call.actor)) {
     errors.push(`permission_denied: actor not found ${transcript.call.actor}`);
   }
 
@@ -255,11 +260,11 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
       errors.push(`permission_denied: missing writer for create ${create.object}`);
       continue;
     }
-    if (!recordedWriterIsValid(serializedBefore, transcript, create.writer, validWriters)) {
+    if (!recordedWriterIsValid(index, transcript, create.writer, validWriters)) {
       errors.push(`permission_denied: writer frame not recorded ${writerFrameLabel(create.writer)} for create ${create.object}`);
       continue;
     }
-    if (canWriterCreateObject(serializedBefore, create.writer.progr, create.parent, create.owner)) {
+    if (canWriterCreateObject(index, create.writer.progr, create.parent, create.owner)) {
       authorizedCreates.set(create.object, create);
     } else {
       errors.push(`permission_denied: no recorded authority can create ${create.object}`);
@@ -271,24 +276,24 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
       errors.push(`permission_denied: missing writer for ${cellLabel(write.cell)}`);
       continue;
     }
-    if (!recordedWriterIsValid(serializedBefore, transcript, write.writer, validWriters)) {
+    if (!recordedWriterIsValid(index, transcript, write.writer, validWriters)) {
       errors.push(`permission_denied: writer frame not recorded ${writerFrameLabel(write.writer)} for ${cellLabel(write.cell)}`);
       continue;
     }
     const createdObject = authorizedCreates.get(write.cell.object);
     if (write.cell.kind === "lifecycle") {
-      if (!createdObject || !writerCanInitializeCreatedObject(serializedBefore, write.writer.progr, createdObject)) {
+      if (!createdObject || !writerCanInitializeCreatedObject(index, write.writer.progr, createdObject)) {
         errors.push(`permission_denied: no recorded authority can create ${write.cell.object}`);
       }
       continue;
     }
-    if (createdObject && writerCanInitializeCreatedObject(serializedBefore, write.writer.progr, createdObject)) {
+    if (createdObject && writerCanInitializeCreatedObject(index, write.writer.progr, createdObject)) {
       continue;
     }
-    if (write.cell.kind === "prop" && !canWriterWriteProperty(serializedBefore, write.writer.progr, write.cell.object, write.cell.name)) {
+    if (write.cell.kind === "prop" && !canWriterWriteProperty(index, write.writer.progr, write.cell.object, write.cell.name)) {
       errors.push(`permission_denied: no recorded authority can write ${cellLabel(write.cell)}`);
     }
-    if (write.cell.kind === "location" && !canWriterControlObject(serializedBefore, write.writer.progr, write.cell.object)) {
+    if (write.cell.kind === "location" && !canWriterControlObject(index, write.writer.progr, write.cell.object)) {
       errors.push(`permission_denied: no recorded authority can move ${write.cell.object}`);
     }
   }
@@ -314,10 +319,27 @@ export function applyShadowTranscriptToCommittedState(
     });
   };
   let stepStartedAt = Date.now();
-  const next = structuredClone(current) as SerializedWorld;
+  const next: SerializedWorld = {
+    ...current,
+    objects: current.objects.slice()
+  };
   profile("clone_world", stepStartedAt);
   stepStartedAt = Date.now();
   const currentObjects = new Map<ObjRef, SerializedObject>(next.objects.map((obj) => [obj.id, obj]));
+  const objectIndexes = new Map<ObjRef, number>(next.objects.map((obj, index) => [obj.id, index]));
+  const mutableObjects = new Set<ObjRef>();
+  let objectsNeedSort = false;
+  const mutableObject = (id: ObjRef): SerializedObject | null => {
+    const existing = currentObjects.get(id);
+    if (!existing) return null;
+    if (mutableObjects.has(id)) return existing;
+    const clone = structuredClone(existing) as SerializedObject;
+    currentObjects.set(id, clone);
+    mutableObjects.add(id);
+    const index = objectIndexes.get(id);
+    if (index !== undefined) next.objects[index] = clone;
+    return clone;
+  };
   profile("index_objects", stepStartedAt);
 
   // The commit scope constructs authoritative post-state from the transcript.
@@ -325,10 +347,15 @@ export function applyShadowTranscriptToCommittedState(
   // boundary; they are diagnostics/cache-fill only.
   stepStartedAt = Date.now();
   for (const create of transcript.creates) {
+    if (currentObjects.has(create.object)) continue;
     const created = serializedObjectFromCreate(create, options.objectTimestamp);
     currentObjects.set(create.object, created);
-    if (created.parent) addUniqueObjectRef(currentObjects.get(created.parent)?.children, created.id);
-    if (created.location) addUniqueObjectRef(currentObjects.get(created.location)?.contents, created.id);
+    objectIndexes.set(create.object, next.objects.length);
+    mutableObjects.add(create.object);
+    next.objects.push(created);
+    objectsNeedSort = true;
+    if (created.parent) addUniqueObjectRef(mutableObject(created.parent)?.children, created.id);
+    if (created.location) addUniqueObjectRef(mutableObject(created.location)?.contents, created.id);
   }
   profile("apply_creates", stepStartedAt);
   stepStartedAt = Date.now();
@@ -336,17 +363,18 @@ export function applyShadowTranscriptToCommittedState(
   profile("collect_writes", stepStartedAt);
   stepStartedAt = Date.now();
   for (const write of writes) {
-    applyTranscriptWrite(currentObjects, write, options.objectTimestamp);
+    const target = mutableObject(write.cell.object);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, options.objectTimestamp);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
-  applyTranscriptSessionLocation(next, transcript);
+  next.sessions = applyTranscriptSessionLocation(current.sessions, transcript);
   profile("apply_session", stepStartedAt);
   stepStartedAt = Date.now();
-  next.objects = Array.from(currentObjects.values()).sort((a, b) => a.id.localeCompare(b.id));
+  if (objectsNeedSort) next.objects.sort((a, b) => a.id.localeCompare(b.id));
   profile("sort_objects", stepStartedAt);
   stepStartedAt = Date.now();
-  next.logs = applyTranscriptLog(next.logs, transcript);
+  next.logs = applyTranscriptLog(current.logs, transcript);
   profile("apply_log", stepStartedAt);
   stepStartedAt = Date.now();
   next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
@@ -362,15 +390,18 @@ export function transcriptSessionActiveScope(transcript: EffectTranscript): { se
   return { session: transcript.session, actor: transcript.call.actor, activeScope: actorMove.to };
 }
 
-function applyTranscriptSessionLocation(next: SerializedWorld, transcript: EffectTranscript): void {
+function applyTranscriptSessionLocation(sessions: SerializedWorld["sessions"], transcript: EffectTranscript): SerializedWorld["sessions"] {
   const update = transcriptSessionActiveScope(transcript);
-  if (!update) return;
-  for (const session of next.sessions) {
+  if (!update) return sessions;
+  for (let index = 0; index < sessions.length; index += 1) {
+    const session = sessions[index];
     if (session.id === update.session && session.actor === update.actor) {
-      session.activeScope = update.activeScope;
-      return;
+      const next = sessions.slice();
+      next[index] = { ...session, activeScope: update.activeScope };
+      return next;
     }
   }
+  return sessions;
 }
 
 function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: number | undefined): SerializedObject {
@@ -422,13 +453,18 @@ export function transcriptLogEntry(transcript: EffectTranscript): SerializedWorl
 function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: EffectTranscript): SerializedWorld["logs"] {
   const entry = transcriptLogEntry(transcript);
   if (!entry) return logEntries;
-  const logs = new Map<ObjRef, SerializedWorld["logs"][number][1]>(
-    logEntries.map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]])
-  );
-  const entries = logs.get(transcript.scope) ?? [];
+  const next = logEntries.slice();
+  const index = next.findIndex(([space]) => space === transcript.scope);
+  const entries = index >= 0
+    ? structuredClone(next[index][1]) as SerializedWorld["logs"][number][1]
+    : [];
   mergeTranscriptLogEntry(entries, entry);
-  logs.set(transcript.scope, entries);
-  return Array.from(logs.entries()).sort(([a], [b]) => a.localeCompare(b));
+  if (index >= 0) {
+    next[index] = [transcript.scope, entries];
+    return next;
+  }
+  next.push([transcript.scope, entries]);
+  return next.sort(([a], [b]) => a.localeCompare(b));
 }
 
 export function mergeTranscriptLogEntry(entries: SpaceLogEntryLike[], entry: SpaceLogEntryLike): void {
@@ -472,16 +508,6 @@ export function applyTranscriptWriteToSerializedObject(
       // accepted verb-edit materialization is intentionally not implemented.
       return;
   }
-}
-
-function applyTranscriptWrite(
-  currentObjects: Map<ObjRef, SerializedObject>,
-  write: TranscriptWrite,
-  objectTimestamp: number | undefined
-): void {
-  const target = currentObjects.get(write.cell.object);
-  if (!target) return;
-  applyTranscriptWriteToSerializedObject(target, write, objectTimestamp);
 }
 
 function touchSerializedObject(target: SerializedObject, objectTimestamp: number | undefined): void {
@@ -538,7 +564,7 @@ export function nextObjectCounterForCreates(current: number, creates: Transcript
 }
 
 function recordedWriterIsValid(
-  serialized: SerializedWorld,
+  index: SerializedAuthorityIndex,
   transcript: EffectTranscript,
   writer: RecordedWriteAuthority,
   validWriters: Map<string, boolean>
@@ -547,7 +573,7 @@ function recordedWriterIsValid(
   const cached = validWriters.get(key);
   if (cached !== undefined) return cached;
   const valid =
-    serializedObject(serialized, writer.progr) !== undefined &&
+    serializedObject(index, writer.progr) !== undefined &&
     transcript.reads.some((read) => {
       if (read.cell.kind !== "verb" || read.cell.object !== writer.definer || read.cell.name !== writer.verb) return false;
       if (!read.value || typeof read.value !== "object" || Array.isArray(read.value)) return false;
@@ -561,49 +587,59 @@ function writerFrameLabel(writer: RecordedWriteAuthority): string {
   return `${writer.progr} ${writer.definer}:${writer.verb} this=${writer.thisObj}`;
 }
 
-function canWriterWriteProperty(serialized: SerializedWorld, writer: ObjRef, object: ObjRef, name: string): boolean {
-  const target = serializedObject(serialized, object);
+function canWriterWriteProperty(index: SerializedAuthorityIndex, writer: ObjRef, object: ObjRef, name: string): boolean {
+  const target = serializedObject(index, object);
   if (!target) return false;
-  const info = serializedPropertyInfo(serialized, object, name);
-  if (isWizard(serialized, writer)) return true;
+  const info = serializedPropertyInfo(index, object, name);
+  if (isWizard(index, writer)) return true;
   if (!info && target.owner === writer) return true;
   return info !== null && (info.owner === writer || String(info.perms).includes("w"));
 }
 
-function canWriterControlObject(serialized: SerializedWorld, writer: ObjRef, object: ObjRef): boolean {
-  const target = serializedObject(serialized, object);
+function canWriterControlObject(index: SerializedAuthorityIndex, writer: ObjRef, object: ObjRef): boolean {
+  const target = serializedObject(index, object);
   if (!target) return false;
-  return isWizard(serialized, writer) || target.owner === writer;
+  return isWizard(index, writer) || target.owner === writer;
 }
 
-function canWriterCreateObject(serialized: SerializedWorld, writer: ObjRef, parent: ObjRef | null, owner: ObjRef): boolean {
+function canWriterCreateObject(index: SerializedAuthorityIndex, writer: ObjRef, parent: ObjRef | null, owner: ObjRef): boolean {
   if (!parent) return false;
-  const parentObj = serializedObject(serialized, parent);
+  const parentObj = serializedObject(index, parent);
   if (!parentObj) return false;
-  if (isWizard(serialized, writer)) return true;
+  if (isWizard(index, writer)) return true;
   return owner === writer && (parentObj.owner === writer || parentObj.flags.fertile === true);
 }
 
-function writerCanInitializeCreatedObject(serialized: SerializedWorld, writer: ObjRef, create: TranscriptCreate): boolean {
-  return isWizard(serialized, writer) || create.owner === writer;
+function writerCanInitializeCreatedObject(index: SerializedAuthorityIndex, writer: ObjRef, create: TranscriptCreate): boolean {
+  return isWizard(index, writer) || create.owner === writer;
 }
 
-function serializedPropertyInfo(serialized: SerializedWorld, object: ObjRef, name: string): { owner: ObjRef; perms: string } | null {
-  let current = serializedObject(serialized, object);
+function serializedPropertyInfo(index: SerializedAuthorityIndex, object: ObjRef, name: string): { owner: ObjRef; perms: string } | null {
+  let current = serializedObject(index, object);
   while (current) {
     const def = current.propertyDefs.find((item) => item.name === name);
     if (def) return { owner: def.owner, perms: def.perms };
-    current = current.parent ? serializedObject(serialized, current.parent) : undefined;
+    current = current.parent ? serializedObject(index, current.parent) : undefined;
   }
   return null;
 }
 
-function serializedObject(serialized: SerializedWorld, id: ObjRef): SerializedObject | undefined {
-  return serialized.objects.find((obj) => obj.id === id);
+type SerializedAuthorityIndex = {
+  objectById: Map<ObjRef, SerializedObject>;
+};
+
+function serializedAuthorityIndex(serialized: SerializedWorld): SerializedAuthorityIndex {
+  return {
+    objectById: new Map(serialized.objects.map((obj) => [obj.id, obj]))
+  };
 }
 
-function isWizard(serialized: SerializedWorld, id: ObjRef): boolean {
-  return serializedObject(serialized, id)?.flags.wizard === true;
+function serializedObject(index: SerializedAuthorityIndex, id: ObjRef): SerializedObject | undefined {
+  return index.objectById.get(id);
+}
+
+function isWizard(index: SerializedAuthorityIndex, id: ObjRef): boolean {
+  return serializedObject(index, id)?.flags.wizard === true;
 }
 
 function writeValueMatchesPostState(write: TranscriptWrite, actual: WooValue): boolean {

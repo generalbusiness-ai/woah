@@ -1,6 +1,6 @@
 import type { SerializedWorld } from "./repository";
 import type { ObjRef } from "./types";
-import type { EffectTranscript } from "./effect-transcript";
+import type { EffectTranscript, TranscriptValidation } from "./effect-transcript";
 import { transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld } from "./effect-transcript";
 
 export type ShadowCommitReceipt = {
@@ -20,9 +20,10 @@ export function shadowCommitReceipt(
   serializedBefore: SerializedWorld,
   serializedAfter: SerializedWorld,
   transcript: EffectTranscript,
-  extraErrors: string[] = []
+  extraErrors: string[] = [],
+  precomputedValidation?: TranscriptValidation
 ): ShadowCommitReceipt {
-  const validation = validateTranscriptAgainstSerializedWorld(serializedBefore, transcript);
+  const validation = precomputedValidation ?? validateTranscriptAgainstSerializedWorld(serializedBefore, transcript);
   const errors = [
     ...validation.errors,
     ...extraErrors,

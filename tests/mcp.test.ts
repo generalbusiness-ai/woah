@@ -1156,6 +1156,44 @@ describe("McpHost", () => {
     expect(after.objectCounter).toBe(expected.objectCounter);
   });
 
+  it("applies v2 accepted transcripts without mutating the input serialized snapshot", () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const session = world.auth("guest:mcp-v2-copy-on-write");
+    const beforeApply = world.exportWorld();
+    const beforeSnapshot = structuredClone(beforeApply);
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "mcp-v2-copy-on-write",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 8,
+      session: session.id,
+      call: { actor: session.actor, target: "the_chatroom", verb: "copy_on_write_probe", args: [] },
+      reads: [],
+      writes: [
+        { cell: { kind: "prop", object: session.actor, name: "copy_on_write_probe" }, value: "updated", op: "set" },
+        { cell: { kind: "contents", object: "the_chatroom" }, value: ["$wiz", session.actor], op: "set" }
+      ],
+      creates: [
+        { object: "mcp_copy_on_write_created", name: "copy-on-write probe", parent: "$thing", owner: session.actor, location: "the_chatroom", anchor: null, flags: {}, writer: { progr: "$wiz", definer: "$thing", verb: "copy_on_write_probe", thisObj: "the_chatroom", caller: session.actor, callerPerms: session.actor } }
+      ],
+      moves: [],
+      observations: [{ type: "copy_on_write_probe", actor: session.actor, source: "the_chatroom", text: "updated", ts: 1 }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: "mcp-v2-copy-on-write"
+    };
+
+    const afterApply = applyShadowTranscriptToCommittedState(beforeApply, transcript, { objectTimestamp: Date.now() + 1_000 });
+
+    expect(beforeApply).toEqual(beforeSnapshot);
+    expect(afterApply).not.toEqual(beforeApply);
+  });
+
   it("does not enumerate remote tools while sending post-call list_changed hints", async () => {
     const world = bootstrapWorld();
     // The bridge below declares the_chatroom remote; the lazy-refresh contract

@@ -3477,6 +3477,12 @@ export class WooWorld {
   }
 
   private async applyCallRepository(repo: ObjectRepository, id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
+    // This outer snapshot protects fatal repository failures after the
+    // in-memory turn has already advanced next_seq/log state. The inner
+    // withBehaviorSavepoint below is intentionally separate: normal verb
+    // errors must roll back only the verb body while preserving the applied
+    // error frame. Replacing both with one O(delta) undo log is the right
+    // optimization; dropping either snapshot changes rollback semantics.
     const before = this.snapshotBehaviorState();
     const beforeLogs = this.snapshotLogs();
     const startedAt = Date.now();
@@ -5965,9 +5971,13 @@ export class WooWorld {
       objectCounter: this.objectCounter,
       parkedTaskCounter: this.parkedTaskCounter,
       sessionCounter: this.sessionCounter,
-      objects: Array.from(this.objects.values()).map((obj) => this.serializeObject(obj)),
+      objects: Array.from(this.objects.values())
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((obj) => this.serializeObject(obj)),
       sessions: Array.from(this.sessions.values()).map((session) => this.serializeSession(session)),
-      logs: Array.from(this.logs.entries()).map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]),
+      logs: Array.from(this.logs.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([space, entries]) => [space, cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[]]),
       snapshots: cloneValue(this.snapshots as unknown as WooValue) as unknown as SpaceSnapshotRecord[],
       parkedTasks: Array.from(this.parkedTasks.values()).map((task) => cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord),
       tombstones: Array.from(this.tombstones).sort()
@@ -6185,8 +6195,8 @@ export class WooWorld {
     // accepted transcript instead of export/clone/import of the whole world.
     // This intentionally does not persist to the gateway DO.
     const totalStartedAt = Date.now();
+    const stats = this.shadowGatewayLiveMetricStats();
     const profile = (phase: (MetricEvent & { kind: "shadow_gateway_apply_step" })["phase"], startedAt: number) => {
-      const stats = this.shadowGatewayLiveMetricStats();
       this.recordMetric({
         kind: "shadow_gateway_apply_step",
         phase,
@@ -6241,12 +6251,9 @@ export class WooWorld {
     }
     profile?.("apply_writes", stepStartedAt);
 
-    // The serialized commit-scope applier sorts objects on every accepted
-    // transcript. Keep the gateway cache export-equivalent even for write-only
-    // commits, where insertion order would otherwise remain whatever the live
-    // world happened to have before the transcript arrived.
+    // Export paths sort object/log rows for deterministic snapshots. Keep the
+    // hot gateway cache in mutation order so accepted transcripts stay O(delta).
     stepStartedAt = Date.now();
-    this.sortObjectMap();
     profile?.("sort_objects", stepStartedAt);
 
     stepStartedAt = Date.now();
@@ -6263,7 +6270,6 @@ export class WooWorld {
       const entries = this.logs.get(transcript.scope) ?? [];
       mergeTranscriptLogEntry(entries, logEntry);
       this.logs.set(transcript.scope, entries);
-      this.sortLogsMap();
     }
     profile?.("apply_log", stepStartedAt);
 
@@ -6344,14 +6350,6 @@ export class WooWorld {
     target.propertyVersions = sortedMap(target.propertyVersions);
     target.modified = objectTimestamp;
     if (propName === "subscribers" || propName === "session_subscribers") this.invalidatePresenceIndex();
-  }
-
-  private sortObjectMap(): void {
-    this.objects = sortedMap(this.objects);
-  }
-
-  private sortLogsMap(): void {
-    this.logs = sortedMap(this.logs);
   }
 
   private serializeObject(obj: WooObject): SerializedObject {
@@ -7974,6 +7972,9 @@ export class WooWorld {
   }
 
   private async applyResumeFrameRepository(repo: ObjectRepository, task: ParkedTaskRecord, serialized: Record<string, WooValue>, spaceRef: ObjRef, input?: WooValue): Promise<AppliedFrame> {
+    // Same two-boundary rollback contract as applyCallRepository: fatal
+    // storage errors restore the whole pre-turn state, while VM errors inside
+    // the resumed continuation preserve an applied error/suspend/read frame.
     const before = this.snapshotBehaviorState();
     const beforeLogs = this.snapshotLogs();
     try {
