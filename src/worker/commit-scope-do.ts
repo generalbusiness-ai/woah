@@ -35,58 +35,6 @@ import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 
-// Legacy CommitScopeDOs persisted the full SerializedWorld snapshot in a
-// single `v2_commit_scope_meta.serialized` column. Keep the decoder so old
-// scopes can hydrate once and then rewrite into the row-shaped tables below.
-const COMPRESSED_BLOB_PREFIX = "GZB1:";
-
-async function decodeSerializedWorld(blob: string): Promise<SerializedWorld> {
-  if (!blob.startsWith(COMPRESSED_BLOB_PREFIX)) {
-    // Legacy uncompressed JSON row from before the gzip change. Parse as-is
-    // so existing CommitScopeDOs (e.g. the_chatroom in production) keep
-    // loading until their next write rewrites the row in compressed form.
-    return JSON.parse(blob) as SerializedWorld;
-  }
-  const compressed = bytesFromBase64(blob.slice(COMPRESSED_BLOB_PREFIX.length));
-  const ds = new DecompressionStream("gzip");
-  const writer = ds.writable.getWriter();
-  // Cast to BufferSource: lib.dom TS types narrow Uint8Array's backing buffer
-  // to `ArrayBuffer` and Node's TextEncoder returns the wider `ArrayBufferLike`.
-  const writeDone = writer.write(compressed as unknown as BufferSource).then(() => writer.close());
-  const chunks = await readAllChunks(ds.readable);
-  await writeDone;
-  return JSON.parse(new TextDecoder().decode(concatBytes(chunks))) as SerializedWorld;
-}
-
-async function readAllChunks(readable: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
-  const reader = readable.getReader();
-  const chunks: Uint8Array[] = [];
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
-  }
-  return chunks;
-}
-
-function concatBytes(chunks: Uint8Array[]): Uint8Array {
-  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return out;
-}
-
-function bytesFromBase64(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
 export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
   private snapshotLoaded = false;
@@ -98,13 +46,8 @@ export class CommitScopeDO {
   ) {
     const constructorStartedAt = Date.now();
     this.state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, object_counter INTEGER NOT NULL DEFAULT 1, parked_task_counter INTEGER NOT NULL DEFAULT 1, session_counter INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)"
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, object_counter INTEGER NOT NULL DEFAULT 1, parked_task_counter INTEGER NOT NULL DEFAULT 1, session_counter INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)"
     );
-    this.ensureMetaColumn("version", "INTEGER NOT NULL DEFAULT 1");
-    this.ensureMetaColumn("object_counter", "INTEGER NOT NULL DEFAULT 1");
-    this.ensureMetaColumn("parked_task_counter", "INTEGER NOT NULL DEFAULT 1");
-    this.ensureMetaColumn("session_counter", "INTEGER NOT NULL DEFAULT 1");
-    this.ensureMetaSerializedNullable();
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_object (id TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     );
@@ -464,11 +407,11 @@ export class CommitScopeDO {
 
   private async loadRowSnapshot(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim | null> {
     const rows = sqlRows<CommitScopeMetaRow>(this.state.storage.sql.exec(
-      "SELECT scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter FROM v2_commit_scope_meta WHERE id = 'current'"
+      "SELECT scope, relay_node, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter FROM v2_commit_scope_meta WHERE id = 'current'"
     ));
     const meta = rows[0] ?? null;
     if (!meta) return null;
-    const serialized = await this.loadSerializedWorld(meta);
+    const serialized = this.loadSerializedWorld(meta);
     const relay = createShadowBrowserRelayShim({
       node: meta.relay_node,
       scope: meta.scope as ObjRef,
@@ -495,16 +438,10 @@ export class CommitScopeDO {
     return relay;
   }
 
-  private async loadSerializedWorld(meta: CommitScopeMetaRow): Promise<SerializedWorld> {
+  private loadSerializedWorld(meta: CommitScopeMetaRow): SerializedWorld {
     const objectRows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
       "SELECT body FROM v2_commit_scope_object ORDER BY id"
     ));
-    if (objectRows.length === 0 && meta.serialized) {
-      // One-time upgrade path for legacy single-blob scopes. Mark the relay for
-      // a full row-shaped save after /v2/open has refreshed session authority.
-      this.needsFullSave = true;
-      return await decodeSerializedWorld(meta.serialized);
-    }
     return {
       version: Number(meta.version ?? 1) as 1,
       objectCounter: Number(meta.object_counter ?? 1),
@@ -530,8 +467,9 @@ export class CommitScopeDO {
   }
 
   private async saveFull(relay: ShadowBrowserRelayShim): Promise<void> {
-    // Full saves are reserved for cold initialization and one-time migration
-    // from the legacy blob column. Hot envelopes use saveEnvelopeDelta instead.
+    // Full saves run only on cold initialization, when the gateway delivered
+    // the seed snapshot via /v2/open. Hot envelopes use saveEnvelopeDelta to
+    // rewrite only the rows the accepted transcript actually touched.
     const now = Date.now();
     this.state.storage.transactionSync(() => {
       this.saveMeta(relay, now);
@@ -578,10 +516,9 @@ export class CommitScopeDO {
   private saveMeta(relay: ShadowBrowserRelayShim, now: number): void {
     const serialized = relay.commit_scope.serialized;
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       relay.commit_scope.scope,
       relay.node,
-      null,
       JSON.stringify(relay.commit_scope.head),
       relay.idempotency_window_ms,
       serialized.version,
@@ -824,26 +761,6 @@ export class CommitScopeDO {
     );
   }
 
-  private ensureMetaColumn(column: string, definition: string): void {
-    const columns = new Set(sqlRows<{ name: string }>(this.state.storage.sql.exec("PRAGMA table_info(v2_commit_scope_meta)")).map((row) => String(row.name)));
-    if (!columns.has(column)) this.state.storage.sql.exec(`ALTER TABLE v2_commit_scope_meta ADD COLUMN ${column} ${definition}`);
-  }
-
-  private ensureMetaSerializedNullable(): void {
-    const serializedColumn = sqlRows<{ name: string; notnull: number }>(this.state.storage.sql.exec("PRAGMA table_info(v2_commit_scope_meta)"))
-      .find((row) => row.name === "serialized");
-    if (!serializedColumn || Number(serializedColumn.notnull) === 0) return;
-    this.state.storage.sql.exec("ALTER TABLE v2_commit_scope_meta RENAME TO v2_commit_scope_meta_old_notnull");
-    this.state.storage.sql.exec(
-      "CREATE TABLE v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, object_counter INTEGER NOT NULL DEFAULT 1, parked_task_counter INTEGER NOT NULL DEFAULT 1, session_counter INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)"
-    );
-    this.state.storage.sql.exec(
-      `INSERT INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at)
-        SELECT id, scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at
-        FROM v2_commit_scope_meta_old_notnull`
-    );
-    this.state.storage.sql.exec("DROP TABLE v2_commit_scope_meta_old_notnull");
-  }
 }
 
 type CommitScopeDurableState = {
@@ -894,7 +811,6 @@ type CommitScopeEnvelopeResponse = {
 type CommitScopeMetaRow = {
   scope: string;
   relay_node: string;
-  serialized?: string | null;
   head: string;
   idempotency_window_ms: number;
   version?: number;

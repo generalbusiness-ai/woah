@@ -23,8 +23,6 @@ import {
   snapshotFromSqlRow as snapshotFromRow,
   SQL_DELETE_TABLES,
   SQL_SCHEMA_SCRIPT,
-  SQL_SPACE_MESSAGE_OUTCOME_REBUILD_SCRIPT,
-  SQL_VERB_ORDER_REBUILD_SCRIPT,
   sqlGroupBy as groupBy,
   stringifySqlValue as stringifyValue,
   taskFromSqlRow as taskFromRow,
@@ -154,17 +152,20 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
         for (const [type, schema] of obj.eventSchemas) insertSchema.run(obj.id, type, stringifyValue(schema as WooValue));
       }
 
-      const hasAttachmentColumn = this.tableColumns("session").has("attachment");
-      const hasCurrentLocationColumn = this.tableColumns("session").has("current_location");
       const insertSession = this.db.prepare(
-        hasAttachmentColumn
-          ? `INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}, attachment) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""}, ?)`
-          : `INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class${hasCurrentLocationColumn ? ", current_location" : ""}) VALUES (?, ?, ?, ?, ?, ?${hasCurrentLocationColumn ? ", ?" : ""})`
+        "INSERT INTO session(id, actor, started, expires_at, last_detach_at, token_class, current_location, apikey_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       );
       for (const session of world.sessions) {
-        const values = [session.id, session.actor, session.started, session.expiresAt ?? null, session.lastDetachAt ?? null, session.tokenClass ?? "guest"];
-        const withCurrent = hasCurrentLocationColumn ? [...values, session.activeScope ?? null] : values;
-        insertSession.run(...(hasAttachmentColumn ? [...withCurrent, "{}"] : withCurrent));
+        insertSession.run(
+          session.id,
+          session.actor,
+          session.started,
+          session.expiresAt ?? null,
+          session.lastDetachAt ?? null,
+          session.tokenClass ?? "guest",
+          session.activeScope ?? null,
+          session.apikeyId ?? null
+        );
       }
 
       const insertLog = this.db.prepare("INSERT INTO space_message(space_id, seq, ts, actor, message, observations, applied_ok, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -430,18 +431,18 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   }
 
   saveSession(record: SerializedSession): void {
-    const cols = this.tableColumns("session");
-    const hasAttachmentColumn = cols.has("attachment");
-    const hasCurrentLocationColumn = cols.has("current_location");
-    const hasApikeyIdColumn = cols.has("apikey_id");
-    const columnList = ["id", "actor", "started", "expires_at", "last_detach_at", "token_class"];
-    const values: Array<string | number | null> = [record.id, record.actor, record.started, record.expiresAt ?? null, record.lastDetachAt ?? null, record.tokenClass ?? "guest"];
-    if (hasCurrentLocationColumn) { columnList.push("current_location"); values.push(record.activeScope ?? null); }
-    if (hasApikeyIdColumn) { columnList.push("apikey_id"); values.push(record.apikeyId ?? null); }
-    if (hasAttachmentColumn) { columnList.push("attachment"); values.push("{}"); }
-    const placeholders = columnList.map(() => "?").join(", ");
-    const stmt = this.db.prepare(`INSERT OR REPLACE INTO session(${columnList.join(", ")}) VALUES (${placeholders})`);
-    stmt.run(...values);
+    this.db.prepare(
+      "INSERT OR REPLACE INTO session(id, actor, started, expires_at, last_detach_at, token_class, current_location, apikey_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(
+      record.id,
+      record.actor,
+      record.started,
+      record.expiresAt ?? null,
+      record.lastDetachAt ?? null,
+      record.tokenClass ?? "guest",
+      record.activeScope ?? null,
+      record.apikeyId ?? null
+    );
   }
 
   deleteSession(session_id: string): void {
@@ -523,41 +524,6 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
   private migrate(): void {
     this.db.exec(SQL_SCHEMA_SCRIPT);
-    this.ensureColumn("session", "expires_at", "INTEGER");
-    this.ensureColumn("session", "last_detach_at", "INTEGER");
-    this.ensureColumn("session", "token_class", "TEXT NOT NULL DEFAULT 'guest'");
-    this.ensureColumn("session", "current_location", "TEXT");
-    this.ensureColumn("session", "apikey_id", "TEXT");
-    this.ensureColumn("space_message", "observations", "TEXT NOT NULL DEFAULT '[]'");
-    this.ensureNullableSpaceMessageOutcome();
-    this.ensureColumn("verb", "flags", "TEXT NOT NULL DEFAULT '{}'");
-    this.ensureOrderedVerbTable();
-    this.db.exec("DROP TABLE IF EXISTS session_socket");
-  }
-
-  private ensureColumn(table: string, column: string, definition: string): void {
-    if (this.tableColumns(table).has(column)) return;
-    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-
-  private tableColumns(table: string): Set<string> {
-    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
-    return new Set(rows.map((row) => String(row.name)));
-  }
-
-  private ensureNullableSpaceMessageOutcome(): void {
-    const rows = this.db.prepare("PRAGMA table_info(space_message)").all() as Row[];
-    const appliedOk = rows.find((row) => String(row.name) === "applied_ok");
-    if (!appliedOk || Number(appliedOk.notnull ?? 0) === 0) return;
-    // Current sequenced-call storage inserts a pending log row before behavior
-    // outcome is known, then records applied_ok in the same outer transaction.
-    // Older demo DBs used NOT NULL here, which rejects that pending state.
-    this.db.exec(SQL_SPACE_MESSAGE_OUTCOME_REBUILD_SCRIPT);
-  }
-
-  private ensureOrderedVerbTable(): void {
-    if (this.tableColumns("verb").has("slot")) return;
-    this.db.exec(SQL_VERB_ORDER_REBUILD_SCRIPT);
   }
 
   private ensureHostedObject(id: ObjRef): void {

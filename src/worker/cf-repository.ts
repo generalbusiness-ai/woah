@@ -41,10 +41,7 @@ import {
   sessionFromSqlRow as sessionFromRow,
   snapshotFromSqlRow as snapshotFromRow,
   SQL_DELETE_TABLES,
-  SQL_LEGACY_RESET_TABLES,
   SQL_SCHEMA_STATEMENTS,
-  SQL_SPACE_MESSAGE_OUTCOME_REBUILD_STATEMENTS,
-  SQL_VERB_ORDER_REBUILD_STATEMENTS,
   sqlGroupBy as groupBy,
   stringifySqlValue as stringifyValue,
   taskFromSqlRow as taskFromRow,
@@ -733,53 +730,10 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
   }
 
   private migrate(): void {
-    // v0.5 schema upgrade: the verb table gained a `flags` column to persist
-    // direct_callable / skip_presence_check. If we find an old verb table
-    // without that column, drop everything and rebuild — the runtime cannot
-    // fix flag-less verb rows without re-running catalog install. The next
-    // request runs createWorld() against empty storage → fresh bootstrap.
-    // Operator re-claims the wizard token after this one-time reset.
-    const verbCols = this.tableColumns("verb");
-    if (verbCols.size > 0 && !verbCols.has("flags")) {
-      for (const table of SQL_LEGACY_RESET_TABLES) {
-        this.sql.exec(`DROP TABLE IF EXISTS ${table}`);
-      }
-    }
-
     // Schema mirrors src/server/sqlite-repository.ts via sql-shape.ts.
     // CF Workers SQL doesn't support multi-statement exec in one call, so each
     // CREATE TABLE / CREATE INDEX runs separately.
     for (const stmt of SQL_SCHEMA_STATEMENTS) this.sql.exec(stmt);
-    this.ensureColumn("session", "current_location", "TEXT");
-    this.ensureColumn("session", "apikey_id", "TEXT");
-    this.ensureColumn("space_message", "observations", "TEXT NOT NULL DEFAULT '[]'");
-    this.ensureNullableSpaceMessageOutcome();
-    this.ensureColumn("verb", "flags", "TEXT NOT NULL DEFAULT '{}'");
-    this.ensureOrderedVerbTable();
-  }
-
-  private ensureColumn(table: string, column: string, definition: string): void {
-    if (this.tableColumns(table).has(column)) return;
-    this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-
-  private tableColumns(table: string): Set<string> {
-    return new Set(this.all(`PRAGMA table_info(${table})`).map((row) => String(row.name)));
-  }
-
-  private ensureNullableSpaceMessageOutcome(): void {
-    const rows = this.all("PRAGMA table_info(space_message)");
-    const appliedOk = rows.find((row) => String(row.name) === "applied_ok");
-    if (!appliedOk || Number(appliedOk.notnull ?? 0) === 0) return;
-    // Current sequenced-call storage inserts a pending log row before behavior
-    // outcome is known, then records applied_ok in the same outer transaction.
-    // Older demo DBs used NOT NULL here, which rejects that pending state.
-    for (const stmt of SQL_SPACE_MESSAGE_OUTCOME_REBUILD_STATEMENTS) this.sql.exec(stmt);
-  }
-
-  private ensureOrderedVerbTable(): void {
-    if (this.tableColumns("verb").has("slot")) return;
-    for (const stmt of SQL_VERB_ORDER_REBUILD_STATEMENTS) this.sql.exec(stmt);
   }
 
   private emitMetric(event: MetricEvent): void {

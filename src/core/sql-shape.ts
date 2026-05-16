@@ -25,13 +25,6 @@ export const SQL_DELETE_TABLES = [
   "object"
 ] as const;
 
-export const SQL_LEGACY_RESET_TABLES = [
-  ...SQL_DELETE_TABLES,
-  "ancestor_verb_cache",
-  "ancestor_prop_cache",
-  "ancestor_chain"
-] as const;
-
 export const SQL_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS object (
     id TEXT PRIMARY KEY,
@@ -160,61 +153,6 @@ export const SQL_SCHEMA_STATEMENTS = [
 ] as const;
 
 export const SQL_SCHEMA_SCRIPT = `${SQL_SCHEMA_STATEMENTS.join(";\n")};`;
-
-export const SQL_SPACE_MESSAGE_OUTCOME_REBUILD_STATEMENTS = [
-  "DROP INDEX IF EXISTS space_message_ts",
-  "ALTER TABLE space_message RENAME TO space_message_old_notnull",
-  `CREATE TABLE space_message (
-    space_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    ts INTEGER NOT NULL,
-    actor TEXT NOT NULL,
-    message TEXT NOT NULL,
-    observations TEXT NOT NULL DEFAULT '[]',
-    applied_ok INTEGER,
-    error TEXT,
-    PRIMARY KEY (space_id, seq)
-  )`,
-  `INSERT INTO space_message(space_id, seq, ts, actor, message, observations, applied_ok, error)
-    SELECT space_id, seq, ts, actor, message, COALESCE(observations, '[]'), applied_ok, error
-    FROM space_message_old_notnull`,
-  "DROP TABLE space_message_old_notnull",
-  "CREATE INDEX IF NOT EXISTS space_message_ts ON space_message(space_id, ts)"
-] as const;
-
-export const SQL_SPACE_MESSAGE_OUTCOME_REBUILD_SCRIPT = `${SQL_SPACE_MESSAGE_OUTCOME_REBUILD_STATEMENTS.join(";\n")};`;
-
-export const SQL_VERB_ORDER_REBUILD_STATEMENTS = [
-  "DROP INDEX IF EXISTS verb_object_name",
-  "ALTER TABLE verb RENAME TO verb_old_name_pk",
-  `CREATE TABLE verb (
-    object_id TEXT NOT NULL,
-    slot INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    aliases TEXT NOT NULL,
-    owner TEXT NOT NULL,
-    perms TEXT NOT NULL,
-    arg_spec TEXT NOT NULL,
-    source TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1,
-    line_map TEXT NOT NULL,
-    native TEXT,
-    bytecode TEXT,
-    flags TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY (object_id, slot)
-  )`,
-  `INSERT INTO verb(object_id, slot, name, kind, aliases, owner, perms, arg_spec, source, source_hash, version, line_map, native, bytecode, flags)
-    SELECT object_id,
-           ROW_NUMBER() OVER (PARTITION BY object_id ORDER BY name),
-           name, kind, aliases, owner, perms, arg_spec, source, source_hash, version, line_map, native, bytecode, COALESCE(flags, '{}')
-    FROM verb_old_name_pk`,
-  "DROP TABLE verb_old_name_pk",
-  "CREATE INDEX IF NOT EXISTS verb_object_name ON verb(object_id, name)"
-] as const;
-
-export const SQL_VERB_ORDER_REBUILD_SCRIPT = `${SQL_VERB_ORDER_REBUILD_STATEMENTS.join(";\n")};`;
 
 export function sqlGroupBy<T extends SqlRow>(rows: T[], key: string): Map<string, T[]> {
   const groups = new Map<string, T[]>();

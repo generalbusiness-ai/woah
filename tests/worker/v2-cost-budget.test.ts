@@ -167,9 +167,6 @@ describe("v2 CommitScopeDO cost budget", () => {
         v2_commit_scope_object: harness.world.exportWorld().objects.length,
         v2_commit_scope_session: harness.world.exportWorld().sessions.length
       });
-      expect(sqlRows(harness.scopeState.storage.sql.exec(
-        "SELECT serialized IS NULL AS cleared FROM v2_commit_scope_meta WHERE id = 'current'"
-      ))[0]).toMatchObject({ cleared: 1 });
       resetCostLog(harness);
 
       await harness.sendTurn(1);
@@ -184,57 +181,6 @@ describe("v2 CommitScopeDO cost budget", () => {
     } finally {
       harness.cleanup();
     }
-  });
-
-  it.each([
-    ["raw JSON", async (serialized: SerializedWorld) => JSON.stringify(serialized)],
-    ["GZB1 gzip", encodeLegacyGzipSerializedWorld]
-  ])("migrates a legacy %s single-blob scope into row-shaped storage on open", async (_name, encodeLegacy) => {
-    const state = new FakeDurableObjectState("#-1");
-    const world = createWorld();
-    const session = world.auth("guest:legacy-commit-scope");
-    const serialized = world.exportWorld();
-    const legacyBlob = await encodeLegacy(serialized);
-    const legacyRelay = createShadowBrowserRelayShim({
-      node: "node:commit-scope:#-1",
-      scope: "#-1",
-      serialized
-    });
-    state.storage.sql.exec(
-      "CREATE TABLE v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT NOT NULL, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
-    );
-    state.storage.sql.exec(
-      "INSERT INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?)",
-      "#-1",
-      legacyRelay.node,
-      legacyBlob,
-      JSON.stringify(legacyRelay.commit_scope.head),
-      legacyRelay.idempotency_window_ms,
-      Date.now()
-    );
-
-    const scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    const request = await signInternalRequest({ WOO_INTERNAL_SECRET: "cf-test-secret" }, new Request("https://woo.internal/v2/open", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        scope: "#-1",
-        node: "browser:legacy-migration",
-        token: "guest:legacy-commit-scope",
-        session: session.id,
-        actor: session.actor,
-        sessions: world.exportSessions(),
-        serialized
-      })
-    }));
-
-    const response = await scope.fetch(request);
-    expect(response.ok).toBe(true);
-    expect(sqlRows<{ n: number }>(state.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_object"))[0]?.n).toBe(serialized.objects.length);
-    expect(sqlRows<{ n: number }>(state.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_session"))[0]?.n).toBe(serialized.sessions.length);
-    expect(sqlRows<{ cleared: number }>(state.storage.sql.exec(
-      "SELECT serialized IS NULL AS cleared FROM v2_commit_scope_meta WHERE id = 'current'"
-    ))[0]).toMatchObject({ cleared: 1 });
   });
 
   it("performs exactly zero durable writes on duplicate envelope replay", async () => {
@@ -405,43 +351,6 @@ function resetCostLog(harness: CostHarness): void {
 
 function resetStateCostLog(state: FakeDurableObjectState): void {
   state.storage.sql.execLog.length = 0;
-}
-
-async function encodeLegacyGzipSerializedWorld(serialized: SerializedWorld): Promise<string> {
-  const cs = new CompressionStream("gzip");
-  const writer = cs.writable.getWriter();
-  const writeDone = writer.write(new TextEncoder().encode(JSON.stringify(serialized))).then(() => writer.close());
-  const chunks = await readAllChunks(cs.readable);
-  await writeDone;
-  return `GZB1:${base64FromBytes(concatBytes(chunks))}`;
-}
-
-async function readAllChunks(readable: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
-  const reader = readable.getReader();
-  const chunks: Uint8Array[] = [];
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
-  }
-  return chunks;
-}
-
-function concatBytes(chunks: Uint8Array[]): Uint8Array {
-  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return out;
-}
-
-function base64FromBytes(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
 }
 
 async function initializeMcp(gateway: PersistentObjectDO, token: string, id: number): Promise<string> {

@@ -217,9 +217,6 @@ export class DirectoryDO {
     ]) {
       this.state.storage.sql.exec(stmt);
     }
-    this.ensureColumn("session_route", "current_location", "TEXT");
-    this.ensureColumn("session_route", "apikey_id", "TEXT");
-    this.ensureColumn("session_route", "mcp_shard", "TEXT");
   }
 
   private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): boolean {
@@ -498,15 +495,6 @@ export class DirectoryDO {
       recycled_at: Number(row.recycled_at),
       reason: row.reason === null ? null : String(row.reason)
     };
-  }
-
-  private ensureColumn(table: string, column: string, definition: string): void {
-    if (this.tableColumns(table).has(column)) return;
-    this.state.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-
-  private tableColumns(table: string): Set<string> {
-    return new Set([...this.state.storage.sql.exec(`PRAGMA table_info(${table})`)].map((row) => String(row.name)));
   }
 
   private countRows(table: string): number {
