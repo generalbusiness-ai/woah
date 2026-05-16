@@ -174,7 +174,7 @@ export const BUILTIN_NAMES = [
   "is_remote_object",
   "presence_status",
   "describe_object", "room_look_projection", "room_who_projection",
-  "player_listing", "object_examine_projection", "help_topic_projection"
+  "player_listing_projection", "object_examine_projection", "help_topic_projection"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -990,8 +990,8 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "room_who_projection expects one room");
         return await frame.ctx.world.roomWhoProjection(frame.ctx, assertObj(builtinArgs[0]));
       }
-      case "player_listing": {
-        if (builtinArgs.length > 1) throw wooError("E_INVARG", "player_listing expects optional names");
+      case "player_listing_projection": {
+        if (builtinArgs.length > 1) throw wooError("E_INVARG", "player_listing_projection expects optional names");
         return await frame.ctx.world.playerListingProjection(frame.ctx, builtinArgs[0] ?? null);
       }
       case "object_examine_projection": {

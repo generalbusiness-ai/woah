@@ -107,7 +107,7 @@ const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
 }`;
 
 const PLAYER_WHO_ALL_SOURCE = `verb :who_all(names) rxd {
-  let projection = player_listing(names);
+  let projection = player_listing_projection(names);
   if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
   if (has(projection, "observation") && projection["observation"] != null) { observe(projection["observation"]); }
   return projection["rows"];
@@ -119,7 +119,7 @@ const PLAYER_EXAMINE_DETAILED_SOURCE = `verb :examine_detailed(name) rxd {
   return projection["result"];
 }`;
 
-const PLAYER_TELL_SOURCE = `verb :tell(text) rxd {
+const PLAYER_TELL_SOURCE = `verb :tell() rxd {
   let out = "";
   for part in args { out = out + to_string(part); }
   tell(this, out);

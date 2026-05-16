@@ -931,7 +931,7 @@ const VALID_BUILTINS = new Set([
   "describe_object",
   "room_look_projection",
   "room_who_projection",
-  "player_listing",
+  "player_listing_projection",
   "object_examine_projection",
   "help_topic_projection",
   // builder_create_object and builder_chparent stay native; see

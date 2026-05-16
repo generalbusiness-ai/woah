@@ -281,7 +281,7 @@ same connection and idle policy as `is_connected` and `idle_seconds`. The idle
 threshold is a substrate constant (currently 60 seconds) so catalog roster
 implementations do not each choose their own cutoff.
 
-`player_listing(names?)` returns `{rows, lines, observation?}` for the
+`player_listing_projection(names?)` returns `{rows, lines, observation?}` for the
 LambdaCore-shaped player listing. It reads live session state and actor
 locations without exposing global object enumeration to catalog code.
 
