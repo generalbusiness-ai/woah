@@ -17,6 +17,9 @@ const WORLD_HOST = "world";
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+const MCP_SESSION_HEADER = "mcp-session-id";
+const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
+const DEFAULT_MCP_GATEWAY_SHARDS = 32;
 
 function isApiPath(pathname: string): boolean {
   return (
@@ -46,6 +49,10 @@ export default {
       const response = await forwardToHost(env, WORLD_HOST, request);
       await registerAuthResponse(env, response.clone());
       return response;
+    }
+
+    if (url.pathname === "/mcp") {
+      return forwardToMcpGateway(env, request);
     }
 
     const objectRoute = parseObjectRoute(url.pathname);
@@ -127,9 +134,29 @@ async function forwardToHost(env: Env, host: string, request: Request): Promise<
   }
 }
 
+async function forwardToMcpGateway(env: Env, request: Request): Promise<Response> {
+  const sessionId = request.headers.get(MCP_SESSION_HEADER)?.trim();
+  if (!sessionId) {
+    // First-request MCP auth can mint a new woo session, so it remains on the
+    // canonical world gateway. Once the MCP session id exists, later requests
+    // are stable-hashed to shard DOs and resume from Directory session state.
+    return forwardToHost(env, WORLD_HOST, request);
+  }
+  const session = await resolveSessionId(env, sessionId);
+  const routed = session ? withSessionHeaders(request, session) : request;
+  return forwardToHost(env, mcpGatewayShardHost(env, sessionId), routed);
+}
+
 async function withDirectorySession(env: Env, request: Request): Promise<Request> {
   const session = await resolveRequestSession(env, request);
   if (!session) return request;
+  return withSessionHeaders(request, session);
+}
+
+function withSessionHeaders(
+  request: Request,
+  session: { session_id: string; actor: string; expires_at: number; token_class: string; active_scope?: string | null; apikey_id?: string | null }
+): Request {
   const headers = cleanInternalHeaders(request.headers);
   headers.set("x-woo-internal-session", session.session_id);
   headers.set("x-woo-internal-actor", session.actor);
@@ -238,8 +265,12 @@ async function resolveRequestSession(env: Env, request: Request): Promise<{ sess
   const header = request.headers.get("authorization") ?? "";
   const match = /^Session\s+(.+)$/i.exec(header.trim());
   if (!match) return null;
+  return resolveSessionId(env, match[1]);
+}
+
+async function resolveSessionId(env: Env, sessionId: string): Promise<{ session_id: string; actor: string; expires_at: number; token_class: string; active_scope?: string | null; current_location?: string | null; apikey_id?: string | null } | null> {
   try {
-    const body = await directoryPost(env, "/resolve-session", { session_id: match[1] }) as Record<string, unknown>;
+    const body = await directoryPost(env, "/resolve-session", { session_id: sessionId }) as Record<string, unknown>;
     const session = body.session;
     if (!session || typeof session !== "object") return null;
     const record = session as Record<string, unknown>;
@@ -257,6 +288,25 @@ async function resolveRequestSession(env: Env, request: Request): Promise<{ sess
   } catch {
     return null;
   }
+}
+
+function mcpGatewayShardHost(env: Env, sessionId: string): string {
+  const shards = mcpGatewayShardCount(env);
+  return `${MCP_GATEWAY_SHARD_PREFIX}${stableHash(sessionId) % shards}`;
+}
+
+function mcpGatewayShardCount(env: Env): number {
+  const raw = Number(env.WOO_MCP_GATEWAY_SHARDS ?? DEFAULT_MCP_GATEWAY_SHARDS);
+  return Number.isInteger(raw) && raw > 0 && raw <= 256 ? raw : DEFAULT_MCP_GATEWAY_SHARDS;
+}
+
+function stableHash(input: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
 }
 
 function sessionActiveScope(record: Record<string, unknown>): string | null {

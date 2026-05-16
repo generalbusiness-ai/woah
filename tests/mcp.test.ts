@@ -5,6 +5,7 @@ import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
 import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
 import type { EffectTranscript } from "../src/core/effect-transcript";
+import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
 import { applyShadowTranscriptToCommittedState } from "../src/core/shadow-commit-scope";
 import type { MetricEvent, Observation, ObjRef, RemoteToolDescriptor, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
@@ -770,6 +771,78 @@ describe("McpHost", () => {
       creates: 1,
       writes: 1
     });
+  });
+
+  it("applies remote MCP shard commits in scope sequence order and dedups repeats", () => {
+    const world = bootstrapWorld();
+    world.setProp("the_chatroom", "next_seq", 5);
+    const gateway = new McpGateway(world);
+    const relay = createShadowBrowserRelayShim({
+      node: "mcp-order-test",
+      scope: "the_chatroom",
+      serialized: world.exportWorld()
+    });
+    relay.commit_scope.head = { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 4, hash: "head-4" };
+    (gateway as unknown as { v2Scopes: Map<string, unknown> }).v2Scopes.set("the_chatroom", {
+      scope: "the_chatroom",
+      relay,
+      openedSessions: new Set()
+    });
+    const transcript = (seq: number, value: string): EffectTranscript => ({
+      kind: "woo.effect_transcript.shadow.v1",
+      id: `remote-order-${seq}`,
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq,
+      session: null,
+      call: { actor: "$wiz", target: "the_chatroom", verb: "remote_order_probe", args: [value] },
+      reads: [],
+      writes: [
+        { cell: { kind: "prop", object: "$wiz", name: "remote_order_probe" }, value, op: "set" },
+        { cell: { kind: "prop", object: "the_chatroom", name: "next_seq" }, value: seq + 1, op: "set" }
+      ],
+      creates: [],
+      moves: [],
+      observations: [{ type: "remote_order_probe", source: "the_chatroom", text: value, ts: seq }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: `remote-order-${seq}`
+    });
+    const commit = (seq: number) => ({
+      kind: "woo.commit.accepted.shadow.v1" as const,
+      id: `remote-order-${seq}`,
+      position: { kind: "woo.scope_head.shadow.v1" as const, scope: "the_chatroom", epoch: 1, seq, hash: `head-${seq}` },
+      transcript_hash: `remote-order-${seq}`,
+      post_state_hash: `post-${seq}`,
+      observations: [{ type: "remote_order_probe", source: "the_chatroom", text: String(seq), ts: seq }],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1" as const,
+        id: `remote-order-${seq}`,
+        route: "sequenced" as const,
+        scope: "the_chatroom",
+        seq,
+        transcript_hash: `remote-order-${seq}`,
+        pre_state_hash: `pre-${seq}`,
+        post_state_hash: `post-${seq}`,
+        accepted: true,
+        errors: []
+      }
+    });
+
+    gateway.acceptRemoteV2Commit("the_chatroom", commit(6), transcript(6, "six"));
+    expect(world.propOrNull("$wiz", "remote_order_probe")).toBe(null);
+    expect(world.getProp("the_chatroom", "next_seq")).toBe(5);
+
+    gateway.acceptRemoteV2Commit("the_chatroom", commit(5), transcript(5, "five"));
+    expect(world.propOrNull("$wiz", "remote_order_probe")).toBe("six");
+    expect(world.getProp("the_chatroom", "next_seq")).toBe(7);
+
+    gateway.acceptRemoteV2Commit("the_chatroom", commit(6), transcript(6, "six-duplicate"));
+    expect(world.propOrNull("$wiz", "remote_order_probe")).toBe("six");
+    expect(world.getProp("the_chatroom", "next_seq")).toBe(7);
   });
 
   it("matches the serialized applier for write-only v2 accepted transcripts", () => {

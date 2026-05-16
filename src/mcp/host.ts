@@ -190,9 +190,12 @@ export class McpHost {
       for (const [sessionId, queue] of this.queues) {
         if (originSessionId && sessionId === originSessionId) continue;
         const sessionLocation = this.world.activeScopeForSession(sessionId);
+        const sourceScope = typeof observation.source === "string" ? observation.source : null;
         const shouldDeliver = directedActors.size > 0
           ? directedActors.has(queue.actor)
-          : this.actorSubscribes(queue.actor, frame.position.scope) || sessionLocation === frame.position.scope;
+          : this.actorSubscribes(queue.actor, frame.position.scope) ||
+            sessionLocation === frame.position.scope ||
+            (sourceScope !== null && (this.actorSubscribes(queue.actor, sourceScope) || sessionLocation === sourceScope));
         if (shouldDeliver) {
           this.enqueueFor(sessionId, observation);
           refreshSessions.add(sessionId);
@@ -709,6 +712,9 @@ export class McpHost {
       // scope's stale serialized world and returns missing_state.
       const liveEnclosing = this.enclosingSpaceFor(tool.object) ?? tool.enclosingSpace;
       try {
+        if (this.isMcpWaitTool(actor, tool)) {
+          return { result: await this.drainWait(sessionId, args), observations: [] };
+        }
         const result = this.isMcpControlTool(actor, tool)
           ? await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId })
           : this.dispatchHooks.direct
@@ -751,6 +757,10 @@ export class McpHost {
     };
   }
 
+  private isMcpWaitTool(actor: ObjRef, tool: McpTool): boolean {
+    return tool.object === actor && tool.verb === "wait";
+  }
+
   private isMcpControlTool(actor: ObjRef, tool: McpTool): boolean {
     return tool.object === actor && ["wait", "focus", "unfocus", "focus_list"].includes(tool.verb);
   }
@@ -765,8 +775,6 @@ export class McpHost {
   }
 
   private async handleWait(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
-    const timeoutMs = Math.max(0, Math.min(MAX_TIMEOUT_MS, toInt(args[0], 0)));
-    const limit = Math.max(1, Math.min(MAX_LIMIT, toInt(args[1], DEFAULT_LIMIT)));
     const sessionId = CURRENT_WAIT_SESSION_ID;
     if (!sessionId) {
       // Outside MCP context (e.g., REST directCall hits the verb). Return an
@@ -774,6 +782,12 @@ export class McpHost {
       // there's just no MCP session to source observations from.
       return emptyDrain();
     }
+    return await this.drainWait(sessionId, args);
+  }
+
+  private async drainWait(sessionId: string, args: WooValue[]): Promise<WooValue> {
+    const timeoutMs = Math.max(0, Math.min(MAX_TIMEOUT_MS, toInt(args[0], 0)));
+    const limit = Math.max(1, Math.min(MAX_LIMIT, toInt(args[1], DEFAULT_LIMIT)));
     const queue = this.queues.get(sessionId);
     if (!queue) return emptyDrain();
     if (queue.observations.length === 0 && timeoutMs > 0) {

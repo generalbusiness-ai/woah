@@ -12,6 +12,7 @@
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import type { EffectTranscript } from "../core/effect-transcript";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, ErrorValue, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedObject } from "../core/repository";
@@ -24,12 +25,15 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 
 const MCP_TOKEN_HEADER = "mcp-token";
 const MCP_SESSION_HEADER = "mcp-session-id";
 const AUTHORIZATION_HEADER = "authorization";
+const REMOTE_ACCEPTED_LRU_LIMIT = 8192;
+const REMOTE_PENDING_LIMIT = 1024;
+const REMOTE_PENDING_MAX_AGE_MS = 60_000;
 
 type SessionEntry = {
   woo: Session;
@@ -84,6 +88,13 @@ type V2ScopeClient = {
   openedSessions: Set<string>;
 };
 
+type RemoteAcceptedCommit = {
+  commit: ShadowCommitAccepted;
+  transcript: EffectTranscript;
+  originSessionId: string | null;
+  receivedAt: number;
+};
+
 export type McpGatewayOptions = {
   serverName?: string;
   serverVersion?: string;
@@ -96,6 +107,10 @@ export class McpGateway {
   readonly host: McpHost;
   private sessions = new Map<string, SessionEntry>();
   private v2Scopes = new Map<ObjRef, V2ScopeClient>();
+  private remoteAccepted = new Set<string>();
+  private remoteAcceptedOrder: string[] = [];
+  private remotePending = new Map<ObjRef, Map<number, RemoteAcceptedCommit>>();
+  private remotePendingCount = 0;
 
   constructor(private world: WooWorld, private options: McpGatewayOptions = {}) {
     const dispatch = options.v2 ? {
@@ -193,14 +208,14 @@ export class McpGateway {
     this.host.routeLiveEvents(result, originSessionId ?? null);
   }
 
-  closeSession(id: string): void {
+  closeSession(id: string, options: { unbind?: boolean } = {}): void {
     const entry = this.sessions.get(id);
     if (entry) {
       entry.dispose();
       void entry.transport.close().catch(() => {});
       this.sessions.delete(id);
     }
-    this.host.unbindSession(id);
+    if (options.unbind !== false) this.host.unbindSession(id);
   }
 
   sessionCount(): number {
@@ -212,6 +227,114 @@ export class McpGateway {
   // without an MCP client.
   bindActorSession(sessionId: string, actor: ObjRef): void {
     this.host.bindSession(sessionId, actor);
+  }
+
+  acceptRemoteV2Commit(scope: ObjRef, commit: ShadowCommitAccepted, transcript: EffectTranscript, originSessionId?: string | null): void {
+    const commitScope = commit.position.scope;
+    const key = remoteAcceptedKey(commit);
+    if (this.remoteAccepted.has(key)) return;
+    const pending = this.remotePending.get(commitScope);
+    if (pending?.has(commit.position.seq)) return;
+
+    this.pruneRemotePending();
+    const entry = { commit, transcript, originSessionId: originSessionId ?? null, receivedAt: Date.now() };
+    const expectedSeq = this.remoteExpectedSeq(commitScope);
+    if (expectedSeq === null) {
+      this.applyRemoteAccepted(scope, entry);
+      return;
+    }
+    if (commit.position.seq < expectedSeq) {
+      this.rememberRemoteAccepted(key);
+      return;
+    }
+    if (commit.position.seq > expectedSeq) {
+      this.queueRemoteAccepted(commitScope, entry);
+      return;
+    }
+    this.applyRemoteAccepted(scope, entry);
+    this.drainRemoteAccepted(scope, commitScope);
+  }
+
+  private applyRemoteAccepted(scope: ObjRef, entry: RemoteAcceptedCommit): void {
+    this.rememberRemoteAccepted(remoteAcceptedKey(entry.commit));
+    const client = this.v2Scopes.get(scope);
+    if (client) applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
+    this.world.applyCommittedShadowTranscript(entry.transcript);
+    this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId);
+  }
+
+  private drainRemoteAccepted(scope: ObjRef, commitScope: ObjRef): void {
+    const pending = this.remotePending.get(commitScope);
+    if (!pending) return;
+    while (true) {
+      const expectedSeq = this.remoteExpectedSeq(commitScope);
+      if (expectedSeq === null) break;
+      const entry = pending.get(expectedSeq);
+      if (!entry) break;
+      pending.delete(expectedSeq);
+      this.remotePendingCount -= 1;
+      this.applyRemoteAccepted(scope, entry);
+    }
+    if (pending.size === 0) this.remotePending.delete(commitScope);
+  }
+
+  private remoteExpectedSeq(scope: ObjRef): number | null {
+    const head = this.v2Scopes.get(scope)?.relay.commit_scope.head;
+    return head ? head.seq + 1 : null;
+  }
+
+  private queueRemoteAccepted(scope: ObjRef, entry: RemoteAcceptedCommit): void {
+    let pending = this.remotePending.get(scope);
+    if (!pending) {
+      pending = new Map();
+      this.remotePending.set(scope, pending);
+    }
+    pending.set(entry.commit.position.seq, entry);
+    this.remotePendingCount += 1;
+    this.trimRemotePending();
+  }
+
+  private rememberRemoteAccepted(key: string): void {
+    if (this.remoteAccepted.has(key)) return;
+    this.remoteAccepted.add(key);
+    this.remoteAcceptedOrder.push(key);
+    while (this.remoteAcceptedOrder.length > REMOTE_ACCEPTED_LRU_LIMIT) {
+      const oldest = this.remoteAcceptedOrder.shift();
+      if (oldest) this.remoteAccepted.delete(oldest);
+    }
+  }
+
+  private pruneRemotePending(): void {
+    const cutoff = Date.now() - REMOTE_PENDING_MAX_AGE_MS;
+    for (const [scope, pending] of this.remotePending) {
+      for (const [seq, entry] of pending) {
+        if (entry.receivedAt >= cutoff) continue;
+        pending.delete(seq);
+        this.remotePendingCount -= 1;
+      }
+      if (pending.size === 0) this.remotePending.delete(scope);
+    }
+  }
+
+  private trimRemotePending(): void {
+    while (this.remotePendingCount > REMOTE_PENDING_LIMIT) {
+      let oldestScope: ObjRef | null = null;
+      let oldestSeq: number | null = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [scope, pending] of this.remotePending) {
+        for (const [seq, entry] of pending) {
+          if (entry.receivedAt >= oldestAt) continue;
+          oldestAt = entry.receivedAt;
+          oldestScope = scope;
+          oldestSeq = seq;
+        }
+      }
+      if (oldestScope === null || oldestSeq === null) break;
+      const pending = this.remotePending.get(oldestScope);
+      if (!pending?.delete(oldestSeq)) break;
+      this.remotePendingCount -= 1;
+      if (pending.size === 0) this.remotePending.delete(oldestScope);
+    }
   }
 
   private bind(woo: Session): SessionEntry {
@@ -231,7 +354,7 @@ export class McpGateway {
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => woo.id,
       enableJsonResponse: true,
-      onsessionclosed: (id) => { this.closeSession(id); }
+      onsessionclosed: (id) => { this.closeSession(id, { unbind: false }); }
     });
 
     void server.connect(transport).catch(() => {});
@@ -414,10 +537,15 @@ export class McpGateway {
   private v2NodeFor(entry: SessionEntry): string {
     return `mcp:${entry.woo.id}`;
   }
+
 }
 
 function mcpV2Token(woo: Session): string {
   return `mcp-v2:${woo.id}:${woo.actor}`;
+}
+
+function remoteAcceptedKey(commit: ShadowCommitAccepted): string {
+  return `${commit.position.scope}:${commit.position.seq}`;
 }
 
 function refreshSerializedSessionAuthority(

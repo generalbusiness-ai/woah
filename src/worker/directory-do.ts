@@ -31,6 +31,7 @@ type SessionRoute = {
    * (and so revokeApiKey on a sibling host can tear them down). null for
    * guest/bearer-class sessions. */
   apikey_id: string | null;
+  mcp_shard: string | null;
   updated_at: number;
 };
 
@@ -120,6 +121,7 @@ export class DirectoryDO {
             active_scope: sessionActiveScope(body),
             current_location: sessionActiveScope(body),
             apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
+            mcp_shard: typeof body.mcp_shard === "string" && body.mcp_shard.length > 0 ? body.mcp_shard : null,
             updated_at: Date.now()
           });
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "ok", writes: wrote ? 1 : 0 });
@@ -145,6 +147,10 @@ export class DirectoryDO {
       if (request.method === "POST" && url.pathname === "/resolve-session") {
         const body = await readJson(request);
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
+      }
+
+      if (request.method === "POST" && url.pathname === "/mcp-shards") {
+        return json({ shards: this.activeMcpShards() });
       }
 
       if (request.method === "POST" && url.pathname === "/__internal/inherit-tombstones") {
@@ -193,6 +199,7 @@ export class DirectoryDO {
         token_class TEXT NOT NULL,
         current_location TEXT,
         apikey_id TEXT,
+        mcp_shard TEXT,
         updated_at INTEGER NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS directory_meta (
@@ -212,6 +219,7 @@ export class DirectoryDO {
     }
     this.ensureColumn("session_route", "current_location", "TEXT");
     this.ensureColumn("session_route", "apikey_id", "TEXT");
+    this.ensureColumn("session_route", "mcp_shard", "TEXT");
   }
 
   private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): boolean {
@@ -273,7 +281,7 @@ export class DirectoryDO {
     // singleton. Compare every column except updated_at; an unchanged row
     // is a no-op.
     const existing = firstRow(this.state.storage.sql.exec(
-      "SELECT actor, expires_at, token_class, current_location, apikey_id FROM session_route WHERE session_id = ?",
+      "SELECT actor, expires_at, token_class, current_location, apikey_id, mcp_shard FROM session_route WHERE session_id = ?",
       session.session_id
     ));
     if (existing
@@ -281,17 +289,19 @@ export class DirectoryDO {
       && Number(existing.expires_at) === session.expires_at
       && String(existing.token_class) === session.token_class
       && (existing.current_location === null ? null : String(existing.current_location)) === session.active_scope
-      && (existing.apikey_id === null ? null : String(existing.apikey_id)) === session.apikey_id) {
+      && (existing.apikey_id === null ? null : String(existing.apikey_id)) === session.apikey_id
+      && (existing.mcp_shard === null ? null : String(existing.mcp_shard)) === session.mcp_shard) {
       return false;
     }
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO session_route(session_id, actor, expires_at, token_class, current_location, apikey_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO session_route(session_id, actor, expires_at, token_class, current_location, apikey_id, mcp_shard, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
       session.actor,
       session.expires_at,
       session.token_class,
       session.active_scope,
       session.apikey_id,
+      session.mcp_shard,
       Date.now()
     );
     return true;
@@ -315,7 +325,7 @@ export class DirectoryDO {
   private resolveSession(sessionId: string): SessionRoute | null {
     if (!sessionId) return null;
     const row = firstRow(this.state.storage.sql.exec(
-      "SELECT session_id, actor, expires_at, token_class, current_location, apikey_id, updated_at FROM session_route WHERE session_id = ?",
+      "SELECT session_id, actor, expires_at, token_class, current_location, apikey_id, mcp_shard, updated_at FROM session_route WHERE session_id = ?",
       sessionId
     ));
     if (!row) return null;
@@ -332,8 +342,18 @@ export class DirectoryDO {
       active_scope: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
       current_location: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
       apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
+      mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
       updated_at: Number(row.updated_at)
     };
+  }
+
+  private activeMcpShards(): string[] {
+    const now = Date.now();
+    const rows = this.state.storage.sql.exec(
+      "SELECT DISTINCT mcp_shard FROM session_route WHERE mcp_shard IS NOT NULL AND mcp_shard != '' AND expires_at > ? ORDER BY mcp_shard",
+      now
+    ).toArray() as Array<{ mcp_shard?: unknown }>;
+    return rows.map((row) => String(row.mcp_shard)).filter(Boolean);
   }
 
   private async handleInheritTombstones(request: Request): Promise<Response> {
