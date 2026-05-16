@@ -1779,25 +1779,27 @@ export class PersistentObjectDO {
     world.setChainOriginPrefix(localHost);
   }
 
-  // Sample high-rate metric kinds so a noisy gateway doesn't blow up the log
-  // pipeline. `applied`, `direct_call`, and `compose_look` already have
-  // natural 1-per-call bounds; `broadcast` and `cross_host_rpc` can fire many
-  // times per call so we cap each kind at SAMPLE_BUDGET per SAMPLE_WINDOW_MS
-  // and emit a periodic dropped-count summary.
+  // Throttle log emission for high-rate metric kinds so a noisy gateway
+  // doesn't blow up the log pipeline. `applied`, `direct_call`, and
+  // `compose_look` already have natural 1-per-call bounds; `broadcast` and
+  // `cross_host_rpc` can fire many times per call so we cap each kind's log
+  // emission at SAMPLE_BUDGET per SAMPLE_WINDOW_MS and emit a periodic
+  // summary of how many *log lines* were skipped. The underlying operations
+  // still ran — only the per-event log line was suppressed.
   private emitMetric(event: MetricEvent, hostKey: string): void {
     if (event.kind === "broadcast" || event.kind === "cross_host_rpc" || event.kind === "storage_direct_write") {
       const counter = this.metricSampleCounters[event.kind];
       const now = Date.now();
       if (now - counter.windowStart >= METRIC_SAMPLE_WINDOW_MS) {
-        if (counter.dropped > 0) {
-          console.log("woo.metric", JSON.stringify({ kind: `${event.kind}_dropped`, count: counter.dropped, ms_window: METRIC_SAMPLE_WINDOW_MS, ts: now, host_key: hostKey }));
+        if (counter.suppressed > 0) {
+          console.log("woo.metric", JSON.stringify({ kind: `${event.kind}_log_sampled`, suppressed: counter.suppressed, ms_window: METRIC_SAMPLE_WINDOW_MS, ts: now, host_key: hostKey }));
         }
         counter.windowStart = now;
         counter.emitted = 0;
-        counter.dropped = 0;
+        counter.suppressed = 0;
       }
       if (counter.emitted >= METRIC_SAMPLE_BUDGET) {
-        counter.dropped += 1;
+        counter.suppressed += 1;
         return;
       }
       counter.emitted += 1;
@@ -1805,10 +1807,10 @@ export class PersistentObjectDO {
     console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: hostKey }));
   }
 
-  private metricSampleCounters: Record<"broadcast" | "cross_host_rpc" | "storage_direct_write", { windowStart: number; emitted: number; dropped: number }> = {
-    broadcast: { windowStart: 0, emitted: 0, dropped: 0 },
-    cross_host_rpc: { windowStart: 0, emitted: 0, dropped: 0 },
-    storage_direct_write: { windowStart: 0, emitted: 0, dropped: 0 }
+  private metricSampleCounters: Record<"broadcast" | "cross_host_rpc" | "storage_direct_write", { windowStart: number; emitted: number; suppressed: number }> = {
+    broadcast: { windowStart: 0, emitted: 0, suppressed: 0 },
+    cross_host_rpc: { windowStart: 0, emitted: 0, suppressed: 0 },
+    storage_direct_write: { windowStart: 0, emitted: 0, suppressed: 0 }
   };
 
   private serializedCallContext(ctx: CallContext): Record<string, unknown> {
