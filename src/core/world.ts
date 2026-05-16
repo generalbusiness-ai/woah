@@ -393,6 +393,11 @@ type PersistenceDirtyState = {
 
 const MAX_CALL_DEPTH = 128;
 
+// Upper bound on $actor.focus_list — keeps the per-actor working set finite
+// when an MCP client repeatedly focuses without unfocusing. Older entries are
+// evicted FIFO once this cap is reached.
+const ACTOR_FOCUS_LIST_CAP = 32;
+
 // WooWorld still carries both persistence shapes during the v0.5 transition:
 // exportWorld/importWorld support bootstrap migration and JSON-folder dumps,
 // while ObjectRepository is the runtime hot path after bootstrap.
@@ -7139,6 +7144,12 @@ export class WooWorld {
     return location && location !== "$nowhere" && this.objects.has(location) ? location : home;
   }
 
+  private focusListOf(actor: ObjRef): ObjRef[] {
+    if (!this.objects.has(actor)) return [];
+    const raw = this.propOrNull(actor, "focus_list");
+    return Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
+  }
+
   private inventoryEjectTarget(item: ObjRef, fallback: ObjRef): ObjRef {
     const homeValue = this.propOrNull(item, "home");
     return typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : fallback;
@@ -8570,6 +8581,48 @@ export class WooWorld {
         error: entry.error as unknown as WooValue
       }));
     });
+    // $actor:focus/unfocus/focus_list mutate the actor's focus_list property.
+    // These are registered here (not in McpHost) so that they remain available
+    // when the actor's home DO wakes from hibernation via /__internal/remote-
+    // dispatch — that path does not construct an McpHost, so handlers installed
+    // by McpHost's constructor would not be present on the fresh world.
+    this.nativeHandlers.set("actor_focus", (ctx, args) => {
+      const target = String(args[0] ?? "");
+      if (!target) throw wooError("E_INVARG", `focus target not found: ${target}`);
+      const actor = ctx.thisObj;
+      if (this.objects.has(target)) {
+        if (target !== actor && this.inheritsFrom(target, "$actor") && !this.inheritsFrom(target, "$block")) {
+          throw wooError("E_PERM", `cannot focus another actor: ${target}`);
+        }
+        if (!this.canReadProperty(actor, target, "name")) {
+          throw wooError("E_PERM", `focus target not visible: ${target}`);
+        }
+      }
+      const list = this.focusListOf(actor);
+      if (!list.includes(target)) {
+        list.push(target);
+        while (list.length > ACTOR_FOCUS_LIST_CAP) list.shift();
+        this.setProp(actor, "focus_list", list);
+      }
+      return list as unknown as WooValue;
+    });
+    this.nativeHandlers.set("actor_unfocus", (ctx, args) => {
+      const target = String(args[0] ?? "");
+      const actor = ctx.thisObj;
+      const list = this.focusListOf(actor).filter((id) => id !== target);
+      this.setProp(actor, "focus_list", list);
+      return list as unknown as WooValue;
+    });
+    this.nativeHandlers.set("actor_focus_list", (ctx) => this.focusListOf(ctx.thisObj) as unknown as WooValue);
+    // $actor:wait normally short-circuits in McpHost.invokeTool (drainWait) so
+    // this native rarely runs. It exists for non-MCP callers (e.g. woocode
+    // dispatching $actor:wait directly) — they have no session queue, so the
+    // correct behavior is an empty drain rather than a missing-handler error.
+    this.nativeHandlers.set("actor_wait", () => ({
+      observations: [] as unknown as WooValue,
+      more: false,
+      queue_depth: 0
+    } as unknown as WooValue));
     this.nativeHandlers.set("catalog_registry_install", (ctx, args) => {
       if (!this.object(ctx.actor).flags.wizard) throw wooError("E_PERM", "only wizards may install catalogs", ctx.actor);
       const manifest = assertMap(args[0]) as unknown as CatalogManifest;

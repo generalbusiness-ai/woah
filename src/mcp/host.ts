@@ -6,7 +6,7 @@
 // and §M2 (verb-to-tool mapping with route classification). Transport
 // (stdio/HTTP) lives in src/mcp/server.ts; this module is transport-agnostic.
 
-import type { CallContext, NativeHandler, WooWorld } from "../core/world";
+import type { WooWorld } from "../core/world";
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Observation, RemoteToolDescriptor, WooValue } from "../core/types";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
@@ -26,7 +26,6 @@ const DEFAULT_LIMIT = 64;
 const MAX_LIMIT = 256;
 const DEFAULT_TOOL_PAGE_LIMIT = 40;
 const MAX_TOOL_PAGE_LIMIT = 200;
-const FOCUS_LIST_CAP = 32;
 const MAX_TIMEOUT_MS = 30_000;
 const OBJECT_VERB_SEP = "\u0000";
 
@@ -106,10 +105,24 @@ export class McpHost {
   private broadcasts: McpBroadcastHooks = {};
 
   constructor(private world: WooWorld, private dispatchHooks: McpDispatchHooks = {}) {
-    // Native handlers register ONCE per world. Subsequent McpHost instances on
-    // the same world would clobber per-session queues — McpGateway owns one
-    // singleton McpHost per world to avoid that footgun.
-    this.installNativeHandlers();
+    // The actor_focus/unfocus/focus_list/wait native handlers are registered
+    // by WooWorld's constructor (see registerNativeHandlers in world.ts) so
+    // they remain installed when the actor's home DO wakes from hibernation
+    // via /__internal/remote-dispatch — that path resolves verbs without ever
+    // constructing an McpHost.
+    //
+    // McpHost.invokeTool short-circuits the actor's *own* wait tool directly
+    // to drainWait(sessionId). But cross-actor wait dispatch (one session's
+    // invokeTool reaching another actor's wait verb) reaches this world via
+    // world.directCall and needs queue-aware draining keyed by CURRENT_WAIT_
+    // SESSION_ID. Override the world.ts no-op only when McpHost is present;
+    // it's safe because invokeTool sets/restores CURRENT_WAIT_SESSION_ID
+    // around every dispatch.
+    this.world.registerNativeHandler("actor_wait", async (_ctx, args) => {
+      const sessionId = CURRENT_WAIT_SESSION_ID;
+      if (!sessionId) return emptyDrain();
+      return await this.drainWait(sessionId, args);
+    });
   }
 
   setBroadcastHooks(hooks: McpBroadcastHooks): void {
@@ -833,25 +846,7 @@ export class McpHost {
     });
   }
 
-  // ----- $actor:wait / focus / unfocus / focus_list handlers -----
-
-  private installNativeHandlers(): void {
-    this.world.registerNativeHandler("actor_wait", (ctx, args) => this.handleWait(ctx, args));
-    this.world.registerNativeHandler("actor_focus", (ctx, args) => this.handleFocus(ctx, args));
-    this.world.registerNativeHandler("actor_unfocus", (ctx, args) => this.handleUnfocus(ctx, args));
-    this.world.registerNativeHandler("actor_focus_list", (ctx) => this.handleFocusList(ctx));
-  }
-
-  private async handleWait(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
-    const sessionId = CURRENT_WAIT_SESSION_ID;
-    if (!sessionId) {
-      // Outside MCP context (e.g., REST directCall hits the verb). Return an
-      // empty drain rather than throwing — the verb is still well-formed,
-      // there's just no MCP session to source observations from.
-      return emptyDrain();
-    }
-    return await this.drainWait(sessionId, args);
-  }
+  // ----- $actor:wait drain (focus/unfocus/focus_list natives live in world.ts) -----
 
   private async drainWait(sessionId: string, args: WooValue[]): Promise<WooValue> {
     const timeoutMs = Math.max(0, Math.min(MAX_TIMEOUT_MS, toInt(args[0], 0)));
@@ -885,42 +880,6 @@ export class McpHost {
       more: queue.observations.length > 0,
       queue_depth: queue.observations.length
     } as unknown as WooValue;
-  }
-
-  private handleFocus(ctx: CallContext, args: WooValue[]): WooValue {
-    const target = String(args[0] ?? "");
-    if (!target) throw wooError("E_INVARG", `focus target not found: ${target}`);
-    const actor = ctx.thisObj;
-    // Local-known targets get full visibility/actor checks. Remote targets
-    // (runtime objects on a different host that this gateway has never seen
-    // a stub for) are accepted on trust: the cross-host enumeration that
-    // surfaced their tools has already filtered visibility on the owning
-    // host (mcp.md §M3). The actor-exclusion check requires a local stub,
-    // so a remote target can't accidentally escalate to another actor's
-    // verbs anyway.
-    if (this.world.objects.has(target)) {
-      if (this.isOtherActor(actor, target)) throw wooError("E_PERM", `cannot focus another actor: ${target}`);
-      if (!this.actorCanSee(actor, target)) throw wooError("E_PERM", `focus target not visible: ${target}`);
-    }
-    const list = this.focusListOf(actor);
-    if (!list.includes(target)) {
-      list.push(target);
-      while (list.length > FOCUS_LIST_CAP) list.shift();
-      this.world.setProp(actor, "focus_list", list);
-    }
-    return list as unknown as WooValue;
-  }
-
-  private handleUnfocus(ctx: CallContext, args: WooValue[]): WooValue {
-    const target = String(args[0] ?? "");
-    const actor = ctx.thisObj;
-    const list = this.focusListOf(actor).filter((id) => id !== target);
-    this.world.setProp(actor, "focus_list", list);
-    return list as unknown as WooValue;
-  }
-
-  private handleFocusList(ctx: CallContext): WooValue {
-    return this.focusListOf(ctx.thisObj) as unknown as WooValue;
   }
 
   private focusListOf(actor: ObjRef): ObjRef[] {
