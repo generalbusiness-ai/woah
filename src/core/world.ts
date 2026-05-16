@@ -8378,7 +8378,6 @@ export class WooWorld {
   }
 
   private registerNativeHandlers(): void {
-    this.nativeHandlers.set("describe", (ctx) => this.describeForActor(ctx.thisObj, ctx.actor));
     this.nativeHandlers.set("player_on_disfunc", () => true);
     this.nativeHandlers.set("player_moveto", async (ctx, args) => {
       if (ctx.thisObj !== ctx.actor && !this.isWizard(ctx.actor)) throw wooError("E_PERM", "players may only move themselves", { actor: ctx.actor, target: ctx.thisObj });

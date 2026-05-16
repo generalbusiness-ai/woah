@@ -222,11 +222,14 @@ object behavior such as a mounted pinboard or control surface emitting visible
 activity to its containing room; it does not make the containing-room relation a
 core property.
 
-`room_look_projection(room)` returns the substrate-provided structured room
-view used by the bundled chat catalog's `$room:look_self()`: room id, title,
-description, roster rows, and visible contents. It exists because that view is a
-cross-host projection over room contents and remote object summaries; the
-English command and observation policy still live in catalog source.
+`room_look_projection(room)` is a public builtin that returns the
+substrate-provided structured room view used by the bundled chat catalog's
+`$room:look_self()`: room id, title, description, roster rows, and visible
+contents. It exists because that view is a cross-host projection over room
+contents and remote object summaries; the English command and observation
+policy still live in catalog source. Visibility is evaluated with the calling
+actor's authority, so third-party catalogs may reuse the projection without
+gaining read access beyond what ordinary room look would reveal to that actor.
 
 `room_who_projection(room)` returns `{roster, observation}` for a room's
 present actors. Catalog `$room:who()` emits the observation and returns the

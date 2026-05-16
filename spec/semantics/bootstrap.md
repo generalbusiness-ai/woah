@@ -515,7 +515,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 | `:emote(text)` | str | Emits `emoted`. |
 | `:tell(recipient, text)` | obj, str | Emits `told` to `recipient`. |
 | `:look()` | — | Thin chat command wrapper over `this:look_at(this)`. |
-| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. |
+| `:look_at(target)` | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. |
 | `:who()` | — | Woocode over `room_who_projection(this)`. Emits a private `who` observation and returns the present-actor roster. |
 | `:enter(actor?)` | obj? | Adds presence; emits `entered`. |
 | `:leave(actor?)` | obj? | Removes presence; emits `left`. |

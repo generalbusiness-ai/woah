@@ -971,7 +971,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         source_hash: "conf-remote-command-ping-seed",
         version: 1,
         line_map: {},
-        native: "describe",
+        native: "player_on_disfunc",
         direct_callable: true
       });
       expect(installVerb(home, "conf_home_widget", "ping", `verb :ping() rxd {
