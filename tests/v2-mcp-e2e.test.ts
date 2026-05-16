@@ -154,6 +154,62 @@ describe("v2 MCP e2e", () => {
     }
   });
 
+  it("carries actor inventory across scopes so drop succeeds in the new room", async () => {
+    // Production walkthrough surfaced this companion to the cross-scope move
+    // bug: take an item in chatroom, southeast to deck, then drop. Inventory
+    // verbs read `actor.contents` (which the slice already refreshes), but
+    // drop calls `location(item) == actor` — the item's `location` field must
+    // also be authoritative on the destination scope, or drop raises E_INVARG
+    // even though the actor visibly carries the item. Authority slice must
+    // include each item the actor holds.
+    const world = createWorld();
+    const scopeStates = new Map<string, FakeDurableObjectState>();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopes = new Map<string, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
+      }
+    });
+
+    try {
+      const alice = await initializeMcp(gateway, "guest:v2-mcp-cross-scope-inventory", 1);
+      const aliceActor = world.sessions.get(alice)!.actor;
+      const take = await mcp(gateway, alice, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "take", args: ["the_mug"] }
+      });
+      expect(take.result.isError, JSON.stringify(take.result.structuredContent)).not.toBe(true);
+      expect(world.object("the_mug").location).toBe(aliceActor);
+
+      const move = await mcp(gateway, alice, 3, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+      });
+      expect(move.result.isError, JSON.stringify(move.result.structuredContent)).not.toBe(true);
+
+      const drop = await mcp(gateway, alice, 4, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_deck", verb: "drop", args: ["the_mug"] }
+      });
+      expect(drop.result.isError, JSON.stringify(drop.result.structuredContent)).not.toBe(true);
+      expect(world.object("the_mug").location).toBe("the_deck");
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
   it("commits woo_focus through the v2 authority instead of mutating only the gateway", async () => {
     const world = createWorld();
     const scopeState = new FakeDurableObjectState("the_chatroom");

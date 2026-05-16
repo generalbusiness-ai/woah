@@ -5992,15 +5992,20 @@ export class WooWorld {
     // V2 commit scopes plan against durable, long-lived snapshots. On every
     // open/envelope the gateway sends the authoritative live cells needed to
     // validate and plan the next turn: session rows, session actor objects,
-    // and the rooms those sessions currently occupy. Room rows carry the
-    // contents/session_subscribers materialized indexes, so cross-scope moves
-    // do not leave another CommitScopeDO planning against stale presence.
+    // the rooms those sessions currently occupy, and each item the actor
+    // carries. Room rows carry contents/session_subscribers indexes, so
+    // cross-scope moves do not leave another CommitScopeDO planning against
+    // stale presence. Inventory items must travel too — verbs like `drop`
+    // assert `location(item) == actor`, which would fail on the destination
+    // scope if the item's location field were still anchored at the room
+    // where the actor first picked it up.
     const ids: ObjRef[] = Array.from(extraObjectIds);
     for (const session of sessions) {
       ids.push(session.actor);
       if (session.activeScope) ids.push(session.activeScope);
       const actor = this.objects.get(session.actor);
       if (actor?.location) ids.push(actor.location);
+      if (actor) for (const item of actor.contents) ids.push(item);
     }
     return {
       kind: "woo.authority_slice.shadow.v1",
