@@ -28,36 +28,17 @@ import {
   type ShadowBrowserStateTransfer,
   type ShadowTransportHello
 } from "../core/shadow-browser-node";
-import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
+import { transcriptLogEntry, transcriptSessionActiveScope, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 
-// CommitScopeDO persists the full SerializedWorld snapshot in a single
-// `v2_commit_scope_meta.serialized` column. Cloudflare Durable Object SQL
-// rejects individual values larger than ~2 MiB with SQLITE_TOOBIG, and a
-// world with the bundled catalogs installed crosses that boundary. Storage
-// is gzipped + base64-encoded so it stays comfortably under the limit; the
-// `GZB1:` prefix is the format marker and load detects legacy uncompressed
-// JSON rows (which start with `{`) so existing scopes upgrade without a
-// migration step.
+// Legacy CommitScopeDOs persisted the full SerializedWorld snapshot in a
+// single `v2_commit_scope_meta.serialized` column. Keep the decoder so old
+// scopes can hydrate once and then rewrite into the row-shaped tables below.
 const COMPRESSED_BLOB_PREFIX = "GZB1:";
-
-async function encodeSerializedWorld(serialized: SerializedWorld): Promise<string> {
-  const bytes = new TextEncoder().encode(JSON.stringify(serialized));
-  // Drive CompressionStream directly through its writable/readable interface;
-  // wrapping in `new Response(...)` is convenient but fails in tests that stub
-  // the global Response constructor (e.g. cf-repository's WebSocket upgrade
-  // test), and we never need a Response object here.
-  const cs = new CompressionStream("gzip");
-  const writer = cs.writable.getWriter();
-  const writeDone = writer.write(bytes).then(() => writer.close());
-  const chunks = await readAllChunks(cs.readable);
-  await writeDone;
-  return COMPRESSED_BLOB_PREFIX + base64FromBytes(concatBytes(chunks));
-}
 
 async function decodeSerializedWorld(blob: string): Promise<SerializedWorld> {
   if (!blob.startsWith(COMPRESSED_BLOB_PREFIX)) {
@@ -99,17 +80,6 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
-function base64FromBytes(bytes: Uint8Array): string {
-  // btoa needs a binary string; String.fromCharCode(...arr) stack-overflows on
-  // payloads larger than ~100 KB, so chunk the conversion.
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
 function bytesFromBase64(b64: string): Uint8Array {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
@@ -128,7 +98,30 @@ export class CommitScopeDO {
   ) {
     const constructorStartedAt = Date.now();
     this.state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT NOT NULL, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, object_counter INTEGER NOT NULL DEFAULT 1, parked_task_counter INTEGER NOT NULL DEFAULT 1, session_counter INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)"
+    );
+    this.ensureMetaColumn("version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureMetaColumn("object_counter", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureMetaColumn("parked_task_counter", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureMetaColumn("session_counter", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureMetaSerializedNullable();
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_object (id TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_session (id TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_log (space TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(space, seq))"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_snapshot (space TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(space, seq))"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_task (id TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_tombstone (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL)"
     );
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_accepted_frame (scope TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, position_hash TEXT NOT NULL, body TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(scope, seq))"
@@ -471,14 +464,15 @@ export class CommitScopeDO {
 
   private async loadRowSnapshot(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim | null> {
     const rows = sqlRows<CommitScopeMetaRow>(this.state.storage.sql.exec(
-      "SELECT scope, relay_node, serialized, head, idempotency_window_ms FROM v2_commit_scope_meta WHERE id = 'current'"
+      "SELECT scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter FROM v2_commit_scope_meta WHERE id = 'current'"
     ));
     const meta = rows[0] ?? null;
     if (!meta) return null;
+    const serialized = await this.loadSerializedWorld(meta);
     const relay = createShadowBrowserRelayShim({
       node: meta.relay_node,
       scope: meta.scope as ObjRef,
-      serialized: await decodeSerializedWorld(meta.serialized),
+      serialized,
       idempotency_window_ms: Number(meta.idempotency_window_ms)
     });
     relay.commit_scope.head = JSON.parse(meta.head) as ShadowScopeHead;
@@ -501,15 +495,47 @@ export class CommitScopeDO {
     return relay;
   }
 
+  private async loadSerializedWorld(meta: CommitScopeMetaRow): Promise<SerializedWorld> {
+    const objectRows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_object ORDER BY id"
+    ));
+    if (objectRows.length === 0 && meta.serialized) {
+      // One-time upgrade path for legacy single-blob scopes. Mark the relay for
+      // a full row-shaped save after /v2/open has refreshed session authority.
+      this.needsFullSave = true;
+      return await decodeSerializedWorld(meta.serialized);
+    }
+    return {
+      version: Number(meta.version ?? 1) as 1,
+      objectCounter: Number(meta.object_counter ?? 1),
+      parkedTaskCounter: Number(meta.parked_task_counter ?? 1),
+      sessionCounter: Number(meta.session_counter ?? 1),
+      objects: objectRows.map((row) => JSON.parse(row.body) as SerializedObject),
+      sessions: sqlRows<{ body: string }>(this.state.storage.sql.exec(
+        "SELECT body FROM v2_commit_scope_session ORDER BY id"
+      )).map((row) => JSON.parse(row.body) as SerializedSession),
+      logs: logsFromRows(sqlRows<{ space: string; body: string }>(this.state.storage.sql.exec(
+        "SELECT space, body FROM v2_commit_scope_log ORDER BY space, seq"
+      ))),
+      snapshots: sqlRows<{ body: string }>(this.state.storage.sql.exec(
+        "SELECT body FROM v2_commit_scope_snapshot ORDER BY space, seq"
+      )).map((row) => JSON.parse(row.body) as SerializedWorld["snapshots"][number]),
+      parkedTasks: sqlRows<{ body: string }>(this.state.storage.sql.exec(
+        "SELECT body FROM v2_commit_scope_task ORDER BY id"
+      )).map((row) => JSON.parse(row.body) as SerializedWorld["parkedTasks"][number]),
+      tombstones: sqlRows<{ id: string }>(this.state.storage.sql.exec(
+        "SELECT id FROM v2_commit_scope_tombstone ORDER BY id"
+      )).map((row) => row.id)
+    };
+  }
+
   private async saveFull(relay: ShadowBrowserRelayShim): Promise<void> {
     // Full saves are reserved for cold initialization and one-time migration
-    // from the legacy blob table. Hot envelopes use saveEnvelopeDelta instead.
+    // from the legacy blob column. Hot envelopes use saveEnvelopeDelta instead.
     const now = Date.now();
-    // Gzip-encode the serialized world before opening the storage transaction,
-    // since CompressionStream is async and transactionSync requires sync work.
-    const serializedBlob = await encodeSerializedWorld(relay.commit_scope.serialized);
     this.state.storage.transactionSync(() => {
-      this.saveMeta(relay, now, serializedBlob);
+      this.saveMeta(relay, now);
+      this.saveWorldRows(relay.commit_scope.serialized, now);
       this.saveAcceptedFrames(relay, now);
       this.saveTranscriptTail(relay, now);
       this.saveSeenKeys(relay);
@@ -529,15 +555,8 @@ export class CommitScopeDO {
     const seenAt = relay.recently_seen.get(receipt.idempotency_key);
     if (seenAt === undefined) return;
     const now = Date.now();
-    // The delta path only rewrites the meta row when a turn actually committed.
-    // Skip the (async, ~100 ms on 2 MiB) gzip pass when the reply was rejected
-    // or carries no commit, so write-amplification stays proportional to real
-    // commits rather than every envelope retry.
     const body = reply?.body;
     const willSaveMeta = body?.ok === true && Boolean(body.commit) && Boolean(body.transcript);
-    const serializedBlob = willSaveMeta
-      ? await encodeSerializedWorld(relay.commit_scope.serialized)
-      : null;
     this.state.storage.transactionSync(() => {
       this.saveSeenKey(receipt.idempotency_key, seenAt);
       this.pruneSeenAndReplies(relay, now);
@@ -545,8 +564,9 @@ export class CommitScopeDO {
         this.saveRecentReply(receipt.idempotency_key, reply, now);
         this.pruneRecentReplies();
       }
-      if (willSaveMeta && serializedBlob !== null && body && body.ok === true && body.commit && body.transcript) {
-        this.saveMeta(relay, now, serializedBlob);
+      if (willSaveMeta && body && body.ok === true && body.commit && body.transcript) {
+        this.saveMeta(relay, now);
+        this.saveTranscriptDelta(relay.commit_scope.serialized, body.transcript, now);
         this.saveAcceptedFrame(body.commit, now);
         this.saveTranscript(body.transcript, now);
         this.pruneAcceptedFrames(relay);
@@ -555,14 +575,101 @@ export class CommitScopeDO {
     });
   }
 
-  private saveMeta(relay: ShadowBrowserRelayShim, now: number, serializedBlob: string): void {
+  private saveMeta(relay: ShadowBrowserRelayShim, now: number): void {
+    const serialized = relay.commit_scope.serialized;
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       relay.commit_scope.scope,
       relay.node,
-      serializedBlob,
+      null,
       JSON.stringify(relay.commit_scope.head),
       relay.idempotency_window_ms,
+      serialized.version,
+      serialized.objectCounter,
+      serialized.parkedTaskCounter,
+      serialized.sessionCounter,
+      now
+    );
+  }
+
+  private saveWorldRows(serialized: SerializedWorld, now: number): void {
+    for (const table of [
+      "v2_commit_scope_tombstone",
+      "v2_commit_scope_task",
+      "v2_commit_scope_snapshot",
+      "v2_commit_scope_log",
+      "v2_commit_scope_session",
+      "v2_commit_scope_object"
+    ]) {
+      this.state.storage.sql.exec(`DELETE FROM ${table}`);
+    }
+    for (const obj of serialized.objects) this.saveObjectRow(obj, now);
+    for (const session of serialized.sessions) this.saveSessionRow(session, now);
+    for (const [space, entries] of serialized.logs) {
+      for (const entry of entries) this.saveLogRow(space, entry, now);
+    }
+    for (const snapshot of serialized.snapshots) {
+      this.state.storage.sql.exec(
+        "INSERT OR REPLACE INTO v2_commit_scope_snapshot(space, seq, body, updated_at) VALUES (?, ?, ?, ?)",
+        snapshot.space_id,
+        snapshot.seq,
+        JSON.stringify(snapshot),
+        now
+      );
+    }
+    for (const task of serialized.parkedTasks) {
+      this.state.storage.sql.exec(
+        "INSERT OR REPLACE INTO v2_commit_scope_task(id, body, updated_at) VALUES (?, ?, ?)",
+        task.id,
+        JSON.stringify(task),
+        now
+      );
+    }
+    for (const id of serialized.tombstones ?? []) {
+      this.state.storage.sql.exec("INSERT OR REPLACE INTO v2_commit_scope_tombstone(id, updated_at) VALUES (?, ?)", id, now);
+    }
+  }
+
+  private saveTranscriptDelta(serialized: SerializedWorld, transcript: EffectTranscript, now: number): void {
+    for (const id of transcriptTouchedObjectIds(transcript)) {
+      // Typical turns touch only a few objects. If this path grows to many
+      // touched ids per turn, build a one-shot id->object map before the loop.
+      const obj = serialized.objects.find((item) => item.id === id);
+      if (obj) this.saveObjectRow(obj, now);
+    }
+    const sessionUpdate = transcriptSessionActiveScope(transcript);
+    if (sessionUpdate) {
+      const session = serialized.sessions.find((item) => item.id === sessionUpdate.session && item.actor === sessionUpdate.actor);
+      if (session) this.saveSessionRow(session, now);
+    }
+    const log = transcriptLogEntry(transcript);
+    if (log) this.saveLogRow(log.space, log, now);
+  }
+
+  private saveObjectRow(obj: SerializedObject, now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_object(id, body, updated_at) VALUES (?, ?, ?)",
+      obj.id,
+      JSON.stringify(obj),
+      now
+    );
+  }
+
+  private saveSessionRow(session: SerializedSession, now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_session(id, body, updated_at) VALUES (?, ?, ?)",
+      session.id,
+      JSON.stringify(session),
+      now
+    );
+  }
+
+  private saveLogRow(space: ObjRef, entry: SerializedWorld["logs"][number][1][number], now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_log(space, seq, body, updated_at) VALUES (?, ?, ?, ?)",
+      space,
+      entry.seq,
+      JSON.stringify(entry),
       now
     );
   }
@@ -716,6 +823,27 @@ export class CommitScopeDO {
       overflow
     );
   }
+
+  private ensureMetaColumn(column: string, definition: string): void {
+    const columns = new Set(sqlRows<{ name: string }>(this.state.storage.sql.exec("PRAGMA table_info(v2_commit_scope_meta)")).map((row) => String(row.name)));
+    if (!columns.has(column)) this.state.storage.sql.exec(`ALTER TABLE v2_commit_scope_meta ADD COLUMN ${column} ${definition}`);
+  }
+
+  private ensureMetaSerializedNullable(): void {
+    const serializedColumn = sqlRows<{ name: string; notnull: number }>(this.state.storage.sql.exec("PRAGMA table_info(v2_commit_scope_meta)"))
+      .find((row) => row.name === "serialized");
+    if (!serializedColumn || Number(serializedColumn.notnull) === 0) return;
+    this.state.storage.sql.exec("ALTER TABLE v2_commit_scope_meta RENAME TO v2_commit_scope_meta_old_notnull");
+    this.state.storage.sql.exec(
+      "CREATE TABLE v2_commit_scope_meta (id TEXT PRIMARY KEY, scope TEXT NOT NULL, relay_node TEXT NOT NULL, serialized TEXT, head TEXT NOT NULL, idempotency_window_ms INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, object_counter INTEGER NOT NULL DEFAULT 1, parked_task_counter INTEGER NOT NULL DEFAULT 1, session_counter INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)"
+    );
+    this.state.storage.sql.exec(
+      `INSERT INTO v2_commit_scope_meta(id, scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at)
+        SELECT id, scope, relay_node, serialized, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at
+        FROM v2_commit_scope_meta_old_notnull`
+    );
+    this.state.storage.sql.exec("DROP TABLE v2_commit_scope_meta_old_notnull");
+  }
 }
 
 type CommitScopeDurableState = {
@@ -766,9 +894,13 @@ type CommitScopeEnvelopeResponse = {
 type CommitScopeMetaRow = {
   scope: string;
   relay_node: string;
-  serialized: string;
+  serialized?: string | null;
   head: string;
   idempotency_window_ms: number;
+  version?: number;
+  object_counter?: number;
+  parked_task_counter?: number;
+  session_counter?: number;
 };
 
 async function readJson<T>(request: Request): Promise<T> {
@@ -795,6 +927,34 @@ function decodeStorageKey(hex: string): string {
     bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
   }
   return new TextDecoder().decode(bytes);
+}
+
+function logsFromRows(rows: Array<{ space: string; body: string }>): SerializedWorld["logs"] {
+  const bySpace = new Map<ObjRef, SerializedWorld["logs"][number][1]>();
+  for (const row of rows) {
+    const entries = bySpace.get(row.space) ?? [];
+    entries.push(JSON.parse(row.body) as SerializedWorld["logs"][number][1][number]);
+    bySpace.set(row.space, entries);
+  }
+  return Array.from(bySpace.entries()).map(([space, entries]) => [
+    space,
+    entries.sort((a, b) => a.seq - b.seq)
+  ]);
+}
+
+function transcriptTouchedObjectIds(transcript: EffectTranscript): Set<ObjRef> {
+  const ids = new Set<ObjRef>();
+  for (const create of transcript.creates) {
+    ids.add(create.object);
+    if (create.parent) ids.add(create.parent);
+    if (create.location) ids.add(create.location);
+  }
+  for (const write of transcript.writes) {
+    if (write.cell.kind === "prop" || write.cell.kind === "location" || write.cell.kind === "contents" || write.cell.kind === "lifecycle") {
+      ids.add(write.cell.object);
+    }
+  }
+  return ids;
 }
 
 type V2EnvelopeReplyMetric = "none" | "accepted" | "live" | "missing_state" | "commit_rejected";

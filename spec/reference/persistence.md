@@ -331,6 +331,103 @@ configurable horizon with the same backup/restore caveat as §14.2.1.
 
 All writes within a single opcode are atomic (CF DOs give us SQLite transactions). A verb body is *not* atomic across yield points; cross-DO ops give other tasks a chance to interleave on each DO. Authors who need atomicity across multiple ops use `with_lock(obj) { ... }` (deferred to phase 2; simply documented for v1).
 
+### 14.4 CommitScopeDO v2 authority schema
+
+`CommitScopeDO` owns v2 commit authority state, not ordinary hosted object
+storage, so it does not implement the `ObjectRepository` interface. Its
+Cloudflare encoding still follows the same row-shaped rule: state that grows
+with world size is split into rows, and accepted commits rewrite only rows
+touched by the transcript.
+
+```sql
+CREATE TABLE v2_commit_scope_meta (
+  id                     TEXT PRIMARY KEY, -- always 'current'
+  scope                  TEXT NOT NULL,
+  relay_node             TEXT NOT NULL,
+  serialized             TEXT,             -- legacy single-blob migration source only
+  head                   TEXT NOT NULL,    -- JSON ShadowScopeHead
+  idempotency_window_ms  INTEGER NOT NULL,
+  version                INTEGER NOT NULL DEFAULT 1,
+  object_counter         INTEGER NOT NULL DEFAULT 1,
+  parked_task_counter    INTEGER NOT NULL DEFAULT 1,
+  session_counter        INTEGER NOT NULL DEFAULT 1,
+  updated_at             INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_object (
+  id          TEXT PRIMARY KEY,
+  body        TEXT NOT NULL, -- JSON SerializedObject
+  updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_session (
+  id          TEXT PRIMARY KEY,
+  body        TEXT NOT NULL, -- JSON SerializedSession
+  updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_log (
+  space       TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  body        TEXT NOT NULL, -- JSON SpaceLogEntry
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY (space, seq)
+);
+
+CREATE TABLE v2_commit_scope_snapshot (
+  space       TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  body        TEXT NOT NULL, -- JSON SpaceSnapshotRecord
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY (space, seq)
+);
+
+CREATE TABLE v2_commit_scope_task (
+  id          TEXT PRIMARY KEY,
+  body        TEXT NOT NULL, -- JSON ParkedTaskRecord
+  updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_tombstone (
+  id          TEXT PRIMARY KEY,
+  updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_accepted_frame (
+  scope         TEXT NOT NULL,
+  seq           INTEGER NOT NULL,
+  id            TEXT NOT NULL,
+  position_hash TEXT NOT NULL,
+  body          TEXT NOT NULL, -- JSON ShadowCommitAccepted
+  updated_at    INTEGER NOT NULL,
+  PRIMARY KEY(scope, seq)
+);
+
+CREATE TABLE v2_commit_scope_transcript_tail (
+  scope      TEXT NOT NULL,
+  seq        INTEGER NOT NULL,
+  hash       TEXT NOT NULL PRIMARY KEY,
+  body       TEXT NOT NULL, -- JSON EffectTranscript
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_seen (
+  idempotency_key TEXT PRIMARY KEY,
+  seen_at         INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_reply (
+  idempotency_key TEXT PRIMARY KEY,
+  body            TEXT NOT NULL, -- JSON reply envelope
+  updated_at      INTEGER NOT NULL
+);
+```
+
+The `serialized` column remains nullable/empty so old scopes whose current row
+contains a gzip or raw JSON world can be loaded once. After the first successful
+open, implementations SHOULD rewrite the scope into the row tables and clear
+`serialized`; new commits MUST NOT store the full world in that column.
+
 ---
 
 ## 15. Caching and invalidation

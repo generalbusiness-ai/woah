@@ -1138,10 +1138,13 @@ and can return shadow execution replies. Reconnect opens may include the
 browser's cached `last_known_head` so `CommitScopeDO` can return a retained
 delta instead of a full projection when the tail is still available. The Worker gateway
 forwards authority-bearing v2 envelopes to `CommitScopeDO`, which persists the
-shadow commit scope, accepted-frame tail, transcript tail, seen idempotency
-keys, and cached replies in row-shaped storage. Fresh envelopes write only the
-new idempotency key/reply and accepted commit delta; duplicate envelopes replay
-the cached reply without another durable write. Gateway isolate hibernation no
+shadow commit scope in row-shaped storage: one row per serialized object plus
+small rows for sessions, log entries, counters, accepted-frame tail,
+transcript tail, seen idempotency keys, and cached replies. Fresh accepted
+envelopes write only the new idempotency key/reply, accepted-frame/transcript
+tail rows, updated counters/head, and the object rows touched by the accepted
+transcript; duplicate envelopes replay the cached reply without another
+durable write. Gateway isolate hibernation no
 longer resets v2 commit authority; browsers still resubscribe and run VTN9
 catch-up after any transport reconnect because live socket subscriptions remain
 connection-local. The local dev server keeps the earlier socket-lifetime
