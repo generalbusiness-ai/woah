@@ -5537,35 +5537,6 @@ export class WooWorld {
     });
   }
 
-  async helpTopicProjection(ctx: CallContext, topicValue: WooValue): Promise<WooValue> {
-    const topic = helpTopic(topicValue) || "index";
-    const dbs = await this.helpSearchPath(ctx);
-    const result = await this.resolveHelpTopic(ctx, topic, dbs);
-    const lines = result && typeof result === "object" && !Array.isArray(result) && Array.isArray(result.lines)
-      ? result.lines.map((line) => valueToText(line))
-      : [valueToText(result)];
-    return { result: result as WooValue, lines: lines as unknown as WooValue } as unknown as WooValue;
-  }
-
-  private async helpSearchPath(ctx: CallContext): Promise<ObjRef[]> {
-    const dbs: ObjRef[] = [];
-    const pushHelpValue = (value: WooValue): void => this.appendHelpDbs(dbs, value);
-
-    for (const id of this.localAncestry(ctx.actor)) pushHelpValue(this.propOrNullForActor(ctx.actor, id, "help"));
-
-    const location = await this.objectLocationChecked(ctx.actor, ctx.hostMemo).catch(() => null);
-    if (typeof location === "string") {
-      if (this.objects.has(location)) {
-        for (const id of this.localAncestry(location)) pushHelpValue(this.propOrNullForActor(ctx.actor, id, "help"));
-      } else {
-        pushHelpValue(await this.propOrNullForActorAsync(ctx.actor, location, "help", ctx.hostMemo).catch(() => null));
-      }
-    }
-
-    pushHelpValue(this.propOrNullForActor(ctx.actor, "$system", "help_dbs"));
-    return dbs;
-  }
-
   private localAncestry(objRef: ObjRef): ObjRef[] {
     const ids: ObjRef[] = [];
     let current: ObjRef | null = objRef;
@@ -5574,35 +5545,6 @@ export class WooWorld {
       current = this.object(current).parent;
     }
     return ids;
-  }
-
-  private appendHelpDbs(dbs: ObjRef[], value: WooValue): void {
-    const values = Array.isArray(value) ? value : [value];
-    for (const item of values) {
-      if (typeof item === "string" && item.length > 0 && !dbs.includes(item)) dbs.push(item);
-    }
-  }
-
-  private async resolveHelpTopic(ctx: CallContext, topic: string, dbs: ObjRef[]): Promise<WooValue> {
-    for (let i = 0; i < dbs.length; i += 1) {
-      const db = dbs[i];
-      try {
-        const result = await this.dispatch({ ...ctx, caller: ctx.thisObj }, db, "get_topic", [topic, dbs.slice(i + 1)]);
-        if (result && typeof result === "object" && !Array.isArray(result)) return result;
-      } catch (err) {
-        const error = normalizeError(err);
-        if (error.code !== "E_HELPNF") throw err;
-      }
-    }
-    if (dbs.length > 0) {
-      await this.dispatch({ ...ctx, caller: ctx.thisObj }, dbs[0], "record_miss", [topic]).catch(() => null);
-    }
-    return {
-      ok: false,
-      status: "not_found",
-      topic,
-      lines: [`No help available for "${topic || "index"}".`]
-    };
   }
 
   private helpDbTopics(ctx: CallContext): Record<string, WooValue> {
@@ -5646,6 +5588,28 @@ export class WooWorld {
     }
     const matched = matches[0];
     return await this.renderHelpTopic(ctx, ctx.thisObj, matched, topics[matched], remaining);
+  }
+
+  private async resolveHelpTopic(ctx: CallContext, topic: string, dbs: ObjRef[]): Promise<WooValue> {
+    for (let i = 0; i < dbs.length; i += 1) {
+      const db = dbs[i];
+      try {
+        const result = await this.dispatch({ ...ctx, caller: ctx.thisObj }, db, "get_topic", [topic, dbs.slice(i + 1)]);
+        if (result && typeof result === "object" && !Array.isArray(result)) return result;
+      } catch (err) {
+        const error = normalizeError(err);
+        if (error.code !== "E_HELPNF") throw err;
+      }
+    }
+    if (dbs.length > 0) {
+      await this.dispatch({ ...ctx, caller: ctx.thisObj }, dbs[0], "record_miss", [topic]).catch(() => null);
+    }
+    return {
+      ok: false,
+      status: "not_found",
+      topic,
+      lines: [`No help available for "${topic || "index"}".`]
+    };
   }
 
   private async renderHelpTopic(ctx: CallContext, db: ObjRef, topic: string, raw: WooValue, remaining: ObjRef[]): Promise<WooValue> {
@@ -8711,8 +8675,6 @@ export class WooWorld {
       const location = await this.publicCommandLocation(ctx, actor, args[2]);
       return await this.parseCommandMap(assertString(args[0] ?? ""), ctx, location, actor) as unknown as WooValue;
     });
-    this.nativeHandlers.set("embodied_room_roster", (ctx) => this.embodiedRoomRoster(ctx));
-    this.nativeHandlers.set("workspace_room_roster", (ctx) => this.workspaceRoomRoster(ctx));
     this.nativeHandlers.set("space_live_audience", (ctx, args) => this.spaceLiveAudience(ctx, args));
     this.nativeHandlers.set("help_db_find_topics", (ctx, args) => this.helpDbFindTopics(ctx, args));
     this.nativeHandlers.set("help_db_get_topic", (ctx, args) => this.helpDbGetTopic(ctx, args));
@@ -8944,38 +8906,6 @@ export class WooWorld {
     });
   }
 
-  async roomLookProjection(ctx: CallContext, room: ObjRef): Promise<WooValue> {
-    const look = await this.composeRoomLook({ ...ctx, thisObj: room }, room);
-    return look as unknown as WooValue;
-  }
-
-  private async composeRoomLook(ctx: CallContext, room: ObjRef): Promise<Record<string, WooValue>> {
-    const startedAt = Date.now();
-    const present = await this.chatPresentAsync(room, ctx.progr, ctx.hostMemo);
-    const items = (await this.objectContents(room, ctx.hostMemo)).filter((item) => !this.isActorForLook(item, present));
-    const remoteSummaries = await this.objectSummariesForLook(ctx, items);
-    const contents = await Promise.all(items.map(async (item) => {
-      return await this.lookEntryFor(ctx, room, item, remoteSummaries.summaries.get(item) ?? null);
-    }));
-    const look = {
-      id: room,
-      title: await this.titleForLook(ctx, ctx.caller, room),
-      description: this.propOrNullForActor(ctx.actor, room, "description"),
-      roster: await this.rosterRowsForActors(ctx, present) as WooValue,
-      contents
-    } as unknown as Record<string, WooValue>;
-    this.recordMetric({
-      kind: "compose_look",
-      room,
-      present_count: present.length,
-      contents_count: items.length,
-      remote_titles: remoteSummaries.remoteCount,
-      remote_describe_batches: remoteSummaries.batchCount,
-      ms: Date.now() - startedAt
-    });
-    return look;
-  }
-
   private async objectContents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]> {
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
@@ -8984,11 +8914,6 @@ export class WooWorld {
       return await this.hostBridge.contents(objRef, memo);
     }
     return this.contentsOf(objRef);
-  }
-
-  private isActorForLook(item: ObjRef, present: ObjRef[]): boolean {
-    if (present.includes(item)) return true;
-    return this.objects.has(item) && this.inheritsFrom(item, "$player");
   }
 
   private async propOrNullForActorAsync(actor: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
@@ -9000,20 +8925,9 @@ export class WooWorld {
     }
   }
 
-  private async lookEntryFor(ctx: CallContext, room: ObjRef, item: ObjRef, prefetchedSummary: HostObjectSummary | null = null): Promise<Record<string, WooValue>> {
-    const summary = prefetchedSummary ?? await this.objectSummaryForLook(ctx, item);
-    if (summary) {
-      return {
-        id: item,
-        title: titleFromSummary(item, summary),
-        description: summary.description
-      };
-    }
-    return {
-      id: item,
-      title: await this.titleForLook(ctx, room, item),
-      description: await this.propOrNullForActorAsync(ctx.actor, item, "description", ctx.hostMemo)
-    };
+  private isActorForLook(item: ObjRef, present: ObjRef[]): boolean {
+    if (present.includes(item)) return true;
+    return this.objects.has(item) && this.inheritsFrom(item, "$player");
   }
 
   private async objectSummaryForLook(ctx: CallContext, item: ObjRef): Promise<HostObjectSummary | null> {
@@ -9058,61 +8972,75 @@ export class WooWorld {
     return { summaries, remoteCount: remoteIds.length, batchCount: remoteIds.length };
   }
 
-  async roomWhoProjection(ctx: CallContext, room: ObjRef): Promise<WooValue> {
-    const present = await this.chatPresentAsync(room, ctx.progr, ctx.hostMemo);
-    const roster = await this.rosterRowsForActors(ctx, present);
-    const presentNames = (await this.collectPropChecked(ctx.progr, present, "name", ctx.hostMemo)).map((name) => valueToText(name));
-    const now = this.logicalNow("room_who.now");
-    return {
-      roster,
-      observation: {
-      type: "who",
-      source: room,
-      actor: ctx.actor,
-      to: ctx.actor,
-      room,
-      roster,
-      text: `Present: ${presentNames.join(", ") || "nobody"}.`,
-      ts: now
-      }
-    } as unknown as WooValue;
-  }
-
-  private async embodiedRoomRoster(ctx: CallContext): Promise<WooValue> {
-    const actors = this.contentsOf(ctx.thisObj)
-      .filter((item) => this.objects.has(item) && this.inheritsFrom(item, "$actor"));
-    return await this.rosterRowsForActors(ctx, actors);
-  }
-
-  private async workspaceRoomRoster(ctx: CallContext): Promise<WooValue> {
-    const sessions = this.presenceSessionsIn(ctx.thisObj);
-    if (!sessions) return [] as unknown as WooValue;
+  async presentActorsIn(ctx: CallContext, space: ObjRef): Promise<ObjRef[]> {
+    const sessions = this.presenceSessionsIn(space);
+    if (!sessions) return [];
     const actors = new Set<ObjRef>();
     const now = Date.now();
     for (const [sessionId, actor] of sessions) {
       const session = this.sessions.get(sessionId);
       if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
-      if (this.objects.has(actor) && this.inheritsFrom(actor, "$actor")) actors.add(actor);
+      actors.add(actor);
     }
-    return await this.rosterRowsForActors(ctx, Array.from(actors));
+    return Array.from(actors).sort();
   }
 
-  private async rosterRowsForActors(ctx: CallContext, actors: ObjRef[]): Promise<WooValue> {
-    const now = this.logicalNow("room_roster.now");
-    const rows = await Promise.all(actors.map(async (id) => {
-      const lastInputAt = this.actorLastInputAt(id);
-      const idleSeconds = lastInputAt === null
-        ? null
-        : Math.max(0, Math.floor((now - lastInputAt) / 1000));
-      return {
-        id,
-        name: await this.objectDisplayNameAsync(ctx.progr, id, ctx.hostMemo),
-        presence: this.actorPresenceStatus(id, now),
-        ...(idleSeconds !== null ? { idle_seconds: idleSeconds } : {})
-      } as Record<string, WooValue>;
-    }));
-    rows.sort((left, right) => String(left.name).localeCompare(String(right.name)) || String(left.id).localeCompare(String(right.id)));
-    return rows as unknown as WooValue;
+  async visibleContentsForActor(ctx: CallContext, objRef: ObjRef): Promise<ObjRef[]> {
+    const items = await this.objectContents(objRef, ctx.hostMemo);
+    const out: ObjRef[] = [];
+    for (const item of items) {
+      if (await this.remoteHostForObject(item, ctx.hostMemo)) {
+        out.push(item);
+        continue;
+      }
+      if (!this.objects.has(item)) continue;
+      if (this.canReadProperty(ctx.progr, item, "name") || this.canReadProperty(ctx.progr, item, "description")) out.push(item);
+    }
+    return out;
+  }
+
+  obviousVerbSpecsForActor(actor: ObjRef, target: ObjRef): WooValue[] {
+    const out: WooValue[] = [];
+    const seen = new Set<string>();
+    for (const definer of this.localAncestry(target)) {
+      for (const verb of this.object(definer).verbs) {
+        if (!this.canReadVerb(actor, verb)) continue;
+        const command = verb.arg_spec && typeof verb.arg_spec === "object" && !Array.isArray(verb.arg_spec)
+          ? (verb.arg_spec.command as WooValue | undefined)
+          : undefined;
+        if (!command || typeof command !== "object" || Array.isArray(command)) continue;
+        const key = `${definer}:${verb.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          definer,
+          name: verb.name,
+          aliases: [...(verb.aliases ?? [])],
+          perms: verb.perms,
+          command: cloneValue(command)
+        } as unknown as WooValue);
+      }
+    }
+    return out;
+  }
+
+  async remoteDescribeForActor(ctx: CallContext, target: WooValue): Promise<WooValue> {
+    if (Array.isArray(target)) {
+      const ids = target.filter((item): item is ObjRef => typeof item === "string");
+      const { summaries } = await this.objectSummariesForLook(ctx, ids);
+      const out: Record<string, WooValue> = {};
+      for (const [id, summary] of summaries) out[id] = summary as unknown as WooValue;
+      return out as unknown as WooValue;
+    }
+    if (typeof target !== "string") throw wooError("E_TYPE", "remote_describe expects an object or list of objects", target);
+    if (!await this.remoteHostForObject(target, ctx.hostMemo)) return null;
+    if (!this.hostBridge?.describeObject) return null;
+    try {
+      return await this.hostBridge.describeObject(ctx.progr, ctx.actor, target, ctx.hostMemo) as unknown as WooValue;
+    } catch (err) {
+      if (!isReadAvailabilityError(err)) throw err;
+      return null;
+    }
   }
 
   private async spaceLiveAudience(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
@@ -9136,80 +9064,6 @@ export class WooWorld {
       out.push(sessionId);
     }
     return out.sort();
-  }
-
-  async playerListingProjection(ctx: CallContext, names: WooValue): Promise<WooValue> {
-    const requested = valueToText(names ?? null).trim();
-    const players = requested
-      ? this.playerNameTokens(requested).map((name) => this.matchPlayerForCommand(name))
-      : this.connectedPlayers();
-    const missing = requested ? players.find((item) => !item) : null;
-    if (missing === null && requested) {
-      return { rows: [], lines: ["I don't recognize one of those players."] } as unknown as WooValue;
-    }
-    const unique = Array.from(new Set(players.filter((item): item is ObjRef => typeof item === "string")));
-    if (unique.length === 0) return { rows: [], lines: [] } as unknown as WooValue;
-    if (unique.length > 100) {
-      return {
-        rows: [],
-        lines: [`You have requested a listing of ${unique.length} players. Please specify fewer players or use a broader user listing.`]
-      } as unknown as WooValue;
-    }
-
-    const now = this.logicalNow("player_who.now");
-    const rows = await Promise.all(unique.map(async (player) => {
-      const location = this.objects.has(player) ? this.object(player).location : null;
-      const locationName = location && this.objects.has(location) ? await this.objectDisplayNameAsync(ctx.progr, location, ctx.hostMemo) : "Nowhere";
-      const stats = this.playerSessionStats(player, now);
-      return {
-        player,
-        name: await this.objectDisplayNameAsync(ctx.progr, player, ctx.hostMemo),
-        connected: stats.connected,
-        connected_at: stats.connectedAt,
-        connected_seconds: stats.connectedSeconds,
-        idle_seconds: stats.idleSeconds,
-        last_login_at: stats.lastLoginAt,
-        location,
-        location_name: locationName
-      };
-    }));
-
-    const lines = ["Player                 Conn      Idle   Location"];
-    for (const row of rows) {
-      const idle = row.connected
-        ? row.idle_seconds === null || row.idle_seconds < 60
-          ? "active"
-          : this.formatWhoDuration(row.idle_seconds)
-        : "sleep";
-      const connection = row.connected
-        ? this.formatWhoDuration(row.connected_seconds)
-        : this.formatWhoLastLogin(row.last_login_at);
-      lines.push(`${row.name.padEnd(22).slice(0, 22)} ${connection.padEnd(9).slice(0, 9)} ${idle.padEnd(6).slice(0, 6)} ${row.location_name}`);
-    }
-    const roster = rows.map((row) => ({
-      id: row.player,
-      name: row.name,
-      presence: row.connected
-        ? row.idle_seconds === null || row.idle_seconds < IDLE_PRESENCE_IDLE_THRESHOLD_SECONDS
-          ? "awake"
-          : "idle"
-        : "sleeping",
-      ...(typeof row.idle_seconds === "number" ? { idle_seconds: row.idle_seconds } : {})
-    }));
-    return {
-      rows,
-      lines,
-      observation: {
-        type: "who",
-        source: ctx.thisObj,
-        actor: ctx.actor,
-        to: ctx.actor,
-        room: this.objects.get(ctx.actor)?.location ?? null,
-        roster,
-        text: lines.join("\n"),
-        ts: now
-      }
-    } as unknown as WooValue;
   }
 
   private async playerJoin(ctx: CallContext, args: WooValue[]): Promise<WooValue> {
@@ -9253,60 +9107,7 @@ export class WooWorld {
     return { room: dest, from: old, target, here_request: true, look_deferred: true } as unknown as WooValue;
   }
 
-  async objectExamineProjection(ctx: CallContext, nameValue: WooValue): Promise<WooValue> {
-    const name = valueToText(nameValue).trim();
-    if (!name) {
-      return { result: null, lines: ["Usage: @examine <object>"] } as unknown as WooValue;
-    }
-    const location = this.objects.get(ctx.actor)?.location ?? null;
-    const match = await this.matchObjectForActorAsync(name, ctx, location, ctx.actor);
-    if (match.status === "ambiguous") {
-      return { result: null, lines: [`I don't know which ${name} you mean.`] } as unknown as WooValue;
-    }
-    if (match.status !== "ok") {
-      return { result: null, lines: [`I don't see ${name} here.`] } as unknown as WooValue;
-    }
-    const target = match.value;
-    if (await this.remoteHostForObject(target, ctx.hostMemo)) return await this.objectExamineRemoteProjection(ctx, target, name);
-    const obj = this.object(target);
-    const owner = obj.owner;
-    const aliasesValue = this.propOrNullForActor(ctx.actor, target, "aliases");
-    const aliases = Array.isArray(aliasesValue) ? aliasesValue.filter((item): item is string => typeof item === "string") : [];
-    const descriptionValue = this.propOrNullForActor(ctx.actor, target, "description");
-    const description = typeof descriptionValue === "string" && descriptionValue.length > 0 ? descriptionValue : "(No description set.)";
-    const contents = await this.objectContents(target, ctx.hostMemo).catch(() => [] as ObjRef[]);
-    const contentRows = await Promise.all(contents.map(async (item) => ({
-      id: item,
-      name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
-    })));
-    const obviousVerbs = this.obviousCommandSyntaxes(target, name);
-    const ownerName = this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : "a recycled player";
-    const lines = [
-      `${obj.name} (${this.formatPasteableObjRef(target)}) is owned by ${ownerName} (${this.formatPasteableObjRef(owner)}).`,
-      `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
-      description
-    ];
-    if (contentRows.length > 0) {
-      lines.push("Contents:");
-      for (const item of contentRows) lines.push(`  ${item.name} (${this.formatPasteableObjRef(item.id)})`);
-    }
-    if (obviousVerbs.length > 0) {
-      lines.push("Obvious verbs:");
-      lines.push(...obviousVerbs);
-    }
-    const result = {
-      target,
-      owner,
-      aliases,
-      description,
-      contents: contentRows,
-      obvious_verbs: obviousVerbs,
-      text: lines.join("\n")
-    } as unknown as WooValue;
-    return { result, lines: lines as unknown as WooValue } as unknown as WooValue;
-  }
-
-  private connectedPlayers(): ObjRef[] {
+  connectedPlayerRefs(): ObjRef[] {
     const seen = new Set<ObjRef>();
     for (const session of this.sessions.values()) {
       if (!this.actorIsConnected(session.actor)) continue;
@@ -9320,7 +9121,7 @@ export class WooWorld {
     });
   }
 
-  private playerSessionStats(actor: ObjRef, now: number): { connected: boolean; connectedAt: number | null; connectedSeconds: number | null; idleSeconds: number | null; lastLoginAt: number | null } {
+  private playerSessionStats(actor: ObjRef, now: number): { connected: boolean; connectedAt: number | null; connectedSeconds: number | null; idleSeconds: number | null; lastLoginAt: number | null; lastSeenAt: number | null } {
     const liveCutoff = now - IDLE_PRESENCE_LIVE_WINDOW_MS;
     let connectedAt: number | null = null;
     let lastInputAt: number | null = null;
@@ -9337,8 +9138,21 @@ export class WooWorld {
       connectedAt,
       connectedSeconds: connectedAt === null ? null : Math.max(0, Math.floor((now - connectedAt) / 1000)),
       idleSeconds: connectedAt === null || lastInputAt === null ? null : Math.max(0, Math.floor((now - lastInputAt) / 1000)),
-      lastLoginAt
+      lastLoginAt,
+      lastSeenAt: lastInputAt
     };
+  }
+
+  sessionMetadataForActor(actor: ObjRef, now: number): WooValue {
+    const stats = this.playerSessionStats(actor, now);
+    return {
+      connected: stats.connected,
+      connected_at: stats.connectedAt,
+      connected_seconds: stats.connectedSeconds,
+      idle_seconds: stats.idleSeconds,
+      last_login_at: stats.lastLoginAt,
+      last_seen_at: stats.lastSeenAt
+    } as unknown as WooValue;
   }
 
   private formatWhoDuration(seconds: number | null): string {
@@ -9354,60 +9168,6 @@ export class WooWorld {
   private formatWhoLastLogin(at: number | null): string {
     if (at === null) return "unknown";
     return new Date(at).toISOString().slice(0, 10);
-  }
-
-  private async objectExamineRemoteProjection(ctx: CallContext, target: ObjRef, matchedName: string): Promise<WooValue> {
-    const summary = await this.hostBridge?.describeObject?.(ctx.progr, ctx.actor, target, ctx.hostMemo).catch((err) => {
-      if (isReadAvailabilityError(err)) return null;
-      throw err;
-    }) ?? null;
-    const name = typeof summary?.name === "string" && summary.name.length > 0 ? summary.name : target;
-    const owner = typeof summary?.owner === "string" ? summary.owner : null;
-    const aliases = Array.isArray(summary?.aliases) ? summary.aliases.filter((item): item is string => typeof item === "string") : [];
-    const description = typeof summary?.description === "string" && summary.description.length > 0 ? summary.description : "(No description set.)";
-    const obviousVerbs = Array.isArray(summary?.obvious_verbs)
-      ? summary.obvious_verbs.filter((item): item is string => typeof item === "string")
-      : [];
-    const contents = await this.objectContents(target, ctx.hostMemo).catch((err) => {
-      if (isReadAvailabilityError(err)) return [] as ObjRef[];
-      throw err;
-    });
-    const contentRows = await Promise.all(contents.map(async (item) => ({
-      id: item,
-      name: await this.objectDisplayNameAsync(ctx.progr, item, ctx.hostMemo)
-    })));
-    const ownerName = owner && this.objects.has(owner) ? await this.objectDisplayNameAsync(ctx.progr, owner, ctx.hostMemo) : null;
-    const lines = [
-      owner ? `${name} (${this.formatPasteableObjRef(target)}) is owned by ${ownerName ?? owner} (${this.formatPasteableObjRef(owner)}).` : `${name} (${this.formatPasteableObjRef(target)}) is on a remote host.`,
-      `Aliases: ${aliases.length > 0 ? aliases.join(", ") : "none"}.`,
-      description
-    ];
-    if (contentRows.length > 0) {
-      lines.push("Contents:");
-      for (const item of contentRows) lines.push(`  ${item.name} (${this.formatPasteableObjRef(item.id)})`);
-    }
-    const rewrittenObviousVerbs = obviousVerbs.map((syntax) => this.rewriteObviousSyntaxObjectName(syntax, name, matchedName));
-    if (rewrittenObviousVerbs.length > 0) {
-      lines.push("Obvious verbs:");
-      lines.push(...rewrittenObviousVerbs);
-    }
-    const result = {
-      target,
-      owner,
-      aliases,
-      description,
-      contents: contentRows,
-      obvious_verbs: rewrittenObviousVerbs,
-      remote: true,
-      text: lines.join("\n")
-    } as unknown as WooValue;
-    return { result, lines: lines as unknown as WooValue } as unknown as WooValue;
-  }
-
-  private rewriteObviousSyntaxObjectName(syntax: string, remoteName: string, matchedName: string): string {
-    const replacement = matchedName.trim();
-    if (!replacement || replacement === remoteName) return syntax;
-    return syntax.replace(new RegExp(`\\b${escapeRegExp(remoteName)}\\b`, "g"), replacement);
   }
 
   private playerNameTokens(input: string): string[] {

@@ -107,16 +107,175 @@ const PLAYER_LOOK_SELF_SOURCE = `verb :look_self() rxd {
 }`;
 
 const PLAYER_WHO_ALL_SOURCE = `verb :who_all(names) rxd {
-  let projection = player_listing_projection(names);
-  if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
-  if (has(projection, "observation") && projection["observation"] != null) { observe(projection["observation"]); }
-  return projection["rows"];
+  let requested = "";
+  if (names != null) { requested = str_trim(to_string(names)); }
+  let players = [];
+  if (requested == "") {
+    players = connected_players();
+  } else {
+    let raw_tokens = str_split(requested, " ");
+    for token in raw_tokens {
+      let item = str_trim(token);
+      if (item == "") { continue; }
+      if (valid(item) && isa(item, $player) && !(item in players)) { players = players + [item]; }
+    }
+    if (length(players) == 0) {
+      this:tell("I don't recognize one of those players.");
+      return [];
+    }
+  }
+  if (length(players) > 100) {
+    this:tell("You have requested a listing of " + to_string(length(players)) + " players. Please specify fewer players or use a broader user listing.");
+    return [];
+  }
+  let rows = [];
+  let roster = [];
+  let lines = ["Player                 Conn      Idle   Location"];
+  for who in players {
+    let meta = session_metadata(who);
+    let loc = location(who);
+    let loc_name = "Nowhere";
+    if (loc != null && valid(loc)) { try { loc_name = loc:title(); } except err { loc_name = loc.name; } }
+    let row = {
+      player: who,
+      name: who.name,
+      connected: meta["connected"],
+      connected_at: meta["connected_at"],
+      connected_seconds: meta["connected_seconds"],
+      idle_seconds: meta["idle_seconds"],
+      last_login_at: meta["last_login_at"],
+      location: loc,
+      location_name: loc_name
+    };
+    rows = rows + [row];
+    let presence = "sleeping";
+    if (meta["connected"]) {
+      presence = "awake";
+      if (meta["idle_seconds"] != null && meta["idle_seconds"] >= 60) { presence = "idle"; }
+    }
+    let roster_row = { id: who, name: who.name, presence: presence };
+    if (meta["idle_seconds"] != null) { roster_row["idle_seconds"] = meta["idle_seconds"]; }
+    roster = roster + [roster_row];
+    let conn = "unknown";
+    if (meta["connected"]) { conn = to_string(meta["connected_seconds"]) + "s"; }
+    else if (meta["last_login_at"] != null) { conn = to_string(meta["last_login_at"]); }
+    let idle = "sleep";
+    if (meta["connected"]) {
+      idle = "active";
+      if (meta["idle_seconds"] != null && meta["idle_seconds"] >= 60) { idle = to_string(meta["idle_seconds"]) + "s"; }
+    }
+    lines = lines + [who.name + " " + conn + " " + idle + " " + loc_name];
+  }
+  this:tell_lines(lines);
+  observe({ type: "who", source: this, actor: actor, to: actor, room: location(this), roster: roster, text: str_join(lines, "\\n"), ts: now() });
+  return rows;
 }`;
 
 const PLAYER_EXAMINE_DETAILED_SOURCE = `verb :examine_detailed(name) rxd {
-  let projection = object_examine_projection(name);
-  if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
-  return projection["result"];
+  let q = "";
+  if (name != null) { q = str_trim(to_string(name)); }
+  if (q == "") {
+    this:tell("Usage: @examine <object>");
+    return null;
+  }
+  let here = location(this);
+  let target = $match:match_object(q, here);
+  if (target == $ambiguous_match) {
+    this:tell("I don't know which " + q + " you mean.");
+    return null;
+  }
+  if (target == $failed_match) {
+    this:tell("I don't see " + q + " here.");
+    return null;
+  }
+  let summary = null;
+  if (is_remote_object(target)) { summary = remote_describe(target); }
+  let obj_name = target.name;
+  let owner = target.owner;
+  let aliases = [];
+  let description = "(No description set.)";
+  let obvious = [];
+  let remote = false;
+  if (typeof(summary) == "map") {
+    remote = true;
+    if (has(summary, "name") && summary["name"]) { obj_name = summary["name"]; }
+    if (has(summary, "owner")) { owner = summary["owner"]; }
+    if (has(summary, "aliases") && typeof(summary["aliases"]) == "list") { aliases = summary["aliases"]; }
+    if (has(summary, "description") && summary["description"]) { description = summary["description"]; }
+    if (has(summary, "obvious_verbs") && typeof(summary["obvious_verbs"]) == "list") { obvious = summary["obvious_verbs"]; }
+    let rewritten = [];
+    for line in obvious {
+      let idx = str_index(line, obj_name);
+      if (idx > 0) { line = str_slice(line, 1, idx - 1) + q + str_slice(line, idx + length(obj_name)); }
+      rewritten = rewritten + [line];
+    }
+    obvious = rewritten;
+  } else {
+    try { aliases = target.aliases; } except err { aliases = []; }
+    try { if (target.description) { description = target.description; } } except err { description = "(No description set.)"; }
+    let specs = obvious_verbs(target);
+    let dull = [$root, $room, $player, $prog, $builder];
+    for spec in specs {
+      if (spec["definer"] in dull) { continue; }
+      let command = spec["command"];
+      let dobj = "any";
+      let prep = "any";
+      let iobj = "any";
+      if (typeof(command) == "map") {
+        if (has(command, "dobj") && typeof(command["dobj"]) == "string") { dobj = command["dobj"]; }
+        if (has(command, "prep")) {
+          if (typeof(command["prep"]) == "string") { prep = command["prep"]; }
+          else if (typeof(command["prep"]) == "list" && length(command["prep"]) > 0) { prep = command["prep"][1]; }
+        }
+        if (has(command, "iobj") && typeof(command["iobj"]) == "string") { iobj = command["iobj"]; }
+      }
+      if (prep == "none" && iobj == "this") { continue; }
+      let names = [];
+      if (!str_starts(spec["name"], "@")) { names = names + [spec["name"]]; }
+      for alias in spec["aliases"] { if (!str_starts(alias, "@")) { names = names + [alias]; } }
+      if (length(names) == 0) { continue; }
+      let syntax = str_join(names, "/");
+      if (dobj != "none") { if (dobj == "this") { syntax = syntax + " " + q; } else { syntax = syntax + " <anything>"; } }
+      if (prep != "none") {
+        if (prep == "any") { syntax = syntax + " <anything>"; } else { syntax = syntax + " " + prep; }
+        if (iobj != "none") { if (iobj == "this") { syntax = syntax + " " + q; } else { syntax = syntax + " <anything>"; } }
+      }
+      obvious = obvious + ["  " + syntax];
+    }
+  }
+  let contents_rows = [];
+  for item in visible_contents(target) {
+    let item_name = item.name;
+    contents_rows = contents_rows + [{ id: item, name: item_name }];
+  }
+  let target_id = target;
+  if (!str_starts(target_id, "$")) { target_id = "#" + target_id; }
+  let owner_id = owner;
+  if (owner_id != null && !str_starts(owner_id, "$")) { owner_id = "#" + owner_id; }
+  let owner_name = "a recycled player";
+  if (owner != null && valid(owner)) { owner_name = owner.name; }
+  let lines = [];
+  if (owner != null) { lines = lines + [obj_name + " (" + target_id + ") is owned by " + owner_name + " (" + owner_id + ")."]; }
+  else { lines = lines + [obj_name + " (" + target_id + ") is on a remote host."]; }
+  let alias_text = "none";
+  if (length(aliases) > 0) { alias_text = str_join(aliases, ", "); }
+  lines = lines + ["Aliases: " + alias_text + ".", description];
+  if (length(contents_rows) > 0) {
+    lines = lines + ["Contents:"];
+    for item_row in contents_rows {
+      let item_id = item_row["id"];
+      if (!str_starts(item_id, "$")) { item_id = "#" + item_id; }
+      lines = lines + ["  " + item_row["name"] + " (" + item_id + ")"];
+    }
+  }
+  if (length(obvious) > 0) {
+    lines = lines + ["Obvious verbs:"];
+    for line in obvious { lines = lines + [line]; }
+  }
+  this:tell_lines(lines);
+  let result = { target: target, owner: owner, aliases: aliases, description: description, contents: contents_rows, obvious_verbs: obvious, text: str_join(lines, "\\n") };
+  if (remote) { result["remote"] = true; }
+  return result;
 }`;
 
 const PLAYER_TELL_SOURCE = `verb :tell() rxd {
@@ -134,9 +293,53 @@ const PLAYER_TELL_LINES_SOURCE = `verb :tell_lines(lines) rxd {
 }`;
 
 const PLAYER_HELP_SOURCE = `verb :help(topic) rxd {
-  let projection = help_topic_projection(topic);
-  if (has(projection, "lines")) { this:tell_lines(projection["lines"]); }
-  return projection["result"];
+  let t = "index";
+  if (topic != null && str_trim(to_string(topic)) != "") { t = str_lower(str_trim(to_string(topic))); }
+  let dbs = [];
+  let actor_chain = [this] + parents(this);
+  for obj in actor_chain {
+    try {
+      let h = obj.help;
+      if (typeof(h) == "list") { for db in h { if (db != null && !(db in dbs)) { dbs = dbs + [db]; } } }
+      else if (h != null && !(h in dbs)) { dbs = dbs + [h]; }
+    } except err { }
+  }
+  let here = location(this);
+  if (here != null && valid(here)) {
+    let here_chain = [here] + parents(here);
+    for obj2 in here_chain {
+      try {
+        let hh = obj2.help;
+        if (typeof(hh) == "list") { for db2 in hh { if (db2 != null && !(db2 in dbs)) { dbs = dbs + [db2]; } } }
+        else if (hh != null && !(hh in dbs)) { dbs = dbs + [hh]; }
+      } except err2 { }
+    }
+  }
+  try {
+    for db3 in "$system".help_dbs { if (db3 != null && !(db3 in dbs)) { dbs = dbs + [db3]; } }
+  } except err3 { }
+  let result = null;
+  let found = false;
+  let n = length(dbs);
+  for i in [1..n] {
+    let db4 = dbs[i];
+    let remaining = [];
+    if (i < n) { for j in [(i + 1)..n] { remaining = remaining + [dbs[j]]; } }
+    try {
+      result = dispatch(db4, "get_topic", [t, remaining]);
+      found = true;
+      break;
+    } except err4 {
+      if (err4["code"] != "E_HELPNF") { raise err4; }
+    }
+  }
+  if (!found) {
+    if (length(dbs) > 0) { try { dispatch(dbs[1], "record_miss", [t]); } except err5 { } }
+    result = { ok: false, status: "not_found", topic: t, lines: ["No help available for " + str_char(34) + t + str_char(34) + "."] };
+  }
+  if (typeof(result) == "map" && has(result, "lines")) { this:tell_lines(result["lines"]); }
+  else { this:tell(to_string(result)); }
+  return result;
 }`;
 
 const ROOT_DESCRIBE_SOURCE = `verb :describe() rxd {

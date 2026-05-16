@@ -60,6 +60,87 @@ describe("woo core", () => {
     if (described.op === "result") expect((described.result as Record<string, unknown>).description).toBeNull();
   });
 
+  it("exposes catalog-generic presentation builtins with substrate-only facts", async () => {
+    const { world, session, actor } = authedWorld();
+    const other = world.auth("guest:builtin-other");
+    await world.directCall("builtin-actor-enter", actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    await world.directCall("builtin-other-enter", other.actor, "the_chatroom", "enter", [], { sessionId: other.id });
+
+    world.createObject({ id: "builtin_visible_box", name: "Visible Box", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
+    world.setProp("builtin_visible_box", "description", "Visible to room look.");
+    world.createObject({ id: "builtin_verb_box", name: "Verb Box", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
+    world.addVerb("builtin_verb_box", {
+      ...nativeVerb("polish"),
+      perms: "rxd",
+      direct_callable: true,
+      aliases: ["shine"],
+      arg_spec: { command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } }
+    });
+    expect(installVerb(world, actor, "builtin_probe", `verb :builtin_probe() rxd {
+      return {
+        present: present_actors("the_chatroom"),
+        players: connected_players(),
+        meta: session_metadata(actor),
+        visible: visible_contents("the_chatroom"),
+        obvious: obvious_verbs("builtin_verb_box")
+      };
+    }`, null).ok).toBe(true);
+
+    const probed = await world.directCall("builtin-probe", actor, actor, "builtin_probe", [], { sessionId: session.id });
+    expect(probed.op).toBe("result");
+    if (probed.op !== "result") return;
+    const result = probed.result as Record<string, unknown>;
+    expect(result.present).toEqual(expect.arrayContaining([actor, other.actor]));
+    expect(result.players).toEqual(expect.arrayContaining([actor, other.actor]));
+    expect(result.visible).toEqual(expect.arrayContaining(["builtin_visible_box", "builtin_verb_box"]));
+    expect(result.meta).toMatchObject({ connected: true });
+    expect((result.meta as Record<string, unknown>).connected_at).toEqual(expect.any(Number));
+    expect(result.obvious).toEqual(expect.arrayContaining([expect.objectContaining({
+      definer: "builtin_verb_box",
+      name: "polish",
+      aliases: ["shine"],
+      command: expect.objectContaining({ dobj: "this", prep: "none", iobj: "none" })
+    })]));
+  });
+
+  it("remote_describe returns remote summaries singly and in batches without local property reads", async () => {
+    const { world: home, actor } = authedWorld();
+    const remote = createWorld({ catalogs: false });
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["remote", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([
+      ["remote_builtin_lamp", "remote"],
+      ["remote_builtin_mug", "remote"]
+    ]);
+    const bridge = new LocalHostBridge("home", worlds, routes);
+    home.setHostBridge(bridge);
+    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    remote.createObject({ id: "remote_builtin_lamp", name: "Remote Builtin Lamp", parent: "$thing", owner: "$wiz" });
+    remote.setProp("remote_builtin_lamp", "description", "A remote lamp summary.");
+    remote.createObject({ id: "remote_builtin_mug", name: "Remote Builtin Mug", parent: "$thing", owner: "$wiz" });
+    remote.setProp("remote_builtin_mug", "description", "A remote mug summary.");
+
+    expect(installVerb(home, actor, "remote_builtin_probe", `verb :remote_builtin_probe() rxd {
+      return {
+        one: remote_describe("remote_builtin_lamp"),
+        many: remote_describe(["remote_builtin_lamp", "remote_builtin_mug", "the_chatroom"])
+      };
+    }`, null).ok).toBe(true);
+
+    const probed = await home.directCall("remote-builtin-probe", actor, actor, "remote_builtin_probe", []);
+    expect(probed.op).toBe("result");
+    if (probed.op !== "result") return;
+    const result = probed.result as Record<string, Record<string, Record<string, unknown>>>;
+    expect(result.one).toMatchObject({ name: "Remote Builtin Lamp", description: "A remote lamp summary." });
+    expect(result.many.remote_builtin_lamp).toMatchObject({ name: "Remote Builtin Lamp" });
+    expect(result.many.remote_builtin_mug).toMatchObject({ name: "Remote Builtin Mug" });
+    expect(result.many.the_chatroom).toBeUndefined();
+    expect(bridge.describeManyCalls).toEqual([expect.arrayContaining(["remote_builtin_lamp", "remote_builtin_mug"])]);
+    expect(Array.from(bridge.getPropCalls.keys()).some((key) => key.includes("remote_builtin_lamp"))).toBe(false);
+  });
+
   it("rejects non-x verbs across direct, sequenced, CALL_VERB, and PASS dispatch", async () => {
     const { world, session, actor } = authedWorld();
     world.createObject({ id: "no_x_target", name: "No X Target", parent: "$thing", owner: "$wiz" });

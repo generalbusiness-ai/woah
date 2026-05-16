@@ -191,11 +191,6 @@ permission system.
 not a user-facing verb. It reads the target's metadata, visible properties,
 verbs, schemas, children, and contents using the caller actor's authority.
 
-`object_examine_projection(name)` resolves a visible object name from the
-current actor's command scope and returns `{result, lines}` for
-LambdaCore-shaped examination. It is a data projection for catalog code:
-catalog source owns the user-facing verb, direct text delivery, and aliases.
-
 There is intentionally no "list all objects in the world" builtin. Instance enumeration is by class via recursive `children($class)`; per-owner enumeration is by convention (creator maintains a list). Ops-level host enumeration uses the runtime's management plane, not the runtime API.
 
 ### 19.5 Task / scheduling
@@ -222,23 +217,24 @@ object behavior such as a mounted pinboard or control surface emitting visible
 activity to its containing room; it does not make the containing-room relation a
 core property.
 
-`room_look_projection(room)` is a public builtin that returns the
-substrate-provided structured room view used by the bundled chat catalog's
-`$room:look_self()`: room id, title, description, roster rows, and visible
-contents. It exists because that view is a cross-host projection over room
-contents and remote object summaries; the English command and observation
-policy still live in catalog source. Visibility is evaluated with the calling
-actor's authority, so third-party catalogs may reuse the projection without
-gaining read access beyond what ordinary room look would reveal to that actor.
+`present_actors(space)` returns the actors with live session-presence rows in
+`space`. It exposes the substrate-owned session/presence relation only; catalog
+verbs decide whether those actors are a room roster, a board roster, an
+audience, or something else.
 
-`room_who_projection(room)` returns `{roster, observation}` for a room's
-present actors. Catalog `$room:who()` emits the observation and returns the
-roster; the builtin only centralizes session/presence projection.
+`visible_contents(obj)` returns `obj.contents` filtered to objects the current
+task authority may inspect. It exists because contents and permission checks are
+substrate-owned; catalog code still chooses how to format or classify those
+objects.
 
-`help_topic_projection(topic?)` returns `{result, lines}` for the contextual
-help search path rooted at the current actor and room, including global
-`$system.help_dbs`. Catalog `$player:help()` delivers the lines and returns
-the result.
+`obvious_verbs(obj)` returns readable verb metadata with command arg-specs for
+`obj`. It is verb-slot introspection, not a formatted `@examine` view.
+
+`remote_describe(obj)` returns the host-bridge summary for a remote object, or
+`null` for local objects or unavailable summaries. `remote_describe(list)` is
+the batched form and returns an object-id-keyed map of summaries for the remote
+members of the list. Catalogs use it when they need cross-host display data
+without encoding host-bridge calls in user-facing verbs.
 
 `set_presence(space, present)` updates the current actor/session's presence in a
 space through the host-safe presence primitive. The authoritative storage is
@@ -281,9 +277,11 @@ same connection and idle policy as `is_connected` and `idle_seconds`. The idle
 threshold is a substrate constant (currently 60 seconds) so catalog roster
 implementations do not each choose their own cutoff.
 
-`player_listing_projection(names?)` returns `{rows, lines, observation?}` for the
-LambdaCore-shaped player listing. It reads live session state and actor
-locations without exposing global object enumeration to catalog code.
+`connected_players()` returns actors with live connections. `session_metadata(actor)`
+returns `{connected, connected_at, connected_seconds, idle_seconds,
+last_login_at, last_seen_at}` for the actor's sessions. These are generic
+session facts; catalog `$player:who_all` owns the LambdaCore-shaped table,
+observation, and text formatting.
 
 ### 19.8 Wizard-only
 

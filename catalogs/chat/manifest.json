@@ -202,7 +202,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { return room_look_projection(this); }"
+          "source": "verb :look_self() rxd { set_task_perms(caller_perms()); let roster = []; for who in contents(this) { if (isa(who, $player)) { let idle = idle_seconds(who); let row = { id: who, name: who.name, presence: presence_status(who) }; if (idle != null) { row[\"idle_seconds\"] = idle; } roster = roster + [row]; } } let visible = visible_contents(this); let remote_summaries = remote_describe(visible); let contents_rows = []; for item in visible { if (isa(item, $player)) { continue; } let title = item; let description = null; if (is_remote_object(item)) { let summary = null; if (typeof(remote_summaries) == \"map\" && has(remote_summaries, item)) { summary = remote_summaries[item]; } if (typeof(summary) == \"map\") { if (has(summary, \"name\") && summary[\"name\"]) { title = summary[\"name\"]; } if (has(summary, \"description\")) { description = summary[\"description\"]; } } } else { title = item.name; try { title = item:title(); } except err { if (err[\"code\"] == \"E_VERBNF\" || err[\"code\"] == \"E_TOOBIG\") { title = item.name; } else { raise err; } } try { description = item.description; } except err2 { description = null; } } contents_rows = contents_rows + [{ id: item, title: title, description: description }]; } return { id: this, title: this:title(), description: this.description, roster: roster, contents: contents_rows }; }"
         },
         {
           "name": "announce",
@@ -750,7 +750,7 @@
             ,
             "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
-          "source": "verb :look() rxd { return this:look_at(this); }"
+          "source": "verb :look() rxd { set_task_perms(caller_perms()); return this:look_at(this); }"
         },
         {
           "name": "look_at",
@@ -781,7 +781,7 @@
             ,
             "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "live" }
           },
-          "source": "verb :who() rxd { let projection = room_who_projection(this); observe(projection[\"observation\"]); return projection[\"roster\"]; }"
+          "source": "verb :who() rxd { let roster = this:room_roster(); let names = []; for row in roster { if (typeof(row) == \"map\" && has(row, \"id\")) { names = names + [row[\"name\"]]; } } let text = \"Present: \"; if (length(names) > 0) { text = text + str_join(names, \", \"); } else { text = text + \"nobody\"; } text = text + \".\"; observe({ type: \"who\", source: this, actor: actor, to: actor, room: this, roster: roster, text: text, ts: now() }); return roster; }"
         },
         {
           "name": "room_roster",
@@ -791,11 +791,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { if (isa(item, $player)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }",
-          "implementation": {
-            "kind": "native",
-            "handler": "embodied_room_roster"
-          }
+          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { if (isa(item, $player)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }"
         },
         {
           "name": "live_audience",

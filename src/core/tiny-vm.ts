@@ -173,8 +173,9 @@ export const BUILTIN_NAMES = [
   // raise E_CROSS_HOST_WRITE before reaching SET_PROP.
   "is_remote_object",
   "presence_status",
-  "describe_object", "room_look_projection", "room_who_projection",
-  "player_listing_projection", "object_examine_projection", "help_topic_projection"
+  "_dead_room_look_projection", "_dead_room_who_projection",
+  "_dead_player_listing_projection", "_dead_object_examine_projection", "_dead_help_topic_projection",
+  "present_actors", "connected_players", "session_metadata", "visible_contents", "obvious_verbs", "remote_describe"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -982,25 +983,29 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "describe_object expects one object");
         return frame.ctx.world.describeForActor(assertObj(builtinArgs[0]), frame.ctx.actor) as unknown as WooValue;
       }
-      case "room_look_projection": {
-        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "room_look_projection expects one room");
-        return await frame.ctx.world.roomLookProjection(frame.ctx, assertObj(builtinArgs[0]));
+      case "present_actors": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "present_actors expects one space");
+        return await frame.ctx.world.presentActorsIn(frame.ctx, assertObj(builtinArgs[0])) as unknown as WooValue;
       }
-      case "room_who_projection": {
-        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "room_who_projection expects one room");
-        return await frame.ctx.world.roomWhoProjection(frame.ctx, assertObj(builtinArgs[0]));
+      case "connected_players": {
+        if (builtinArgs.length !== 0) throw wooError("E_INVARG", "connected_players expects no arguments");
+        return frame.ctx.world.connectedPlayerRefs() as unknown as WooValue;
       }
-      case "player_listing_projection": {
-        if (builtinArgs.length > 1) throw wooError("E_INVARG", "player_listing_projection expects optional names");
-        return await frame.ctx.world.playerListingProjection(frame.ctx, builtinArgs[0] ?? null);
+      case "session_metadata": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "session_metadata expects one actor");
+        return frame.ctx.world.sessionMetadataForActor(assertObj(builtinArgs[0]), frame.ctx.world.logicalNow("session_metadata.now")) as unknown as WooValue;
       }
-      case "object_examine_projection": {
-        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "object_examine_projection expects one name");
-        return await frame.ctx.world.objectExamineProjection(frame.ctx, builtinArgs[0]);
+      case "visible_contents": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "visible_contents expects one object");
+        return await frame.ctx.world.visibleContentsForActor(frame.ctx, assertObj(builtinArgs[0])) as unknown as WooValue;
       }
-      case "help_topic_projection": {
-        if (builtinArgs.length > 1) throw wooError("E_INVARG", "help_topic_projection expects optional topic");
-        return await frame.ctx.world.helpTopicProjection(frame.ctx, builtinArgs[0] ?? null);
+      case "obvious_verbs": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "obvious_verbs expects one object");
+        return frame.ctx.world.obviousVerbSpecsForActor(frame.ctx.actor, assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "remote_describe": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "remote_describe expects one object or list of objects");
+        return await frame.ctx.world.remoteDescribeForActor(frame.ctx, builtinArgs[0] ?? null) as unknown as WooValue;
       }
       case "presence_status": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "presence_status expects one actor");

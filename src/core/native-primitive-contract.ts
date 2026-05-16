@@ -52,40 +52,6 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: [],
     note: "Name resolution is transcript-safe only while every semantic candidate read goes through recorded world accessors."
   },
-  embodied_room_roster: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "embodied_room_roster",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: [
-      "room contents",
-      "actor display names",
-      "actor session activity"
-    ],
-    writes: [],
-    emits: [
-      "logical_input"
-    ],
-    note: "Room roster construction is read-only; the native path exists to keep embodied presence filtering centralized."
-  },
-  workspace_room_roster: {
-    kind: "woo.native_primitive_contract.shadow.v1",
-    handler: "workspace_room_roster",
-    version: 1,
-    transcript: "tracked",
-    deterministic: true,
-    reads: [
-      "session presence rows",
-      "actor display names",
-      "actor session activity"
-    ],
-    writes: [],
-    emits: [
-      "logical_input"
-    ],
-    note: "Workspace roster construction is read-only; the native path filters live session presence without mutating legacy mirrors."
-  },
   match_verb: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "match_verb",
