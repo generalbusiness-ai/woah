@@ -25,7 +25,7 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, applyShadowTranscriptToCommittedState, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 
 const MCP_TOKEN_HEADER = "mcp-token";
@@ -260,6 +260,7 @@ export class McpGateway {
     const client = this.v2Scopes.get(scope);
     if (client) applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
     this.world.applyCommittedShadowTranscript(entry.transcript);
+    this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
     this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript);
   }
 
@@ -517,7 +518,27 @@ export class McpGateway {
     if (!reply.commit || !reply.transcript) return;
     applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
     this.world.applyCommittedShadowTranscript(reply.transcript);
+    this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.transcript);
     this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript);
+  }
+
+  // The commit happened in `originScope`; that scope's V2 client has had the
+  // accepted frame applied (head advanced, serialized state updated). Other
+  // cached scope clients also need the transcript's *writes* (without head
+  // advancement) so that cross-scope state changes — most importantly an
+  // actor's `location` after a room-to-room move — show up in whatever scope
+  // the next call dispatches to. Without this, a `deck:west` commit updates
+  // the deck client's snapshot but the chatroom client's snapshot still has
+  // actor.location=the_deck, and the very next actor verb routed to the
+  // chatroom scope reads the stale location.
+  private propagateTranscriptToOtherScopes(originScope: ObjRef, transcript: EffectTranscript): void {
+    for (const [scope, client] of this.v2Scopes) {
+      if (scope === originScope) continue;
+      client.relay.commit_scope.serialized = applyShadowTranscriptToCommittedState(
+        client.relay.commit_scope.serialized,
+        transcript
+      );
+    }
   }
 
   private scopeForV2Call(actor: ObjRef, target: ObjRef): ObjRef {

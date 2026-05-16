@@ -1169,6 +1169,115 @@ describe("McpHost", () => {
     expect(world.getProp("the_chatroom", "next_seq")).toBe(7);
   });
 
+  it("propagates accepted-frame writes to other cached scope snapshots", () => {
+    // Production bug: after `chatroom → southeast → deck`, then `deck → west →
+    // chatroom`, the next actor verb routed to the chatroom scope reads stale
+    // `actor.location=the_deck`. The gateway caches per-scope serialized
+    // snapshots; the `deck:west` commit updates the deck client's snapshot
+    // (head + transcript writes) and the gateway's main world, but the
+    // chatroom client's snapshot was last touched by the `southeast` commit
+    // and still has actor.location=the_deck. The next dispatch goes to
+    // `chatroom`, reads from the chatroom client's stale snapshot, and the
+    // actor verb returns the wrong room. Acceptance of a commit must mirror
+    // the transcript's writes to every other cached scope so cross-scope
+    // state changes (actor.location, room.contents) stay coherent.
+    const world = bootstrapWorld();
+    world.createObject({ id: "scope_room_a", name: "Room A", parent: "$room", owner: "$wiz" });
+    world.createObject({ id: "scope_room_b", name: "Room B", parent: "$room", owner: "$wiz" });
+    world.setProp("scope_room_a", "next_seq", 1);
+    world.setProp("scope_room_b", "next_seq", 1);
+    const session = world.auth("guest:mcp-cross-scope-propagation");
+    world.object(session.actor).location = "scope_room_a";
+    world.object("scope_room_a").contents.add(session.actor);
+    const gateway = new McpGateway(world);
+    const v2Scopes = (gateway as unknown as { v2Scopes: Map<string, { scope: ObjRef; relay: ReturnType<typeof createShadowBrowserRelayShim>; openedSessions: Set<string> }> }).v2Scopes;
+    for (const scope of ["scope_room_a", "scope_room_b"] as const) {
+      const relay = createShadowBrowserRelayShim({
+        node: `mcp-cross-scope-${scope}`,
+        scope,
+        serialized: world.exportWorld()
+      });
+      relay.commit_scope.head = { kind: "woo.scope_head.shadow.v1", scope, epoch: 1, seq: 0, hash: `head-${scope}-0` };
+      v2Scopes.set(scope, { scope, relay, openedSessions: new Set() });
+    }
+
+    // Sanity: both snapshots see the actor in room A.
+    const findActor = (objects: ReturnType<WooWorld["exportWorld"]>["objects"], id: ObjRef) =>
+      objects.find((object) => object.id === id);
+    expect(findActor(v2Scopes.get("scope_room_a")!.relay.commit_scope.serialized.objects, session.actor)?.location).toBe("scope_room_a");
+    expect(findActor(v2Scopes.get("scope_room_b")!.relay.commit_scope.serialized.objects, session.actor)?.location).toBe("scope_room_a");
+
+    // Simulate a commit in room A that moves the actor to room B. Production
+    // would reach this through invokeV2 → CommitScopeDO → acceptV2Commit; the
+    // remote-fan-in path uses the same acceptance plumbing so applyRemote-
+    // Accepted is the cheaper entry point to exercise here.
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "cross-scope-move",
+      route: "sequenced",
+      scope: "scope_room_a",
+      seq: 1,
+      session: session.id,
+      call: { actor: session.actor, target: "scope_room_a", verb: "move_probe", args: [] },
+      reads: [],
+      writes: [
+        { cell: { kind: "location", object: session.actor }, value: "scope_room_b", op: "move" },
+        { cell: { kind: "contents", object: "scope_room_a" }, value: [], op: "remove" },
+        { cell: { kind: "contents", object: "scope_room_b" }, value: [session.actor], op: "add" },
+        { cell: { kind: "prop", object: "scope_room_a", name: "next_seq" }, value: 2, op: "set" }
+      ],
+      creates: [],
+      moves: [{ object: session.actor, from: "scope_room_a", to: "scope_room_b" }],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: "cross-scope-move"
+    };
+    const commit = {
+      kind: "woo.commit.accepted.shadow.v1" as const,
+      id: "cross-scope-move",
+      position: { kind: "woo.scope_head.shadow.v1" as const, scope: "scope_room_a", epoch: 1, seq: 1, hash: "head-scope_room_a-1" },
+      transcript_hash: "cross-scope-move",
+      post_state_hash: "post-cross-scope-move",
+      observations: [],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1" as const,
+        id: "cross-scope-move",
+        route: "sequenced" as const,
+        scope: "scope_room_a",
+        seq: 1,
+        transcript_hash: "cross-scope-move",
+        pre_state_hash: "pre-cross-scope-move",
+        post_state_hash: "post-cross-scope-move",
+        accepted: true,
+        errors: []
+      }
+    };
+
+    gateway.acceptRemoteV2Commit("scope_room_a", commit, transcript);
+
+    // The originating scope (room A) advanced head + applied writes — actor is
+    // gone from its snapshot's room A contents and now at room B.
+    const roomASnapshot = v2Scopes.get("scope_room_a")!.relay.commit_scope.serialized;
+    expect(findActor(roomASnapshot.objects, session.actor)?.location).toBe("scope_room_b");
+    expect(v2Scopes.get("scope_room_a")!.relay.commit_scope.head.seq).toBe(1);
+
+    // The OTHER cached scope (room B) also reflects the actor's new location
+    // — without this propagation, the next call dispatched to scope B would
+    // read actor.location=room A and reject the verb as "not present here".
+    const roomBSnapshot = v2Scopes.get("scope_room_b")!.relay.commit_scope.serialized;
+    expect(findActor(roomBSnapshot.objects, session.actor)?.location).toBe("scope_room_b");
+    // Room B's head is NOT advanced by another scope's commit — only writes
+    // mirror across.
+    expect(v2Scopes.get("scope_room_b")!.relay.commit_scope.head.seq).toBe(0);
+
+    // The gateway's main world also reflects the actor's new location.
+    expect(world.object(session.actor).location).toBe("scope_room_b");
+  });
+
   it("matches the serialized applier for write-only v2 accepted transcripts", () => {
     const world = bootstrapWorld();
     world.setProp("$system", "guest_initial_room", null);
