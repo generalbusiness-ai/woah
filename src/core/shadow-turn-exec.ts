@@ -137,6 +137,8 @@ export type ShadowExecutionNode = {
   trusted_transfer_authorities: Map<string, string>;
   serialized?: SerializedWorld;
   world?: WooWorld;
+  committed_head_hash?: string;
+  serialized_generation?: number;
 };
 
 export type ShadowTurnExecutionResult =
@@ -366,8 +368,8 @@ export function buildShadowCellPageTransfer(input: {
   const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage));
   const knownPageHashes = new Set(input.known_page_hashes ?? []);
   const pageRefs = requiredPages.map((page) => {
-    const hash = shadowStatePageHash(page);
-    return shadowStatePageRef(page, !knownPageHashes.has(hash));
+    const ref = shadowStatePageRef(page, true);
+    return { ...ref, inline: !knownPageHashes.has(ref.hash) };
   });
   const inlinePages = requiredPages
     .filter((page, index) => pageRefs[index]?.inline === true)

@@ -12,6 +12,7 @@ import {
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
   handleShadowBrowserTurnExecEnvelope,
+  markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   purgeShadowBrowserRelayHistory,
@@ -375,6 +376,7 @@ describe("shadow browser node shim", () => {
     if (!secondActor) throw new Error("expected second actor object");
     relay.commit_scope.serialized.objects.push(secondActor);
     relay.commit_scope.serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
+    markShadowBrowserRelaySerializedChanged(relay);
     const second = createShadowBrowserNode({
       node: "browser-reused-executor-b",
       scope: "the_pinboard",
@@ -1077,6 +1079,55 @@ describe("shadow browser node shim", () => {
     expect(receiver.cache.transfers.some((transfer) => transfer.mode === "projection")).toBe(true);
     expect(receiver.cache.live_events).toHaveLength(1);
   });
+
+  it("reuses the relay executor across committed turns at the current head", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-executor-reuse");
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const first = await submitIntentForTest(browser, {
+      id: "browser-executor-reuse-first",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.21]
+    });
+    expect(first.body).toMatchObject({ ok: true });
+    const executor = browser.relay.executors.find((node) => node.node === `${browser.relay.node}:executor`);
+    expect(executor).toBeDefined();
+
+    const second = await submitIntentForTest(browser, {
+      id: "browser-executor-reuse-second",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.22]
+    });
+
+    expect(second.body).toMatchObject({ ok: true });
+    expect(browser.relay.executors.find((node) => node.node === `${browser.relay.node}:executor`)).toBe(executor);
+  });
+
+  it("rebuilds the relay executor when serialized authority changes without a new head", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-executor-generation");
+    await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const first = await submitIntentForTest(browser, {
+      id: "browser-executor-generation-first",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.23]
+    });
+    expect(first.body).toMatchObject({ ok: true });
+    const executor = browser.relay.executors.find((node) => node.node === `${browser.relay.node}:executor`);
+    expect(executor).toBeDefined();
+    markShadowBrowserRelaySerializedChanged(browser.relay);
+
+    const second = await submitIntentForTest(browser, {
+      id: "browser-executor-generation-second",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.24]
+    });
+
+    expect(second.body).toMatchObject({ ok: true });
+    expect(browser.relay.executors.find((node) => node.node === `${browser.relay.node}:executor`)).not.toBe(executor);
+  });
 });
 
 async function browserForScope<T = undefined>(
@@ -1105,6 +1156,25 @@ async function browserForScope<T = undefined>(
 
 function worldFor(browser: ShadowBrowserNode): ReturnType<typeof createWorldFromSerialized> {
   return createWorldFromSerialized(browser.relay.commit_scope.serialized, { persist: false });
+}
+
+async function submitIntentForTest(
+  browser: ShadowBrowserNode,
+  input: { id: string; target: ObjRef; verb: string; args?: WooValue[] }
+): Promise<{ body: NonNullable<Awaited<ReturnType<typeof handleShadowBrowserTurnExecEnvelope>>>["body"] }> {
+  const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+    kind: "woo.turn.intent.request.shadow.v1" as const,
+    id: input.id,
+    route: "sequenced" as const,
+    scope: browser.scope,
+    target: input.target,
+    verb: input.verb,
+    args: input.args ?? [],
+    persistence: "durable" as const
+  });
+  const reply = await handleShadowBrowserTurnExecEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+  if (!reply) throw new Error(`expected intent reply for ${input.id}`);
+  return { body: reply.body };
 }
 
 function observationObject(turn: { result: { transcript?: { observations: Array<Record<string, WooValue> & { type: string }> } } }, type: string, key: string): ObjRef {

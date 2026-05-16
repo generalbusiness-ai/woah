@@ -18,6 +18,7 @@ import {
   MAX_SHADOW_IDEMPOTENCY_ENTRIES,
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
   MAX_SHADOW_TRANSCRIPT_TAIL,
+  markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -30,6 +31,7 @@ import {
 } from "../core/shadow-browser-node";
 import { transcriptLogEntry, transcriptSessionActiveScope, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
@@ -304,7 +306,11 @@ export class CommitScopeDO {
     // state, not only from the transport auth map. Keep that narrow session
     // slice fresh so a new MCP/browser session can commit into a scope whose
     // durable snapshot was opened by an earlier session.
-    relay.commit_scope.serialized.sessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, input.sessions);
+    const mergedSessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, input.sessions);
+    if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
+      relay.commit_scope.serialized.sessions = mergedSessions;
+      markShadowBrowserRelaySerializedChanged(relay);
+    }
     this.refreshSerializedObjects(relay, input.session_objects ?? []);
   }
 
@@ -320,18 +326,24 @@ export class CommitScopeDO {
     if (index < 0) {
       relay.commit_scope.serialized.sessions.push(serialized);
       relay.commit_scope.serialized.sessions.sort((a, b) => a.id.localeCompare(b.id));
+      markShadowBrowserRelaySerializedChanged(relay);
       return;
     }
     const existing = relay.commit_scope.serialized.sessions[index];
-    relay.commit_scope.serialized.sessions[index] = {
+    const next = {
       ...serialized,
       activeScope: existing.actor === serialized.actor && existing.activeScope !== undefined
         ? existing.activeScope
         : serialized.activeScope
     };
+    if (stableShadowJson(next as unknown as WooValue) !== stableShadowJson(existing as unknown as WooValue)) {
+      relay.commit_scope.serialized.sessions[index] = next;
+      markShadowBrowserRelaySerializedChanged(relay);
+    }
   }
 
   private refreshSerializedObjects(relay: ShadowBrowserRelayShim, objects: SerializedObject[]): void {
+    if (objects.length === 0) return;
     const byId = new Map(relay.commit_scope.serialized.objects.map((obj, index) => [obj.id, index] as const));
     for (const obj of objects) {
       const clone = structuredClone(obj) as SerializedObject;
@@ -343,6 +355,7 @@ export class CommitScopeDO {
         relay.commit_scope.serialized.objects[index] = clone;
       }
     }
+    markShadowBrowserRelaySerializedChanged(relay);
   }
 
   private browserFor(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest) {

@@ -18,7 +18,7 @@ import type { EffectTranscript } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
-import type { MetricEvent, ObjRef, Observation, WooValue } from "./types";
+import type { MetricEvent, ObjRef, Observation, PropertyDef, WooValue } from "./types";
 import { cloneValue } from "./types";
 import type { ScopedObjectSummary } from "./world";
 
@@ -168,6 +168,7 @@ export type ShadowBrowserRelayShim = {
   browsers: Map<string, ShadowBrowserNode>;
   session_auth: Map<string, ShadowBrowserSessionClaims>;
   session_revs: Map<string, number>;
+  serialized_generation: number;
   idempotency_window_ms: number;
   recently_seen: Map<string, number>;
   recent_replies: Map<string, ShadowEnvelope>;
@@ -380,6 +381,7 @@ export function createShadowBrowserRelayShim(input: {
     browsers: new Map(),
     session_auth: auth.session_auth,
     session_revs: auth.session_revs,
+    serialized_generation: 0,
     idempotency_window_ms: Math.max(input.idempotency_window_ms ?? MIN_SHADOW_IDEMPOTENCY_WINDOW_MS, MIN_SHADOW_IDEMPOTENCY_WINDOW_MS),
     recently_seen: new Map(),
     recent_replies: new Map(),
@@ -429,6 +431,11 @@ export function mergeShadowBrowserSessionState(current: SerializedSession[], fre
     mergedById.set(session.id, merged);
   }
   return Array.from(mergedById.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export function markShadowBrowserRelaySerializedChanged(relay: ShadowBrowserRelayShim): void {
+  relay.serialized_generation++;
+  SHADOW_SERIALIZED_INDEX_CACHE.delete(relay.commit_scope.serialized);
 }
 
 export function createShadowBrowserNode(input: {
@@ -800,7 +807,8 @@ export function buildShadowBrowserCatchupTransfer(
       .sort((a, b) => a.position.seq - b.position.seq);
     const expectedSeqs = new Set(Array.from({ length: relay.commit_scope.head.seq - lastKnownHead.seq }, (_item, index) => lastKnownHead.seq + index + 1));
     const hasContiguousTail = accepted.length === expectedSeqs.size && accepted.every((frame) => expectedSeqs.has(frame.position.seq));
-    const transcripts = accepted.map((frame) => relay.transcript_tail.find((item) => item.hash === frame.transcript_hash));
+    const transcriptByHash = new Map(relay.transcript_tail.map((item) => [item.hash, item] as const));
+    const transcripts = accepted.map((frame) => transcriptByHash.get(frame.transcript_hash));
     if (hasContiguousTail && transcripts.every((item): item is EffectTranscript => Boolean(item))) {
       return buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient, viewer);
     }
@@ -1039,6 +1047,8 @@ async function executeShadowBrowserTurnExecRequest(
 
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
   if (network.result.ok) {
+    executor.committed_head_hash = browser.relay.commit_scope.head.hash;
+    executor.serialized_generation = browser.relay.serialized_generation;
     if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
     else {
       browser.cache.transcript_tail.push(network.result.transcript);
@@ -1053,22 +1063,25 @@ async function executeShadowBrowserTurnExecRequest(
 function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: ShadowTurnExecRequest): ShadowExecutionNode {
   const nodeId = `${relay.node}:executor`;
   let executor = relay.executors.find((node) => node.node === nodeId);
-  if (!executor) {
-    executor = createShadowExecutionNode({
+  const needsRefresh = !executor ||
+    executor.scope !== request.key.scope ||
+    executor.committed_head_hash !== relay.commit_scope.head.hash ||
+    executor.serialized_generation !== relay.serialized_generation;
+  if (needsRefresh) {
+    const fresh = createShadowExecutionNode({
       node: nodeId,
       scope: request.key.scope,
       serialized: relay.commit_scope.serialized,
       atom_hashes: request.key.atom_hashes
     });
-    relay.executors.push(executor);
-  } else {
-    // The relay executor is reused across socket lifetimes, while the commit
-    // scope's serialized session slice can refresh between turns. Rebuild the
-    // executor world from the current committed snapshot before planning or an
-    // old cached world can reject a freshly accepted session before recording.
-    executor.serialized = structuredClone(relay.commit_scope.serialized);
-    executor.world = undefined;
+    fresh.committed_head_hash = relay.commit_scope.head.hash;
+    fresh.serialized_generation = relay.serialized_generation;
+    const index = relay.executors.findIndex((node) => node.node === nodeId);
+    if (index < 0) relay.executors.push(fresh);
+    else relay.executors[index] = fresh;
+    executor = fresh;
   }
+  if (!executor) throw new Error(`shadow relay executor unavailable: ${nodeId}`);
   // The relay executor has the authoritative scope state locally. The atom set
   // still gates the actual execution against the client's planned key; missing
   // actual atoms trigger the normal state-plane retry path.
@@ -1174,7 +1187,7 @@ function shadowScopeProjection(
       return obj ? shadowSerializedObjectSummary(index, obj, viewer?.actor) : null;
     })
     .filter((item): item is ScopedObjectSummary => item !== null);
-  const seq = seqOverride ?? serialized.logs.find(([space]) => space === scope)?.[1].reduce((max, entry) => Math.max(max, entry.seq), 0) ?? 0;
+  const seq = seqOverride ?? index.logSeqBySpace.get(scope) ?? 0;
   return {
     kind: "woo.scope_projection.shadow.v1",
     scope,
@@ -1203,13 +1216,40 @@ function shadowScopeProjection(
 type ShadowSerializedIndex = {
   objects: Map<ObjRef, SerializedObject>;
   sessions: Map<string, SerializedSession>;
+  indexedObjects: Map<ObjRef, ShadowIndexedObject>;
+  logSeqBySpace: Map<ObjRef, number>;
 };
 
+type ShadowIndexedObject = {
+  record: SerializedObject;
+  properties: Map<string, WooValue>;
+  propertyDefs: Map<string, PropertyDef>;
+};
+
+const SHADOW_SERIALIZED_INDEX_CACHE = new WeakMap<SerializedWorld, ShadowSerializedIndex>();
+
 function shadowSerializedIndex(serialized: SerializedWorld): ShadowSerializedIndex {
-  return {
+  const cached = SHADOW_SERIALIZED_INDEX_CACHE.get(serialized);
+  if (cached) return cached;
+  const indexedObjects = new Map<ObjRef, ShadowIndexedObject>();
+  for (const obj of serialized.objects) {
+    indexedObjects.set(obj.id, {
+      record: obj,
+      properties: new Map(obj.properties),
+      propertyDefs: new Map(obj.propertyDefs.map((def) => [def.name, def] as const))
+    });
+  }
+  const index = {
     objects: new Map(serialized.objects.map((obj) => [obj.id, obj])),
-    sessions: new Map(serialized.sessions.map((session) => [session.id, session]))
+    sessions: new Map(serialized.sessions.map((session) => [session.id, session])),
+    indexedObjects,
+    logSeqBySpace: new Map(serialized.logs.map(([space, entries]) => [
+      space,
+      entries.reduce((max, entry) => Math.max(max, entry.seq), 0)
+    ] as const))
   };
+  SHADOW_SERIALIZED_INDEX_CACHE.set(serialized, index);
+  return index;
 }
 
 function shadowProjectionRefs(index: ShadowSerializedIndex, scope: ObjRef, viewer?: ShadowProjectionViewer): ObjRef[] {
@@ -1283,8 +1323,9 @@ function shadowPropertyNames(index: ShadowSerializedIndex, objRef: ObjRef): stri
   const seen = new Set<ObjRef>();
   while (current && !seen.has(current.id)) {
     seen.add(current.id);
-    for (const def of current.propertyDefs) names.add(def.name);
-    for (const [name] of current.properties) names.add(name);
+    const indexed = index.indexedObjects.get(current.id);
+    for (const name of indexed?.propertyDefs.keys() ?? []) names.add(name);
+    for (const name of indexed?.properties.keys() ?? []) names.add(name);
     current = current.parent ? index.objects.get(current.parent) ?? null : null;
   }
   return Array.from(names).sort();
@@ -1301,14 +1342,14 @@ function shadowPropertyValue(
   let hasValue = false;
   while (current && !seen.has(current.id)) {
     seen.add(current.id);
+    const indexed = index.indexedObjects.get(current.id);
     if (!hasValue) {
-      const own = current.properties.find(([prop]) => prop === name);
-      if (own) {
-        value = own[1];
+      if (indexed?.properties.has(name)) {
+        value = indexed.properties.get(name);
         hasValue = true;
       }
     }
-    const def = current.propertyDefs.find((item) => item.name === name);
+    const def = indexed?.propertyDefs.get(name);
     if (def) {
       return { value: hasValue ? value : def.defaultValue, owner: def.owner, perms: def.perms };
     }

@@ -32,6 +32,7 @@ import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
+import { readObjectPropertyValue } from "./property-read";
 import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
 import {
   finalWritesByCell,
@@ -1099,40 +1100,14 @@ export class WooWorld {
 
   getProp(objRef: ObjRef, name: string): WooValue {
     const obj = this.object(objRef);
-    if (name === "owner") {
-      this.recordTurnEvent({ kind: "prop_read", object: objRef, name, value: obj.owner, version: this.propertyVersionForRecording(objRef, name) });
-      return obj.owner;
-    }
-    if (obj.properties.has(name)) {
-      const value = cloneValue(obj.properties.get(name)!);
-      this.recordTurnEvent({ kind: "prop_read", object: objRef, name, value, version: this.propertyVersionForRecording(objRef, name) });
-      return value;
-    }
-    // The `name` attribute is the substrate's authoritative display label
-    // (see createObject, examine output, objectDisplayNameAsync). When no
-    // explicit property has been set, surface the attribute to woocode
-    // readers like `dobj.name` so they don't see the inherited "" default
-    // for seed objects ($wiz, $root, $thing, …) that carry only an
-    // attribute, not a property value. createAuthoredObject mirrors them
-    // intentionally for builder-created objects; this fallback covers the
-    // bootstrap path that doesn't.
-    if (name === "name") {
-      this.recordTurnEvent({ kind: "prop_read", object: objRef, name, value: obj.name, version: this.propertyVersionForRecording(objRef, name) });
-      return obj.name;
-    }
-    let parent = obj.parent;
-    while (parent) {
-      const ancestor = this.parentWalkLookup(objRef, parent);
-      if (!ancestor) break;
-      const def = ancestor.propertyDefs.get(name);
-      if (def) {
-        const value = cloneValue(def.defaultValue);
-        this.recordTurnEvent({ kind: "prop_read", object: objRef, name, value, version: this.propertyVersionForRecording(objRef, name) });
-        return value;
-      }
-      parent = ancestor.parent;
-    }
-    throw wooError("E_PROPNF", `property not found: ${name}`, name);
+    const value = readObjectPropertyValue({
+      object: obj,
+      name,
+      lookupParent: (parent, start) => this.parentWalkLookup(start, parent),
+      propertyNotFound: (missing) => wooError("E_PROPNF", `property not found: ${missing}`, missing)
+    });
+    this.recordTurnEvent({ kind: "prop_read", object: objRef, name, value, version: this.propertyVersionForRecording(objRef, name) });
+    return value;
   }
 
   addVerb(objRef: ObjRef, verb: VerbDef, options: { append?: boolean; slot?: number } = {}): VerbDef {

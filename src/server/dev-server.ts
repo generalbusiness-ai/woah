@@ -30,6 +30,7 @@ import {
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
   handleShadowBrowserTurnExecEnvelope,
+  markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -40,6 +41,7 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 
@@ -372,7 +374,11 @@ function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim): void {
     const claims = relay.session_auth.get(shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor }));
     if (claims) relay.session_auth.set(browser.session_token, claims);
   }
-  relay.commit_scope.serialized.sessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, world.exportSessions());
+  const mergedSessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, world.exportSessions());
+  if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
+    relay.commit_scope.serialized.sessions = mergedSessions;
+    markShadowBrowserRelaySerializedChanged(relay);
+  }
 }
 
 function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Session): void {
@@ -399,15 +405,20 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
   if (index < 0) {
     relay.commit_scope.serialized.sessions.push(serialized);
     refreshDevV2SerializedSessionActor(relay, session.actor);
+    markShadowBrowserRelaySerializedChanged(relay);
     return;
   }
   const existing = relay.commit_scope.serialized.sessions[index];
-  relay.commit_scope.serialized.sessions[index] = {
+  const next = {
     ...serialized,
     activeScope: existing.actor === session.actor && existing.activeScope !== undefined
       ? existing.activeScope
       : serialized.activeScope
   };
+  if (stableShadowJson(next as unknown as WooValue) !== stableShadowJson(existing as unknown as WooValue)) {
+    relay.commit_scope.serialized.sessions[index] = next;
+    markShadowBrowserRelaySerializedChanged(relay);
+  }
   refreshDevV2SerializedSessionActor(relay, session.actor);
 }
 
@@ -418,9 +429,11 @@ function refreshDevV2SerializedSessionActor(relay: ShadowBrowserRelayShim, actor
   if (index < 0) {
     relay.commit_scope.serialized.objects.push(record);
     relay.commit_scope.serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
+    markShadowBrowserRelaySerializedChanged(relay);
     return;
   }
   relay.commit_scope.serialized.objects[index] = record;
+  markShadowBrowserRelaySerializedChanged(relay);
 }
 
 async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame> {

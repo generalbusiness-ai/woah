@@ -1,10 +1,10 @@
-import { createWorldFromSerialized } from "./bootstrap";
 import type { SerializedWorld } from "./repository";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import type { ErrorValue, ObjRef, Observation, WooValue } from "./types";
 import type { RecordedCell, RecordedCellWriteOp, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
 import { nativePrimitiveContractValue, nativePrimitiveIsTranscriptTracked } from "./native-primitive-contract";
+import { readObjectPropertyValue, type PropertyReadableObject } from "./property-read";
 
 export type TranscriptCell = RecordedCell;
 
@@ -81,8 +81,11 @@ export type TranscriptCellRead = { ok: true; version?: string; value: WooValue }
 
 export type TranscriptCellReader = {
   serialized: SerializedWorld;
-  world: ReturnType<typeof createWorldFromSerialized>;
   objectById: Map<ObjRef, SerializedWorld["objects"][number]>;
+  propertiesByObject: Map<ObjRef, Map<string, WooValue>>;
+  propertyDefsByObject: Map<ObjRef, Map<string, SerializedWorld["objects"][number]["propertyDefs"][number]>>;
+  propertyVersionsByObject: Map<ObjRef, Map<string, number | string>>;
+  verbsByObject: Map<ObjRef, SerializedWorld["objects"][number]["verbs"]>;
 };
 
 export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTranscript {
@@ -331,10 +334,23 @@ export function readTranscriptCellFromSerializedWorld(serialized: SerializedWorl
 }
 
 export function createTranscriptCellReader(serialized: SerializedWorld): TranscriptCellReader {
+  const propertiesByObject = new Map<ObjRef, Map<string, WooValue>>();
+  const propertyDefsByObject = new Map<ObjRef, Map<string, SerializedWorld["objects"][number]["propertyDefs"][number]>>();
+  const propertyVersionsByObject = new Map<ObjRef, Map<string, number | string>>();
+  const verbsByObject = new Map<ObjRef, SerializedWorld["objects"][number]["verbs"]>();
+  for (const obj of serialized.objects) {
+    propertiesByObject.set(obj.id, new Map(obj.properties));
+    propertyDefsByObject.set(obj.id, new Map(obj.propertyDefs.map((def) => [def.name, def] as const)));
+    propertyVersionsByObject.set(obj.id, new Map(obj.propertyVersions));
+    verbsByObject.set(obj.id, obj.verbs);
+  }
   return {
     serialized,
-    world: createWorldFromSerialized(serialized, { persist: false }),
-    objectById: new Map(serialized.objects.map((obj) => [obj.id, obj]))
+    objectById: new Map(serialized.objects.map((obj) => [obj.id, obj])),
+    propertiesByObject,
+    propertyDefsByObject,
+    propertyVersionsByObject,
+    verbsByObject
   };
 }
 
@@ -345,7 +361,7 @@ export function readTranscriptCell(reader: TranscriptCellReader, cell: Transcrip
         return {
           ok: true,
           version: versionString(propVersion(reader, cell.object, cell.name)),
-          value: reader.world.getProp(cell.object, cell.name)
+          value: readSerializedProp(reader, cell.object, cell.name)
         };
       case "verb": {
         const verb = serializedVerb(reader, cell.object, cell.name);
@@ -389,7 +405,7 @@ function propVersion(reader: TranscriptCellReader, object: ObjRef, name: string)
   const obj = serializedObject(reader, object);
   if (!obj) return undefined;
   if (name === "owner") return shadowOwnerCellVersion(object, obj.owner);
-  return obj.propertyVersions.find(([prop]) => prop === name)?.[1] ?? 0;
+  return reader.propertyVersionsByObject.get(object)?.get(name) ?? 0;
 }
 
 function serializedObject(reader: TranscriptCellReader, object: ObjRef): SerializedWorld["objects"][number] | undefined {
@@ -397,8 +413,35 @@ function serializedObject(reader: TranscriptCellReader, object: ObjRef): Seriali
 }
 
 function serializedVerb(reader: TranscriptCellReader, object: ObjRef, name: string): SerializedWorld["objects"][number]["verbs"][number] | undefined {
+  return reader.verbsByObject.get(object)?.find((verb) => verb.name === name || verb.aliases.includes(name));
+}
+
+function readSerializedProp(reader: TranscriptCellReader, object: ObjRef, name: string): WooValue {
   const obj = serializedObject(reader, object);
-  return obj?.verbs.find((verb) => verb.name === name || verb.aliases.includes(name));
+  if (!obj) throw new Error(`object not found: ${object}`);
+  return readObjectPropertyValue({
+    object: readableSerializedObject(reader, obj),
+    name,
+    lookupParent: (parent) => {
+      const ancestor = serializedObject(reader, parent);
+      return ancestor ? readableSerializedObject(reader, ancestor) : null;
+    },
+    propertyNotFound: (missing) => new Error(`property not found: ${missing}`)
+  });
+}
+
+function readableSerializedObject(
+  reader: TranscriptCellReader,
+  obj: SerializedWorld["objects"][number]
+): PropertyReadableObject {
+  return {
+    id: obj.id,
+    name: obj.name,
+    parent: obj.parent,
+    owner: obj.owner,
+    properties: reader.propertiesByObject.get(obj.id) ?? new Map(),
+    propertyDefs: reader.propertyDefsByObject.get(obj.id) ?? new Map()
+  };
 }
 
 function uniqueTranscriptCells(transcript: EffectTranscript): TranscriptCell[] {

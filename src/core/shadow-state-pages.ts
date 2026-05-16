@@ -104,13 +104,23 @@ export function shadowPropertyCellPages(obj: SerializedObject): ShadowPropertyCe
   const values = new Map(obj.properties);
   const versions = new Map(obj.propertyVersions);
   const names = new Set<string>([...defs.keys(), ...values.keys(), ...versions.keys()]);
-  return Array.from(names).sort().map((name) => shadowPropertyCellPage(obj, name));
+  return Array.from(names).sort().map((name) => shadowPropertyCellPageFromMaps(obj, name, defs, values, versions));
 }
 
 export function shadowPropertyCellPage(obj: SerializedObject, name: string): ShadowPropertyCellPage {
   const defs = new Map(obj.propertyDefs.map((def) => [def.name, def] as const));
   const values = new Map(obj.properties);
   const versions = new Map(obj.propertyVersions);
+  return shadowPropertyCellPageFromMaps(obj, name, defs, values, versions);
+}
+
+function shadowPropertyCellPageFromMaps(
+  obj: SerializedObject,
+  name: string,
+  defs: Map<string, PropertyDef>,
+  values: Map<string, WooValue>,
+  versions: Map<string, number>
+): ShadowPropertyCellPage {
   const hasValue = values.has(name);
   return {
     kind: "woo.state_page.property_cell.shadow.v1",
@@ -141,12 +151,13 @@ export function shadowStatePageHash(page: ShadowStatePage): string {
 }
 
 export function shadowStatePageRef(page: ShadowStatePage, inline: boolean): ShadowStatePageRef {
+  const json = stableShadowJson(page as unknown as WooValue);
   return {
     object: page.object,
     page: page.page,
     ...("name" in page ? { name: page.name } : {}),
-    hash: shadowStatePageHash(page),
-    bytes: Buffer.byteLength(stableShadowJson(page as unknown as WooValue), "utf8"),
+    hash: hashSource(json),
+    bytes: Buffer.byteLength(json, "utf8"),
     inline
   };
 }
