@@ -57,7 +57,10 @@ describeRemote("deployed v2 MCP smoke", () => {
       await session.call("tools/list");
       const focused = await session.call("tools/call", {
         name: "woo_focus",
-        arguments: { target: "the_taskspace" }
+        // `woo_focus` is a reachability promotion, not a global lookup. Use the
+        // active room so this smoke tests list_changed without depending on a
+        // retired or catalog-specific singleton such as the old taskspace.
+        arguments: { target: "the_chatroom" }
       });
       expect(focused.result?.isError).not.toBe(true);
 
