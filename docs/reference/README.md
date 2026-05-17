@@ -20,6 +20,8 @@ user benefits from understanding, written for the user.
   convention used by catalog classes that gate their own state.
 - **[text-format.md](text-format.md)** — the `.format` convention
   for plain vs markdown content.
+- **[tool-ui.md](tool-ui.md)** — the standard workspace/minichat pattern
+  for interactive tool catalogs.
 
 ## Vocabulary you'll see across the docs
 

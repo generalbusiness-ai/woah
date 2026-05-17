@@ -116,7 +116,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["$system.api_keys", "target actor existence", "target actor ancestry", "target actor ownership", "actor wizard authority"],
     writes: ["$system.api_keys", "$system.wizard_actions"],
     emits: [],
-    note: "Owner-mint path used by $block:mint_apikey: same effect shape as create_api_key, with the wizard-authority check replaced by an ownership read."
+    note: "Owner-mint path used by block mint_apikey: same effect shape as create_api_key, with the wizard-authority check replaced by an ownership read."
   },
   list_api_keys: {
     kind: "woo.native_primitive_contract.shadow.v1",

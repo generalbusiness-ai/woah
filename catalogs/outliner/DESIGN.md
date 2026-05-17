@@ -534,6 +534,13 @@ instance — no demoworld dependency.
 
 ## UI
 
+Outliner follows the standard tool workspace contract in
+[`docs/reference/tool-ui.md`](../../docs/reference/tool-ui.md): a
+`space-workspace` frame with an outliner main-region component and the
+shared `chat:chat.space-mini` chat-region component. It should be read
+as another example of the same model used by Pinboard, Dubspace, and
+Tasks, not as a separate client-side integration pattern.
+
 The catalog ships a `<woo-outliner-tree>` web component in
 `ui/outliner-tree.ts`. The SPA renders it as the active component for
 a dedicated **Outliner** tab (between Tasks and Inspector). Routing:
@@ -619,13 +626,13 @@ event.
 
 The `frames` block declares `outliner.tree` as the main-region
 component and `chat:chat.space-mini` as the chat-region component for
-any `$outliner` instance. `toolFrameComponentTag` reads the main
-component when the SPA renders the Outliner tab; the dedicated render
-path in `main.ts` writes subject+woo on the tag and the component
-self-hydrates from there. Once the actor is present in the outliner, the
-component renders the same ambient companion shell/slot used by
-pinboard, dubspace, and tasks, and the host mounts the shared minichat
-component into that slot.
+any `$outliner` instance. `toolFrameComponentTag` reads the frame's main
+component when the SPA renders the Outliner tab, then writes
+`subject` + `woo` on the tag and lets the component self-hydrate from
+there. Once the actor is present in the outliner, the component uses
+the shared ambient companion helpers from `src/client/framework.ts` to
+render the same shell/slot used by Pinboard, Dubspace, and Tasks. The
+host mounts the shared minichat component into that slot.
 
 The component owns:
 

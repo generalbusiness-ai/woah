@@ -1,5 +1,8 @@
 import {
   escapeHtml,
+  preserveAmbientCompanionPanel,
+  renderAmbientCompanionShell,
+  restoreAmbientCompanionPanel,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -115,15 +118,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const focusLabel = data.focus
       ? data.items.find((it) => it.id === data.focus)?.text ?? data.focus
       : "(root)";
-    const existingChatPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap }>(
-      "[data-ambient-companion-shell] [data-space-chat-panel]"
-    );
-    if (existingChatPanel && existingChatPanel.dataset.spaceChatSpace !== outlinerId) {
-      existingChatPanel.remove();
-    }
-    const preservedPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap }>(
-      "[data-ambient-companion-shell] [data-space-chat-panel]"
-    );
+    const preservedPanel = preserveAmbientCompanionPanel(this, outlinerId);
     const tree = `
       <section class="outliner">
         <header class="outliner-header">
@@ -148,15 +143,9 @@ export class WooOutlinerTreeElement extends HTMLElement {
       </section>
     `;
     this.innerHTML = this.companionVisible
-      ? `<section class="ambient-companion-shell outliner-shell" data-ambient-companion-shell="${escapeHtml(outlinerId)}">
-          <section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${tree}</section>
-          <div data-ambient-companion></div>
-        </section>`
+      ? renderAmbientCompanionShell(outlinerId, `<section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${tree}</section>`)
       : tree;
-    if (preservedPanel) {
-      const slot = this.querySelector<HTMLElement>("[data-ambient-companion]");
-      if (slot) slot.append(preservedPanel);
-    }
+    restoreAmbientCompanionPanel(this, preservedPanel);
   }
 
   private computeVisibleItems(items: OutlinerItem[]): Array<OutlinerItem & { depth: number }> {

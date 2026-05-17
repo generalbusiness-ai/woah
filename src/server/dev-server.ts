@@ -468,8 +468,8 @@ async function handleV2ShadowFrame(
 ): Promise<void> {
   try {
     // Per-envelope relay routing: a single WS may carry calls for any scope
-    // (e.g. the chat panel is the_chatroom but the outliner tree calls
-    // list_items on the_outline). The WS-bound browser is bound to one
+    // (e.g. the chat panel and a nested tool component can target different
+    // spaces). The WS-bound browser is bound to one
     // relay at open time; without rerouting here, off-scope calls would be
     // submitted to the wrong commit scope and rejected as scope_mismatch.
     // The production worker handles this internally via per-DO routing;

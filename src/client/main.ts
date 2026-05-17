@@ -163,10 +163,10 @@ const state: AppState = {
 let audio: DubAudio | undefined;
 const ui = createWooClientFramework();
 let chatRoomPin: ChatRoomPin | null = null;
-// `the_dubspace` / `the_pinboard` / `the_outline` seeds live in demoworld's
-// manifest now (the demoworld-dependency-inversion). Read from demoworld so
-// the SPA can route to them on first load. Tasks still self-seeds the
-// taskboard with no location coupling, so it reads from its own manifest.
+// Demo tool seeds live in demoworld's manifest now (the
+// demoworld-dependency-inversion). Read from demoworld so the SPA can route
+// to them on first load. Tasks still self-seeds its board with no location
+// coupling, so it reads from its own manifest.
 const bundledToolSeeds = {
   dubspace: bundledSeedRef(demoworldManifest, "$dubspace"),
   pinboard: bundledSeedRef(demoworldManifest, "$pinboard"),

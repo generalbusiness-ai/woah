@@ -1,4 +1,12 @@
-import { escapeHtml, type ObservationRegistry, type WooComponentRegistry, type WooContext } from "../../../src/client/framework";
+import {
+  escapeHtml,
+  preserveAmbientCompanionPanel,
+  renderAmbientCompanionShell,
+  restoreAmbientCompanionPanel,
+  type ObservationRegistry,
+  type WooComponentRegistry,
+  type WooContext
+} from "../../../src/client/framework";
 import tasksManifest from "../manifest.json";
 
 export type KanbanActionArg = {
@@ -1548,15 +1556,7 @@ export class WooTasksKanbanElement extends HTMLElement {
         </div>
       </section>
     `;
-    const existingChatPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap; remove: () => void }>(
-      "[data-ambient-companion-shell] [data-space-chat-panel]"
-    );
-    if (existingChatPanel && existingChatPanel.dataset.spaceChatSpace !== registryId) {
-      existingChatPanel.remove();
-    }
-    const preservedPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap; remove: () => void }>(
-      "[data-ambient-companion-shell] [data-space-chat-panel]"
-    );
+    const preservedPanel = preserveAmbientCompanionPanel(this, registryId);
     // Toolbar lives at the top of the custom element, outside the ambient-companion
     // shell — same structure as pinboard (`<section class="toolbar pinboard-toolbar">`
     // before `<section class="ambient-companion-shell">`). Putting it inside the
@@ -1564,15 +1564,9 @@ export class WooTasksKanbanElement extends HTMLElement {
     // versus other tools.
     this.innerHTML = `
       ${this.renderHeader(registryName || "Tasks")}
-      <section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(registryId)}">
-        ${workspace}
-        <div data-ambient-companion></div>
-      </section>
+      ${renderAmbientCompanionShell(registryId, workspace)}
     `;
-    if (preservedPanel) {
-      const slot = this.querySelector<HTMLElement>("[data-ambient-companion]");
-      if (slot) slot.append(preservedPanel);
-    }
+    restoreAmbientCompanionPanel(this, preservedPanel);
     this.dispatchEvent(new CustomEvent("woo-tasks-rendered", { bubbles: true }));
   }
 
