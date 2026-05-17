@@ -52,6 +52,26 @@ export function escapeHtml(value: unknown): string {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char] ?? char));
 }
 
+const AMBIENT_COMPANION_PANEL_SELECTOR = "[data-ambient-companion-shell] [data-space-chat-panel]";
+
+export function renderAmbientCompanionShell(subject: string, workspaceHtml: string): string {
+  return `<section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(subject)}">${workspaceHtml}<div data-ambient-companion></div></section>`;
+}
+
+export function preserveAmbientCompanionPanel(root: ParentNode, subject: string): HTMLElement | null {
+  const existing = root.querySelector<HTMLElement>(AMBIENT_COMPANION_PANEL_SELECTOR);
+  if (existing && existing.dataset.spaceChatSpace !== subject) existing.remove();
+  return root.querySelector<HTMLElement>(AMBIENT_COMPANION_PANEL_SELECTOR);
+}
+
+export function restoreAmbientCompanionPanel(root: ParentNode, panel: HTMLElement | null): boolean {
+  if (!panel) return false;
+  const slot = root.querySelector<HTMLElement>("[data-ambient-companion]");
+  if (!slot) return false;
+  slot.append(panel);
+  return true;
+}
+
 export type DeliveredObservation = {
   route: WooObservationRoute;
   seq?: number;

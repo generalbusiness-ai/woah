@@ -3083,7 +3083,7 @@ textarea {
 
   .nav {
     display: grid;
-    grid-template-columns: auto minmax(7rem, 1fr) repeat(5, minmax(0, max-content));
+    grid-template-columns: auto minmax(7rem, 1fr) repeat(6, minmax(0, max-content));
     align-items: center;
     gap: 0.45rem;
     padding: 0.55rem;
@@ -3257,7 +3257,7 @@ textarea {
 
 @media (max-width: 520px) {
   .nav {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
   }
 
   .brand,
@@ -3268,8 +3268,8 @@ textarea {
 
   .nav-button {
     width: 100%;
-    padding-inline: 0.25rem;
-    font-size: 0.76rem;
+    padding-inline: 0.1rem;
+    font-size: 0.66rem;
   }
 
   .loop-console {

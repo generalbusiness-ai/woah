@@ -5,10 +5,17 @@ import { describe, expect, it, vi } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
+import outlinerManifest from "../catalogs/outliner/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import tasksManifest from "../catalogs/tasks/manifest.json";
 import weatherManifest from "../catalogs/weather/manifest.json";
-import { CatalogUiRegistry, type WooContext } from "../src/client/framework";
+import {
+  CatalogUiRegistry,
+  preserveAmbientCompanionPanel,
+  renderAmbientCompanionShell,
+  restoreAmbientCompanionPanel,
+  type WooContext
+} from "../src/client/framework";
 
 function defineOnce(tag: string, ctor: CustomElementConstructor): void {
   if (!customElements.get(tag)) customElements.define(tag, ctor);
@@ -28,6 +35,30 @@ function testWooContext(names: Record<string, string> = {}): WooContext {
 }
 
 describe("bundled catalog UI components", () => {
+  it("renders and preserves the shared ambient companion shell", () => {
+    const host = document.createElement("section");
+    host.innerHTML = renderAmbientCompanionShell(
+      "the_tool",
+      '<section class="tool-workspace has-ambient-companion" data-space-chat-layout="the_tool"></section>'
+    );
+    const slot = host.querySelector("[data-ambient-companion]");
+    const panel = document.createElement("aside");
+    panel.dataset.spaceChatPanel = "";
+    panel.dataset.spaceChatSpace = "the_tool";
+    slot?.append(panel);
+
+    const preserved = preserveAmbientCompanionPanel(host, "the_tool");
+    host.innerHTML = renderAmbientCompanionShell(
+      "the_tool",
+      '<section class="tool-workspace has-ambient-companion" data-space-chat-layout="the_tool"></section>'
+    );
+
+    expect(preserved).toBe(panel);
+    expect(restoreAmbientCompanionPanel(host, preserved)).toBe(true);
+    expect(host.querySelector("[data-ambient-companion]")?.firstElementChild).toBe(panel);
+    expect(host.querySelector('[data-ambient-companion-shell="the_tool"]')).not.toBeNull();
+  });
+
   it("keeps the ambient-companion-shell-enabled layouts vertically consistent across tools", () => {
     // Ambient-companion-shell sizing now goes through the shared
     // `.split.has-ambient-companion` primitive (used by dubspace + pinboard
@@ -38,31 +69,53 @@ describe("bundled catalog UI components", () => {
     const css = readFileSync(resolve(process.cwd(), "src/client/styles.css"), "utf8");
     const splitMatch = css.match(/\.split\.has-ambient-companion\s*\{([\s\S]*?)\}/);
     const tasksMatch = css.match(/\.woo-tasks-workspace\.has-ambient-companion\s*\{([\s\S]*?)\}/);
+    const outlinerMatch = css.match(/\.outliner-workspace\s*\{([\s\S]*?)\}/);
 
     expect(splitMatch, "split has-ambient-companion primitive present").not.toBeNull();
     expect(tasksMatch, "tasks has-ambient-companion rule present").not.toBeNull();
+    expect(outlinerMatch, "outliner workspace rule present").not.toBeNull();
 
     const splitBlock = splitMatch?.[1] ?? "";
     const tasksBlock = tasksMatch?.[1] ?? "";
+    const outlinerBlock = outlinerMatch?.[1] ?? "";
 
     expect(splitBlock).toMatch(/height:\s*100%/);
     expect(tasksBlock).toMatch(/height:\s*100%/);
+    expect(outlinerBlock).toMatch(/height:\s*100%/);
 
-    const splitPanelMatch = splitBlock.match(/height:\s*([^;]+);/);
-    const tasksPanelMatch = tasksBlock.match(/height:\s*([^;]+);/);
+    const splitPanelMatch = splitBlock.match(/(?:^|\n)\s*height:\s*([^;]+);/);
+    const tasksPanelMatch = tasksBlock.match(/(?:^|\n)\s*height:\s*([^;]+);/);
+    const outlinerPanelMatch = outlinerBlock.match(/(?:^|\n)\s*height:\s*([^;]+);/);
     expect(splitPanelMatch?.[1]).toBe("100%");
     expect(tasksPanelMatch?.[1]).toBe("100%");
+    expect(outlinerPanelMatch?.[1]).toBe("100%");
+  });
+
+  it("keeps first-party tool workspace frames on the shared minichat path", () => {
+    const manifests = [dubspaceManifest, outlinerManifest, pinboardManifest, tasksManifest] as const;
+    for (const manifest of manifests) {
+      const frames = ((manifest as any).ui?.frames ?? []).filter((frame: any) => frame.layout === "space-workspace");
+      expect(frames.length, `${(manifest as any).name} declares a space-workspace frame`).toBeGreaterThan(0);
+      for (const frame of frames) {
+        expect(frame.regions?.main?.length, `${(manifest as any).name} ${frame.id} has main region`).toBeGreaterThan(0);
+        expect(frame.regions?.chat, `${(manifest as any).name} ${frame.id} has chat region`).toEqual([
+          { component: "chat:chat.space-mini", subject: "this" }
+        ]);
+      }
+    }
   });
 
   it("declares and resolves first-party tool frames", () => {
     const registry = new CatalogUiRegistry();
     expect(registry.installCatalogUi({ alias: "chat", catalog: "chat", objects: { "$space": "$space", "$chatroom": "$chatroom" }, ui: (chatManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "dubspace", catalog: "dubspace", objects: { "$dubspace": "$dubspace" }, ui: (dubspaceManifest as any).ui })).toEqual([]);
+    expect(registry.installCatalogUi({ alias: "outliner", catalog: "outliner", objects: { "$outliner": "$outliner" }, ui: (outlinerManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "pinboard", catalog: "pinboard", objects: { "$pinboard": "$pinboard" }, ui: (pinboardManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "tasks", catalog: "tasks", objects: { "$task_registry": "$task_registry" }, ui: (tasksManifest as any).ui })).toEqual([]);
     expect(registry.installCatalogUi({ alias: "weather", catalog: "weather", objects: { "$weather_block": "$weather_block" }, ui: (weatherManifest as any).ui })).toEqual([]);
 
     expect(registry.resolveFrame("the_dubspace", undefined, (_subject, classRef) => classRef === "$dubspace" ? 1 : false)?.frame.id).toBe("dubspace.workspace");
+    expect(registry.resolveFrame("the_outline", undefined, (_subject, classRef) => classRef === "$outliner" ? 1 : false)?.frame.id).toBe("outliner.tree");
     expect(registry.resolveFrame("the_pinboard", undefined, (_subject, classRef) => classRef === "$pinboard" ? 1 : false)?.frame.id).toBe("pinboard.board");
     expect(registry.resolveFrame("the_taskboard", undefined, (_subject, classRef) => classRef === "$task_registry" ? 1 : false)?.frame.id).toBe("tasks.kanban");
     expect(registry.componentsForSurface("title-badge").map((component) => component.declaration.tag)).toContain("woo-weather-badge");

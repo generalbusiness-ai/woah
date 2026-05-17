@@ -1,8 +1,8 @@
 // Per-envelope relay routing helpers for the dev WebSocket path. The dev
 // server gives each commit scope its own ShadowBrowserRelayShim, but the v2
 // browser worker only maintains one WS at a time. When a single page issues
-// turns to multiple scopes (chat panel on the chatroom + outliner tree on
-// the_outline + a chat command that audiences to the_dubspace), the WS-bound
+// turns to multiple scopes (chat panel + nested tool component + a command
+// that audiences to another tool space), the WS-bound
 // relay alone cannot route every envelope correctly — off-scope submits get
 // rejected as `scope_mismatch`.
 //

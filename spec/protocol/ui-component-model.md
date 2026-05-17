@@ -606,6 +606,17 @@ The built-in layouts for v1 are:
 Layouts MAY ignore unknown regions. Components MUST NOT assume their region is
 visible; responsive clients may collapse, reorder, or hide regions.
 
+For an interactive tool whose subject is a `$space` descendant, the
+`space-workspace` frame is the default shape. Such frames MUST declare a
+non-empty `main` region for the tool-specific surface and a `chat` region using
+`chat:chat.space-mini` with `subject: "this"`, unless the catalog documents why
+the shared mini-chat region cannot express the tool. Bundled first-party tool
+catalogs MUST use that mini-chat region unless the catalog is the chatroom
+renderer itself. The main-region component should expose the standard ambient
+companion slot (`data-ambient-companion`) when the actor is present in the tool
+space, leaving message routing, focus, resize/collapse state, and chat panel
+preservation to the host.
+
 The `view` field corresponds to the `?view=` hint in
 [routing.md §AR3](routing.md#ar3-view-hint). Omitted or `"default"` frames are
 the default renderer for their subject.

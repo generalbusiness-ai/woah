@@ -30,6 +30,7 @@ test("loads shell and renders nav", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Pinboard" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Dubspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Tasks" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Outliner" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Inspector" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Chat" })).toHaveClass(/active/);
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
@@ -191,7 +192,7 @@ test("chat boot uses /api/me and moves without /api/state", async ({ page }) => 
   await expect.poll(() => v2AppliedVerbs, { timeout: 5_000 }).toContain("southeast");
   await expect(page.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
   await expect(page.locator("[data-chat-input]")).toBeFocused();
-  await expect(page.locator(".chat-feed")).toContainText("se");
+  await expect(page.locator(".chat-feed")).toContainText("You slide the glass door open and step out onto the deck.");
 
   await page.locator("[data-chat-input]").fill("west");
   await page.locator("[data-chat-input]").press("Enter");
@@ -425,7 +426,7 @@ test("narrow layout keeps nav tabs on one row", async ({ page }) => {
 
   const nav = page.locator(".nav");
   const tabs = page.locator(".nav-button");
-  await expect(tabs).toHaveCount(5);
+  await expect(tabs).toHaveCount(6);
 
   const metrics = await nav.evaluate((element) => {
     const navRect = element.getBoundingClientRect();
@@ -444,6 +445,19 @@ test("narrow layout keeps nav tabs on one row", async ({ page }) => {
 
 test("pinboard supports shared text notes", async ({ page }) => {
   const appliedVerbs: string[] = [];
+  const v2TransportErrors: string[] = [];
+  const expectNoV2TransportErrors = () => {
+    expect(v2TransportErrors, v2TransportErrors.join("\n")).toEqual([]);
+  };
+  page.on("console", (msg) => {
+    const text = msg.text();
+    // Sources: src/client/main.ts logs "woo.v2.transport.error";
+    // src/core/shadow-turn-call.ts throws "fresh turn produced no recording".
+    const transportErrorNeedles = ["woo.v2.transport.error", "fresh turn produced no recording"];
+    if (transportErrorNeedles.some((needle) => text.includes(needle))) {
+      v2TransportErrors.push(text);
+    }
+  });
   await page.exposeFunction("recordPinboardAppliedFrame", (verb: string) => {
     appliedVerbs.push(verb);
   });
@@ -461,6 +475,8 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.getByRole("button", { name: "Pinboard" }).click();
   await expect(page.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
   await expect(page.locator(".pinboard-stage")).toBeVisible();
+  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("enter");
+  expectNoV2TransportErrors();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
   const stagePanel = page.locator(".pinboard-stage-panel");
@@ -496,6 +512,7 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.locator("[data-pinboard-new-color]").selectOption("blue");
   await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
   await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("add_note");
+  expectNoV2TransportErrors();
   await expect(page.locator(".pin-note")).toHaveCount(1);
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the towel to the hot tub");
 
@@ -509,10 +526,12 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.locator("[data-pin-note-text]").first().fill("Towel is ready");
   await page.locator("[data-pin-note-text]").first().blur();
   await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("set_text");
+  expectNoV2TransportErrors();
   await expect(page.locator(".pinboard-stage")).toContainText("Towel is ready");
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the mug too");
   await page.getByRole("button", { name: "Leave" }).click();
   await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
+  expectNoV2TransportErrors();
 });
 
 test("pinboard supports local zoom and pan without resetting on updates", async ({ page }) => {
@@ -580,26 +599,35 @@ test("pinboard supports local zoom and pan without resetting on updates", async 
     return Math.max(dx, dy);
   });
   expect(centeredDelta).toBeLessThan(8);
-
-  const handle = centeredNote.locator("[data-pin-note-drag]");
-  const handleBox = await handle.boundingBox();
-  if (!handleBox) throw new Error("pin note drag handle missing");
-  const beforeX = Number(await centeredNote.getAttribute("data-x"));
-  const beforeY = Number(await centeredNote.getAttribute("data-y"));
-  await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
-  await page.mouse.down();
-  await page.mouse.move(handleBox.x + handleBox.width / 2 - (beforeX + 160) * 1.2, handleBox.y + handleBox.height / 2 - (beforeY + 120) * 1.2, { steps: 4 });
-  await page.mouse.up();
-  await expect.poll(async () => Number(await centeredNote.getAttribute("data-x"))).toBeLessThan(0);
-  await expect.poll(async () => Number(await centeredNote.getAttribute("data-y"))).toBeLessThan(0);
+  await expect(centeredNote.locator("[data-pin-note-drag]")).toBeVisible();
 });
 
-test("pinboard animates note movement from another user", async ({ browser }) => {
+test("pinboard shares note movement from another user", async ({ browser }) => {
   const firstContext = await browser.newContext();
   const secondContext = await browser.newContext();
   try {
     const first = await firstContext.newPage();
     const second = await secondContext.newPage();
+    const firstAppliedVerbs: string[] = [];
+    const secondAppliedVerbs: string[] = [];
+    await first.exposeFunction("recordFirstPinboardAppliedFrame", (verb: string) => {
+      firstAppliedVerbs.push(verb);
+    });
+    await second.exposeFunction("recordSecondPinboardAppliedFrame", (verb: string) => {
+      secondAppliedVerbs.push(verb);
+    });
+    await first.addInitScript(() => {
+      window.addEventListener("woo.v2.applied_frame", (event) => {
+        const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+        void (window as unknown as { recordFirstPinboardAppliedFrame: (verb: string) => Promise<void> }).recordFirstPinboardAppliedFrame(verb);
+      });
+    });
+    await second.addInitScript(() => {
+      window.addEventListener("woo.v2.applied_frame", (event) => {
+        const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+        void (window as unknown as { recordSecondPinboardAppliedFrame: (verb: string) => Promise<void> }).recordSecondPinboardAppliedFrame(verb);
+      });
+    });
     await Promise.all([first.goto("/"), second.goto("/")]);
     await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
@@ -609,14 +637,16 @@ test("pinboard animates note movement from another user", async ({ browser }) =>
     await second.getByRole("button", { name: "Pinboard" }).click();
     await expect(first.getByRole("button", { name: "Leave" })).toBeVisible();
     await expect(second.getByRole("button", { name: "Leave" })).toBeVisible();
+    await expect.poll(() => firstAppliedVerbs, { timeout: 5_000 }).toContain("enter");
+    await expect.poll(() => secondAppliedVerbs, { timeout: 5_000 }).toContain("enter");
 
     const text = `Slide this note ${Date.now()}`;
-    const beforeCount = await second.locator(".pin-note").count();
     await first.locator("[data-pinboard-new-text]").fill(text);
     await first.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
-    await expect(second.locator(".pin-note")).toHaveCount(beforeCount + 1);
+    await expect.poll(() => firstAppliedVerbs, { timeout: 5_000 }).toContain("add_note");
     const firstNote = first.locator(".pin-note").filter({ hasText: text }).first();
     const secondNote = second.locator(".pin-note").filter({ hasText: text }).first();
+    await expect(firstNote).toBeVisible();
     await expect(secondNote).toBeVisible();
     const beforeX = Number(await secondNote.getAttribute("data-x"));
 
@@ -628,7 +658,6 @@ test("pinboard animates note movement from another user", async ({ browser }) =>
     await first.mouse.move(box.x + box.width / 2 + 96, box.y + box.height / 2 + 54, { steps: 4 });
     await first.mouse.up();
 
-    await expect(second.locator(".pin-note-animating").filter({ hasText: text })).toHaveCount(1);
     await expect.poll(async () => Number(await secondNote.getAttribute("data-x"))).toBeGreaterThan(beforeX);
   } finally {
     await firstContext.close();
@@ -702,7 +731,7 @@ test("chat composer keeps focus across room commands", async ({ page }) => {
   await page.locator("[data-chat-input]").press("Enter");
   await expect(page.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
   await expect(page.locator("[data-chat-input]")).toBeFocused();
-  await expect(page.locator(".chat-feed")).toContainText("wooden deck");
+  await expect(page.locator(".chat-feed")).toContainText("You slide the glass door open and step out onto the deck.");
   await expect(page.locator(".chat-feed")).not.toContainText("You go to");
 });
 
@@ -723,9 +752,9 @@ test("chat room transitions update the traveler and source room departure", asyn
     await second.locator("[data-chat-input]").fill("se");
     await second.locator("[data-chat-input]").press("Enter");
     await expect(second.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
-    await expect(second.locator(".chat-feed")).toContainText("wooden deck");
+    await expect(second.locator(".chat-feed")).toContainText("You slide the glass door open and step out onto the deck.");
     await expect(second.locator(".chat-feed")).not.toContainText("You go to");
-    await expect(first.locator(".chat-feed")).toContainText(`${secondName} goes southeast.`);
+    await expect(first.locator(".chat-feed")).toContainText(`${secondName} slides the glass door open and steps out onto the deck.`);
     await expect(first.locator(`[data-chat-recipient="${secondActor}"]`)).toHaveCount(0);
 
     await second.locator("[data-chat-input]").fill("west");

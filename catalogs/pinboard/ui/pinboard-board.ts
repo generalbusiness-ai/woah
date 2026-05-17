@@ -1,5 +1,6 @@
 import {
   escapeHtml,
+  renderAmbientCompanionShell,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -134,7 +135,7 @@ export class WooPinboardBoardElement extends HTMLElement {
       </section>
     `;
     this.innerHTML = this.model.inBoard
-      ? `${toolbar}<section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(boardId)}">${layout}<div data-ambient-companion></div></section>`
+      ? `${toolbar}${renderAmbientCompanionShell(boardId, layout)}`
       : `${toolbar}${layout}`;
     this.bind();
   }
