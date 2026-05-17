@@ -550,6 +550,18 @@ export async function executeShadowTurnCallOrNeedState(
   if (!receipt.accepted) {
     node.world = undefined;
     const conflict = commit?.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
+    // Surface the receipt errors so commit_rejected is debuggable end-to-end.
+    // The worker already logs these (`woo.commit_rejected.errors`) but the dev
+    // server path does not — without this, a rejection is opaque on the client.
+    if (typeof console !== "undefined") {
+      console.log("woo.commit_rejected.errors", JSON.stringify({
+        scope: run.transcript.scope,
+        verb: run.transcript.call?.verb,
+        target: run.transcript.call?.target,
+        actor: run.transcript.call?.actor,
+        errors: receipt.errors
+      }));
+    }
     return {
       ok: false,
       reason: "commit_rejected",

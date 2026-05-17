@@ -433,7 +433,7 @@ export function mergeShadowBrowserSessionState(current: SerializedSession[], fre
   return Array.from(mergedById.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
-export function mergeShadowBrowserAuthoritySessionState(current: SerializedSession[], fresh: SerializedSession[]): SerializedSession[] {
+export function mergeShadowBrowserAuthoritySessionState(current: readonly SerializedSession[], fresh: readonly SerializedSession[]): SerializedSession[] {
   const mergedById = new Map<string, SerializedSession>(
     current.map((session) => [session.id, structuredClone(session) as SerializedSession])
   );

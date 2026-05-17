@@ -41,6 +41,7 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { resolveTurnEnvelopeScope } from "./dev-v2-routing";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
@@ -466,16 +467,28 @@ async function handleV2ShadowFrame(
   encoded: string
 ): Promise<void> {
   try {
-    refreshDevV2RelaySessions(browser.relay);
-    ensureDevV2SerializedSession(browser.relay, session);
-    const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
-    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+    // Per-envelope relay routing: a single WS may carry calls for any scope
+    // (e.g. the chat panel is the_chatroom but the outliner tree calls
+    // list_items on the_outline). The WS-bound browser is bound to one
+    // relay at open time; without rerouting here, off-scope calls would be
+    // submitted to the wrong commit scope and rejected as scope_mismatch.
+    // The production worker handles this internally via per-DO routing;
+    // for dev we resolve the target relay from the envelope body and run
+    // the turn through a transient browser anchored to that relay.
+    const callScope = resolveTurnEnvelopeScope(world, encoded);
+    const turnBrowser = callScope && callScope !== browser.relay.commit_scope.scope
+      ? v2ShadowBrowser(browser.node, token, session, callScope)
+      : browser;
+    refreshDevV2RelaySessions(turnBrowser.relay, callScope ? [callScope] : []);
+    ensureDevV2SerializedSession(turnBrowser.relay, session);
+    const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
+    const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt);
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
       world.applyCommittedShadowTranscript(reply.body.transcript);
     }
     if (reply) {
       ws.send(encodeEnvelope(reply));
-      sendDevV2Fanout(browser, reply);
+      sendDevV2Fanout(turnBrowser, reply);
     }
   } catch (err) {
     ws.send(encodeEnvelope(buildTransportErrorEnvelope({
