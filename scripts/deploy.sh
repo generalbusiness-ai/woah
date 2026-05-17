@@ -275,27 +275,41 @@ else
   warn "no non-universal object in /api/state; skipped cluster-route check"
 fi
 
-# WebSocket handshake: upgrade, auth as guest, await op:session, close.
-# Read-only — auth creates a guest session row but mutates nothing else.
-# Catches WS regressions that REST routes happen to bypass (Phase 2.2 class).
-ws_url="${WORKER_URL/https:/wss:}/ws"
-ws_session=$(node --input-type=module -e "
+# WebSocket handshake: upgrade to the v2 turn-network endpoint (the legacy
+# /ws was removed 2026-05-15 and now returns 410). Re-uses the REST $sid as
+# the bearer token, expects the server to emit a transport-hello followed
+# by the initial state-transfer envelope. Read-only — the existing session
+# is just attached to a fresh socket. Catches WS regressions that REST
+# routes happen to bypass (gateway socket plumbing, v2 envelope codec).
+ws_base="${WORKER_URL/https:/wss:}/v2/turn-network/ws"
+ws_state=$(WS_BASE="$ws_base" WS_SID="$sid" WS_TIMEOUT="$POSTFLIGHT_TIMEOUT" node --input-type=module -e "
   import { WebSocket } from 'ws';
-  const ws = new WebSocket('$ws_url');
-  const t = setTimeout(() => { console.error('timeout'); process.exit(1); }, Number('$POSTFLIGHT_TIMEOUT') * 1000);
-  ws.on('open', () => ws.send(JSON.stringify({ op: 'auth', token: 'guest:postflight' })));
+  const url = new URL(process.env.WS_BASE);
+  url.searchParams.set('token', 'session:' + process.env.WS_SID);
+  url.searchParams.set('node', 'postflight-' + Date.now());
+  const ws = new WebSocket(url.toString(), 'woo-v2.turn-network.json');
+  const t = setTimeout(() => { console.error('timeout'); process.exit(1); }, Number(process.env.WS_TIMEOUT) * 1000);
+  let sawHello = false;
   ws.on('message', (data) => {
     try {
-      const f = JSON.parse(String(data));
-      if (f.op === 'session') { clearTimeout(t); console.log(f.session); ws.close(); process.exit(0); }
-      if (f.op === 'error') { clearTimeout(t); console.error('ws error frame: ' + JSON.stringify(f.error)); process.exit(1); }
+      const env = JSON.parse(String(data));
+      if (env.type === 'woo.transport.hello.v1') sawHello = true;
+      if (env.type === 'woo.state.transfer.shadow.v1') {
+        if (!sawHello) { clearTimeout(t); console.error('state-transfer arrived before transport-hello'); process.exit(1); }
+        clearTimeout(t);
+        console.log('hello+transfer');
+        ws.close();
+        process.exit(0);
+      }
+      if (env.type === 'woo.transport.error.v1') {
+        clearTimeout(t); console.error('error frame: ' + JSON.stringify(env.body)); process.exit(1);
+      }
     } catch {}
   });
   ws.on('error', (err) => { clearTimeout(t); console.error('socket: ' + err.message); process.exit(1); });
-" 2>&1) || fail "ws handshake failed: $ws_session"
-[[ "$ws_session" =~ ^session-[0-9a-f]{32}$ ]] || fail "ws handshake unexpected reply: $ws_session"
-POSTFLIGHT_SESSIONS+=("$ws_session")
-ok "ws handshake: session=$ws_session"
+" 2>&1) || fail "v2 ws handshake failed: $ws_state"
+[[ "$ws_state" == "hello+transfer" ]] || fail "v2 ws handshake unexpected: $ws_state (expected 'hello+transfer')"
+ok "ws handshake (/v2/turn-network/ws): hello + state-transfer"
 
 # Wizard claim with a decoy token. On a claimed world this returns
 # E_TOKEN_CONSUMED; on a fresh world it returns a token-rejected error.
