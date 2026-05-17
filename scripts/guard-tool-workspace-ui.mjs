@@ -9,6 +9,7 @@ import { join, relative } from "node:path";
 
 const root = process.cwd();
 const catalogsRoot = join(root, "catalogs");
+const mainTsPath = join(root, "src/client/main.ts");
 const errors = [];
 let auditedFrames = 0;
 
@@ -67,6 +68,34 @@ for (const dir of dirs) {
     if (!hasSharedMiniChat(frame)) {
       errors.push(`${where}: space-workspace tool frames must declare regions.chat with chat:chat.space-mini`);
     }
+  }
+}
+
+let mainTs = "";
+try {
+  mainTs = readFileSync(mainTsPath, "utf8");
+} catch (err) {
+  errors.push(`${rel(mainTsPath)}: cannot read app shell source (${err.message})`);
+}
+
+if (mainTs) {
+  const requiredHostMarkers = [
+    "function renderGenericToolWorkspace",
+    "function mountGenericToolComponent",
+    "data-generic-tool-workspace",
+    "TOOL_TAB_DEFINITIONS"
+  ];
+  for (const marker of requiredHostMarkers) {
+    if (!mainTs.includes(marker)) errors.push(`${rel(mainTsPath)}: missing generic tool host marker ${JSON.stringify(marker)}`);
+  }
+  const legacyRenderBranches = [
+    "function renderDubspace(",
+    "function renderPinboard(",
+    "function renderTasks(",
+    "function renderOutliner("
+  ];
+  for (const marker of legacyRenderBranches) {
+    if (mainTs.includes(marker)) errors.push(`${rel(mainTsPath)}: catalog-specific workspace renderer ${JSON.stringify(marker)} must use the generic tool host`);
   }
 }
 

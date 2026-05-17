@@ -207,7 +207,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (presence) {
       event.preventDefault();
       const action = presence.dataset.outlinerPresence === "leave" ? "leave" : "enter";
-      this.dispatchEvent(new CustomEvent(`woo-outliner-${action}`, { bubbles: true }));
+      await this.callVerb(action, []);
       return;
     }
     const btn = target.closest<HTMLElement>("[data-outliner-action]");

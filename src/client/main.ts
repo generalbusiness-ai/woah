@@ -28,6 +28,8 @@ import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
 
 type AuthStatus = "checking" | "anonymous" | "authenticated";
 type AuthMethod = "guest" | "apikey";
+type ToolTab = "dubspace" | "pinboard" | "tasks" | "outliner";
+type AppTab = "chat" | ToolTab | "tool" | "ide";
 
 class SessionExpiredError extends Error {
   constructor(message: string) {
@@ -42,11 +44,12 @@ type AppState = {
   authStatus: AuthStatus;
   loginError?: string;
   loginPending?: boolean;
-  tab: "chat" | "dubspace" | "pinboard" | "tasks" | "outliner" | "ide";
+  tab: AppTab;
   scopedProjection?: ScopedProjectionStateModel;
   v2Projection?: V2ProjectionMessage;
   scopedObjectSummaries: Record<string, any>;
-  routedSubjects: Partial<Record<"dubspace" | "pinboard" | "tasks" | "outliner", string>>;
+  routedSubjects: Partial<Record<ToolTab, string>>;
+  genericToolSubject: string;
   audioOn: boolean;
   clockOffset: number;
   cueSlots: Record<string, boolean>;
@@ -78,6 +81,23 @@ type RouteLocation = {
   view?: string;
 };
 
+type ToolTabDefinition = {
+  tab: ToolTab;
+  label: string;
+  viewAliases: string[];
+  catalogAlias: string;
+  frameComponent: string;
+  seedCatalogAlias: string;
+  classRef: string;
+  emptyTitle: string;
+  emptyMessage: string;
+  elementSelector: string;
+  elementTagAttrs: (subject: string) => string;
+  mount: () => void;
+  enter?: () => void;
+  leave?: (done?: () => void) => void;
+};
+
 function bundledSeedRef(manifest: any, classRef: string): string {
   return String(manifest?.seed_hooks?.find((hook: any) => hook?.kind === "create_instance" && hook?.class === classRef)?.as ?? "");
 }
@@ -89,7 +109,7 @@ function bundledSeedRefs(manifest: any, classRef: string): string[] {
 }
 
 type RenderFocusSnapshot = {
-  tab: AppState["tab"];
+  tab: AppTab;
   selector: string;
   value: string;
   selectionStart?: number;
@@ -140,6 +160,7 @@ const state: AppState = {
   authStatus: "checking",
   scopedObjectSummaries: {},
   routedSubjects: {},
+  genericToolSubject: "",
   audioOn: false,
   clockOffset: 0,
   cueSlots: {},
@@ -173,6 +194,70 @@ const bundledToolSeeds = {
   outliner: bundledSeedRef(demoworldManifest, "$outliner"),
   tasks: bundledSeedRef(tasksManifest, "$task_registry")
 } as const;
+const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
+  {
+    tab: "dubspace",
+    label: "Dubspace",
+    viewAliases: ["dubspace"],
+    catalogAlias: "dubspace",
+    frameComponent: "dubspace.workspace",
+    seedCatalogAlias: "dubspace",
+    classRef: "$dubspace",
+    emptyTitle: "Dubspace",
+    emptyMessage: "No dubspace UI is registered for this space.",
+    elementSelector: "[data-dubspace-workspace]",
+    elementTagAttrs: (subject) => `data-dubspace-workspace data-dubspace-space="${escapeHtml(subject)}"`,
+    mount: () => bindDubspace(),
+    enter: () => enterDubspace(),
+    leave: (done) => leaveDubspace(done)
+  },
+  {
+    tab: "pinboard",
+    label: "Pinboard",
+    viewAliases: ["pinboard"],
+    catalogAlias: "pinboard",
+    frameComponent: "pinboard.board",
+    seedCatalogAlias: "pinboard",
+    classRef: "$pinboard",
+    emptyTitle: "Pinboard",
+    emptyMessage: "No pinboard UI is registered for this board.",
+    elementSelector: "[data-pinboard-board]",
+    elementTagAttrs: (subject) => `data-pinboard-board data-pinboard-space="${escapeHtml(subject)}"`,
+    mount: () => bindPinboard(),
+    enter: () => enterPinboard(),
+    leave: (done) => leavePinboard(done)
+  },
+  {
+    tab: "tasks",
+    label: "Tasks",
+    viewAliases: ["tasks", "kanban"],
+    catalogAlias: "tasks",
+    frameComponent: "tasks.kanban",
+    seedCatalogAlias: "tasks",
+    classRef: "$task_registry",
+    emptyTitle: "Tasks",
+    emptyMessage: "No tasks UI is registered for this registry.",
+    elementSelector: "[data-tasks-board]",
+    elementTagAttrs: (subject) => `data-tasks-board data-tasks-registry="${escapeHtml(subject)}"`,
+    mount: () => bindTasks()
+  },
+  {
+    tab: "outliner",
+    label: "Outliner",
+    viewAliases: ["outliner", "outline"],
+    catalogAlias: "outliner",
+    frameComponent: "outliner.tree",
+    seedCatalogAlias: "demoworld",
+    classRef: "$outliner",
+    emptyTitle: "Outliner",
+    emptyMessage: "No outliner UI is registered.",
+    elementSelector: "[data-outliner-tree]",
+    elementTagAttrs: (subject) => `data-outliner-tree data-outliner-subject="${escapeHtml(subject)}"`,
+    mount: () => bindOutliner(),
+    enter: () => enterOutliner()
+  }
+];
+const TOOL_TABS = TOOL_TAB_DEFINITIONS.map((definition) => definition.tab);
 const bundledCatalogManifests: Record<string, any> = {
   dubspace: dubspaceManifest,
   pinboard: pinboardManifest,
@@ -228,17 +313,21 @@ const SPACE_CHAT_DEFAULT_HEIGHT = 280;
 // has its own compact CSS state.
 const SPACE_CHAT_MIN_HEIGHT = 176;
 const SPACE_CHAT_MAX_VIEWPORT_RATIO = 0.45;
-const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
+const TAB_FROM_VIEW: Record<string, AppTab> = {
   chat: "chat",
-  dubspace: "dubspace",
-  pinboard: "pinboard",
-  tasks: "tasks",
-  kanban: "tasks",
-  outliner: "outliner",
-  outline: "outliner",
+  tool: "tool",
   ide: "ide",
-  editor: "ide"
+  editor: "ide",
+  ...Object.fromEntries(TOOL_TAB_DEFINITIONS.flatMap((definition) => definition.viewAliases.map((view) => [view, definition.tab])))
 };
+
+function toolDefinition(tab: AppTab): ToolTabDefinition | undefined {
+  return TOOL_TAB_DEFINITIONS.find((definition) => definition.tab === tab);
+}
+
+function isToolTab(tab: AppTab): tab is ToolTab {
+  return (TOOL_TABS as AppTab[]).includes(tab);
+}
 let reconnectDelayMs = reconnectBaseDelayMs;
 let reconnectTimer: number | undefined;
 let pinboardViewportTimer: number | undefined;
@@ -789,22 +878,20 @@ function parseLocationRoute(pathname: string, search: string): RouteLocation | n
   }
 }
 
-function tabFromViewHint(view?: string): AppState["tab"] | undefined {
+function tabFromViewHint(view?: string): AppTab | undefined {
   if (!view) return undefined;
   return TAB_FROM_VIEW[view.trim().toLowerCase()];
 }
 
-function objectIdForTab(tab: AppState["tab"]): string {
+function objectIdForTab(tab: AppTab): string {
   if (tab === "chat") return activeChatRoom();
-  if (tab === "dubspace") return dubspaceSpace();
-  if (tab === "pinboard") return pinboardSpace();
-  if (tab === "tasks") return tasksSpace();
-  if (tab === "outliner") return outlinerSpace();
+  if (isToolTab(tab)) return toolSpace(tab);
+  if (tab === "tool") return state.genericToolSubject;
   if (tab === "ide") return state.selectedObject || defaultSelectedObject();
   return "";
 }
 
-function canonicalRouteForCurrentState(tab: AppState["tab"] = state.tab): RouteLocation | null {
+function canonicalRouteForCurrentState(tab: AppTab = state.tab): RouteLocation | null {
   const objectId = objectIdForTab(tab);
   if (!objectId) return null;
   return { objectId };
@@ -837,27 +924,35 @@ function syncUrlFromCurrentState(mode: "replace" | "push" = "replace") {
   else history.pushState({}, "", next);
 }
 
-function routeForObjectId(objectId: string, summary?: any): AppState["tab"] {
+function routeForObjectId(objectId: string, summary?: any): AppTab {
   if (objectId === activeChatRoom()) return "chat";
-  if (objectId === dubspaceSpace()) return "dubspace";
-  if (objectId === pinboardSpace()) return "pinboard";
-  if (objectId === tasksSpace()) return "tasks";
-  if (objectId === outlinerSpace()) return "outliner";
+  for (const definition of TOOL_TAB_DEFINITIONS) {
+    if (objectId === toolSpace(definition.tab)) return definition.tab;
+  }
+  if (subjectHasSpaceWorkspaceFrame(objectId, summary)) return "tool";
   const summaryTab = tabForScopedSummary(objectId, summary ?? scopedObjectSummary(objectId));
   if (summaryTab) return summaryTab;
   return "ide";
 }
 
-function pinRoutedSubject(tab: AppState["tab"], subject: string) {
+function pinRoutedSubject(tab: AppTab, subject: string) {
   if (!subject) return;
-  if (tab === "dubspace" || tab === "pinboard" || tab === "tasks" || tab === "outliner") {
-    state.routedSubjects = { ...state.routedSubjects, [tab]: subject };
-  }
+  if (isToolTab(tab)) state.routedSubjects = { ...state.routedSubjects, [tab]: subject };
+  if (tab === "tool") state.genericToolSubject = subject;
 }
 
-function routeSubjectForTab(tab: AppState["tab"], routedObject: string, _summary: any): string {
-  if (tab === "dubspace" || tab === "pinboard" || tab === "tasks" || tab === "outliner") return routedObject;
+function routeSubjectForTab(tab: AppTab, routedObject: string, _summary: any): string {
+  if (isToolTab(tab) || tab === "tool") return routedObject;
   return "";
+}
+
+function subjectHasSpaceWorkspaceFrame(subject: string, summary?: any): boolean {
+  return toolFrameForSubject(subject, summary)?.frame.layout === "space-workspace";
+}
+
+function toolFrameForSubject(subject: string, summary?: any) {
+  if (!subject) return undefined;
+  return ui.catalogUi.resolveFrame(subject, undefined, (candidate, classRef) => clientClassDistance(candidate, classRef, candidate === subject ? summary : undefined));
 }
 
 async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation | null = parseLocationRoute(location.pathname, location.search)) {
@@ -865,10 +960,8 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
     syncUrlFromCurrentState(mode);
     return;
   }
-  const ensureTabPresence = (tab: AppState["tab"]) => {
-    if (tab === "dubspace") enterDubspace();
-    if (tab === "pinboard") enterPinboard();
-    if (tab === "outliner") enterOutliner();
+  const ensureTabPresence = (tab: AppTab) => {
+    toolDefinition(tab)?.enter?.();
   };
   const viewTab = tabFromViewHint(route.view);
   if (viewTab) {
@@ -896,7 +989,7 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
   });
 }
 
-function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leaveCurrent?: boolean } = {}, done?: () => void) {
+function setTab(tab: AppTab, options: { mode?: "replace" | "push"; leaveCurrent?: boolean } = {}, done?: () => void) {
   const mode = options.mode ?? "push";
   const leaveCurrent = options.leaveCurrent ?? true;
   const current = state.tab;
@@ -912,7 +1005,7 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
     syncV2BrowserWorkerScope();
     render();
     requestTasksChatFocusIfPending();
-    if (tab !== "chat" && tab !== "ide") {
+    if (isToolTab(tab)) {
       void ensureScopedOverlayForTab(tab).then(() => {
         if (state.tab === tab) render();
       }).catch((err) => {
@@ -931,12 +1024,9 @@ function setTab(tab: AppState["tab"], options: { mode?: "replace" | "push"; leav
     finalize();
     return;
   }
-  if (current === "dubspace" && tab !== "dubspace") {
-    leaveDubspace(finalize);
-    return;
-  }
-  if (current === "pinboard" && tab !== "pinboard") {
-    leavePinboard(finalize);
+  const currentDefinition = toolDefinition(current);
+  if (currentDefinition?.leave && current !== tab) {
+    currentDefinition.leave(finalize);
     return;
   }
   finalize();
@@ -1050,7 +1140,7 @@ function installCatalogUiIndex(index: any) {
   }
 }
 
-async function ensureScopedOverlayForTab(tab: AppState["tab"], options: { force?: boolean } = {}): Promise<void> {
+async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean } = {}): Promise<void> {
   const subject = overlaySubjectForTab(tab);
   if (!subject) return;
   const key = `${tab}:${subject}`;
@@ -1070,20 +1160,15 @@ async function ensureScopedOverlayForTab(tab: AppState["tab"], options: { force?
   }
 }
 
-function overlaySubjectForTab(tab: AppState["tab"]): string {
+function overlaySubjectForTab(tab: AppTab): string {
   if (tab === "dubspace") return dubspaceSpace();
   if (tab === "pinboard") return pinboardSpace();
   return "";
 }
 
-function scopedToolSubject(surface: "dubspace" | "pinboard" | "tasks" | "outliner"): string {
-  const className = surface === "dubspace"
-    ? "$dubspace"
-    : surface === "pinboard"
-      ? "$pinboard"
-      : surface === "outliner"
-        ? "$outliner"
-        : "$task_registry";
+function scopedToolSubject(surface: ToolTab): string {
+  const definition = toolDefinition(surface);
+  if (!definition) return "";
   const overlays = state.scopedProjection?.overlays ?? {};
   for (const handle of Object.values(overlays)) {
     const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
@@ -1091,9 +1176,9 @@ function scopedToolSubject(surface: "dubspace" | "pinboard" | "tasks" | "outline
     if (subject && handleSurface === surface) return subject;
   }
   const current = sessionActiveScope(state.scopedProjection?.session);
-  if (typeof current === "string" && isCatalogObjectSummary(ui.observe(current), surface, className)) return current;
+  if (typeof current === "string" && isCatalogObjectSummary(ui.observe(current), surface, definition.classRef)) return current;
   for (const item of arrayOfObjects(state.scopedProjection?.here?.contents)) {
-    if (isCatalogObjectSummary(item, surface, className)) return String(item.id ?? "");
+    if (isCatalogObjectSummary(item, surface, definition.classRef)) return String(item.id ?? "");
   }
   return "";
 }
@@ -1277,13 +1362,12 @@ function ensureProjectionFields(subject: string, fields: readonly string[]): voi
   projectionFiller.ensure(subject, fields);
 }
 
-function tabForScopedSummary(id: string, summary: any): AppState["tab"] | undefined {
+function tabForScopedSummary(id: string, summary: any): AppTab | undefined {
   if (!summary) return undefined;
   if (id === activeChatRoom() || isRoomSummary(summary)) return "chat";
-  if (isCatalogObjectSummary(summary, "dubspace", "$dubspace")) return "dubspace";
-  if (isCatalogObjectSummary(summary, "pinboard", "$pinboard")) return "pinboard";
-  if (isCatalogObjectSummary(summary, "tasks", "$task_registry")) return "tasks";
-  if (isCatalogObjectSummary(summary, "outliner", "$outliner")) return "outliner";
+  for (const definition of TOOL_TAB_DEFINITIONS) {
+    if (isCatalogObjectSummary(summary, definition.tab, definition.classRef)) return definition.tab;
+  }
   return undefined;
 }
 
@@ -1746,39 +1830,30 @@ function defaultSelectedObject() {
   return dubspaceMeta().delay ?? state.scopedProjection?.here?.id ?? state.actor ?? "";
 }
 
-function dubspaceSpace() {
+function toolSpace(tab: ToolTab): string {
+  const definition = toolDefinition(tab);
+  if (!definition) return "";
   const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-  if (route?.view === "dubspace" && route.objectId) return route.objectId;
-  if (state.routedSubjects.dubspace) return state.routedSubjects.dubspace;
-  const scoped = scopedToolSubject("dubspace");
-  return scoped || activeInstalledCatalogSeed("dubspace", bundledToolSeeds.dubspace);
+  if (route?.view && definition.viewAliases.includes(route.view) && route.objectId) return route.objectId;
+  if (state.routedSubjects[tab]) return state.routedSubjects[tab] ?? "";
+  const scoped = scopedToolSubject(tab);
+  return scoped || activeInstalledCatalogSeed(definition.seedCatalogAlias, bundledToolSeeds[tab]);
+}
+
+function dubspaceSpace() {
+  return toolSpace("dubspace");
 }
 
 function pinboardSpace() {
-  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-  if (route?.view === "pinboard" && route.objectId) return route.objectId;
-  if (state.routedSubjects.pinboard) return state.routedSubjects.pinboard;
-  const scoped = scopedToolSubject("pinboard");
-  return scoped || activeInstalledCatalogSeed("pinboard", bundledToolSeeds.pinboard);
+  return toolSpace("pinboard");
 }
 
 function tasksSpace() {
-  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-  if ((route?.view === "tasks" || route?.view === "kanban") && route.objectId) return route.objectId;
-  if (state.routedSubjects.tasks) return state.routedSubjects.tasks;
-  const scoped = scopedToolSubject("tasks");
-  return scoped || activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
+  return toolSpace("tasks");
 }
 
 function outlinerSpace() {
-  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
-  if ((route?.view === "outliner" || route?.view === "outline") && route.objectId) return route.objectId;
-  if (state.routedSubjects.outliner) return state.routedSubjects.outliner;
-  const scoped = scopedToolSubject("outliner");
-  // the_outline lives in demoworld's seed_hooks; demoworld is the install
-  // record we look in for the seed objref. Fallback chain mirrors the
-  // other tabs but reads the bundled seed from demoworld's manifest.
-  return scoped || activeInstalledCatalogSeed("demoworld", bundledToolSeeds.outliner);
+  return toolSpace("outliner");
 }
 
 function chatRoom() {
@@ -2285,44 +2360,32 @@ function render() {
   }
   const focus = captureRenderFocus();
   const app = document.querySelector<HTMLDivElement>("#app")!;
-  // Detach the tasks kanban element before we replace #app.innerHTML so it
-  // survives the rerender. The kanban carries lots of ephemeral UI state
-  // (adminOpen, adminEditing, createOpen, openDetail, draft inputs, focus)
-  // that has no other home — without this, every applied-frame trigger
-  // closes the admin panel, drops a half-typed task, etc.
-  const preservedTasksKanban = state.tab === "tasks"
-    ? app.querySelector<HTMLElement>("[data-tasks-board]")
+  // Tool components may own transient UI state in their custom element
+  // instance. Preserve the active frame root generically so a new tool catalog
+  // does not need another app-shell branch to keep drafts, panels, or hydrate
+  // guards alive across projection rerenders.
+  const activeToolSelector = activeToolElementSelector();
+  const preservedToolElement = activeToolSelector
+    ? app.querySelector<HTMLElement>(activeToolSelector)
     : null;
-  if (preservedTasksKanban) preservedTasksKanban.remove();
-  // Same preservation rule for the outliner tree. The component owns ephemeral
-  // UI state (collapsed set, in-progress edit, drag source, show-hidden) and
-  // its own hydrate cycle — recreating it on every applied-frame rerender
-  // both drops that state and re-runs hydrate, which fires another applied
-  // frame, looping at 3-7Hz. See catalogs/outliner/ui/outliner-tree.ts.
-  const preservedOutlinerTree = state.tab === "outliner"
-    ? app.querySelector<HTMLElement>("[data-outliner-tree]")
-    : null;
-  if (preservedOutlinerTree) preservedOutlinerTree.remove();
+  if (preservedToolElement) preservedToolElement.remove();
   app.innerHTML = `
     <div class="shell ${state.observationsCollapsed ? "observations-collapsed" : ""}">
       <aside class="nav">
         <div class="brand">${escapeHtml(state.actor ? actorLabel(state.actor) : "connecting...")}</div>
         <div class="actor">${escapeHtml(state.actor ?? "")}</div>
         ${navButton("chat", "Chat")}
-        ${navButton("dubspace", "Dubspace")}
-        ${navButton("pinboard", "Pinboard")}
-        ${navButton("tasks", "Tasks")}
-        ${navButton("outliner", "Outliner")}
+        ${TOOL_TAB_DEFINITIONS.map((definition) => navButton(definition.tab, definition.label)).join("")}
+        ${state.tab === "tool" ? "<!-- Generic routed tools are URL-addressable for now; keep their nav item transient until tool discovery is designed. -->" : ""}
+        ${state.tab === "tool" ? navButton("tool", objectName(state.genericToolSubject) || "Tool") : ""}
         ${navButton("ide", "Inspector")}
         <a class="github-link" href="https://github.com/hughpyle/woo" target="_blank" rel="noopener noreferrer" aria-label="woo on GitHub" title="woo on GitHub">
           <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
       </aside>
       <main class="main">
-        ${state.tab === "dubspace" ? renderDubspace() : ""}
-        ${state.tab === "pinboard" ? renderPinboard() : ""}
-        ${state.tab === "tasks" ? renderTasks() : ""}
-        ${state.tab === "outliner" ? renderOutliner() : ""}
+        ${isToolTab(state.tab) ? renderToolWorkspace(state.tab) : ""}
+        ${state.tab === "tool" ? renderGenericToolWorkspace(state.genericToolSubject) : ""}
         ${state.tab === "chat" ? renderChat() : ""}
         ${state.tab === "ide" ? renderIde() : ""}
       </main>
@@ -2330,20 +2393,14 @@ function render() {
     </div>
   `;
 
-  if (preservedTasksKanban) {
-    const placeholder = app.querySelector<HTMLElement>("[data-tasks-board]");
-    if (placeholder) placeholder.replaceWith(preservedTasksKanban);
-  }
-  if (preservedOutlinerTree) {
-    const placeholder = app.querySelector<HTMLElement>("[data-outliner-tree]");
-    if (placeholder) placeholder.replaceWith(preservedOutlinerTree);
+  if (preservedToolElement && activeToolSelector) {
+    const placeholder = app.querySelector<HTMLElement>(activeToolSelector);
+    if (placeholder) placeholder.replaceWith(preservedToolElement);
   }
   bindCommon();
   if (state.tab === "chat") mountChatComponent();
-  if (state.tab === "dubspace") bindDubspace();
-  if (state.tab === "pinboard") bindPinboard();
-  if (state.tab === "tasks") bindTasks();
-  if (state.tab === "outliner") bindOutliner();
+  if (isToolTab(state.tab)) toolDefinition(state.tab)?.mount();
+  if (state.tab === "tool") mountGenericToolComponent();
   if (state.tab === "ide") bindIde();
   if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
 }
@@ -2460,7 +2517,7 @@ function cssAttrValue(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\a ");
 }
 
-function navButton(tab: AppState["tab"], label: string) {
+function navButton(tab: AppTab, label: string) {
   return `<button class="nav-button ${state.tab === tab ? "active" : ""}" data-tab="${tab}">${label}</button>`;
 }
 
@@ -2487,14 +2544,12 @@ function renderObservationsPanel() {
 function bindCommon() {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const next = button.dataset.tab as AppState["tab"];
+      const next = button.dataset.tab as AppTab;
       if (next !== "ide") void ensureScopedProjectionReady();
       const wasDifferent = state.tab !== next;
       setTab(next, { mode: "push" }, () => {
         if (!wasDifferent) return;
-        if (next === "dubspace") enterDubspace();
-        if (next === "pinboard") enterPinboard();
-        if (next === "outliner") enterOutliner();
+        toolDefinition(next)?.enter?.();
       });
     });
   });
@@ -2542,18 +2597,6 @@ function installBundledCatalogUi() {
       ui.catalogUi.registerModuleExports(item.alias, moduleId, mod, ui.observations, ui.chatFormatters);
     }
   }
-}
-
-function renderDubspace() {
-  const tag = toolFrameComponentTag(dubspaceSpace(), "dubspace.workspace", "dubspace");
-  if (!tag) {
-    return `
-      <section class="toolbar"><h1>Dubspace</h1></section>
-      <section class="card"><p class="empty-state">No dubspace UI is registered for this space.</p></section>
-    `;
-  }
-  const spaceId = dubspaceSpace();
-  return `<${tag} data-dubspace-workspace data-dubspace-space="${escapeHtml(spaceId)}"></${tag}>`;
 }
 
 function dubspaceOperators(): string[] {
@@ -3520,8 +3563,8 @@ function setCustomElementData<T>(element: HTMLElement & { data?: T }, data: T, a
   void customElements.whenDefined(element.localName).then(assign);
 }
 
-function clientClassDistance(subject: string, classRef: string): number | false {
-  const object = ui.observe(subject);
+function clientClassDistance(subject: string, classRef: string, summary?: any): number | false {
+  const object = summary && (!summary.id || String(summary.id) === subject) ? summary : ui.observe(subject);
   if (subject === classRef || object?.parent === classRef) return subject === classRef ? 0 : 1;
   const ancestors = Array.isArray(object?.ancestors) ? object.ancestors.map(String) : [];
   const index = ancestors.indexOf(classRef);
@@ -3768,40 +3811,40 @@ function actorLabel(id: string | undefined) {
   return String(projectedObjectView(id)?.name ?? id);
 }
 
-function renderPinboard() {
-  const tag = toolFrameComponentTag(pinboardSpace(), "pinboard.board", "pinboard");
+function renderToolWorkspace(tab: ToolTab) {
+  const definition = toolDefinition(tab);
+  if (!definition) return "";
+  const subject = toolSpace(tab);
+  const tag = toolFrameComponentTag(subject, definition.frameComponent, definition.catalogAlias);
   if (!tag) {
     return `
-      <section class="toolbar"><h1>Pinboard</h1></section>
-      <section class="card"><p class="empty-state">No pinboard UI is registered for this board.</p></section>
+      <section class="toolbar"><h1>${escapeHtml(definition.emptyTitle)}</h1></section>
+      <section class="panel"><p class="empty-state">${escapeHtml(definition.emptyMessage)}</p></section>
     `;
   }
-  const boardId = pinboardSpace();
-  return `<${tag} data-pinboard-board data-pinboard-space="${escapeHtml(boardId)}"></${tag}>`;
+  return `<${tag} data-tool-workspace="${escapeHtml(tab)}" ${definition.elementTagAttrs(subject)}></${tag}>`;
 }
 
-function renderTasks() {
-  const tag = toolFrameComponentTag(tasksSpace(), "tasks.kanban", "tasks");
+function renderGenericToolWorkspace(subject: string) {
+  const resolved = toolFrameForSubject(subject);
+  const firstMainNode = resolved?.frame.regions.main?.[0];
+  const component = firstMainNode ? ui.catalogUi.component(firstMainNode.component, resolved?.catalog.alias) : undefined;
+  const tag = component?.declaration.tag;
+  const title = objectName(subject) || "Tool";
   if (!tag) {
     return `
-      <section class="toolbar"><h1>Tasks</h1></section>
-      <section class="panel"><p class="empty-state">No tasks UI is registered for this registry.</p></section>
+      <section class="toolbar"><h1>${escapeHtml(title)}</h1></section>
+      <section class="panel"><p class="empty-state">No tool UI is registered for this object.</p></section>
     `;
   }
-  const boardId = tasksSpace();
-  return `<${tag} data-tasks-board data-tasks-registry="${escapeHtml(boardId)}"></${tag}>`;
+  return `<${tag} data-tool-workspace="tool" data-generic-tool-workspace data-tool-subject="${escapeHtml(subject)}"></${tag}>`;
 }
 
-function renderOutliner() {
-  const tag = toolFrameComponentTag(outlinerSpace(), "outliner.tree", "outliner");
-  if (!tag) {
-    return `
-      <section class="toolbar"><h1>Outliner</h1></section>
-      <section class="panel"><p class="empty-state">No outliner UI is registered.</p></section>
-    `;
-  }
-  const id = outlinerSpace();
-  return `<${tag} data-outliner-tree data-outliner-subject="${escapeHtml(id)}"></${tag}>`;
+function activeToolElementSelector(): string {
+  const definition = toolDefinition(state.tab);
+  if (definition) return definition.elementSelector;
+  if (state.tab === "tool") return "[data-generic-tool-workspace]";
+  return "";
 }
 
 function renderAmbientCompanion(space: string) {
@@ -4099,16 +4142,30 @@ function bindTasks() {
 
 function bindOutliner() {
   mountOutlinerComponent();
-  bindOutlinerComponentEvents();
   bindSpaceChatPanels();
 }
 
-function bindOutlinerComponentEvents() {
-  const element = document.querySelector<WooElement>("[data-outliner-tree]");
-  if (!element || element.dataset.outlinerEventsBound === "true") return;
-  element.dataset.outlinerEventsBound = "true";
-  element.addEventListener("woo-outliner-enter", () => direct(outlinerSpace(), "enter"));
-  element.addEventListener("woo-outliner-leave", () => direct(outlinerSpace(), "leave"));
+function mountGenericToolComponent() {
+  const element = document.querySelector<WooElement & { hydrate?: () => Promise<void>; showCompanion?: boolean }>("[data-generic-tool-workspace]");
+  if (!element) return;
+  const subject = state.genericToolSubject || element.dataset.toolSubject || "";
+  if (!subject) return;
+  const subjectChanged = element.subject !== subject;
+  const resolved = toolFrameForSubject(subject);
+  const mainNode = resolved?.frame.regions.main?.[0];
+  element.subject = subject;
+  element.node = mainNode;
+  element.woo = createChatWooContext(subject);
+  if ("showCompanion" in element) element.showCompanion = actorPresentInSpace(subject);
+  // Generic tools are expected to hydrate through WooContext. This keeps the
+  // host catalog-agnostic: the component calls or observes its subject instead
+  // of receiving a main.ts-shaped data object.
+  if (subjectChanged || element.dataset.genericToolHydrated !== "true") {
+    element.dataset.genericToolHydrated = "true";
+    void element.hydrate?.();
+  }
+  if (actorPresentInSpace(subject)) mountAmbientCompanion(element, subject);
+  bindSpaceChatPanels();
 }
 
 function mountOutlinerComponent() {

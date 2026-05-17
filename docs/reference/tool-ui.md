@@ -29,6 +29,11 @@ chat panel across rerenders.
 
 ## Main Component
 
+The host renders any object whose catalog resolves to a `space-workspace` frame
+through the generic tool path. A new catalog should not need a new `main.ts`
+tab branch: its component receives `element.subject` and `element.woo`, then
+hydrates itself by calling or observing its subject through `WooContext`.
+
 The main component should expose the shared companion slot when the current
 actor is present in the tool space. Use the shared helpers from
 `src/client/framework.ts` so the shell shape and chat-panel preservation stay
@@ -56,7 +61,9 @@ restoreAmbientCompanionPanel(this, preservedPanel);
 
 If the actor is not present, the component should still render an obvious
 Enter control. Enter/Leave controls call the tool space's normal `enter` and
-`leave` verbs; they do not invent a parallel presence model.
+`leave` verbs through `this.woo.call(this.subject, "enter", [])` or
+`this.woo.call(this.subject, "leave", [])`; they do not invent a parallel
+presence model.
 
 ## Do Not
 
@@ -64,6 +71,8 @@ Enter control. Enter/Leave controls call the tool space's normal `enter` and
 - Do not omit `regions.chat` from an interactive `space-workspace` frame.
 - Do not put mini-chat mounting logic in a catalog-specific branch unless the
   shared host path cannot express the tool.
+- Do not add a new `main.ts` render/bind branch for a tool whose main
+  component can hydrate from `WooContext`.
 - Do not store presence only in client-local state.
 - Do not copy a tool's domain UI as the pattern. Copy the frame shape and
   workspace shell contract; the domain UI should remain catalog-specific.

@@ -305,6 +305,22 @@ test("page header h1 aligns across tools", async ({ page, request }) => {
   expect(sizes.size, `h1 font-size mismatch: ${JSON.stringify(headers)}`).toBe(1);
 });
 
+test("generic tool view mounts a catalog space-workspace frame", async ({ page }) => {
+  await page.goto("/objects/the_outline?view=tool");
+  await continueAsGuestIfPrompted(page);
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.getByRole("button", { name: "Outline", exact: true })).toHaveClass(/active/);
+  await expect(page.locator("[data-generic-tool-workspace][data-tool-workspace='tool']")).toBeVisible({ timeout: 5_000 });
+  const tree = page.locator("woo-outliner-tree[data-generic-tool-workspace]");
+  await expect(tree).toBeVisible();
+  await expect(tree.locator("h2")).toHaveText("Outline");
+  await tree.getByRole("button", { name: "Enter" }).click();
+  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+  await expect(tree.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible();
+  await tree.getByRole("button", { name: "Leave" }).click();
+  await expect(tree.getByRole("button", { name: "Enter" })).toBeVisible({ timeout: 5_000 });
+});
+
 test("space chat panel bottoms are visually aligned", async ({ page, request }) => {
   const response = await request.post("/api/auth", { data: { token: "guest:e2e-chat-alignment" } });
   expect(response.ok()).toBe(true);
@@ -658,7 +674,9 @@ test("pinboard shares note movement from another user", async ({ browser }) => {
     await first.mouse.move(box.x + box.width / 2 + 96, box.y + box.height / 2 + 54, { steps: 4 });
     await first.mouse.up();
 
-    await expect.poll(async () => Number(await secondNote.getAttribute("data-x"))).toBeGreaterThan(beforeX);
+    await expect.poll(() => firstAppliedVerbs, { timeout: 5_000 }).toContain("move_pin");
+    await expect.poll(async () => Number(await firstNote.getAttribute("data-x")), { timeout: 5_000 }).toBeGreaterThan(beforeX);
+    await expect.poll(async () => Number(await secondNote.getAttribute("data-x")), { timeout: 10_000 }).toBeGreaterThan(beforeX);
   } finally {
     await firstContext.close();
     await secondContext.close();
