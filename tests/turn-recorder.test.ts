@@ -390,6 +390,58 @@ describe("turn recorder", () => {
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
+  it("keeps catalog_registry_install transcript complete and records the contract", async () => {
+    // Regression: catalog_registry_install runs as a sequenced call through
+    // $catalog_registry. Without a tracked-native contract entry, v2 envelope
+    // commits of online installs (REST $space:call → :install) are rejected
+    // with incomplete_transcript — the gap that blocked the online repair
+    // for the woah garden topology.
+    const world = createWorld();
+    const session = world.createSessionForActor("$wiz", "bearer");
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const manifest = {
+      name: "online-install-test",
+      version: "0.0.1",
+      spec_version: "v1",
+      description: "Test manifest exercising the catalog_registry_install transcript contract.",
+      license: "MIT",
+      depends: [],
+      seed_hooks: []
+    };
+    const provenance = { tap: "@local", catalog: manifest.name, alias: manifest.name, ref_requested: "@local", ref_resolved_sha: "test", fetched_at: 1 };
+
+    const frame = await world.call(
+      "online-install",
+      session.id,
+      "$catalog_registry",
+      { actor: "$wiz", target: "$catalog_registry", verb: "install", args: [manifest, manifest, manifest.name, provenance] }
+    );
+
+    expect(frame, JSON.stringify(frame)).toMatchObject({ op: "applied" });
+    expect(recorder.turns.length).toBeGreaterThan(0);
+    const installTurn = recorder.turns.find((t) => t.start.verb === "install");
+    expect(installTurn, "expected a recorded turn for $catalog_registry:install").toBeTruthy();
+    const transcript = effectTranscriptFromRecordedTurn(installTurn!);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.incompleteReasons).toEqual([]);
+    expect(transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "$catalog_registry", name: "install" },
+      value: expect.objectContaining({
+        implementation: "native",
+        native: "catalog_registry_install",
+        native_contract: expect.objectContaining({
+          kind: "woo.native_primitive_contract.shadow.v1",
+          handler: "catalog_registry_install",
+          transcript: "tracked",
+          deterministic: true,
+          writes: expect.arrayContaining(["$catalog_registry.installed_catalogs"])
+        })
+      })
+    }));
+  });
+
   it("marks cross-host dispatch as explicit incomplete_transcript until remote sub-transcripts are implemented", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-remote");

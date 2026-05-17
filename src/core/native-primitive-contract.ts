@@ -151,6 +151,28 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: [],
     note: "Revocation records the authoritative property mutation in the transcript; gateway and Directory session cleanup runs only after an accepted commit."
   },
+  catalog_registry_install: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "catalog_registry_install",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["$catalog_registry.installed_catalogs", "world class registry", "world object existence", "actor wizard authority"],
+    writes: ["$catalog_registry.installed_catalogs", "world classes", "world seed objects", "world verbs", "world property defs", "world event schemas", "feature attachments"],
+    emits: ["catalog_install"],
+    note: "Catalog install runs as a sequenced $catalog_registry call. All authoritative mutations (class creation, seed_hook instance creation, feature attachment) flow through the recorded transcript; recovery from a partial install is operator-driven (CT14.3)."
+  },
+  catalog_registry_update: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "catalog_registry_update",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["$catalog_registry.installed_catalogs", "world class registry", "world object state", "actor wizard authority"],
+    writes: ["$catalog_registry.installed_catalogs", "world classes", "world seed objects", "world verbs", "world property defs", "migration_state"],
+    emits: ["catalog_update", "migration_failed"],
+    note: "Catalog update reuses the install pipeline plus any optional migration steps; same transcript-completeness contract."
+  },
   help_db_find_topics: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "help_db_find_topics",
