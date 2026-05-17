@@ -408,12 +408,12 @@ export class CommitScopeDO {
         id: body.id,
         reason: body.commit?.reason ?? body.reason
       });
-      // Diagnostic: surface the receipt.errors so the actual gate that
-      // rejected the commit is greppable from a worker tail. The structured
-      // metric above only carries the bucketed reason ("nondeterministic"
-      // when no specific prefix matched), which hides the underlying
-      // "write prior mismatch" / "post_state_mismatch" / etc. that we need
-      // to fix.
+      // Surface the underlying receipt.errors so the actual validation gate
+      // that rejected the commit is greppable from a worker tail. The
+      // structured metric above only carries the bucketed reason
+      // ("nondeterministic" when no specific prefix matched), which hides
+      // the per-cell "write prior mismatch" / "post_state_mismatch" /
+      // "read unavailable" detail that an operator needs to triage.
       try {
         const errors = (body.commit as { errors?: unknown } | undefined)?.errors;
         if (Array.isArray(errors) && errors.length > 0) {
@@ -425,7 +425,8 @@ export class CommitScopeDO {
           }));
         }
       } catch {
-        // Diagnostic-only; never block the metric flow.
+        // Logging is best-effort; never block the metric flow on a stray
+        // shape mismatch.
       }
     }
   }

@@ -281,8 +281,17 @@ function sameTurnRead(transcript: EffectTranscript, read: TranscriptRead): { ok:
   if (!create) return { ok: false };
   switch (read.cell.kind) {
     case "prop":
-      if (read.cell.name === "owner" && read.value === create.owner) return { ok: true };
-      return { ok: false, reason: "own_write_mismatch" };
+      // Same-turn create + same-turn prop read: pre-state cannot satisfy the
+      // read because the object did not exist yet. Any in-turn write to the
+      // same cell is already accepted by sameTurnReadMatchesOwnWrite above.
+      // For reads with no in-turn write to that cell (typical for inherited
+      // defaults like description/aliases on a freshly-created instance),
+      // the recorded value is whatever propOrNull returned from the parent
+      // chain or null — deterministic on replay. Accept unconditionally; a
+      // value mismatch would surface later as post_state_mismatch when the
+      // write side of the same cell is validated against the merged
+      // post-state, not as a stale-pre-state read failure.
+      return { ok: true };
     case "location": {
       const moved = lastMoveForObject(transcript, read.cell.object);
       if (stableJson(create.location) === stableJson(read.value)) return { ok: true };

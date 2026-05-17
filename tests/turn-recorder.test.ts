@@ -442,6 +442,66 @@ describe("turn recorder", () => {
     }));
   });
 
+  it("accepts a same-turn prop read on a same-turn-created object through shadow commit validation", async () => {
+    // Regression for the woah-specific catalog_registry_install rejection:
+    // production CommitScopeDO validation hit
+    //   "read unavailable catalog_<alias>.description: object not found"
+    // and bucketed the rejection as "nondeterministic". The install runs
+    // a sequenced turn that both creates `catalog_<alias>` and reads its
+    // `.description` (LambdaCore-style describe lookup). Pre-state cannot
+    // satisfy the read because the object did not exist yet; in-turn
+    // creates make the read deterministic on replay.
+    const world = createWorld();
+    const session = world.createSessionForActor("$wiz", "bearer");
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const manifest = {
+      name: "same-turn-create-read-probe",
+      version: "0.0.1",
+      spec_version: "v1",
+      description: "Probe that exercises the same-turn create-then-read path that prod CommitScopeDO rejected as nondeterministic.",
+      license: "MIT",
+      depends: [],
+      seed_hooks: []
+    };
+    const provenance = { tap: "@local", catalog: manifest.name, alias: manifest.name, ref_requested: "@local", ref_resolved_sha: "test", fetched_at: 1 };
+
+    const before = world.exportWorld();
+    const frame = await world.call(
+      "same-turn-create-read",
+      session.id,
+      "$catalog_registry",
+      { actor: "$wiz", target: "$catalog_registry", verb: "install", args: [manifest, manifest, manifest.name, provenance] }
+    );
+
+    expect(frame, JSON.stringify(frame)).toMatchObject({ op: "applied" });
+    const installTurn = recorder.turns.find((t) => t.start.verb === "install");
+    expect(installTurn).toBeTruthy();
+    const transcript = effectTranscriptFromRecordedTurn(installTurn!);
+
+    // The transcript must contain both a create for catalog_<alias> and at
+    // least one prop read on that object — otherwise this test is not
+    // exercising the regression path.
+    const created = transcript.creates.find((c) => c.object.startsWith("catalog_"));
+    expect(created, "expected a catalog_<alias> create in the transcript").toBeTruthy();
+    const sameTurnPropRead = transcript.reads.find((r) =>
+      r.cell.kind === "prop" &&
+      r.cell.object === created!.object &&
+      r.cell.name !== "owner"
+    );
+    expect(sameTurnPropRead, "expected at least one prop read other than `owner` on the same-turn-created catalog record").toBeTruthy();
+
+    // The validator must accept the transcript end-to-end: shadow-commit
+    // receipt with no errors. Before the fix, this asserted `accepted: false`
+    // with errors like "read unavailable catalog_<alias>.<prop>: object not
+    // found", which `shadowConflictReason` bucketed as "nondeterministic".
+    const validation = validateTranscriptAgainstSerializedWorld(before, transcript);
+    expect(validation.errors, JSON.stringify(validation.errors.slice(0, 4))).toEqual([]);
+    const receipt = shadowCommitReceipt(before, world.exportWorld(), transcript);
+    expect(receipt.accepted, JSON.stringify(receipt.errors.slice(0, 4))).toBe(true);
+  });
+
   it("marks cross-host dispatch as explicit incomplete_transcript until remote sub-transcripts are implemented", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-remote");
