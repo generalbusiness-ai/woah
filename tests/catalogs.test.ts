@@ -81,6 +81,43 @@ function installHelpDependency(world: ReturnType<typeof createWorld>) {
   });
 }
 
+// Install demoworld's full dependency closure from source with no
+// trusted implementation hints. Used by "from source without hints"
+// tests that need the_chatroom / the_deck rooms to exist.
+//
+// Demoworld is the sink in the catalog graph: it depends on chat, tasks,
+// outliner, pinboard, dubspace, weather, horoscope (and through them on
+// help, note, perm, block, dispenser). Each catalog must be installed
+// after its own deps; this helper walks them in topological order.
+function installDemoworldDependencyClosure(
+  world: ReturnType<typeof createWorld>,
+  options: { allowImplementationHints?: boolean } = {}
+) {
+  const allow = options.allowImplementationHints ?? false;
+  const order = [
+    "help",
+    "perm",
+    "chat",
+    "block",
+    "note",
+    "weather",
+    "tasks",
+    "outliner",
+    "pinboard",
+    "dispenser",
+    "dubspace",
+    "horoscope",
+    "demoworld"
+  ];
+  for (const name of order) {
+    installCatalogManifest(world, readManifest(name) as unknown as RuntimeCatalogManifest, {
+      tap: "github:example/woo-test",
+      alias: name,
+      allowImplementationHints: allow
+    });
+  }
+}
+
 describe("local catalogs", () => {
   it("discovers bundled catalogs from manifest locations", async () => {
     const catalogDirs = readdirSync(root).filter((name) => existsSync(join(root, name, "manifest.json"))).sort();
@@ -109,16 +146,31 @@ describe("local catalogs", () => {
   });
 
   it("uses explicit dependency order for embedded chat", async () => {
+    // Demo-instance seeds (the_dubspace, the_pinboard, the_outline, …) live
+    // in demoworld so demoworld is the dependency sink. Class catalogs only
+    // depend on their primitive catalog deps. The :$transparent attach_feature
+    // hooks therefore travel with demoworld, not the source catalog.
     const chat = readManifest("chat");
     const dubspace = readManifest("dubspace");
     const pinboard = readManifest("pinboard");
     const tasks = readManifest("tasks");
+    const demoworld = readManifest("demoworld");
     expect(chat.depends).toEqual(["@local:help"]);
-    expect(dubspace.depends).toEqual(["@local:chat", "@local:demoworld"]);
-    expect(dubspace.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_dubspace", feature: "chat:$transparent" });
-    expect(pinboard.depends).toEqual(["@local:chat", "@local:note", "@local:demoworld"]);
-    expect(pinboard.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_pinboard", feature: "chat:$transparent" });
+    expect(dubspace.depends).toEqual(["@local:chat"]);
+    expect(pinboard.depends).toEqual(["@local:chat", "@local:note"]);
     expect(tasks.depends).toEqual(["@local:chat", "@local:note"]);
+    expect(demoworld.depends).toEqual([
+      "@local:chat",
+      "@local:tasks",
+      "@local:outliner",
+      "@local:pinboard",
+      "@local:dubspace",
+      "@local:weather",
+      "@local:horoscope"
+    ]);
+    expect(demoworld.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_dubspace", feature: "chat:$transparent" });
+    expect(demoworld.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_pinboard", feature: "chat:$transparent" });
+    expect(demoworld.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_outline", feature: "chat:$transparent" });
     expect(tasks.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskboard", feature: "chat:$transparent" });
   });
 
@@ -174,6 +226,24 @@ describe("local catalogs", () => {
     expect(Array.isArray(gardenSouthAliases)).toBe(true);
     expect(gardenSouthAliases as string[]).toEqual(expect.arrayContaining(["south", "s", "santa's workshop", "workshop"]));
     expect(world.getProp("the_taskboard", "name")).toBe("Taskboard");
+  });
+
+  it("repairs older demoworld installs where the garden missed $conversational", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    world.setProp("the_garden", "features", []);
+    world.setProp("the_garden", "features_version", 0);
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-17-demoworld-garden-conversational-feature");
+    world.setProp("$system", "applied_migrations", ledger);
+
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    expect(world.getProp("the_garden", "features")).toEqual(["$conversational"]);
+    expect(world.getProp("the_garden", "features_version")).toBe(1);
+    expect(world.verbInfo("the_garden", "say").definer).toBe("$conversational");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-17-demoworld-garden-conversational-feature");
   });
 
   it("wires the_taskboard back to the garden, and the garden back to the deck", async () => {
@@ -541,31 +611,10 @@ describe("local catalogs", () => {
 
   it("installs chat from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
-    installHelpDependency(world);
-    const manifest = readManifest("chat") as unknown as RuntimeCatalogManifest;
-    installCatalogManifest(world, manifest, {
-      tap: "github:example/woo-test",
-      alias: "chat",
-      allowImplementationHints: false
-    });
-    // demoworld now depends on tasks (for the deck → garden → Santa's
-    // workshop south exits); tasks itself depends on note. Install both
-    // before demoworld.
-    installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "note",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("tasks") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "tasks",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "demoworld",
-      allowImplementationHints: false
-    });
+    // demoworld now sinks every demo-capable catalog (outliner, pinboard,
+    // dubspace, weather, horoscope), so installing it from source covers
+    // chat-from-source plus everything it transitively depends on.
+    installDemoworldDependencyClosure(world);
 
     expect(world.ownVerb("$conversational", "say")?.kind).toBe("bytecode");
     expect(world.ownVerb("$conversational", "enter")?.kind).toBe("bytecode");
@@ -628,34 +677,10 @@ describe("local catalogs", () => {
 
   it("installs dubspace from source without trusted implementation hints", async () => {
     const world = createWorld({ catalogs: false });
-    installHelpDependency(world);
-    installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "chat",
-      allowImplementationHints: false
-    });
-    // demoworld → tasks → note dependency chain (the deck has a south
-    // exit into the garden, which itself routes south to the_taskboard).
-    installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "note",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("tasks") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "tasks",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "demoworld",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("dubspace") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "dubspace",
-      allowImplementationHints: false
-    });
+    // demoworld now owns the_dubspace seed (and pulls dubspace in as a dep),
+    // so installing demoworld's closure from source covers dubspace + every
+    // other class catalog the demo geography uses.
+    installDemoworldDependencyClosure(world);
 
     expect(world.object("the_dubspace").location).toBe("the_chatroom");
     expect(world.object("the_chatroom").contents.has("the_dubspace")).toBe(true);
@@ -908,34 +933,7 @@ describe("local catalogs", () => {
 
   it("installs pinboard from source and keeps notes as board-contained pin objects", async () => {
     const world = createWorld({ catalogs: false });
-    installHelpDependency(world);
-    installCatalogManifest(world, readManifest("chat") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "chat",
-      allowImplementationHints: false
-    });
-    // demoworld → tasks → note: tasks must install before demoworld so the
-    // deck's south exit can resolve `tasks:the_taskboard`.
-    installCatalogManifest(world, readManifest("note") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "note",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("tasks") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "tasks",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("demoworld") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "demoworld",
-      allowImplementationHints: false
-    });
-    installCatalogManifest(world, readManifest("pinboard") as unknown as RuntimeCatalogManifest, {
-      tap: "github:example/woo-test",
-      alias: "pinboard",
-      allowImplementationHints: false
-    });
+    installDemoworldDependencyClosure(world);
 
     expect(world.object("$pin").parent).toBe("$note");
     expect(world.propOrNull("$pinboard", "notes")).toBeNull();
@@ -1012,7 +1010,8 @@ describe("local catalogs", () => {
 
   it("plans pinboard chat commands against the current board space", async () => {
     const world = createWorld({ catalogs: false });
-    installLocalCatalogs(world, ["pinboard"]);
+    // the_pinboard seed lives in demoworld now (demoworld depends on pinboard).
+    installLocalCatalogs(world, ["demoworld"]);
 
     const session = world.auth("guest:catalog-pinboard-chat");
     const entered = await world.directCall("pinboard-chat-enter", session.actor, "the_pinboard", "enter", []);
@@ -2256,11 +2255,15 @@ describe("local catalogs", () => {
     if (goDeck.op === "result") {
       expect(goDeck.result).toMatchObject({ room: "the_deck", from: "the_chatroom", look_deferred: true });
       expect(goDeck.observations).toMatchObject([
-        { type: "left", source: "the_chatroom", actor: session.actor, destination: "the_deck", text: `${world.object(session.actor).name} goes southeast.` },
-        { type: "entered", source: "the_deck", actor: session.actor, origin: "the_chatroom", text: `${world.object(session.actor).name} has arrived.` }
+        { type: "text", target: session.actor, source: "the_chatroom", text: "You slide the glass door open and step out onto the deck." },
+        { type: "left", source: "the_chatroom", actor: session.actor, destination: "the_deck", text: `${world.object(session.actor).name} slides the glass door open and steps out onto the deck.` },
+        { type: "entered", source: "the_deck", actor: session.actor, origin: "the_chatroom", text: `${world.object(session.actor).name} steps out through the sliding glass door.` }
       ]);
-      expect(goDeck.observationAudiences?.[0]).toContain(watcher.actor);
-      expect(goDeck.observationAudiences?.[0]).not.toContain(session.actor);
+      // The actor's leave_msg is delivered via tell() as a directed text
+      // observation before the room broadcast; only the watcher in the source
+      // room should receive the room-level "left" observation.
+      expect(goDeck.observationAudiences?.[1]).toContain(watcher.actor);
+      expect(goDeck.observationAudiences?.[1]).not.toContain(session.actor);
     }
     expect(world.hasPresence(session.actor, "the_chatroom")).toBe(false);
     expect(world.hasPresence(session.actor, "the_deck")).toBe(true);
@@ -2560,7 +2563,8 @@ describe("local catalogs", () => {
 
   it("exposes roster and live-audience contracts on v2 spaces", async () => {
     const world = createWorld({ catalogs: false });
-    installLocalCatalogs(world, ["pinboard", "dubspace"]);
+    // the_pinboard / the_dubspace seeds live in demoworld now.
+    installLocalCatalogs(world, ["demoworld"]);
 
     const first = world.auth("guest:v2-roster-first");
     const second = world.auth("guest:v2-roster-second");
@@ -3796,9 +3800,10 @@ describe("local catalogs", () => {
       expect(world.objects.has(noteId)).toBe(true);
     });
 
-    it("blocks-demo seeds visible weather and horoscope blocks with useful look output", async () => {
+    it("demoworld seeds visible weather and horoscope blocks with useful look output", async () => {
       const world = createWorld({ catalogs: false });
-      installLocalCatalogs(world, ["blocks-demo"]);
+      // the_weather / the_horoscope seeds live in demoworld now.
+      installLocalCatalogs(world, ["demoworld"]);
       // Weather panel: anchored in the chatroom, default config matches manifest seed.
       expect(world.objects.has("the_weather")).toBe(true);
       expect(world.object("the_weather").parent).toBe("$weather_block");
@@ -4339,10 +4344,10 @@ describe("local catalogs", () => {
 
     it("$weather_block:ask answers today/tomorrow/yesterday/weekday/M-D from current.local_date and daily[]", async () => {
       const world = createWorld({ catalogs: false });
-      // Reuse blocks-demo's seed graph so we get the_weather pre-anchored in
-      // the_chatroom under a $conversational space — that gives us :command_plan
-      // for the routing check below without setting up the world by hand.
-      installLocalCatalogs(world, ["blocks-demo"]);
+      // demoworld now owns the_weather (anchored in the_chatroom under a
+      // $conversational space) so installing it gives us the same scenery
+      // blocks-demo used to seed plus :command_plan for the routing check.
+      installLocalCatalogs(world, ["demoworld"]);
       const blockId = "the_weather";
       const roomId = "the_chatroom";
 

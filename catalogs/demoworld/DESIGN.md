@@ -51,9 +51,19 @@ the_deck also holds:
   the_towel ($portable)
 ```
 
-`the_dubspace` and `the_pinboard` are seeded by their own catalogs
-(`dubspace`, `pinboard`) which depend on `demoworld` so the
-`location` references resolve.
+All bundled demo instances — `the_dubspace` and its controls,
+`the_pinboard`, `the_outline`, `the_weather`, `the_horoscope` — are
+seeded by **demoworld itself**, not by their class catalogs. Demoworld
+depends on `chat`, `tasks`, `outliner`, `pinboard`, `dubspace`,
+`weather`, and `horoscope`; nothing depends on demoworld. The
+dependency direction is enforced by
+[`scripts/guard-catalog-layering.mjs`](../../scripts/guard-catalog-layering.mjs).
+
+This inversion lets operators install the class libraries without the
+demo geography: a world that wants `$pinboard`/`$outliner` classes but
+its own room layout installs `pinboard` and `outliner` directly and
+skips `demoworld`. The class catalogs ship with no demoworld coupling
+in their manifests.
 
 ## Cockatoo
 
@@ -67,8 +77,21 @@ squawking is actor-driven.
 - Not a replacement for the `chat` catalog. `chat` defines `$room`,
   `$exit`, `$conversational`, `$chatroom`, `$portable`, `$furniture`,
   `$match` — the building blocks. demoworld only assembles them.
-- Not a long-term home for new world-content. Each new bundled demo
-  should ship its own seed catalog (dubspace / pinboard / tasks
-  pattern) rather than appending to demoworld.
 - Not a foundation for third-party catalogs. A world that installs
   `chat` + a community-published room set should not need demoworld.
+
+## What goes here
+
+New bundled demo placements belong in demoworld's `seed_hooks`. To
+ship a new demo:
+
+1. Build the class catalog (with classes/verbs and no demoworld
+   coupling). It must not declare `@local:demoworld` in its `depends`.
+2. Add `@local:<new-catalog>` to demoworld's `depends`.
+3. Append a `create_instance` (and any `attach_feature` /
+   `set_property`) entry to demoworld's `seed_hooks` referencing
+   demoworld-local objects (e.g. `the_chatroom`, `the_deck`) for
+   `location` / `mount_room`.
+
+The reverse direction — a class catalog seeding into demoworld's
+rooms — is blocked by the layering guard.

@@ -4,6 +4,7 @@ import demoworldManifest from "../../catalogs/demoworld/manifest.json";
 import dispenserManifest from "../../catalogs/dispenser/manifest.json";
 import dubspaceManifest from "../../catalogs/dubspace/manifest.json";
 import noteManifest from "../../catalogs/note/manifest.json";
+import outlinerManifest from "../../catalogs/outliner/manifest.json";
 import pinboardManifest from "../../catalogs/pinboard/manifest.json";
 import tasksManifest from "../../catalogs/tasks/manifest.json";
 import weatherManifest from "../../catalogs/weather/manifest.json";
@@ -12,6 +13,7 @@ import * as demoworldUiModule from "../../catalogs/demoworld/ui/demoworld-chat";
 import * as dispenserUiModule from "../../catalogs/dispenser/ui/dispenser-chat";
 import * as dubspaceUiModule from "../../catalogs/dubspace/ui/dubspace-workspace";
 import * as noteUiModule from "../../catalogs/note/ui/note-chat";
+import * as outlinerUiModule from "../../catalogs/outliner/ui/outliner-tree";
 import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
 import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
@@ -40,11 +42,11 @@ type AppState = {
   authStatus: AuthStatus;
   loginError?: string;
   loginPending?: boolean;
-  tab: "chat" | "dubspace" | "pinboard" | "tasks" | "ide";
+  tab: "chat" | "dubspace" | "pinboard" | "tasks" | "outliner" | "ide";
   scopedProjection?: ScopedProjectionStateModel;
   v2Projection?: V2ProjectionMessage;
   scopedObjectSummaries: Record<string, any>;
-  routedSubjects: Partial<Record<"dubspace" | "pinboard" | "tasks", string>>;
+  routedSubjects: Partial<Record<"dubspace" | "pinboard" | "tasks" | "outliner", string>>;
   audioOn: boolean;
   clockOffset: number;
   cueSlots: Record<string, boolean>;
@@ -161,15 +163,22 @@ const state: AppState = {
 let audio: DubAudio | undefined;
 const ui = createWooClientFramework();
 let chatRoomPin: ChatRoomPin | null = null;
+// `the_dubspace` / `the_pinboard` / `the_outline` seeds live in demoworld's
+// manifest now (the demoworld-dependency-inversion). Read from demoworld so
+// the SPA can route to them on first load. Tasks still self-seeds the
+// taskboard with no location coupling, so it reads from its own manifest.
 const bundledToolSeeds = {
-  dubspace: bundledSeedRef(dubspaceManifest, "$dubspace"),
-  pinboard: bundledSeedRef(pinboardManifest, "$pinboard"),
+  dubspace: bundledSeedRef(demoworldManifest, "$dubspace"),
+  pinboard: bundledSeedRef(demoworldManifest, "$pinboard"),
+  outliner: bundledSeedRef(demoworldManifest, "$outliner"),
   tasks: bundledSeedRef(tasksManifest, "$task_registry")
 } as const;
 const bundledCatalogManifests: Record<string, any> = {
   dubspace: dubspaceManifest,
   pinboard: pinboardManifest,
-  tasks: tasksManifest
+  outliner: outlinerManifest,
+  tasks: tasksManifest,
+  demoworld: demoworldManifest
 };
 const sessionKey = "woo.session";
 const usernameKey = "woo.username";
@@ -199,6 +208,7 @@ const directThrottle = new Map<string, number>();
 const pendingDirect = new Map<string, (result: any) => void>();
 const pendingFrameErrors = new Map<string, (error: any) => void>();
 const pendingCommands = new Map<string, { space: string; text: string; action?: ChatCommandUiAction }>();
+const pendingNetworkTurns = new Set<string>();
 let pinboardNotesRefreshPending = false;
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
@@ -214,8 +224,9 @@ const PINBOARD_VIEW_ANIMATION_MS = 480;
 const PINBOARD_VIEWPORT_MIN_MS = 110;
 const PINBOARD_MAP_DEFAULT_ASPECT = 0.42;
 const SPACE_CHAT_DEFAULT_HEIGHT = 280;
-// Keep drag-resize floor aligned with the collapsed mini-chat footprint.
-const SPACE_CHAT_MIN_HEIGHT = 42;
+// Keep the expanded mini-chat tall enough for a visible transcript; collapse
+// has its own compact CSS state.
+const SPACE_CHAT_MIN_HEIGHT = 176;
 const SPACE_CHAT_MAX_VIEWPORT_RATIO = 0.45;
 const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
   chat: "chat",
@@ -223,6 +234,8 @@ const TAB_FROM_VIEW: Record<string, AppState["tab"]> = {
   pinboard: "pinboard",
   tasks: "tasks",
   kanban: "tasks",
+  outliner: "outliner",
+  outline: "outliner",
   ide: "ide",
   editor: "ide"
 };
@@ -248,6 +261,8 @@ let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, l
 let routeInitialized = false;
 let v2BrowserWorker: Worker | undefined;
 let v2BrowserWorkerScope = "";
+let pendingNetworkRequests = 0;
+let networkWaitTimer: number | undefined;
 state.spaceChatHeights = loadSpaceChatHeights();
 const persistedSpaceChatCollapsed = readStorage(spaceChatCollapsedKey);
 state.spaceChatCollapsed = persistedSpaceChatCollapsed === "1" || persistedSpaceChatCollapsed === "true";
@@ -262,6 +277,45 @@ window.addEventListener("resize", () => {
 window.addEventListener("popstate", () => {
   void applyLocationRoute("replace");
 });
+
+function beginNetworkWait() {
+  pendingNetworkRequests += 1;
+  if (pendingNetworkRequests !== 1) return;
+  // Delay the cursor so fast local requests don't flash the whole document.
+  networkWaitTimer = window.setTimeout(() => {
+    if (pendingNetworkRequests > 0) document.documentElement.classList.add("woo-network-waiting");
+  }, 120);
+}
+
+function endNetworkWait() {
+  pendingNetworkRequests = Math.max(0, pendingNetworkRequests - 1);
+  if (pendingNetworkRequests > 0) return;
+  if (networkWaitTimer !== undefined) {
+    window.clearTimeout(networkWaitTimer);
+    networkWaitTimer = undefined;
+  }
+  document.documentElement.classList.remove("woo-network-waiting");
+}
+
+async function trackedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  beginNetworkWait();
+  try {
+    return await fetch(input, init);
+  } finally {
+    endNetworkWait();
+  }
+}
+
+function trackV2TurnNetworkWait(id: string) {
+  if (pendingNetworkTurns.has(id)) return;
+  pendingNetworkTurns.add(id);
+  beginNetworkWait();
+}
+
+function completeV2TurnNetworkWait(id: unknown) {
+  if (typeof id !== "string" || !pendingNetworkTurns.delete(id)) return;
+  endNetworkWait();
+}
 
 function connect() {
   if (state.authStatus !== "authenticated") return;
@@ -361,6 +415,7 @@ function syncV2BrowserWorkerScope(scopeOverride?: string) {
 }
 
 function receiveDirectResultFrame(frame: any) {
+  completeV2TurnNetworkWait(frame.id);
   const handler = pendingDirect.get(frame.id);
   if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
   for (const observation of frame.observations ?? []) {
@@ -383,6 +438,7 @@ function receiveDirectResultFrame(frame: any) {
 }
 
 function receiveErrorFrame(frame: any, socket?: WebSocket) {
+  completeV2TurnNetworkWait(frame.id);
   const errorHandler = typeof frame.id === "string" ? pendingFrameErrors.get(frame.id) : undefined;
   if (typeof frame.id === "string") {
     ui.failOptimisticCall(frame.id);
@@ -410,6 +466,7 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
 }
 
 function receiveAppliedFrame(frame: any) {
+  completeV2TurnNetworkWait(frame.id);
   ui.ingestAppliedFrame(frame);
   applyScopedMoveResult(frame.result);
   const needsScopedDeferredLook = frame.result
@@ -565,7 +622,7 @@ function storeUsername(username: string) {
 async function postAuth(token: string): Promise<{ session: string; actor: string } | { error: string }> {
   let response: Response;
   try {
-    response = await fetch("/api/auth", {
+    response = await trackedFetch("/api/auth", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token })
@@ -649,7 +706,7 @@ async function logout() {
   v2BrowserWorkerScope = "";
   if (sessionId) {
     try {
-      await fetch("/api/session", { method: "DELETE", headers: { authorization: `Session ${sessionId}` } });
+      await trackedFetch("/api/session", { method: "DELETE", headers: { authorization: `Session ${sessionId}` } });
     } catch {
       // best-effort; the local session is already cleared
     }
@@ -742,6 +799,7 @@ function objectIdForTab(tab: AppState["tab"]): string {
   if (tab === "dubspace") return dubspaceSpace();
   if (tab === "pinboard") return pinboardSpace();
   if (tab === "tasks") return tasksSpace();
+  if (tab === "outliner") return outlinerSpace();
   if (tab === "ide") return state.selectedObject || defaultSelectedObject();
   return "";
 }
@@ -784,6 +842,7 @@ function routeForObjectId(objectId: string, summary?: any): AppState["tab"] {
   if (objectId === dubspaceSpace()) return "dubspace";
   if (objectId === pinboardSpace()) return "pinboard";
   if (objectId === tasksSpace()) return "tasks";
+  if (objectId === outlinerSpace()) return "outliner";
   const summaryTab = tabForScopedSummary(objectId, summary ?? scopedObjectSummary(objectId));
   if (summaryTab) return summaryTab;
   return "ide";
@@ -791,13 +850,13 @@ function routeForObjectId(objectId: string, summary?: any): AppState["tab"] {
 
 function pinRoutedSubject(tab: AppState["tab"], subject: string) {
   if (!subject) return;
-  if (tab === "dubspace" || tab === "pinboard" || tab === "tasks") {
+  if (tab === "dubspace" || tab === "pinboard" || tab === "tasks" || tab === "outliner") {
     state.routedSubjects = { ...state.routedSubjects, [tab]: subject };
   }
 }
 
 function routeSubjectForTab(tab: AppState["tab"], routedObject: string, _summary: any): string {
-  if (tab === "dubspace" || tab === "pinboard" || tab === "tasks") return routedObject;
+  if (tab === "dubspace" || tab === "pinboard" || tab === "tasks" || tab === "outliner") return routedObject;
   return "";
 }
 
@@ -909,8 +968,8 @@ async function refresh() {
 async function refreshScopedProjectionSmoke() {
   try {
     const [meResponse, catalogsResponse] = await Promise.all([
-      fetch("/api/me", { headers: authHeaders() }),
-      fetch("/api/catalogs/ui", { headers: authHeaders() })
+      trackedFetch("/api/me", { headers: authHeaders() }),
+      trackedFetch("/api/catalogs/ui", { headers: authHeaders() })
     ]);
     throwIfAuthExpired(meResponse, "/api/me");
     throwIfAuthExpired(catalogsResponse, "/api/catalogs/ui");
@@ -929,7 +988,7 @@ async function refreshScopedProjection() {
   const startedRevision = scopedProjectionLocalRevision;
   try {
     const [meResponse, catalogs] = await Promise.all([
-      fetch("/api/me", { headers: authHeaders() }),
+      trackedFetch("/api/me", { headers: authHeaders() }),
       fetchCatalogUiIndex()
     ]);
     throwIfAuthExpired(meResponse, "/api/me");
@@ -965,7 +1024,7 @@ async function refreshScopedProjection() {
 
 async function fetchCatalogUiIndex() {
   const headers = catalogUiEtag ? authHeaders({ "if-none-match": catalogUiEtag }) : authHeaders();
-  const response = await fetch("/api/catalogs/ui", { headers });
+  const response = await trackedFetch("/api/catalogs/ui", { headers });
   if (response.status === 304 && catalogUiCache) return catalogUiCache;
   throwIfAuthExpired(response, "/api/catalogs/ui");
   if (!response.ok) throw new Error(`/api/catalogs/ui ${response.status}`);
@@ -998,7 +1057,7 @@ async function ensureScopedOverlayForTab(tab: AppState["tab"], options: { force?
   const pending = pendingOverlaySnapshots.get(key);
   if (pending && !options.force) return await pending;
   const request = (async () => {
-    const response = await fetch(`/api/objects/${encodeURIComponent(subject)}/ui-snapshot?surface=${encodeURIComponent(tab)}`, { headers: authHeaders() });
+    const response = await trackedFetch(`/api/objects/${encodeURIComponent(subject)}/ui-snapshot?surface=${encodeURIComponent(tab)}`, { headers: authHeaders() });
     if (!response.ok) throw new Error(`/api/objects/${subject}/ui-snapshot ${response.status}`);
     applyScopedOverlaySnapshot(key, await response.json());
   })();
@@ -1016,8 +1075,14 @@ function overlaySubjectForTab(tab: AppState["tab"]): string {
   return "";
 }
 
-function scopedToolSubject(surface: "dubspace" | "pinboard" | "tasks"): string {
-  const className = surface === "dubspace" ? "$dubspace" : surface === "pinboard" ? "$pinboard" : "$task_registry";
+function scopedToolSubject(surface: "dubspace" | "pinboard" | "tasks" | "outliner"): string {
+  const className = surface === "dubspace"
+    ? "$dubspace"
+    : surface === "pinboard"
+      ? "$pinboard"
+      : surface === "outliner"
+        ? "$outliner"
+        : "$task_registry";
   const overlays = state.scopedProjection?.overlays ?? {};
   for (const handle of Object.values(overlays)) {
     const subject = typeof (handle as any)?.subject === "string" ? (handle as any).subject : "";
@@ -1156,7 +1221,7 @@ async function fetchScopedObjectSummary(id: string): Promise<any | undefined> {
   if (!id) return undefined;
   const cached = state.scopedObjectSummaries[id] ?? (isCompleteScopedSummary(ui.observe(id)) ? ui.observe(id) : undefined);
   if (cached) return cached;
-  const response = await fetch(`/api/objects/${encodeURIComponent(id)}/summary`, { headers: authHeaders() });
+  const response = await trackedFetch(`/api/objects/${encodeURIComponent(id)}/summary`, { headers: authHeaders() });
   if (!response.ok) throw new Error(`/api/objects/${id}/summary ${response.status}`);
   const summary = await response.json();
   state.scopedObjectSummaries = { ...state.scopedObjectSummaries, [id]: summary };
@@ -1177,7 +1242,7 @@ function isCompleteScopedSummary(summary: any): boolean {
 // ancestors, satisfying that shortcut, but still lack the props a title-badge
 // component needs. Field-level fills must hit the network.
 async function fetchObjectSummaryForFill(subject: string): Promise<void> {
-  const response = await fetch(`/api/objects/${encodeURIComponent(subject)}/summary`, { headers: authHeaders() });
+  const response = await trackedFetch(`/api/objects/${encodeURIComponent(subject)}/summary`, { headers: authHeaders() });
   if (!response.ok) throw new Error(`/api/objects/${subject}/summary ${response.status}`);
   const summary = await response.json();
   state.scopedObjectSummaries = { ...state.scopedObjectSummaries, [subject]: summary };
@@ -1217,6 +1282,7 @@ function tabForScopedSummary(id: string, summary: any): AppState["tab"] | undefi
   if (isCatalogObjectSummary(summary, "dubspace", "$dubspace")) return "dubspace";
   if (isCatalogObjectSummary(summary, "pinboard", "$pinboard")) return "pinboard";
   if (isCatalogObjectSummary(summary, "tasks", "$task_registry")) return "tasks";
+  if (isCatalogObjectSummary(summary, "outliner", "$outliner")) return "outliner";
   return undefined;
 }
 
@@ -1703,10 +1769,23 @@ function tasksSpace() {
   return scoped || activeInstalledCatalogSeed("tasks", bundledToolSeeds.tasks);
 }
 
+function outlinerSpace() {
+  const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
+  if ((route?.view === "outliner" || route?.view === "outline") && route.objectId) return route.objectId;
+  if (state.routedSubjects.outliner) return state.routedSubjects.outliner;
+  const scoped = scopedToolSubject("outliner");
+  // the_outline lives in demoworld's seed_hooks; demoworld is the install
+  // record we look in for the seed objref. Fallback chain mirrors the
+  // other tabs but reads the bundled seed from demoworld's manifest.
+  return scoped || activeInstalledCatalogSeed("demoworld", bundledToolSeeds.outliner);
+}
+
 function chatRoom() {
+  if (chatRoomPin && chatRoomPin.expiresAt > Date.now()) return chatRoomPin.room;
+  chatRoomPin = null;
   const here = String(state.scopedProjection?.here?.id ?? "");
   if (here) return here;
-  return String(state.scopedProjection?.session?.current_location ?? "");
+  return sessionActiveScope(state.scopedProjection?.session) ?? "";
 }
 
 function defaultChatRoom() {
@@ -1753,6 +1832,7 @@ function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "sc
     args: input.args ?? [],
     ...(input.persistence ? { persistence: input.persistence } : {})
   });
+  trackV2TurnNetworkWait(input.id);
   return true;
 }
 
@@ -2061,6 +2141,17 @@ function receiveLiveEvent(observation: any) {
       }
     }
   }
+  if (isOutlinerObservation(observation)) {
+    if (String(observation?.actor ?? "") === state.actor) {
+      if (observation?.type === "outliner_entered") {
+        markNestedSpaceDeparture(outlinerSpace());
+        if (state.tab !== "outliner") setTab("outliner", { mode: "push", leaveCurrent: false });
+        requestSpaceChatFocus(outlinerSpace());
+      } else if (observation?.type === "outliner_left" && state.tab === "outliner") {
+        setTab("chat", { mode: "push", leaveCurrent: false });
+      }
+    }
+  }
   if (isChatObservation(observation)) {
     receiveChatEvent(observation);
     return;
@@ -2196,6 +2287,15 @@ function render() {
     ? app.querySelector<HTMLElement>("[data-tasks-board]")
     : null;
   if (preservedTasksKanban) preservedTasksKanban.remove();
+  // Same preservation rule for the outliner tree. The component owns ephemeral
+  // UI state (collapsed set, in-progress edit, drag source, show-hidden) and
+  // its own hydrate cycle — recreating it on every applied-frame rerender
+  // both drops that state and re-runs hydrate, which fires another applied
+  // frame, looping at 3-7Hz. See catalogs/outliner/ui/outliner-tree.ts.
+  const preservedOutlinerTree = state.tab === "outliner"
+    ? app.querySelector<HTMLElement>("[data-outliner-tree]")
+    : null;
+  if (preservedOutlinerTree) preservedOutlinerTree.remove();
   app.innerHTML = `
     <div class="shell ${state.observationsCollapsed ? "observations-collapsed" : ""}">
       <aside class="nav">
@@ -2205,6 +2305,7 @@ function render() {
         ${navButton("dubspace", "Dubspace")}
         ${navButton("pinboard", "Pinboard")}
         ${navButton("tasks", "Tasks")}
+        ${navButton("outliner", "Outliner")}
         ${navButton("ide", "Inspector")}
         <a class="github-link" href="https://github.com/hughpyle/woo" target="_blank" rel="noopener noreferrer" aria-label="woo on GitHub" title="woo on GitHub">
           <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -2214,6 +2315,7 @@ function render() {
         ${state.tab === "dubspace" ? renderDubspace() : ""}
         ${state.tab === "pinboard" ? renderPinboard() : ""}
         ${state.tab === "tasks" ? renderTasks() : ""}
+        ${state.tab === "outliner" ? renderOutliner() : ""}
         ${state.tab === "chat" ? renderChat() : ""}
         ${state.tab === "ide" ? renderIde() : ""}
       </main>
@@ -2225,11 +2327,16 @@ function render() {
     const placeholder = app.querySelector<HTMLElement>("[data-tasks-board]");
     if (placeholder) placeholder.replaceWith(preservedTasksKanban);
   }
+  if (preservedOutlinerTree) {
+    const placeholder = app.querySelector<HTMLElement>("[data-outliner-tree]");
+    if (placeholder) placeholder.replaceWith(preservedOutlinerTree);
+  }
   bindCommon();
   if (state.tab === "chat") mountChatComponent();
   if (state.tab === "dubspace") bindDubspace();
   if (state.tab === "pinboard") bindPinboard();
   if (state.tab === "tasks") bindTasks();
+  if (state.tab === "outliner") bindOutliner();
   if (state.tab === "ide") bindIde();
   if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
 }
@@ -2374,10 +2481,7 @@ function bindCommon() {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", async () => {
       const next = button.dataset.tab as AppState["tab"];
-      if (next !== "ide") {
-        await ensureScopedProjectionReady();
-        await ensureScopedOverlayForTab(next);
-      }
+      if (next !== "ide") void ensureScopedProjectionReady();
       const wasDifferent = state.tab !== next;
       setTab(next, { mode: "push" }, () => {
         if (!wasDifferent) return;
@@ -2408,6 +2512,7 @@ function installBundledCatalogUi() {
     { alias: "demoworld", manifest: demoworldManifest, objects: {}, modules: { "demoworld-chat": demoworldUiModule } },
     { alias: "dubspace", manifest: dubspaceManifest, objects: { "$dubspace": "$dubspace" }, modules: { "dubspace-ui": dubspaceUiModule } },
     { alias: "pinboard", manifest: pinboardManifest, objects: { "$pinboard": "$pinboard" }, modules: { "pinboard-ui": pinboardUiModule } },
+    { alias: "outliner", manifest: outlinerManifest, objects: { "$outliner": "$outliner" }, modules: { "outliner-ui": outlinerUiModule } },
     { alias: "tasks", manifest: tasksManifest, objects: { "$task_registry": "$task_registry" }, modules: { "tasks-ui": tasksUiModule } },
     { alias: "weather", manifest: weatherManifest, objects: { "$weather_block": "$weather_block" }, modules: { "weather-ui": weatherUiModule } }
   ] as const;
@@ -2450,7 +2555,8 @@ function dubspaceOperators(): string[] {
 }
 
 function mountAmbientCompanion(element: HTMLElement, space: string) {
-  const slot = element.querySelector<HTMLElement>("[data-ambient-companion]");
+  const slot = element.querySelector<HTMLElement>("[data-ambient-companion]")
+    ?? element.closest<HTMLElement>("[data-ambient-companion-shell]")?.querySelector<HTMLElement>("[data-ambient-companion]");
   if (!slot || !space) return;
   const existing = slot.querySelector<HTMLElement & WooElement & { data?: SpaceChatPanelData }>(`[data-space-chat-panel]`);
   if (existing && existing.dataset.spaceChatSpace === space) {
@@ -2805,6 +2911,14 @@ function isPinboardObservation(observation: any) {
     "note_color_changed",
     "note_deleted",
     "notes_cleared"
+  ].includes(String(observation?.type ?? ""));
+}
+
+function isOutlinerObservation(observation: any) {
+  return [
+    "outliner_entered",
+    "outliner_left",
+    "outliner_activity"
   ].includes(String(observation?.type ?? ""));
 }
 
@@ -3173,8 +3287,8 @@ function currentTabHasChatPanel(): boolean {
   // Tabs whose layout embeds a `.ambient-companion-shell` and therefore needs
   // a live repaint when chat lines arrive. Tasks renders chat alongside
   // the kanban board via the shared `space-chat-mini` component, same
-  // shape as dubspace/pinboard.
-  return ["chat", "dubspace", "pinboard", "tasks"].includes(state.tab);
+  // shape as dubspace/pinboard/outliner.
+  return ["chat", "dubspace", "pinboard", "tasks", "outliner"].includes(state.tab);
 }
 
 function loadChatHistory(): string[] {
@@ -3300,7 +3414,7 @@ function setChatPresent(result: any) {
 }
 
 function setCurrentChatRoom(room: string) {
-  if (room) chatRoomPin = { room, expiresAt: Date.now() + 2_500 };
+  if (room) chatRoomPin = { room, expiresAt: Date.now() + 10_000 };
   if (state.actor && !state.chatPresent.includes(state.actor)) state.chatPresent = [...state.chatPresent, state.actor];
   syncUrlFromCurrentState("replace");
 }
@@ -3582,6 +3696,16 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     requestSpaceChatFocus(target);
     return;
   }
+  if (verb === "enter" && target === outlinerSpace()) {
+    setTab("outliner", { mode: "push", leaveCurrent: false });
+    requestSpaceChatFocus(target);
+    return;
+  }
+  if ((verb === "leave" || verb === "out") && target === outlinerSpace()) {
+    setTab("chat", { mode: "push", leaveCurrent: false });
+    focusChatInput();
+    return;
+  }
   if (verb === "who") {
     setChatPresent(result);
     return;
@@ -3658,6 +3782,18 @@ function renderTasks() {
   }
   const boardId = tasksSpace();
   return `<${tag} data-tasks-board data-tasks-registry="${escapeHtml(boardId)}"></${tag}>`;
+}
+
+function renderOutliner() {
+  const tag = toolFrameComponentTag(outlinerSpace(), "outliner.tree", "outliner");
+  if (!tag) {
+    return `
+      <section class="toolbar"><h1>Outliner</h1></section>
+      <section class="panel"><p class="empty-state">No outliner UI is registered.</p></section>
+    `;
+  }
+  const id = outlinerSpace();
+  return `<${tag} data-outliner-tree data-outliner-subject="${escapeHtml(id)}"></${tag}>`;
 }
 
 function renderAmbientCompanion(space: string) {
@@ -3951,6 +4087,44 @@ function bindTasks() {
   mountTasksKanbanComponent();
   requestTasksChatFocusIfPending();
   bindSpaceChatPanels();
+}
+
+function bindOutliner() {
+  mountOutlinerComponent();
+  bindOutlinerComponentEvents();
+  bindSpaceChatPanels();
+}
+
+function bindOutlinerComponentEvents() {
+  const element = document.querySelector<WooElement>("[data-outliner-tree]");
+  if (!element || element.dataset.outlinerEventsBound === "true") return;
+  element.dataset.outlinerEventsBound = "true";
+  element.addEventListener("woo-outliner-enter", () => direct(outlinerSpace(), "enter"));
+  element.addEventListener("woo-outliner-leave", () => direct(outlinerSpace(), "leave"));
+}
+
+function mountOutlinerComponent() {
+  const element = document.querySelector<WooElement & { subject?: string; hydrate?: () => Promise<void>; showCompanion?: boolean }>("[data-outliner-tree]");
+  if (!element) return;
+  const id = outlinerSpace();
+  if (!id) return;
+  const subjectChanged = element.subject !== id;
+  element.subject = id;
+  element.woo = createChatWooContext(id);
+  element.showCompanion = actorPresentInSpace(id);
+  // Only kick the initial hydrate once per mounted element. The SPA writes
+  // markup, then patches subject+woo in here, so the component's own
+  // connectedCallback can't auto-hydrate on first insert. After that, the
+  // element is preserved across rerenders (see `render()`), and the
+  // observation reducer in outliner-tree.ts triggers re-hydrates on
+  // structural changes. Re-hydrating on every render would spin a 3-7Hz
+  // server loop because each list_items call produces an applied frame
+  // that triggers another render.
+  if (subjectChanged || element.dataset.outlinerHydrated !== "true") {
+    element.dataset.outlinerHydrated = "true";
+    void element.hydrate?.();
+  }
+  if (actorPresentInSpace(id)) mountAmbientCompanion(element, id);
 }
 
 function mountTasksKanbanComponent() {

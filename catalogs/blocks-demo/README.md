@@ -1,29 +1,26 @@
 ---
 name: blocks-demo
-version: 0.1.0
+version: 0.2.0
 spec_version: v1
 license: MIT
-description: Demo seed instances for the $block pattern — a weather panel in the chatroom and a horoscope machine on the deck.
+description: DEPRECATED no-op stub. Block demo seeds moved into demoworld in 0.2 as part of the demoworld-dependency-inversion. Install demoworld for the block demos.
 keywords:
   - block
   - demo
-  - weather
-  - horoscope
+  - deprecated
 ---
 
-# blocks-demo
+# blocks-demo (deprecated)
 
-Bundles the two demo block instances:
+This catalog is a no-op stub kept for install-list backwards compatibility.
 
-- **`the_weather`** — a `$weather_block` anchored in `the_chatroom`, the
-  default place is `Mountain View CA`, timezone `America/Los_Angeles`,
-  units imperial, 12h forecast.
-- **`the_horoscope`** — a `$horoscope_block` anchored on `the_deck`, with
-  a wry-fortune-teller `system_prompt` and the default 60s rate limit.
+The_weather and the_horoscope seeds moved into the
+[demoworld](../demoworld/manifest.json) catalog when demoworld became the
+sink of the demo-instance dependency graph. Catalogs that define classes
+no longer depend on demoworld; demoworld depends on them, and a
+[`scripts/guard-catalog-layering.mjs`](../../scripts/guard-catalog-layering.mjs)
+guard now enforces that direction.
 
-This catalog is pure seed-hook wiring; it adds no classes or verbs.
-Install when you want the demo ambience pre-populated. Skip if you want
-to create block instances by hand via `@create_instance`.
+To get the block demos: install `demoworld` instead of `blocks-demo`.
 
-See [DESIGN.md](DESIGN.md) for placement rationale and how to wire the
-plugs.
+See [DESIGN.md](DESIGN.md) for the historical context.

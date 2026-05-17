@@ -402,20 +402,23 @@ kanban:add_card("doing", "Write the spec")
 
 ## Seed instance
 
-The pinboard catalog will seed one kanban board instance alongside
-`the_pinboard` once `$kanban_board` ships:
+The pinboard catalog defines `$pin`, `$pinboard`, and (when shipped)
+`$kanban_board` but seeds no instances of its own. The bundled
+`the_pinboard` instance — mounted on the Deck (`the_deck`) — is seeded
+by the [demoworld](../demoworld/manifest.json) catalog, which depends
+on pinboard. When `$kanban_board` ships, its bundled `the_kanban`
+instance will likewise live in demoworld:
 
 | Object | Class | Location | Mount room | Purpose |
 | --- | --- | --- | --- | --- |
-| `the_kanban` | `$kanban_board` | `demoworld:the_chatroom` | `demoworld:the_chatroom` | Living Room kanban board with the default `To Do` / `Doing` / `Done` columns. |
+| `the_kanban` | `$kanban_board` | `the_chatroom` | `the_chatroom` | Living Room kanban board with the default `To Do` / `Doing` / `Done` columns (added to demoworld's `seed_hooks` when the class lands). |
 
-This keeps the first kanban surface visible in the Living Room, while the
-existing spatial `the_pinboard` remains mounted on the Deck. When this seed
-lands, `catalogs/demoworld/DESIGN.md`'s "Room layout" diagram should be
-updated to show `the_kanban` as a second mounted space inside the Living Room
-alongside `the_dubspace`, and `pinboard` should add `@local:demoworld` to its
-manifest depends if it doesn't already (it does, as of the chat→demoworld
-split).
+The dependency direction is enforced one-way:
+[`scripts/guard-catalog-layering.mjs`](../../scripts/guard-catalog-layering.mjs)
+rejects any catalog (other than demoworld itself) that declares
+`@local:demoworld` in its `depends`. A world that wants the pinboard
+classes with a different room layout installs `pinboard` directly and
+creates its own `$pinboard` / `$kanban_board` instances.
 
 ## Core dependencies
 

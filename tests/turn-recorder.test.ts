@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
+import { installCatalogManifest } from "../src/core/catalog-installer";
 import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld } from "../src/core/effect-transcript";
 import { remoteBridgeEffectName } from "../src/core/remote-bridge-transcript-policy";
+import { transcriptTouchedObjectIds } from "../src/core/shadow-commit-scope";
 import { shadowCommitReceipt } from "../src/core/turn-commit";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { comparableTurnEvents, replayRecordedTurn } from "../src/core/turn-replay";
@@ -500,6 +502,170 @@ describe("turn recorder", () => {
     expect(validation.errors, JSON.stringify(validation.errors.slice(0, 4))).toEqual([]);
     const receipt = shadowCommitReceipt(before, world.exportWorld(), transcript);
     expect(receipt.accepted, JSON.stringify(receipt.errors.slice(0, 4))).toBe(true);
+  });
+
+  it("records catalog_registry_install seed-hook writes to existing object-hosted instances", async () => {
+    // Regression: native catalog install seed hooks must leave ordinary
+    // prop_write entries for v2 fan-out when they touch routed objects.
+    const world = createWorld();
+    const session = world.createSessionForActor("$wiz", "bearer");
+
+    world.createObject({ id: "rec_remote_anchor", name: "Remote Anchor", parent: "$thing", owner: "$wiz" });
+    world.setProp("rec_remote_anchor", "host_placement", "self");
+    world.createObject({
+      id: "rec_remote_seed_target",
+      name: "Remote Seed Target",
+      parent: "$thing",
+      owner: "$wiz",
+      anchor: "rec_remote_anchor",
+      location: "$nowhere"
+    });
+    world.setProp("rec_remote_seed_target", "description", "before install");
+    expect(world.objectRoutes().find((route) => route.id === "rec_remote_seed_target")?.host).toBe("rec_remote_anchor");
+
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const manifest = {
+      name: "existing-seed-write-test",
+      version: "0.0.1",
+      spec_version: "v1",
+      description: "Test manifest exercising seed-hook writes to existing routed objects.",
+      license: "MIT",
+      depends: [],
+      seed_hooks: [
+        {
+          kind: "set_property",
+          object: "rec_remote_seed_target",
+          property: "description",
+          value: "after install"
+        }
+      ]
+    };
+    const provenance = {
+      tap: "@local",
+      catalog: manifest.name,
+      alias: manifest.name,
+      ref_requested: "@local",
+      ref_resolved_sha: "test-seed-hook-write",
+      fetched_at: 1
+    };
+
+    const frame = await world.call(
+      "existing-seed-write",
+      session.id,
+      "$catalog_registry",
+      { actor: "$wiz", target: "$catalog_registry", verb: "install", args: [manifest, manifest, manifest.name, provenance] }
+    );
+
+    expect(frame, JSON.stringify(frame)).toMatchObject({ op: "applied" });
+    expect(world.propOrNull("rec_remote_seed_target", "description")).toBe("after install");
+
+    const installTurn = recorder.turns.find((t) => t.start.verb === "install");
+    expect(installTurn, "expected a recorded turn for $catalog_registry:install").toBeTruthy();
+    expect(installTurn!.events).toContainEqual(expect.objectContaining({
+      kind: "prop_write",
+      object: "rec_remote_seed_target",
+      name: "description",
+      before: "before install",
+      after: "after install",
+      changed: true
+    }));
+
+    const transcript = effectTranscriptFromRecordedTurn(installTurn!);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.incompleteReasons).toEqual([]);
+    expect(transcript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "prop", object: "rec_remote_seed_target", name: "description" },
+      value: "after install",
+      op: "set",
+      writer: expect.objectContaining({
+        thisObj: "$catalog_registry",
+        verb: "install",
+        definer: "$catalog_registry"
+      })
+    }));
+    expect(transcriptTouchedObjectIds(transcript)).toContain("rec_remote_seed_target");
+  });
+
+  it("records catalog_registry_update seed-hook writes for same-version patch catalogs", async () => {
+    // Same-version catalog repairs use the update native; keep that path
+    // covered separately from first-install seed hooks.
+    const world = createWorld();
+    const session = world.createSessionForActor("$wiz", "bearer");
+
+    world.createObject({ id: "rec_patch_anchor", name: "Patch Anchor", parent: "$thing", owner: "$wiz" });
+    world.setProp("rec_patch_anchor", "host_placement", "self");
+    world.createObject({
+      id: "rec_patch_target",
+      name: "Patch Target",
+      parent: "$thing",
+      owner: "$wiz",
+      anchor: "rec_patch_anchor",
+      location: "$nowhere"
+    });
+    world.setProp("rec_patch_target", "dest", "before_patch");
+    expect(world.objectRoutes().find((route) => route.id === "rec_patch_target")?.host).toBe("rec_patch_anchor");
+
+    const baseManifest = {
+      name: "same-version-patch-test",
+      version: "0.0.1",
+      spec_version: "v1",
+      description: "Base manifest for same-version patch update transcript coverage.",
+      license: "MIT",
+      depends: [],
+      seed_hooks: []
+    };
+    installCatalogManifest(world, baseManifest, { tap: "@local", alias: baseManifest.name, actor: "$wiz" });
+
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+    const patchManifest = {
+      ...baseManifest,
+      seed_hooks: [
+        {
+          kind: "set_property",
+          object: "rec_patch_target",
+          property: "dest",
+          value: "after_patch"
+        }
+      ]
+    };
+    const provenance = {
+      tap: "@local",
+      catalog: patchManifest.name,
+      alias: patchManifest.name,
+      ref_requested: "@local",
+      ref_resolved_sha: "test-same-version-patch",
+      fetched_at: 1
+    };
+
+    const frame = await world.call(
+      "same-version-patch",
+      session.id,
+      "$catalog_registry",
+      { actor: "$wiz", target: "$catalog_registry", verb: "update", args: [patchManifest, patchManifest, patchManifest.name, provenance, {}, null] }
+    );
+
+    expect(frame, JSON.stringify(frame)).toMatchObject({ op: "applied" });
+    expect(world.propOrNull("rec_patch_target", "dest")).toBe("after_patch");
+
+    const updateTurn = recorder.turns.find((t) => t.start.verb === "update");
+    expect(updateTurn, "expected a recorded turn for $catalog_registry:update").toBeTruthy();
+    const transcript = effectTranscriptFromRecordedTurn(updateTurn!);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.incompleteReasons).toEqual([]);
+    expect(transcript.writes).toContainEqual(expect.objectContaining({
+      cell: { kind: "prop", object: "rec_patch_target", name: "dest" },
+      value: "after_patch",
+      op: "set",
+      writer: expect.objectContaining({
+        thisObj: "$catalog_registry",
+        verb: "update",
+        definer: "$catalog_registry"
+      })
+    }));
+    expect(transcriptTouchedObjectIds(transcript)).toContain("rec_patch_target");
   });
 
   it("marks cross-host dispatch as explicit incomplete_transcript until remote sub-transcripts are implemented", async () => {

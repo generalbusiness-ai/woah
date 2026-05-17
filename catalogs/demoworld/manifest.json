@@ -3,10 +3,15 @@
   "version": "0.1.0",
   "spec_version": "v1",
   "license": "MIT",
-  "description": "First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and provides the mount-point rooms that bundled demo apps (dubspace, pinboard) use.",
+  "description": "First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and the bundled demo instances of every demo-capable catalog (dubspace, pinboard, outliner, weather, horoscope). Other catalogs define classes/verbs but never depend on demoworld; demoworld owns every demo placement so the layering stays one-way.",
   "depends": [
     "@local:chat",
-    "@local:tasks"
+    "@local:tasks",
+    "@local:outliner",
+    "@local:pinboard",
+    "@local:dubspace",
+    "@local:weather",
+    "@local:horoscope"
   ],
   "keywords": [
     "demo",
@@ -398,8 +403,9 @@
         ],
         "source": "the_chatroom",
         "dest": "the_deck",
-        "oleave_msg": "goes southeast.",
-        "oarrive_msg": "has arrived."
+        "leave_msg": "You slide the glass door open and step out onto the deck.",
+        "oleave_msg": "slides the glass door open and steps out onto the deck.",
+        "oarrive_msg": "steps out through the sliding glass door."
       }
     },
     {
@@ -438,8 +444,9 @@
         ],
         "source": "the_deck",
         "dest": "the_chatroom",
-        "oleave_msg": "goes west.",
-        "oarrive_msg": "has arrived."
+        "leave_msg": "You slide the glass door open and step back into the living room.",
+        "oleave_msg": "slides the glass door open and steps back into the living room.",
+        "oarrive_msg": "steps in through the sliding glass door."
       }
     },
     {
@@ -459,8 +466,8 @@
         "source": "the_deck",
         "dest": "the_hot_tub",
         "leave_msg": "You enter the soothing waters of the hot tub.",
-        "oleave_msg": "heads toward the hot tub.",
-        "oarrive_msg": "has arrived."
+        "oleave_msg": "enters the hot tub.",
+        "oarrive_msg": "settles into the hot tub with a contented sigh."
       }
     },
     {
@@ -482,7 +489,7 @@
         "dest": "the_garden",
         "leave_msg": "You walk down the steps into the garden.",
         "oleave_msg": "heads down the steps into the garden.",
-        "oarrive_msg": "comes down the steps into the garden."
+        "oarrive_msg": "walks down the steps into the garden."
       }
     },
     {
@@ -506,7 +513,7 @@
         "dest": "the_deck",
         "leave_msg": "You walk up the steps onto the deck.",
         "oleave_msg": "heads back up the steps to the deck.",
-        "oarrive_msg": "arrives back on the deck."
+        "oarrive_msg": "walks up the steps to the deck."
       }
     },
     {
@@ -529,7 +536,7 @@
         "source": "the_garden",
         "dest": "tasks:the_taskboard",
         "leave_msg": "You walk past the sign into the workshop.",
-        "oleave_msg": "heads south along the gravelled path.",
+        "oleave_msg": "heads south into the workshop.",
         "oarrive_msg": "arrives at the workshop."
       }
     },
@@ -581,8 +588,9 @@
         ],
         "source": "the_hot_tub",
         "dest": "the_deck",
-        "oleave_msg": "gets out of the hot tub.",
-        "oarrive_msg": "has arrived."
+        "leave_msg": "You get out of the tub.",
+        "oleave_msg": "gets out of the tub.",
+        "oarrive_msg": "gets out of the hot tub."
       }
     },
     {
@@ -663,6 +671,262 @@
           "cuckatoo",
           "duck"
         ]
+      }
+    },
+
+    {
+      "kind": "create_instance",
+      "class": "$outliner",
+      "as": "the_outline",
+      "name": "Outline",
+      "description": "A shared outline pinned to the Living Room wall. Sketch a hierarchy of tasks, ideas, or anything else here together.",
+      "location": "the_chatroom",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": ["outline", "outliner", "tree"],
+        "focus_by_actor": {},
+        "last_undo": {},
+        "mount_room": "the_chatroom"
+      }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_outline",
+      "feature": "chat:$transparent"
+    },
+
+    {
+      "kind": "create_instance",
+      "class": "$pinboard",
+      "as": "the_pinboard",
+      "name": "Pinboard",
+      "description": "A shared cork-backed pinboard mounted on the Deck wall. It is a visible object in the chat world and a separate coordination space where people and agents arrange durable text notes.",
+      "location": "the_deck",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": [
+          "pinboard",
+          "board",
+          "note board",
+          "corkboard"
+        ],
+        "layout": {},
+        "next_z": 1,
+        "palette": [
+          "yellow",
+          "blue",
+          "green",
+          "pink",
+          "white"
+        ],
+        "viewport": {
+          "w": 960,
+          "h": 560
+        },
+        "mount_room": "the_deck"
+      }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_pinboard",
+      "feature": "chat:$transparent"
+    },
+
+    {
+      "kind": "create_instance",
+      "class": "$dubspace",
+      "as": "the_dubspace",
+      "name": "Dubspace",
+      "description": "The first runnable sound-space instance. It owns the sequenced coordination surface for four loop slots, one channel, one filter, one delay, one percussion loop, and one default scene.",
+      "location": "the_chatroom",
+      "properties": {
+        "next_seq": 1,
+        "subscribers": [],
+        "last_snapshot_seq": 0,
+        "host_placement": "self",
+        "aliases": [
+          "dubspace",
+          "dub",
+          "mix",
+          "controls"
+        ],
+        "operators": [],
+        "mount_room": "the_chatroom"
+      }
+    },
+    {
+      "kind": "attach_feature",
+      "consumer": "the_dubspace",
+      "feature": "chat:$transparent"
+    },
+    {
+      "kind": "create_instance",
+      "class": "$loop_slot",
+      "as": "slot_1",
+      "name": "Loop 1",
+      "description": "Loop slot 1 in the demo dubspace. It is anchored to the_dubspace and stores loop id, playing state, gain, and oscillator frequency.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "loop_id": "loop-1",
+        "playing": false,
+        "gain": 0.75,
+        "freq": 110
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$loop_slot",
+      "as": "slot_2",
+      "name": "Loop 2",
+      "description": "Loop slot 2 in the demo dubspace. It is anchored to the_dubspace and stores loop id, playing state, gain, and oscillator frequency.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "loop_id": "loop-2",
+        "playing": false,
+        "gain": 0.75,
+        "freq": 146.83
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$loop_slot",
+      "as": "slot_3",
+      "name": "Loop 3",
+      "description": "Loop slot 3 in the demo dubspace. It is anchored to the_dubspace and stores loop id, playing state, gain, and oscillator frequency.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "loop_id": "loop-3",
+        "playing": false,
+        "gain": 0.75,
+        "freq": 196
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$loop_slot",
+      "as": "slot_4",
+      "name": "Loop 4",
+      "description": "Loop slot 4 in the demo dubspace. It is anchored to the_dubspace and stores loop id, playing state, gain, and oscillator frequency.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "loop_id": "loop-4",
+        "playing": false,
+        "gain": 0.75,
+        "freq": 261.63
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$channel",
+      "as": "channel_1",
+      "name": "Channel",
+      "description": "Mixer channel for the demo dubspace. It is anchored to the_dubspace and contributes shared gain state to the current mix.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "gain": 0.8
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$filter",
+      "as": "filter_1",
+      "name": "Filter",
+      "description": "Shared filter control for the demo dubspace. It is anchored to the_dubspace and exposes cutoff as a sequenced parameter.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "aliases": ["filter"],
+        "cutoff": 1000
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$delay",
+      "as": "delay_1",
+      "name": "Delay",
+      "description": "Shared delay control for the demo dubspace. It is anchored to the_dubspace and stores send, time, feedback, and wet mix values.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "send": 0.3,
+        "time": 0.25,
+        "feedback": 0.35,
+        "wet": 0.4
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$drum_loop",
+      "as": "drum_1",
+      "name": "Percussion Loop",
+      "description": "Eight-step percussion loop for the demo dubspace. It is anchored to the_dubspace and stores tempo, transport state, and a shared pattern.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "bpm": 118,
+        "playing": false,
+        "started_at": 0,
+        "step_count": 8,
+        "pattern": {
+          "kick": [true, false, false, false, true, false, false, false],
+          "snare": [false, false, true, false, false, false, true, false],
+          "hat": [true, true, true, true, true, true, true, true],
+          "tone": [false, false, false, true, false, false, false, true]
+        }
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$scene",
+      "as": "default_scene",
+      "name": "Default Scene",
+      "description": "Initial saved scene for the demo dubspace. It records a named control snapshot and gives scene recall a concrete object to read and rewrite.",
+      "anchor": "the_dubspace",
+      "location": "the_dubspace",
+      "properties": {
+        "name": "Default",
+        "controls": {}
+      }
+    },
+
+    {
+      "kind": "create_instance",
+      "class": "$weather_block",
+      "as": "the_weather",
+      "name": "Weather panel",
+      "description": "A small weather panel on the wall by the door. It hums faintly. The current temperature, today's forecast, and recent history glow in soft monochrome.",
+      "anchor": "the_chatroom",
+      "location": "the_chatroom",
+      "properties": {
+        "aliases": ["weather", "panel", "thermometer"],
+        "place": "Mountain View CA",
+        "timezone": "America/Los_Angeles",
+        "units": "imperial"
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$horoscope_block",
+      "as": "the_horoscope",
+      "name": "Horoscope machine",
+      "description": "A small wooden cabinet with a brass crank and a paper-tape slot, set against the deck railing. Drop a sign or topic in and it produces a slip of paper for you. The machine hums when an order is in flight.",
+      "anchor": "the_deck",
+      "location": "the_deck",
+      "properties": {
+        "aliases": ["horoscope", "machine", "cabinet"],
+        "system_prompt": "You are a wry, slightly weary fortune-teller running a vending machine on a porch deck. Reply in two short sentences for the asker's sign or topic. Be specific, concrete, and a little dry — never moralize, never warn, never apologize.",
+        "rate_limit_seconds": 60
       }
     }
   ]

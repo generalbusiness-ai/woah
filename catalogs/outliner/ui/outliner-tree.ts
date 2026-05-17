@@ -1,0 +1,399 @@
+import {
+  escapeHtml,
+  type ChatFormatterRegistry,
+  type ObservationRegistry,
+  type WooComponentRegistry,
+  type WooContext
+} from "../../../src/client/framework";
+
+// Single row delivered by $outliner:list_items. Shape mirrors the joined
+// view; positions are server-internal and not exposed here.
+export type OutlinerItem = {
+  id: string;
+  name: string;
+  text: string;
+  parent_id: string | null;
+  index: number;
+  hidden: boolean;
+  owner: string;
+  writers: string[];
+  has_children: boolean;
+};
+
+export type OutlinerData = {
+  outlinerId: string;
+  outlinerName: string;
+  items: OutlinerItem[];
+  focus: string | null;
+  actor: string | null;
+};
+
+// Component-local UI state lives on the element itself (collapse, edit,
+// show-hidden). The server is the source of truth for everything in
+// OutlinerData; whenever it changes, the element re-renders.
+export class WooOutlinerTreeElement extends HTMLElement {
+  woo?: WooContext;
+  subject?: string;
+
+  private model: OutlinerData = { outlinerId: "", outlinerName: "Outline", items: [], focus: null, actor: null };
+  private companionVisible = false;
+  private collapsed = new Set<string>();
+  private showHidden = false;
+  private editing: { id: string; original: string } | null = null;
+  private dragSourceId: string | null = null;
+  private hydrating = false;
+  private hydrateAttempted = false;
+  private bound = false;
+
+  set data(value: OutlinerData) {
+    this.model = value;
+    this.render();
+  }
+
+  set showCompanion(value: boolean) {
+    const next = Boolean(value);
+    if (this.companionVisible === next) return;
+    this.companionVisible = next;
+    this.render();
+  }
+
+  connectedCallback(): void {
+    // If the host hasn't pre-populated `data`, hydrate ourselves from the
+    // outliner. This keeps the component runnable without any host-side
+    // integration code in main.ts. Guard with `hydrateAttempted` so a
+    // genuinely empty outliner doesn't loop hydrate → applied-frame →
+    // rerender → connectedCallback → hydrate when the SPA preserves the
+    // element across renders.
+    if (!this.hydrateAttempted && this.subject && this.woo) {
+      this.hydrate().catch(() => undefined);
+    }
+    this.render();
+  }
+
+  async hydrate(): Promise<void> {
+    if (this.hydrating || !this.woo || !this.subject) return;
+    this.hydrating = true;
+    this.hydrateAttempted = true;
+    try {
+      const items = await this.woo.call(this.subject, "list_items", []);
+      const focusMap = (this.woo.observe(this.subject)?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
+      const actor = this.woo.actor;
+      const focus = actor ? focusMap[actor] ?? null : null;
+      const nameProp = this.woo.observe(this.subject)?.props?.name;
+      this.model = {
+        outlinerId: this.subject,
+        outlinerName: typeof nameProp === "string" ? nameProp : "Outline",
+        items: Array.isArray(items) ? (items as OutlinerItem[]) : [],
+        focus,
+        actor
+      };
+      this.render();
+    } finally {
+      this.hydrating = false;
+    }
+  }
+
+  private render(): void {
+    if (!this.bound) {
+      this.bound = true;
+      this.addEventListener("click", this.onClick);
+      this.addEventListener("change", this.onChange);
+      this.addEventListener("submit", this.onSubmit);
+      this.addEventListener("dragstart", this.onDragStart);
+      this.addEventListener("dragover", this.onDragOver);
+      this.addEventListener("drop", this.onDrop);
+      this.addEventListener("dragend", this.onDragEnd);
+    }
+    const data = this.model;
+    const outlinerId = data.outlinerId || this.subject || "";
+    const visibleItems = this.computeVisibleItems(data.items);
+    const focusLabel = data.focus
+      ? data.items.find((it) => it.id === data.focus)?.text ?? data.focus
+      : "(root)";
+    const existingChatPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap }>(
+      "[data-ambient-companion-shell] [data-space-chat-panel]"
+    );
+    if (existingChatPanel && existingChatPanel.dataset.spaceChatSpace !== outlinerId) {
+      existingChatPanel.remove();
+    }
+    const preservedPanel = this.querySelector<HTMLElement & { dataset: DOMStringMap }>(
+      "[data-ambient-companion-shell] [data-space-chat-panel]"
+    );
+    const tree = `
+      <section class="outliner">
+        <header class="outliner-header">
+          <h2>${escapeHtml(data.outlinerName)}</h2>
+          <div class="outliner-toolbar">
+            <button type="button" data-outliner-presence="${this.companionVisible ? "leave" : "enter"}">${this.companionVisible ? "Leave" : "Enter"}</button>
+            <label class="outliner-toggle">
+              <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
+              show hidden
+            </label>
+            <button type="button" data-outliner-action="undo">Undo</button>
+            <span class="outliner-focus">focus: ${escapeHtml(focusLabel)}</span>
+          </div>
+        </header>
+        <form class="outliner-add" data-outliner-add>
+          <input type="text" name="text" placeholder="add an item…" autocomplete="off">
+          <button type="submit">Add</button>
+        </form>
+        <ul class="outliner-rows" data-outliner-rows>
+          ${visibleItems.map((item) => this.renderRow(item, data)).join("")}
+        </ul>
+      </section>
+    `;
+    this.innerHTML = this.companionVisible
+      ? `<section class="ambient-companion-shell outliner-shell" data-ambient-companion-shell="${escapeHtml(outlinerId)}">
+          <section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${tree}</section>
+          <div data-ambient-companion></div>
+        </section>`
+      : tree;
+    if (preservedPanel) {
+      const slot = this.querySelector<HTMLElement>("[data-ambient-companion]");
+      if (slot) slot.append(preservedPanel);
+    }
+  }
+
+  private computeVisibleItems(items: OutlinerItem[]): Array<OutlinerItem & { depth: number }> {
+    // The server returns depth-first order with each row's parent_id; we
+    // compute the depth here and drop subtrees whose parent is collapsed
+    // or hidden (when show-hidden is off).
+    const childrenOf = new Map<string | null, OutlinerItem[]>();
+    for (const item of items) {
+      const key = item.parent_id;
+      const list = childrenOf.get(key) ?? [];
+      list.push(item);
+      childrenOf.set(key, list);
+    }
+    const out: Array<OutlinerItem & { depth: number }> = [];
+    const walk = (parent: string | null, depth: number, ancestorHidden: boolean) => {
+      const kids = childrenOf.get(parent) ?? [];
+      for (const kid of kids) {
+        const isHidden = ancestorHidden || (kid.hidden && !this.showHidden);
+        if (!isHidden) out.push({ ...kid, depth });
+        if (!this.collapsed.has(kid.id)) {
+          walk(kid.id, depth + 1, ancestorHidden || (kid.hidden && !this.showHidden));
+        }
+      }
+    };
+    walk(null, 0, false);
+    return out;
+  }
+
+  private renderRow(item: OutlinerItem & { depth: number }, data: OutlinerData): string {
+    const id = item.id;
+    const isFocused = data.focus === id;
+    const isEditing = this.editing?.id === id;
+    const collapsed = this.collapsed.has(id);
+    const indent = item.depth * 20;
+    const twistie = item.has_children
+      ? `<button type="button" class="outliner-twistie" data-outliner-action="toggle-collapse" data-id="${escapeHtml(id)}" aria-label="${collapsed ? "expand" : "collapse"}">${collapsed ? "▸" : "▾"}</button>`
+      : `<span class="outliner-twistie outliner-twistie-empty">·</span>`;
+    const textCell = isEditing
+      ? `<form class="outliner-edit" data-outliner-edit data-id="${escapeHtml(id)}"><input type="text" name="text" value="${escapeHtml(item.text)}" autofocus></form>`
+      : `<span class="outliner-text" data-outliner-action="edit" data-id="${escapeHtml(id)}">${escapeHtml(item.text || "(empty)")}</span>`;
+    const hiddenClass = item.hidden ? " is-hidden" : "";
+    const focusClass = isFocused ? " is-focused" : "";
+    return `
+      <li class="outliner-row${hiddenClass}${focusClass}" data-outliner-row data-id="${escapeHtml(id)}" draggable="true" style="--indent: ${indent}px">
+        <span class="outliner-row-inner">
+          ${twistie}
+          <input type="checkbox" data-outliner-hide data-id="${escapeHtml(id)}" ${item.hidden ? "checked" : ""} title="hide">
+          ${textCell}
+          <button type="button" class="outliner-focus-btn" data-outliner-action="focus" data-id="${escapeHtml(id)}" title="focus">⊙</button>
+          <button type="button" class="outliner-remove-btn" data-outliner-action="remove" data-id="${escapeHtml(id)}" title="remove">×</button>
+        </span>
+      </li>
+    `;
+  }
+
+  private onClick = async (event: Event): Promise<void> => {
+    const target = event.target as HTMLElement;
+    const presence = target.closest<HTMLElement>("[data-outliner-presence]");
+    if (presence) {
+      event.preventDefault();
+      const action = presence.dataset.outlinerPresence === "leave" ? "leave" : "enter";
+      this.dispatchEvent(new CustomEvent(`woo-outliner-${action}`, { bubbles: true }));
+      return;
+    }
+    const btn = target.closest<HTMLElement>("[data-outliner-action]");
+    if (!btn) return;
+    event.preventDefault();
+    const action = btn.dataset.outlinerAction;
+    const id = btn.dataset.id ?? null;
+    if (action === "toggle-collapse" && id) {
+      if (this.collapsed.has(id)) this.collapsed.delete(id);
+      else this.collapsed.add(id);
+      this.render();
+      return;
+    }
+    if (action === "focus" && id) {
+      await this.callVerb("focus_on", [id]);
+      return;
+    }
+    if (action === "remove" && id) {
+      await this.callVerb("remove_item", [id]);
+      return;
+    }
+    if (action === "undo") {
+      await this.callVerb("undo", []);
+      return;
+    }
+    if (action === "edit" && id) {
+      const item = this.model.items.find((it) => it.id === id);
+      if (!item) return;
+      this.editing = { id, original: item.text };
+      this.render();
+      const input = this.querySelector<HTMLInputElement>(`form[data-outliner-edit][data-id="${CSS.escape(id)}"] input`);
+      input?.focus();
+      input?.select();
+      input?.addEventListener("blur", () => this.commitEdit(input.value, id), { once: true });
+      input?.addEventListener("keydown", (ev) => {
+        if ((ev as KeyboardEvent).key === "Escape") {
+          this.editing = null;
+          this.render();
+        }
+      });
+    }
+  };
+
+  private onChange = async (event: Event): Promise<void> => {
+    const target = event.target as HTMLElement;
+    if (target.matches?.("[data-outliner-show-hidden]")) {
+      this.showHidden = (target as HTMLInputElement).checked;
+      this.render();
+      return;
+    }
+    if (target.matches?.("[data-outliner-hide]")) {
+      const id = (target as HTMLInputElement).dataset.id;
+      if (!id) return;
+      const checked = (target as HTMLInputElement).checked;
+      await this.callVerb("hide", [id, checked]);
+    }
+  };
+
+  private onSubmit = async (event: Event): Promise<void> => {
+    const form = event.target as HTMLFormElement;
+    if (form.matches?.("[data-outliner-add]")) {
+      event.preventDefault();
+      const input = form.querySelector<HTMLInputElement>("input[name=text]");
+      const text = input?.value.trim() ?? "";
+      if (!text) return;
+      if (input) input.value = "";
+      await this.callVerb("add", [text]);
+      return;
+    }
+    if (form.matches?.("[data-outliner-edit]")) {
+      event.preventDefault();
+      const id = (form as HTMLFormElement).dataset.id;
+      const input = form.querySelector<HTMLInputElement>("input[name=text]");
+      if (id && input) await this.commitEdit(input.value, id);
+    }
+  };
+
+  private async commitEdit(value: string, id: string): Promise<void> {
+    const editing = this.editing;
+    this.editing = null;
+    if (!editing || editing.original === value) {
+      this.render();
+      return;
+    }
+    await this.callVerb("set_item_text", [id, value]);
+  }
+
+  private onDragStart = (event: DragEvent): void => {
+    const row = (event.target as HTMLElement).closest<HTMLElement>("[data-outliner-row]");
+    if (!row) return;
+    this.dragSourceId = row.dataset.id ?? null;
+    if (event.dataTransfer && this.dragSourceId) {
+      event.dataTransfer.setData("text/plain", this.dragSourceId);
+      event.dataTransfer.effectAllowed = "move";
+    }
+  };
+
+  private onDragOver = (event: DragEvent): void => {
+    const row = (event.target as HTMLElement).closest<HTMLElement>("[data-outliner-row]");
+    if (!row || !this.dragSourceId) return;
+    event.preventDefault();
+  };
+
+  private onDrop = async (event: DragEvent): Promise<void> => {
+    const row = (event.target as HTMLElement).closest<HTMLElement>("[data-outliner-row]");
+    if (!row || !this.dragSourceId) return;
+    event.preventDefault();
+    const dropTarget = row.dataset.id;
+    const sourceId = this.dragSourceId;
+    this.dragSourceId = null;
+    if (!dropTarget || sourceId === dropTarget) return;
+    // Drop onto a node: move under that node at the end.
+    await this.callVerb("move_item", [sourceId, dropTarget, null]);
+  };
+
+  private onDragEnd = (): void => {
+    this.dragSourceId = null;
+  };
+
+  private async callVerb(verb: string, args: unknown[]): Promise<unknown> {
+    if (!this.woo || !this.subject) return null;
+    try {
+      const result = await this.woo.call(this.subject, verb, args);
+      // Re-hydrate after any mutation. Cheap enough for v0 — replace with
+      // observation-driven patching once measurements demand it.
+      void this.hydrate();
+      return result;
+    } catch (err) {
+      // Surface the error to the user as inline status text rather than
+      // throwing into the browser console.
+      const banner = document.createElement("div");
+      banner.className = "outliner-error";
+      banner.textContent = `${verb}: ${(err as Error)?.message ?? String(err)}`;
+      this.prepend(banner);
+      setTimeout(() => banner.remove(), 4000);
+      return null;
+    }
+  }
+}
+
+export function registerWooComponents(registry: WooComponentRegistry): void {
+  registry.defineTag("woo-outliner-tree", WooOutlinerTreeElement);
+}
+
+// Incremental observations all re-trigger a hydrate on every live
+// `<woo-outliner-tree>` whose subject matches. This is intentionally
+// blunt — the v0 implementation is fetch-on-update; we can replace it
+// with optimistic per-event reducers once the basic flow is measured.
+export function registerWooObservationHandlers(registry: ObservationRegistry): void {
+  const STRUCTURAL_TYPES = [
+    "outline_item_added",
+    "outline_item_removed",
+    "outline_item_moved",
+    "outline_item_reordered",
+    "outline_item_hidden",
+    "outline_focus_changed",
+    "outline_undone",
+    "note_edited"
+  ];
+  registry.observation({
+    types: STRUCTURAL_TYPES,
+    route: "sequenced",
+    reduce: (_draft, envelope) => {
+      const outlinerId = String(envelope.observation.outliner ?? envelope.observation.source ?? "");
+      if (!outlinerId) return;
+      for (const el of document.querySelectorAll<WooOutlinerTreeElement>(`woo-outliner-tree`)) {
+        if (el.subject === outlinerId) void el.hydrate();
+      }
+    }
+  });
+}
+
+// Chat lines for outliner entry/exit and the umbrella activity event.
+// Mirrors pinboard's compact system-line treatment.
+export function registerWooChatFormatters(registry: ChatFormatterRegistry): void {
+  registry.formatter({
+    types: ["outliner_entered", "outliner_left", "outliner_activity"],
+    format: (observation) => ({
+      kind: "system",
+      text: typeof observation.text === "string" ? observation.text : "The outline changes."
+    })
+  });
+}

@@ -15,13 +15,14 @@ import manifest8 from "../../catalogs/horoscope/manifest.json";
 import manifest9 from "../../catalogs/note/manifest.json";
 import migration10 from "../../catalogs/note/migration-v0-to-v1.json";
 import migration11 from "../../catalogs/note/migration-v1-to-v2.json";
-import manifest12 from "../../catalogs/perm/manifest.json";
-import manifest13 from "../../catalogs/pinboard/manifest.json";
-import manifest14 from "../../catalogs/prog/manifest.json";
-import manifest15 from "../../catalogs/tasks/manifest.json";
-import migration16 from "../../catalogs/tasks/migration-v0-to-v1.json";
-import manifest17 from "../../catalogs/weather/manifest.json";
-import migration18 from "../../catalogs/weather/migration-v0-to-v1.json";
+import manifest12 from "../../catalogs/outliner/manifest.json";
+import manifest13 from "../../catalogs/perm/manifest.json";
+import manifest14 from "../../catalogs/pinboard/manifest.json";
+import manifest15 from "../../catalogs/prog/manifest.json";
+import manifest16 from "../../catalogs/tasks/manifest.json";
+import migration17 from "../../catalogs/tasks/migration-v0-to-v1.json";
+import manifest18 from "../../catalogs/weather/manifest.json";
+import migration19 from "../../catalogs/weather/migration-v0-to-v1.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -40,9 +41,10 @@ export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
   { path: "catalogs/help/manifest.json", manifest: manifest7 as unknown as CatalogManifest, migrations: [] },
   { path: "catalogs/horoscope/manifest.json", manifest: manifest8 as unknown as CatalogManifest, migrations: [] },
   { path: "catalogs/note/manifest.json", manifest: manifest9 as unknown as CatalogManifest, migrations: [migration10 as unknown as CatalogMigrationManifest, migration11 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/perm/manifest.json", manifest: manifest12 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest13 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/prog/manifest.json", manifest: manifest14 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/tasks/manifest.json", manifest: manifest15 as unknown as CatalogManifest, migrations: [migration16 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/weather/manifest.json", manifest: manifest17 as unknown as CatalogManifest, migrations: [migration18 as unknown as CatalogMigrationManifest] }
+  { path: "catalogs/outliner/manifest.json", manifest: manifest12 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/perm/manifest.json", manifest: manifest13 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest14 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/prog/manifest.json", manifest: manifest15 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/tasks/manifest.json", manifest: manifest16 as unknown as CatalogManifest, migrations: [migration17 as unknown as CatalogMigrationManifest] },
+  { path: "catalogs/weather/manifest.json", manifest: manifest18 as unknown as CatalogManifest, migrations: [migration19 as unknown as CatalogMigrationManifest] }
 ];

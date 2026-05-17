@@ -7,6 +7,8 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+syntax for @-someone
+
 want to integrate this as a hermes plugin
 - run locally (with ability to switch to cloud just by providing a URL in config)
 - local runtime has:

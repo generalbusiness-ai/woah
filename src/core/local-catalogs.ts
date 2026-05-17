@@ -73,6 +73,7 @@ const LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-note-stale-cl
 const LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-pinboard-stale-class-verbs";
 const LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION = "2026-05-06-dispenser-stale-class-verbs";
 const LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION = "2026-05-08-tasks-transparent-feature";
+const LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION = "2026-05-17-demoworld-garden-conversational-feature";
 // Re-reconcile note + dispenser class verbs after May-8 manifest changes that
 // the May-6 stale-class-verbs migrations missed: $note:read got an arg_spec
 // .command pattern (so `read <noun>` parses), and $dispensed_note gained a
@@ -180,6 +181,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_NOTE_STALE_CLASS_VERBS_MIGRATION, only: "note" },
   { id: LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, only: "pinboard" },
   { id: LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, only: "dispenser" },
+  { id: LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION, only: "demoworld" },
   { id: LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, only: "note" },
   { id: LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
@@ -426,6 +428,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_PINBOARD_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DISPENSER_STALE_CLASS_VERBS_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runTasksTransparentFeatureMigration(world, names);
+  runDemoworldGardenConversationalFeatureMigration(world, names);
   run(LOCAL_CATALOG_NOTE_READ_COMMAND_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "note" });
   run(LOCAL_CATALOG_DISPENSED_NOTE_MOVETO_REPAIR_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   runWizProgrammerParentMigration(world, names);
@@ -1086,6 +1089,32 @@ function runTasksTransparentFeatureMigration(world: WooWorld, names: readonly st
     world.setProp(consumer, "features_version", Number(world.propOrNull(consumer, "features_version") ?? 0) + 1);
   }
   markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRANSPARENT_FEATURE_MIGRATION);
+}
+
+// Same-version demoworld repairs added the_garden after early worlds already
+// had chat installed. Those installs can miss native seed_hook property writes
+// to non-gateway hosts, leaving the room without $conversational verbs and
+// making the client render an empty task-space chat until a later event.
+function runDemoworldGardenConversationalFeatureMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION)) return;
+  if (!names.includes("demoworld") || !localCatalogInstalled(world, "demoworld")) {
+    markMigrationApplied(world, LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION);
+    return;
+  }
+  if (!world.objects.has("$conversational") || !world.objects.has("the_garden")) return;
+  const manifest = LOCAL_CATALOGS.get("demoworld");
+  const hasHook = (manifest?.seed_hooks ?? []).some((hook) =>
+    hook.kind === "attach_feature" && hook.consumer === "the_garden" && hook.feature === "$conversational"
+  );
+  if (!hasHook) return;
+  const raw = world.propOrNull("the_garden", "features");
+  const features = Array.isArray(raw) ? raw.filter((item): item is ObjRef => typeof item === "string") : [];
+  const next = ["$conversational", ...features.filter((item) => item !== "$conversational")];
+  if (features.length !== next.length || features.some((item, i) => item !== next[i])) {
+    world.setProp("the_garden", "features", next);
+    world.setProp("the_garden", "features_version", Number(world.propOrNull("the_garden", "features_version") ?? 0) + 1);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_DEMOWORLD_GARDEN_CONVERSATIONAL_FEATURE_MIGRATION);
 }
 
 function runDemoSpacesNoAutoPresenceMigration(world: WooWorld): void {

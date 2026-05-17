@@ -6,8 +6,7 @@
   "license": "MIT",
   "depends": [
     "@local:chat",
-    "@local:note",
-    "@local:demoworld"
+    "@local:note"
   ],
   "ui": {
     "abi": "woo-ui/v1",
@@ -513,45 +512,5 @@
       }
     }
   ],
-  "seed_hooks": [
-    {
-      "kind": "create_instance",
-      "class": "$pinboard",
-      "as": "the_pinboard",
-      "name": "Pinboard",
-      "description": "A shared cork-backed pinboard mounted on the Deck wall. It is a visible object in the chat world and a separate coordination space where people and agents arrange durable text notes.",
-      "location": "demoworld:the_deck",
-      "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
-        "host_placement": "self",
-        "aliases": [
-          "pinboard",
-          "board",
-          "note board",
-          "corkboard"
-        ],
-        "layout": {},
-        "next_z": 1,
-        "palette": [
-          "yellow",
-          "blue",
-          "green",
-          "pink",
-          "white"
-        ],
-        "viewport": {
-          "w": 960,
-          "h": 560
-        },
-        "mount_room": "demoworld:the_deck"
-      }
-    },
-    {
-      "kind": "attach_feature",
-      "consumer": "the_pinboard",
-      "feature": "chat:$transparent"
-    }
-  ]
+  "seed_hooks": []
 }

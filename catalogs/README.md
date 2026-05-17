@@ -15,21 +15,30 @@ Each catalog owns its app-level design in `DESIGN.md`; platform-wide contracts
 stay under `spec/`. Roles (foundational utility vs demo application) are
 documented in [spec/discovery/catalogs.md §CT15](../spec/discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo).
 
-Install order for the full demo world:
+Install order for the full demo world (dependency-topological):
 
 1. `@local:help`
-2. `@local:chat`
-3. `@local:note`
-4. `@local:prog`
-5. `@local:demoworld`
-6. `@local:dubspace`
-7. `@local:pinboard`
-8. `@local:tasks`
+2. `@local:perm`
+3. `@local:chat`
+4. `@local:block`
+5. `@local:note`
+6. `@local:weather`
+7. `@local:tasks`
+8. `@local:outliner`
+9. `@local:pinboard`
+10. `@local:dispenser`
+11. `@local:dubspace`
+12. `@local:horoscope`
+13. `@local:prog`
+14. `@local:demoworld`
 
-Class libraries (`chat`, `note`, `prog`) install foundational primitives without
-seeding instances; `demoworld` seeds the bundled Living Room set; the demo apps
-(`dubspace`, `pinboard`, `tasks`) bring their own seeds. A world that wants
-foundational classes without any demo content installs steps 1-4 only.
+`demoworld` is the dependency sink: it depends on every demo class library
+(`outliner`, `pinboard`, `dubspace`, `weather`, `horoscope`, plus `chat`/`tasks`)
+and contains every bundled demo's instance placement. Nothing depends on
+`demoworld`, enforced by
+[`scripts/guard-catalog-layering.mjs`](../scripts/guard-catalog-layering.mjs).
+A world that wants foundational classes without the bundled demo geography
+installs everything *except* `demoworld`.
 
 ## Class diagram
 
