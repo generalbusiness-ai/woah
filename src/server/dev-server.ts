@@ -40,8 +40,8 @@ import {
   shadowBrowserTransportHello,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
-import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import { resolveTurnEnvelopeScope } from "./dev-v2-routing";
+import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeScope } from "./dev-v2-routing";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
@@ -491,6 +491,29 @@ async function handleV2ShadowFrame(
       sendDevV2Fanout(turnBrowser, reply);
     }
   } catch (err) {
+    // Pre-recording throws (the substrate's presence/permission gates fire
+    // before withTurnRecording starts, so the recorder has no turn) escape
+    // out of runShadowTurnCallOnWorld and land here. Sending a bare
+    // woo.transport.error.v1 has no reply_to back-reference, so the worker
+    // never delete-pendings the original intent and the SPA's
+    // pendingNetworkTurns set never drains — the wait cursor spins forever.
+    // Send back a proper turn.exec.reply with ok:false and reply_to set so
+    // v2BrowserCacheMutationsForEnvelope can correlate and clear the
+    // optimistic call.
+    const normalized = normalizeError(err);
+    const intent = decodeTurnIntentForRecovery(encoded);
+    if (intent) {
+      ws.send(encodeEnvelope(buildVerbThrewReplyEnvelope({
+        intent,
+        error: { code: normalized.code, message: normalized.message },
+        relayNode: "node:dev:relay",
+        to: node,
+        actor: session.actor,
+        session: session.id,
+        auth: { mode: "session", token }
+      })));
+      return;
+    }
     ws.send(encodeEnvelope(buildTransportErrorEnvelope({
       id: `dev-relay:error:${Date.now()}`,
       from: "node:dev:relay",
@@ -499,7 +522,7 @@ async function handleV2ShadowFrame(
       session: session.id,
       auth: { mode: "session", token },
       code: "E_PROTOCOL",
-      message: normalizeError(err).message ?? "v2 transport error"
+      message: normalized.message ?? "v2 transport error"
     })));
   }
 }

@@ -19,7 +19,9 @@ import {
   shadowBrowserSessionBearer
 } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
-import { resolveTurnEnvelopeScope } from "../src/server/dev-v2-routing";
+import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeScope } from "../src/server/dev-v2-routing";
+import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
+import { v2TurnResultMessageFromReply } from "../src/client/v2-browser-messages";
 import type { ObjRef } from "../src/core/types";
 
 describe("dev v2 cross-scope WS routing", () => {
@@ -173,6 +175,201 @@ describe("dev v2 cross-scope WS routing", () => {
     expect(reply?.body).toMatchObject({ ok: false, reason: "commit_rejected" });
     if (!reply || reply.body.ok !== false) return;
     expect(reply.body.commit?.errors ?? []).toEqual(expect.arrayContaining([expect.stringContaining("scope_mismatch")]));
+  });
+
+  it("commits an outliner 'add' intent end-to-end through the same WS handler logic the SPA uses", async () => {
+    // Reproduces the SPA's outliner Add button: the v2 browser worker is
+    // connected to scope=the_outline and submits an intent with target=
+    // the_outline, verb=add. The SPA was hanging on this call ("spinning
+    // wait cursor") because mutating verbs hit $space's presence gate and
+    // the SPA wasn't auto-entering the outliner on tab open. This test
+    // exercises the post-fix flow: enter first, then add.
+    const world = createWorld();
+    const session = world.auth("guest:outliner-add");
+    // Match the SPA's startup state: actor is logged in, has just entered
+    // the chatroom (where they were before clicking the Outliner tab).
+    await world.directCall("setup:enter-chatroom-add", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    // The SPA's `enterOutliner()` runs on Outliner-tab activation so
+    // subsequent mutating intents pass the presence check.
+    await world.directCall("setup:enter-the_outline-add", session.actor, "the_outline", "enter", [], { sessionId: session.id });
+    const serialized = world.exportWorld();
+    const sessions = world.exportSessions();
+    const targetScope = "the_outline" as ObjRef;
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-outliner-add",
+      scope: targetScope,
+      serialized,
+      deployment: "local-dev"
+    });
+    const sessionAuth = buildShadowBrowserSessionAuth({
+      sessions,
+      scope: targetScope,
+      deployment: relay.deployment
+    });
+    relay.session_auth = sessionAuth.session_auth;
+    relay.session_revs = sessionAuth.session_revs;
+    relay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
+      relay.commit_scope.serialized.sessions,
+      sessions
+    );
+    const browser = createShadowBrowserClient({
+      node: "browser-outliner-add",
+      scope: targetScope,
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: shadowBrowserSessionBearer({ id: session.id, actor: session.actor })
+    });
+
+    const callId = "intent-outliner-add-hello";
+    const intent = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: callId,
+      route: "sequenced",
+      scope: targetScope,
+      target: targetScope,
+      verb: "add",
+      args: ["hello outliner"],
+      persistence: "durable"
+    });
+    const reply = await handleShadowBrowserTurnExecEnvelope(
+      browser,
+      receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(intent))
+    );
+    expect(reply?.body).toMatchObject({ ok: true });
+    if (!reply || reply.body.ok !== true) return;
+    // The transcript must commit on the_outline; the reply.commit must
+    // carry the same id the SPA submitted, because that's what the SPA's
+    // optimistic-call tracker keys off when it clears the wait cursor.
+    expect(reply.body.transcript?.scope).toBe(targetScope);
+    expect(reply.body.commit).toMatchObject({ id: callId, position: { scope: targetScope } });
+    expect(reply.body.transcript?.creates?.length ?? 0).toBeGreaterThan(0);
+    expect(reply.body.transcript?.observations ?? []).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "outline_item_added", text: "hello outliner" })
+    ]));
+  });
+
+  it("fails 'add' from outside the outliner — regression for the SPA's auto-enter on tab open", async () => {
+    // Pins the failure mode that produced the spinning wait cursor: a user
+    // who has not entered the_outline still submits an outliner mutation
+    // because the SPA forgot to call enter on tab activation. The substrate
+    // throws E_PERM (\"actor not present in <space>\") synchronously inside
+    // the shadow turn recorder, which surfaces as a transport error in the
+    // dev WS and never settles the optimistic call on the client.
+    const world = createWorld();
+    const session = world.auth("guest:outliner-add-no-presence");
+    await world.directCall("setup:enter-chatroom-no-presence", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const serialized = world.exportWorld();
+    const sessions = world.exportSessions();
+    const targetScope = "the_outline" as ObjRef;
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-outliner-no-presence",
+      scope: targetScope,
+      serialized,
+      deployment: "local-dev"
+    });
+    const sessionAuth = buildShadowBrowserSessionAuth({
+      sessions,
+      scope: targetScope,
+      deployment: relay.deployment
+    });
+    relay.session_auth = sessionAuth.session_auth;
+    relay.session_revs = sessionAuth.session_revs;
+    relay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
+      relay.commit_scope.serialized.sessions,
+      sessions
+    );
+    const browser = createShadowBrowserClient({
+      node: "browser-outliner-no-presence",
+      scope: targetScope,
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: shadowBrowserSessionBearer({ id: session.id, actor: session.actor })
+    });
+
+    const intent = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: "intent-outliner-add-no-presence",
+      route: "sequenced",
+      scope: targetScope,
+      target: targetScope,
+      verb: "add",
+      args: ["hello"],
+      persistence: "durable"
+    });
+    await expect(
+      handleShadowBrowserTurnExecEnvelope(
+        browser,
+        receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(intent))
+      )
+    ).rejects.toThrow(/not present in the_outline/);
+  });
+
+  it("recovers a pre-recording substrate throw into a reply that drains the SPA's pending intent", () => {
+    // Belt-and-braces for the wait cursor: even if a future regression
+    // re-introduces an unentered-outliner mutation (or any other case where
+    // the substrate throws before withTurnRecording starts), the dev WS
+    // must emit a turn.exec.reply with reply_to set so the worker's
+    // v2BrowserCacheMutationsForEnvelope produces pending_delete and the
+    // main thread's v2TurnResultMessageFromReply produces an error frame
+    // whose id matches the original intent — that's what
+    // `completeV2TurnNetworkWait` keys off when it clears the cursor.
+    const encodedIntent = encodeEnvelope({
+      v: 2 as const,
+      type: "woo.turn.intent.request.shadow.v1" as const,
+      id: "intent-recovery-env-id",
+      from: "browser-recovery",
+      to: "node:dev:relay",
+      actor: "$wiz" as ObjRef,
+      auth: { mode: "session" as const, token: "session:t" },
+      body: {
+        kind: "woo.turn.intent.request.shadow.v1" as const,
+        id: "intent-recovery-body-id",
+        route: "sequenced" as const,
+        scope: "the_outline" as ObjRef,
+        target: "the_outline" as ObjRef,
+        verb: "add",
+        args: ["hello"],
+        persistence: "durable" as const
+      }
+    });
+    const intent = decodeTurnIntentForRecovery(encodedIntent);
+    expect(intent).not.toBeNull();
+    if (!intent) return;
+    expect(intent).toMatchObject({
+      id: "intent-recovery-body-id",
+      envelope_id: "intent-recovery-env-id",
+      scope: "the_outline",
+      route: "sequenced"
+    });
+    const reply = buildVerbThrewReplyEnvelope({
+      intent,
+      error: { code: "E_PERM", message: "$wiz is not present in the_outline" },
+      relayNode: "node:dev:relay",
+      to: "browser-recovery",
+      actor: "$wiz" as ObjRef,
+      session: "session-recovery",
+      auth: { mode: "session" as const, token: "session:t" }
+    });
+    expect(reply.reply_to).toBe("intent-recovery-env-id");
+    expect(reply.body.ok).toBe(false);
+    expect(reply.body.id).toBe("intent-recovery-body-id");
+
+    // Worker-side cache: presence of reply_to gates the pending delete.
+    const mutations = v2BrowserCacheMutationsForEnvelope(reply);
+    expect(mutations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "pending_delete", id: "intent-recovery-env-id" })
+    ]));
+
+    // Main-thread error frame: id MUST equal the original intent body id,
+    // because that's the call id `trackV2TurnNetworkWait` registered.
+    const turnResult = v2TurnResultMessageFromReply(reply.body, reply.reply_to);
+    expect(turnResult).not.toBeUndefined();
+    expect(turnResult).toMatchObject({
+      kind: "turn_result",
+      frame: { op: "error", id: "intent-recovery-body-id" }
+    });
   });
 
   it("falls back to the intent's declared scope when the target has no $space audience", () => {

@@ -868,6 +868,7 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
   const ensureTabPresence = (tab: AppState["tab"]) => {
     if (tab === "dubspace") enterDubspace();
     if (tab === "pinboard") enterPinboard();
+    if (tab === "outliner") enterOutliner();
   };
   const viewTab = tabFromViewHint(route.view);
   if (viewTab) {
@@ -2487,6 +2488,7 @@ function bindCommon() {
         if (!wasDifferent) return;
         if (next === "dubspace") enterDubspace();
         if (next === "pinboard") enterPinboard();
+        if (next === "outliner") enterOutliner();
       });
     });
   });
@@ -4682,6 +4684,30 @@ function bindPinNoteResize(handle: HTMLButtonElement) {
   });
   handle.addEventListener("pointercancel", () => {
     active = false;
+  });
+}
+
+function enterOutliner() {
+  // Outliner mutating verbs (add, hide, move_item, set_item_text, undo, ...)
+  // pass the substrate's presence gate on $space, so the SPA must move the
+  // actor into the_outline before they press Add. Skip when already present
+  // so repeat tab clicks don't trigger redundant enter intents.
+  const space = outlinerSpace();
+  if (!space || !canSendV2Browser()) return;
+  if (actorPresentInSpace(space)) {
+    requestSpaceChatFocus(space);
+    return;
+  }
+  v2Turn({
+    scope: space,
+    route: "direct",
+    target: space,
+    verb: "enter",
+    args: [],
+    persistence: "durable",
+    onResult: () => {
+      requestSpaceChatFocus(space);
+    }
   });
 }
 
