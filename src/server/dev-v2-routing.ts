@@ -131,10 +131,18 @@ export function buildVerbThrewReplyEnvelope(input: {
 }
 
 export function resolveTurnEnvelopeScope(world: WooWorld, encoded: string): ObjRef | null {
+  return resolveTurnEnvelopeRouting(world, encoded)?.scope ?? null;
+}
+
+export function resolveTurnEnvelopeRouting(world: WooWorld, encoded: string): { scope: ObjRef; target: ObjRef | null } | null {
   // Decode just enough of the envelope to find the call target. The target
   // determines the audience scope; the intent's declared scope is only used
   // as a fallback when the target isn't space-resolvable (e.g. a verb on a
-  // floating object that lives outside any $space).
+  // floating object that lives outside any $space). The dev WS handler
+  // needs both the resolved scope (to pick the relay) AND the call target
+  // (to refresh that row in the destination relay's serialized snapshot
+  // before planning — matching the explicit-rows authority-slice contract
+  // the REST and MCP paths use).
   try {
     const envelope = decodeEnvelope<{ scope?: unknown; target?: unknown; call?: { scope?: unknown; target?: unknown } }>(encoded);
     if (envelope.type !== "woo.turn.intent.request.shadow.v1" && envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
@@ -151,9 +159,10 @@ export function resolveTurnEnvelopeScope(world: WooWorld, encoded: string): ObjR
         : null;
     if (target) {
       const audience = directAudienceForTarget(world, target as ObjRef);
-      if (audience) return audience;
+      if (audience) return { scope: audience, target: target as ObjRef };
     }
-    return (intentScope as ObjRef | null) ?? null;
+    if (intentScope) return { scope: intentScope as ObjRef, target: (target as ObjRef | null) ?? null };
+    return null;
   } catch {
     return null;
   }

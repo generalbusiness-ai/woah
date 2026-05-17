@@ -19,7 +19,7 @@ import {
   shadowBrowserSessionBearer
 } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
-import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeScope } from "../src/server/dev-v2-routing";
+import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting, resolveTurnEnvelopeScope } from "../src/server/dev-v2-routing";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import { v2TurnResultMessageFromReply } from "../src/client/v2-browser-messages";
 import type { ObjRef } from "../src/core/types";
@@ -593,6 +593,55 @@ describe("dev v2 cross-scope WS routing", () => {
     // The substrate's contract: sequenced commands on a $space target plan
     // with `space === target`. The SPA must use this as the intent scope.
     expect(plan.space).toBe("the_pinboard");
+  });
+
+  it("refreshes the destination relay's scope/target/actor rows when routing to a pre-existing cross-scope relay (regression: explicit-rows authority slice)", async () => {
+    // Aligns the dev WS path with the explicit-rows authority-slice
+    // contract the REST and MCP paths follow (`[input.scope, input.target,
+    // input.actor]` in persistent-object-do.ts; `[scope, target]` in
+    // mcp/gateway.ts). For an existing destination relay, `v2RelayForScope`
+    // only refreshes session_auth — not the serialized target/scope/actor
+    // rows — so the destination can plan against stale state if the dev
+    // handler doesn't pass explicit rows.
+    //
+    // This test pins the routing-helper output that the handler feeds to
+    // `refreshDevV2RelaySessions`. Specifically: for a cross-scope
+    // pinboard:enter intent issued from the deck, the resolver must
+    // return scope=the_pinboard AND target=the_pinboard so both rows are
+    // refreshed before planning. If the helper drops `target` (or the
+    // handler forgets to use it as an explicit row), the destination
+    // relay's snapshot of the_pinboard would be the world-export from
+    // first relay creation and would not reflect any later mutation —
+    // exactly the divergence the reviewer flagged.
+    const world = createWorld();
+    const session = world.auth("guest:explicit-rows-cross-scope");
+    await world.directCall("setup:enter-chatroom-rows", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    await world.directCall("setup:goto-deck-rows", session.actor, "exit_living_room_southeast", "move", [session.actor], { sessionId: session.id });
+
+    // The SPA's chat-issued sequenced enter for pinboard. plan.space ===
+    // target after the planner fix.
+    const intent = {
+      v: 2 as const,
+      type: "woo.turn.intent.request.shadow.v1" as const,
+      id: "intent-explicit-rows",
+      from: "browser-explicit-rows",
+      to: "node:dev:relay",
+      actor: session.actor as ObjRef,
+      session: session.id,
+      auth: { mode: "session" as const, token: `session:${session.id}` },
+      body: {
+        kind: "woo.turn.intent.request.shadow.v1" as const,
+        id: "intent-explicit-rows",
+        route: "sequenced" as const,
+        scope: "the_pinboard" as ObjRef,
+        target: "the_pinboard" as ObjRef,
+        verb: "enter",
+        args: [],
+        persistence: "durable" as const
+      }
+    };
+    const routing = resolveTurnEnvelopeRouting(world, encodeEnvelope(intent));
+    expect(routing).toMatchObject({ scope: "the_pinboard", target: "the_pinboard" });
   });
 
   it("falls back to the intent's declared scope when the target has no $space audience", () => {
