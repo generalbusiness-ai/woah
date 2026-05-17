@@ -408,6 +408,25 @@ export class CommitScopeDO {
         id: body.id,
         reason: body.commit?.reason ?? body.reason
       });
+      // Diagnostic: surface the receipt.errors so the actual gate that
+      // rejected the commit is greppable from a worker tail. The structured
+      // metric above only carries the bucketed reason ("nondeterministic"
+      // when no specific prefix matched), which hides the underlying
+      // "write prior mismatch" / "post_state_mismatch" / etc. that we need
+      // to fix.
+      try {
+        const errors = (body.commit as { errors?: unknown } | undefined)?.errors;
+        if (Array.isArray(errors) && errors.length > 0) {
+          console.log("woo.commit_rejected.errors", JSON.stringify({
+            scope: body.commit?.scope,
+            id: body.id,
+            reason: body.commit?.reason ?? body.reason,
+            errors: errors.slice(0, 12)
+          }));
+        }
+      } catch {
+        // Diagnostic-only; never block the metric flow.
+      }
     }
   }
 
