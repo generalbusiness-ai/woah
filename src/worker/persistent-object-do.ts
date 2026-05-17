@@ -2931,13 +2931,27 @@ export class PersistentObjectDO {
     transcript: EffectTranscript,
     originSessionId: string | null
   ): Promise<void> {
-    const hosts = new Set(await this.activeMcpShardHosts());
+    // The broad active-shard cache is only a best-effort accelerator; a shard
+    // can become relevant by moving into a room after this origin cached the
+    // active list. Query Directory freshly for scopes whose presence/contents
+    // changed so co-present MCP sessions receive the accepted transcript before
+    // they plan their next local read.
+    const affectedScopes = affectedMcpFanoutScopes(scope, transcript);
+    const cachedHosts = await this.activeMcpShardHosts();
+    const hosts = new Set(cachedHosts);
+    const scopedHosts = await this.mcpShardHostsForScopes(affectedScopes);
+    const localHost = this.durableHostKey();
+    let scopedAdded = 0;
+    for (const host of scopedHosts) {
+      if (host !== localHost && !hosts.has(host)) scopedAdded += 1;
+      hosts.add(host);
+    }
     for (const item of fanout) {
       const sessionId = mcpSessionIdFromNode(item.node);
       if (!sessionId) continue;
       hosts.add(mcpGatewayShardHost(this.env, sessionId));
     }
-    hosts.delete(this.durableHostKey());
+    hosts.delete(localHost);
     if (hosts.size === 0) return;
     const body = {
       scope,
@@ -2952,7 +2966,30 @@ export class PersistentObjectDO {
         console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
       }
     }));
-    world.recordMetric({ kind: "mcp_fanout", scope, shards: hosts.size, observations: commit.observations.length });
+    world.recordMetric({
+      kind: "mcp_fanout",
+      scope,
+      shards: hosts.size,
+      observations: commit.observations.length,
+      affected_scopes: affectedScopes.length,
+      cached_shards: cachedHosts.length,
+      scoped_shards: scopedHosts.length,
+      scoped_added: scopedAdded
+    });
+  }
+
+  private async mcpShardHostsForScopes(scopes: ObjRef[]): Promise<string[]> {
+    if (scopes.length === 0) return [];
+    const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/mcp-shards-for-scopes`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ scopes })
+    }));
+    const response = await this.env.DIRECTORY.get(id).fetch(request);
+    const body = await response.json().catch(() => null) as { shards?: unknown } | null;
+    if (!response.ok || !body || !Array.isArray(body.shards)) return [];
+    return body.shards.filter((item): item is string => typeof item === "string" && item.startsWith(MCP_GATEWAY_SHARD_PREFIX));
   }
 
   private async activeMcpShardHosts(): Promise<string[]> {
@@ -3482,6 +3519,28 @@ function mcpGatewayShardHost(env: Env, sessionId: string): string {
 function mcpGatewayShardCount(env: Env): number {
   const raw = Number(env.WOO_MCP_GATEWAY_SHARDS ?? DEFAULT_MCP_GATEWAY_SHARDS);
   return Number.isInteger(raw) && raw > 0 && raw <= 256 ? raw : DEFAULT_MCP_GATEWAY_SHARDS;
+}
+
+function affectedMcpFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
+  const scopes = new Set<ObjRef>([scope]);
+  const add = (value: ObjRef | null | undefined): void => {
+    if (value) scopes.add(value);
+  };
+  for (const move of transcript.moves) {
+    add(move.from);
+    add(move.to);
+  }
+  for (const create of transcript.creates) {
+    add(create.location);
+  }
+  for (const write of transcript.writes) {
+    const cell = write.cell;
+    if (cell.kind === "contents") add(cell.object);
+    if (cell.kind === "prop" && (cell.name === "session_subscribers" || cell.name === "subscribers")) {
+      add(cell.object);
+    }
+  }
+  return Array.from(scopes).sort();
 }
 
 function stableHash(input: string): number {

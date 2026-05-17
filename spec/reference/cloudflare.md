@@ -640,18 +640,24 @@ write O(world-size) rows once for a new or migrated scope.
 The Directory `session_route` row records the active MCP shard in `mcp_shard`
 after that shard has actually handled the session. Directory exposes the active
 set through signed `POST /mcp-shards`, returning `{shards: ["mcp-gateway-N",
-...]}`. Origin hosts cache that active-shard list briefly; the cache is an
-optimization only, because the session route is still the authority.
+...]}`, and exposes a scope-filtered form through signed
+`POST /mcp-shards-for-scopes` with `{scopes: [objref...]}`. The scoped query
+returns shards with live sessions whose `current_location`/`active_scope`
+matches any requested scope. Origin hosts may cache the broad active-shard list
+briefly, but presence-sensitive delivery uses the scoped query because a shard
+can become relevant to a room after another origin has cached the broad list.
 
 When a turn is accepted, the origin delivers normal local WebSocket fanout and
-also POSTs to active MCP shards through signed
+also POSTs to affected MCP shards through signed
 `POST /__internal/mcp-commit-fanout` with `{scope, origin_session, commit,
 transcript}`. `commit` is a `woo.commit.accepted.shadow.v1`; `transcript` is
-the matching `woo.effect_transcript.shadow.v1`. Remote shards apply the
-accepted transcript to their non-persistent snapshot and route the accepted
-observations into their own MCP wait queues. This keeps co-present MCP sessions
-observable across shard boundaries without making any shard authoritative for
-durable world state.
+the matching `woo.effect_transcript.shadow.v1`. Affected shards include
+CommitScope fanout recipients, shards in the cached active set, and shards with
+sessions in scopes touched by transcript moves, creates, contents writes, or
+presence-list writes. Remote shards apply the accepted transcript to their
+non-persistent snapshot and route the accepted observations into their own MCP
+wait queues. This keeps co-present MCP sessions observable across shard
+boundaries without making any shard authoritative for durable world state.
 
 Remote shards deduplicate accepted fanout by `(scope, seq)` using a bounded LRU.
 For scopes the shard has opened through its v2 relay, accepted commits are

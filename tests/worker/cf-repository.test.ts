@@ -1471,6 +1471,174 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("fans accepted cross-scope moves to MCP shards in the destination room", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const wooStates = new Map<string, FakeDurableObjectState>();
+    const wooObjects = new Map<string, PersistentObjectDO>();
+    const fanoutHosts: string[] = [];
+    let env: Env;
+    const wooNamespace = new FakeDurableObjectNamespace((name) => {
+      let object = wooObjects.get(name);
+      if (!object) {
+        const state = new FakeDurableObjectState(name);
+        wooStates.set(name, state);
+        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+        wooObjects.set(name, object);
+      }
+      return {
+        fetch: async (request: Request): Promise<Response> => {
+          if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") {
+            fanoutHosts.push(name);
+          }
+          return await object.fetch(request);
+        }
+      };
+    });
+    env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-mcp-presence-fanout-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
+      WOO_MCP_GATEWAY_SHARDS: "4",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    async function mcp(body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Record<string, any>> {
+      const response = await worker.fetch(new Request("https://woo.test/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...headers
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      expect(response.ok, await response.clone().text()).toBe(true);
+      return await response.json() as Record<string, any>;
+    }
+
+    async function initialize(token: string, id: number): Promise<string> {
+      const initResponse = await worker.fetch(new Request("https://woo.test/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "mcp-token": token
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "cf-mcp-presence-fanout", version: "0.0.0" }
+          }
+        })
+      }), env, {});
+      expect(initResponse.ok, await initResponse.clone().text()).toBe(true);
+      const sessionId = initResponse.headers.get("mcp-session-id");
+      expect(sessionId).toBeTruthy();
+      const notified = await worker.fetch(new Request("https://woo.test/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "mcp-session-id": sessionId!
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })
+      }), env, {});
+      expect(notified.status).toBe(202);
+      return sessionId!;
+    }
+
+    try {
+      const bob = await initialize("guest:cf-mcp-presence-bob", 1);
+      const bobShard = testMcpShardHost(bob, 4);
+      const bobReady = await mcp({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "woo_call",
+          arguments: { object: "the_chatroom", verb: "enter", args: [] }
+        }
+      }, { "mcp-session-id": bob });
+      expect(bobReady.result.isError, JSON.stringify(bobReady.result.structuredContent)).not.toBe(true);
+
+      let alice = "";
+      let aliceShard = "";
+      for (let i = 0; i < 8; i += 1) {
+        const candidate = await initialize(`guest:cf-mcp-presence-alice-${i}`, 10 + i);
+        const shard = testMcpShardHost(candidate, 4);
+        if (shard !== bobShard) {
+          alice = candidate;
+          aliceShard = shard;
+          break;
+        }
+      }
+      expect(alice).toBeTruthy();
+
+      const aliceMove = await mcp({
+        jsonrpc: "2.0",
+        id: 30,
+        method: "tools/call",
+        params: {
+          name: "woo_call",
+          arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+        }
+      }, { "mcp-session-id": alice });
+      expect(aliceMove.result.isError, JSON.stringify(aliceMove.result.structuredContent)).not.toBe(true);
+
+      const bobObject = wooObjects.get(bobShard)! as unknown as {
+        world?: WooWorld;
+        activeMcpShardCache?: { expiresAt: number; hosts: string[] };
+      };
+      const aliceObject = wooObjects.get(aliceShard)! as unknown as { world?: WooWorld };
+      const bobActor = bobObject.world?.sessions.get(bob)?.actor;
+      const aliceActor = aliceObject.world?.sessions.get(alice)?.actor;
+      expect(bobActor).toBeTruthy();
+      expect(aliceActor).toBeTruthy();
+
+      // Force the race deterministically: before the fix, Bob's origin shard
+      // would rely on this stale all-shard cache and miss Alice's shard, even
+      // though Alice's Directory route now says her session is in the_deck.
+      bobObject.activeMcpShardCache = { hosts: [bobShard], expiresAt: Date.now() + 60_000 };
+      fanoutHosts.length = 0;
+      const bobMove = await mcp({
+        jsonrpc: "2.0",
+        id: 31,
+        method: "tools/call",
+        params: {
+          name: "woo_call",
+          arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+        }
+      }, { "mcp-session-id": bob });
+      expect(bobMove.result.isError, JSON.stringify(bobMove.result.structuredContent)).not.toBe(true);
+      expect(fanoutHosts, JSON.stringify({ aliceShard, bobShard, fanoutHosts })).toContain(aliceShard);
+
+      const who = await mcp({
+        jsonrpc: "2.0",
+        id: 32,
+        method: "tools/call",
+        params: {
+          name: "woo_call",
+          arguments: { object: "the_deck", verb: "who", args: [] }
+        }
+      }, { "mcp-session-id": alice });
+      expect(who.result.isError, JSON.stringify(who.result.structuredContent)).not.toBe(true);
+      const rosterIds = (who.result.structuredContent.result as Array<{ id?: unknown }>).map((row) => row.id);
+      expect(rosterIds, JSON.stringify(who.result.structuredContent)).toEqual(expect.arrayContaining([aliceActor, bobActor]));
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+    }
+  });
+
   it("keeps REST v2 relay snapshots on open instead of every envelope", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });

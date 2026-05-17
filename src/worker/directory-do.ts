@@ -65,9 +65,9 @@ export class DirectoryDO {
         try {
           this.ensureSchema();
           this.schemaEnsured = true;
-          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 5 });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 6 });
         } catch (err) {
-          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 5, error: metricErrorCode(err) });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 6, error: metricErrorCode(err) });
           throw err;
         }
       }
@@ -153,6 +153,12 @@ export class DirectoryDO {
         return json({ shards: this.activeMcpShards() });
       }
 
+      if (request.method === "POST" && url.pathname === "/mcp-shards-for-scopes") {
+        const body = await readJson(request);
+        const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+        return json({ shards: this.mcpShardsForScopes(scopes) });
+      }
+
       if (request.method === "POST" && url.pathname === "/__internal/inherit-tombstones") {
         return await this.handleInheritTombstones(request);
       }
@@ -213,7 +219,9 @@ export class DirectoryDO {
         reason TEXT
       )`,
       `CREATE INDEX IF NOT EXISTS inherited_tombstone_former_host
-        ON inherited_tombstone(former_host)`
+        ON inherited_tombstone(former_host)`,
+      `CREATE INDEX IF NOT EXISTS session_route_current_location_mcp_shard
+        ON session_route(current_location, mcp_shard, expires_at)`
     ]) {
       this.state.storage.sql.exec(stmt);
     }
@@ -349,6 +357,30 @@ export class DirectoryDO {
     const rows = this.state.storage.sql.exec(
       "SELECT DISTINCT mcp_shard FROM session_route WHERE mcp_shard IS NOT NULL AND mcp_shard != '' AND expires_at > ? ORDER BY mcp_shard",
       now
+    ).toArray() as Array<{ mcp_shard?: unknown }>;
+    return rows.map((row) => String(row.mcp_shard)).filter(Boolean);
+  }
+
+  private mcpShardsForScopes(values: unknown[]): string[] {
+    const requestedScopes = Array.from(new Set(
+      values.filter((value): value is string => typeof value === "string" && value.length > 0)
+    )).sort();
+    const scopes = requestedScopes.slice(0, 128);
+    if (requestedScopes.length > scopes.length) {
+      console.warn("woo.directory.mcp_shards_for_scopes.truncated", { requested: requestedScopes.length, used: scopes.length });
+    }
+    if (scopes.length === 0) return [];
+    const placeholders = scopes.map(() => "?").join(", ");
+    const rows = this.state.storage.sql.exec(
+      `SELECT DISTINCT mcp_shard FROM session_route
+        -- current_location is the Directory row's persisted session active-scope room.
+        WHERE current_location IN (${placeholders})
+          AND mcp_shard IS NOT NULL
+          AND mcp_shard != ''
+          AND expires_at > ?
+        ORDER BY mcp_shard`,
+      ...scopes,
+      Date.now()
     ).toArray() as Array<{ mcp_shard?: unknown }>;
     return rows.map((row) => String(row.mcp_shard)).filter(Boolean);
   }

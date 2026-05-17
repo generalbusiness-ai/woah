@@ -70,6 +70,13 @@ async function resolve(directory: DirectoryDO, sessionId: string): Promise<Recor
   return (body.session as Record<string, unknown>) ?? null;
 }
 
+async function mcpShardsForScopes(directory: DirectoryDO, scopes: unknown[]): Promise<string[]> {
+  const resp = await directory.fetch(await signed("/mcp-shards-for-scopes", { scopes }));
+  expect(resp.ok).toBe(true);
+  const body = await resp.json() as Record<string, unknown>;
+  return body.shards as string[];
+}
+
 function makeDirectory(): { directory: DirectoryDO; cleanup: () => void } {
   const state = new FakeDirectoryState();
   const directory = new DirectoryDO(state as unknown as DurableObjectState, env);
@@ -186,6 +193,52 @@ describe("DirectoryDO register-session dedup", () => {
       vi.setSystemTime(T0 + 1_000);
       const upgraded = await postRegister(directory, { ...base, token_class: "apikey", apikey_id: "key_xyz" });
       expect(upgraded.wrote).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("resolves active MCP shards by session active scope", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      await postRegister(directory, {
+        session_id: "sess_lobby",
+        actor: "$alice",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-1"
+      });
+      await postRegister(directory, {
+        session_id: "sess_garden",
+        actor: "$bob",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$garden",
+        mcp_shard: "mcp-gateway-2"
+      });
+      await postRegister(directory, {
+        session_id: "sess_expired",
+        actor: "$carol",
+        expires_at: T0 - 1,
+        token_class: "guest",
+        active_scope: "$garden",
+        mcp_shard: "mcp-gateway-3"
+      });
+
+      await postRegister(directory, {
+        session_id: "sess_other_garden",
+        actor: "$dave",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$garden",
+        mcp_shard: "mcp-gateway-2"
+      });
+
+      expect(await mcpShardsForScopes(directory, ["$garden", "$missing", "$garden"])).toEqual(["mcp-gateway-2"]);
+      expect(await mcpShardsForScopes(directory, ["$lobby", "$garden"])).toEqual(["mcp-gateway-1", "mcp-gateway-2"]);
     } finally {
       cleanup();
     }
