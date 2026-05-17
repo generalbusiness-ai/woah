@@ -96,6 +96,28 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     emits: [],
     note: "Command parsing is read-only and all semantic candidates are read through tracked match helpers."
   },
+  create_api_key: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "create_api_key",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["$system.api_keys", "target actor existence", "target actor ancestry", "actor wizard authority"],
+    writes: ["$system.api_keys", "$system.wizard_actions"],
+    emits: [],
+    note: "Wizard-authority minting: records the authoritative api_keys insertion and audit append in the transcript. The minted secret is derived from randomness recorded by the host as a logical input — replay produces the same record."
+  },
+  create_api_key_for_owner: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "create_api_key_for_owner",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["$system.api_keys", "target actor existence", "target actor ancestry", "target actor ownership", "actor wizard authority"],
+    writes: ["$system.api_keys", "$system.wizard_actions"],
+    emits: [],
+    note: "Owner-mint path used by $block:mint_apikey: same effect shape as create_api_key, with the wizard-authority check replaced by an ownership read."
+  },
   list_api_keys: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "list_api_keys",

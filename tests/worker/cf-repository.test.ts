@@ -2404,6 +2404,141 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("create_api_key mints through the v2 REST envelope and the minted key authenticates", async () => {
+    // End-to-end regression for the missing native-primitive-contract bug:
+    // before the fix, /api/objects/%24system/calls/create_api_key failed with
+    // E_RETRY/incomplete_transcript on woah, blocking any wizard-initiated
+    // apikey rotation through REST.
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-apikey-mint-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: undefined,
+      WOO: undefined,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
+    } as unknown as Env;
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, env);
+    (env as any).DIRECTORY = new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    });
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    (env as any).WOO = new FakeDurableObjectNamespace((name) => {
+      if (name !== "world") throw new Error(`unexpected Woo DO ${name}`);
+      return gateway;
+    });
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, any> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    }
+
+    try {
+      const auth = await post("/api/auth", { token: "wizard:cf-apikey-mint-token" });
+      expect(auth.status).toBe(200);
+      const wizardSession = String(auth.body.session);
+
+      const minted = await post("/api/objects/%24system/calls/create_api_key", { args: ["$wiz", "mint-from-rest"] }, wizardSession);
+      expect(minted.status).toBe(200);
+      expect(minted.body.result).toMatchObject({ actor: "$wiz", label: "mint-from-rest" });
+      const id = String(minted.body.result.id);
+      const secret = String(minted.body.result.secret);
+      expect(id).toMatch(/^[0-9a-f]{32}$/);
+      expect(secret).toMatch(/^[0-9a-f]{64}$/);
+
+      const apiAuth = await post("/api/auth", { token: `apikey:${id}:${secret}` });
+      expect(apiAuth.status).toBe(200);
+      expect(apiAuth.body).toMatchObject({ actor: "$wiz", token_class: "apikey" });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
+  it("create_api_key_for_owner mints through the v2 REST envelope when the caller owns the target", async () => {
+    // The owner-mint path is what $block:mint_apikey ultimately invokes.
+    // This test exercises the chain through the v2 envelope so the contract
+    // entry is validated end-to-end alongside the wizard-mint path above.
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-apikey-owner-mint-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: undefined,
+      WOO: undefined,
+      COMMIT_SCOPE: fakeCommitScopeNamespace()
+    } as unknown as Env;
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, env);
+    (env as any).DIRECTORY = new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    });
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+    (env as any).WOO = new FakeDurableObjectNamespace((name) => {
+      if (name !== "world") throw new Error(`unexpected Woo DO ${name}`);
+      return gateway;
+    });
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, any> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    }
+
+    try {
+      const auth = await post("/api/auth", { token: "wizard:cf-apikey-owner-mint-token" });
+      expect(auth.status).toBe(200);
+      const wizardSession = String(auth.body.session);
+
+      // Seed an owner actor and a target actor owned by them. The wizard
+      // creates both; afterwards the owner authenticates and mints a key
+      // bound to the target using the owner-mint path.
+      const gatewayWorld = await (gateway as any).getWorld("world") as WooWorld;
+      gatewayWorld.createObject({ id: "rest_block_owner", name: "Block Owner", parent: "$actor", owner: "$wiz" });
+      gatewayWorld.createObject({ id: "rest_owned_block", name: "Owned Block", parent: "$actor", owner: "rest_block_owner" });
+      const ownerCredential = gatewayWorld.ensureApiKey("$wiz", "rest_block_owner", "owner-key-id", "owner-key-secret", "owner-bootstrap");
+
+      const ownerAuth = await post("/api/auth", { token: `apikey:${ownerCredential.id}:${ownerCredential.secret}` });
+      expect(ownerAuth.status).toBe(200);
+      const ownerSession = String(ownerAuth.body.session);
+
+      const minted = await post("/api/objects/%24system/calls/create_api_key_for_owner", { args: ["rest_owned_block", "owner-mint-from-rest"] }, ownerSession);
+      expect(minted.status).toBe(200);
+      expect(minted.body.result).toMatchObject({ actor: "rest_owned_block", label: "owner-mint-from-rest" });
+
+      const blockAuth = await post("/api/auth", { token: `apikey:${minted.body.result.id}:${minted.body.result.secret}` });
+      expect(blockAuth.status).toBe(200);
+      expect(blockAuth.body).toMatchObject({ actor: "rest_owned_block", token_class: "apikey" });
+
+      // Non-owner cannot mint: a stranger session against the block raises E_PERM.
+      gatewayWorld.createObject({ id: "rest_stranger_actor", name: "Stranger", parent: "$actor", owner: "$wiz" });
+      const strangerCredential = gatewayWorld.ensureApiKey("$wiz", "rest_stranger_actor", "stranger-key-id", "stranger-key-secret", "stranger");
+      const strangerAuth = await post("/api/auth", { token: `apikey:${strangerCredential.id}:${strangerCredential.secret}` });
+      const strangerSession = String(strangerAuth.body.session);
+      const denied = await post("/api/objects/%24system/calls/create_api_key_for_owner", { args: ["rest_owned_block", "stranger-mint"] }, strangerSession);
+      expect(denied.body.error).toMatchObject({ code: "E_PERM" });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("publishes Worker-installed self-hosted tap objects before serving host seeds", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");

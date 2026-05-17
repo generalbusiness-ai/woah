@@ -313,6 +313,83 @@ describe("turn recorder", () => {
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
+  it("keeps create_api_key transcript complete and records the contract", async () => {
+    // Regression: native create_api_key was missing from the primitive-contract
+    // registry, so v2 shadow-commit envelopes (REST and MCP) rejected wizard
+    // apikey minting with incomplete_transcript. Adding the contract entry
+    // both authorizes the commit and surfaces the effect shape in the
+    // recorded dispatch read.
+    const world = createWorld();
+    const actor = "$wiz";
+
+    world.createObject({ id: "apikey_target_actor", name: "Apikey Target", parent: "$actor", owner: actor });
+
+    const before = world.exportWorld();
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("create-apikey", actor, "$system", "create_api_key", ["apikey_target_actor", "wizard-mint"]);
+
+    expect(result.op).toBe("result");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.incompleteReasons).toEqual([]);
+    expect(transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "$system", name: "create_api_key" },
+      value: expect.objectContaining({
+        implementation: "native",
+        native: "create_api_key",
+        native_contract: expect.objectContaining({
+          kind: "woo.native_primitive_contract.shadow.v1",
+          handler: "create_api_key",
+          transcript: "tracked",
+          deterministic: true,
+          writes: expect.arrayContaining(["$system.api_keys", "$system.wizard_actions"])
+        })
+      })
+    }));
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+  });
+
+  it("keeps create_api_key_for_owner transcript complete and records the contract", async () => {
+    // Owner-mint is the path $block:mint_apikey uses. The bug also blocked
+    // this path on woah, so any plug whose configuration starts with
+    // `:mint_apikey` (weather, horoscope, dispenser-style blocks) could not
+    // bootstrap until this fix landed.
+    const world = createWorld();
+    const wizard = "$wiz";
+
+    world.createObject({ id: "apikey_block_owner", name: "Block Owner", parent: "$actor", owner: wizard });
+    world.createObject({ id: "apikey_owned_block", name: "Owned Block", parent: "$actor", owner: "apikey_block_owner" });
+
+    const before = world.exportWorld();
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("owner-mint-apikey", "apikey_block_owner", "$system", "create_api_key_for_owner", ["apikey_owned_block", "owner-mint"]);
+
+    expect(result.op).toBe("result");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.complete).toBe(true);
+    expect(transcript.incompleteReasons).toEqual([]);
+    expect(transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "verb", object: "$system", name: "create_api_key_for_owner" },
+      value: expect.objectContaining({
+        implementation: "native",
+        native: "create_api_key_for_owner",
+        native_contract: expect.objectContaining({
+          kind: "woo.native_primitive_contract.shadow.v1",
+          handler: "create_api_key_for_owner",
+          transcript: "tracked",
+          deterministic: true,
+          reads: expect.arrayContaining(["target actor ownership"]),
+          writes: expect.arrayContaining(["$system.api_keys", "$system.wizard_actions"])
+        })
+      })
+    }));
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+  });
+
   it("marks cross-host dispatch as explicit incomplete_transcript until remote sub-transcripts are implemented", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-remote");
