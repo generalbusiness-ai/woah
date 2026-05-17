@@ -372,6 +372,229 @@ describe("dev v2 cross-scope WS routing", () => {
     });
   });
 
+  it("dispatches 'enter dubspace' end-to-end through the WS handler routing (regression: chat-issued enter)", async () => {
+    // Mirrors the SPA exactly: the v2 browser worker is connected to the
+    // chatroom, the chat command planner issues `the_dubspace:enter` from
+    // that connection, and the dev WS handler must (1) resolve the
+    // audience to the_dubspace, (2) construct a transient browser
+    // anchored on the_dubspace relay with refreshed session_auth, and
+    // (3) dispatch the turn there. If the routing helper is bypassed or
+    // misconfigured, the chatroom-bound submit lands on the wrong relay
+    // and the SPA sees `commit_rejected`.
+    const world = createWorld();
+    const session = world.auth("guest:enter-dubspace-routing-e2e");
+    await world.directCall("setup:enter-chatroom-routing-e2e", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const serialized = world.exportWorld();
+    const sessions = world.exportSessions();
+    const bearer = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
+
+    // WS-bound relay + browser: scope=the_chatroom (the worker's connection).
+    const chatroomRelay = createShadowBrowserRelayShim({
+      node: "browser-enter-dubspace-routing-e2e",
+      scope: "the_chatroom" as ObjRef,
+      serialized,
+      deployment: "local-dev"
+    });
+    const chatroomAuth = buildShadowBrowserSessionAuth({
+      sessions,
+      scope: "the_chatroom" as ObjRef,
+      deployment: chatroomRelay.deployment
+    });
+    chatroomRelay.session_auth = chatroomAuth.session_auth;
+    chatroomRelay.session_revs = chatroomAuth.session_revs;
+    chatroomRelay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
+      chatroomRelay.commit_scope.serialized.sessions,
+      sessions
+    );
+    const chatroomBrowser = createShadowBrowserClient({
+      node: "browser-enter-dubspace-routing-e2e",
+      scope: "the_chatroom" as ObjRef,
+      actor: session.actor,
+      session: session.id,
+      relay: chatroomRelay,
+      token: bearer
+    });
+
+    // The SPA's chat-issued intent: chatroom scope + dubspace target. The
+    // shadowBrowserEnvelope helper signs the envelope as the chatroom
+    // browser; that bearer must still validate inside the dubspace relay
+    // after the WS handler reroutes.
+    const intent = shadowBrowserEnvelope(chatroomBrowser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: "intent-enter-dubspace-routing-e2e",
+      route: "direct",
+      scope: "the_chatroom" as ObjRef,
+      target: "the_dubspace" as ObjRef,
+      verb: "enter",
+      args: [],
+      persistence: "live"
+    });
+    const encoded = encodeEnvelope(intent);
+
+    // Replicate the dev WS handler's routing step verbatim. If this drifts
+    // from `handleV2ShadowFrame`, update both.
+    const callScope = resolveTurnEnvelopeScope(world, encoded);
+    expect(callScope).toBe("the_dubspace");
+
+    // Build the transient routed relay+browser exactly as the dev handler
+    // does, including the session-auth refresh.
+    const dubspaceRelay = createShadowBrowserRelayShim({
+      node: "browser-enter-dubspace-routing-e2e",
+      scope: "the_dubspace" as ObjRef,
+      serialized,
+      deployment: "local-dev"
+    });
+    const dubspaceAuth = buildShadowBrowserSessionAuth({
+      sessions,
+      scope: "the_dubspace" as ObjRef,
+      deployment: dubspaceRelay.deployment
+    });
+    dubspaceRelay.session_auth = dubspaceAuth.session_auth;
+    dubspaceRelay.session_revs = dubspaceAuth.session_revs;
+    dubspaceRelay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
+      dubspaceRelay.commit_scope.serialized.sessions,
+      sessions
+    );
+    const dubspaceBrowser = createShadowBrowserClient({
+      node: "browser-enter-dubspace-routing-e2e",
+      scope: "the_dubspace" as ObjRef,
+      actor: session.actor,
+      session: session.id,
+      relay: dubspaceRelay,
+      token: bearer
+    });
+
+    // The chatroom-signed envelope must still validate inside the dubspace
+    // relay (different scope, same deployment). If this throws, the SPA
+    // surfaces `commit_rejected` and the user sees a stuck chat line.
+    const receipt = receiveShadowBrowserEnvelopeReceipt(dubspaceBrowser, encoded);
+    const reply = await handleShadowBrowserTurnExecEnvelope(dubspaceBrowser, receipt);
+    expect(reply?.body).toMatchObject({ ok: true });
+    if (!reply || reply.body.ok !== true) return;
+    expect(reply.body.transcript?.scope).toBe("the_dubspace");
+    expect(reply.body.transcript?.call).toMatchObject({ target: "the_dubspace", verb: "enter" });
+  });
+
+  it("preserves the wire-token mapping on the transient relay when routing cross-scope (regression: refresh order)", async () => {
+    // Pins the subtle order-of-operations bug that bit `enter dubspace` from
+    // a chat-attached WS: `createShadowBrowserClient` installs the wire
+    // token (e.g. `session:<id>`) into the destination relay's session_auth
+    // via `setShadowBrowserSessionToken`, but a follow-on call to
+    // `refreshDevV2RelaySessions` rebuilds the map from scratch and only
+    // re-registers wire tokens for browsers tracked in `relay.browsers`.
+    // The transient cross-scope browser is intentionally not subscribed
+    // there, so refreshing AFTER createShadowBrowserClient wipes the wire
+    // token and the next envelope fails with
+    // `E_INTERNAL: shadow browser auth token is unknown`, which the WS
+    // handler then surfaces to the SPA as `commit_rejected`.
+    const world = createWorld();
+    const session = world.auth("guest:cross-scope-refresh-order");
+    await world.directCall("setup:enter-chatroom-refresh-order", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const serialized = world.exportWorld();
+    const wireToken = `session:${session.id}`;
+
+    // Build the dubspace relay exactly as v2RelayForScope does the first
+    // time it sees the scope: createShadowBrowserRelayShim with the live
+    // world export. session_auth then has only the local shadow-session
+    // bearer (no wire token yet).
+    const dubspaceRelay = createShadowBrowserRelayShim({
+      node: "browser-cross-scope-refresh-order",
+      scope: "the_dubspace" as ObjRef,
+      serialized,
+      deployment: "local-dev"
+    });
+
+    // Create the transient browser the same way `v2ShadowBrowser` does:
+    // createShadowBrowserClient internally calls
+    // `setShadowBrowserSessionToken` which copies the local-bearer claims
+    // to the wire token in session_auth and then deletes the local bearer.
+    const dubspaceBrowser = createShadowBrowserClient({
+      node: "browser-cross-scope-refresh-order",
+      scope: "the_dubspace" as ObjRef,
+      actor: session.actor,
+      session: session.id,
+      relay: dubspaceRelay,
+      token: wireToken
+    });
+    expect(dubspaceRelay.session_auth.has(wireToken), "wire token registered after createShadowBrowserClient").toBe(true);
+
+    // The SPA's envelope uses the wire token as auth.token (the worker
+    // passes through `current.token` which is the page's session token,
+    // not the shadow-local bearer).
+    const intent = {
+      v: 2 as const,
+      type: "woo.turn.intent.request.shadow.v1" as const,
+      id: "intent-refresh-order",
+      from: dubspaceBrowser.node,
+      to: dubspaceRelay.node,
+      actor: session.actor as ObjRef,
+      session: session.id,
+      auth: { mode: "session" as const, token: wireToken },
+      body: {
+        kind: "woo.turn.intent.request.shadow.v1" as const,
+        id: "intent-refresh-order",
+        route: "direct" as const,
+        scope: "the_chatroom" as ObjRef,
+        target: "the_dubspace" as ObjRef,
+        verb: "enter",
+        args: [],
+        persistence: "live" as const
+      }
+    };
+
+    // No extra `refreshDevV2RelaySessions` after the createShadowBrowserClient
+    // — this mirrors the fixed handler order. If a future change adds an
+    // unconditional refresh here, this test fails with
+    // "shadow browser auth token is unknown".
+    const receipt = receiveShadowBrowserEnvelopeReceipt(dubspaceBrowser, encodeEnvelope(intent));
+    const reply = await handleShadowBrowserTurnExecEnvelope(dubspaceBrowser, receipt);
+    expect(reply?.body, "WS-style cross-scope enter must succeed").toMatchObject({ ok: true });
+    if (!reply || reply.body.ok !== true) return;
+    expect(reply.body.transcript?.scope).toBe("the_dubspace");
+    expect(reply.body.transcript?.observations ?? []).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "dubspace_entered" })
+    ]));
+  });
+
+  it("plans 'enter pinboard' with plan.space === target so the SPA does not submit on the chat room", async () => {
+    // Regression for the chat command's plan/execute split: when the matched
+    // verb's `arg_spec.command.route` is "sequenced" and the target is a
+    // $space (`pinboard:enter`, `outliner:enter`), the substrate plans with
+    // `space: target`. If the SPA ignores `plan.space` and uses the chat
+    // room as the intent scope, the executed turn records `transcript.scope
+    // = chat_room` while the dev WS routes to the target's relay → the
+    // commit submits on the wrong scope and rejects as `scope_mismatch:
+    // submit=<chat_room> transcript=<chat_room> scope=<target>`. This test
+    // pins the substrate's plan shape so the SPA fix can rely on it.
+    const world = createWorld();
+    const session = world.auth("guest:enter-pinboard-plan-space");
+    // Mirror the user's flow: enter the chatroom and walk to the deck so
+    // the chat panel's space is the_deck when they type `enter pinboard`.
+    await world.directCall("setup:enter-chatroom-pp", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    await world.directCall("setup:goto-deck-pp", session.actor, "exit_living_room_southeast", "move", [session.actor], { sessionId: session.id });
+
+    const planFrame = await world.directCall(
+      "plan-enter-pinboard",
+      session.actor,
+      "the_deck",
+      "command_plan",
+      ["enter pinboard"],
+      { sessionId: session.id }
+    );
+    expect(planFrame.op).toBe("result");
+    if (planFrame.op !== "result") return;
+    const plan = planFrame.result as { ok?: boolean; route?: string; space?: string | null; target?: string; verb?: string };
+    expect(plan).toMatchObject({
+      ok: true,
+      route: "sequenced",
+      target: "the_pinboard",
+      verb: "enter"
+    });
+    // The substrate's contract: sequenced commands on a $space target plan
+    // with `space === target`. The SPA must use this as the intent scope.
+    expect(plan.space).toBe("the_pinboard");
+  });
+
   it("falls back to the intent's declared scope when the target has no $space audience", () => {
     const world = createWorld();
     const intentEnvelope = {

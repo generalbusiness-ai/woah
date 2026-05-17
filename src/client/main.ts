@@ -1881,13 +1881,19 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     const persistence = plan.persistence === "durable" || plan.persistence === "live"
       ? plan.persistence
       : route === "direct" ? "live" : "durable";
+    // Sequenced commands on $space-typed targets (e.g. pinboard:enter when its
+    // arg_spec.command.route is "sequenced") plan with `space: target`. Honor
+    // the substrate's plan.space; otherwise the executed turn's scope is the
+    // caller's chat room, the transcript is recorded there, and the dev WS
+    // routing layer submits to the target's relay → `scope_mismatch`.
+    const intentScope = typeof plan.space === "string" && plan.space ? plan.space : space;
     ui.applyOptimisticCall(id, undefined);
     pendingCommands.set(id, { space, text, action: { target, verb } });
     if (onError) pendingFrameErrors.set(id, onError);
     if (!sendV2TurnIntent({
       id,
       route,
-      scope: space,
+      scope: intentScope,
       target,
       verb,
       args,

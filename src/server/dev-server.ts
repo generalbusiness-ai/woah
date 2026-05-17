@@ -476,11 +476,25 @@ async function handleV2ShadowFrame(
     // for dev we resolve the target relay from the envelope body and run
     // the turn through a transient browser anchored to that relay.
     const callScope = resolveTurnEnvelopeScope(world, encoded);
-    const turnBrowser = callScope && callScope !== browser.relay.commit_scope.scope
-      ? v2ShadowBrowser(browser.node, token, session, callScope)
+    const crossScope = !!callScope && callScope !== browser.relay.commit_scope.scope;
+    if (!crossScope) {
+      // Same-scope: keep the WS-bound browser. Refresh its relay's session
+      // auth so a long-lived WS that lasted across world mutations still
+      // accepts the wire token.
+      refreshDevV2RelaySessions(browser.relay);
+      ensureDevV2SerializedSession(browser.relay, session);
+    }
+    // Cross-scope: build a transient browser anchored on the target relay.
+    // `v2RelayForScope` already refreshes session_auth on existing relays,
+    // and `createShadowBrowserClient` then re-registers the wire token via
+    // `setShadowBrowserSessionToken` — calling `refreshDevV2RelaySessions`
+    // *after* that would wipe the wire-token mapping (refresh only
+    // re-registers tokens for browsers tracked in `relay.browsers`, and a
+    // transient browser is intentionally not subscribed there).
+    const turnBrowser = crossScope
+      ? v2ShadowBrowser(browser.node, token, session, callScope!)
       : browser;
-    refreshDevV2RelaySessions(turnBrowser.relay, callScope ? [callScope] : []);
-    ensureDevV2SerializedSession(turnBrowser.relay, session);
+    if (crossScope) ensureDevV2SerializedSession(turnBrowser.relay, session);
     const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt);
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
