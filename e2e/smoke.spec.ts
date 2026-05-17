@@ -444,6 +444,19 @@ test("narrow layout keeps nav tabs on one row", async ({ page }) => {
 
 test("pinboard supports shared text notes", async ({ page }) => {
   const appliedVerbs: string[] = [];
+  const v2TransportErrors: string[] = [];
+  const expectNoV2TransportErrors = () => {
+    expect(v2TransportErrors, v2TransportErrors.join("\n")).toEqual([]);
+  };
+  page.on("console", (msg) => {
+    const text = msg.text();
+    // Sources: src/client/main.ts logs "woo.v2.transport.error";
+    // src/core/shadow-turn-call.ts throws "fresh turn produced no recording".
+    const transportErrorNeedles = ["woo.v2.transport.error", "fresh turn produced no recording"];
+    if (transportErrorNeedles.some((needle) => text.includes(needle))) {
+      v2TransportErrors.push(text);
+    }
+  });
   await page.exposeFunction("recordPinboardAppliedFrame", (verb: string) => {
     appliedVerbs.push(verb);
   });
@@ -461,6 +474,8 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.getByRole("button", { name: "Pinboard" }).click();
   await expect(page.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
   await expect(page.locator(".pinboard-stage")).toBeVisible();
+  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("enter");
+  expectNoV2TransportErrors();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
   const stagePanel = page.locator(".pinboard-stage-panel");
@@ -496,6 +511,7 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.locator("[data-pinboard-new-color]").selectOption("blue");
   await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
   await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("add_note");
+  expectNoV2TransportErrors();
   await expect(page.locator(".pin-note")).toHaveCount(1);
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the towel to the hot tub");
 
@@ -509,10 +525,12 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.locator("[data-pin-note-text]").first().fill("Towel is ready");
   await page.locator("[data-pin-note-text]").first().blur();
   await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("set_text");
+  expectNoV2TransportErrors();
   await expect(page.locator(".pinboard-stage")).toContainText("Towel is ready");
   await expect(page.locator(".pinboard-stage")).toContainText("Bring the mug too");
   await page.getByRole("button", { name: "Leave" }).click();
   await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
+  expectNoV2TransportErrors();
 });
 
 test("pinboard supports local zoom and pan without resetting on updates", async ({ page }) => {
