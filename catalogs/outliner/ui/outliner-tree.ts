@@ -76,13 +76,18 @@ export class WooOutlinerTreeElement extends HTMLElement {
     this.hydrateAttempted = true;
     try {
       const items = await this.woo.call(this.subject, "list_items", []);
-      const focusMap = (this.woo.observe(this.subject)?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
+      const projection = this.woo.observe(this.subject);
+      const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
       const actor = this.woo.actor;
       const focus = actor ? focusMap[actor] ?? null : null;
-      const nameProp = this.woo.observe(this.subject)?.props?.name;
+      // The display title is the object's own name (e.g. "Outline" from the
+      // seed). `props.name` is not the same field — for inherited classes it
+      // can surface the parent class's own name (e.g. "$space") and produce
+      // the wrong title in the header.
+      const objectName = projection?.name;
       this.model = {
         outlinerId: this.subject,
-        outlinerName: typeof nameProp === "string" ? nameProp : "Outline",
+        outlinerName: typeof objectName === "string" && objectName ? objectName : "Outline",
         items: Array.isArray(items) ? (items as OutlinerItem[]) : [],
         focus,
         actor
