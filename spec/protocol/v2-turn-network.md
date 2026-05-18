@@ -990,18 +990,27 @@ instead of copying the whole world or even whole object records.
 The shadow browser relay also implements `mode: "projection"` and
 `mode: "delta"` for display/cache catch-up. Opening a scope installs a
 projection transfer instead of directly mutating the browser projection cache.
-After an accepted commit, the relay sends delta transfers only to browser nodes
-subscribed to that commit scope; other browser nodes learn the new head through
-later state transfer. A shadow delta transfer carries the accepted frame, a
-transcript tail, and exactly one display-state update: either a full refreshed
-projection or a projection patch against the receiver's previous projection
-head. Relays SHOULD send a projection patch for hot subscribed fan-out when they
-know the receiver's cached base projection, and MUST fall back to a full
-projection when the base is unknown, the patch would be larger than replacement,
-or the receiver reports a missing/mismatched base. The first shadow patch shape
-updates scalar projection fields plus ordered object-summary lists. Patch base
-comparison MUST match scope, epoch, and sequence; when both sides have a non-empty
-head hash, it MUST match too.
+After an accepted commit, browser delivery is routed by the gateway's live
+session/socket table, not by volatile subscriber maps inside a commit-scope
+relay. The gateway computes the transcript's affected scopes from the commit
+scope, move endpoints, create locations, contents writes, and subscriber writes;
+then it delivers only observations whose per-observation audience contains the
+recipient session or actor. A recipient attached to the commit scope also
+receives a recipient-bound projection transfer for that scope, built and signed
+by the commit-scope/state authority. Recipients attached to other affected
+scopes receive live observations only; a state transfer for those scopes MUST be
+served by that scope's own state authority, never by the origin commit scope,
+because the transfer head and projection scope have to name the same scope. A
+shadow delta transfer carries the accepted frame, a transcript tail, and exactly
+one display-state update: either a full refreshed projection or a projection
+patch against the receiver's previous projection head. Relays SHOULD send a
+projection patch for hot subscribed fan-out when they know the receiver's cached
+base projection, and MUST fall back to a full projection when the base is
+unknown, the patch would be larger than replacement, or the receiver reports a
+missing/mismatched base. The first shadow patch shape updates scalar projection
+fields plus ordered object-summary lists. Patch base comparison MUST match
+scope, epoch, and sequence; when both sides have a non-empty head hash, it MUST
+match too.
 
 The M4 shadow projection body is `kind: "woo.scope_projection.shadow.v1"`.
 It is catalog-neutral display/cache state, not executable authority. It MUST
@@ -1164,10 +1173,12 @@ Shadow implementation status: the in-process prototype includes a
 browser-shaped node/relay shim with an object-page cache, scope projection
 cache, pending-turn table, accepted/conflict frame queues, and transfer
 tracking. Scope open uses a shadow projection transfer, accepted commits fan
-out to subscribed browser nodes as shadow delta transfers carrying the accepted
-frame, transcript tail, and either a refreshed projection or a projection patch,
-and relay MAC proofs are verified before cache install. The shim also includes
-scope subscriptions and best-effort live-event fan-out with coalescing, without advancing the
+out through the Worker gateway's live socket table. CommitScopeDO remains the
+scope-head and state-transfer authority; it serves recipient-bound projection
+transfers for commit-scope gateway fan-out, while the gateway routes committed
+observations by per-observation session/actor audience across affected scopes. Relay MAC
+proofs are verified before cache install. The shim also includes scope
+subscriptions and best-effort live-event fan-out with coalescing, without advancing the
 commit-scope head. Relay and browser diagnostic tails are bounded in the shadow
 implementation; if a browser reconnects from a head older than the retained
 tail, it receives a projection fallback rather than an unbounded replay. The

@@ -296,6 +296,189 @@ describe("v2 Worker fan-out helpers", () => {
     }
   });
 
+  it("supplements durable same-scope browser fan-out from gateway sockets when commit-scope memory lacks peer nodes", async () => {
+    class SocketState extends FakeDurableObjectState {
+      override getWebSockets(): WebSocket[] {
+        return this.acceptedWebSockets;
+      }
+    }
+    class FakeWebSocket {
+      readonly sent: string[] = [];
+      constructor(private readonly attachment: Record<string, unknown>) {}
+      send(data: string): void { this.sent.push(data); }
+      deserializeAttachment(): unknown { return this.attachment; }
+    }
+
+    const gatewayState = new SocketState("world");
+    const transferRequests: Array<{ commitScope: string; transferScope: string; node: string }> = [];
+    const env = {
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      COMMIT_SCOPE: fakeProjectionCommitScopeNamespace(transferRequests),
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Directory DO ${name}`);
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const world = createWorld();
+      const alice = world.auth("guest:v2-durable-same-alice");
+      const bob = world.auth("guest:v2-durable-same-bob");
+      world.sessions.get(alice.id)!.activeScope = "the_chatroom";
+      world.sessions.get(bob.id)!.activeScope = "the_chatroom";
+      world.setActorPresence(alice.actor, "the_chatroom", true, alice.id);
+      world.setSpaceSubscriber("the_chatroom", alice.actor, true, alice.id);
+      world.setActorPresence(bob.actor, "the_chatroom", true, bob.id);
+      world.setSpaceSubscriber("the_chatroom", bob.actor, true, bob.id);
+
+      const aliceWs = new FakeWebSocket(v2SocketAttachment(alice.id, alice.actor, "browser:durable-same-alice", "the_chatroom"));
+      const bobWs = new FakeWebSocket(v2SocketAttachment(bob.id, bob.actor, "browser:durable-same-bob", "the_chatroom"));
+      gatewayState.acceptedWebSockets.push(aliceWs as unknown as WebSocket, bobWs as unknown as WebSocket);
+
+      const transcript = durableTranscript("durable-same-note", "the_chatroom", alice.id, alice.actor, [
+        { type: "note_added", source: "the_chatroom", board: "the_chatroom", actor: alice.actor, note: { id: "note_1", text: "hello" }, ts: 1 }
+      ]);
+      const replyEnvelope = durableReplyEnvelope("reply-durable-same", "the_chatroom", "browser:durable-same-alice", alice.id, alice.actor, transcript);
+
+      await (gateway as unknown as {
+        sendV2CommitTranscriptFanout(
+          world: WooWorld,
+          replyEnvelope: unknown,
+          alreadyDeliveredNodes: ReadonlySet<string>,
+          originNode: string | null
+        ): Promise<void>;
+      }).sendV2CommitTranscriptFanout(world, replyEnvelope, new Set(), "browser:durable-same-alice");
+
+      expect(aliceWs.sent).toHaveLength(0);
+      const bobEvents = bobWs.sent.map((item) => decodeEnvelope(item));
+      expect(bobEvents.some((event) => event.type === "woo.state.transfer.shadow.v1")).toBe(true);
+      expect(bobEvents).toContainEqual(expect.objectContaining({
+        type: "woo.live.event.shadow.v1",
+        to: "browser:durable-same-bob",
+        body: expect.objectContaining({
+          observation: expect.objectContaining({ type: "note_added", note: expect.objectContaining({ id: "note_1" }) })
+        })
+      }));
+      expect(transferRequests).toContainEqual({
+        commitScope: "the_chatroom",
+        transferScope: "the_chatroom",
+        node: "browser:durable-same-bob"
+      });
+    } finally {
+      gatewayState.close();
+    }
+  });
+
+  it("routes durable movement observations by per-observation audience across affected browser scopes", async () => {
+    class SocketState extends FakeDurableObjectState {
+      override getWebSockets(): WebSocket[] {
+        return this.acceptedWebSockets;
+      }
+    }
+    class FakeWebSocket {
+      readonly sent: string[] = [];
+      constructor(private readonly attachment: Record<string, unknown>) {}
+      send(data: string): void { this.sent.push(data); }
+      deserializeAttachment(): unknown { return this.attachment; }
+    }
+
+    const gatewayState = new SocketState("world");
+    const transferRequests: Array<{ commitScope: string; transferScope: string; node: string }> = [];
+    const env = {
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      COMMIT_SCOPE: fakeProjectionCommitScopeNamespace(transferRequests),
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Directory DO ${name}`);
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const world = createWorld();
+      const alice = world.auth("guest:v2-durable-move-alice");
+      const bob = world.auth("guest:v2-durable-move-bob");
+      const carol = world.auth("guest:v2-durable-move-carol");
+      world.sessions.get(alice.id)!.activeScope = "the_chatroom";
+      world.sessions.get(bob.id)!.activeScope = "the_chatroom";
+      world.sessions.get(carol.id)!.activeScope = "the_deck";
+      world.setActorPresence(alice.actor, "the_chatroom", true, alice.id);
+      world.setSpaceSubscriber("the_chatroom", alice.actor, true, alice.id);
+      world.setActorPresence(bob.actor, "the_chatroom", true, bob.id);
+      world.setSpaceSubscriber("the_chatroom", bob.actor, true, bob.id);
+      world.setActorPresence(carol.actor, "the_deck", true, carol.id);
+      world.setSpaceSubscriber("the_deck", carol.actor, true, carol.id);
+
+      const aliceWs = new FakeWebSocket(v2SocketAttachment(alice.id, alice.actor, "browser:durable-move-alice", "the_chatroom"));
+      const bobWs = new FakeWebSocket(v2SocketAttachment(bob.id, bob.actor, "browser:durable-move-bob", "the_chatroom"));
+      const carolWs = new FakeWebSocket(v2SocketAttachment(carol.id, carol.actor, "browser:durable-move-carol", "the_deck"));
+      gatewayState.acceptedWebSockets.push(aliceWs as unknown as WebSocket, bobWs as unknown as WebSocket, carolWs as unknown as WebSocket);
+
+      const transcript = {
+        ...durableTranscript("durable-cross-scope-move", "the_chatroom", alice.id, alice.actor, [
+          { type: "left", source: "the_chatroom", actor: alice.actor, destination: "the_deck", text: "Alice left.", ts: 1 },
+          { type: "entered", source: "the_deck", actor: alice.actor, origin: "the_chatroom", text: "Alice entered.", ts: 2 }
+        ]),
+        moves: [{ object: alice.actor, from: "the_chatroom", to: "the_deck" }]
+      };
+      const replyEnvelope = durableReplyEnvelope("reply-durable-move", "the_chatroom", "browser:durable-move-alice", alice.id, alice.actor, transcript);
+
+      await (gateway as unknown as {
+        sendV2CommitTranscriptFanout(
+          world: WooWorld,
+          replyEnvelope: unknown,
+          alreadyDeliveredNodes: ReadonlySet<string>,
+          originNode: string | null
+        ): Promise<void>;
+      }).sendV2CommitTranscriptFanout(world, replyEnvelope, new Set(), "browser:durable-move-alice");
+
+      expect(aliceWs.sent).toHaveLength(0);
+      const bobLive = bobWs.sent.map((item) => decodeEnvelope(item)).filter((event) => event.type === "woo.live.event.shadow.v1");
+      const carolLive = carolWs.sent.map((item) => decodeEnvelope(item)).filter((event) => event.type === "woo.live.event.shadow.v1");
+      const carolStateTransfers = carolWs.sent.map((item) => decodeEnvelope(item)).filter((event) => event.type === "woo.state.transfer.shadow.v1");
+      expect(bobLive.map((event) => (event as any).body.observation.type)).toEqual(["left"]);
+      expect(carolLive.map((event) => (event as any).body.observation.type)).toEqual(["entered"]);
+      expect(carolStateTransfers).toHaveLength(0);
+      expect(transferRequests).toEqual([
+        { commitScope: "the_chatroom", transferScope: "the_chatroom", node: "browser:durable-move-bob" }
+      ]);
+    } finally {
+      gatewayState.close();
+    }
+  });
+
+  it("rejects state transfers whose requested projection scope does not match the authority scope", async () => {
+    const secret = "cf-test-secret";
+    const state = new FakeDurableObjectState("the_chatroom");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/state-transfer", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_chatroom",
+          transfer_scope: "the_deck",
+          node: "browser:deck",
+          token: "token:deck",
+          session: "session:deck",
+          actor: "guest_deck",
+          sessions: [],
+          session_objects: []
+        })
+      }));
+      await expect(target.fetch(request)).rejects.toThrow(/state transfer scope mismatch/);
+    } finally {
+      state.close();
+    }
+  });
+
   it("does not reserve the removed legacy WebSocket endpoint at the Worker entry", async () => {
     const env = {
       ASSETS: {
@@ -317,6 +500,146 @@ describe("v2 Worker fan-out helpers", () => {
     await expect(response.text()).resolves.toBe("asset:/ws");
   });
 });
+
+function v2SocketAttachment(sessionId: string, actor: ObjRef, node: string, scope: ObjRef): Record<string, unknown> {
+  return {
+    protocol: "v2-turn-network",
+    sessionId,
+    actor,
+    socketId: `${node}:socket`,
+    node,
+    scope,
+    token: `token:${node}`
+  };
+}
+
+function durableTranscript(hash: string, scope: ObjRef, session: string, actor: ObjRef, observations: any[]): any {
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    route: "sequenced",
+    scope,
+    seq: 1,
+    session,
+    call: { actor, target: scope, verb: "test", args: [] },
+    reads: [],
+    writes: [],
+    creates: [],
+    moves: [],
+    observations,
+    logicalInputs: [],
+    untrackedEffects: [],
+    result: true,
+    complete: true,
+    incompleteReasons: [],
+    hash
+  };
+}
+
+function durableReplyEnvelope(id: string, scope: ObjRef, to: string, session: string, actor: ObjRef, transcript: any): any {
+  const position = {
+    kind: "woo.scope_head.shadow.v1",
+    scope,
+    epoch: 1,
+    seq: 1,
+    hash: `${id}:head`
+  };
+  return {
+    v: 2,
+    type: "woo.turn.exec.reply.shadow.v1",
+    id,
+    from: `node:commit-scope:${scope}`,
+    to,
+    actor,
+    session,
+    auth: { mode: "session", token: `token:${to}` },
+    body: {
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true,
+      id: `${id}:turn`,
+      outcome: { result: true },
+      commit: {
+        kind: "woo.commit.accepted.shadow.v1",
+        id: `${id}:commit`,
+        position,
+        ts: 1,
+        transcript_hash: transcript.hash,
+        post_state_hash: `${id}:post`,
+        observations: transcript.observations,
+        receipt: {
+          kind: "woo.commit_receipt.shadow.v1",
+          id: `${id}:receipt`,
+          route: transcript.route,
+          scope,
+          seq: 1,
+          transcript_hash: transcript.hash,
+          pre_state_hash: `${id}:pre`,
+          post_state_hash: `${id}:post`,
+          accepted: true,
+          errors: []
+        }
+      },
+      transcript
+    }
+  };
+}
+
+function fakeProjectionCommitScopeNamespace(requests: Array<{ commitScope: string; transferScope: string; node: string }>): FakeDurableObjectNamespace {
+  return new FakeDurableObjectNamespace((name) => ({
+    fetch: async (request: Request) => {
+      const body = await request.json() as Record<string, unknown>;
+      requests.push({
+        commitScope: name,
+        transferScope: String(body.transfer_scope ?? ""),
+        node: String(body.node ?? "")
+      });
+      return new Response(JSON.stringify({
+        ok: true,
+        relay: `node:commit-scope:${name}`,
+        transfer: fakeProjectionTransfer(String(body.transfer_scope ?? name), name, String(body.node ?? "browser:test"))
+      }), { headers: { "content-type": "application/json" } });
+    }
+  }));
+}
+
+function fakeProjectionTransfer(scope: string, headScope: string, recipient: string): any {
+  const to = {
+    kind: "woo.scope_head.shadow.v1",
+    scope: headScope,
+    epoch: 1,
+    seq: 1,
+    hash: `${headScope}:head`
+  };
+  return {
+    kind: "woo.state.transfer.shadow.v1",
+    mode: "projection",
+    scope,
+    to,
+    projection: {
+      kind: "woo.scope_projection.shadow.v1",
+      scope,
+      title: scope,
+      object_count: 0,
+      contents: [],
+      seq: 1,
+      cursor: { spaces: {}, live: { resumable: false } },
+      inventory: [],
+      subject: null,
+      objects: []
+    },
+    proof: {
+      kind: "woo.state_proof.shadow.v1",
+      scheme: "shadow.relay_mac.v1",
+      authority: "test",
+      key_id: "test",
+      recipient,
+      scope,
+      mode: "projection",
+      head: to,
+      root: "test",
+      signature: "test"
+    }
+  };
+}
 
 function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
   return cursor.toArray() as T[];

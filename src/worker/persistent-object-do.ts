@@ -48,6 +48,7 @@ import {
   shadowLiveEventsForTranscriptRelay,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
+  type ShadowLiveAudience,
   type ShadowLiveEvent,
   type ShadowBrowserRelayShim,
   type ShadowBrowserStateTransfer
@@ -130,6 +131,12 @@ type CommitScopeEnvelopeResponse = {
   reply: string | null;
   fanout?: Array<{ node: string; envelope: string }>;
   head?: ShadowScopeHead;
+};
+
+type CommitScopeStateTransferResponse = {
+  ok: true;
+  relay: string;
+  transfer: ShadowBrowserStateTransfer;
 };
 
 type RestV2RelayClient = {
@@ -2705,7 +2712,7 @@ export class PersistentObjectDO {
     }
   }
 
-  private async v2CommitScopePost<T>(scope: ObjRef, path: "/v2/open" | "/v2/envelope", body: Record<string, unknown>): Promise<T> {
+  private async v2CommitScopePost<T>(scope: ObjRef, path: "/v2/open" | "/v2/envelope" | "/v2/state-transfer", body: Record<string, unknown>): Promise<T> {
     if (!this.env.COMMIT_SCOPE) throw wooError("E_NOT_IMPLEMENTED", "COMMIT_SCOPE binding is required for v2 turn network");
     const id = this.env.COMMIT_SCOPE.idFromName(String(scope));
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
@@ -2979,13 +2986,109 @@ export class PersistentObjectDO {
     const revokedBefore = this.revokedApiKeyIds(world);
     const localHostMaterialized = await this.writeThroughV2CommitToObjectHosts(world, reply.commit.position.scope, reply.commit, reply.transcript);
     await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
-    this.sendV2Fanout(fanout);
+    const deliveredNodes = this.sendV2Fanout(fanout);
     const frame = restFrameFromTurnReply(scope, reply);
     const observations = "observations" in frame && frame.observations.length > 0
       ? frame.observations
       : reply.commit.observations;
+    await this.sendV2CommitTranscriptFanout(world, replyEnvelope, deliveredNodes, originNode ?? null);
     await this.deliverMcpCommitFanout(world, scope, fanout, { ...reply.commit, observations }, reply.transcript, originSessionId ?? null);
     return { localHostMaterialized };
+  }
+
+  private async sendV2CommitTranscriptFanout(
+    world: WooWorld,
+    replyEnvelope: ShadowEnvelope<ShadowTurnExecReply>,
+    alreadyDeliveredNodes: ReadonlySet<string>,
+    originNode: string | null
+  ): Promise<void> {
+    const reply = replyEnvelope.body;
+    if (reply.ok !== true || !reply.commit || !reply.transcript) return;
+    const commitScope = reply.commit.position.scope;
+    const from = replyEnvelope.from || this.durableHostKey();
+    const observations = structuredClone(reply.transcript.observations) as Observation[];
+    const audiences = await world.computeDirectLiveAudiences(commitScope, observations);
+    const eventTranscript = { ...reply.transcript, observations } as EffectTranscript;
+    const events = shadowLiveEventsForTranscriptRelay(from, eventTranscript)
+      .map((event, index) => withComputedLiveAudience(
+        event,
+        audiences.observationAudiences?.[index] ?? [],
+        audiences.observationSessionAudiences?.[index] ?? []
+      ))
+      .filter((event): event is ShadowLiveEvent => event !== null);
+    const affectedScopes = new Set(affectedBrowserFanoutScopes(commitScope, reply.transcript));
+    if (events.length === 0 && affectedScopes.size === 0) return;
+    const stateTargets = new Map<string, { ws: WebSocket; att: V2SocketAttachment }>();
+    for (const ws of this.state.getWebSockets()) {
+      const att = this.attachment(ws);
+      if (!att?.node || att.protocol !== "v2-turn-network") continue;
+      if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
+      const matching = events.filter((event) => v2LiveEventMatchesAttachment(event, att));
+      // Projection transfers are scoped to the relay head that signs them. Peer
+      // scopes receive live events only until their own scope DO can build a
+      // self-consistent catch-up transfer.
+      if (att.scope === commitScope) stateTargets.set(att.node, { ws, att });
+      if (matching.length === 0) continue;
+      for (const event of matching) this.sendV2LiveEvent(ws, att, from, event);
+    }
+    await Promise.all(Array.from(stateTargets.values(), ({ ws, att }) => this.sendV2ProjectionStateTransfer(world, ws, att, commitScope, from)));
+  }
+
+  private sendV2LiveEvent(ws: WebSocket, att: V2SocketAttachment, from: string, event: ShadowLiveEvent): void {
+    try {
+      ws.send(encodeEnvelope({
+        v: 2,
+        type: event.kind,
+        id: `${event.id}:${att.node}`,
+        from,
+        to: att.node,
+        actor: att.actor,
+        session: att.sessionId,
+        auth: { mode: "session", token: att.token ?? "" },
+        body: event
+      } satisfies ShadowEnvelope<typeof event>));
+    } catch {
+      // Socket cleanup is driven by webSocketClose/webSocketError.
+    }
+  }
+
+  private async sendV2ProjectionStateTransfer(
+    world: WooWorld,
+    ws: WebSocket,
+    att: V2SocketAttachment,
+    commitScope: ObjRef,
+    from: string
+  ): Promise<void> {
+    if (!att.node || !att.token) return;
+    try {
+      const transfer = await this.v2CommitScopePost<CommitScopeStateTransferResponse>(commitScope, "/v2/state-transfer", {
+        ...v2TurnGatewayAuthorityPayload(world, [commitScope, att.scope, att.actor]),
+        scope: commitScope,
+        node: att.node,
+        token: att.token,
+        session: att.sessionId,
+        actor: att.actor,
+        transfer_scope: att.scope
+      });
+      ws.send(encodeEnvelope({
+        v: 2,
+        type: transfer.transfer.kind,
+        id: `${from}:state:${Date.now()}:${att.node}`,
+        from: transfer.relay || from,
+        to: att.node,
+        actor: att.actor,
+        session: att.sessionId,
+        auth: { mode: "session", token: att.token },
+        body: transfer.transfer
+      } satisfies ShadowEnvelope<typeof transfer.transfer>));
+    } catch (err) {
+      console.warn("woo.v2_browser_commit_fanout.state_transfer_failed", {
+        node: att.node,
+        scope: att.scope,
+        commit_scope: commitScope,
+        error: normalizeError(err)
+      });
+    }
   }
 
   private sendV2LiveTranscriptFanout(
@@ -3004,21 +3107,7 @@ export class PersistentObjectDO {
       if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
       const matching = events.filter((event) => v2LiveEventMatchesAttachment(event, att));
       for (const event of matching) {
-        try {
-          ws.send(encodeEnvelope({
-            v: 2,
-            type: event.kind,
-            id: `${event.id}:${att.node}`,
-            from,
-            to: att.node,
-            actor: att.actor,
-            session: att.sessionId,
-            auth: { mode: "session", token: att.token ?? "" },
-            body: event
-          } satisfies ShadowEnvelope<typeof event>));
-        } catch {
-          // Socket cleanup is driven by webSocketClose/webSocketError.
-        }
+        this.sendV2LiveEvent(ws, att, from, event);
       }
     }
   }
@@ -3658,6 +3747,14 @@ function mcpGatewayShardCount(env: Env): number {
 }
 
 function affectedMcpFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
+  return affectedTranscriptScopes(scope, transcript);
+}
+
+function affectedBrowserFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
+  return affectedTranscriptScopes(scope, transcript);
+}
+
+function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
   const scopes = new Set<ObjRef>([scope]);
   const add = (value: ObjRef | null | undefined): void => {
     if (value) scopes.add(value);
@@ -3677,6 +3774,21 @@ function affectedMcpFanoutScopes(scope: ObjRef, transcript: EffectTranscript): O
     }
   }
   return Array.from(scopes).sort();
+}
+
+function withComputedLiveAudience(event: ShadowLiveEvent, actors: ObjRef[], sessions: string[]): ShadowLiveEvent | null {
+  const audience = computedShadowLiveAudience(actors, sessions);
+  return audience ? { ...event, audience } : null;
+}
+
+function computedShadowLiveAudience(actors: ObjRef[], sessions: string[]): ShadowLiveAudience | null {
+  const uniqueActors = Array.from(new Set(actors.filter(Boolean)));
+  const uniqueSessions = Array.from(new Set(sessions.filter(Boolean)));
+  if (uniqueActors.length === 0 && uniqueSessions.length === 0) return null;
+  return {
+    ...(uniqueActors.length > 0 ? { actors: uniqueActors } : {}),
+    ...(uniqueSessions.length > 0 ? { sessions: uniqueSessions } : {})
+  };
 }
 
 function stableHash(input: string): number {

@@ -18,6 +18,7 @@ import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
 import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
+import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { v2ProjectionSnapshotFromMessage, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
@@ -3091,14 +3092,13 @@ function receiveChatEvent(observation: any, shouldRender = true) {
   // Only adopt roster as the chat sidebar list when the observation came from
   // the actor's current chat room; a `look at pinboard` from the deck would
   // otherwise overwrite the deck's presence list with the pinboard's roster.
-  const observationRoom = typeof observation.room === "string" ? observation.room : "";
+  const observationRoom = chatObservationSpace(observation);
   const fromCurrentRoom = !observationRoom || observationRoom === chatRoom();
   if ((type === "looked" || type === "who") && presentActors.length > 0 && fromCurrentRoom) state.chatPresent = presentActors;
-  if (type === "entered" && typeof observation.actor === "string" && !state.chatPresent.includes(observation.actor)) {
-    state.chatPresent = [...state.chatPresent, observation.actor];
-  }
-  if (type === "left" && typeof observation.actor === "string") {
-    state.chatPresent = state.chatPresent.filter((id) => id !== observation.actor);
+  const presenceUpdate = updateEnteredLeftChatPresence(state.chatPresent, observation, chatRoom());
+  if (presenceUpdate.handledPresence) {
+    state.chatPresent = presenceUpdate.present;
+    if (!presenceUpdate.shouldPushChatLine) return;
   }
   // `taken` / `dropped` (and `entered` / `left`) are room-broadcasts that the
   // server's audience computation excludes the doer from (world.ts'
@@ -3151,8 +3151,8 @@ function applyScopedProjectionModel() {
 
 function applyScopedChatObservation(observation: any) {
   if (!state.scopedProjection?.here || !observation || typeof observation !== "object" || Array.isArray(observation)) return;
-  const room = typeof observation.room === "string" ? observation.room : typeof observation.source === "string" ? observation.source : "";
-  if (room && room !== state.scopedProjection.here.id) return;
+  const space = chatObservationSpace(observation);
+  if (space && space !== state.scopedProjection.here.id) return;
   const actor = typeof observation.actor === "string" ? observation.actor : "";
   if (!actor) return;
   const type = String(observation.type ?? "");

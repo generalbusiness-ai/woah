@@ -9,8 +9,8 @@
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
+  buildShadowBrowserProjectionTransfer,
   buildShadowBrowserSessionAuth,
-  buildShadowBrowserDeltaTransfer,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   handleShadowBrowserTurnExecEnvelope,
@@ -210,6 +210,43 @@ export class CommitScopeDO {
           throw err;
         }
       }
+      if (request.method === "POST" && url.pathname === "/v2/state-transfer") {
+        const startedAt = Date.now();
+        let scope: ObjRef | undefined;
+        let node: string | undefined;
+        try {
+          await verifyInternalRequest(this.env, request);
+          const input = await readJson<CommitScopeStateTransferRequest>(request);
+          scope = input.scope;
+          node = input.node;
+          if (input.transfer_scope !== input.scope) {
+            throw wooError("E_PROTOCOL", `state transfer scope mismatch: authority=${input.scope} transfer=${input.transfer_scope}`);
+          }
+          const relay = await this.relayFor(input);
+          this.ensureSerializedSession(relay, input);
+          const transfer = buildShadowBrowserProjectionTransfer(relay, input.transfer_scope, input.node, {
+            actor: input.actor,
+            session: input.session
+          });
+          this.emitMetric({
+            kind: "v2_state_transfer",
+            scope: input.transfer_scope,
+            node,
+            ms: Date.now() - startedAt,
+            status: "ok",
+            transfer_mode: transfer.mode,
+            full_save: false
+          });
+          return jsonResponse({
+            ok: true,
+            relay: relay.node,
+            transfer
+          } satisfies CommitScopeStateTransferResponse);
+        } catch (err) {
+          this.emitMetric({ kind: "v2_state_transfer", scope, node, ms: Date.now() - startedAt, status: "error", full_save: false, ...metricErrorFields(err) });
+          throw err;
+        }
+      }
       return jsonResponse({
         error: {
           code: "E_NOT_IMPLEMENTED",
@@ -350,30 +387,11 @@ export class CommitScopeDO {
     const body = reply.body;
     if (body.ok !== true || !body.transcript) return [];
     if (!body.commit) return this.liveFanoutEnvelopes(relay, originNode, reply);
-    const out: Array<{ node: string; envelope: string }> = [];
-    for (const browser of relay.browsers.values()) {
-      if (browser.node === originNode) continue;
-      if (relay.subscriptions.get(body.commit.position.scope)?.has(browser.node) !== true) continue;
-      const transfer = buildShadowBrowserDeltaTransfer(relay, body.commit as ShadowCommitAccepted, body.transcript, browser.node, {
-        actor: browser.actor,
-        session: browser.session
-      });
-      out.push({
-        node: browser.node,
-        envelope: encodeEnvelope({
-          v: 2,
-          type: transfer.kind,
-          id: `${relay.node}:state:${body.commit.position.seq}:${browser.node}`,
-          from: relay.node,
-          to: browser.node,
-          actor: browser.actor,
-          ...(browser.session ? { session: browser.session } : {}),
-          auth: { mode: "session", token: browser.session_token ?? "" },
-          body: transfer
-        } satisfies ShadowEnvelope<typeof transfer>)
-      });
-    }
-    return out;
+    // Durable browser fan-out is owned by the gateway, which has the live
+    // WebSocket/session set after hibernation and can route by per-observation
+    // audiences across every affected scope. CommitScopeDO remains the state
+    // authority and serves recipient-bound projection transfers on demand.
+    return [];
   }
 
   private liveFanoutEnvelopes(
@@ -864,11 +882,21 @@ type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {
   envelope: string;
 };
 
+type CommitScopeStateTransferRequest = CommitScopeBaseRequest & {
+  transfer_scope: ObjRef;
+};
+
 type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
   head: ShadowScopeHead;
   fanout: Array<{ node: string; envelope: string }>;
+};
+
+type CommitScopeStateTransferResponse = {
+  ok: true;
+  relay: string;
+  transfer: ShadowBrowserStateTransfer;
 };
 
 type CommitScopeMetaRow = {
