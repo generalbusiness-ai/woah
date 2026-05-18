@@ -1,5 +1,5 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
-import { createShadowCommitScope, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
+import { createShadowCommitScope, markShadowCommitScopeSerializedChanged, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
@@ -448,6 +448,7 @@ export function mergeShadowBrowserAuthoritySessionState(current: readonly Serial
 }
 
 export function markShadowBrowserRelaySerializedChanged(relay: ShadowBrowserRelayShim): void {
+  markShadowCommitScopeSerializedChanged(relay.commit_scope);
   relay.serialized_generation++;
   SHADOW_SERIALIZED_INDEX_CACHE.delete(relay.commit_scope.serialized);
 }

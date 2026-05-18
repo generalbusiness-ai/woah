@@ -1,17 +1,21 @@
 import type { SerializedObject, SerializedWorld } from "./repository";
 import {
   createTranscriptCellReader,
+  createTranscriptCellReaderFromObjectMap,
   readTranscriptCell,
+  transcriptTouchedStateHashWithReader,
   validateTranscriptAgainstSerializedWorld,
+  validateTranscriptWithCellReader,
   type EffectTranscript,
   type TranscriptCell,
+  type TranscriptCellReader,
   type TranscriptCreate,
   type TranscriptValidation,
   type TranscriptWrite
 } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
-import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
+import { shadowCommitReceipt, shadowCommitReceiptFromTouchedStateHashes, type ShadowCommitReceipt } from "./turn-commit";
 import type { RecordedWriteAuthority } from "./turn-recorder";
 import type { MetricEvent, ObjRef, WooValue } from "./types";
 
@@ -74,7 +78,33 @@ export type ShadowCommitScope = {
   epoch: number;
   head: ShadowScopeHead;
   serialized: SerializedWorld;
+  state: ShadowCommitScopeState;
   submissions: Map<string, ShadowCommitResult>;
+};
+
+export type ShadowCommitScopeState = {
+  kind: "woo.commit_scope_state.shadow.v1";
+  version: 1;
+  objectCounter: number;
+  parkedTaskCounter: number;
+  sessionCounter: number;
+  objectsById: Map<ObjRef, SerializedObject>;
+  sessionsById: Map<string, SerializedWorld["sessions"][number]>;
+  logsByScope: Map<ObjRef, SerializedWorld["logs"][number][1]>;
+  snapshots: SerializedWorld["snapshots"];
+  parkedTasks: SerializedWorld["parkedTasks"];
+  tombstones?: ObjRef[];
+  serializedRefs: ShadowCommitScopeSerializedRefs;
+};
+
+type ShadowCommitScopeSerializedRefs = {
+  serialized: SerializedWorld;
+  objects: SerializedWorld["objects"];
+  sessions: SerializedWorld["sessions"];
+  logs: SerializedWorld["logs"];
+  snapshots: SerializedWorld["snapshots"];
+  parkedTasks: SerializedWorld["parkedTasks"];
+  tombstones?: ObjRef[];
 };
 
 export type ShadowTranscriptApplyOptions = {
@@ -97,6 +127,7 @@ export function createShadowCommitScope(input: {
     epoch,
     head: shadowScopeHeadForSerialized(input.scope, epoch, serialized),
     serialized,
+    state: createShadowCommitScopeState(serialized),
     submissions: new Map()
   };
 }
@@ -128,13 +159,22 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     if (existing) return existing;
   }
 
-  const validation = validateTranscriptAgainstSerializedWorld(scope.serialized, submit.transcript);
-  const mergedAfter = applyShadowTranscriptToCommittedState(scope.serialized, submit.transcript, { profile: submit.profile });
+  const stateBefore = ensureShadowCommitScopeState(scope);
+  const beforeReader = createCommitScopeStateCellReader(stateBefore);
+  const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
+  const mergedState = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile });
+  const afterReader = createCommitScopeStateCellReader(mergedState);
   const extraErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
-  extraErrors.push(...validateShadowPostState(mergedAfter, submit.transcript));
-  extraErrors.push(...validateShadowWriteAuthority(scope.serialized, submit.transcript));
+  extraErrors.push(...validateShadowPostState(afterReader, submit.transcript));
+  extraErrors.push(...validateShadowWriteAuthorityIndex(serializedAuthorityIndexFromState(stateBefore), submit.transcript));
 
-  const receipt = shadowCommitReceipt(scope.serialized, mergedAfter, submit.transcript, extraErrors, validation);
+  const receipt = shadowCommitReceiptFromTouchedStateHashes(
+    submit.transcript,
+    transcriptTouchedStateHashWithReader(beforeReader, submit.transcript),
+    transcriptTouchedStateHashWithReader(afterReader, submit.transcript),
+    extraErrors,
+    validation
+  );
   if (!receipt.accepted) {
     const conflict: ShadowCommitConflict = {
       kind: "woo.commit.conflict.shadow.v1",
@@ -149,7 +189,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     return conflict;
   }
 
-  scope.serialized = mergedAfter;
+  scope.serialized = commitShadowCommitScopeState(scope, mergedState);
   // Shadow commit scopes sequence accepted transcripts independently of the
   // legacy durable space log. The serialized state is still in the hash, but
   // browser catch-up needs every accepted v2 commit to advance the head.
@@ -176,9 +216,28 @@ export function applyAcceptedShadowFrame(
   // Consumers that receive an accepted frame from the commit authority already
   // have the validation result. Update their local cache from the transcript
   // and authority head without running the expensive authority checks again.
-  scope.serialized = applyShadowTranscriptToCommittedState(scope.serialized, transcript);
+  applyShadowTranscriptToCommitScopeCache(scope, transcript);
   scope.head = structuredClone(accepted.position) as ShadowScopeHead;
   if (accepted.id) scope.submissions.set(accepted.id, structuredClone(accepted) as ShadowCommitAccepted);
+}
+
+export function applyShadowTranscriptToCommitScopeCache(scope: ShadowCommitScope, transcript: EffectTranscript): void {
+  const state = applyShadowTranscriptToIndexedState(ensureShadowCommitScopeState(scope), transcript);
+  scope.serialized = commitShadowCommitScopeState(scope, state);
+}
+
+export function markShadowCommitScopeSerializedChanged(scope: ShadowCommitScope): void {
+  scope.state = createShadowCommitScopeState(scope.serialized);
+}
+
+export function shadowCommitScopeObject(scope: ShadowCommitScope, id: ObjRef): SerializedObject | undefined {
+  return ensureShadowCommitScopeState(scope).objectsById.get(id);
+}
+
+export function shadowCommitScopeSession(scope: ShadowCommitScope, id: string, actor?: ObjRef): SerializedWorld["sessions"][number] | undefined {
+  const session = ensureShadowCommitScopeState(scope).sessionsById.get(id);
+  if (!session || (actor !== undefined && session.actor !== actor)) return undefined;
+  return session;
 }
 
 function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowCommitSubmit, validation?: TranscriptValidation): string[] {
@@ -197,10 +256,9 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   return errors;
 }
 
-function validateShadowPostState(serializedAfter: SerializedWorld, transcript: EffectTranscript): string[] {
+function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
   const finalWrites = finalWritesByCell(transcript);
-  const reader = createTranscriptCellReader(serializedAfter);
   for (const write of finalWrites) {
     const actual = readTranscriptCell(reader, write.cell);
     if (!actual.ok) {
@@ -244,12 +302,15 @@ export function finalWritesByCell(transcript: EffectTranscript): TranscriptWrite
 }
 
 function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcript: EffectTranscript): string[] {
+  return validateShadowWriteAuthorityIndex(serializedAuthorityIndex(serializedBefore), transcript);
+}
+
+function validateShadowWriteAuthorityIndex(index: SerializedAuthorityIndex, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
-  const index = serializedAuthorityIndex(serializedBefore);
   const validWriters = new Map<string, boolean>();
   const authorizedCreates = new Map<ObjRef, TranscriptCreate>();
   if (transcript.session) {
-    const session = serializedBefore.sessions.find((item) => item.id === transcript.session);
+    const session = index.sessionById.get(transcript.session);
     if (!session) errors.push(`permission_denied: session not found ${transcript.session}`);
     else if (session.actor !== transcript.call.actor) errors.push(`permission_denied: session actor mismatch ${transcript.session}`);
   }
@@ -300,6 +361,193 @@ function validateShadowWriteAuthority(serializedBefore: SerializedWorld, transcr
     }
   }
   return errors;
+}
+
+function createShadowCommitScopeState(serialized: SerializedWorld): ShadowCommitScopeState {
+  return {
+    kind: "woo.commit_scope_state.shadow.v1",
+    version: serialized.version,
+    objectCounter: serialized.objectCounter,
+    parkedTaskCounter: serialized.parkedTaskCounter,
+    sessionCounter: serialized.sessionCounter,
+    objectsById: new Map(serialized.objects.map((obj) => [obj.id, obj])),
+    sessionsById: new Map(serialized.sessions.map((session) => [session.id, session])),
+    logsByScope: new Map(serialized.logs.map(([space, entries]) => [space, entries] as const)),
+    snapshots: serialized.snapshots,
+    parkedTasks: serialized.parkedTasks,
+    tombstones: serialized.tombstones,
+    serializedRefs: serializedRefs(serialized)
+  };
+}
+
+function ensureShadowCommitScopeState(scope: ShadowCommitScope): ShadowCommitScopeState {
+  // Older transport/cache boundaries still mutate `scope.serialized` directly.
+  // Rebuild the indexed view whenever those callers replace a top-level row
+  // array; in-place row edits must call markShadowCommitScopeSerializedChanged.
+  if (!stateMatchesSerializedRefs(scope.state, scope.serialized)) {
+    scope.state = createShadowCommitScopeState(scope.serialized);
+  }
+  return scope.state;
+}
+
+function stateMatchesSerializedRefs(state: ShadowCommitScopeState, serialized: SerializedWorld): boolean {
+  return state.serializedRefs.serialized === serialized &&
+    state.serializedRefs.objects === serialized.objects &&
+    state.serializedRefs.sessions === serialized.sessions &&
+    state.serializedRefs.logs === serialized.logs &&
+    state.serializedRefs.snapshots === serialized.snapshots &&
+    state.serializedRefs.parkedTasks === serialized.parkedTasks &&
+    state.serializedRefs.tombstones === serialized.tombstones;
+}
+
+function serializedRefs(serialized: SerializedWorld): ShadowCommitScopeSerializedRefs {
+  return {
+    serialized,
+    objects: serialized.objects,
+    sessions: serialized.sessions,
+    logs: serialized.logs,
+    snapshots: serialized.snapshots,
+    parkedTasks: serialized.parkedTasks,
+    tombstones: serialized.tombstones
+  };
+}
+
+function cloneShadowCommitScopeState(current: ShadowCommitScopeState): ShadowCommitScopeState {
+  return {
+    ...current,
+    objectsById: new Map(current.objectsById),
+    sessionsById: new Map(current.sessionsById),
+    logsByScope: new Map(current.logsByScope),
+    snapshots: current.snapshots.slice(),
+    parkedTasks: current.parkedTasks.slice(),
+    tombstones: current.tombstones?.slice()
+  };
+}
+
+function createCommitScopeStateCellReader(state: ShadowCommitScopeState): TranscriptCellReader {
+  return createTranscriptCellReaderFromObjectMap(serializedShellFromCommitScopeState(state), state.objectsById);
+}
+
+function applyShadowTranscriptToIndexedState(
+  current: ShadowCommitScopeState,
+  transcript: EffectTranscript,
+  options: ShadowTranscriptApplyOptions = {}
+): ShadowCommitScopeState {
+  const totalStartedAt = Date.now();
+  const profile = (phase: (MetricEvent & { kind: "shadow_apply_step" })["phase"], startedAt: number) => {
+    options.profile?.({
+      kind: "shadow_apply_step",
+      phase,
+      scope: transcript.scope,
+      route: transcript.route,
+      ms: Date.now() - startedAt,
+      objects: current.objectsById.size,
+      creates: transcript.creates.length,
+      writes: transcript.writes.length
+    });
+  };
+  const next = cloneShadowCommitScopeState(current);
+  const mutableObjects = new Set<ObjRef>();
+  const mutableObject = (id: ObjRef): SerializedObject | null => {
+    const existing = next.objectsById.get(id);
+    if (!existing) return null;
+    if (mutableObjects.has(id)) return existing;
+    const clone = structuredClone(existing) as SerializedObject;
+    next.objectsById.set(id, clone);
+    mutableObjects.add(id);
+    return clone;
+  };
+
+  // The indexed path keeps commit-scope objects in a Map and clones only rows
+  // touched by the accepted transcript. Serialized arrays are materialized
+  // after validation for existing transport/cache boundaries.
+  let stepStartedAt = Date.now();
+  for (const create of transcript.creates) {
+    if (next.objectsById.has(create.object)) continue;
+    const created = serializedObjectFromCreate(create, options.objectTimestamp);
+    next.objectsById.set(create.object, created);
+    mutableObjects.add(create.object);
+    if (created.parent) addUniqueObjectRef(mutableObject(created.parent)?.children, created.id);
+    if (created.location) addUniqueObjectRef(mutableObject(created.location)?.contents, created.id);
+  }
+  profile("apply_creates", stepStartedAt);
+  stepStartedAt = Date.now();
+  const writes = finalWritesByCell(transcript);
+  profile("collect_writes", stepStartedAt);
+  stepStartedAt = Date.now();
+  for (const write of writes) {
+    const target = mutableObject(write.cell.object);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, options.objectTimestamp);
+  }
+  profile("apply_writes", stepStartedAt);
+  stepStartedAt = Date.now();
+  applyTranscriptSessionLocationToState(next, transcript);
+  profile("apply_session", stepStartedAt);
+  stepStartedAt = Date.now();
+  applyTranscriptLogToState(next, transcript);
+  profile("apply_log", stepStartedAt);
+  stepStartedAt = Date.now();
+  next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
+  profile("counters", stepStartedAt);
+  profile("total", totalStartedAt);
+  return next;
+}
+
+function applyTranscriptSessionLocationToState(state: ShadowCommitScopeState, transcript: EffectTranscript): void {
+  const update = transcriptSessionActiveScope(transcript);
+  if (!update) return;
+  const session = state.sessionsById.get(update.session);
+  if (!session || session.actor !== update.actor) return;
+  state.sessionsById.set(update.session, { ...session, activeScope: update.activeScope });
+}
+
+function applyTranscriptLogToState(state: ShadowCommitScopeState, transcript: EffectTranscript): void {
+  const entry = transcriptLogEntry(transcript);
+  if (!entry) return;
+  // The indexed state still materializes full log arrays for the scope-head
+  // snapshot boundary, so this path remains O(N_log) for sequenced turns. Keep
+  // the per-turn clone shallow here; eliminating the remaining copy belongs
+  // with lazy full-snapshot/head hashing.
+  const entries = (state.logsByScope.get(transcript.scope) ?? []).slice();
+  mergeTranscriptLogEntry(entries, entry);
+  state.logsByScope.set(transcript.scope, entries);
+}
+
+function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState): SerializedWorld {
+  const serialized = serializedWorldFromCommitScopeState(state);
+  state.serializedRefs = serializedRefs(serialized);
+  scope.state = state;
+  return serialized;
+}
+
+function serializedWorldFromCommitScopeState(state: ShadowCommitScopeState): SerializedWorld {
+  return {
+    version: state.version,
+    objectCounter: state.objectCounter,
+    parkedTaskCounter: state.parkedTaskCounter,
+    sessionCounter: state.sessionCounter,
+    objects: Array.from(state.objectsById.values()).sort((a, b) => a.id.localeCompare(b.id)),
+    sessions: Array.from(state.sessionsById.values()).sort((a, b) => a.id.localeCompare(b.id)),
+    logs: Array.from(state.logsByScope.entries()).sort(([a], [b]) => a.localeCompare(b)),
+    snapshots: state.snapshots,
+    parkedTasks: state.parkedTasks,
+    tombstones: state.tombstones
+  };
+}
+
+function serializedShellFromCommitScopeState(state: ShadowCommitScopeState): SerializedWorld {
+  return {
+    version: state.version,
+    objectCounter: state.objectCounter,
+    parkedTaskCounter: state.parkedTaskCounter,
+    sessionCounter: state.sessionCounter,
+    objects: [],
+    sessions: [],
+    logs: [],
+    snapshots: state.snapshots,
+    parkedTasks: state.parkedTasks,
+    tombstones: state.tombstones
+  };
 }
 
 export function applyShadowTranscriptToCommittedState(
@@ -644,11 +892,20 @@ function serializedPropertyInfo(index: SerializedAuthorityIndex, object: ObjRef,
 
 type SerializedAuthorityIndex = {
   objectById: Map<ObjRef, SerializedObject>;
+  sessionById: Map<string, SerializedWorld["sessions"][number]>;
 };
 
 function serializedAuthorityIndex(serialized: SerializedWorld): SerializedAuthorityIndex {
   return {
-    objectById: new Map(serialized.objects.map((obj) => [obj.id, obj]))
+    objectById: new Map(serialized.objects.map((obj) => [obj.id, obj])),
+    sessionById: new Map(serialized.sessions.map((session) => [session.id, session]))
+  };
+}
+
+function serializedAuthorityIndexFromState(state: ShadowCommitScopeState): SerializedAuthorityIndex {
+  return {
+    objectById: state.objectsById,
+    sessionById: state.sessionsById
   };
 }
 

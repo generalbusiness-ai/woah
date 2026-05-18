@@ -76,6 +76,31 @@ Second implementation slice:
   commit application. Commit application still rebuilds indexes from serialized
   arrays; the row-map commit-scope work remains the next substrate bottleneck.
 
+Third implementation slice:
+
+- Added an indexed `ShadowCommitScopeState` behind the existing commit-scope
+  API. Commit scopes now keep object, session, and log indexes as the
+  authoritative in-memory shape while retaining `SerializedWorld` snapshots for
+  current transport/cache boundaries.
+- Moved authoritative durable commit application, post-state validation,
+  touched-state receipt hashes, accepted-frame cache application, MCP
+  cross-scope propagation, and Worker row-delta persistence onto the indexed
+  state path. Commit validation now reads through the existing object index and
+  builds per-object property/version maps lazily for the cells touched by the
+  transcript.
+- The durable commit-scope hot path no longer reports the old full-array
+  `clone_world`, `index_objects`, or `sort_objects` phases for property-write
+  commits. It clones only touched object rows and applies session/log updates
+  through maps. Sequenced-turn log updates no longer deep-clone the full log
+  entry list, but they still copy the scope log array while full serialized
+  snapshots are the head-hash boundary; removing that remaining O(N_log) copy
+  belongs with lazy full-snapshot/head hashing.
+- Compatibility boundary: adapters still read and sometimes mutate
+  `commit_scope.serialized`; those mutations now reindex via
+  `markShadowBrowserRelaySerializedChanged`. A later resident-scope slice can
+  make serialized export lazier once browser/executor cache contracts stop
+  requiring immediate full snapshots.
+
 • Best Opportunities
 
 1. Unify all turn ingress behind one v2 “turn gateway” module

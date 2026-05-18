@@ -655,7 +655,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         expect.objectContaining({ kind: "do_constructor", class: "CommitScopeDO", host_key: "#-1" }),
         expect.objectContaining({ kind: "do_handler", class: "CommitScopeDO", route: "/v2/open", status: "ok", host_key: "#-1" }),
         expect.objectContaining({ kind: "do_handler", class: "CommitScopeDO", route: "/v2/envelope", status: "ok", host_key: "#-1" }),
-        expect.objectContaining({ kind: "shadow_apply_step", phase: "clone_world", scope: "#-1", route: "direct", host_key: "#-1" }),
+        expect.objectContaining({ kind: "shadow_apply_step", phase: "apply_writes", scope: "#-1", route: "direct", host_key: "#-1" }),
         expect.objectContaining({ kind: "shadow_apply_step", phase: "total", scope: "#-1", route: "direct", host_key: "#-1" }),
         expect.objectContaining({ kind: "v2_open", scope: "#-1", node: "browser:worker-test", status: "ok", host_key: "#-1" }),
         expect.objectContaining({ kind: "v2_envelope", scope: "#-1", node: "browser:worker-test", status: "ok", reply: "accepted", fanout: 0, host_key: "#-1" }),
@@ -663,16 +663,19 @@ describe("CFObjectRepository production-shape coverage", () => {
       ]));
       const applySteps = metrics.filter((metric) => metric.kind === "shadow_apply_step" && metric.scope === "#-1");
       const phaseIndex = (phase: string) => applySteps.findIndex((metric) => metric.phase === phase);
-      const cloneWorld = applySteps[phaseIndex("clone_world")];
+      const applyWrites = applySteps[phaseIndex("apply_writes")];
       const total = applySteps[phaseIndex("total")];
-      expect(cloneWorld).toBeDefined();
+      expect(applyWrites).toBeDefined();
       expect(total).toBeDefined();
-      expect(typeof cloneWorld?.ms).toBe("number");
+      expect(typeof applyWrites?.ms).toBe("number");
       expect(typeof total?.ms).toBe("number");
-      expect(cloneWorld?.ms).toBeGreaterThanOrEqual(0);
-      expect(total?.ms).toBeGreaterThanOrEqual(cloneWorld?.ms as number);
-      expect(phaseIndex("clone_world")).toBeGreaterThanOrEqual(0);
-      expect(phaseIndex("total")).toBeGreaterThan(phaseIndex("clone_world"));
+      expect(applyWrites?.ms).toBeGreaterThanOrEqual(0);
+      expect(total?.ms).toBeGreaterThanOrEqual(applyWrites?.ms as number);
+      expect(phaseIndex("clone_world")).toBe(-1);
+      expect(phaseIndex("index_objects")).toBe(-1);
+      expect(phaseIndex("sort_objects")).toBe(-1);
+      expect(phaseIndex("apply_writes")).toBeGreaterThanOrEqual(0);
+      expect(phaseIndex("total")).toBeGreaterThan(phaseIndex("apply_writes"));
       const catchupRequest = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
         method: "POST",
         headers: { "content-type": "application/json" },
