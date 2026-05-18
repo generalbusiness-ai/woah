@@ -50,6 +50,15 @@ CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# Force the Worker to run before static-asset routing for /admin/*.
+# Without this, Cloudflare's `single-page-application` not-found handling
+# serves the SPA's index.html for /admin/ (no matching asset) without
+# ever invoking the Worker, so the dashboard is unreachable from a
+# browser — curl with a JSON Accept header happens to bypass the
+# heuristic but a browser Accept gets the SPA. The Worker handles auth
+# and serves the inline HTML; everything else falls through to
+# env.ASSETS.fetch.
+run_worker_first = ["/admin", "/admin/*"]
 
 [[durable_objects.bindings]]
 name = "WOO"
