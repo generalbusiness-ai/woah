@@ -10,6 +10,7 @@ import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
 import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-browser-delegation";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
+import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
 import { planV2BrowserLocalTurn } from "./v2-browser-local-turn";
 import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2TurnResultMessageFromReply } from "./v2-browser-messages";
 import { v2BrowserWebSocketUrl } from "./v2-browser-url";
@@ -293,9 +294,19 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     records: await allExecutionAds(),
     scope: body.scope
   });
-  if (scopeDelegation.ok) {
-    body.selected_ad = scopeDelegation.ad.node;
-    postMessage({ kind: "local_turn_delegated", id: command.id, node: scopeDelegation.ad.node, reason: "scope_ad" });
+  const fallbackPolicy = v2ServerAssistedIntentPolicy({
+    route: command.route,
+    persistence: body.persistence,
+    selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null
+  });
+  if (!fallbackPolicy.ok) {
+    postTurnUnavailable(command.id, fallbackPolicy.reason);
+    postStatus();
+    return;
+  }
+  if (fallbackPolicy.selected_ad) {
+    body.selected_ad = fallbackPolicy.selected_ad;
+    postMessage({ kind: "local_turn_delegated", id: command.id, node: fallbackPolicy.selected_ad, reason: "scope_ad" });
   }
   const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
     v: 2,
@@ -317,6 +328,21 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
   });
   sendEncoded(encoded);
   postStatus();
+}
+
+function postTurnUnavailable(id: string, reason: string): void {
+  postMessage({ kind: "local_turn_fallback", id, reason });
+  postMessage({
+    kind: "turn_result",
+    frame: {
+      op: "error",
+      id,
+      error: {
+        code: "E_V2_LOCAL_EXECUTION_UNAVAILABLE",
+        message: reason
+      }
+    }
+  });
 }
 
 async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call" }>): Promise<boolean> {

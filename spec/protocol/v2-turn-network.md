@@ -1263,11 +1263,12 @@ commit scope: validate, rerun or receipt-check, then accept/conflict
 worker -> UI: confirm, rollback, rebase, or retry
 ```
 
-The browser may send `woo.turn.intent.request.v1` only as a migration fallback
-when it cannot reconstruct an execution node. A v2 implementation is not
-complete until ordinary chat movement, pinboard edits, kanban edits, and
-dubspace committed controls use browser-built `TurnExecRequest` messages by
-default.
+The browser may send `woo.turn.intent.request.v1` only for live turns or for a
+cold durable delegation that names a selected scope-level `ExecCapabilityAd`.
+It MUST NOT submit an unselected durable intent as a silent server-assisted
+planning fallback. A v2 implementation is not complete until ordinary chat
+movement, pinboard edits, kanban edits, and dubspace committed controls use
+browser-built `TurnExecRequest` messages by default.
 
 Delegation is whole-turn execution, not remote object RPC. If local execution
 cannot proceed after bounded state repair, the browser chooses the best
@@ -1397,8 +1398,9 @@ An implementation does not claim browser-edge v2 completion until tests cover:
   outliner contents through a gateway/cache-only projection;
 - reconnect from a stale head falls back to projection without confirming or
   deleting unresolved optimistic turns;
-- server-assisted `woo.turn.intent.request.v1` usage is measured and can be
-  disabled behind a feature flag.
+- unselected durable `woo.turn.intent.request.v1` usage is disabled; remaining
+  server-assisted intents are limited to live turns and selected cold
+  delegation.
 
 Implementation status: the in-process v2 simulator includes a browser-shaped
 node/relay shim with an object-page cache, scope projection cache, pending-turn
