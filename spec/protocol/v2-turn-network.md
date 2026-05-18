@@ -1165,6 +1165,204 @@ commit scope -> worker: CommitAccepted or CommitConflict
 worker -> UI: confirm, patch-forward, or report conflict
 ```
 
+### VTN14.1 Browser cache ownership
+
+Browser IndexedDB is an execution cache and pending-turn journal. It is not
+durable world authority. A browser cache contains several layers with different
+rights:
+
+| Store | Contents | May drive VM reads? | May overwrite UI projection? | Authority |
+|---|---|---:|---:|---|
+| `meta` | node id, session, current scope, scope heads, cache epoch | No | No | relay/session claims |
+| `pending` | outbound envelopes and optimistic turn records | No | Only through optimistic layer | browser-local |
+| `projections` | `woo.scope_projection.v1` rows and patches | No | Yes, for the named scope/head | state authority proof |
+| `applied_frames` | accepted commit frames by `(scope, seq)` | No | Yes, via reducer | commit receipt |
+| `transcript_tail` | recent accepted transcripts | Only after page verification | Indirectly | commit receipt |
+| `object_pages` | verified object-record pages | Yes | No | state proof |
+| `state_pages` | verified cell/bytecode/metadata pages | Yes | No | state proof |
+
+Projection rows are deliberately excluded from VM execution. They may be stale,
+redacted, or display-shaped. A browser-local turn may read only verified
+executable pages and session/scope metadata whose proof chain is valid for the
+authenticated actor. UI code may render projection rows immediately, but those
+rows do not satisfy `TurnKey` atoms.
+
+Each executable page installed into IndexedDB MUST record:
+
+- page hash and codec;
+- page kind (`object_lineage`, `object_live`, `property_cell`,
+  `verb_bytecode`, or future registered page kind);
+- object id and optional property/verb name;
+- source scope/head or owner host identity;
+- proof root, authority, key id, recipient, and verification status;
+- insertion time and last-used time for eviction.
+
+A browser MUST discard executable pages whose proof recipient does not match
+the browser node, whose session/actor authorization no longer matches
+`TransportHello.actor`, or whose epoch is known stale.
+
+### VTN14.2 Reconstructing an execution node
+
+Before optimistic execution, the worker builds an in-memory execution node from
+IndexedDB:
+
+```text
+load current scope head and session claims
+load verified executable pages referenced by local page index
+materialize the minimal SerializedWorld needed by the VM
+install atom hashes/page hashes into the execution node
+run command planning if the UI supplied text rather than a direct target/verb
+```
+
+The materialized world is disposable. It is rebuilt from verified pages after a
+cache miss, reconnect, conflict, or actor/session change. The worker MUST NOT
+persist VM-mutated post-state as authoritative executable pages until the turn
+is accepted or a verified state transfer supplies the matching pages. Tentative
+post-state lives only in the pending-turn/optimistic layer.
+
+The browser execution node has narrow authority:
+
+- it may execute for `TransportHello.actor`;
+- it may submit a transcript for scopes allowed by the session token;
+- it may not advertise broad capability to unrelated nodes;
+- it may not execute turns requiring native handlers that lack a deterministic
+  `woo.native_primitive_contract.v1`;
+- it may not satisfy a VM read from display projection or from an unverified
+  IndexedDB row.
+
+### VTN14.3 Optimistic local turn flow
+
+The completed browser path for a committed UI action is:
+
+```text
+UI -> worker: TurnIntent or direct TurnCall
+worker: reconstruct execution node from verified pages
+worker: build or reuse TurnCall
+worker: run command planning if needed
+worker: execute VM turn locally in transcript mode
+worker: if E_NEED_STATE, run VTN14.4 and retry
+worker: derive TurnKey and tentative EffectTranscript
+worker -> UI: optimistic result/observations/projection patch
+worker -> relay: Envelope<TurnExecRequest>
+relay/commit scope: validate, rerun or receipt-check, then accept/conflict
+worker -> UI: confirm, rollback, rebase, or retry
+```
+
+The browser may send `woo.turn.intent.request.v1` only as a migration fallback
+when it cannot reconstruct an execution node. A v2 implementation is not
+complete until ordinary chat movement, pinboard edits, kanban edits, and
+dubspace committed controls use browser-built `TurnExecRequest` messages by
+default.
+
+The first production browser execution milestone MAY let the server rerun the
+transcript before commit. That still qualifies as browser-edge optimistic
+execution because local UI state comes from the browser VM transcript and the
+server response is authoritative reconciliation. A later milestone MAY validate
+a client transcript without full rerun when the transcript has complete VM
+hashes, read versions, write facts, and state hashes.
+
+### VTN14.4 Missing-state repair
+
+Missing state is a cache miss, not a semantic fallback. When local execution
+cannot prove it has the required atoms:
+
+```text
+worker -> relay: StateTransferRequest(mode:"closure", atoms:[...], base:head)
+relay/authority: select pages from owner/commit-scope state
+relay -> worker: StateTransfer(mode:"closure", pages, inline_pages, proof)
+worker: verify proof, page hashes, recipient, scope/epoch, authorization
+worker: install executable pages into IndexedDB
+worker: rebuild execution node and retry the same turn id
+```
+
+The worker MUST cap retries and transferred bytes. A turn that still cannot be
+executed after the negotiated retry/byte budget returns a visible
+`missing_state` error or uses the server-assisted planning fallback; it MUST NOT
+silently submit an optimistic success based on partial state.
+
+State-transfer authorities MUST obey ownership:
+
+- object-host state supplies hosted object pages;
+- commit scope supplies scope heads, accepted-frame tails, and scope-owned
+  sequenced state;
+- gateway/session authority supplies current session rows and actor/session
+  objects;
+- projection authority supplies only projection and projection-patch rows.
+
+A cache fill from one authority MUST NOT overwrite rows owned by another
+authority unless the transfer proof explicitly names that owner and the row kind
+is in the owner's authority set.
+
+### VTN14.5 Optimistic UI and reconciliation
+
+The UI applies browser-local execution through an optimistic layer keyed by
+turn id. The optimistic layer may include:
+
+- emitted observations;
+- direct result or error;
+- projection patches derived from the tentative transcript;
+- local audio/control state for dubspace;
+- pending status for controls that should show confirmation.
+
+The authoritative reconciliation rules are:
+
+- `CommitAccepted` for the same turn id confirms the optimistic layer and
+  collapses it into canonical projection/applied-frame state.
+- `CommitAccepted` for another turn at an earlier sequence is applied first; if
+  it changes any cell read by a pending optimistic turn, the worker rebases by
+  discarding that tentative layer, rebuilding from verified pages, and retrying
+  the same turn id against the new head.
+- `CommitConflict` rolls back the optimistic layer, installs any returned state
+  transfer, and either retries automatically when the reason is `stale_head` or
+  reports the conflict to the UI.
+- Projection fallback replaces only the canonical projection layer for its
+  named scope/head. It MUST NOT erase pending optimistic layers until those
+  layers are either reconciled or explicitly invalidated by changed read cells.
+- Live events never confirm or reject committed optimistic state.
+
+The browser MUST retain enough pending-turn metadata to decide whether an
+accepted frame confirms, invalidates, or is independent of each optimistic turn:
+turn id, base head, predicted atoms, read cells, write cells, transcript hash,
+and UI patch id.
+
+### VTN14.6 Reconnect and cold-open behavior
+
+On startup or reconnect, the worker posts cached projection to the UI only as
+cached display state, then opens the v2 transport and waits for
+`TransportHello` plus projection/delta catch-up before replaying pending
+authority-bearing envelopes. It then:
+
+1. validates that `TransportHello.actor` matches the cached actor;
+2. discards executable pages bound to stale actor/session/epoch authority;
+3. installs the initial projection/delta transfer for the opened scope;
+4. replays pending envelopes whose auth token and actor/session still match;
+5. rebuilds execution nodes lazily for the next local turn.
+
+If a pending optimistic turn predates a projection fallback, the worker MUST
+compare the fallback head and pending base head. If the fallback skipped over
+the pending turn without an accepted frame for that turn id, the worker treats
+the pending turn as unresolved and resubmits or fails it through the idempotent
+turn path; it does not assume success from display projection.
+
+### VTN14.7 Completion test gates
+
+An implementation does not claim browser-edge v2 completion until tests cover:
+
+- browser-local transcript equals server transcript for representative chat,
+  pinboard, kanban, and dubspace committed turns;
+- partial IndexedDB cache triggers missing-state transfer, installs pages, and
+  retries locally before submit;
+- tampered projection rows cannot satisfy VM execution reads;
+- tampered executable pages fail hash/proof verification;
+- two browsers editing the same scope reconcile accepted/conflict frames without
+  losing durable state;
+- fresh browser open with host-owned durable rows cannot clear pinboard or
+  outliner contents through a gateway/cache-only projection;
+- reconnect from a stale head falls back to projection without confirming or
+  deleting unresolved optimistic turns;
+- server-assisted `woo.turn.intent.request.v1` usage is measured and can be
+  disabled behind a feature flag.
+
 Implementation status: the in-process v2 simulator includes a browser-shaped
 node/relay shim with an object-page cache, scope projection cache, pending-turn
 table, accepted/conflict frame queues, and transfer tracking. Scope open uses a
@@ -1320,21 +1518,50 @@ deferred until the execution plane exists.
 - browser audio engines apply both live previews and accepted committed frames;
 - logical time replaces wall-clock reads for persistent transport state.
 
-## VTN16. Prototype milestones
+## VTN16. Completion milestones
 
-The prototype SHOULD land in this order:
+The v2 completion path SHOULD land in this order. Each milestone MUST either
+remove an interim server-assisted path or add a guard that prevents it from
+spreading.
 
-1. Turn recorder and replay/diff in the current runtime.
-2. In-process multi-node simulator with execution, commit, state, and live
-   planes.
-3. Content-addressed state transfer and fixed Bloom ad profile.
-4. Browser-node worker with IndexedDB cache and relay transport.
-5. Networked infrastructure nodes, anchors, and disposable executors.
-6. Eviction, cold activation, transcript compaction, and chaos tests.
+1. **Protocol namespace cleanup.** Public v2 specs, wire messages, and tests use
+   only `woo.*.v1` protocol names. Interim local names remain behind adapters
+   while code is renamed.
+2. **Commit-eligible transcripts.** Browser and server recorders emit
+   `woo.effect_transcript.v1` with `base`, `vm`, logical inputs, complete read
+   and write facts, and pre/post state hashes.
+3. **IndexedDB execution cache.** The browser worker persists verified
+   executable pages with proof metadata, reconstructs an execution node from
+   IndexedDB, and refuses to use projection rows for VM reads.
+4. **Missing-state repair.** Browser local execution requests closure
+   transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
+   same turn id locally before fallback.
+5. **Browser-planned committed turns.** Chat movement/carrying, pinboard,
+   kanban, and dubspace committed controls submit browser-built
+   `TurnExecRequest` messages by default. `woo.turn.intent.request.v1` remains
+   only as a measured fallback.
+6. **Optimistic projection reconciliation.** The UI applies tentative
+   transcript effects immediately, confirms them on `CommitAccepted`, rebases on
+   intervening accepted frames, and rolls back or retries on `CommitConflict`.
+7. **Owner-authoritative state transfer.** Object-host, gateway/session,
+   commit-scope, and projection authorities are enforced at every merge
+   boundary. Cache-only rows cannot clear host-owned durable state.
+8. **Transcript validation without routine rerun.** Commit scopes can validate
+   complete client transcripts by read/write/state hashes and VM contracts for
+   the common deterministic path, while retaining rerun as an audit/fallback
+   mode.
+9. **Interim path removal.** Server-assisted browser planning can be disabled in
+   tests and production. New browser feature work must use local execution or
+   explicitly fail when executable state is unavailable.
+10. **Operational hardening.** Eviction, cold activation, transcript
+    compaction, chaos tests, and metrics prove the browser recovers from stale
+    heads, lost sockets, bad pages, and conflicting edits without data loss.
 
-The first milestone is successful when chat, pinboard, and dubspace committed
-turns produce complete replayable transcripts, and live-only interactions are
-classified as live rather than smuggled durable mutation.
+Milestones 2-6 are the minimum bar for a real distributed VM: the browser edge
+must execute optimistic committed turns from verified local state and reconcile
+against authoritative sequencing. Milestones 7-10 are the durability and
+operational bar for retiring server-assisted planning as the ordinary browser
+path.
 
 ## VTN17. Open decisions before production
 
