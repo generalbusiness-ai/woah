@@ -272,7 +272,13 @@ async function handleFootprint(_request: Request, env: Env, url: URL): Promise<R
   }
 
   const body = await aeResponse.json() as { data?: Array<Record<string, unknown>> };
-  const rows = (body.data ?? []).map((row) => ({
+  // Mirror parseAeResponse's defensive guard. AE's SQL API normally
+  // returns `data: [...]`, but a malformed query or a future format
+  // change could surface a non-array (or missing) `data` field. Treat
+  // that as an empty result rather than crashing the request with an
+  // unhandled TypeError → 500.
+  const data = Array.isArray(body.data) ? body.data : [];
+  const rows = data.map((row) => ({
     key: String(row.k ?? ""),
     samples: Number(row.samples ?? 0),
     p50_ms: Number(row.p50 ?? 0),
@@ -748,6 +754,12 @@ const ADMIN_HTML = String.raw`<!doctype html>
       ctx.fillText(new Date(ts[0] * 1000).toLocaleTimeString(), padL, padT + h + 12);
       ctx.fillText(new Date(ts[ts.length - 1] * 1000).toLocaleTimeString(), padL + w - 40, padT + h + 12);
 
+      // Snapshot the painted chart in raw pixels so bindZoom can repaint
+      // it under each pointermove overlay without rebuilding from data.
+      // putImageData operates in canvas pixel space (ignores transform),
+      // so the snapshot rectangle uses canvas.width/height, not cssW/cssH.
+      try { canvas._snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height); } catch {}
+
       return { ts, xAt, padL, padR, padT, padB, w, h, cssW, cssH };
     }
 
@@ -786,13 +798,20 @@ const ADMIN_HTML = String.raw`<!doctype html>
         const x = e.clientX - rect.left;
         const geom = getGeom();
         if (!geom || !geom.ts.length) return;
-        // Repaint by triggering the caller — we redraw via geometry overlay.
-        // Cheaper: draw a translucent rect on the existing canvas.
+        // Restore the chart from the snapshot captured at end of paint
+        // (drawArea stashes it on canvas._snapshot). Without this, every
+        // pointermove stacks another translucent rect onto the canvas
+        // and a long drag paints a visibly darkening stripe.
         const ctx = canvas.getContext('2d');
-        // Restore happens on the next data tick; for now leave the overlay.
+        if (canvas._snapshot) ctx.putImageData(canvas._snapshot, 0, 0);
         ctx.save();
-        ctx.fillStyle = 'rgba(31,119,180,0.15)';
-        ctx.fillRect(Math.min(downX, x), geom.padT, Math.abs(x - downX), geom.h);
+        ctx.fillStyle = 'rgba(31,119,180,0.18)';
+        ctx.strokeStyle = '#1f77b4';
+        ctx.lineWidth = 1;
+        const ox = Math.min(downX, x);
+        const ow = Math.abs(x - downX);
+        ctx.fillRect(ox, geom.padT, ow, geom.h);
+        ctx.strokeRect(ox + 0.5, geom.padT + 0.5, Math.max(0, ow - 1), Math.max(0, geom.h - 1));
         ctx.restore();
       });
       const finish = (e) => {
@@ -800,9 +819,19 @@ const ADMIN_HTML = String.raw`<!doctype html>
         const rect = canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const geom = getGeom();
+        // Capture downX into a local before nulling. Reading downX in the
+        // expression below after assigning downX = null would (silently)
+        // always resolve to x and reduce every drag to a zero-width
+        // selection — silent breakage with no test coverage.
+        const down = downX;
         downX = null;
         if (!geom || !geom.ts.length) return;
-        const a = Math.min(downX === null ? x : downX, x), b = Math.max(downX === null ? x : downX, x);
+        const a = Math.min(down, x), b = Math.max(down, x);
+        // Restore the chart so any in-flight overlay rect from pointermove
+        // doesn't linger after pointerup. The next render() will redraw
+        // anyway when zoom triggers, but on a sub-threshold drag the
+        // chart should clean up immediately.
+        if (canvas._snapshot) canvas.getContext('2d').putImageData(canvas._snapshot, 0, 0);
         if (b - a < 6) return;  // ignore accidental drags
         const tFromPx = (px) => {
           // Inverse of xAt: px = padL + w * i / (n-1)  → i = (px - padL) * (n-1) / w

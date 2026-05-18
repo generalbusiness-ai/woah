@@ -261,4 +261,23 @@ describe("/admin/footprint", () => {
     const res = await call(baseEnv(), "/admin/footprint", { headers: authHeaders });
     expect(res.status).toBe(502);
   });
+
+  it("returns 200 with empty rows when AE's data field is not an array", async () => {
+    // AE normally returns { data: [...] }, but a future format change
+    // (or malformed query) could surface a non-array. The handler must
+    // treat that as empty rather than crashing with TypeError → 500.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: { unexpected: "shape" } }), { status: 200 }));
+    const res = await call(baseEnv(), "/admin/footprint", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { rows: unknown[] };
+    expect(body.rows).toEqual([]);
+  });
+
+  it("returns 200 with empty rows when AE response omits data altogether", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ meta: {} }), { status: 200 }));
+    const res = await call(baseEnv(), "/admin/footprint", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { rows: unknown[] };
+    expect(body.rows).toEqual([]);
+  });
 });
