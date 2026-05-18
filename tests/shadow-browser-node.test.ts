@@ -33,6 +33,8 @@ import { hashSource } from "../src/core/source-hash";
 import type { ObjRef, WooValue } from "../src/core/types";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
+import type { EffectTranscript } from "../src/core/effect-transcript";
+import type { ShadowCommitAccepted, ShadowScopeHead } from "../src/core/shadow-commit-scope";
 
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
@@ -943,6 +945,83 @@ describe("shadow browser node shim", () => {
       reconnected.cache.applied_frames.map((frame) => frame.transcript_hash)
     );
     expect(reconnected.cache.projections.get("the_dubspace")).toMatchObject({ seq: 3 });
+  });
+
+  it("falls back to projection when retained delta catch-up would exceed one envelope", async () => {
+    const { browser } = await browserForScope("the_chatroom", "guest:browser-catchup-oversized");
+    await openShadowBrowserScope(browser);
+    const base = structuredClone(browser.relay.commit_scope.head);
+    const largeText = "chat transcript padding ".repeat(4000);
+
+    for (let seq = 1; seq <= 20; seq += 1) {
+      const position: ShadowScopeHead = {
+        kind: "woo.scope_head.shadow.v1",
+        scope: "the_chatroom",
+        epoch: browser.relay.commit_scope.head.epoch,
+        seq,
+        hash: `oversized-head-${seq}`
+      };
+      const transcriptHash = `oversized-transcript-${seq}`;
+      const accepted: ShadowCommitAccepted = {
+        kind: "woo.commit.accepted.shadow.v1",
+        id: `oversized-frame-${seq}`,
+        position,
+        transcript_hash: transcriptHash,
+        post_state_hash: `oversized-post-state-${seq}`,
+        observations: [{ type: "said", actor: browser.actor, text: largeText, source: "the_chatroom" }],
+        receipt: {
+          kind: "woo.commit_receipt.shadow.v1",
+          id: `oversized-frame-${seq}`,
+          route: "sequenced",
+          scope: "the_chatroom",
+          seq,
+          transcript_hash: transcriptHash,
+          pre_state_hash: `oversized-pre-state-${seq}`,
+          post_state_hash: `oversized-post-state-${seq}`,
+          accepted: true,
+          errors: []
+        }
+      };
+      const transcript: EffectTranscript = {
+        kind: "woo.effect_transcript.shadow.v1",
+        id: `oversized-transcript-${seq}`,
+        route: "sequenced",
+        scope: "the_chatroom",
+        seq,
+        session: browser.session,
+        call: { actor: browser.actor, target: "the_chatroom", verb: "say", args: [largeText] },
+        reads: [],
+        writes: [],
+        creates: [],
+        moves: [],
+        observations: [{ type: "said", actor: browser.actor, text: largeText, source: "the_chatroom" }],
+        logicalInputs: [],
+        untrackedEffects: [],
+        result: true,
+        complete: true,
+        incompleteReasons: [],
+        hash: transcriptHash
+      };
+      browser.relay.accepted_frames.push(accepted);
+      browser.relay.transcript_tail.push(transcript);
+      browser.relay.commit_scope.head = position;
+    }
+
+    const reconnected = createShadowBrowserNode({
+      node: "browser-catchup-oversized-reconnect",
+      scope: "the_chatroom",
+      actor: browser.actor,
+      session: browser.session,
+      relay: browser.relay
+    });
+    const caughtUp = await openShadowBrowserScope(reconnected, { last_known_head: base });
+
+    expect(caughtUp.transfer_mode).toBe("projection");
+    expect(reconnected.cache.applied_frames).toHaveLength(0);
+    expect(reconnected.cache.projections.get("the_chatroom")).toMatchObject({ seq: 20 });
+    expect(() => encodeEnvelope(
+      shadowBrowserEnvelope(reconnected, "woo.state.transfer.shadow.v1", caughtUp.transfer, "oversized-catchup-transfer")
+    )).not.toThrow();
   });
 
   it("falls back to projection catch-up when the relay has no delta tail", async () => {

@@ -38,6 +38,11 @@ const MAX_SHADOW_LIVE_EVENTS = 500;
 const MAX_SHADOW_BROWSER_TRANSFERS = 200;
 const MAX_SHADOW_BROWSER_CACHE_TAIL = 1_000;
 const MAX_SHADOW_BROWSER_CONFLICTS = 200;
+// The envelope codec rejects frames at 1 MiB. Keep browser state-transfer
+// bodies comfortably below that so the surrounding envelope metadata and
+// session token cannot push a retained-tail catch-up over the wire limit.
+const MAX_SHADOW_BROWSER_TRANSFER_BODY_BYTES = 900 * 1024;
+const SHADOW_BROWSER_TRANSFER_ENCODER = new TextEncoder();
 const SHADOW_LIVE_DURABILITY_RESERVED_FIELDS = new Set([
   "writes",
   "creates",
@@ -825,10 +830,18 @@ export function buildShadowBrowserCatchupTransfer(
     const transcriptByHash = new Map(relay.transcript_tail.map((item) => [item.hash, item] as const));
     const transcripts = accepted.map((frame) => transcriptByHash.get(frame.transcript_hash));
     if (hasContiguousTail && transcripts.every((item): item is EffectTranscript => Boolean(item))) {
-      return buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient, viewer);
+      const delta = buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient, viewer);
+      // A retained tail can still be the wrong transfer choice when the browser
+      // has been away for many chatty turns. Projection fallback is smaller for
+      // display catch-up and preserves the one-frame WebSocket contract.
+      if (shadowBrowserTransferBodyByteLength(delta) <= MAX_SHADOW_BROWSER_TRANSFER_BODY_BYTES) return delta;
     }
   }
   return buildShadowBrowserProjectionTransfer(relay, scope, recipient, viewer);
+}
+
+function shadowBrowserTransferBodyByteLength(transfer: ShadowProjectionTransfer | ShadowDeltaTransfer): number {
+  return SHADOW_BROWSER_TRANSFER_ENCODER.encode(JSON.stringify(transfer)).byteLength;
 }
 
 export function publishShadowBrowserAcceptedFrame(

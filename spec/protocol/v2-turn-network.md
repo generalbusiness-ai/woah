@@ -1651,8 +1651,9 @@ catch-up shortcut for a single scope. When present, `last_known_head` is a JSON
 encoded `ScopeHead` for `scope`; the relay validates the shape, treats malformed
 or stale values as absent, and sends the state transfer that VTN9 would have
 returned for that cursor. Relays with retained contiguous history SHOULD send a
-delta transfer; otherwise they send a projection transfer. This shortcut does
-not replace explicit `Subscribe`/`CatchupRequest` for multi-scope clients.
+delta transfer when it fits within the advertised message-size budget; otherwise
+they send a projection transfer. This shortcut does not replace explicit
+`Subscribe`/`CatchupRequest` for multi-scope clients.
 
 The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
 reject the upgrade with HTTP 400. A server that accepts the WebSocket without
