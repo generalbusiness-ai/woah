@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -462,7 +462,7 @@
             ],
             "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"] }
           },
-          "source": "verb :set_tempo(raw_bpm) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let bpm = raw_bpm; if (typeof(raw_bpm) == \"string\") { let trimmed = str_trim(raw_bpm); bpm = to_int(trimmed); if (bpm == 0 && trimmed != \"0\") { raise { code: \"E_INVARG\", message: \"BPM expects digits.\", value: raw_bpm }; } } if (typeof(bpm) != \"number\") { raise { code: \"E_TYPE\", message: \"tempo must be numeric\", value: raw_bpm }; } bpm = round(bpm); if (bpm < 60) { bpm = 60; } if (bpm > 200) { bpm = 200; } \"drum_1\".bpm = bpm; observe({ type: \"tempo_changed\", target: \"drum_1\", bpm: bpm }); return bpm; }"
+          "source": "verb :set_tempo(raw_bpm) rx { if (!(actor in this.operators) && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"you must be operating this dubspace\", value: actor }; } let bpm = raw_bpm; if (typeof(raw_bpm) == \"string\") { let trimmed = str_trim(raw_bpm); bpm = to_int(trimmed); if (bpm == 0 && trimmed != \"0\") { raise { code: \"E_INVARG\", message: \"BPM expects digits.\", value: raw_bpm }; } } if (typeof(bpm) != \"number\") { raise { code: \"E_TYPE\", message: \"tempo must be numeric\", value: raw_bpm }; } bpm = round(bpm); if (bpm < 60 || bpm > 200) { raise { code: \"E_INVARG\", message: \"BPM must be between 60 and 200.\", value: raw_bpm }; } \"drum_1\".bpm = bpm; observe({ type: \"tempo_changed\", target: \"drum_1\", bpm: bpm }); return bpm; }"
         },
         {
           "name": "start_transport",

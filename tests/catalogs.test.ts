@@ -313,6 +313,21 @@ describe("local catalogs", () => {
     const miss = await world.directCall("help-miss", "$wiz", "$wiz", "help", ["definitely-missing"]);
     expect(miss.op).toBe("result");
     expect(world.getProp("$help", "missed_topics")).toContainEqual(expect.objectContaining({ topic: "definitely-missing", actor: "$wiz" }));
+
+    // Regression for notes/2026-05-16-online-walkthrough.md Inconsistency 1.
+    // The minimum first-light topic set must include look, say, focus, wait,
+    // and ways alongside movement/chat/commands. Any of these missing leaves
+    // a guest with `No help available for "X"` for an obvious basic verb.
+    const minimumTopics = ["look", "say", "focus", "wait", "ways", "speech", "movement", "commands", "chat"];
+    const helpTopics = world.getProp("$help", "topics") as Record<string, WooValue>;
+    for (const topic of minimumTopics) {
+      expect(helpTopics[topic], `expected $help to define topic "${topic}"`).toBeDefined();
+      const looked = await world.directCall(`help-${topic}`, "$wiz", "$wiz", "help", [topic]);
+      expect(looked.op).toBe("result");
+      if (looked.op === "result") {
+        expect(looked.result, `help ${topic} should resolve`).toMatchObject({ ok: true, topic, db: "$help" });
+      }
+    }
   });
 
   it("does not leak unreadable verb source through verbdoc help topics", async () => {
@@ -831,10 +846,24 @@ describe("local catalogs", () => {
       expect(drumChanged.observations[0]).toMatchObject({ type: "drum_step_changed", target: "drum_1", voice: "tone", step: 3, enabled: true });
       expect((drumChanged.observations[0] as any).pattern.tone[3]).toBe(true);
     }
-    await callInDubspace(world, session.id, "tempo", { actor, target: "the_dubspace", verb: "set_tempo", args: [250] });
+    // set_tempo now rejects out-of-range input rather than silently
+    // clamping (notes/2026-05-16-online-walkthrough.md Bug 6). 250 BPM
+    // raises E_INVARG and leaves the previous tempo (142, from above)
+    // unchanged. Negative inputs raise too. The sequenced path returns
+    // an applied frame whose $error observation carries the code.
+    const tooFast = await callInDubspace(world, session.id, "tempo-too-fast", { actor, target: "the_dubspace", verb: "set_tempo", args: [250] });
+    expect(tooFast.op).toBe("applied");
+    if (tooFast.op === "applied") {
+      expect(tooFast.observations).toContainEqual(expect.objectContaining({ type: "$error", code: "E_INVARG" }));
+    }
+    const negative = await callInDubspace(world, session.id, "tempo-negative", { actor, target: "the_dubspace", verb: "set_tempo", args: [-50] });
+    expect(negative.op).toBe("applied");
+    if (negative.op === "applied") {
+      expect(negative.observations).toContainEqual(expect.objectContaining({ type: "$error", code: "E_INVARG" }));
+    }
     const pattern = world.getProp("drum_1", "pattern") as Record<string, boolean[]>;
     expect(pattern.tone[3]).toBe(true);
-    expect(world.getProp("drum_1", "bpm")).toBe(200);
+    expect(world.getProp("drum_1", "bpm")).toBe(142);
 
     await callInDubspace(world, session.id, "save", { actor, target: "the_dubspace", verb: "save_scene", args: ["Source Scene"] });
     await callInDubspace(world, session.id, "mutate", { actor, target: "the_dubspace", verb: "set_control", args: ["delay_1", "feedback", 0.11] });

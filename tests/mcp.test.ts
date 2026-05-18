@@ -283,6 +283,16 @@ describe("McpHost", () => {
 
     // Tool names are unique.
     expect(new Set(tools.map((t) => t.name)).size).toBe(tools.length);
+
+    // Regression for notes/2026-05-16-online-walkthrough.md Bug 9.2:
+    // the cockatoo's teach tool MUST expose its single argument under
+    // the same name the verb body destructures (`phrase`), so MCP
+    // clients can call {phrase: "..."} and not hit
+    // `E_TYPE: teach requires a string phrase` from a missing key.
+    const teachTool = byObjVerb.get("the_cockatoo:teach");
+    expect(teachTool).toBeDefined();
+    const teachProperties = teachTool!.inputSchema.properties as Record<string, unknown>;
+    expect(Object.keys(teachProperties)).toEqual(["phrase"]);
   });
 
   it("exposes verb editor tools after the programmer enters the editor room", async () => {
@@ -392,6 +402,20 @@ describe("McpHost", () => {
     expect(sayTool).toBeDefined();
     const sayResult = await host.invokeTool(session.actor, session.id, sayTool, ["hello, world"]);
     expect(sayResult.observations.some((o) => o.type === "said")).toBe(true);
+    // Regression for notes/2026-05-16-online-walkthrough.md Bug 5:
+    // an actor inside `the_dubspace` (`$transparent`) sees ONE `said`
+    // for one `say`. The engine still emits two raw observations (one
+    // local, one forwarded upward to the chatroom for outside
+    // listeners), but the MCP layer trims to the caller's session
+    // audience so the dubspace tab matches the chatroom tab in
+    // single-utterance count.
+    await world.directCall(undefined, session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    const dubspaceSayTool = (await host.enumerateTools(session.actor)).find((t) => t.object === "the_dubspace" && t.verb === "say")!;
+    expect(dubspaceSayTool).toBeDefined();
+    const dubspaceSay = await host.invokeTool(session.actor, session.id, dubspaceSayTool, ["beat"]);
+    const saidEvents = dubspaceSay.observations.filter((o) => o.type === "said");
+    expect(saidEvents).toHaveLength(1);
+    expect(saidEvents[0]).toMatchObject({ source: "the_dubspace", text: "beat" });
 
     // The own-call observations are NOT also enqueued — wait should drain empty.
     const waitTool = (await host.enumerateTools(session.actor)).find((t) => t.object === session.actor && t.verb === "wait")!;
@@ -1903,7 +1927,13 @@ describe("McpGateway", () => {
         params: { name: "woo_focus", arguments: { target } }
       }, { "mcp-session-id": sessionId! }));
       expect(response.ok).toBe(true);
-      return await response.json() as { result: { isError?: boolean; structuredContent?: { error?: { code?: string }; result?: unknown } } };
+      return await response.json() as {
+        result: {
+          isError?: boolean;
+          content?: Array<{ type: string; text?: string }>;
+          structuredContent?: { error?: { code?: string }; result?: unknown };
+        };
+      };
     };
 
     const missingNative = await world.directCall(undefined, actor!, actor!, "focus", ["no_such_object"], { sessionId: sessionId! });
@@ -1913,6 +1943,13 @@ describe("McpGateway", () => {
     const missing = await callFocus(2, "no_such_object");
     expect(missing.result.isError).toBe(true);
     expect(missing.result.structuredContent?.error?.code).toBe("E_OBJNF");
+    // Regression for the tool-error doubled-prefix bug (notes/
+    // 2026-05-16-online-walkthrough.md Bug 2). Before the
+    // fromError change, MCP clients saw text like
+    // "E_OBJNF: E_OBJNF: …". The code now appears exactly once.
+    const errorText = missing.result.content?.[0]?.text ?? "";
+    expect(errorText).toMatch(/^E_OBJNF: /);
+    expect(errorText).not.toMatch(/^E_OBJNF: E_OBJNF/);
 
     const remoteRoomObject = await callFocus(3, "the_pinboard");
     expect(remoteRoomObject.result.isError).toBe(true);

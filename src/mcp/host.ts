@@ -776,7 +776,7 @@ export class McpHost {
         if (decision.refresh) {
           await this.refreshToolList(sessionId, actor);
         }
-        return { result: result.result, observations: result.observations };
+        return { result: result.result, observations: this.filterCallerObservations(sessionId, result.observations, result.observationSessionAudiences) };
       } finally {
         CURRENT_WAIT_SESSION_ID = previous;
       }
@@ -803,9 +803,32 @@ export class McpHost {
     const errObs = frame.observations.find((o) => o.type === "$error");
     return {
       result: errObs ? null : true,
-      observations: frame.observations,
+      observations: this.filterCallerObservations(sessionId, frame.observations, frame.observationSessionAudiences),
       applied: { space: frame.space, seq: frame.seq, ts: frame.ts }
     };
+  }
+
+  // Trim the verb's emitted observations to those whose per-observation
+  // session audience includes the calling MCP session. The engine's
+  // `result.observations` is the raw transcript and contains every
+  // observation any verb produced during the call — including forwards
+  // to other spaces (e.g. `$transparent:say` re-emits to `location(this)`
+  // for actors in the parent room). Without this filter, an MCP client
+  // sees two `said` events for a single `the_dubspace:say` even though
+  // its own audience only contains one. See notes/2026-05-16-online-
+  // walkthrough.md Bug 5.
+  //
+  // If observationSessionAudiences is absent or shorter than observations
+  // (older callers / cross-host bridges that don't populate it), pass the
+  // observation through — better to over-report than to drop legitimate
+  // events.
+  private filterCallerObservations(sessionId: string, observations: Observation[], observationSessionAudiences?: string[][]): Observation[] {
+    if (!observationSessionAudiences) return observations;
+    return observations.filter((_, index) => {
+      const audience = observationSessionAudiences[index];
+      if (!audience) return true;
+      return audience.includes(sessionId);
+    });
   }
 
   private isMcpWaitTool(actor: ObjRef, tool: McpTool): boolean {
@@ -1028,7 +1051,13 @@ function jsonSchemaForHint(hint: string): Record<string, unknown> {
 }
 
 function fromError(error: { code: string; message?: string; value?: unknown; trace?: unknown }): Error {
-  const err = new Error(`${error.code}: ${error.message ?? ""}`);
+  // Keep the bare engine message on `.message` and the code on `.code`.
+  // The MCP server formats tool-error text as `${code}: ${message}` at
+  // its own catch site (src/mcp/server.ts:invokeForMcp), so prefixing
+  // the code into `.message` here produced "E_INVARG: E_INVARG: ..."
+  // duplication visible to MCP clients (see
+  // notes/2026-05-16-online-walkthrough.md Bug 2).
+  const err = new Error(error.message ?? error.code);
   const enriched = err as Error & { code?: string; value?: unknown; trace?: unknown };
   enriched.code = error.code;
   if (error.value !== undefined) enriched.value = error.value;

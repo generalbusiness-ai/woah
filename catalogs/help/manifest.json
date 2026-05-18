@@ -1,6 +1,6 @@
 {
   "name": "help",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "spec_version": "v1",
   "description": "LambdaMOO-shaped in-world help database classes and a seeded global help database.",
   "license": "MIT",
@@ -82,9 +82,33 @@
             "Rooms expose exits as verbs such as north, west, southeast, out, or go <exit>.",
             "Moving through an exit calls the exit object, which moves you and announces the departure and arrival through the source and destination rooms."
           ],
+          "ways": [
+            "ways lists the exits available from your current room. Each exit shows up as its own verb (north, southeast, out, ...) or can be used via go <exit>.",
+            "See also: movement."
+          ],
+          "look": [
+            "look (no argument) describes the room you are in, who else is here, and what objects are visible.",
+            "look <thing> asks the thing to describe itself. Objects may add their own flavor — look at a person, a couch, the_cockatoo, or any other object you can see."
+          ],
+          "say": [
+            "say <text> speaks aloud to everyone in the current room. Backtick syntax (`person text) directs your line to one listener.",
+            "Variants: emote <action>, pose <text>, quote <text>, self <text>, say_as <style> <text>, tell <person> <text>. See also: speech."
+          ],
+          "speech": [
+            "Speech verbs are live and direct: say, emote, pose, quote, tell, say_as, and self each emit a different observation type so clients can render them distinctly.",
+            "Embedded spaces (the_dubspace, the_pinboard, the_outline) forward speech to the surrounding room so listeners outside still hear it. See also: say, chat."
+          ],
           "chat": [
             "Speech is live and direct. say sends text to the current room; emote, pose, quote, and tell are conversational variants.",
             "look asks the target to describe itself with look_self; room output is composed by the room."
+          ],
+          "focus": [
+            "Use woo_focus(<object>) to add a reachable object to your working set. Its tool-exposed verbs become callable directly even after you move to another room.",
+            "woo_unfocus(<object>) removes it. focus_list shows the current working set. Focused remote objects expose their admin (tool_exposed) verbs; the room listing exposes the obvious command-shape verbs."
+          ],
+          "wait": [
+            "wait(<timeout_ms>, <limit>) drains queued external observations for this session. It returns immediately if events are queued, or holds until timeout_ms elapses or limit events arrive.",
+            "wait is how an MCP agent listens for chat, taken/dropped, moves, and other events that other actors generate while you are not making a call."
           ],
           "building": [
             "Builder and programmer tools live on player classes. Builders create and arrange objects; programmers install and edit source.",

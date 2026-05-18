@@ -220,3 +220,30 @@ Schemas are **advisory in v1**: introspectable (`event_schema(obj, type)` builti
 Inheritance: schemas declared on an ancestor are visible to descendants (chain walk). Descendants may *extend* (add optional fields) but not *redefine* (change required field types).
 
 Base objects ship a small core schema set — `text`, `say`, `emote`, `enter`, `leave`, `look`, `take`, `drop`, `cursor`, `presence:hover`, `presence:idle`. Whether any of these reach a subscriber as part of an applied frame or as a live observation depends on whether the verb that emitted it was sequenced. New event types are open-world; objects don't have to declare a schema to emit one.
+
+### 13.1 Movement observation vocabulary is per-catalog
+
+Movement is the canonical example of catalog-extensible observation
+vocabulary. **The substrate does not guarantee a uniform shape for
+"the actor moved" events**; what comes out depends on the verb the
+catalog chose to invoke.
+
+Three observed shapes from the bundled catalogs:
+
+| Verb path | Observations |
+|---|---|
+| `the_chatroom:southeast → the_deck` | `left`, `entered` (chat catalog's room/exit baseline). |
+| `the_deck:east → the_hot_tub` | `text`, `left`, `entered` — exits may add flavor text via an extra `text` observation alongside the standard pair. |
+| `the_dubspace:enter` | `dubspace_entered`, `dubspace_activity` — catalog-specific types because dubspace entry has its own semantics (operator roster, mount-room announcement). |
+
+Clients MUST treat the movement observation surface as open: catalogs
+can introduce new types and extra observations, and the same logical
+event ("actor changed scope") can produce different observation
+sequences depending on whose verb composed the move. The `left`/
+`entered` core schemas (§13 list above) describe the *common* fields
+that bundled rooms emit, but catalogs are free to additionally emit
+their own typed observations from `:enter`, `:leave`, `:moveto`, or
+exit verbs as long as they declare the schemas. Clients that need a
+single canonical "moved" event should derive it themselves from
+`session.active_scope` rather than relying on a fixed observation
+type — see [identity.md](identity.md) for the session-state model.
