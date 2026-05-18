@@ -104,18 +104,55 @@ doubles[2] = count          (kind-specific primary: rows | audience_size |
 
 The full vitest suite (934 tests) is unaffected by the change.
 
-## Step 2 — `/admin/` UI (next branch)
-
-Out of scope here. Sketch:
+## Step 2a — `/admin/` UI scaffolding (shipped)
 
 - HTTP Basic auth, single fixed user `admin`, password from
-  `env.ADMIN_PASSWORD` (Cloudflare secret).
-- `/admin/series?metric=...&groupBy=host_key|scope|class|kind|error_detail&from=&to=&bucket=`
+  `env.ADMIN_PASSWORD` (Cloudflare secret). Fails closed at 503 when
+  the secret is unset.
+- `/admin/series?metric=...&groupBy=…&from=&to=&bucket=&filter.…`
   proxies to the AE SQL API with `Account Analytics:Read`.
-- Three pivots (host_key / scope / class), one error-rate chart, one
-  footprint table (per-DO-class p50/p95/error%).
-- Click-drag a chart → URL hash carries the window → all panels re-query.
-- "Look deeper" produces a `wrangler tail` command preset for the window.
+- Inline HTML page (no separate asset deploy step). First-light shell
+  was a single chart with a pivot selector.
+
+## Step 2b — multi-chart dashboard
+
+- Three pivot charts side-by-side (host_key / kind / class) sharing
+  one time window — the dashboard's "who, what, where" frame.
+- Error-rate chart below them: `status=error` rows, grouped by kind.
+- Footprint table below that: per-axis `samples` / `p50_ms` / `p95_ms`
+  / `error_rate` for the same window. Axis is selectable
+  (class / host_key / route / verb / kind).
+- New endpoint `/admin/footprint?groupBy=&from=&to=&filter.=&limit=`
+  serves the table — single AE query returning sample-aware aggregates
+  (`quantileWeighted(0.5)` and `quantileWeighted(0.95)` over
+  `_sample_interval × double2`, so latency percentiles survive both
+  AE's adaptive sampling and our 1-in-N manual sampling). Default
+  `LIMIT 50`, clamped to `[1, 200]`.
+- URL hash carries the lens: `#from=<unix>&to=<unix>&filter.host_key=…`
+  so a refresh stays put and links are shareable. No hash → sliding
+  window of `range` seconds ending now; range chips (15m/1h/6h/24h/7d)
+  reset to sliding.
+- Click-drag on any chart sets a new explicit window.
+- Click a legend swatch or footprint row pins a filter on its axis;
+  filter chips render at the top and clear with ×.
+- "Copy wrangler tail" button copies a `wrangler tail woah --search`
+  command string with the active filter values, for live drill-in.
+- Auto-bucket picker — 1m for ≤2h, 5m for ≤24h, else 1h. Keeps
+  charts at ~30–120 data points without operator tuning.
+- Sliding-window refresh every 30s; frozen windows are static.
+
+### 2b coverage
+
+`tests/worker/admin.test.ts` now also pins `/admin/footprint`:
+
+- 503 when AE token/account unset.
+- 400 on unknown groupBy and on from ≥ to.
+- Happy path returns sample-aware aggregates with the expected slot
+  mapping (`blob3 AS k` for class, `blob8 = 'error'` for the error
+  numerator, `_sample_interval * double2` for the weight).
+- Limit clamped to `[1, 200]`.
+- Filters land in the WHERE clause with the correct column mapping.
+- 502 when AE itself errors.
 
 ## Decisions still open
 

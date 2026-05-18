@@ -183,3 +183,82 @@ describe("/admin/series", () => {
     expect(body.error?.code).toBe("E_AE_QUERY_FAILED");
   });
 });
+
+describe("/admin/footprint", () => {
+  const authHeaders = { authorization: basicAuthHeader("admin", "hunter2") };
+  const baseEnv = (extras: Partial<Env> = {}): Env =>
+    envOf({ ADMIN_PASSWORD: "hunter2", CF_ANALYTICS_TOKEN: "tok", CF_ACCOUNT_ID: "acct", ...extras });
+
+  it("returns 503 when CF_ANALYTICS_TOKEN or CF_ACCOUNT_ID is unset", async () => {
+    const res = await call(envOf({ ADMIN_PASSWORD: "hunter2" }), "/admin/footprint", { headers: authHeaders });
+    expect(res.status).toBe(503);
+    const body = await res.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("E_AE_NOT_CONFIGURED");
+  });
+
+  it("rejects unknown groupBy", async () => {
+    const res = await call(baseEnv(), "/admin/footprint?groupBy=nonsense", { headers: authHeaders });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects from >= to", async () => {
+    const res = await call(baseEnv(), "/admin/footprint?from=200&to=100", { headers: authHeaders });
+    expect(res.status).toBe(400);
+  });
+
+  it("happy path: per-class aggregates", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      data: [
+        { k: "PersistentObjectDO", samples: 1200, p50: 3, p95: 41, err_rate: 0.012 },
+        { k: "DirectoryDO", samples: 800, p50: 1, p95: 9, err_rate: 0 },
+        { k: "CommitScopeDO", samples: 300, p50: 5, p95: 22, err_rate: 0.02 }
+      ]
+    }), { status: 200 }));
+
+    const res = await call(baseEnv(), "/admin/footprint?groupBy=class", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { groupBy: string; rows: Array<{ key: string; samples: number; p50_ms: number; p95_ms: number; error_rate: number }> };
+    expect(body.groupBy).toBe("class");
+    expect(body.rows).toHaveLength(3);
+    expect(body.rows[0]!.key).toBe("PersistentObjectDO");
+    expect(body.rows[0]!.samples).toBe(1200);
+    expect(body.rows[0]!.p95_ms).toBe(41);
+    expect(body.rows[0]!.error_rate).toBeCloseTo(0.012);
+
+    const sql = String(fetchSpy.mock.calls[0]![1]?.body);
+    // Aggregates are sample-aware so they reconstruct from sampled rows.
+    expect(sql).toContain("SUM(_sample_interval * double2) AS samples");
+    expect(sql).toContain("quantileWeighted(0.5)(double1, toUInt32(_sample_interval * double2)) AS p50");
+    expect(sql).toContain("quantileWeighted(0.95)(double1, toUInt32(_sample_interval * double2)) AS p95");
+    expect(sql).toContain("blob8 = 'error'");
+    // Default groupBy is class → blob3.
+    expect(sql).toContain("blob3 AS k");
+    expect(sql).toContain("LIMIT 50");
+  });
+
+  it("clamps limit to [1, 200]", async () => {
+    // Fresh Response per call — Body can only be read once.
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    await call(baseEnv(), "/admin/footprint?limit=999", { headers: authHeaders });
+    expect(String(fetchSpy.mock.calls[0]![1]?.body)).toContain("LIMIT 200");
+
+    fetchSpy.mockClear();
+    await call(baseEnv(), "/admin/footprint?limit=-3", { headers: authHeaders });
+    expect(String(fetchSpy.mock.calls[0]![1]?.body)).toContain("LIMIT 50");
+  });
+
+  it("applies filters to the SQL", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    await call(baseEnv(), "/admin/footprint?groupBy=route&filter.host_key=the_chatroom&filter.status=error", { headers: authHeaders });
+    const sql = String(fetchSpy.mock.calls[0]![1]?.body);
+    expect(sql).toContain("blob4 AS k");
+    expect(sql).toContain("index1 = 'the_chatroom'");
+    expect(sql).toContain("blob8 = 'error'");
+  });
+
+  it("returns 502 when AE errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("nope", { status: 500 }));
+    const res = await call(baseEnv(), "/admin/footprint", { headers: authHeaders });
+    expect(res.status).toBe(502);
+  });
+});
