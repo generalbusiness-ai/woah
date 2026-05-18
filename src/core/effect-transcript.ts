@@ -81,7 +81,7 @@ export type TranscriptCellRead = { ok: true; version?: string; value: WooValue }
 
 export type TranscriptCellReader = {
   serialized: SerializedWorld;
-  objectById: Map<ObjRef, SerializedWorld["objects"][number]>;
+  objectById: ReadonlyMap<ObjRef, SerializedWorld["objects"][number]>;
   propertiesByObject: Map<ObjRef, Map<string, WooValue>>;
   propertyDefsByObject: Map<ObjRef, Map<string, SerializedWorld["objects"][number]["propertyDefs"][number]>>;
   propertyVersionsByObject: Map<ObjRef, Map<string, number | string>>;
@@ -237,7 +237,10 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
 }
 
 export function validateTranscriptAgainstSerializedWorld(serializedBefore: SerializedWorld, transcript: EffectTranscript): TranscriptValidation {
-  const reader = createTranscriptCellReader(serializedBefore);
+  return validateTranscriptWithCellReader(createTranscriptCellReader(serializedBefore), transcript);
+}
+
+export function validateTranscriptWithCellReader(reader: TranscriptCellReader, transcript: EffectTranscript): TranscriptValidation {
   const errors: string[] = [];
 
   for (const read of transcript.reads) {
@@ -324,7 +327,10 @@ function lastMoveForObject(transcript: EffectTranscript, object: ObjRef): Transc
 }
 
 export function transcriptTouchedStateHash(serialized: SerializedWorld, transcript: EffectTranscript): string {
-  const reader = createTranscriptCellReader(serialized);
+  return transcriptTouchedStateHashWithReader(createTranscriptCellReader(serialized), transcript);
+}
+
+export function transcriptTouchedStateHashWithReader(reader: TranscriptCellReader, transcript: EffectTranscript): string {
   const cells = uniqueTranscriptCells(transcript);
   const snapshot = cells.map((cell) => {
     const actual = readTranscriptCell(reader, cell);
@@ -343,23 +349,30 @@ export function readTranscriptCellFromSerializedWorld(serialized: SerializedWorl
 }
 
 export function createTranscriptCellReader(serialized: SerializedWorld): TranscriptCellReader {
-  const propertiesByObject = new Map<ObjRef, Map<string, WooValue>>();
-  const propertyDefsByObject = new Map<ObjRef, Map<string, SerializedWorld["objects"][number]["propertyDefs"][number]>>();
-  const propertyVersionsByObject = new Map<ObjRef, Map<string, number | string>>();
-  const verbsByObject = new Map<ObjRef, SerializedWorld["objects"][number]["verbs"]>();
-  for (const obj of serialized.objects) {
-    propertiesByObject.set(obj.id, new Map(obj.properties));
-    propertyDefsByObject.set(obj.id, new Map(obj.propertyDefs.map((def) => [def.name, def] as const)));
-    propertyVersionsByObject.set(obj.id, new Map(obj.propertyVersions));
-    verbsByObject.set(obj.id, obj.verbs);
-  }
+  return createTranscriptCellReaderFromObjects(serialized, serialized.objects);
+}
+
+export function createTranscriptCellReaderFromObjects(
+  serialized: SerializedWorld,
+  objects: Iterable<SerializedWorld["objects"][number]>
+): TranscriptCellReader {
+  return createTranscriptCellReaderFromObjectMap(
+    serialized,
+    new Map(Array.from(objects, (obj) => [obj.id, obj] as const))
+  );
+}
+
+export function createTranscriptCellReaderFromObjectMap(
+  serialized: SerializedWorld,
+  objectById: ReadonlyMap<ObjRef, SerializedWorld["objects"][number]>
+): TranscriptCellReader {
   return {
     serialized,
-    objectById: new Map(serialized.objects.map((obj) => [obj.id, obj])),
-    propertiesByObject,
-    propertyDefsByObject,
-    propertyVersionsByObject,
-    verbsByObject
+    objectById,
+    propertiesByObject: new Map(),
+    propertyDefsByObject: new Map(),
+    propertyVersionsByObject: new Map(),
+    verbsByObject: new Map()
   };
 }
 
@@ -414,7 +427,7 @@ function propVersion(reader: TranscriptCellReader, object: ObjRef, name: string)
   const obj = serializedObject(reader, object);
   if (!obj) return undefined;
   if (name === "owner") return shadowOwnerCellVersion(object, obj.owner);
-  return reader.propertyVersionsByObject.get(object)?.get(name) ?? 0;
+  return readerPropertyVersions(reader, obj).get(name) ?? 0;
 }
 
 function serializedObject(reader: TranscriptCellReader, object: ObjRef): SerializedWorld["objects"][number] | undefined {
@@ -422,7 +435,8 @@ function serializedObject(reader: TranscriptCellReader, object: ObjRef): Seriali
 }
 
 function serializedVerb(reader: TranscriptCellReader, object: ObjRef, name: string): SerializedWorld["objects"][number]["verbs"][number] | undefined {
-  return reader.verbsByObject.get(object)?.find((verb) => verb.name === name || verb.aliases.includes(name));
+  const obj = serializedObject(reader, object);
+  return obj ? readerVerbs(reader, obj).find((verb) => verb.name === name || verb.aliases.includes(name)) : undefined;
 }
 
 function readSerializedProp(reader: TranscriptCellReader, object: ObjRef, name: string): WooValue {
@@ -448,9 +462,51 @@ function readableSerializedObject(
     name: obj.name,
     parent: obj.parent,
     owner: obj.owner,
-    properties: reader.propertiesByObject.get(obj.id) ?? new Map(),
-    propertyDefs: reader.propertyDefsByObject.get(obj.id) ?? new Map()
+    properties: readerProperties(reader, obj),
+    propertyDefs: readerPropertyDefs(reader, obj)
   };
+}
+
+function readerProperties(reader: TranscriptCellReader, obj: SerializedWorld["objects"][number]): Map<string, WooValue> {
+  let properties = reader.propertiesByObject.get(obj.id);
+  if (!properties) {
+    properties = new Map(obj.properties);
+    reader.propertiesByObject.set(obj.id, properties);
+  }
+  return properties;
+}
+
+function readerPropertyDefs(
+  reader: TranscriptCellReader,
+  obj: SerializedWorld["objects"][number]
+): Map<string, SerializedWorld["objects"][number]["propertyDefs"][number]> {
+  let defs = reader.propertyDefsByObject.get(obj.id);
+  if (!defs) {
+    defs = new Map(obj.propertyDefs.map((def) => [def.name, def] as const));
+    reader.propertyDefsByObject.set(obj.id, defs);
+  }
+  return defs;
+}
+
+function readerPropertyVersions(reader: TranscriptCellReader, obj: SerializedWorld["objects"][number]): Map<string, number | string> {
+  let versions = reader.propertyVersionsByObject.get(obj.id);
+  if (!versions) {
+    versions = new Map(obj.propertyVersions);
+    reader.propertyVersionsByObject.set(obj.id, versions);
+  }
+  return versions;
+}
+
+function readerVerbs(
+  reader: TranscriptCellReader,
+  obj: SerializedWorld["objects"][number]
+): SerializedWorld["objects"][number]["verbs"] {
+  let verbs = reader.verbsByObject.get(obj.id);
+  if (!verbs) {
+    verbs = obj.verbs;
+    reader.verbsByObject.set(obj.id, verbs);
+  }
+  return verbs;
 }
 
 function uniqueTranscriptCells(transcript: EffectTranscript): TranscriptCell[] {
