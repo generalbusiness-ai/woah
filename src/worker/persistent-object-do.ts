@@ -40,12 +40,10 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import {
-  buildShadowTurnExecEnvelope,
-  buildShadowTurnIntentEnvelope,
   createShadowBrowserRelayShim,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
@@ -54,10 +52,15 @@ import {
 } from "../core/shadow-browser-node";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
-import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 import { applyAcceptedShadowFrame, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import {
+  mergeV2TurnGatewayAuthority,
+  submitTurnIntent,
+  v2TurnGatewayAuthorityPayload,
+  v2TurnGatewayEnvelopeId
+} from "../core/v2-turn-gateway";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -207,16 +210,6 @@ function webSocketProtocols(request: Request): string[] {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-function v2SessionAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef> = []): { sessions: SerializedSession[]; session_objects: SerializedObject[]; authority: SerializedAuthoritySlice } {
-  // CommitScopeDO needs fresh bearer authority plus the live session working
-  // set before planning. The explicit authority slice stays narrow — session
-  // actors, active rooms, and caller-supplied turn objects — without smuggling
-  // a full world snapshot back across the DO boundary.
-  const sessions = world.exportSessions();
-  const authority = world.exportAuthoritySlice(sessions, extraObjectIds);
-  return { sessions: authority.sessions, session_objects: authority.objects, authority };
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -2600,7 +2593,7 @@ export class PersistentObjectDO {
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
     try {
-      const authority = v2SessionAuthorityPayload(world, [commitScope, session.actor]);
+      const authority = v2TurnGatewayAuthorityPayload(world, [commitScope, session.actor]);
       const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
         scope: commitScope,
         node,
@@ -2691,7 +2684,7 @@ export class PersistentObjectDO {
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
       const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
-        ...v2SessionAuthorityPayload(world, [att.scope, att.actor]),
+        ...v2TurnGatewayAuthorityPayload(world, [att.scope, att.actor]),
         scope: att.scope,
         node: att.node,
         token: att.token,
@@ -2742,7 +2735,7 @@ export class PersistentObjectDO {
   ): Promise<RestV2RelayClient> {
     if (forceReopen) this.restV2Relays.delete(scope);
     let client = this.restV2Relays.get(scope);
-    const authorityPayload = v2SessionAuthorityPayload(world, [scope, input.target, input.actor]);
+    const authorityPayload = v2TurnGatewayAuthorityPayload(world, [scope, input.target, input.actor]);
     if (!client) {
       const snapshot = world.exportWorld();
       client = {
@@ -2770,7 +2763,7 @@ export class PersistentObjectDO {
       return client;
     }
     this.rememberRestV2Relay(scope, client);
-    this.refreshRestV2RelayAuthority(client, authorityPayload.authority);
+    mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, authorityPayload.authority, { clone: true });
     return client;
   }
 
@@ -2784,140 +2777,42 @@ export class PersistentObjectDO {
     }
   }
 
-  private restV2EnvelopeId(id: string, attempt: number): string {
-    // CommitScopeDO caches every fresh reply by envelope id, including stale
-    // rejections. A repair retry must therefore use a new envelope id while
-    // preserving any caller-supplied turn id inside the request body.
-    return attempt === 0 ? id : `${id}:repair:${crypto.randomUUID()}`;
-  }
-
-  private refreshRestV2RelayAuthority(client: RestV2RelayClient, authority: SerializedAuthoritySlice): void {
-    const serialized = client.relay.commit_scope.serialized;
-    // Gateway-local REST planning must see the latest session location from
-    // the gateway world. One REST call may move the session in a different
-    // scope, and a later command planner must not consult stale per-scope
-    // session or room rows.
-    serialized.sessions = structuredClone(authority.sessions) as SerializedSession[];
-    const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
-    for (const obj of authority.objects) {
-      const clone = structuredClone(obj) as SerializedObject;
-      const index = byId.get(clone.id);
-      if (index === undefined) {
-        byId.set(clone.id, serialized.objects.length);
-        serialized.objects.push(clone);
-      } else {
-        serialized.objects[index] = clone;
-      }
-    }
-  }
-
-  private restV2ReplyNeedsRelayRepair(reply: ShadowTurnExecReply): boolean {
-    if (reply.ok === true) return false;
-    if (reply.reason === "missing_state") return true;
-    return reply.reason === "commit_rejected" && reply.commit?.reason === "stale_head";
-  }
-
   private async restV2Turn(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
     if (!this.env.COMMIT_SCOPE) {
       this.emitRestV2InProcessFallback(input, "no_commit_scope");
       return await this.restV2TurnInProcess(world, input);
     }
     const token = shadowBrowserSessionBearer(input.session);
-    if (input.persistence === "live") {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const client = await this.ensureRestV2Relay(world, input, input.scope, token, attempt > 0);
-        const id = input.id ?? `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`;
-        const envelopeId = this.restV2EnvelopeId(id, attempt);
-        const envelope = encodeEnvelope(buildShadowTurnIntentEnvelope({
-          ...input,
-          id,
-          envelopeId,
-          node: client.node,
-          session: input.session.id,
-          token,
-          persistence: "live"
-        }));
-        const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(input.scope, "/v2/envelope", {
-          ...v2SessionAuthorityPayload(world, [input.scope, input.target, input.actor]),
-          scope: input.scope,
-          node: client.node,
-          token,
-          session: input.session.id,
-          actor: input.actor,
-          envelope
-        });
-        const delivery = await this.deliverV2Fanout(world, input.scope, result, input.session.id);
-        if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-        const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
-        if (attempt === 0 && this.restV2ReplyNeedsRelayRepair(reply.body)) continue;
-        await this.applyV2CommittedTranscript(world, result.reply, input.session.id, delivery.localHostMaterialized);
-        return restFrameFromTurnReply(input.scope, reply.body);
-      }
-      throw wooError("E_INTERNAL", "v2 REST live turn retry exhausted");
-    }
-    const planningScope = input.scope;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const planningClient = await this.ensureRestV2Relay(world, input, planningScope, token, attempt > 0);
-      const id = input.id ?? `${planningClient.node}:turn:${planningClient.nextTurn++}:${crypto.randomUUID()}`;
-      const envelopeId = this.restV2EnvelopeId(id, attempt);
-      const call: ShadowTurnCall = {
-        kind: "woo.turn_call.shadow.v1",
-        id,
+    const submitted = await submitTurnIntent<RestV2RelayClient, CommitScopeEnvelopeResponse>({
+      input: {
+        id: input.id,
         route: input.route,
-        scope: planningScope,
+        scope: input.scope,
         session: input.session.id,
         actor: input.actor,
         target: input.target,
         verb: input.verb,
         args: input.args,
-        body: input.body
-      };
-      const planned = await runShadowTurnCall(planningClient.relay.commit_scope.serialized, call);
-      if (planned.frame.op === "error") return planned.frame;
-      const key = shadowTurnKeyFromTranscript(planned.transcript);
-      const commitScope = key.scope;
-      const commitClient = commitScope === planningScope
-        ? planningClient
-        : await this.ensureRestV2Relay(world, input, commitScope, token, attempt > 0);
-      const body: ShadowTurnExecRequest = {
-        kind: "woo.turn.exec.request.shadow.v1",
-        id,
-        call,
-        key,
-        expected: commitClient.relay.commit_scope.head,
-        auth: {
-          mode: "shadow_local",
-          actor: input.actor,
-          session: input.session.id
-        },
-        persistence: input.persistence
-      };
-      const envelope = encodeEnvelope(buildShadowTurnExecEnvelope({
-        node: commitClient.node,
-        actor: input.actor,
-        session: input.session.id,
-        token,
-        id,
-        envelopeId,
-        body
-      }));
-      const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(commitScope, "/v2/envelope", {
-        ...v2SessionAuthorityPayload(world, [commitScope, planningScope, input.target, input.actor]),
-        scope: commitScope,
-        node: commitClient.node,
-        token,
-        session: input.session.id,
-        actor: input.actor,
-        envelope
-      });
-      const delivery = await this.deliverV2Fanout(world, commitScope, result, input.session.id);
-      if (!result.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-      const reply = decodeEnvelope<ShadowTurnExecReply>(result.reply);
-      if (attempt === 0 && this.restV2ReplyNeedsRelayRepair(reply.body)) continue;
-      await this.applyV2CommittedTranscript(world, result.reply, input.session.id, delivery.localHostMaterialized);
-      return restFrameFromTurnReply(input.scope, reply.body);
-    }
-    throw wooError("E_INTERNAL", "v2 REST durable turn retry exhausted");
+        body: input.body,
+        persistence: input.persistence,
+        token
+      },
+      strategy: input.persistence === "live" ? "intent" : "planned-exec",
+      maxAttempts: 2,
+      ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
+      clientNode: (client) => client.node,
+      clientHead: (client) => client.relay.commit_scope.head,
+      clientSerialized: (client) => client.relay.commit_scope.serialized,
+      nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
+      envelopeId: (id, attempt) => v2TurnGatewayEnvelopeId(id, attempt, () => crypto.randomUUID()),
+      authorityPayload: (_scope, extraObjectIds) => v2TurnGatewayAuthorityPayload(world, extraObjectIds),
+      submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body)
+    });
+    if (submitted.kind === "local_frame") return submitted.frame;
+    const delivery = await this.deliverV2Fanout(world, submitted.commitScope, submitted.result, input.session.id);
+    if (!submitted.result.reply || !submitted.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
+    await this.applyV2CommittedTranscript(world, submitted.result.reply, input.session.id, delivery.localHostMaterialized);
+    return restFrameFromTurnReply(input.scope, submitted.reply);
   }
 
   private emitRestV2InProcessFallback(

@@ -25,7 +25,6 @@ import { McpGateway } from "../mcp/gateway";
 import {
   buildShadowBrowserSessionAuth,
   buildShadowBrowserDeltaTransfer,
-  buildShadowTurnIntentEnvelope,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
@@ -45,6 +44,11 @@ import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEn
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
+import {
+  encodeV2TurnGatewayIntentEnvelope,
+  v2TurnGatewayAuthorityObjectIds,
+  v2TurnGatewayAuthorityPayload
+} from "../core/v2-turn-gateway";
 
 // Local dev server only: HTTP authoring endpoints require a session and then
 // defer to the world's object-authoring permission checks.
@@ -362,7 +366,7 @@ function v2RelayForScope(scope: ObjRef): ShadowBrowserRelayShim {
 }
 
 function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds: Iterable<ObjRef> = []): void {
-  const authority = world.exportAuthoritySlice(world.exportSessions(), extraObjectIds);
+  const { authority } = v2TurnGatewayAuthorityPayload(world, extraObjectIds);
   const auth = buildShadowBrowserSessionAuth({
     sessions: authority.sessions,
     scope: relay.commit_scope.scope,
@@ -447,8 +451,24 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
   const browser = v2ShadowBrowser(`node:dev:rest:${input.id ?? randomUUID()}`, token, input.session, input.scope);
   refreshDevV2RelaySessions(browser.relay, [input.scope, input.target, input.actor]);
   ensureDevV2SerializedSession(browser.relay, input.session);
-  const envelope = buildShadowTurnIntentEnvelope({ ...input, node: browser.node, session: input.session.id, token });
-  const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope));
+  const encoded = encodeV2TurnGatewayIntentEnvelope({
+    node: browser.node,
+    turn: {
+      id: input.id,
+      route: input.route,
+      scope: input.scope,
+      session: input.session.id,
+      actor: input.actor,
+      target: input.target,
+      verb: input.verb,
+      args: input.args,
+      body: input.body,
+      persistence: input.persistence,
+      token
+    },
+    turnId: input.id
+  });
+  const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
   const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
   if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
   if (reply.body.commit && reply.body.transcript) {
@@ -486,9 +506,29 @@ async function handleV2ShadowFrame(
     const callScope = routing?.scope ?? null;
     const callTarget = routing?.target ?? null;
     const crossScope = !!callScope && callScope !== browser.relay.commit_scope.scope;
-    const explicitRows: ObjRef[] = crossScope
-      ? [callScope!, ...(callTarget && callTarget !== callScope ? [callTarget] : []), session.actor]
-      : [browser.relay.commit_scope.scope, ...(callTarget ? [callTarget] : []), session.actor];
+    // Verbs commonly iterate `contents(this)` and call isa/prop reads on each
+    // member (e.g. $outliner:list_items, $room:look_self). The relay's
+    // serialized snapshot must therefore include those contained objects, not
+    // just the target itself — otherwise isa throws E_OBJNF on items created
+    // by earlier commits in the same session. The REST path's per-request
+    // relay reuses a fully-refreshed shim so it hits this naturally; the WS
+    // path's persistent relay misses it unless we ask explicitly.
+    const baseTarget = crossScope ? callScope! : browser.relay.commit_scope.scope;
+    const containerForContents = callTarget ?? baseTarget;
+    const containerContents = world.objects.has(containerForContents)
+      ? Array.from(world.object(containerForContents).contents)
+      : [];
+    const explicitRows = v2TurnGatewayAuthorityObjectIds({
+      scope: callScope ?? browser.relay.commit_scope.scope,
+      target: callTarget ?? undefined,
+      actor: session.actor
+    });
+    const seenExplicitRows = new Set(explicitRows);
+    for (const id of containerContents) {
+      if (seenExplicitRows.has(id)) continue;
+      seenExplicitRows.add(id);
+      explicitRows.push(id);
+    }
     const targetRelay = crossScope ? v2RelayForScope(callScope!) : browser.relay;
     // Refresh wipes session_auth and then re-registers wire tokens only
     // for browsers tracked in `relay.browsers`. The WS-bound `browser` is

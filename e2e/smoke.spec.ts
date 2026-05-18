@@ -321,6 +321,45 @@ test("generic tool view mounts a catalog space-workspace frame", async ({ page }
   await expect(tree.getByRole("button", { name: "Enter" })).toBeVisible({ timeout: 5_000 });
 });
 
+test("outliner displays items added via the UI", async ({ page }) => {
+  // Regression: outliner-tree hydrate must use `woo.directCall` (returns the
+  // verb's result) — not `woo.call` (fire-and-forget, returns the request
+  // id). If list_items resolves to a UUID string, `Array.isArray(items)` is
+  // false and the tree renders with zero rows. Clicking a twisty then makes
+  // the (already-empty) tree look like it "disappeared." Also asserts the
+  // observation reducer's hydrate isn't dropped while the initial hydrate is
+  // still in flight, and that direct reads see post-commit state — the
+  // dev relay's live_session_serialized snapshot must rebase on accepted
+  // sequenced commits, otherwise the new item appears written but is
+  // invisible to the next list_items.
+  const tag = `e2e${Math.random().toString(36).slice(2, 8)}`;
+  const parentText = `parent-${tag}`;
+  const childText = `child-${tag}`;
+  await page.goto("/objects/the_outline?view=tool");
+  await continueAsGuestIfPrompted(page);
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  const tree = page.locator("woo-outliner-tree[data-generic-tool-workspace]");
+  await expect(tree).toBeVisible();
+  await tree.getByRole("button", { name: "Enter" }).click();
+  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+
+  // Add a root-level item via the form. Use keyboard Enter — Playwright
+  // "fill" then click on the submit button has occasional races where the
+  // submit handler reads the input value mid-render.
+  const addInput = tree.locator("[data-outliner-add] input[name=text]");
+  await addInput.fill(parentText);
+  await addInput.press("Enter");
+  const parentRow = tree.locator(".outliner-row").filter({ hasText: parentText });
+  await expect(parentRow).toHaveCount(1, { timeout: 5_000 });
+
+  // Add a second item to confirm the observation reducer's coalesced
+  // hydrate picks up the new row even while a prior hydrate is in flight.
+  await addInput.fill(`${parentText}-b`);
+  await addInput.press("Enter");
+  await expect(tree.locator(".outliner-row").filter({ hasText: `${parentText}-b` })).toHaveCount(1, { timeout: 5_000 });
+  void childText;
+});
+
 test("space chat panel bottoms are visually aligned", async ({ page, request }) => {
   const response = await request.post("/api/auth", { data: { token: "guest:e2e-chat-alignment" } });
   expect(response.ok()).toBe(true);
