@@ -41,7 +41,7 @@ import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteTool
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
-import { createHostOperationMemo, normalizeError, type ParkedTaskRun } from "../core/world";
+import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import {
   createShadowBrowserRelayShim,
@@ -53,7 +53,7 @@ import {
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
-import { runShadowTurnCall, type ShadowTurnCall } from "../core/shadow-turn-call";
+import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import {
   mergeV2TurnGatewayAuthority,
@@ -151,7 +151,6 @@ const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
 const MCP_GATEWAY_SHARD_CACHE_TTL_MS = 2_000;
-const REMOTE_ROUTE_SYNC_TTL_MS = 60_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
@@ -261,12 +260,6 @@ export class PersistentObjectDO {
   private routeCache = new Map<ObjRef, string>();
   private publishedRoutes = new Map<ObjRef, string>();
   private routesRegistered = false;
-  // Last time we synced routes from a given remote host. Cross-host
-  // `registerRemoteObjectRoutes` is a best-effort accelerator — fetching
-  // a remote's full route list after every cross-host call is wasted when
-  // the satellite's slice has not added objects, which is the common case.
-  // Throttle to one round-trip per host per `REMOTE_ROUTE_SYNC_TTL_MS`.
-  private remoteRouteSyncAt = new Map<string, number>();
   private mcpGateway: McpGateway | null = null;
   private activeMcpShardCache: { expiresAt: number; hosts: string[] } | null = null;
   // Gateway-owned REST relays mirror the browser/MCP open-once shape. Keep a
@@ -1276,14 +1269,13 @@ export class PersistentObjectDO {
 
   private async registerRoutes(routes: Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>): Promise<boolean> {
     // Per-frame dedup: skip routes whose (id → host) mapping is already
-    // published by this DO. Without this filter, every session register,
-    // every cross-host call's `registerRemoteObjectRoutes`, and every
-    // single-route adopt path fired a signed RPC even when the directory
-    // would have written zero rows. The directory's `register-objects`
-    // metric showed `routes:1 writes:0` on basically every call — the
-    // round-trip itself was the cost. We still emit when any route is
-    // new or has changed host (e.g. host-placement migration moves an
-    // object), so directory acceleration stays current.
+    // published by this DO. Without this filter, repeated session registration
+    // and single-route adoption fired signed RPCs even when the directory would
+    // have written zero rows. The directory's `register-objects` metric showed
+    // `routes:1 writes:0` on basically every call — the round-trip itself was
+    // the cost. We still emit when any route is new or has changed host (e.g.
+    // host-placement migration moves an object), so directory acceleration
+    // stays current.
     const fresh = routes.filter((route) => this.publishedRoutes.get(route.id) !== route.host);
     if (fresh.length === 0) return true;
     try {
@@ -1869,35 +1861,6 @@ export class PersistentObjectDO {
       message: ctx.message,
       moveto_stack: ctx.movetoStack ? Array.from(ctx.movetoStack) : []
     };
-  }
-
-  private async registerRemoteObjectRoutes(host: string): Promise<void> {
-    // Throttle the per-host route sync. The remote's slice changes
-    // rarely (catalog installs, host_placement migrations, new actors
-    // created on it); meanwhile every cross-host call lands here and
-    // would otherwise pay a `/__internal/object-routes` round-trip plus
-    // a directory register-objects RPC every single time. Acceleration
-    // is best-effort, so a stale view costs at most one extra
-    // resolve-object lookup.
-    const now = Date.now();
-    const last = this.remoteRouteSyncAt.get(host);
-    if (last !== undefined && now - last < REMOTE_ROUTE_SYNC_TTL_MS) return;
-    this.remoteRouteSyncAt.set(host, now);
-    try {
-      const routes = await this.forwardInternal<Array<{ id: ObjRef; host: string; anchor: ObjRef | null }>>(host, "/__internal/object-routes", {});
-      const ok = await this.registerRoutes(routes.filter((route) => route.host === host));
-      // registerRoutes returns false when the directory publish itself
-      // failed (non-OK status, transport error). Drop the throttle entry
-      // so the next caller retries instead of suppressing for the full
-      // TTL — directory acceleration is best-effort but the comment
-      // promised retry on failure, and forgetting to honor that
-      // contract turned a transient publish failure into a 60s blackout.
-      if (!ok) this.remoteRouteSyncAt.delete(host);
-    } catch {
-      // Fetch threw (transport, timeout, etc.). Same retry semantics as
-      // a failed publish — drop the throttle entry.
-      this.remoteRouteSyncAt.delete(host);
-    }
   }
 
   private async handleInternal(request: Request, world: WooWorld, pathname: string, hostKey: string): Promise<Response> {
@@ -3138,10 +3101,6 @@ export class PersistentObjectDO {
     };
   }
 
-  private async resolveObjectHost(id: ObjRef, fallbackHost: string): Promise<string> {
-    return await this.resolveObjectHostForWorld(this.world, id, fallbackHost);
-  }
-
   // Helper used at every cross-host verb-dispatch site to (a) probe verb
   // purity from the local class registry and (b) emit a `dispatch_resolved`
   // event so we always have a tail trace of the verb routed to which host
@@ -3341,58 +3300,40 @@ export class PersistentObjectDO {
     return await this.forwardInternalChecked<T>(host, path, body, { timeoutMs: this.hostReadRpcTimeoutMs() });
   }
 
-  private forwardBody(
-    world: WooWorld,
-    session: { sessionId: string; actor: ObjRef },
-    extra: Record<string, unknown>
-  ): Record<string, unknown> {
-    const local = world.sessions.get(session.sessionId);
-    return {
-      session_id: session.sessionId,
-      actor: session.actor,
-      expires_at: local?.expiresAt ?? Date.now() + 5 * 60_000,
-      token_class: local?.tokenClass ?? "bearer",
-      active_scope: local?.activeScope ?? null,
-      current_location: local?.activeScope ?? null,
-      ...(local?.apikeyId !== undefined ? { apikey_id: local.apikeyId } : {}),
-      ...extra
-    };
-  }
-
-    private broadcastApplied(world: WooWorld, frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
-      const startedAt = Date.now();
-      const data = JSON.stringify(frame);
-      const publicFrame = publicAppliedFrame(frame);
-      const dataNoId = JSON.stringify(publicFrame);
-      let audienceSize = 0;
-      if (originator?.readyState === WebSocket.OPEN) {
+  private broadcastApplied(world: WooWorld, frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): void {
+    const startedAt = Date.now();
+    const data = JSON.stringify(frame);
+    const publicFrame = publicAppliedFrame(frame);
+    const dataNoId = JSON.stringify(publicFrame);
+    let audienceSize = 0;
+    if (originator?.readyState === WebSocket.OPEN) {
+      try {
+        originator.send(data);
+        audienceSize += 1;
+      } catch {
+        // socket gone; webSocketClose will clean up
+      }
+    }
+    const sendSockets = (sockets: Set<WebSocket> | undefined): void => {
+      if (!sockets) return;
+      for (const ws of sockets) {
+        if (ws === originator) continue;
+        audienceSize += 1;
         try {
-          originator.send(data);
-          audienceSize += 1;
+          ws.send(dataNoId);
         } catch {
           // socket gone; webSocketClose will clean up
         }
       }
-      const sendSockets = (sockets: Set<WebSocket> | undefined): void => {
-        if (!sockets) return;
-        for (const ws of sockets) {
-          if (ws === originator) continue;
-          audienceSize += 1;
-          try {
-            ws.send(dataNoId);
-          } catch {
-            // socket gone; webSocketClose will clean up
-          }
-        }
-      };
-      if (frame.audienceSessions) {
-        for (const sessionId of frame.audienceSessions) sendSockets(this.socketsBySession.get(sessionId));
-      } else {
-        const audience = world.presenceActorsIn(frame.space);
-        if (audience) {
-          for (const actor of audience) sendSockets(this.socketsByActor.get(actor));
-        }
+    };
+    if (frame.audienceSessions) {
+      for (const sessionId of frame.audienceSessions) sendSockets(this.socketsBySession.get(sessionId));
+    } else {
+      const audience = world.presenceActorsIn(frame.space);
+      if (audience) {
+        for (const actor of audience) sendSockets(this.socketsByActor.get(actor));
       }
+    }
     this.mcpGateway?.routeAppliedFrame(publicFrame, originMcpSessionId ?? null);
     world.recordMetric({ kind: "broadcast", audience_size: audienceSize, obs_count: frame.observations.length, ms: Date.now() - startedAt });
   }
@@ -3400,24 +3341,6 @@ export class PersistentObjectDO {
   private async handleAppliedFrame(world: WooWorld, frame: AppliedFrame, originator?: WebSocket, originMcpSessionId?: string | null): Promise<void> {
     if (this.durableHostKey() === WORLD_HOST) await this.registerIncrementalObjectRoutes(world);
     this.broadcastApplied(world, frame, originator, originMcpSessionId);
-  }
-
-  private broadcastTaskResult(world: WooWorld, result: ParkedTaskRun): void {
-    if (result.frame?.op === "applied") {
-      this.broadcastApplied(world, result.frame);
-      return;
-    }
-    const space = taskResultSpace(result);
-    const data = JSON.stringify({ op: "task", task: result.task.id, space, observations: result.observations });
-    const audience = world.presenceActorsIn(space);
-    if (!audience) return;
-    for (const actor of audience) {
-      const sockets = this.socketsByActor.get(actor);
-      if (!sockets) continue;
-      for (const ws of sockets) {
-        try { ws.send(data); } catch { /* gone */ }
-      }
-    }
   }
 
   private broadcastLiveEvents(world: WooWorld, result: DirectResultFrame, originMcpSessionId?: string | null, originator?: WebSocket): void {
@@ -3492,15 +3415,6 @@ function memoizeHostOperation<T>(cache: Map<string, Promise<unknown>>, key: stri
   const promise = load();
   cache.set(key, promise as Promise<unknown>);
   return promise;
-}
-
-function taskResultSpace(result: ParkedTaskRun): ObjRef {
-  const serialized = result.task.serialized as unknown;
-  if (serialized && typeof serialized === "object" && !Array.isArray(serialized)) {
-    const space = (serialized as Record<string, unknown>).space;
-    if (typeof space === "string") return space as ObjRef;
-  }
-  return result.task.parked_on;
 }
 
 function workerRestRequest(request: Request, pathname: string): RestProtocolRequest {

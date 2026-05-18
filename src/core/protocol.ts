@@ -578,7 +578,3 @@ function messageFromRestMap(host: RestProtocolHost, request: RestProtocolRequest
     body: value.body && typeof value.body === "object" && !Array.isArray(value.body) ? value.body as Record<string, WooValue> : undefined
   };
 }
-
-function frameId(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}

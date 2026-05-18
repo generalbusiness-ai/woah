@@ -573,11 +573,11 @@ describe("McpHost", () => {
     const session = world.auth("guest:mcp-enclosing-space-restore");
     const passedScopes: Array<{ verb: string; scope: ObjRef | null | undefined }> = [];
     const host = new McpHost(world, {
-      direct: async (_sessionId, actor, target, verb, _args, scope) => {
+      direct: async (_sessionId, _actor, _target, verb, _args, scope) => {
         passedScopes.push({ verb, scope });
         return { op: "result", result: null, observations: [], audience: null };
       },
-      call: async (_sessionId, actor, space, message) => {
+      call: async (_sessionId, _actor, space, message) => {
         passedScopes.push({ verb: message.verb, scope: space });
         return { op: "applied", space, seq: 1, ts: 0, message, observations: [] };
       }

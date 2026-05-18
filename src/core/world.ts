@@ -41,8 +41,7 @@ import {
   nextObjectCounterForCreates,
   serializedObjectForTranscriptCreate,
   transcriptLogEntry,
-  transcriptSessionActiveScope,
-  transcriptTouchedObjectIds
+  transcriptSessionActiveScope
 } from "./shadow-commit-scope";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
@@ -4956,20 +4955,6 @@ export class WooWorld {
     return { definer: objRef, verb };
   }
 
-  private selectOwnVerbSlot(objRef: ObjRef, descriptor: WooValue): { slot: number; verb: VerbDef } {
-    const obj = this.object(objRef);
-    if (typeof descriptor === "number") {
-      if (!Number.isInteger(descriptor) || descriptor < 1) throw wooError("E_INVARG", "verb slot must be a positive integer", descriptor);
-      const verb = obj.verbs[descriptor - 1];
-      if (!verb) throw wooError("E_VERBNF", `verb slot not found: ${objRef}:${descriptor}`, { obj: objRef, slot: descriptor });
-      return { slot: descriptor, verb };
-    }
-    const name = assertVerbNameDescriptor(descriptor);
-    const index = obj.verbs.findIndex((verb) => verb.name === name || verb.aliases.some((alias) => verbAliasMatches(alias, name)));
-    if (index < 0) throw wooError("E_VERBNF", `own verb not found: ${objRef}:${name}`, { obj: objRef, name });
-    return { slot: index + 1, verb: obj.verbs[index] };
-  }
-
   private selectOwnVerbForInstall(
     objRef: ObjRef,
     descriptor: WooValue,
@@ -9177,7 +9162,7 @@ export class WooWorld {
     return { summaries, remoteCount: remoteIds.length, batchCount: remoteIds.length };
   }
 
-  async presentActorsIn(ctx: CallContext, space: ObjRef): Promise<ObjRef[]> {
+  async presentActorsIn(_ctx: CallContext, space: ObjRef): Promise<ObjRef[]> {
     const sessions = this.presenceSessionsIn(space);
     if (!sessions) return [];
     const actors = new Set<ObjRef>();
@@ -9360,25 +9345,6 @@ export class WooWorld {
     } as unknown as WooValue;
   }
 
-  private formatWhoDuration(seconds: number | null): string {
-    if (seconds === null) return "-";
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h`;
-    return `${Math.floor(hours / 24)}d`;
-  }
-
-  private formatWhoLastLogin(at: number | null): string {
-    if (at === null) return "unknown";
-    return new Date(at).toISOString().slice(0, 10);
-  }
-
-  private playerNameTokens(input: string): string[] {
-    return input.split(/\s+/).map((token) => token.trim()).filter(Boolean);
-  }
-
   private matchPlayerForCommand(input: string): ObjRef | null {
     const wanted = input.trim().toLowerCase();
     if (!wanted) return null;
@@ -9494,16 +9460,9 @@ export class WooWorld {
 
   // Cross-host-aware display name. The local stub of a remote object
   // (created by ensureInternalActor on cross-host /__internal/remote-dispatch)
-  // carries `name = id` rather than the authoritative display name, so we
-  // Render an id in eval-pasteable form: corenames keep their `$` prefix,
-  // ULID-shape ids gain a `#` so they tokenize as objref literals (see
-  // dsl-compiler.ts ref()).
-  private formatPasteableObjRef(id: ObjRef): string {
-    return id.startsWith("$") ? id : `#${id}`;
-  }
-
-  // always RPC to the owning host when the object is remote — even when a
-  // stub happens to be present locally.
+  // carries `name = id` rather than the authoritative display name, so always
+  // RPC to the owning host when the object is remote — even when a stub happens
+  // to be present locally.
   private async objectDisplayNameAsync(progr: ObjRef, objRef: ObjRef, memo?: HostOperationMemo): Promise<string> {
     if (await this.remoteHostForObject(objRef, memo)) {
       try {
@@ -10153,11 +10112,6 @@ function optionMaybeString(options: Record<string, WooValue>, name: string): str
   return typeof value === "string" ? value : undefined;
 }
 
-function optionMaybeBool(options: Record<string, WooValue>, name: string): boolean | undefined {
-  const value = options[name];
-  return typeof value === "boolean" ? value : undefined;
-}
-
 function optionObjOrNull(options: Record<string, WooValue>, name: string, fallback: ObjRef | null): ObjRef | null {
   if (!hasOption(options, name)) return fallback;
   const value = options[name];
@@ -10208,18 +10162,6 @@ function valueSummary(value: WooValue, maxBytes: number): string {
   else summary = `map(${Object.keys(value).length}) ${JSON.stringify(value)}`;
   if (summary.length <= maxBytes) return summary;
   return `${summary.slice(0, Math.max(0, maxBytes - 3))}...`;
-}
-
-function propertyDefSummary(def: PropertyDef, definedOn: ObjRef): Record<string, WooValue> {
-  return {
-    name: def.name,
-    owner: def.owner,
-    perms: def.perms,
-    defined_on: definedOn,
-    type_hint: def.typeHint ?? null,
-    default_summary: valueSummary(def.defaultValue, 512),
-    version: def.version
-  };
 }
 
 function typeHintForValue(value: WooValue): string {
@@ -10470,10 +10412,6 @@ function commandPersistenceHint(argSpec: Record<string, WooValue> | undefined): 
   return policy === "durable" || policy === "live" ? policy : null;
 }
 
-function addUnique<T>(items: T[], item: T): T[] {
-  return items.includes(item) ? items : [...items, item];
-}
-
 function uniqueVerbNames(verbs: VerbDef[]): string[] {
   return Array.from(new Set(verbs.map((verb) => verb.name)));
 }
@@ -10485,10 +10423,6 @@ function assertVerbNameDescriptor(value: WooValue): string {
 
 function titleFromSummary(fallback: ObjRef, summary: HostObjectSummary): string {
   return typeof summary.name === "string" && summary.name.length > 0 ? summary.name : fallback;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function valueToText(value: WooValue): string {

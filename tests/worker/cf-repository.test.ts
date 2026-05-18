@@ -7,8 +7,7 @@ import {
   createShadowBrowserRelayShim,
   openShadowBrowserScope,
   setShadowBrowserSessionToken,
-  shadowBrowserEnvelope,
-  type ShadowBrowserNode
+  shadowBrowserEnvelope
 } from "../../src/core/shadow-browser-node";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
@@ -2163,7 +2162,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(horoscopeRoute).toMatchObject({ host: "the_deck" });
       gateway.routeCache.set("the_horoscope", "world");
       gateway.publishedRoutes.set("the_horoscope", "world");
-      const repairedHost = await gateway.resolveObjectHost("the_horoscope" as ObjRef, "world");
+      const repairedHost = await (gatewayWorld as any).hostBridge.hostForObject("the_horoscope" as ObjRef);
       expect(repairedHost).toBe("the_deck");
       expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
       expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
@@ -2178,7 +2177,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       gateway.publishedRoutes.delete("the_horoscope");
       gateway.registerRoutes = async () => false;
       try {
-        const localHost = await gateway.resolveObjectHost("the_horoscope" as ObjRef, "world");
+        const localHost = await (gatewayWorld as any).hostBridge.hostForObject("the_horoscope" as ObjRef);
         expect(localHost).toBe("the_deck");
         expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
         expect(gateway.publishedRoutes.has("the_horoscope")).toBe(false);
@@ -2691,7 +2690,6 @@ describe("CFObjectRepository production-shape coverage", () => {
     try {
       const auth = await post("/api/auth", { token: "wizard:cf-apikey-owner-mint-token" });
       expect(auth.status).toBe(200);
-      const wizardSession = String(auth.body.session);
 
       // Seed an owner actor and a target actor owned by them. The wizard
       // creates both; afterwards the owner authenticates and mints a key

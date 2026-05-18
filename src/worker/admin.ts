@@ -51,7 +51,7 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
   }
 
   if (url.pathname === "/admin/series") {
-    return await handleSeries(request, env, url);
+    return await handleSeries(env, url);
   }
 
   if (url.pathname === "/admin/footprint") {
@@ -140,7 +140,7 @@ const BUCKET_SECONDS: Record<string, number> = {
   "1h": 3600
 };
 
-async function handleSeries(request: Request, env: Env, url: URL): Promise<Response> {
+async function handleSeries(env: Env, url: URL): Promise<Response> {
   if (!env.CF_ANALYTICS_TOKEN || !env.CF_ACCOUNT_ID) {
     return jsonResponse({
       error: {

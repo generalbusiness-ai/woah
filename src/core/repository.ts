@@ -1,4 +1,4 @@
-import { cloneValue, wooError, type ErrorValue, type Message, type ObjRef, type Observation, type PropertyDef, type Session, type SpaceLogEntry, type VerbDef, type WooObject, type WooValue } from "./types";
+import { wooError, type ErrorValue, type Message, type ObjRef, type Observation, type PropertyDef, type SpaceLogEntry, type VerbDef, type WooObject, type WooValue } from "./types";
 
 export type SerializedObject = {
   id: ObjRef;

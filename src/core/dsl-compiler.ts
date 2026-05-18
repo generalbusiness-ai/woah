@@ -1,6 +1,6 @@
 import { hashSource } from "./source-hash";
 import type { CompileDiagnostic, CompileResult, TinyBytecode, TinyOp, VerbCallSite, WooValue } from "./types";
-import { valuesEqual, wooError } from "./types";
+import { valuesEqual } from "./types";
 
 type Span = {
   index: number;

@@ -710,16 +710,10 @@ function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
   return out;
 }
 
-function verbsDeepEqual(left: VerbDef[], right: VerbDef[]): boolean {
-  return verbsDiff(left, right) === null;
-}
-
 /** Returns null when the two verb lists are merge-equivalent, otherwise a
- * short string describing the first concrete divergence. Used both as the
- * core comparison (`verbsDeepEqual` now wraps this) and as a structured
- * diagnostic input — when `mergeSeedObject` decides to take seed verbs,
- * the same string surfaces in `host_seed_merge_diff` so we can see which
- * field actually drove the change instead of guessing post-hoc. */
+ * short string describing the first concrete divergence. `mergeSeedObject`
+ * surfaces this in `host_seed_merge_diff` so we can see which field drove a
+ * seed-verb update instead of guessing post-hoc. */
 function verbsDiff(left: VerbDef[], right: VerbDef[]): string | null {
   if (left.length !== right.length) {
     return `length stored=${left.length} seed=${right.length}`;
@@ -750,10 +744,6 @@ function verbsDiff(left: VerbDef[], right: VerbDef[]): string | null {
     }
   }
   return null;
-}
-
-function verbMetadataEqual(a: VerbDef, b: VerbDef): boolean {
-  return verbMetadataDiff(a, b) === null;
 }
 
 /** Returns null when authoritative verb metadata matches, otherwise a

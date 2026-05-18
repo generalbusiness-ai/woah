@@ -20,7 +20,6 @@
 
 import { escapeHtml, type WooComponentRegistry } from "../../../src/client/framework";
 
-const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 
 export type Timeseries = {

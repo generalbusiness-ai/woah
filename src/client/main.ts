@@ -657,14 +657,6 @@ function storeAuthMethod(method: AuthMethod) {
   writeStorage(authMethodKey, method);
 }
 
-function clearAuthMethod() {
-  try {
-    localStorage.removeItem(authMethodKey);
-  } catch {
-    // Ignore.
-  }
-}
-
 function isSessionExpiredError(err: unknown): err is SessionExpiredError {
   return err instanceof SessionExpiredError;
 }
@@ -1054,25 +1046,6 @@ const lastChatSeparatorAtBySource = new Map<string, number>();
 
 async function refresh() {
   await refreshScopedProjection();
-}
-
-async function refreshScopedProjectionSmoke() {
-  try {
-    const [meResponse, catalogsResponse] = await Promise.all([
-      trackedFetch("/api/me", { headers: authHeaders() }),
-      trackedFetch("/api/catalogs/ui", { headers: authHeaders() })
-    ]);
-    throwIfAuthExpired(meResponse, "/api/me");
-    throwIfAuthExpired(catalogsResponse, "/api/catalogs/ui");
-    if (!meResponse.ok) throw new Error(`/api/me ${meResponse.status}`);
-    if (!catalogsResponse.ok) throw new Error(`/api/catalogs/ui ${catalogsResponse.status}`);
-    state.scopedProjectionSmoke = {
-      me: await meResponse.json(),
-      catalogs: await catalogsResponse.json()
-    };
-  } catch (err) {
-    state.scopedProjectionSmoke = { error: err instanceof Error ? err.message : String(err) };
-  }
 }
 
 async function refreshScopedProjection() {
@@ -1874,13 +1847,6 @@ function activeChatRoom() {
   return state.tab === "chat" ? defaultChatRoom() : "";
 }
 
-function call(space: string, target: string, verb: string, args: unknown[] = [], options?: ProjectionCallOptions) {
-  const id = crypto.randomUUID();
-  ui.applyOptimisticCall(id, options);
-  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) ui.failOptimisticCall(id);
-  return id;
-}
-
 type V2TurnInput = {
   id?: string;
   route: "direct" | "sequenced";
@@ -2050,10 +2016,6 @@ function command(space: string, text: string, onResult?: (result: any) => void, 
   if (id && onResult) pendingDirect.set(id, onResult);
   void options;
   return id;
-}
-
-function canSendDirect() {
-  return canSendV2Browser();
 }
 
 function canSendChat() {
@@ -2900,20 +2862,6 @@ function normalizePattern(raw: any): Record<string, boolean[]> {
     out[voice.id] = Array.from({ length: 8 }, (_, index) => Boolean(row[index]));
   }
   return out;
-}
-
-function renderStepRow(voice: string, label: string, row: boolean[]) {
-  return `
-    <div class="step-row">
-      <span>${escapeHtml(label)}</span>
-      ${row
-        .map(
-          (enabled, index) =>
-            `<button class="step ${enabled ? "active" : ""}" data-step="${escapeHtml(`${voice}:${index}`)}" data-enabled="${enabled ? "true" : "false"}">${index + 1}</button>`
-        )
-        .join("")}
-    </div>
-  `;
 }
 
 function enterChat() {
