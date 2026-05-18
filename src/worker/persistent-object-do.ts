@@ -15,8 +15,8 @@
 //   direct verb calls (with broadcast to connected WS clients), log paging.
 // - v2 turn-network WebSocket upgrade with the CF hibernation API:
 //   state.acceptWebSocket, serializeAttachment, and webSocketMessage/Close/Error
-//   handlers. Legacy /ws returns 410; v2 sockets carry protocol-scoped
-//   attachments so wake-from-hibernation can route frames back to CommitScopeDO.
+//   handlers. V2 sockets carry protocol-scoped attachments so
+//   wake-from-hibernation can route frames back to CommitScopeDO.
 //
 // What's still deferred to later phases:
 // - Alarms for parked tasks (Phase 4): state.storage.setAlarm + alarm()
@@ -48,6 +48,7 @@ import {
   shadowLiveEventsForTranscriptRelay,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
+  type ShadowLiveEvent,
   type ShadowBrowserRelayShim,
   type ShadowBrowserStateTransfer
 } from "../core/shadow-browser-node";
@@ -148,6 +149,17 @@ type V2FanoutDelivery = {
   localHostMaterialized: V2LocalHostMaterialization;
 };
 
+type V2SocketAttachment = {
+  sessionId: string;
+  actor: ObjRef;
+  socketId: string;
+  protocol?: "v2-turn-network";
+  node?: string;
+  scope: ObjRef;
+  token?: string;
+  openedAt?: number;
+};
+
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
@@ -210,6 +222,19 @@ function webSocketProtocols(request: Request): string[] {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function v2LiveEventMatchesAttachment(event: ShadowLiveEvent, att: V2SocketAttachment): boolean {
+  const audience = event.audience;
+  if (audience) {
+    if (audience.sessions?.includes(att.sessionId)) return true;
+    if (audience.actors?.includes(att.actor)) return true;
+    // An explicit actor/session audience is private unless it also names a
+    // scope. Falling back to event.scope would turn direct replies into room
+    // broadcasts.
+    return typeof audience.scope === "string" && audience.scope === att.scope;
+  }
+  return typeof event.scope === "string" && event.scope === att.scope;
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -366,10 +391,6 @@ export class PersistentObjectDO {
 
       if (internalRequest) {
         return await this.handleInternal(request, world, pathname, hostKey);
-      }
-
-      if (pathname === "/ws") {
-        return jsonResponse({ error: { code: "E_NOTSUPPORTED", message: "legacy /ws protocol has been removed; use /v2/turn-network/ws" } }, 410);
       }
 
       if (worldGatewayHost && pathname === "/v2/turn-network/ws") {
@@ -2462,7 +2483,7 @@ export class PersistentObjectDO {
       await this.webSocketV2TurnNetworkMessage(world, ws, message);
       return;
     }
-    ws.close(1002, "legacy /ws protocol has been removed");
+    ws.close(1002, "unsupported WebSocket protocol");
   }
 
   async webSocketClose(ws: WebSocket, code: number, _reason: string, wasClean: boolean): Promise<void> {
@@ -2981,7 +3002,7 @@ export class PersistentObjectDO {
       const att = this.attachment(ws);
       if (!att?.node || att.protocol !== "v2-turn-network") continue;
       if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
-      const matching = events.filter((event) => (event.audience?.scope ?? event.scope) === att.scope);
+      const matching = events.filter((event) => v2LiveEventMatchesAttachment(event, att));
       for (const event of matching) {
         try {
           ws.send(encodeEnvelope({
@@ -3198,7 +3219,7 @@ export class PersistentObjectDO {
 
   // ---- WS helpers ----
 
-  private attachment(ws: WebSocket): { sessionId: string; actor: ObjRef; socketId: string; protocol?: "v2-turn-network"; node?: string; scope: ObjRef; token?: string; openedAt?: number } | null {
+  private attachment(ws: WebSocket): V2SocketAttachment | null {
     const raw = ws.deserializeAttachment();
     if (!raw || typeof raw !== "object") return null;
     const a = raw as Record<string, unknown>;

@@ -1042,6 +1042,14 @@ browser-originated events. Live events are not commit authority, but they are
 still session-authenticated because they can affect other users' displays,
 audio engines, or presence views.
 
+When a relay converts live/direct turn transcript observations into live
+events, it MUST preserve the observation's private or directed audience in
+`LiveEvent.audience`. Actor/session-private transcript hints such as
+`_audience_override` are internal routing data: they MUST be translated into
+the live event audience and MUST NOT be emitted inside `LiveEvent.observation`.
+An event with an explicit `actors` or `sessions` audience is not also delivered
+to its `scope` unless `audience.scope` is explicitly present.
+
 `coalesce` is a sender-chosen ASCII key with grammar:
 
 ```text

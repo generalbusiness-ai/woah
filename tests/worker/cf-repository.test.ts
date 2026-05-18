@@ -157,6 +157,165 @@ describe("v2 Worker fan-out helpers", () => {
       gatewayState.close();
     }
   });
+
+  it("keeps private live transcript supplemental fan-out actor-scoped", async () => {
+    class SocketState extends FakeDurableObjectState {
+      override getWebSockets(): WebSocket[] {
+        return this.acceptedWebSockets;
+      }
+    }
+    class FakeWebSocket {
+      readonly sent: string[] = [];
+      constructor(private readonly attachment: Record<string, unknown>) {}
+      send(data: string): void { this.sent.push(data); }
+      deserializeAttachment(): unknown { return this.attachment; }
+    }
+
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new SocketState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    let gateway: PersistentObjectDO;
+    const env = {
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        if (name === "world") return gateway;
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const world = createWorld();
+      const alice = world.auth("guest:v2-live-private-alice");
+      const bob = world.auth("guest:v2-live-private-bob");
+      const aliceOriginWs = new FakeWebSocket({
+        protocol: "v2-turn-network",
+        sessionId: alice.id,
+        actor: alice.actor,
+        socketId: "socket-alice-origin",
+        node: "browser:alice-origin",
+        scope: "the_chatroom",
+        token: "guest:v2-live-private-alice"
+      });
+      const alicePeerWs = new FakeWebSocket({
+        protocol: "v2-turn-network",
+        sessionId: alice.id,
+        actor: alice.actor,
+        socketId: "socket-alice-peer",
+        node: "browser:alice-peer",
+        scope: "the_chatroom",
+        token: "guest:v2-live-private-alice"
+      });
+      const bobWs = new FakeWebSocket({
+        protocol: "v2-turn-network",
+        sessionId: bob.id,
+        actor: bob.actor,
+        socketId: "socket-bob",
+        node: "browser:bob",
+        scope: "the_chatroom",
+        token: "guest:v2-live-private-bob"
+      });
+      gatewayState.acceptedWebSockets.push(aliceOriginWs as unknown as WebSocket, alicePeerWs as unknown as WebSocket, bobWs as unknown as WebSocket);
+
+      const transcript = {
+        kind: "woo.effect_transcript.shadow.v1",
+        route: "direct",
+        scope: "the_chatroom",
+        seq: -1,
+        session: alice.id,
+        call: { actor: alice.actor, target: "the_chatroom", verb: "command_plan", args: ["foo"] },
+        reads: [],
+        writes: [],
+        creates: [],
+        moves: [],
+        observations: [{
+          type: "huh",
+          source: "the_chatroom",
+          actor: alice.actor,
+          text: "I don't understand that.",
+          _audience_override: [alice.actor],
+          ts: 1
+        }],
+        logicalInputs: [],
+        untrackedEffects: [],
+        result: true,
+        complete: true,
+        incompleteReasons: [],
+        hash: "live-private-huh-transcript"
+      };
+      const reply = encodeEnvelope({
+        v: 2,
+        type: "woo.turn.exec.reply.shadow.v1",
+        id: "reply-live-private-huh",
+        from: "node:commit-scope:the_chatroom",
+        to: "browser:alice-origin",
+        actor: alice.actor,
+        session: alice.id,
+        auth: { mode: "session", token: "guest:v2-live-private-alice" },
+        body: {
+          kind: "woo.turn.exec.reply.shadow.v1",
+          ok: true,
+          id: "turn-live-private-huh",
+          outcome: { result: true },
+          transcript
+        }
+      } as any);
+
+      await (gateway as unknown as {
+        deliverV2Fanout(
+          world: WooWorld,
+          scope: ObjRef,
+          result: { reply: string | null; fanout: Array<{ node: string; envelope: string }> },
+          originSessionId?: string | null,
+          originNode?: string | null
+        ): Promise<unknown>;
+      }).deliverV2Fanout(world, "the_chatroom", { reply, fanout: [] }, alice.id, "browser:alice-origin");
+
+      expect(aliceOriginWs.sent).toHaveLength(0);
+      expect(alicePeerWs.sent).toHaveLength(1);
+      expect(bobWs.sent).toHaveLength(0);
+      const delivered = decodeEnvelope(alicePeerWs.sent[0]);
+      expect(delivered).toMatchObject({
+        type: "woo.live.event.shadow.v1",
+        to: "browser:alice-peer",
+        body: {
+          kind: "woo.live.event.shadow.v1",
+          audience: { actors: [alice.actor] },
+          observation: { type: "huh", text: "I don't understand that." }
+        }
+      });
+      expect(((delivered as any).body.observation as Record<string, unknown>)._audience_override).toBeUndefined();
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
+  it("does not reserve the removed legacy WebSocket endpoint at the Worker entry", async () => {
+    const env = {
+      ASSETS: {
+        fetch: async (request: Request) => new Response(`asset:${new URL(request.url).pathname}`, { status: 404 })
+      },
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`legacy /ws should not route to Woo DO ${name}`);
+      }),
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`legacy /ws should not route to Directory DO ${name}`);
+      })
+    } as unknown as Env;
+
+    const response = await worker.fetch(new Request("https://woo.test/ws", {
+      headers: { upgrade: "websocket" }
+    }), env, {});
+
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe("asset:/ws");
+  });
 });
 
 function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
@@ -404,39 +563,6 @@ describe("CFObjectRepository production-shape coverage", () => {
         actor: "$wiz",
         deployment: "shadow-local",
         rev: 1
-      });
-    } finally {
-      directoryState.close();
-      gatewayState.close();
-    }
-  });
-
-  it("rejects the removed legacy WebSocket endpoint", async () => {
-    const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
-    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    const env = {
-      WOO_INITIAL_WIZARD_TOKEN: "cf-legacy-ws-token",
-      WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "",
-      DIRECTORY: new FakeDurableObjectNamespace((name) => {
-        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-        return directory;
-      }),
-      WOO: new FakeDurableObjectNamespace((name) => {
-        throw new Error(`unexpected Woo DO ${name}`);
-      })
-    } as unknown as Env;
-    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
-
-    try {
-      const response = await gateway.fetch(new Request("https://woo.test/ws", {
-        headers: { upgrade: "websocket" }
-      }));
-
-      expect(response.status).toBe(410);
-      await expect(response.json()).resolves.toMatchObject({
-        error: { code: "E_NOTSUPPORTED" }
       });
     } finally {
       directoryState.close();

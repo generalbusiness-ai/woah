@@ -858,6 +858,59 @@ describe("shadow browser node shim", () => {
     expect(worldFor(browser).getProp("filter_1", "cutoff")).not.toBe(500);
   });
 
+  it("keeps unmatched chat command feedback private in live fan-out", async () => {
+    const anchor = createWorld();
+    const firstSession = anchor.auth("guest:browser-huh-a");
+    const secondSession = anchor.auth("guest:browser-huh-b");
+    await anchor.directCall("browser-huh-a-enter", firstSession.actor, "the_chatroom", "enter", [], { sessionId: firstSession.id });
+    await anchor.directCall("browser-huh-b-enter", secondSession.actor, "the_chatroom", "enter", [], { sessionId: secondSession.id });
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-huh-relay",
+      scope: "the_chatroom",
+      serialized: anchor.exportWorld()
+    });
+    const first = createShadowBrowserNode({
+      node: "browser-huh-a",
+      scope: "the_chatroom",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay
+    });
+    const second = createShadowBrowserNode({
+      node: "browser-huh-b",
+      scope: "the_chatroom",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay
+    });
+    await openShadowBrowserScope(first);
+    await openShadowBrowserScope(second);
+
+    const intent = {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "browser-huh-unmatched",
+      route: "direct" as const,
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "command_plan",
+      args: ["foo"],
+      persistence: "live" as const
+    };
+    const receipt = receiveShadowBrowserEnvelopeReceipt(first, encodeEnvelope(shadowBrowserEnvelope(first, intent.kind, intent, "browser-huh-unmatched:env")));
+    const reply = await handleShadowBrowserTurnExecEnvelope(first, receipt);
+    const body = reply?.body;
+    if (!body || body.ok !== true) throw new Error("expected private huh reply");
+    const transcriptHuh = body.transcript.observations.find((item) => item.type === "huh") as Record<string, unknown> | undefined;
+    const liveHuh = relay.live_events.find((event) => event.observation.type === "huh");
+
+    expect(body.commit).toBeUndefined();
+    expect(transcriptHuh?._audience_override).toEqual([firstSession.actor]);
+    expect(liveHuh?.audience).toEqual({ actors: [firstSession.actor] });
+    expect((liveHuh?.observation as Record<string, unknown> | undefined)?._audience_override).toBeUndefined();
+    expect(first.cache.live_events).toHaveLength(0);
+    expect(second.cache.live_events).toHaveLength(0);
+  });
+
   it("bounds remembered envelope ids and cached replies inside the idempotency window", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-idempotency-cap");
     await openShadowBrowserScope(browser);

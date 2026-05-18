@@ -23,6 +23,7 @@ import {
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
+  shadowLiveEventMatchesBrowser,
   shadowLiveEventsForTranscript,
   shadowBrowserTransportHello,
   type ShadowBrowserEnvelopeReceipt,
@@ -377,10 +378,9 @@ export class CommitScopeDO {
     if (!origin || body.ok !== true || !body.transcript) return [];
     const out: Array<{ node: string; envelope: string }> = [];
     for (const event of shadowLiveEventsForTranscript(origin, body.transcript)) {
-      const scope = event.audience?.scope ?? event.scope;
       for (const browser of relay.browsers.values()) {
         if (browser.node === originNode) continue;
-        if (typeof scope === "string" && relay.subscriptions.get(scope)?.has(browser.node) !== true) continue;
+        if (!shadowLiveEventMatchesBrowser(relay, browser, event)) continue;
         out.push({
           node: browser.node,
           envelope: encodeEnvelope({

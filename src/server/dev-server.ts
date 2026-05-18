@@ -35,6 +35,7 @@ import {
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
+  shadowLiveEventMatchesBrowser,
   shadowLiveEventsForTranscript,
   shadowBrowserTransportHello,
   type ShadowBrowserRelayShim
@@ -627,10 +628,9 @@ function sendDevV2LiveFanout(
   const body = reply.body;
   if (body.ok !== true || !body.transcript) return;
   for (const event of shadowLiveEventsForTranscript(origin, body.transcript)) {
-    const scope = event.audience?.scope ?? event.scope;
     for (const browser of origin.relay.browsers.values()) {
       if (browser.node === origin.node) continue;
-      if (typeof scope === "string" && origin.relay.subscriptions.get(scope)?.has(browser.node) !== true) continue;
+      if (!shadowLiveEventMatchesBrowser(origin.relay, browser, event)) continue;
       const socket = v2SocketsByNode.get(browser.node);
       if (!socket || socket.readyState !== WebSocket.OPEN) continue;
       socket.send(encodeEnvelope({

@@ -19,7 +19,7 @@ import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
 import type { MetricEvent, ObjRef, Observation, PropertyDef, WooValue } from "./types";
-import { cloneValue } from "./types";
+import { cloneValue, directedRecipients } from "./types";
 import type { ScopedObjectSummary } from "./world";
 
 const DEFAULT_SHADOW_BROWSER_STATE_AUTHORITY = "shadow-relay";
@@ -615,6 +615,7 @@ export function shadowLiveEventsForTranscriptRelay(relayNode: string, transcript
     const scope = transcript.scope;
     const source = shadowLiveEventSource(observation, transcript);
     const coalesce = typeof observation?.coalesce_key === "string" ? observation.coalesce_key : undefined;
+    const audience = shadowLiveAudienceForObservation(observation) ?? { scope: source };
     return {
       kind: "woo.live.event.shadow.v1",
       id: `${relayNode}:live:${transcript.hash}:${index}`,
@@ -623,12 +624,36 @@ export function shadowLiveEventsForTranscriptRelay(relayNode: string, transcript
       scope,
       // A single movement transcript can emit observations for both the source
       // and destination rooms. Route live delivery by observation source while
-      // keeping the original transcript scope for ordering/debug metadata.
-      audience: { scope: source },
-      observation,
+      // keeping the original transcript scope for ordering/debug metadata. If
+      // the observation carried an explicit private audience, preserve it here;
+      // otherwise transcript-derived live events would fall back to room scope.
+      audience,
+      observation: publicLiveObservation(observation),
       ...(coalesce ? { coalesce } : {})
     };
   });
+}
+
+function shadowLiveAudienceForObservation(observation: Observation): ShadowLiveAudience | undefined {
+  const override = (observation as Record<string, unknown>)._audience_override;
+  if (Array.isArray(override)) {
+    const actors = Array.from(new Set(override.filter((item): item is ObjRef => typeof item === "string")));
+    return { actors };
+  }
+  if ((observation.type === "looked" || observation.type === "who") && typeof observation.to === "string") {
+    return { actors: [observation.to] };
+  }
+  const directed = directedRecipients(observation);
+  const actors = new Set<ObjRef>();
+  if (directed.to) actors.add(directed.to);
+  if (directed.from) actors.add(directed.from);
+  return actors.size > 0 ? { actors: Array.from(actors) } : undefined;
+}
+
+function publicLiveObservation(observation: Observation): Observation {
+  const clone = structuredClone(observation) as Observation;
+  delete (clone as Record<string, unknown>)._audience_override;
+  return clone;
 }
 
 function shadowLiveEventSource(observation: Observation, transcript: EffectTranscript): ObjRef {
@@ -666,15 +691,19 @@ function receiveShadowBrowserLiveEvent(browser: ShadowBrowserNode, event: Shadow
   trimArrayHead(browser.cache.live_events, MAX_SHADOW_LIVE_EVENTS);
 }
 
-function shadowLiveEventMatchesBrowser(
+export function shadowLiveEventMatchesBrowser(
   relay: ShadowBrowserRelayShim,
   browser: ShadowBrowserNode,
   event: ShadowLiveEvent
 ): boolean {
   const audience = event.audience;
-  if (audience?.sessions?.includes(browser.session ?? "")) return true;
-  if (audience?.actors?.includes(browser.actor)) return true;
-  const scope = audience?.scope ?? event.scope;
+  if (audience) {
+    if (audience.sessions?.includes(browser.session ?? "")) return true;
+    if (audience.actors?.includes(browser.actor)) return true;
+    if (!audience.scope) return false;
+    return relay.subscriptions.get(audience.scope)?.has(browser.node) === true;
+  }
+  const scope = event.scope;
   return typeof scope === "string" && relay.subscriptions.get(scope)?.has(browser.node) === true;
 }
 
