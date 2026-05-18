@@ -169,7 +169,15 @@ export class CommitScopeDO {
           this.ensureSerializedSession(relay, input);
           const browser = this.browserFor(relay, input);
           const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
-          const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, { profile: (event) => this.emitMetric(event) });
+          const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, {
+            profile: (event) => this.emitMetric(event),
+            // Forward verb-execution metrics from the ephemeral
+            // planning world so direct_call / applied /
+            // dispatch_resolved / broadcast events land in AE for
+            // every MCP and WS turn — CommitScopeDO sees every v2
+            // envelope regardless of strategy or transport.
+            onMetric: (event) => this.emitMetric(event)
+          });
           if (this.needsFullSave) {
             await this.saveFull(relay);
             this.needsFullSave = false;

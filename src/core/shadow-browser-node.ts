@@ -953,10 +953,26 @@ export function receiveShadowBrowserEnvelopeReceipt(browser: ShadowBrowserNode, 
   return { envelope, fresh, idempotency_key: key };
 }
 
+export type ShadowBrowserTurnExecEnvelopeOptions = {
+  profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  // Forwarder for engine-level metric events recorded during the
+  // planning-phase verb execution. Both the intent-envelope path and
+  // the live-persistence path run the verb in an ephemeral world
+  // (runShadowTurnCallTranscript / runShadowTurnCall in
+  // shadow-turn-call.ts) which has no metrics hook by default — so
+  // direct_call / applied / dispatch_resolved / broadcast events get
+  // dropped on every MCP and WS turn unless the caller threads its
+  // host's metric sink in here. Without this, /admin/
+  // footprint-by-verb stays empty for the production hot path. The
+  // CommitScopeDO caller passes `event => this.emitMetric(event)` so
+  // AE sees each verb call.
+  onMetric?: (event: MetricEvent) => void;
+};
+
 export async function handleShadowBrowserTurnExecEnvelope(
   browser: ShadowBrowserNode,
   receipt: ShadowBrowserEnvelopeReceipt,
-  options: { profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void } = {}
+  options: ShadowBrowserTurnExecEnvelopeOptions = {}
 ): Promise<ShadowEnvelope<ShadowTurnExecReply> | null> {
   // Keep wire turn-exec dispatch in the substrate so dev-server, Worker, and
   // future socket bindings share the same duplicate handling and reply shape.
@@ -969,10 +985,10 @@ export async function handleShadowBrowserTurnExecEnvelope(
     ? receipt.envelope.body as ShadowTurnIntentRequest
     : null;
   const request = intent
-    ? await shadowTurnExecRequestFromIntent(browser, intent)
+    ? await shadowTurnExecRequestFromIntent(browser, intent, options.onMetric)
     : receipt.envelope.body as ShadowTurnExecRequest;
   const reply = intent?.persistence === "live"
-    ? await executeShadowBrowserLivePersistenceIntent(browser, request)
+    ? await executeShadowBrowserLivePersistenceIntent(browser, request, options.onMetric)
     : (await executeShadowBrowserTurnExecRequest(browser, request, options)).reply;
   if (!reply) return null;
   const response = shadowBrowserTurnExecReplyEnvelope(browser, receipt, request, reply);
@@ -1005,7 +1021,11 @@ function shadowBrowserTurnExecReplyEnvelope(
   return envelope;
 }
 
-async function executeShadowBrowserLivePersistenceIntent(browser: ShadowBrowserNode, request: ShadowTurnExecRequest): Promise<ShadowTurnExecReply> {
+async function executeShadowBrowserLivePersistenceIntent(
+  browser: ShadowBrowserNode,
+  request: ShadowTurnExecRequest,
+  onMetric?: (event: MetricEvent) => void
+): Promise<ShadowTurnExecReply> {
   validateShadowBrowserNodeAuth(browser);
   // Server-assisted browser intents already have a deterministic planned
   // transcript. Live-persistence turns are live/direct surface updates, so keep a
@@ -1015,7 +1035,7 @@ async function executeShadowBrowserLivePersistenceIntent(browser: ShadowBrowserN
   // state.
   const sessionKey = request.call.session ?? request.call.actor;
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? browser.relay.commit_scope.serialized;
-  const run = await runShadowTurnCall(serializedBefore, request.call);
+  const run = await runShadowTurnCall(serializedBefore, request.call, { onMetric });
   browser.relay.live_session_serialized.set(sessionKey, run.serializedAfter);
   for (const event of shadowLiveEventsForTranscript(browser, run.transcript)) {
     publishShadowBrowserLiveEvent(browser.relay, event, { except: browser.node });
@@ -1032,7 +1052,11 @@ async function executeShadowBrowserLivePersistenceIntent(browser: ShadowBrowserN
   };
 }
 
-async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, intent: ShadowTurnIntentRequest): Promise<ShadowTurnExecRequest> {
+async function shadowTurnExecRequestFromIntent(
+  browser: ShadowBrowserNode,
+  intent: ShadowTurnIntentRequest,
+  onMetric?: (event: MetricEvent) => void
+): Promise<ShadowTurnExecRequest> {
   // Browser-local planning is the end-state, but early browser parity needs a
   // safe outbound path before the worker can reconstruct executable closures.
   // Server-assisted planning still records a deterministic transcript and
@@ -1054,7 +1078,7 @@ async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, inten
   const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? browser.relay.commit_scope.serialized
     : browser.relay.commit_scope.serialized;
-  const planned = await runShadowTurnCallTranscript(serialized, call);
+  const planned = await runShadowTurnCallTranscript(serialized, call, { onMetric });
   return {
     kind: "woo.turn.exec.request.shadow.v1",
     id,

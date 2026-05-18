@@ -805,6 +805,80 @@ describe("shadow browser node shim", () => {
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.72);
   });
 
+  it("forwards onMetric through intent-envelope planning and live-persistence paths", async () => {
+    // Regression: CommitScopeDO (and any host wrapping the v2 envelope
+    // surface) wires `onMetric` into handleShadowBrowserTurnExecEnvelope
+    // so the ephemeral planning world's direct_call/applied events reach
+    // AE. Without this threading, /admin/ footprint-by-verb stays empty
+    // for every MCP and WS turn even though the worker emits metrics
+    // around the turn. This test pins the threading on the two ephemeral
+    // execution sites: shadowTurnExecRequestFromIntent (durable/sequenced
+    // intent) and executeShadowBrowserLivePersistenceIntent (live).
+    const { browser: durableBrowser } = await browserForScope("the_dubspace", "guest:browser-onmetric-durable");
+    await openShadowBrowserScope(durableBrowser);
+    const durableIntent = {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "onmetric-durable-wet",
+      route: "sequenced" as const,
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.59],
+      persistence: "durable" as const
+    };
+    const durableReceipt = receiveShadowBrowserEnvelopeReceipt(
+      durableBrowser,
+      encodeEnvelope(shadowBrowserEnvelope(durableBrowser, durableIntent.kind, durableIntent, "onmetric-durable-env"))
+    );
+    const durableEvents: Array<{ kind: string; verb?: string; space?: string; target?: string }> = [];
+    const durableReply = await handleShadowBrowserTurnExecEnvelope(durableBrowser, durableReceipt, {
+      onMetric: (event) => durableEvents.push({
+        kind: event.kind,
+        verb: (event as { verb?: string }).verb,
+        space: (event as { space?: string }).space,
+        target: (event as { target?: string }).target
+      })
+    });
+    expect(durableReply?.body).toMatchObject({ kind: "woo.turn.exec.reply.shadow.v1", ok: true });
+    // Sequenced route produces `applied` events (space + verb) from
+    // the planning world, not `direct_call`. Either shape proves the
+    // hook reached the ephemeral world.
+    expect(
+      durableEvents.some((e) => e.verb === "set_control" && (e.kind === "applied" || e.kind === "direct_call")),
+      `expected an applied/direct_call set_control event; got ${JSON.stringify(durableEvents)}`
+    ).toBe(true);
+
+    const { browser: liveBrowser } = await browserForScope("the_dubspace", "guest:browser-onmetric-live");
+    await openShadowBrowserScope(liveBrowser);
+    const liveIntent = {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "onmetric-live-wet",
+      route: "direct" as const,
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "enter",
+      args: [] as WooValue[],
+      persistence: "live" as const
+    };
+    const liveReceipt = receiveShadowBrowserEnvelopeReceipt(
+      liveBrowser,
+      encodeEnvelope(shadowBrowserEnvelope(liveBrowser, liveIntent.kind, liveIntent, "onmetric-live-env"))
+    );
+    const liveEvents: Array<{ kind: string; verb?: string; target?: string }> = [];
+    const liveReply = await handleShadowBrowserTurnExecEnvelope(liveBrowser, liveReceipt, {
+      onMetric: (event) => liveEvents.push({
+        kind: event.kind,
+        verb: (event as { verb?: string }).verb,
+        target: (event as { target?: string }).target
+      })
+    });
+    expect(liveReply?.body).toMatchObject({ kind: "woo.turn.exec.reply.shadow.v1", ok: true });
+    expect(
+      liveEvents.some((e) => e.verb === "enter" && e.target === "the_dubspace"),
+      "expected at least one engine metric from the live-persistence intent's executor world"
+    ).toBe(true);
+  });
+
   it("chains live-persistence browser intents through per-session live state", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-wire-live-chain");
     await openShadowBrowserScope(browser);
