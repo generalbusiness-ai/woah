@@ -18,7 +18,9 @@ Cron-triggered every minute. Each tick:
    actor-bound apikey for the block. The `tick_ok` log line carries
    `auth: "warm" | "cold"` so the cache hit rate is greppable from
    `wrangler tail`.
-2. GETs the block's `system_prompt` (one property read).
+2. GETs the block's `system_prompt` through a short in-isolate TTL cache
+   (`SYSTEM_PROMPT_TTL_MS`, default 5 minutes). Owner changes may take a
+   few ticks to reach a warm plug isolate; cold starts still read it once.
 3. Loops up to `MAX_ORDERS_PER_TICK`:
    - POSTs `:next_pending` — if `null`, exits the loop.
    - Runs `@cf/meta/llama-3.2-1b-instruct` on Workers AI with
@@ -51,6 +53,11 @@ Failure handling:
   the plug stops the tick and the next cron re-auths.
 
 `:deliver` is idempotent on `order_id`, so retries are safe.
+
+`last_pushed_at` is a health heartbeat, not a work record. Empty ticks only
+write it when `HEARTBEAT_INTERVAL_MS` has elapsed (default 5 minutes);
+ticks that delivered an order or need to surface `last_error` still write
+immediately.
 
 ## Why REST, not MCP
 

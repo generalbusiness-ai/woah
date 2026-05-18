@@ -1,5 +1,6 @@
 import { sessionActiveScopeFromRecord, wooError, type MetricEvent, type ObjRef, type Session } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
+import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 type ObjectRoute = {
@@ -62,6 +63,7 @@ export class DirectoryDO {
     const url = new URL(request.url);
     let handlerStatus: "ok" | "error" = "ok";
     let handlerError: string | undefined;
+    let handlerErrorDetail: string | undefined;
     try {
       if (!this.schemaEnsured) {
         const schemaStartedAt = Date.now();
@@ -70,7 +72,7 @@ export class DirectoryDO {
           this.schemaEnsured = true;
           this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 6 });
         } catch (err) {
-          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 6, error: metricErrorCode(err) });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 6, ...metricErrorFields(err) });
           throw err;
         }
       }
@@ -105,7 +107,7 @@ export class DirectoryDO {
           });
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "ok", routes: routes.length, writes });
         } catch (err) {
-          this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "error", routes: routes.length, error: metricErrorCode(err) });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_objects", ms: Date.now() - startedAt, status: "error", routes: routes.length, ...metricErrorFields(err) });
           throw err;
         }
         return json({ ok: true });
@@ -129,7 +131,7 @@ export class DirectoryDO {
           });
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "ok", writes: wrote ? 1 : 0 });
         } catch (err) {
-          this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "error", ...metricErrorFields(err) });
           throw err;
         }
         return json({ ok: true, wrote });
@@ -178,7 +180,9 @@ export class DirectoryDO {
         ? err
         : { code: "E_INTERNAL", message: err instanceof Error ? err.message : String(err) };
       handlerStatus = "error";
-      handlerError = String((error as { code?: unknown }).code ?? "E_INTERNAL");
+      const fields = metricErrorFields(err);
+      handlerError = fields.error;
+      handlerErrorDetail = fields.error_detail;
       return json({ error }, 500);
     } finally {
       this.emitMetric({
@@ -188,7 +192,8 @@ export class DirectoryDO {
         route: url.pathname,
         ms: Date.now() - handlerStartedAt,
         status: handlerStatus,
-        ...(handlerError ? { error: handlerError } : {})
+        ...(handlerError ? { error: handlerError } : {}),
+        ...(handlerErrorDetail ? { error_detail: handlerErrorDetail } : {})
       });
     }
   }
@@ -562,11 +567,6 @@ function json(body: unknown, status = 200): Response {
 
 function sessionActiveScope(record: Record<string, unknown>): ObjRef | null {
   return sessionActiveScopeFromRecord(record) as ObjRef | null;
-}
-
-function metricErrorCode(err: unknown): string {
-  if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
-  return err instanceof Error ? err.name : "E_INTERNAL";
 }
 
 async function readJson(request: Request, maxBytes: number = MAX_JSON_BODY_BYTES): Promise<Record<string, unknown>> {

@@ -4,7 +4,7 @@
 //   1. Reuse a cached woo session if one is still warm in this isolate
 //      and not within REAUTH_MARGIN_MS of expiry, otherwise authenticate
 //      to woo with the actor-bound apikey for the block.
-//   2. Read the block's `system_prompt` config.
+//   2. Read the block's `system_prompt` config through a short TTL cache.
 //   3. Drain the queue: call :next_pending, run Workers AI, call :deliver,
 //      repeat until the queue is empty or MAX_ORDERS_PER_TICK is reached.
 //
@@ -30,6 +30,8 @@ export interface HoroscopePlugEnv {
   AI: HoroscopeAi;
   MAX_TOKENS?: string;
   MAX_ORDERS_PER_TICK?: string;
+  SYSTEM_PROMPT_TTL_MS?: string;
+  HEARTBEAT_INTERVAL_MS?: string;
   /** Required for the manual POST trigger. Caller must send
    * `Authorization: Bearer <TRIGGER_SECRET>`. Without it, anyone with the
    * Worker URL could drain the queue and burn Workers-AI quota. The cron
@@ -49,10 +51,22 @@ type PendingOrder = {
 // hour margin keeps us comfortably away from the boundary even if a cron
 // tick is delayed or a single tick runs long.
 const REAUTH_MARGIN_MS = 60 * 60 * 1000;
+const DEFAULT_SYSTEM_PROMPT_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 
 export type SessionCache = {
   get(): WooSession | null;
   set(session: WooSession | null): void;
+};
+
+export type SystemPromptCache = {
+  get(blockId: string, now: number, ttlMs: number): string | null;
+  set(blockId: string, value: string, now: number): void;
+};
+
+export type HeartbeatCache = {
+  get(blockId: string): number | null;
+  set(blockId: string, pushedAt: number): void;
 };
 
 // Module-scope singleton cache. CF Workers reuse isolates between
@@ -68,6 +82,24 @@ const moduleScopeSessionCache: SessionCache = {
   set: (session) => { _moduleScopeSession = session; }
 };
 
+const _moduleScopePrompts = new Map<string, { value: string; fetchedAt: number }>();
+const moduleScopeSystemPromptCache: SystemPromptCache = {
+  get(blockId, now, ttlMs) {
+    const cached = _moduleScopePrompts.get(blockId);
+    if (!cached || now - cached.fetchedAt >= ttlMs) return null;
+    return cached.value;
+  },
+  set(blockId, value, now) {
+    _moduleScopePrompts.set(blockId, { value, fetchedAt: now });
+  }
+};
+
+const _moduleScopeHeartbeats = new Map<string, number>();
+const moduleScopeHeartbeatCache: HeartbeatCache = {
+  get: (blockId) => _moduleScopeHeartbeats.get(blockId) ?? null,
+  set: (blockId, pushedAt) => { _moduleScopeHeartbeats.set(blockId, pushedAt); }
+};
+
 /** Build a fresh in-memory SessionCache. Useful for tests so each case
  * starts from a known empty state, and for callers that want explicit
  * control over the cache lifetime. */
@@ -76,6 +108,28 @@ export function createSessionCache(): SessionCache {
   return {
     get: () => cached,
     set: (session) => { cached = session; }
+  };
+}
+
+export function createSystemPromptCache(): SystemPromptCache {
+  const prompts = new Map<string, { value: string; fetchedAt: number }>();
+  return {
+    get(blockId, now, ttlMs) {
+      const cached = prompts.get(blockId);
+      if (!cached || now - cached.fetchedAt >= ttlMs) return null;
+      return cached.value;
+    },
+    set(blockId, value, now) {
+      prompts.set(blockId, { value, fetchedAt: now });
+    }
+  };
+}
+
+export function createHeartbeatCache(): HeartbeatCache {
+  const pushedAt = new Map<string, number>();
+  return {
+    get: (blockId) => pushedAt.get(blockId) ?? null,
+    set: (blockId, value) => { pushedAt.set(blockId, value); }
   };
 }
 
@@ -139,7 +193,7 @@ export type HoroscopeTriggerLabel = "cron" | "fetch";
 export async function runLoggedHoroscopeTick(
   env: HoroscopePlugEnv,
   trigger: HoroscopeTriggerLabel,
-  deps: { fetchImpl?: typeof fetch; now?: () => number; sessionCache?: SessionCache } = {}
+  deps: HoroscopeTickDeps = {}
 ): Promise<HoroscopeTickResult> {
   const now = deps.now ?? Date.now;
   const start = now();
@@ -178,13 +232,23 @@ export type HoroscopeTickResult = {
   authMode: "warm" | "cold";
 };
 
+export type HoroscopeTickDeps = {
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+  sessionCache?: SessionCache;
+  systemPromptCache?: SystemPromptCache;
+  heartbeatCache?: HeartbeatCache;
+};
+
 export async function runHoroscopeTick(
   env: HoroscopePlugEnv,
-  deps: { fetchImpl?: typeof fetch; now?: () => number; sessionCache?: SessionCache } = {}
+  deps: HoroscopeTickDeps = {}
 ): Promise<HoroscopeTickResult> {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now = deps.now ?? Date.now;
   const sessionCache = deps.sessionCache ?? moduleScopeSessionCache;
+  const systemPromptCache = deps.systemPromptCache ?? (deps.fetchImpl ? createSystemPromptCache() : moduleScopeSystemPromptCache);
+  const heartbeatCache = deps.heartbeatCache ?? (deps.fetchImpl ? createHeartbeatCache() : moduleScopeHeartbeatCache);
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
 
   // Warm-path reuse: an apikey-class session minted on a prior tick is
@@ -205,6 +269,8 @@ export async function runHoroscopeTick(
 
   const maxOrdersPerTick = numEnv(env.MAX_ORDERS_PER_TICK, 10);
   const maxTokens = numEnv(env.MAX_TOKENS, 350);
+  const systemPromptTtlMs = durationEnv(env.SYSTEM_PROMPT_TTL_MS, DEFAULT_SYSTEM_PROMPT_TTL_MS);
+  const heartbeatIntervalMs = durationEnv(env.HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS);
 
   // Anything from here on that throws E_NOSESSION must invalidate the
   // session cache before bubbling up — otherwise the next tick adopts the
@@ -215,10 +281,16 @@ export async function runHoroscopeTick(
   // and surfaces as `tick_error` upstream.
   try {
 
-  // Read system_prompt once per tick. Owners change it rarely; the cost of
-  // a one-tick lag is bounded.
-  const promptValue = await client.getProperty(env.BLOCK_ID, "system_prompt");
-  const systemPrompt = typeof promptValue === "string" ? promptValue : "";
+  const tickNow = now();
+  let systemPrompt = systemPromptCache.get(env.BLOCK_ID, tickNow, systemPromptTtlMs);
+  if (systemPrompt === null) {
+    // Owners change system_prompt rarely, while cron reads it every minute.
+    // A short TTL removes the steady-state cold-object read without making
+    // configuration changes wait longer than a few ticks.
+    const promptValue = await client.getProperty(env.BLOCK_ID, "system_prompt");
+    systemPrompt = typeof promptValue === "string" ? promptValue : "";
+    systemPromptCache.set(env.BLOCK_ID, systemPrompt, tickNow);
+  }
 
   const errors: HoroscopeTickResult["errors"] = [];
   const aiFallbacks: Array<{ order_id: string; message: string }> = [];
@@ -342,12 +414,18 @@ export async function runHoroscopeTick(
   if (errors.length > 0) lastErrorValue = errors[errors.length - 1].message;
   else if (aiFallbacks.length > 0) lastErrorValue = `ai fallback: ${aiFallbacks[aiFallbacks.length - 1].message}`;
 
-  await client.directCall(env.BLOCK_ID, "set_properties", [
-    {
-      last_pushed_at: now(),
-      last_error: lastErrorValue
-    }
-  ]);
+  const heartbeatAt = now();
+  const previousHeartbeatAt = heartbeatCache.get(env.BLOCK_ID);
+  const heartbeatDue = previousHeartbeatAt === null || heartbeatAt - previousHeartbeatAt >= heartbeatIntervalMs;
+  if (delivered > 0 || lastErrorValue !== null || heartbeatDue) {
+    await client.directCall(env.BLOCK_ID, "set_properties", [
+      {
+        last_pushed_at: heartbeatAt,
+        last_error: lastErrorValue
+      }
+    ]);
+    heartbeatCache.set(env.BLOCK_ID, heartbeatAt);
+  }
 
   return { block: env.BLOCK_ID, delivered, errors, authMode };
 
@@ -365,6 +443,12 @@ function numEnv(value: string | undefined, fallback: number): number {
   if (value === undefined || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function durationEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
 }
 
 // Build the inventory listing name for a delivered horoscope from the

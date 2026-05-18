@@ -166,6 +166,15 @@ describe("/admin/series", () => {
     expect(sql).toContain("FROM woo_v1_staging");
   });
 
+  it("allows grouping by error_detail", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+
+    const res = await call(baseEnv(), "/admin/series?groupBy=error_detail", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    const sql = String(fetchSpy.mock.calls[0]![1]?.body);
+    expect(sql).toContain("blob17 AS k");
+  });
+
   it("returns 502 when the AE SQL API errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("oops", { status: 500 }));
     const res = await call(baseEnv(), "/admin/series", { headers: authHeaders });

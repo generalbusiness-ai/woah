@@ -64,7 +64,7 @@ export function analyticsSampleRate(event: MetricEvent): number {
 // hard-codes them. New axes get a NEW slot; the existing slot indices
 // must not be reordered or repurposed. See spec/reference/cloudflare.md
 // §R10.1 for the canonical schema and the per-`kind` field mapping.
-const BLOB_SLOTS = 16;
+const BLOB_SLOTS = 17;
 const DOUBLE_SLOTS = 3;
 
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
@@ -127,6 +127,7 @@ function primaryCount(event: MetricEvent): number {
 //   blobs[14]   = path           dispatch_resolved.path: "local"|"read"|"mutating"
 //   blobs[15]   = reason         mcp_tool_refresh_*.reason, shadow_commit_rejected.reason,
 //                                rest_v2_in_process_fallback.reason
+//   blobs[16]   = error_detail   bounded diagnostic detail for uncoded errors
 //   doubles[0]  = ms             latency (when present)
 //   doubles[1]  = sample_rate    1 (default) or the 1-in-N multiplier
 //   doubles[2]  = count          primary kind-specific count: rows |
@@ -171,6 +172,7 @@ export function writeMetricToAnalytics(
   blobs[13] = stringOrEmpty(e.actor);
   blobs[14] = stringOrEmpty(e.path);
   blobs[15] = stringOrEmpty(e.reason);
+  blobs[16] = stringOrEmpty(e.error_detail);
 
   doubles[0] = ms;
   doubles[1] = rate;

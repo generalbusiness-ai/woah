@@ -93,7 +93,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 //
 // Query string:
 //   metric=count|sum_ms|p95_ms|sum_count    (default: count)
-//   groupBy=host_key|kind|scope|class|route|method|phase|what|status|error|target|verb|tool|host|actor|path|reason
+//   groupBy=host_key|kind|scope|class|route|method|phase|what|status|error|target|verb|tool|host|actor|path|reason|error_detail
 //                                            (default: host_key)
 //   from=<unix-seconds-or-iso>              (default: now - 1h)
 //   to=<unix-seconds-or-iso>                (default: now)
@@ -126,7 +126,8 @@ const ALLOWED_GROUP_BY: Record<string, string> = {
   host: "blob13",
   actor: "blob14",
   path: "blob15",
-  reason: "blob16"
+  reason: "blob16",
+  error_detail: "blob17"
 };
 
 const BUCKET_SECONDS: Record<string, number> = {
@@ -364,7 +365,11 @@ const ADMIN_HTML = String.raw`<!doctype html>
         <option value="host_key" selected>host_key</option>
         <option value="kind">kind</option>
         <option value="class">class</option>
+        <option value="route">route</option>
         <option value="status">status</option>
+        <option value="error">error</option>
+        <option value="error_detail">error_detail</option>
+        <option value="verb">verb</option>
       </select>
     </label>
     <label>metric

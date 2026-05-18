@@ -108,7 +108,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": { "args": [], "command": { "persistence": "live" } },
           "source": "verb :next_pending() rxd { let is_self = actor == this; let is_wiz = has_flag(actor, \"wizard\"); if (!is_self && !is_wiz) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can read pending orders\", value: actor }; } let queue = this.pending_orders; if (length(queue) == 0) { return null; } return queue[1]; }"
         },
         {

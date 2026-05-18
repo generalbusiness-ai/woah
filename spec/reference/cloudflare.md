@@ -509,7 +509,7 @@ aggregation; the `/admin/stats` panel queries the AE SQL API.
 
 ```ts
 env.METRICS.writeDataPoint({
-  blobs:   [/* fixed-width 16-slot dimension map; see "Slot map" below */],
+  blobs:   [/* fixed-width 17-slot dimension map; see "Slot map" below */],
   doubles: [/* fixed-width 3-slot numeric map; see "Slot map" below */],
   indexes: [host_key]                  // the only high-cardinality index
 });
@@ -525,7 +525,7 @@ hosts. This also matches the dashboard's primary pivot — "by component".
 
 #### Slot map (stable; the `/admin/stats` query layer hard-codes positions)
 
-The slot map is fixed-width: every data point fills all 16 blobs and 3
+The slot map is fixed-width: every data point fills all 17 blobs and 3
 doubles. Axes the event doesn't carry land as empty strings (blob) or 0
 (double). New axes get a NEW slot; existing slots are never reordered
 or repurposed.
@@ -548,6 +548,7 @@ or repurposed.
 | `blobs[13]` | `actor`     | `mcp_tool_refresh_*.actor`, `dispatch_resolved.actor` |
 | `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating` |
 | `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason` |
+| `blobs[16]` | `error_detail` | bounded diagnostic detail for uncoded internal errors |
 | `doubles[0]` | `ms`         | latency, when present |
 | `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
 | `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects` |
