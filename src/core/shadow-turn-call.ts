@@ -35,6 +35,8 @@ export type ShadowTurnCallRun = {
   serializedAfter: SerializedWorld;
 };
 
+export type ShadowTurnCallTranscriptRun = Omit<ShadowTurnCallRun, "serializedAfter">;
+
 export type ShadowTurnCallOptions = {
   allowed_atom_hashes?: Iterable<string>;
 };
@@ -48,11 +50,35 @@ export async function runShadowTurnCall(
   return await runShadowTurnCallOnWorld(world, call, options);
 }
 
+export async function runShadowTurnCallTranscript(
+  serializedBefore: SerializedWorld,
+  call: ShadowTurnCall,
+  options: ShadowTurnCallOptions = {}
+): Promise<ShadowTurnCallTranscriptRun> {
+  // Durable commit scopes apply transcripts authoritatively, so planning and
+  // commit-scope execution should not pay for a full executor post-state export
+  // unless a caller explicitly needs that snapshot.
+  const world = createWorldFromSerialized(serializedBefore, { persist: false });
+  return await runShadowTurnCallOnWorldTranscript(world, call, options);
+}
+
 export async function runShadowTurnCallOnWorld(
   world: WooWorld,
   call: ShadowTurnCall,
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
+  const run = await runShadowTurnCallOnWorldTranscript(world, call, options);
+  return {
+    ...run,
+    serializedAfter: world.exportWorld()
+  };
+}
+
+export async function runShadowTurnCallOnWorldTranscript(
+  world: WooWorld,
+  call: ShadowTurnCall,
+  options: ShadowTurnCallOptions = {}
+): Promise<ShadowTurnCallTranscriptRun> {
   const recorder = new InMemoryTurnRecorder();
   world.setTurnRecorder(options.allowed_atom_hashes
     ? new ShadowStateGuardTurnRecorder(recorder, new Set(options.allowed_atom_hashes))
@@ -83,8 +109,7 @@ export async function runShadowTurnCallOnWorld(
   return {
     frame,
     recorded,
-    transcript,
-    serializedAfter: world.exportWorld()
+    transcript
   };
 }
 

@@ -11,7 +11,13 @@ import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
-import { runShadowTurnCallOnWorld, type ShadowTurnCall } from "./shadow-turn-call";
+import {
+  runShadowTurnCallOnWorld,
+  runShadowTurnCallOnWorldTranscript,
+  type ShadowTurnCall,
+  type ShadowTurnCallRun,
+  type ShadowTurnCallTranscriptRun
+} from "./shadow-turn-call";
 import {
   submitShadowCommit,
   type ShadowCommitAccepted,
@@ -171,6 +177,11 @@ export type ShadowTurnExecutionResult =
       serializedAfter: SerializedWorld;
       reply?: ShadowTurnExecReply;
     };
+
+function requireSerializedAfter(run: ShadowTurnCallRun | ShadowTurnCallTranscriptRun): SerializedWorld {
+  if ("serializedAfter" in run) return run.serializedAfter;
+  throw new Error("shadow turn post-state snapshot unavailable on transcript-only execution path");
+}
 
 export type ShadowTurnExecRequest = {
   kind: "woo.turn.exec.request.shadow.v1";
@@ -493,11 +504,15 @@ export async function executeShadowTurnCallOrNeedState(
 
   const serializedBefore = node.serialized;
   const world = shadowExecutionWorld(node);
-  let run: Awaited<ReturnType<typeof runShadowTurnCallOnWorld>>;
+  const commitScopeExecution = !!options.commitScope && request.persistence !== "live";
+  let run: ShadowTurnCallRun | ShadowTurnCallTranscriptRun;
   try {
-    run = await runShadowTurnCallOnWorld(world, request.call, {
-      allowed_atom_hashes: node.atom_hashes
-    });
+    const runOptions = { allowed_atom_hashes: node.atom_hashes };
+    // With a durable commit scope, the transcript is the contract and the
+    // commit scope owns authoritative post-state construction.
+    run = commitScopeExecution
+      ? await runShadowTurnCallOnWorldTranscript(world, request.call, runOptions)
+      : await runShadowTurnCallOnWorld(world, request.call, runOptions);
   } catch (err) {
     // A cached executor world is authoritative only after a successful turn.
     // If VM execution throws outside the normal ErrorFrame path, discard the
@@ -546,7 +561,7 @@ export async function executeShadowTurnCallOrNeedState(
     : null;
   const receipt = commit
     ? commit.receipt
-    : shadowCommitReceipt(serializedBefore, run.serializedAfter, run.transcript);
+    : shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript);
   if (!receipt.accepted) {
     node.world = undefined;
     const conflict = commit?.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
@@ -576,10 +591,10 @@ export async function executeShadowTurnCallOrNeedState(
 
   const livePersistence = request.persistence === "live";
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
-    ? options.commitScope?.serialized ?? run.serializedAfter
+    ? options.commitScope?.serialized ?? requireSerializedAfter(run)
     : livePersistence
       ? serializedBefore
-    : run.serializedAfter;
+      : requireSerializedAfter(run);
   node.serialized = structuredClone(serializedAfter) as SerializedWorld;
   // Live-persistence turns are live/direct observations, not authority-bearing
   // state transitions. Keep their reply transcript, but discard the executor's

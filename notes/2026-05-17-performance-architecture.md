@@ -61,6 +61,21 @@ Implemented in this worktree:
 - No resident-world, row-map, or cell-slice semantics were changed in this
   slice.
 
+Second implementation slice:
+
+- Added transcript-only shadow turn execution alongside the existing
+  snapshotting runner. Durable planning and commit-scope execution now collect
+  frame/recording/transcript without exporting a full executor post-world.
+- Kept snapshotting execution for live-persistence session state, no-commit
+  fallback, repair/cold-open state transfer, diagnostics, and tests that need a
+  serialized post-state.
+- Commit scopes still construct authoritative post-state by applying the
+  transcript. The concrete win is avoiding a full executor post-world export on
+  every durable turn: active demo/catalog scopes already serialize 100+ object
+  rows, and that export was the dominant per-turn allocation source before
+  commit application. Commit application still rebuilds indexes from serialized
+  arrays; the row-map commit-scope work remains the next substrate bottleneck.
+
 • Best Opportunities
 
 1. Unify all turn ingress behind one v2 “turn gateway” module

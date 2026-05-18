@@ -4,7 +4,7 @@ import {
   buildShadowTurnIntentEnvelope
 } from "./shadow-browser-node";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
-import { runShadowTurnCall, type ShadowTurnCall, type ShadowTurnCallRun } from "./shadow-turn-call";
+import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import { type ShadowScopeHead } from "./shadow-commit-scope";
 import { shadowTurnKeyFromTranscript } from "./turn-key";
@@ -53,7 +53,7 @@ export type SubmitTurnIntentResult<Client, Result extends V2TurnGatewayEnvelopeR
       kind: "local_frame";
       frame: AppliedFrame | DirectResultFrame | ErrorFrame;
       call: ShadowTurnCall;
-      planned: ShadowTurnCallRun;
+      planned: ShadowTurnCallTranscriptRun;
     }
   | {
       kind: "submitted";
@@ -64,7 +64,7 @@ export type SubmitTurnIntentResult<Client, Result extends V2TurnGatewayEnvelopeR
       replyEnvelope: ShadowEnvelope<ShadowTurnExecReply> | null;
       reply: ShadowTurnExecReply | null;
       call: ShadowTurnCall;
-      planned?: ShadowTurnCallRun;
+      planned?: ShadowTurnCallTranscriptRun;
     };
 
 export type SubmitTurnIntentOptions<Client, Result extends V2TurnGatewayEnvelopeResult> = {
@@ -274,7 +274,7 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
     const call = buildV2TurnGatewayCall(options.input, turnId);
     const serialized = options.clientSerialized?.(planningClient);
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
-    const planned = await runShadowTurnCall(serialized, call);
+    const planned = await runShadowTurnCallTranscript(serialized, call);
     if (planned.frame.op === "error") return { kind: "local_frame", frame: planned.frame, call, planned };
 
     const key = shadowTurnKeyFromTranscript(planned.transcript);

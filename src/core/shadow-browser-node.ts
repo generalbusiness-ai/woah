@@ -11,7 +11,7 @@ import {
   type ShadowTurnExecutionResult
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
-import { runShadowTurnCall, type ShadowTurnCall } from "./shadow-turn-call";
+import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
 import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
@@ -686,7 +686,7 @@ export async function executeShadowBrowserTurn(
     args: input.args ?? [],
     body: input.body
   };
-  const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+  const planned = await runShadowTurnCallTranscript(browser.relay.commit_scope.serialized, call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const pending: ShadowBrowserPendingTurn = {
     id,
@@ -1036,7 +1036,7 @@ async function shadowTurnExecRequestFromIntent(browser: ShadowBrowserNode, inten
   const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? browser.relay.commit_scope.serialized
     : browser.relay.commit_scope.serialized;
-  const planned = await runShadowTurnCall(serialized, call);
+  const planned = await runShadowTurnCallTranscript(serialized, call);
   return {
     kind: "woo.turn.exec.request.shadow.v1",
     id,

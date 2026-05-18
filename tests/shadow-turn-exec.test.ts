@@ -16,7 +16,7 @@ import {
   shadowObjectRecordHash
 } from "../src/core/shadow-turn-exec";
 import { shadowStatePageHash } from "../src/core/shadow-state-pages";
-import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
+import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
@@ -282,6 +282,144 @@ describe("shadow turn execution", () => {
     });
     expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
     expect(createWorldFromSerialized(staleNode.serialized!, { persist: false }).getProp("delay_1", "wet")).not.toBe(0.59);
+  });
+
+  it("does not export executor post-state for durable commit-scope TurnCall execution", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-transcript-only-exec");
+    const actor = session.actor;
+    await anchor.directCall("shadow-transcript-only-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+
+    const serializedBefore = anchor.exportWorld();
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-transcript-only-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.62]
+    };
+    const planned = await runShadowTurnCallTranscript(serializedBefore, call);
+    expect("serializedAfter" in planned).toBe(false);
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    const executorWorld = createWorldFromSerialized(serializedBefore, { persist: false });
+    let postStateExports = 0;
+    executorWorld.exportWorld = () => {
+      postStateExports += 1;
+      throw new Error("executor post-state export should not run for durable commit-scope execution");
+    };
+    const node = createShadowExecutionNode({
+      node: "actor-node",
+      scope: key.scope,
+      atom_hashes: key.atom_hashes,
+      serialized: serializedBefore
+    });
+    node.world = executorWorld;
+
+    const result = await executeShadowTurnCallOrNeedState(node, {
+      kind: "woo.turn.exec.request.shadow.v1",
+      call,
+      key,
+      expected: commitScope.head
+    }, { commitScope });
+
+    expect(result).toMatchObject({ ok: true, attempted: true });
+    if (!result.ok) throw new Error(`transcript-only commit failed: ${result.reason}`);
+    expect(postStateExports).toBe(0);
+    expect(result.transcript.hash).toBe(planned.transcript.hash);
+    expect(result.receipt).toMatchObject({ accepted: true, transcript_hash: planned.transcript.hash });
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.62);
+    expect(createWorldFromSerialized(result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.62);
+  });
+
+  it("does not require executor post-state when a transcript-only commit is rejected", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-transcript-only-rejected");
+    const actor = session.actor;
+    await anchor.directCall("shadow-transcript-only-rejected-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+
+    const serializedBefore = anchor.exportWorld();
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const initialHead = structuredClone(commitScope.head);
+    const acceptedCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-transcript-only-accepted",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.64]
+    };
+    const acceptedPlan = await runShadowTurnCallTranscript(serializedBefore, acceptedCall);
+    const acceptedKey = shadowTurnKeyFromTranscript(acceptedPlan.transcript);
+    const acceptedNode = createShadowExecutionNode({
+      node: "accepted-node",
+      scope: acceptedKey.scope,
+      atom_hashes: acceptedKey.atom_hashes,
+      serialized: serializedBefore
+    });
+    const accepted = await executeShadowTurnCallOrNeedState(acceptedNode, {
+      kind: "woo.turn.exec.request.shadow.v1",
+      call: acceptedCall,
+      key: acceptedKey,
+      expected: initialHead
+    }, { commitScope });
+    expect(accepted).toMatchObject({ ok: true, attempted: true });
+    if (!accepted.ok) throw new Error(`initial transcript-only commit failed: ${accepted.reason}`);
+
+    const staleCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-transcript-only-rejected",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.65]
+    };
+    const stalePlan = await runShadowTurnCallTranscript(serializedBefore, staleCall);
+    expect("serializedAfter" in stalePlan).toBe(false);
+    const staleKey = shadowTurnKeyFromTranscript(stalePlan.transcript);
+    const executorWorld = createWorldFromSerialized(serializedBefore, { persist: false });
+    let postStateExports = 0;
+    // A rejected durable commit should return on the transcript result alone.
+    executorWorld.exportWorld = () => {
+      postStateExports += 1;
+      throw new Error("executor post-state export should not run for rejected durable commit-scope execution");
+    };
+    const staleNode = createShadowExecutionNode({
+      node: "stale-node",
+      scope: staleKey.scope,
+      atom_hashes: staleKey.atom_hashes,
+      serialized: serializedBefore
+    });
+    staleNode.world = executorWorld;
+
+    const rejected = await executeShadowTurnCallOrNeedState(staleNode, {
+      kind: "woo.turn.exec.request.shadow.v1",
+      call: staleCall,
+      key: staleKey,
+      expected: initialHead
+    }, { commitScope });
+
+    expect(rejected).toMatchObject({
+      ok: false,
+      reason: "commit_rejected",
+      commit: { kind: "woo.commit.conflict.shadow.v1", reason: "stale_head" },
+      reply: { kind: "woo.turn.exec.reply.shadow.v1", ok: false, reason: "commit_rejected" }
+    });
+    if (rejected.ok || rejected.reason !== "commit_rejected") throw new Error("expected stale transcript-only commit rejection");
+    expect(postStateExports).toBe(0);
+    expect(rejected.transcript.hash).toBe(stalePlan.transcript.hash);
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.64);
+    expect(createWorldFromSerialized(staleNode.serialized!, { persist: false }).getProp("delay_1", "wet")).not.toBe(0.65);
   });
 
   it("merges accepted commit state at cell granularity", async () => {
