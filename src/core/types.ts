@@ -275,18 +275,22 @@ export type MetricEvent =
   | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean }
   | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean }
   | { kind: "do_constructor"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; ms: number }
-  | { kind: "do_handler"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; method: string; route: string; ms: number; status: "ok" | "error"; error?: string }
+  | { kind: "do_handler"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; method: string; route: string; ms: number; status: "ok" | "error"; error?: string; error_detail?: string }
   | { kind: "shadow_apply_step"; phase: "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "total"; scope: ObjRef; route: string; ms: number; objects: number; creates: number; writes: number }
   | { kind: "shadow_gateway_apply_step"; phase: "capture_runtime" | "export_world" | "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "apply_serialized" | "import_world" | "restore_runtime" | "total"; scope: ObjRef; route: string; ms: number; objects: number; properties: number; sessions: number; logs: number; creates: number; writes: number }
-  | { kind: "v2_open"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; transfer_mode?: string; full_save?: boolean; error?: string }
-  | { kind: "v2_envelope"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; fresh?: boolean; reply?: "none" | "accepted" | "live" | "missing_state" | "commit_rejected"; fanout?: number; full_save?: boolean; error?: string }
+  | { kind: "v2_open"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; transfer_mode?: string; full_save?: boolean; error?: string; error_detail?: string }
+  | { kind: "v2_envelope"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; fresh?: boolean; reply?: "none" | "accepted" | "live" | "missing_state" | "commit_rejected"; fanout?: number; full_save?: boolean; error?: string; error_detail?: string }
+  | { kind: "v2_ws_reject"; scope?: ObjRef; node?: string; ms: number; status: "error"; error: string; error_detail?: string }
+  | { kind: "v2_ws_open"; scope: ObjRef; node: string; actor: ObjRef; ms: number; status: "ok" }
+  | { kind: "v2_ws_close"; scope?: ObjRef; node?: string; actor?: ObjRef; code: number; clean: boolean; reason?: string; ms: number; status: "ok" }
+  | { kind: "v2_ws_error"; scope?: ObjRef; node?: string; actor?: ObjRef; ms: number; status: "error"; error: string; error_detail?: string }
   | { kind: "rest_v2_in_process_fallback"; reason: "no_commit_scope"; scope: ObjRef; target: ObjRef; verb: string; route: "direct" | "sequenced"; persistence: "durable" | "live" }
   | { kind: "shadow_commit_accepted"; scope: ObjRef; seq: number; node?: string; id?: string; fanout?: number }
   | { kind: "shadow_commit_rejected"; scope?: ObjRef; node?: string; id?: string; reason: string }
   | { kind: "v2_host_apply_fanout"; scope: ObjRef; hosts: number; touched: number; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_fanout"; scope: ObjRef; shards: number; observations: number; affected_scopes?: number; cached_shards?: number; scoped_shards?: number; scoped_added?: number }
   | { kind: "init"; phase: "world" | "mcp_gateway"; ms: number }
-  | { kind: "startup_storage"; phase: "cf_repository_migrate" | "cf_repository_load" | "cf_repository_save" | "host_seed_fetch" | "mcp_gateway_snapshot_fetch" | "directory_schema" | "directory_register_objects" | "directory_register_objects_skip" | "directory_register_session" | "directory_inherit_tombstones"; ms: number; status: "ok" | "error"; objects?: number; properties?: number; sessions?: number; logs?: number; snapshots?: number; tasks?: number; routes?: number; writes?: number; statements?: number; stored?: boolean; error?: string; count?: number; inserted?: number; routes_removed?: number; batch_seq?: number; final?: boolean }
+  | { kind: "startup_storage"; phase: "cf_repository_migrate" | "cf_repository_load" | "cf_repository_save" | "host_seed_fetch" | "mcp_gateway_snapshot_fetch" | "directory_schema" | "directory_register_objects" | "directory_register_objects_skip" | "directory_register_session" | "directory_inherit_tombstones"; ms: number; status: "ok" | "error"; objects?: number; properties?: number; sessions?: number; logs?: number; snapshots?: number; tasks?: number; routes?: number; writes?: number; statements?: number; stored?: boolean; error?: string; error_detail?: string; count?: number; inserted?: number; routes_removed?: number; batch_seq?: number; final?: boolean }
   | { kind: "state_projection"; ms: number; objects: number; remote_hosts: number }
   | { kind: "host_schema_sync"; host: string; planned: number; skipped: number; ms: number }
   // Diagnostic events for the host-task serialization queue (world.ts

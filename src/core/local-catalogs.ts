@@ -118,6 +118,7 @@ const LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION = "2026-05-14-chat-room-roster";
 const LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION = "2026-05-14-pinboard-room-roster";
 const LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION = "2026-05-14-dubspace-room-roster";
 const LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION = "2026-05-15-rest-live-persistence-metadata";
+const LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION = "2026-05-18-dispenser-next-pending-live";
 const LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION = "2026-05-15-roster-presentation-reconcile";
 // Repair pass: deployed satellites recorded
 // LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION as applied while the
@@ -194,6 +195,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, only: "pinboard" },
   { id: LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, only: "dubspace" },
   { id: LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION },
+  { id: LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION },
   { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" }
 ];
@@ -442,6 +444,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
   run(LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
+  run(LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   run(LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
   run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   return covered;

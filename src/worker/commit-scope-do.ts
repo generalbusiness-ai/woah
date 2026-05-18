@@ -37,6 +37,7 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
+import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 export class CommitScopeDO {
@@ -92,6 +93,7 @@ export class CommitScopeDO {
     const url = new URL(request.url);
     let handlerStatus: "ok" | "error" = "ok";
     let handlerError: string | undefined;
+    let handlerErrorDetail: string | undefined;
     try {
       if (request.method === "GET" && url.pathname === "/healthz") {
         return jsonResponse({
@@ -141,7 +143,7 @@ export class CommitScopeDO {
             transfer: opened.transfer
           } satisfies CommitScopeOpenResponse);
         } catch (err) {
-          this.emitMetric({ kind: "v2_open", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, error: metricErrorCode(err) });
+          this.emitMetric({ kind: "v2_open", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, ...metricErrorFields(err) });
           throw err;
         }
       }
@@ -187,7 +189,7 @@ export class CommitScopeDO {
             fanout
           } satisfies CommitScopeEnvelopeResponse);
         } catch (err) {
-          this.emitMetric({ kind: "v2_envelope", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, error: metricErrorCode(err) });
+          this.emitMetric({ kind: "v2_envelope", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, ...metricErrorFields(err) });
           throw err;
         }
       }
@@ -199,7 +201,9 @@ export class CommitScopeDO {
       }, 501);
     } catch (err) {
       handlerStatus = "error";
-      handlerError = metricErrorCode(err);
+      const fields = metricErrorFields(err);
+      handlerError = fields.error;
+      handlerErrorDetail = fields.error_detail;
       throw err;
     } finally {
       this.emitMetric({
@@ -209,7 +213,8 @@ export class CommitScopeDO {
         route: url.pathname,
         ms: Date.now() - handlerStartedAt,
         status: handlerStatus,
-        ...(handlerError ? { error: handlerError } : {})
+        ...(handlerError ? { error: handlerError } : {}),
+        ...(handlerErrorDetail ? { error_detail: handlerErrorDetail } : {})
       });
     }
   }
@@ -909,12 +914,6 @@ function shadowReplyMetricKind(reply: ShadowEnvelope<ShadowTurnExecReply> | null
   if (!body) return "none";
   if (body.ok === false) return body.reason;
   return body.commit ? "accepted" : "live";
-}
-
-function metricErrorCode(err: unknown): string {
-  if (err && typeof err === "object" && "code" in err && typeof (err as { code?: unknown }).code === "string") return (err as { code: string }).code;
-  if (err instanceof Error && err.name) return err.name;
-  return "E_UNKNOWN";
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

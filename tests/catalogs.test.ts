@@ -3531,6 +3531,7 @@ describe("local catalogs", () => {
       world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
       world.setProp(blockId, "rate_limit_seconds", 0);
       world.setProp(blockId, "block_cooldown_seconds", 0);
+      expect(world.verbInfo(blockId, "next_pending").arg_spec).toMatchObject({ command: { persistence: "live" } });
 
       const requesterSess = world.auth("guest:disp-requester");
       const requester = requesterSess.actor;

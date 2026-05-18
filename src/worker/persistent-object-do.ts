@@ -65,6 +65,7 @@ import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { hashSource } from "../core/source-hash";
+import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 // Re-import WooWorld type. Note `import type` must reach the world module
@@ -321,6 +322,7 @@ export class PersistentObjectDO {
     let hostKey = this.durableHostKey();
     let handlerStatus: "ok" | "error" = "ok";
     let handlerError: string | undefined;
+    let handlerErrorDetail: string | undefined;
     // Operator-bootstrap precondition check (cloudflare.md §R14.7).
     try {
       if (!this.env.WOO_INITIAL_WIZARD_TOKEN) {
@@ -465,8 +467,10 @@ export class PersistentObjectDO {
       return jsonResponse({ error: { code: "E_OBJNF", message: `no route for ${request.method} ${pathname}` } }, 404);
     } catch (err) {
       const error = normalizeError(err);
+      const fields = metricErrorFields(err);
       handlerStatus = "error";
-      handlerError = error.code;
+      handlerError = fields.error;
+      handlerErrorDetail = fields.error_detail;
       return jsonResponse({ error }, statusForError(error));
     } finally {
       if (!gatewayHost && postHandlerWorld) {
@@ -475,7 +479,9 @@ export class PersistentObjectDO {
     }
     } catch (err) {
       handlerStatus = "error";
-      handlerError = metricErrorCode(err);
+      const fields = metricErrorFields(err);
+      handlerError = fields.error;
+      handlerErrorDetail = fields.error_detail;
       throw err;
     } finally {
       this.emitMetric({
@@ -485,7 +491,8 @@ export class PersistentObjectDO {
         route: pathname || "_pre_route",
         ms: Date.now() - handlerStartedAt,
         status: handlerStatus,
-        ...(handlerError ? { error: handlerError } : {})
+        ...(handlerError ? { error: handlerError } : {}),
+        ...(handlerErrorDetail ? { error_detail: handlerErrorDetail } : {})
       }, hostKey);
     }
   }
@@ -1123,7 +1130,7 @@ export class PersistentObjectDO {
       const digest = response.headers.get("x-woo-seed-digest");
       return { seed: body, digest: digest && digest.length > 0 ? digest : null };
     } catch (err) {
-      this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", error: metricErrorCode(err) }, hostKey);
+      this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", ...metricErrorFields(err) }, hostKey);
       throw err;
     }
   }
@@ -2483,7 +2490,8 @@ export class PersistentObjectDO {
     ws.close(1002, "legacy /ws protocol has been removed");
   }
 
-  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
+  async webSocketClose(ws: WebSocket, code: number, _reason: string, wasClean: boolean): Promise<void> {
+    const startedAt = Date.now();
     const world = await this.getWorld();
     const att = this.attachment(ws);
     if (att) {
@@ -2495,35 +2503,76 @@ export class PersistentObjectDO {
     } catch {
       // ignore — already closed
     }
+    if (att?.protocol === "v2-turn-network") {
+      this.emitMetric({
+        kind: "v2_ws_close",
+        scope: att.scope,
+        node: att.node,
+        actor: att.actor,
+        code,
+        clean: wasClean,
+        reason: `close:${code}`,
+        ms: Date.now() - (att.openedAt ?? startedAt),
+        status: "ok"
+      }, this.durableHostKey());
+    }
   }
 
-  async webSocketError(ws: WebSocket, _err: unknown): Promise<void> {
+  async webSocketError(ws: WebSocket, err: unknown): Promise<void> {
+    const startedAt = Date.now();
     const world = await this.getWorld();
     const att = this.attachment(ws);
     if (att) {
       world.detachSocket(att.sessionId, att.socketId);
       this.indexRemoveSocket(att.sessionId, att.actor, ws);
     }
+    if (att?.protocol === "v2-turn-network") {
+      this.emitMetric({
+        kind: "v2_ws_error",
+        scope: att.scope,
+        node: att.node,
+        actor: att.actor,
+        ms: Date.now() - startedAt,
+        status: "error",
+        ...metricErrorFields(err)
+      }, this.durableHostKey());
+    }
   }
 
   private async acceptV2TurnNetworkWebSocket(request: Request, world: WooWorld): Promise<Response> {
+    const startedAt = Date.now();
     // Public deployments rely on Cloudflare's TLS termination and route this as
     // wss://; plaintext ws:// is only acceptable for localhost development per
     // VTN19.
     const upgrade = request.headers.get("upgrade");
     if (upgrade?.toLowerCase() !== "websocket") {
-      return jsonResponse({ error: { code: "E_INVARG", message: "expected Upgrade: websocket" } }, 400);
+      return this.rejectV2TurnNetworkWebSocket({ code: "E_INVARG", message: "expected Upgrade: websocket" }, 400, startedAt);
     }
     if (!webSocketProtocols(request).includes("woo-v2.turn-network.json")) {
-      return jsonResponse({ error: { code: "E_PROTOCOL", message: "missing Sec-WebSocket-Protocol: woo-v2.turn-network.json" } }, 400);
+      return this.rejectV2TurnNetworkWebSocket({ code: "E_PROTOCOL", message: "missing Sec-WebSocket-Protocol: woo-v2.turn-network.json" }, 400, startedAt);
     }
     const url = new URL(request.url);
     const token = url.searchParams.get("token") ?? "";
     const node = url.searchParams.get("node") || `browser:${crypto.randomUUID()}`;
     const scope = (url.searchParams.get("scope") || "") as ObjRef;
     const lastKnownHead = parseShadowScopeHeadJson(url.searchParams.get("last_known_head"));
-    if (!token) return jsonResponse({ error: { code: "E_NOSESSION", message: "token query parameter is required" } }, 401);
-    const session = this.authenticateToken(world, token);
+    if (!token) {
+      return this.rejectV2TurnNetworkWebSocket({ code: "E_NOSESSION", message: "token query parameter is required" }, 401, startedAt, scope, node);
+    }
+    let session: Session;
+    try {
+      session = this.authenticateToken(world, token);
+    } catch (err) {
+      this.emitMetric({
+        kind: "v2_ws_reject",
+        scope: scope || undefined,
+        node,
+        ms: Date.now() - startedAt,
+        status: "error",
+        ...metricErrorFields(err)
+      }, this.durableHostKey());
+      throw err;
+    }
     const commitScope = scope || session.actor;
     const socketId = `v2-${session.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     world.attachSocket(session.id, socketId);
@@ -2538,52 +2587,92 @@ export class PersistentObjectDO {
       socketId,
       node,
       scope: commitScope,
-      token
+      token,
+      openedAt: startedAt
     });
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
+    try {
+      const authority = v2TurnGatewayAuthorityPayload(world, [commitScope, session.actor]);
+      const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
+        scope: commitScope,
+        node,
+        token,
+        session: session.id,
+        actor: session.actor,
+        ...authority,
+        serialized: world.exportWorld(),
+        ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
+      });
+      const hello = opened.hello;
+      server.send(encodeEnvelope({
+        v: 2,
+        type: hello.kind,
+        id: `${this.durableHostKey()}:hello:${Date.now()}`,
+        from: opened.relay,
+        to: node,
+        actor: session.actor,
+        session: session.id,
+        auth: { mode: "session", token },
+        body: hello
+      } satisfies ShadowEnvelope<typeof hello>));
+      const transfer = opened.transfer;
+      server.send(encodeEnvelope({
+        v: 2,
+        type: transfer.kind,
+        id: `${this.durableHostKey()}:state:${crypto.randomUUID()}`,
+        from: opened.relay,
+        to: node,
+        actor: session.actor,
+        session: session.id,
+        auth: { mode: "session", token },
+        body: transfer
+      } satisfies ShadowEnvelope<typeof transfer>));
+    } catch (err) {
+      world.detachSocket(session.id, socketId);
+      this.indexRemoveSocket(session.id, session.actor, server);
+      try {
+        server.close(1011, "v2 open failed");
+      } catch {
+        // ignore cleanup failure; the fetch error remains the signal
+      }
+      this.emitMetric({
+        kind: "v2_ws_reject",
+        scope: commitScope,
+        node,
+        ms: Date.now() - startedAt,
+        status: "error",
+        ...metricErrorFields(err)
+      }, this.durableHostKey());
+      throw err;
+    }
 
-    const authority = v2TurnGatewayAuthorityPayload(world, [commitScope, session.actor]);
-    const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
+    this.emitMetric({
+      kind: "v2_ws_open",
       scope: commitScope,
       node,
-      token,
-      session: session.id,
       actor: session.actor,
-      ...authority,
-      serialized: world.exportWorld(),
-      ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
-    });
-    const hello = opened.hello;
-    server.send(encodeEnvelope({
-      v: 2,
-      type: hello.kind,
-      id: `${this.durableHostKey()}:hello:${Date.now()}`,
-      from: opened.relay,
-      to: node,
-      actor: session.actor,
-      session: session.id,
-      auth: { mode: "session", token },
-      body: hello
-    } satisfies ShadowEnvelope<typeof hello>));
-    const transfer = opened.transfer;
-    server.send(encodeEnvelope({
-      v: 2,
-      type: transfer.kind,
-      id: `${this.durableHostKey()}:state:${crypto.randomUUID()}`,
-      from: opened.relay,
-      to: node,
-      actor: session.actor,
-      session: session.id,
-      auth: { mode: "session", token },
-      body: transfer
-    } satisfies ShadowEnvelope<typeof transfer>));
+      ms: Date.now() - startedAt,
+      status: "ok"
+    }, this.durableHostKey());
 
     return new Response(null, {
       status: 101,
       webSocket: client,
       headers: { "Sec-WebSocket-Protocol": "woo-v2.turn-network.json" }
     });
+  }
+
+  private rejectV2TurnNetworkWebSocket(error: { code: string; message: string }, status: number, startedAt: number, scope?: ObjRef, node?: string): Response {
+    this.emitMetric({
+      kind: "v2_ws_reject",
+      ...(scope ? { scope } : {}),
+      ...(node ? { node } : {}),
+      ms: Date.now() - startedAt,
+      status: "error",
+      error: error.code
+    }, this.durableHostKey());
+    return jsonResponse({ error }, status);
   }
 
   private async webSocketV2TurnNetworkMessage(world: WooWorld, ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -3032,7 +3121,7 @@ export class PersistentObjectDO {
 
   // ---- WS helpers ----
 
-  private attachment(ws: WebSocket): { sessionId: string; actor: ObjRef; socketId: string; protocol?: "v2-turn-network"; node?: string; scope: ObjRef; token?: string } | null {
+  private attachment(ws: WebSocket): { sessionId: string; actor: ObjRef; socketId: string; protocol?: "v2-turn-network"; node?: string; scope: ObjRef; token?: string; openedAt?: number } | null {
     const raw = ws.deserializeAttachment();
     if (!raw || typeof raw !== "object") return null;
     const a = raw as Record<string, unknown>;
@@ -3044,7 +3133,8 @@ export class PersistentObjectDO {
       ...(a.protocol === "v2-turn-network" ? { protocol: "v2-turn-network" as const } : {}),
       ...(typeof a.node === "string" ? { node: a.node } : {}),
       scope: (typeof a.scope === "string" ? a.scope : a.actor) as ObjRef,
-      ...(typeof a.token === "string" ? { token: a.token } : {})
+      ...(typeof a.token === "string" ? { token: a.token } : {}),
+      ...(typeof a.openedAt === "number" ? { openedAt: a.openedAt } : {})
     };
   }
 
@@ -3567,11 +3657,6 @@ async function workerHashText(text: string): Promise<string> {
 
 function logCatalogTapEvent(event: CatalogTapLogEvent): void {
   console.log("woo.catalog", JSON.stringify({ ...event, ts: Date.now() }));
-}
-
-function metricErrorCode(err: unknown): string {
-  if (err && typeof err === "object" && "code" in err) return String((err as { code: unknown }).code);
-  return err instanceof Error ? err.name : "E_INTERNAL";
 }
 
 export function v2FanoutEnvelopesByNode(fanout: Array<{ node: string; envelope: string }>): Map<string, string[]> {

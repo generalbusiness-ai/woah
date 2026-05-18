@@ -50,7 +50,7 @@ sequencing details.
 | `:order(request)` | public | Checks request size, queue cap, block cooldown, and requester rate limit; appends to `pending_orders`, tells the requester it was accepted, returns `{order_id, queued, text, ts}`, emits `order_placed` (sequenced when invoked through space-call). |
 | `:deliver(order_id, name, text, description)` | block actor (plug) or wizard | Idempotent. Removes the entry, creates a `$dispensed_note` owned by the block with the supplied `name` (inventory listing label), markdown `text` (what `read` returns, capped at 262144 chars by `$note.set_text`), and optional `description` (the one-line cosmetic look-at flavour; per LambdaCore `$note`, this is what `look` shows — pass null/empty to leave it unset). `name` and `text` are required strings. Moves the note to the requester, tells them it arrived, and emits `delivered`. |
 | `:cancel(order_id)` | requester / owner / plug / wizard | Removes the entry, emits `canceled`. The plug (block-actor session, authenticated via apikey) can cancel its own pending orders so a poisoned queue head doesn't block delivery of every following order. |
-| `:next_pending()` | block actor (plug) or wizard | Returns the oldest queued entry, or `null`. |
+| `:next_pending()` | block actor (plug) or wizard | Returns the oldest queued entry, or `null`. Declared live/read-only for REST so polling does not enter the durable commit path. |
 | `:status(order_id)` | public | Returns `{state: "queued", ts}` or `{state: "unknown"}`. |
 
 ## Output: `$dispensed_note`

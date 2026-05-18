@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createSessionCache, horoscopeNoteName, runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
+import { createHeartbeatCache, createSessionCache, createSystemPromptCache, horoscopeNoteName, runHoroscopeTick, type HoroscopePlugEnv } from "../src/index";
 import type { HoroscopeAi } from "../src/horoscope";
 import type { WooSession } from "../src/woo-client";
 
@@ -175,6 +175,33 @@ describe("runHoroscopeTick", () => {
     const result = await runHoroscopeTick(env, { fetchImpl });
     expect(result).toEqual({ block: env.BLOCK_ID, delivered: 0, errors: [], authMode: "cold" });
     expect(ai.run).not.toHaveBeenCalled();
+  });
+
+  it("reuses cached system_prompt and skips empty heartbeat inside the throttle window", async () => {
+    const ai = { run: vi.fn() };
+    const env = makeEnv(ai, { HEARTBEAT_INTERVAL_MS: "300000" });
+    const systemPromptCache = createSystemPromptCache();
+    const heartbeatCache = createHeartbeatCache();
+    let tick = 1_700_000_000_000;
+
+    const { fetchImpl, calls } = makeFetch([
+      authReply,
+      () => propertyReply("cached prompt"),
+      () => callReply(null),
+      () => callReply({ ok: true }),
+      authReply,
+      () => callReply(null)
+    ]);
+
+    const first = await runHoroscopeTick(env, { fetchImpl, systemPromptCache, heartbeatCache, now: () => tick });
+    tick += 60_000;
+    const second = await runHoroscopeTick(env, { fetchImpl, systemPromptCache, heartbeatCache, now: () => tick });
+
+    expect(first.delivered).toBe(0);
+    expect(second.delivered).toBe(0);
+    expect(calls.filter((c) => c.url.includes("/properties/system_prompt"))).toHaveLength(1);
+    expect(calls.filter((c) => c.url.includes("/calls/set_properties"))).toHaveLength(1);
+    expect(calls.filter((c) => c.url.includes("/calls/next_pending"))).toHaveLength(2);
   });
 
   it("works when system_prompt is unset (uses the default)", async () => {

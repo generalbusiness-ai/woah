@@ -19,6 +19,8 @@ binding = "AI"
 #   BLOCK_ID              - canonical block id, e.g. the_horoscope_block
 #   MAX_TOKENS            - optional, defaults to 350
 #   MAX_ORDERS_PER_TICK   - optional, defaults to 10
+#   SYSTEM_PROMPT_TTL_MS   - optional, defaults to 300000
+#   HEARTBEAT_INTERVAL_MS  - optional, defaults to 300000
 #
 # Provisioning:
 #   wrangler secret put WOO_APIKEY
@@ -29,3 +31,5 @@ WOO_BASE_URL = "https://woah.generalbusiness.ai"
 BLOCK_ID = "the_horoscope"
 MAX_TOKENS = "350"
 MAX_ORDERS_PER_TICK = "10"
+SYSTEM_PROMPT_TTL_MS = "300000"
+HEARTBEAT_INTERVAL_MS = "300000"

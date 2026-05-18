@@ -36,6 +36,7 @@ const SLOT_HOST = 12;
 const SLOT_ACTOR = 13;
 const SLOT_PATH = 14;
 const SLOT_REASON = 15;
+const SLOT_ERROR_DETAIL = 16;
 
 const DBL_MS = 0;
 const DBL_SAMPLE_RATE = 1;
@@ -112,7 +113,7 @@ describe("metrics-sink", () => {
 
       // Empty axes still occupy their slot — fixed-width is what /admin/stats
       // SQL relies on.
-      expect(point.blobs).toHaveLength(16);
+      expect(point.blobs).toHaveLength(17);
       expect(point.blobs?.[SLOT_KIND]).toBe("do_handler");
       expect(point.blobs?.[SLOT_CLASS]).toBe("DirectoryDO");
       expect(point.blobs?.[SLOT_ROUTE]).toBe("/register-session");
@@ -124,6 +125,7 @@ describe("metrics-sink", () => {
       expect(point.blobs?.[SLOT_WHAT]).toBe("");
       expect(point.blobs?.[SLOT_TARGET]).toBe("");
       expect(point.blobs?.[SLOT_VERB]).toBe("");
+      expect(point.blobs?.[SLOT_ERROR_DETAIL]).toBe("");
 
       expect(point.doubles).toHaveLength(3);
       expect(point.doubles?.[DBL_MS]).toBe(12);
@@ -256,6 +258,53 @@ describe("metrics-sink", () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]!.blobs?.[SLOT_ERROR]).toBe("E_BOOM");
       expect(calls[0]!.doubles?.[DBL_SAMPLE_RATE]).toBe(1);
+    });
+
+    it("populates bounded error_detail on the new diagnostic axis", () => {
+      const { binding, calls } = fakeAnalytics();
+      const event: MetricEvent = {
+        kind: "do_handler",
+        class: "CommitScopeDO",
+        method: "POST",
+        route: "/v2/envelope",
+        ms: 2,
+        status: "error",
+        error: "E_INTERNAL",
+        error_detail: "plain Error: bad envelope relay state"
+      };
+      writeMetricToAnalytics(event, "the_chatroom", binding);
+      expect(calls[0]!.blobs?.[SLOT_ERROR]).toBe("E_INTERNAL");
+      expect(calls[0]!.blobs?.[SLOT_ERROR_DETAIL]).toBe("plain Error: bad envelope relay state");
+    });
+
+    it("packs v2 WebSocket lifecycle metrics", () => {
+      const { binding, calls } = fakeAnalytics();
+      const rejected: MetricEvent = {
+        kind: "v2_ws_reject",
+        scope: "the_deck",
+        node: "browser:abc",
+        ms: 5,
+        status: "error",
+        error: "E_NOSESSION"
+      };
+      const opened: MetricEvent = {
+        kind: "v2_ws_open",
+        scope: "the_deck",
+        node: "browser:abc",
+        actor: "$wiz",
+        ms: 9,
+        status: "ok"
+      };
+      writeMetricToAnalytics(rejected, "world", binding);
+      writeMetricToAnalytics(opened, "world", binding);
+      writeMetricToAnalytics({ kind: "v2_ws_close", scope: "the_deck", node: "browser:abc", actor: "$wiz", code: 1000, clean: true, reason: "close:1000", ms: 100, status: "ok" }, "world", binding);
+      expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("v2_ws_reject");
+      expect(calls[0]!.blobs?.[SLOT_SCOPE]).toBe("the_deck");
+      expect(calls[0]!.blobs?.[SLOT_ERROR]).toBe("E_NOSESSION");
+      expect(calls[1]!.blobs?.[SLOT_KIND]).toBe("v2_ws_open");
+      expect(calls[1]!.blobs?.[SLOT_ACTOR]).toBe("$wiz");
+      expect(calls[2]!.blobs?.[SLOT_KIND]).toBe("v2_ws_close");
+      expect(calls[2]!.blobs?.[SLOT_REASON]).toBe("close:1000");
     });
 
     it("swallows AE write errors so a metric never breaks the worker", () => {

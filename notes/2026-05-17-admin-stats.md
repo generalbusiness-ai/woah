@@ -82,6 +82,7 @@ blobs[13]  = actor          (mcp_tool_refresh_*, dispatch_resolved)
 blobs[14]  = path           (dispatch_resolved.path: local|read|mutating)
 blobs[15]  = reason         (shadow_commit_rejected.reason, mcp_tool_refresh_*.reason,
                              rest_v2_in_process_fallback.reason)
+blobs[16]  = error_detail   (bounded diagnostic detail for uncoded internal errors)
 
 doubles[0] = ms
 doubles[1] = sample_rate    (1, or the 1-in-N multiplier)
@@ -109,7 +110,7 @@ Out of scope here. Sketch:
 
 - HTTP Basic auth, single fixed user `admin`, password from
   `env.ADMIN_PASSWORD` (Cloudflare secret).
-- `/admin/series?metric=...&groupBy=host_key|scope|class|kind&from=&to=&bucket=`
+- `/admin/series?metric=...&groupBy=host_key|scope|class|kind|error_detail&from=&to=&bucket=`
   proxies to the AE SQL API with `Account Analytics:Read`.
 - Three pivots (host_key / scope / class), one error-rate chart, one
   footprint table (per-DO-class p50/p95/error%).
