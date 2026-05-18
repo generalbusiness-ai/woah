@@ -85,6 +85,20 @@ export interface Env {
   // `MetricEvent` here (modulo sampling) so /admin/stats can query historical
   // counts and latencies without depending on tail-time consumption.
   METRICS?: import("./metrics-sink").MetricsAnalyticsBinding;
+  // /admin/ HTTP Basic auth password. Set via
+  //   wrangler secret put ADMIN_PASSWORD
+  // When unset, /admin/* always returns 503 — the admin panel fails closed.
+  ADMIN_PASSWORD?: string;
+  // Cloudflare account-scoped API token with Account Analytics: Read.
+  // /admin/series proxies AE SQL through this. Set via
+  //   wrangler secret put CF_ANALYTICS_TOKEN
+  // and put the account id in CF_ACCOUNT_ID (a [vars] entry, not a secret).
+  CF_ANALYTICS_TOKEN?: string;
+  CF_ACCOUNT_ID?: string;
+  // AE dataset that /admin/series queries. Set via [vars] (per env) so
+  // staging hits `woo_v1_staging` and prod hits `woo_v1_prod`; defaults
+  // to `woo_v1_prod` for unset envs to fail safely toward production.
+  WOO_AE_DATASET?: string;
 }
 
 type CommitScopeOpenResponse = {

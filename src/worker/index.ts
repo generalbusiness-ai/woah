@@ -8,6 +8,7 @@
 import type { Env } from "./persistent-object-do";
 import { signInternalRequest } from "./internal-auth";
 import { sessionActiveScopeFromRecord, wooError } from "../core/types";
+import { handleAdmin } from "./admin";
 
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
@@ -73,6 +74,12 @@ export default {
 
     if (isApiPath(url.pathname)) {
       return forwardToHost(env, WORLD_HOST, await withDirectorySession(env, request));
+    }
+
+    // /admin/* must run before the SPA fallback so the asset's
+    // not-found-handling=single-page-application doesn't swallow it.
+    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+      return handleAdmin(request, env, url);
     }
 
     if (env.ASSETS) {
