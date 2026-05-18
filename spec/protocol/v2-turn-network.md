@@ -25,6 +25,13 @@ This document is draft, but it is intended to constrain prototype
 implementation. The final byte encoding may change. The state machines and
 validation rules should not change casually once implemented.
 
+Production v2 protocol names use the `woo.*.v1` message namespace defined in
+this document. Earlier implementation-only names from the simulator and
+transport bring-up are not protocol names. New protocol text, tests, and
+client/server APIs MUST NOT add new interim-named message kinds, proof schemes,
+diagnostics, metrics, or process steps; implementation adapters may translate
+old local names at module boundaries while the code is being renamed.
+
 ---
 
 ## VTN1. Scope and compatibility
@@ -112,10 +119,10 @@ A `ScopeHead` names a commit-scope epoch and the last accepted transcript in
 that epoch. Epochs fence sequencer/commit-scope migration. Messages that carry
 an epoch MUST be rejected if the receiver knows that epoch is stale.
 
-`ScopeRef` is a v2 protocol identifier. During the shadow prototype, the
-runtime may store the scope as the existing `ObjRef` directly, with
-`scope:<objRef>` as the canonical wire spelling. This is a prototype shortcut,
-not a different authority model.
+`ScopeRef` is a v2 protocol identifier. An implementation may store the scope
+as the existing `ObjRef` directly while local storage is being migrated, with
+`scope:<objRef>` as the canonical wire spelling. This is a storage shortcut, not
+a different authority model.
 
 ## VTN4. Message envelope
 
@@ -262,10 +269,10 @@ type CellVersion = {
 An implementation MAY store cells differently internally. On the wire, reads,
 writes, validation, and transfer proofs use this vocabulary.
 
-The shadow prototype derives versions for `location`, `contents`, `lifecycle`,
-and `owner` reads from deterministic cell-content hashes. These versions MUST
-NOT depend on wall-clock object metadata such as `modified`, because replaying
-the same turn against the same pre-state must produce the same transcript and
+Implementations derive versions for `location`, `contents`, `lifecycle`, and
+`owner` reads from deterministic cell-content hashes. These versions MUST NOT
+depend on wall-clock object metadata such as `modified`, because replaying the
+same turn against the same pre-state must produce the same transcript and
 post-state hash.
 
 Routing atoms are compact hashes of typed preimages. The preimage MUST include
@@ -316,7 +323,7 @@ Prototype route mapping:
 
 | v1 runtime path | v2 `TurnCall.route` | Notes |
 | --- | --- | --- |
-| `directCall` that may mutate durable cells | `"committed"` | Shadow recorders may label this as `"direct"` until the commit plane exists. |
+| `directCall` that may mutate durable cells | `"committed"` | Transitional code may still call this path `direct`; protocol turns use `"committed"`. |
 | `$space:call` / `$sequenced_log` applied call | `"committed"` | The existing space sequence is the prototype commit order. |
 | Explicit preview/chat/presence-only path | `"live"` | Must not write durable object cells or create durable applied frames. |
 
@@ -325,10 +332,9 @@ scopes. A v1 sequenced space maps to the v2 `ScopeRef` for that space object.
 Not every future commit scope must be a `$space`, but the prototype uses spaces
 as the bridge because they already provide ordered applied frames.
 
-The production `LogicalInputs` shape groups inputs by validation role. The
-shadow recorder currently emits an ordered flat list of named inputs
-(`Array<{name,value}>`) because that is the smallest replay mechanism. The
-mapping is:
+The production `LogicalInputs` shape groups inputs by validation role. Existing
+recorders may internally emit an ordered flat list of named inputs
+(`Array<{name,value}>`) as a replay mechanism. The protocol mapping is:
 
 - `now`, `idle_seconds.now`, and substrate timestamp sites become
   `logical_time` inputs or named time entries under a future structured form;
@@ -450,33 +456,30 @@ incomplete transcript as a durable turn. It MAY store incomplete transcripts as
 diagnostics. `incomplete_reasons` is a diagnostic annotation and is only
 meaningful when `complete` is false.
 
-Shadow v2 does not merge cross-host bridge sub-transcripts. When execution hits
-a runtime host bridge such as dispatch, remote property access, movement, or
+V2 does not accept partial cross-host bridge transcripts. When execution hits a
+runtime host bridge such as dispatch, remote property access, movement, or
 remote contents lookup, the recorder marks the caller transcript incomplete and
-attaches a `woo.remote_bridge_transcript_policy.shadow.v1` diagnostic policy
-value saying that sub-transcripts are deferred and the commit result is
-`reject`. This is intentional: the prototype either executes a whole turn on
-one capable node, or refuses to commit the partial local transcript. A later
-execution-plane milestone may replace this diagnostic boundary with a signed
-callee transcript that can be merged and validated by the caller's commit
-scope.
+attaches a `woo.remote_bridge_transcript_policy.v1` diagnostic policy value
+saying that sub-transcripts are deferred and the commit result is `reject`. This
+is intentional: the protocol either executes a whole turn on one capable node,
+or refuses to commit the partial local transcript. A later execution-plane
+milestone may replace this diagnostic boundary with a signed callee transcript
+that can be merged and validated by the caller's commit scope.
 
-The current implementation emits `kind: "woo.effect_transcript.shadow.v1"`.
-That shadow shape is intentionally not wire-compatible with the production
-`woo.effect_transcript.v1`: it may omit `base`, `vm`, `pre_state_hash`, and
-`post_state_hash`; records logical inputs as a flat ordered list; and may carry
-shadow-only incomplete-effect diagnostics. Shadow transcripts MUST NOT be
-submitted as production commits. They may be converted by a later milestone once
-a `ScopeHead`, accepted VM/catalog hashes, and pre/post state hashes are
-available.
+Production commits MUST submit `kind: "woo.effect_transcript.v1"`. A transcript
+is not commit-eligible unless it includes `base`, `vm`, logical inputs,
+pre/post state hashes, complete read/write facts, and all diagnostics required
+to prove no untracked native or bridge effect occurred. Implementation-local
+recorder objects that omit these fields MUST be normalized to this shape before
+commit submission.
 
-Dispatch reads SHOULD contribute to `vm.verb_hashes`. The shadow recorder
-currently records the resolved definer, owner, version, `source_hash`,
-direct-callability, native handler name when the verb is native, and the
-handler's native primitive contract when one exists. It records both top-level
-dispatches and local bytecode-to-bytecode calls so write-frame validation can
-prove which verb frame performed each mutation. Production transcripts fold
-that data into both the read set and the `vm` block.
+Dispatch reads SHOULD contribute to `vm.verb_hashes`. The recorder MUST record
+the resolved definer, owner, version, `source_hash`, direct-callability, native
+handler name when the verb is native, and the handler's native primitive
+contract when one exists. It records both top-level dispatches and local
+bytecode-to-bytecode calls so write-frame validation can prove which verb frame
+performed each mutation. Production transcripts fold that data into both the
+read set and the `vm` block.
 
 Transcript values MAY be omitted when the receiver already has the matching
 content-addressed state page. Validation still needs either the value or a
@@ -598,20 +601,20 @@ with the same exact-version rule as semantic reads. The first implementation may
 reject all stale projection reads while still carrying the type above for the
 future relaxed path.
 
-The shadow implementation now includes an in-process commit scope. It accepts
-`woo.commit.submit.shadow.v1` messages from the execution helper, owns the
-authoritative serialized state and shadow `ScopeHead`, validates expected head,
-scope, completeness, session/actor shape, read versions, per-write VM-frame
-authority, lifecycle/move post-state, and touched-cell post-state hashes, then
-returns `woo.commit.accepted.shadow.v1` or `woo.commit.conflict.shadow.v1`.
-The shadow submit no longer carries executor post-state. The commit scope
-constructs authoritative post-state from transcript creates, writes, moves, and
-sequenced-log outcome. Accepted frames carry commit position, transcript hash,
-receipt, and observations; current projection state is derived from the commit
-scope's authoritative serialized state or from explicit state transfers, never
-from a per-frame full-world snapshot. Accepted frames also carry the authority's
-acceptance timestamp so transport-specific frame projections can be
-reply-idempotent without minting a fresh wall-clock value on retry.
+The in-process v2 commit scope accepts `woo.commit.submit.v1` messages from the
+execution helper, owns the authoritative serialized state and `ScopeHead`,
+validates expected head, scope, completeness, session/actor shape, read
+versions, per-write VM-frame authority, lifecycle/move post-state, and
+touched-cell post-state hashes, then returns `woo.commit.accepted.v1` or
+`woo.commit.conflict.v1`. The submit message does not carry executor
+post-state. The commit scope constructs authoritative post-state from
+transcript creates, writes, moves, and sequenced-log outcome. Accepted frames
+carry commit position, transcript hash, receipt, and observations; current
+projection state is derived from the commit scope's authoritative serialized
+state or from explicit state transfers, never from a per-frame full-world
+snapshot. Accepted frames also carry the authority's acceptance timestamp so
+transport-specific frame projections can be reply-idempotent without minting a
+fresh wall-clock value on retry.
 
 The current transcript applier materializes object creation, property writes,
 location writes, contents writes, session-location side effects, and sequenced
@@ -781,18 +784,17 @@ missing. If missing state is discovered during execution, the executor MUST
 abort without commit and return `missing_state`. Partial transcripts from such
 runs are diagnostics only.
 
-The shadow implementation covers this for fresh `TurnCall` execution in two
-places: a predicted TurnKey is compared with a local atom cache before running,
-and the turn recorder enforces an `E_NEED_STATE` guard when dispatch, property,
-or structural cell events touch an atom outside the materialized set. The
-recorded-turn replay helper remains a diagnostic preflight harness only.
+The v2 execution implementation covers this for fresh `TurnCall` execution in
+two places: a predicted TurnKey is compared with a local atom cache before
+running, and the turn recorder enforces an `E_NEED_STATE` guard when dispatch,
+property, or structural cell events touch an atom outside the materialized set.
+Recorded-turn replay helpers remain diagnostic preflight harnesses only.
 
-The `executeShadowRecordedTurnOrNeedState` helper is a diagnostic replay
-harness: it accepts an already recorded turn and replays it with recorded
-logical inputs. The newer `executeShadowTurnCallOrNeedState` helper follows the
-target protocol shape more closely: it receives a `TurnCall`, executes it fresh
-on the selected node, returns a shadow `TurnExecReply`, and can submit the fresh
-transcript to the in-process shadow commit scope for accept/conflict handling.
+The production execution helper receives a `TurnCall`, executes it fresh on the
+selected node, returns a `TurnExecReply`, and can submit the fresh transcript to
+the in-process commit scope for accept/conflict handling. Replay of a previously
+recorded turn is useful for debugging, but it is not the browser-edge optimistic
+path.
 
 ## VTN11. Capability gossip
 
@@ -823,23 +825,23 @@ type ExecCapabilityAd = {
 };
 ```
 
-During the M4 browser migration, a relay MAY also accept
-`woo.turn.intent.request.shadow.v1` from a browser node. The intent contains
-`id`, `route`, `scope`, `target`, `verb`, `args`, and optional
-`persistence`, but not a `TurnKey`. It is a transitional shadow-local
-message: the CommitScopeDO plans the deterministic transcript against its
-authoritative scope state, derives the `TurnKey`, and then processes the turn
-through the same `TurnExecRequest`/`TurnExecReply` path. Browsers MUST treat
-this as server-assisted planning, not as proof that local closure execution is
-complete; production v2 returns to browser-built keys once the worker can
-reconstruct executable state from verified pages.
+During the browser migration, a relay MAY also accept
+`woo.turn.intent.request.v1` from a browser node. The intent contains `id`,
+`route`, `scope`, `target`, `verb`, `args`, and optional `persistence`, but not
+a `TurnKey`. It is a transitional server-assisted planning message: the
+CommitScopeDO plans the deterministic transcript against its authoritative
+scope state, derives the `TurnKey`, and then processes the turn through the same
+`TurnExecRequest`/`TurnExecReply` path. Browsers MUST treat this as
+server-assisted planning, not as proof that local closure execution is complete.
+Production v2 uses browser-built keys and browser-submitted `TurnExecRequest`
+messages once the worker can reconstruct executable state from verified pages.
 
 Every internal open/envelope forwarded to a CommitScopeDO SHOULD carry an
 authority slice:
 
 ```ts
 type AuthoritySlice = {
-  kind: "woo.authority_slice.shadow.v1";
+  kind: "woo.authority_slice.v1";
   sessions: SerializedSession[];
   objects: SerializedObject[];
 };
@@ -922,7 +924,7 @@ type StateTransfer = {
 };
 
 type ProjectionPatch = {
-  kind: "woo.scope_projection_patch.shadow.v1";
+  kind: "woo.scope_projection_patch.v1";
   scope: ScopeRef;
   base: ScopeHead;
   to: ScopeHead;
@@ -966,13 +968,9 @@ Transfer modes:
 - `closure`: executable state bundle for a predicted turn, including cells,
   parent/feature/verb metadata, bytecode hashes, and permission facts.
 
-The shadow transfer implementation uses
-`kind: "woo.state.transfer.shadow.v1"`. It still supports `mode: "closure"`
-with a full serialized pre-turn world for diagnostic replay and
-`mode: "object_records"` as a compatibility fallback, but the default fresh-call
-network path now uses `mode: "cell_pages"`. A cell-page transfer is selected
-from missing TurnKey atom preimages and carries reusable content-addressed
-pages:
+State transfers use `kind: "woo.state.transfer.v1"`. The default fresh-call
+network path uses `mode: "closure"` with content-addressed cell pages, selected
+from missing TurnKey atom preimages:
 
 - `object_lineage`: object identity, parent, owner, flags, anchor, and schemas;
 - `object_live`: location, children, and contents cells;
@@ -982,69 +980,67 @@ pages:
 The transfer also carries the session/log/counter envelope data needed to
 execute the turn in a small shard. Page refs can be advertised from cache; only
 unknown pages are inlined. Install verifies inline pages against their
-advertised page hashes and verifies a shadow MAC proof scoped to an anchor
-authority and recipient node. This is not production authorization yet, but it
-proves that state transfer can be driven by exact post-selection inventory gaps
-instead of copying the whole world or even whole object records.
+advertised page hashes and verifies a state-transfer proof scoped to an anchor
+authority and recipient node. State transfer is driven by exact post-selection
+inventory gaps instead of copying the whole world or whole object records.
 
-The shadow browser relay also implements `mode: "projection"` and
-`mode: "delta"` for display/cache catch-up. Opening a scope installs a
-projection transfer instead of directly mutating the browser projection cache.
-After an accepted commit, browser delivery is routed by the gateway's live
-session/socket table, not by volatile subscriber maps inside a commit-scope
-relay. The gateway computes the transcript's affected scopes from the commit
-scope, move endpoints, create locations, contents writes, and subscriber writes;
-then it delivers only observations whose per-observation audience contains the
-recipient session or actor. A recipient attached to the commit scope also
-receives a recipient-bound projection transfer for that scope, built and signed
-by the commit-scope/state authority. Recipients attached to other affected
-scopes receive live observations only; a state transfer for those scopes MUST be
-served by that scope's own state authority, never by the origin commit scope,
-because the transfer head and projection scope have to name the same scope. A
-shadow delta transfer carries the accepted frame, a transcript tail, and exactly
-one display-state update: either a full refreshed projection or a projection
-patch against the receiver's previous projection head. Relays SHOULD send a
-projection patch for hot subscribed fan-out when they know the receiver's cached
-base projection, and MUST fall back to a full projection when the base is
-unknown, the patch would be larger than replacement, or the receiver reports a
-missing/mismatched base. The first shadow patch shape updates scalar projection
-fields plus ordered object-summary lists. Patch base comparison MUST match
-scope, epoch, and sequence; when both sides have a non-empty head hash, it MUST
-match too.
+Browser relays also implement `mode: "projection"` and `mode: "delta"` for
+display/cache catch-up. Opening a scope installs a projection transfer instead
+of directly mutating the browser projection cache. After an accepted commit,
+browser delivery is routed by the gateway's live session/socket table, not by
+volatile subscriber maps inside a commit-scope relay. The gateway computes the
+transcript's affected scopes from the commit scope, move endpoints, create
+locations, contents writes, and subscriber writes; then it delivers only
+observations whose per-observation audience contains the recipient session or
+actor. A recipient attached to the commit scope also receives a recipient-bound
+projection transfer for that scope, built and signed by the commit-scope/state
+authority. Recipients attached to other affected scopes receive live
+observations only; a state transfer for those scopes MUST be served by that
+scope's own state authority, never by the origin commit scope, because the
+transfer head and projection scope have to name the same scope. A delta transfer
+carries the accepted frame, a transcript tail, and exactly one display-state
+update: either a full refreshed projection or a projection patch against the
+receiver's previous projection head. Relays SHOULD send a projection patch for
+hot subscribed fan-out when they know the receiver's cached base projection, and
+MUST fall back to a full projection when the base is unknown, the patch would be
+larger than replacement, or the receiver reports a missing/mismatched base. The
+first patch shape updates scalar projection fields plus ordered object-summary
+lists. Patch base comparison MUST match scope, epoch, and sequence; when both
+sides have a non-empty head hash, it MUST match too.
 
-The M4 shadow projection body is `kind: "woo.scope_projection.shadow.v1"`.
-It is catalog-neutral display/cache state, not executable authority. It MUST
-name the `scope`, current `seq`, a `cursor.spaces[scope].next_seq`, the visible
-`subject` summary when available, and an `objects` array containing only the
-generic neighborhood the browser can display or use for command planning:
-subject, subject contents, viewer actor, viewer inventory, and viewer current
-location contents. When viewer context is available, it also carries generic
-`self`, `session`, and `inventory` fields shaped like the scoped HTTP
-projection. Object summaries use the same generic fields as the scoped HTTP
-projection (`id`, `name`, `parent`, `ancestors`, `owner`, `location`, and
-readable `props`) and MUST NOT depend on bundled catalog object identities.
-Catalog-specific UI state is derived by catalog UI code from readable props and
-observation schemas; the browser worker stores the projection opaquely.
+The projection body is `kind: "woo.scope_projection.v1"`. It is catalog-neutral
+display/cache state, not executable authority. It MUST name the `scope`, current
+`seq`, a `cursor.spaces[scope].next_seq`, the visible `subject` summary when
+available, and an `objects` array containing only the generic neighborhood the
+browser can display or use for command planning: subject, subject contents,
+viewer actor, viewer inventory, and viewer current location contents. When
+viewer context is available, it also carries generic `self`, `session`, and
+`inventory` fields shaped like the scoped HTTP projection. Object summaries use
+the same generic fields as the scoped HTTP projection (`id`, `name`, `parent`,
+`ancestors`, `owner`, `location`, and readable `props`) and MUST NOT depend on
+bundled catalog object identities. Catalog-specific UI state is derived by
+catalog UI code from readable props and observation schemas; the browser worker
+stores the projection opaquely.
 
-Browser projection/delta transfers use proof scheme `shadow.relay_mac.v1`.
+Browser projection/delta transfers use proof scheme `woo.state.relay_mac.v1`.
 The proof root is a canonical hash over mode, scope, recipient, target head,
 projection or projection patch, accepted-frame ids/positions/transcript
 hashes/post-state hashes, and transcript-tail hashes. The proof also carries
-authority, key id, recipient, and a MAC signature over the root. Receivers MUST verify the
-recipient binding, trusted relay authority, MAC signature, transcript
-body-to-hash equality, and projection-patch base before installing
+authority, key id, recipient, and a MAC signature over the root. Receivers MUST
+verify the recipient binding, trusted relay authority, MAC signature,
+transcript body-to-hash equality, and projection-patch base before installing
 projection/delta cache. A receiver that cannot apply a projection patch MUST
-request or await a full projection transfer instead of guessing. This scheme is
-shadow-local relay authority, distinct from the execution-plane
-`shadow.anchor_mac.v1` object-record proof.
+request or await a full projection transfer instead of guessing. Execution
+closures use proof scheme `woo.state.anchor_mac.v1`; projection proofs never
+authorize VM execution.
 
-Shadow latency profiles report bytes for the cell-page closure and the
-object-record closure so later page/cell-bounded work has concrete performance
-targets. The current profile also reports a two-turn warmup: after one dubspace
+Latency profiles SHOULD report bytes for cell-page closure transfer and
+projection/delta transfer so page/cell-bounded work has concrete performance
+targets. A warm profile SHOULD include a two-turn case: after one dubspace
 control turn installs lineage pages, a second control turn for the same object
 can transfer page refs with no inline records. A node preseeded with
-catalog/class pages can likewise materialize those records from cache and
-inline only live instance pages on its first turn.
+catalog/class pages can likewise materialize those records from cache and inline
+only live instance pages on its first turn.
 
 Receivers MUST verify page hashes and proofs before installing cache. Receivers
 MUST apply authorization filtering before exposing transferred values to a
@@ -1169,30 +1165,29 @@ commit scope -> worker: CommitAccepted or CommitConflict
 worker -> UI: confirm, patch-forward, or report conflict
 ```
 
-Shadow implementation status: the in-process prototype includes a
-browser-shaped node/relay shim with an object-page cache, scope projection
-cache, pending-turn table, accepted/conflict frame queues, and transfer
-tracking. Scope open uses a shadow projection transfer, accepted commits fan
-out through the Worker gateway's live socket table. CommitScopeDO remains the
-scope-head and state-transfer authority; it serves recipient-bound projection
-transfers for commit-scope gateway fan-out, while the gateway routes committed
-observations by per-observation session/actor audience across affected scopes. Relay MAC
-proofs are verified before cache install. The shim also includes scope
-subscriptions and best-effort live-event fan-out with coalescing, without advancing the
-commit-scope head. Relay and browser diagnostic tails are bounded in the shadow
-implementation; if a browser reconnects from a head older than the retained
-tail, it receives a projection fallback rather than an unbounded replay. The
-browser-side M4 worker opens the v2 WebSocket, persists
+Implementation status: the in-process v2 simulator includes a browser-shaped
+node/relay shim with an object-page cache, scope projection cache, pending-turn
+table, accepted/conflict frame queues, and transfer tracking. Scope open uses a
+projection transfer, accepted commits fan out through the Worker gateway's live
+socket table. CommitScopeDO remains the scope-head and state-transfer authority;
+it serves recipient-bound projection transfers for commit-scope gateway fan-out,
+while the gateway routes committed observations by per-observation session/actor
+audience across affected scopes. Relay MAC proofs are verified before cache
+install. The shim also includes scope subscriptions and best-effort live-event
+fan-out with coalescing, without advancing the commit-scope head. Relay and
+browser diagnostic tails are bounded; if a browser reconnects from a head older
+than the retained tail, it receives a projection fallback rather than an
+unbounded replay. The browser-side M4 worker opens the v2 WebSocket, persists
 hello/reply/pending-frame state in IndexedDB, applies received projection/delta
 state transfers into projection, applied-frame, and transcript-tail stores,
 persists executable object/state pages from closure transfers, replays pending
 envelopes after reconnect, and marks reset/catch-up-needed state when the relay
 reports reset. The browser worker bundles into the SPA on every deployment and
 the UI consumes applied frames that arrive from the v2 worker. Catalogs can move
-their own controls to v2 by submitting `woo.turn.intent.request.shadow.v1`
-through the shared browser helper. The SPA sends generic sequenced UI calls
-through the same v2 helper whenever a browser-session token is available; the
-legacy `/ws` fallback has been removed.
+their own controls to v2 by submitting `woo.turn.intent.request.v1` through the
+shared browser helper. The SPA sends generic sequenced UI calls through the same
+v2 helper whenever a browser-session token is available; the legacy `/ws`
+fallback has been removed.
 The default browser chat surface uses the same helper:
 it asks the catalog `command_plan` verb to parse text, executes speech/tells as
 direct `live` turns, and executes room movement/carrying commands as
@@ -1203,22 +1198,21 @@ M4 wire-slice status: local dev and the Cloudflare Worker expose the reserved
 `POST /v2/session/mint` path and `GET /v2/turn-network/ws` WebSocket endpoint.
 The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
 `TransportHello` envelope followed by an initial projection/delta state-transfer
-envelope, decodes subsequent frames through the shared shadow envelope codec,
-and can return shadow execution replies. Reconnect opens may include the
-browser's cached `last_known_head` so `CommitScopeDO` can return a retained
-delta instead of a full projection when the tail is still available. The Worker gateway
+envelope, decodes subsequent frames through the shared v2 envelope codec, and
+can return v2 execution replies. Reconnect opens may include the browser's
+cached `last_known_head` so `CommitScopeDO` can return a retained delta instead
+of a full projection when the tail is still available. The Worker gateway
 forwards authority-bearing v2 envelopes to `CommitScopeDO`, which persists the
-shadow commit scope in row-shaped storage: one row per serialized object plus
-small rows for sessions, log entries, counters, accepted-frame tail,
-transcript tail, seen idempotency keys, and cached replies. Fresh accepted
-envelopes write only the new idempotency key/reply, accepted-frame/transcript
-tail rows, updated counters/head, and the object rows touched by the accepted
-transcript; duplicate envelopes replay the cached reply without another
-durable write. Gateway isolate hibernation no
-longer resets v2 commit authority; browsers still resubscribe and run VTN9
-catch-up after any transport reconnect because live socket subscriptions remain
-connection-local. The local dev server keeps the earlier socket-lifetime
-in-process relay shim.
+commit scope in row-shaped storage: one row per serialized object plus small
+rows for sessions, log entries, counters, accepted-frame tail, transcript tail,
+seen idempotency keys, and cached replies. Fresh accepted envelopes write only
+the new idempotency key/reply, accepted-frame/transcript tail rows, updated
+counters/head, and the object rows touched by the accepted transcript; duplicate
+envelopes replay the cached reply without another durable write. Gateway isolate
+hibernation no longer resets v2 commit authority; browsers still resubscribe
+and run VTN9 catch-up after any transport reconnect because live socket
+subscriptions remain connection-local. The local dev server keeps the earlier
+socket-lifetime in-process relay shim.
 
 The first production deployment of this wire path targets a separate
 namespace where v1 compatibility is not maintained. On that namespace, MCP is
@@ -1311,12 +1305,12 @@ Prototype status: browser-shim coverage currently commits pinboard
 and `drop`, plus taskspace `create_task`, task `claim`, and task
 `set_status`. Same-turn object creation is validated against transcript
 create/write facts rather than the pre-turn world. Deterministic native helpers
-are admitted only when a `woo.native_primitive_contract.shadow.v1` contract
+are admitted only when a `woo.native_primitive_contract.v1` contract
 declares the handler transcript-tracked and deterministic, including the state
 families it reads, writes, and emits. Native dispatches without such a contract
 make the transcript incomplete. Runtime cross-host bridge boundaries are also
-explicitly incomplete in the shadow protocol; mergeable remote sub-transcripts
-are deferred until the execution plane exists.
+explicitly incomplete in the v2 protocol; mergeable remote sub-transcripts are
+deferred until the execution plane exists.
 
 ### Dubspace
 
@@ -1693,13 +1687,13 @@ the socket is established, every envelope repeats the bearer token in
 `auth.token` as specified in VTN4.2. Deployments that log URLs MUST redact the
 `token` query parameter.
 
-`scope` and `last_known_head` are the M4 shadow binding's open-handshake
-catch-up shortcut for a single scope. When present, `last_known_head` is a JSON
-encoded `ScopeHead` for `scope`; the relay validates the shape, treats malformed
-or stale values as absent, and sends the state transfer that VTN9 would have
-returned for that cursor. Relays with retained contiguous history SHOULD send a
-delta transfer when it fits within the advertised message-size budget; otherwise
-they send a projection transfer. This shortcut does not replace explicit
+`scope` and `last_known_head` are the M4 open-handshake catch-up shortcut for a
+single scope. When present, `last_known_head` is a JSON encoded `ScopeHead` for
+`scope`; the relay validates the shape, treats malformed or stale values as
+absent, and sends the state transfer that VTN9 would have returned for that
+cursor. Relays with retained contiguous history SHOULD send a delta transfer
+when it fits within the advertised message-size budget; otherwise they send a
+projection transfer. This shortcut does not replace explicit
 `Subscribe`/`CatchupRequest` for multi-scope clients.
 
 The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
@@ -1729,8 +1723,8 @@ MUST close the WebSocket with a policy/auth failure reason. The relay MAY accept
 idempotent `ping` control frames before hello only to keep intermediaries from
 closing a slow-auth connection.
 
-After `TransportHello`, an M4 shadow relay SHOULD immediately send the
-projection or delta `woo.state.transfer.shadow.v1` for the opened `scope` before
+After `TransportHello`, an M4 relay SHOULD immediately send the projection or
+delta `woo.state.transfer.v1` for the opened `scope` before
 processing authority-bearing browser envelopes. This preserves hello-first
 transport semantics while ensuring browser caches install verified state before
 pending turns are replayed.
