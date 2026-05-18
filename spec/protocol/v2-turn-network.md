@@ -1239,12 +1239,14 @@ UI -> worker: TurnIntent or direct TurnCall
 worker: reconstruct execution node from verified pages
 worker: build or reuse TurnCall
 worker: run command planning if needed
-worker: execute VM turn locally in transcript mode
-worker: if E_NEED_STATE, run VTN14.4 and retry
-worker: derive TurnKey and tentative EffectTranscript
-worker -> UI: optimistic result/observations/projection patch
-worker -> relay: Envelope<TurnExecRequest>
-relay/commit scope: validate, rerun or receipt-check, then accept/conflict
+worker: if local cache covers the TurnKey, execute VM turn locally in transcript mode
+worker: otherwise rank gossiped ExecCapabilityAds and delegate the whole turn
+executor: return outcome, transcript, and state transfer, or missing_state/better_ad
+worker: install verified state transfer so the local execution cache advances
+worker: derive or receive TurnKey and tentative EffectTranscript
+worker -> UI: optimistic result/observations/projection patch when a transcript exists
+worker -> relay/commit scope: Envelope<TurnExecRequest or CommitSubmit>
+commit scope: validate, rerun or receipt-check, then accept/conflict
 worker -> UI: confirm, rollback, rebase, or retry
 ```
 
@@ -1253,6 +1255,16 @@ when it cannot reconstruct an execution node. A v2 implementation is not
 complete until ordinary chat movement, pinboard edits, kanban edits, and
 dubspace committed controls use browser-built `TurnExecRequest` messages by
 default.
+
+Delegation is whole-turn execution, not remote object RPC. If local execution
+cannot proceed after bounded state repair, the browser chooses the best
+currently advertised capable executor using VTN11 candidate selection, sends
+the full `TurnExecRequest`, and treats the returned transcript as the tentative
+turn result. The remote executor SHOULD include a closure or delta transfer for
+the material it used, subject to authorization and byte limits. The browser MUST
+verify and install that transfer before it marks the delegated attempt complete,
+so delegation moves the actor-local cache forward and increases the likelihood
+that the next related turn executes locally.
 
 The first production browser execution milestone MAY let the server rerun the
 transcript before commit. That still qualifies as browser-edge optimistic
@@ -1264,7 +1276,8 @@ hashes, read versions, write facts, and state hashes.
 ### VTN14.4 Missing-state repair
 
 Missing state is a cache miss, not a semantic fallback. When local execution
-cannot prove it has the required atoms:
+cannot prove it has the required atoms, the browser first tries to learn enough
+state to execute locally:
 
 ```text
 worker -> relay: StateTransferRequest(mode:"closure", atoms:[...], base:head)
@@ -1276,9 +1289,20 @@ worker: rebuild execution node and retry the same turn id
 ```
 
 The worker MUST cap retries and transferred bytes. A turn that still cannot be
-executed after the negotiated retry/byte budget returns a visible
-`missing_state` error or uses the server-assisted planning fallback; it MUST NOT
-silently submit an optimistic success based on partial state.
+executed locally after the negotiated retry/byte budget MUST be delegated to
+the best suitable gossiped executor when one exists. If no suitable executor is
+available, the worker returns a visible `missing_state`/`no_executor` error or
+uses a measured server-assisted planning fallback while compatibility remains
+enabled. It MUST NOT silently submit an optimistic success based on partial
+state.
+
+Every successful delegated execution is also a cache-warming operation. The
+delegated reply MUST either include state transfer for the execution material or
+name why transfer was withheld. The browser may display the delegated outcome
+optimistically after it has a transcript, but it MUST NOT claim its local
+execution capability advanced until the returned pages or deltas are verified
+and installed. If transfer is withheld, the next related turn may delegate again;
+that is correct but should be visible in metrics.
 
 State-transfer authorities MUST obey ownership:
 
@@ -1535,31 +1559,35 @@ spreading.
    IndexedDB, and refuses to use projection rows for VM reads.
 4. **Missing-state repair.** Browser local execution requests closure
    transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
-   same turn id locally before fallback.
+   same turn id locally before delegation.
 5. **Browser-planned committed turns.** Chat movement/carrying, pinboard,
    kanban, and dubspace committed controls submit browser-built
    `TurnExecRequest` messages by default. `woo.turn.intent.request.v1` remains
    only as a measured fallback.
-6. **Optimistic projection reconciliation.** The UI applies tentative
+6. **Gossiped whole-turn delegation.** When the browser cannot execute locally,
+   it ranks `ExecCapabilityAd`s, delegates the whole turn to the best suitable
+   executor, verifies the returned transcript/state transfer, and installs the
+   returned execution material so future local execution advances.
+7. **Optimistic projection reconciliation.** The UI applies tentative
    transcript effects immediately, confirms them on `CommitAccepted`, rebases on
    intervening accepted frames, and rolls back or retries on `CommitConflict`.
-7. **Owner-authoritative state transfer.** Object-host, gateway/session,
+8. **Owner-authoritative state transfer.** Object-host, gateway/session,
    commit-scope, and projection authorities are enforced at every merge
    boundary. Cache-only rows cannot clear host-owned durable state.
-8. **Transcript validation without routine rerun.** Commit scopes can validate
+9. **Transcript validation without routine rerun.** Commit scopes can validate
    complete client transcripts by read/write/state hashes and VM contracts for
    the common deterministic path, while retaining rerun as an audit/fallback
    mode.
-9. **Interim path removal.** Server-assisted browser planning can be disabled in
+10. **Interim path removal.** Server-assisted browser planning can be disabled in
    tests and production. New browser feature work must use local execution or
    explicitly fail when executable state is unavailable.
-10. **Operational hardening.** Eviction, cold activation, transcript
+11. **Operational hardening.** Eviction, cold activation, transcript
     compaction, chaos tests, and metrics prove the browser recovers from stale
     heads, lost sockets, bad pages, and conflicting edits without data loss.
 
-Milestones 2-6 are the minimum bar for a real distributed VM: the browser edge
+Milestones 2-7 are the minimum bar for a real distributed VM: the browser edge
 must execute optimistic committed turns from verified local state and reconcile
-against authoritative sequencing. Milestones 7-10 are the durability and
+against authoritative sequencing. Milestones 8-11 are the durability and
 operational bar for retiring server-assisted planning as the ordinary browser
 path.
 

@@ -26,5 +26,8 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("### VTN14.5 Optimistic UI and reconciliation");
     expect(spec).toContain("### VTN14.7 Completion test gates");
     expect(spec).toContain("## VTN16. Completion milestones");
+    expect(spec).toContain("rank gossiped ExecCapabilityAds and delegate the whole turn");
+    expect(spec).toContain("delegation moves the actor-local cache forward");
+    expect(spec).toContain("Gossiped whole-turn delegation");
   });
 });
