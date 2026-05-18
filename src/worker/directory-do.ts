@@ -1,5 +1,6 @@
 import { sessionActiveScopeFromRecord, wooError, type MetricEvent, type ObjRef, type Session } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
+import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 type ObjectRoute = {
   id: ObjRef;
@@ -51,7 +52,9 @@ export class DirectoryDO {
     const constructorStartedAt = Date.now();
     this.state = state;
     this.env = env;
-    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "DirectoryDO", ms: Date.now() - constructorStartedAt, ts: Date.now(), host_key: "directory" }));
+    const constructorMs = Date.now() - constructorStartedAt;
+    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "DirectoryDO", ms: constructorMs, ts: Date.now(), host_key: "directory" }));
+    writeConstructorMetricToAnalytics("DirectoryDO", constructorMs, "directory", this.env.METRICS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -534,6 +537,7 @@ export class DirectoryDO {
   }
 
   private emitMetric(event: MetricEvent): void {
+    writeMetricToAnalytics(event, "directory", this.env.METRICS);
     console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: "directory" }));
   }
 }

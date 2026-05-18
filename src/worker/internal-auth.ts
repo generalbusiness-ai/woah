@@ -1,7 +1,13 @@
 import { wooError } from "../core/types";
 
+import type { MetricsAnalyticsBinding } from "./metrics-sink";
+
 export type InternalAuthEnv = {
   WOO_INTERNAL_SECRET?: string;
+  // Optional Analytics Engine binding shared by every DO that runs internal-auth.
+  // Lives on this base type so DirectoryDO and CommitScopeDO inherit it without
+  // a separate env shape. Bound by `wrangler.toml`'s `[[analytics_engine_datasets]]`.
+  METRICS?: MetricsAnalyticsBinding;
 };
 
 const INTERNAL_TS_HEADER = "x-woo-internal-ts";

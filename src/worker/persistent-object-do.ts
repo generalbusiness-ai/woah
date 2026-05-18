@@ -62,6 +62,7 @@ import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { hashSource } from "../core/source-hash";
+import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 // Re-import WooWorld type. Note `import type` must reach the world module
 // without dragging Node-only deps into the Worker bundle.
@@ -80,6 +81,10 @@ export interface Env {
   WOO_HOST_WRITE_TIMEOUT_MS?: string;
   WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
   WOO_MCP_GATEWAY_SHARDS?: string;
+  // Workers Analytics Engine binding. The metrics-sink module writes every
+  // `MetricEvent` here (modulo sampling) so /admin/stats can query historical
+  // counts and latencies without depending on tail-time consumption.
+  METRICS?: import("./metrics-sink").MetricsAnalyticsBinding;
 }
 
 type CommitScopeOpenResponse = {
@@ -298,7 +303,9 @@ export class PersistentObjectDO {
     this.state = state;
     this.env = env;
     this.repo = new CFObjectRepository(state, (event) => this.emitMetric(event, this.durableHostKey()));
-    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: Date.now() - constructorStartedAt, ts: Date.now(), host_key: this.durableHostKey() }));
+    const constructorMs = Date.now() - constructorStartedAt;
+    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: constructorMs, ts: Date.now(), host_key: this.durableHostKey() }));
+    writeConstructorMetricToAnalytics("PersistentObjectDO", constructorMs, this.durableHostKey(), this.env.METRICS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1795,6 +1802,11 @@ export class PersistentObjectDO {
   // summary of how many *log lines* were skipped. The underlying operations
   // still ran — only the per-event log line was suppressed.
   private emitMetric(event: MetricEvent, hostKey: string): void {
+    // AE writes happen before the console-tail throttle: the throttle is only
+    // there to keep tail logs human-readable; AE has its own sampling rules
+    // (see metrics-sink.ts) and we want a noisy `broadcast` burst to still
+    // produce accurate counts in the dashboard.
+    writeMetricToAnalytics(event, hostKey, this.env.METRICS);
     if (event.kind === "broadcast" || event.kind === "cross_host_rpc" || event.kind === "storage_direct_write") {
       const counter = this.metricSampleCounters[event.kind];
       const now = Date.now();

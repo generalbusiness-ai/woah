@@ -37,6 +37,7 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
+import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
@@ -81,7 +82,9 @@ export class CommitScopeDO {
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_reply (idempotency_key TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     );
-    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "CommitScopeDO", ms: Date.now() - constructorStartedAt, ts: Date.now(), host_key: this.durableScopeKey() }));
+    const constructorMs = Date.now() - constructorStartedAt;
+    console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "CommitScopeDO", ms: constructorMs, ts: Date.now(), host_key: this.durableScopeKey() }));
+    writeConstructorMetricToAnalytics("CommitScopeDO", constructorMs, this.durableScopeKey(), this.env.METRICS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -432,7 +435,9 @@ export class CommitScopeDO {
   }
 
   private emitMetric(event: MetricEvent): void {
-    console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: this.durableScopeKey("scope" in event ? event.scope : undefined) }));
+    const hostKey = this.durableScopeKey("scope" in event ? event.scope : undefined);
+    writeMetricToAnalytics(event, hostKey, this.env.METRICS);
+    console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: hostKey }));
   }
 
   private durableScopeKey(scope?: ObjRef): string {

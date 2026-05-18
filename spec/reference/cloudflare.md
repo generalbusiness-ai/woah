@@ -501,29 +501,86 @@ The runtime is world-visible from day one — even a "first cut" deployment must
 
 ### R10.1 Workers Analytics Engine
 
-Standard binding `METRICS`. Every load-bearing call site writes one data point. Each DO writes its own; AE handles aggregation.
+Standard binding `METRICS`, dataset `woo_v1_<env>` (e.g. `woo_v1_prod`).
+Every load-bearing call site emits a `MetricEvent` (`src/core/types.ts`);
+each DO funnels its events through `src/worker/metrics-sink.ts` which
+both `console.log`s and writes one data point to AE. AE handles
+aggregation; the `/admin/stats` panel queries the AE SQL API.
 
 ```ts
 env.METRICS.writeDataPoint({
-  blobs: [event_type, fields...],   // string-tagged dimensions, low cardinality
-  doubles: [latency_ms, count],      // numeric measurements
-  indexes: [do_id]                   // up to 1 high-cardinality index
+  blobs:   [/* fixed-width 16-slot dimension map; see "Slot map" below */],
+  doubles: [/* fixed-width 3-slot numeric map; see "Slot map" below */],
+  indexes: [host_key]                  // the only high-cardinality index
 });
 ```
 
-Required event types (cardinality budget per DO):
+#### Index choice — `host_key`
 
-| Event | Blobs | Doubles | Indexes |
-|---|---|---|---|
-| `call` | verb_name, target_class, error_code? | latency_ms | actor_id |
-| `cross_do_rpc` | method, error_code? | latency_ms, retry_count | callee_id |
-| `alarm` | — | due_count, skew_ms | do_id |
-| `session` | event_kind ('bind'\|'detach'\|'reap'), token_class | — | actor_id |
-| `wizard_action` | action ('force_direct'\|'force_recycle'\|'impersonate') | — | actor_id |
-| `error` | code, surface ('rest'\|'wire'\|'rpc') | — | request_id |
-| `startup_storage` | phase, status, error_code? | latency_ms, object_count, route_count, statement_count | do_id |
+`host_key` identifies the DO/logical component the metric came from
+(`world`, `the_chatroom`, `the_deck`, `directory`, `mcp-gateway-N`,
+each `the_<instance>`). AE's adaptive sampling boundary is per-index
+value, so a burst on one host doesn't degrade the fidelity of quieter
+hosts. This also matches the dashboard's primary pivot — "by component".
 
-Cost: one AE write per call is fine at v1 traffic levels; budget revisits at scale.
+#### Slot map (stable; the `/admin/stats` query layer hard-codes positions)
+
+The slot map is fixed-width: every data point fills all 16 blobs and 3
+doubles. Axes the event doesn't carry land as empty strings (blob) or 0
+(double). New axes get a NEW slot; existing slots are never reordered
+or repurposed.
+
+| Slot | Field | Source on `MetricEvent` |
+|---|---|---|
+| `blobs[0]`  | `kind`      | every event |
+| `blobs[1]`  | `scope`     | `v2_*`, `shadow_*`, `mcp_fanout`, `direct_call`, … |
+| `blobs[2]`  | `class`     | `do_constructor`, `do_handler` |
+| `blobs[3]`  | `route`     | `do_handler.route`, `cross_host_rpc.route`, `shadow_*_step.route` |
+| `blobs[4]`  | `method`    | `do_handler.method`, `mcp_request.method` |
+| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase` |
+| `blobs[6]`  | `what`      | `storage_direct_write.what` |
+| `blobs[7]`  | `status`    | `"ok" \| "error" \| "timeout"` |
+| `blobs[8]`  | `error`     | error code (`E_*`) |
+| `blobs[9]`  | `target`    | `direct_call.target`, `dispatch_resolved.target`, falls back to `dangling_parent_ref.start` |
+| `blobs[10]` | `verb`      | `applied.verb`, `direct_call.verb`, `dispatch_resolved.verb` |
+| `blobs[11]` | `tool`      | `mcp_request.tool` |
+| `blobs[12]` | `host`      | `cross_host_rpc.host`, `dispatch_resolved.host`, `host_schema_sync.host` |
+| `blobs[13]` | `actor`     | `mcp_tool_refresh_*.actor`, `dispatch_resolved.actor` |
+| `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating` |
+| `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason` |
+| `doubles[0]` | `ms`         | latency, when present |
+| `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
+| `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects` |
+
+The canonical event union is `MetricEvent` in `src/core/types.ts`. That
+union is the source of truth for which kinds exist and which fields they
+carry; this spec only describes how those fields project onto AE slots.
+
+#### Sampling
+
+Console-tail is unaffected (it sees every emission). AE-side sampling:
+
+- **Dropped (never written):** `shadow_apply_step` and
+  `shadow_gateway_apply_step` records whose `phase != "total"`. The
+  `total` phase carries the same dashboard-visible information; the
+  per-phase records are ~10× amplification per envelope.
+- **1-in-10:** `storage_direct_write`, `storage_flush`. The multiplier
+  (10) is recorded in `doubles[1]` so dashboard queries can reconstruct
+  totals — e.g. `SUM(double2 * double1)` for sampled-up sums.
+- **Always written:** any event with `status:"error"` or a non-empty
+  `error` field, regardless of kind. Dashboard error panes must reflect
+  ground truth even during a burst.
+- **1:1:** everything else.
+
+AE write failures are swallowed inside the sink. A broken AE binding
+must never propagate into the request path.
+
+#### Cost
+
+One AE write per `MetricEvent` is fine at v1 traffic levels; the
+sampling rules above keep the storage-write hot kinds within the free
+100k-writes-per-dataset-per-day budget. Each environment (`woo_v1_prod`,
+`woo_v1_staging`) has its own quota.
 
 Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch (`host_seed_fetch`), Directory schema setup, Directory object-route registration (`directory_register_objects`), and Directory session-route registration (`directory_register_session`). Both Directory register phases include a `writes` count distinguishing diff-deduped no-ops (`writes: 0`) from actual row writes; downstream metric consumers can monitor that ratio to confirm dedup is healthy.
 
@@ -738,7 +795,7 @@ new_sqlite_classes = ["DirectoryDO"]
 
 [[analytics_engine_datasets]]
 binding = "METRICS"
-dataset = "woo_v1"
+dataset = "woo_v1_prod"
 
 [observability]
 enabled = true

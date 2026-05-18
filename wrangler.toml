@@ -67,6 +67,17 @@ new_sqlite_classes = ["DirectoryDO"]
 tag = "cf-do-0006"
 new_sqlite_classes = [ "CommitScopeDO" ]
 
+# Workers Analytics Engine dataset for the admin stats panel
+# (notes/2026-05-17-admin-stats.md, spec/reference/cloudflare.md §R10.1).
+# Binding name `METRICS` matches the spec. One dataset per env so prod and
+# staging get independent 100k/day quotas; both share the binding name so
+# worker code is env-agnostic. The sink writes host_key as the single index
+# field; AE's adaptive sampling boundary then matches the dashboard's
+# primary pivot.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "woo_v1_prod"
+
 # Optional staging slot. Uncomment, rename to taste, and deploy with:
 #   wrangler deploy --env staging
 # The staging worker gets its own DO storage namespace; cost is per-request
@@ -98,3 +109,7 @@ new_sqlite_classes = [ "CommitScopeDO" ]
 # # foundational-only or a custom bundle in staging:
 # # WOO_AUTO_INSTALL_CATALOGS = "chat,help,note,prog"
 # # WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
+#
+# [[env.staging.analytics_engine_datasets]]
+# binding = "METRICS"
+# dataset = "woo_v1_staging"
