@@ -6,6 +6,8 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
+import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
+import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2TurnResultMessageFromReply } from "./v2-browser-messages";
 import { v2BrowserWebSocketUrl } from "./v2-browser-url";
 
@@ -33,12 +35,15 @@ type V2CacheStatus = {
   transcript_tail: number;
   object_pages: number;
   state_pages: number;
+  execution_transfers: number;
+  executable_scopes: string[];
+  local_execution_ready?: boolean;
   last_hello?: unknown;
   catchup_required?: boolean;
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const PROJECTION_STORE = "projections";
@@ -46,6 +51,7 @@ const APPLIED_STORE = "applied_frames";
 const TRANSCRIPT_STORE = "transcript_tail";
 const OBJECT_PAGE_STORE = "object_pages";
 const STATE_PAGE_STORE = "state_pages";
+const EXECUTION_TRANSFER_STORE = "execution_transfers";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -340,6 +346,7 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(TRANSCRIPT_STORE)) database.createObjectStore(TRANSCRIPT_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(OBJECT_PAGE_STORE)) database.createObjectStore(OBJECT_PAGE_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(STATE_PAGE_STORE)) database.createObjectStore(STATE_PAGE_STORE, { keyPath: "hash" });
+      if (!database.objectStoreNames.contains(EXECUTION_TRANSFER_STORE)) database.createObjectStore(EXECUTION_TRANSFER_STORE, { keyPath: "id" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
@@ -398,6 +405,9 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
     case "state_page":
       await putStatePage(mutation.hash, mutation.ref, mutation.page);
       return;
+    case "execution_transfer":
+      await putExecutionTransfer(mutation.record);
+      return;
   }
 }
 
@@ -449,7 +459,19 @@ async function putStatePage(hash: string, ref: string, page: unknown): Promise<v
   await tx(STATE_PAGE_STORE, "readwrite", (store) => store.put({ hash, ref, page, received_at: Date.now() }));
 }
 
+async function putExecutionTransfer(record: V2ExecutableTransferRecord): Promise<void> {
+  await tx(EXECUTION_TRANSFER_STORE, "readwrite", (store) => store.put(record));
+}
+
+async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
+  return await tx<V2ExecutableTransferRecord[]>(EXECUTION_TRANSFER_STORE, "readonly", (store) => store.getAll());
+}
+
 async function status(): Promise<V2CacheStatus> {
+  const executionTransfers = await allExecutionTransfers();
+  const localExecutionReady = current?.scope
+    ? canReconstructExecutionNode(current.node, current.scope, executionTransfers)
+    : undefined;
   return {
     connected: socket?.readyState === WebSocket.OPEN,
     pending: (await allPending()).length,
@@ -458,9 +480,28 @@ async function status(): Promise<V2CacheStatus> {
     transcript_tail: await countStore(TRANSCRIPT_STORE),
     object_pages: await countStore(OBJECT_PAGE_STORE),
     state_pages: await countStore(STATE_PAGE_STORE),
+    execution_transfers: executionTransfers.length,
+    executable_scopes: executableScopes(executionTransfers),
+    ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
     last_hello: await getMeta("hello"),
     catchup_required: await getMeta("catchup_required")
   };
+}
+
+function executableScopes(records: readonly V2ExecutableTransferRecord[]): string[] {
+  const scopes = new Set<string>();
+  for (const record of records) scopes.add(record.scope);
+  return Array.from(scopes).sort();
+}
+
+function canReconstructExecutionNode(node: string, scope: string, records: readonly V2ExecutableTransferRecord[]): boolean {
+  if (!records.some((record) => record.scope === scope)) return false;
+  try {
+    const executionNode = createV2BrowserExecutionNodeFromTransfers({ node, scope, records });
+    return executionNode.serialized !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 async function countStore(storeName: string): Promise<number> {

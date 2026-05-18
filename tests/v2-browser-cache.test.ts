@@ -190,7 +190,16 @@ describe("v2 browser cache reducer", () => {
       proof: { kind: "test" }
     });
 
-    expect(v2BrowserCacheMutationsForEnvelope(envelope)).toEqual([
+    const mutations = v2BrowserCacheMutationsForEnvelope(envelope);
+    expect(mutations[0]).toMatchObject({
+      kind: "execution_transfer",
+      record: {
+        scope: "#room",
+        mode: "cell_pages",
+        transfer: envelope.body
+      }
+    });
+    expect(mutations.slice(1)).toEqual([
       { kind: "state_page", hash: "page-hash", ref: "#room:object_live:", page }
     ]);
   });
