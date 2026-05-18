@@ -643,6 +643,36 @@ describe("local catalogs", () => {
     expect(world.hasPresence(second.actor, "the_chatroom")).toBe(false);
   });
 
+  it("tolerates stale refs in the_chatroom.contents (look + who keep working)", async () => {
+    // Prod observation 2026-05-17: the_chatroom.contents had `the_outline`
+    // in it but the object was no longer present in the host, so
+    // `$room:look_self` and `$conversational:room_roster` crashed with
+    // E_OBJNF when their `for X in contents(this) { if (isa(X, $player)) }`
+    // loop reached the stale ref. Same root cause as the outliner fix in
+    // 33aa5b5. Mirror the outliner test pattern.
+    const world = createWorld({ catalogs: false });
+    installDemoworldDependencyClosure(world);
+    const session = world.auth("guest:chatroom-stale");
+    const entered = await world.directCall("stale-enter", session.actor, "the_chatroom", "enter", []);
+    expect(entered.op).toBe("result");
+
+    // Inject a stale ref. contentsOf surfaces the underlying Set, so the
+    // DSL `contents(this)` will yield it; `isa` then throws E_OBJNF when
+    // it tries to resolve the id, which is exactly the prod failure mode.
+    world.object("the_chatroom").contents.add("the_outline_stale");
+
+    const look = await world.directCall("stale-look", session.actor, "the_chatroom", "look", []);
+    expect(look.op).toBe("result");
+    const who = await world.directCall("stale-who", session.actor, "the_chatroom", "who", []);
+    expect(who.op).toBe("result");
+    if (who.op === "result") {
+      // The roster still contains the live actor; the stale ref is filtered
+      // out by the guarded isa() check rather than aborting the verb.
+      const rows = (who.result as Array<{ id: string }>) ?? [];
+      expect(rows.map((r) => r.id)).toContain(session.actor);
+    }
+  });
+
   it("treats rxd catalog source perms as direct-callable shorthand", async () => {
     const world = createWorld({ catalogs: false });
     const manifest: RuntimeCatalogManifest = {
@@ -1006,6 +1036,30 @@ describe("local catalogs", () => {
     if (clearedColor.op === "applied") expect(clearedColor.observations.find((obs) => obs.type === "pin_recolored")?.color).toBeNull();
     expect(world.getProp(pin, "color")).toBeNull();
     expect(world.getProp("the_pinboard", "layout")).toMatchObject({ [pin]: { x: 80, y: 96 } });
+  });
+
+  it("tolerates stale refs in the_pinboard.contents (look + list_notes keep working)", async () => {
+    // Same contents-cache-drift class as the chatroom case above. The
+    // pinboard's :look_self iterates `for item in contents(this)` and
+    // calls `!isa(item, $note) && !isa(item, $actor)`; :list_notes calls
+    // `isa(pin, $note)`. Either explodes if `contents(this)` surfaces a
+    // ref to an object the host no longer has.
+    const world = createWorld({ catalogs: false });
+    installDemoworldDependencyClosure(world);
+    const session = world.auth("guest:pinboard-stale");
+    const entered = await world.directCall("pinboard-stale-enter", session.actor, "the_pinboard", "enter", []);
+    expect(entered.op).toBe("result");
+    world.object("the_pinboard").contents.add("the_pinboard_stale");
+
+    const look = await world.directCall("pinboard-stale-look", session.actor, "the_pinboard", "look", []);
+    expect(look.op).toBe("result");
+    const listed = await world.directCall("pinboard-stale-list", session.actor, "the_pinboard", "list_notes", []);
+    expect(listed.op).toBe("result");
+    if (listed.op === "result") {
+      // No real notes were added — the stale ref must not appear and the
+      // call must not raise.
+      expect(Array.isArray(listed.result)).toBe(true);
+    }
   });
 
   it("plans pinboard chat commands against the current board space", async () => {

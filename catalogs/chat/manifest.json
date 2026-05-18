@@ -202,7 +202,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :look_self() rxd { set_task_perms(caller_perms()); let roster = []; for who in contents(this) { if (isa(who, $player)) { let idle = idle_seconds(who); let row = { id: who, name: who.name, presence: presence_status(who) }; if (idle != null) { row[\"idle_seconds\"] = idle; } roster = roster + [row]; } } let visible = visible_contents(this); let remote_summaries = remote_describe(visible); let contents_rows = []; for item in visible { if (isa(item, $player)) { continue; } let title = item; let description = null; if (is_remote_object(item)) { let summary = null; if (typeof(remote_summaries) == \"map\" && has(remote_summaries, item)) { summary = remote_summaries[item]; } if (typeof(summary) == \"map\") { if (has(summary, \"name\") && summary[\"name\"]) { title = summary[\"name\"]; } if (has(summary, \"description\")) { description = summary[\"description\"]; } } } else { title = item.name; try { title = item:title(); } except err { if (err[\"code\"] == \"E_VERBNF\" || err[\"code\"] == \"E_TOOBIG\") { title = item.name; } else { raise err; } } try { description = item.description; } except err2 { description = null; } } contents_rows = contents_rows + [{ id: item, title: title, description: description }]; } return { id: this, title: this:title(), description: this.description, roster: roster, contents: contents_rows }; }"
+          "source": "verb :look_self() rxd { set_task_perms(caller_perms()); let roster = []; for who in contents(this) { let _is_player = false; try { _is_player = isa(who, $player); } except err { _is_player = false; } if (_is_player) { let idle = idle_seconds(who); let row = { id: who, name: who.name, presence: presence_status(who) }; if (idle != null) { row[\"idle_seconds\"] = idle; } roster = roster + [row]; } } let visible = visible_contents(this); let remote_summaries = remote_describe(visible); let contents_rows = []; for item in visible { if (isa(item, $player)) { continue; } let title = item; let description = null; if (is_remote_object(item)) { let summary = null; if (typeof(remote_summaries) == \"map\" && has(remote_summaries, item)) { summary = remote_summaries[item]; } if (typeof(summary) == \"map\") { if (has(summary, \"name\") && summary[\"name\"]) { title = summary[\"name\"]; } if (has(summary, \"description\")) { description = summary[\"description\"]; } } } else { title = item.name; try { title = item:title(); } except err { if (err[\"code\"] == \"E_VERBNF\" || err[\"code\"] == \"E_TOOBIG\") { title = item.name; } else { raise err; } } try { description = item.description; } except err2 { description = null; } } contents_rows = contents_rows + [{ id: item, title: title, description: description }]; } return { id: this, title: this:title(), description: this.description, roster: roster, contents: contents_rows }; }"
         },
         {
           "name": "announce",
@@ -238,7 +238,7 @@
               "origin?"
             ]
           },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = null; try { matched = $match:match_verb(\"hear_parent_announce\", item); } except err { matched = null; } if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in contents(this) { let _is_player = false; try { _is_player = isa(listener, $player); } except err { _is_player = false; } if (_is_player && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } for item in contents(this) { if (item != origin) { let matched = null; try { matched = $match:match_verb(\"hear_parent_announce\", item); } except err { matched = null; } if (typeof(matched) == \"map\") { try { item:hear_parent_announce(ignore, text); } except err { } } } } return true; }"
         },
         {
           "name": "match_exit",
@@ -791,7 +791,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { if (isa(item, $player)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }"
+          "source": "verb :room_roster() rxd { let rows = []; for item in contents(this) { let _is_player = false; try { _is_player = isa(item, $player); } except err { _is_player = false; } if (_is_player) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }"
         },
         {
           "name": "live_audience",
@@ -935,14 +935,14 @@
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text", "origin?"] },
-          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
+          "source": "verb :announce_all_but(ignore, text, origin) rxd { for listener in contents(this) { let _is_player = false; try { _is_player = isa(listener, $player); } except err { _is_player = false; } if (_is_player && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } let parent = location(this); if (parent != null && parent != this && isa(parent, $space)) { try { parent:announce_all_but(ignore, text, this); } except err { } } return true; }"
         },
         {
           "name": "hear_parent_announce",
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
+          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in contents(this) { let _is_player = false; try { _is_player = isa(listener, $player); } except err { _is_player = false; } if (_is_player && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
         },
         {
           "name": "say",
@@ -1005,7 +1005,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "arg_spec": { "args": ["ignore", "text"] },
-          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in contents(this) { if (isa(listener, $player) && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
+          "source": "verb :hear_parent_announce(ignore, text) rxd { for listener in contents(this) { let _is_player = false; try { _is_player = isa(listener, $player); } except err { _is_player = false; } if (_is_player && !(listener in ignore)) { observe_to_space(this, { type: \"text\", target: listener, actor: actor, text: text, body: text, ts: now() }); } } return true; }"
         }
       ]
     }
