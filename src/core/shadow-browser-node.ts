@@ -1,6 +1,7 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import { createShadowCommitScope, markShadowCommitScopeSerializedChanged, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
+  buildShadowCellPageTransfer,
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
   shadowObjectRecordHash,
@@ -12,7 +13,7 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
-import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
+import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -1207,6 +1208,24 @@ async function executeShadowBrowserTurnExecRequest(
 
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
   if (network.result.ok) {
+    const selectedExecutor = browser.relay.executors.find((node) => node.node === network.selected_node);
+    if (selectedExecutor) {
+      // A delegated success must also warm the actor-side executable cache.
+      // Projection deltas update display state, but only execution transfers
+      // let the browser plan the next related turn locally.
+      const stateTransfer = buildShadowCellPageTransfer({
+        serialized: browser.relay.commit_scope.serialized,
+        key: request.key,
+        atom_hashes: request.key.atom_hashes,
+        known_page_hashes: browser.execution_node.page_hashes,
+        session: request.call.session,
+        recipient: browser.node
+      });
+      if (network.result.reply) {
+        network.result.reply.state_transfer = stateTransfer;
+        network.result.reply.ads = [buildShadowTurnExecAdFromNode({ node: selectedExecutor, accepts: request.key, factor: 0.1 })];
+      }
+    }
     executor.committed_head_hash = browser.relay.commit_scope.head.hash;
     executor.serialized_generation = browser.relay.serialized_generation;
     if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
@@ -1221,6 +1240,11 @@ async function executeShadowBrowserTurnExecRequest(
 }
 
 function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: ShadowTurnExecRequest): ShadowExecutionNode {
+  const selected = request.selected_ad
+    ? relay.executors.find((node) => node.node === request.selected_ad && node.scope === request.key.scope)
+    : undefined;
+  if (selected) return selected;
+
   const nodeId = `${relay.node}:executor`;
   let executor = relay.executors.find((node) => node.node === nodeId);
   const needsRefresh = !executor ||

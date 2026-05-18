@@ -6,6 +6,8 @@ import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
+import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
+import { selectV2DelegatedExecutor } from "./v2-browser-delegation";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { planV2BrowserLocalTurn } from "./v2-browser-local-turn";
@@ -37,6 +39,7 @@ type V2CacheStatus = {
   object_pages: number;
   state_pages: number;
   execution_transfers: number;
+  execution_ads: number;
   executable_scopes: string[];
   local_execution_ready?: boolean;
   last_hello?: unknown;
@@ -44,7 +47,7 @@ type V2CacheStatus = {
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const PROJECTION_STORE = "projections";
@@ -53,6 +56,7 @@ const TRANSCRIPT_STORE = "transcript_tail";
 const OBJECT_PAGE_STORE = "object_pages";
 const STATE_PAGE_STORE = "state_pages";
 const EXECUTION_TRANSFER_STORE = "execution_transfers";
+const EXECUTION_AD_STORE = "execution_ads";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -330,6 +334,26 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     transfers: await allExecutionTransfers()
   });
   if (!local.ok) {
+    if (local.reason === "missing_state" && local.request && local.key) {
+      const delegation = selectV2DelegatedExecutor({
+        records: await allExecutionAds(),
+        key: local.key
+      });
+      if (delegation.ok) {
+        const request: ShadowTurnExecRequest = {
+          ...local.request,
+          selected_ad: delegation.ad.node
+        };
+        await sendTurnExecEnvelope(command.id, request);
+        postMessage({
+          kind: "local_turn_delegated",
+          id: command.id,
+          node: delegation.ad.node,
+          missing_atoms: local.missing_atoms?.map((atom) => atom.hash) ?? []
+        });
+        return true;
+      }
+    }
     postMessage({
       kind: "local_turn_fallback",
       id: command.id,
@@ -338,15 +362,28 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     });
     return false;
   }
+  await sendTurnExecEnvelope(command.id, local.request);
+  postMessage({
+    kind: "local_turn_planned",
+    id: command.id,
+    transcript_hash: local.transcript_hash,
+    observation_count: local.observation_count,
+    result_known: local.result_known
+  });
+  return true;
+}
+
+async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest): Promise<void> {
+  if (!current || !current.actor) return;
   const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
     v: 2,
-    type: local.request.kind,
-    id: command.id,
+    type: request.kind,
+    id,
     from: current.node,
     actor: current.actor,
     ...(current.session ? { session: current.session } : {}),
     auth: { mode: "session", token: current.token },
-    body: local.request
+    body: request
   };
   const encoded = encodeEnvelope(envelope);
   await putPending({
@@ -356,15 +393,7 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     auth_token: current.token,
     from: current.node
   });
-  postMessage({
-    kind: "local_turn_planned",
-    id: command.id,
-    transcript_hash: local.transcript_hash,
-    observation_count: local.observation_count,
-    result_known: local.result_known
-  });
   sendEncoded(encoded);
-  return true;
 }
 
 function sendEncoded(encoded: string): void {
@@ -412,6 +441,7 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(OBJECT_PAGE_STORE)) database.createObjectStore(OBJECT_PAGE_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(STATE_PAGE_STORE)) database.createObjectStore(STATE_PAGE_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(EXECUTION_TRANSFER_STORE)) database.createObjectStore(EXECUTION_TRANSFER_STORE, { keyPath: "id" });
+      if (!database.objectStoreNames.contains(EXECUTION_AD_STORE)) database.createObjectStore(EXECUTION_AD_STORE, { keyPath: "id" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
@@ -469,6 +499,9 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
       return;
     case "state_page":
       await putStatePage(mutation.hash, mutation.ref, mutation.page);
+      return;
+    case "execution_ad":
+      await putExecutionAd(mutation.record);
       return;
     case "execution_transfer":
       await putExecutionTransfer(mutation.record);
@@ -528,8 +561,16 @@ async function putExecutionTransfer(record: V2ExecutableTransferRecord): Promise
   await tx(EXECUTION_TRANSFER_STORE, "readwrite", (store) => store.put(record));
 }
 
+async function putExecutionAd(record: V2ExecutionAdRecord): Promise<void> {
+  await tx(EXECUTION_AD_STORE, "readwrite", (store) => store.put(record));
+}
+
 async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
   return await tx<V2ExecutableTransferRecord[]>(EXECUTION_TRANSFER_STORE, "readonly", (store) => store.getAll());
+}
+
+async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {
+  return await tx<V2ExecutionAdRecord[]>(EXECUTION_AD_STORE, "readonly", (store) => store.getAll());
 }
 
 async function status(): Promise<V2CacheStatus> {
@@ -546,6 +587,7 @@ async function status(): Promise<V2CacheStatus> {
     object_pages: await countStore(OBJECT_PAGE_STORE),
     state_pages: await countStore(STATE_PAGE_STORE),
     execution_transfers: executionTransfers.length,
+    execution_ads: await countStore(EXECUTION_AD_STORE),
     executable_scopes: executableScopes(executionTransfers),
     ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
     last_hello: await getMeta("hello"),

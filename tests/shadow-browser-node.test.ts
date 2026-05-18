@@ -36,6 +36,7 @@ import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../src/core/shadow-commit-scope";
+import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
@@ -1369,6 +1370,50 @@ describe("shadow browser node shim", () => {
 
     expect(second.body).toMatchObject({ ok: true });
     expect(browser.relay.executors.find((node) => node.node === `${browser.relay.node}:executor`)).not.toBe(executor);
+  });
+
+  it("honors a selected delegated executor and replies with executable cache material", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-selected-executor", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-selected-executor-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.37]
+    };
+    const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    browser.relay.executors.push(createShadowExecutionNode({
+      node: "near-executor",
+      scope: key.scope,
+      serialized: browser.relay.commit_scope.serialized,
+      atom_hashes: key.atom_hashes
+    }));
+    const request = {
+      kind: "woo.turn.exec.request.shadow.v1" as const,
+      id: call.id,
+      call,
+      key,
+      expected: browser.relay.commit_scope.head,
+      selected_ad: "near-executor",
+      persistence: "durable" as const
+    };
+    const envelope = shadowBrowserEnvelope(browser, "woo.turn.exec.request.shadow.v1", request, "browser-selected-executor-env");
+
+    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+
+    expect(reply?.body).toMatchObject({
+      ok: true,
+      state_transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
+      ads: [expect.objectContaining({ node: "near-executor" })]
+    });
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
   });
 });
 

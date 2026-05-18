@@ -6,6 +6,8 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { SerializedObject } from "../core/repository";
 import type { WooValue } from "../core/types";
+import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
+import { v2ExecutionAdRecord } from "./v2-browser-delegation";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { v2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 
@@ -18,6 +20,7 @@ export type V2BrowserCacheMutation =
   | { kind: "transcript"; transcript: EffectTranscript }
   | { kind: "object_page"; hash: string; object: SerializedObject }
   | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage }
+  | { kind: "execution_ad"; record: V2ExecutionAdRecord }
   | { kind: "execution_transfer"; record: V2ExecutableTransferRecord };
 
 export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2BrowserCacheMutation[] {
@@ -47,6 +50,8 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
       mutations.push({ kind: "transcript" as const, transcript: reply.transcript });
       if (reply.commit) mutations.push({ kind: "meta" as const, key: `head:${reply.commit.position.scope}`, value: reply.commit.position });
     }
+    if (reply.state_transfer) mutations.push(...stateTransferMutations(reply.state_transfer));
+    for (const ad of reply.ads ?? []) mutations.push({ kind: "execution_ad" as const, record: v2ExecutionAdRecord(ad) });
     return mutations;
   }
   if (envelope.reply_to) return [{ kind: "pending_delete", id: envelope.reply_to }];

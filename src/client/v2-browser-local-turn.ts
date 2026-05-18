@@ -2,6 +2,7 @@ import { runShadowTurnCallTranscript } from "../core/shadow-turn-call";
 import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { executeShadowTurnCallOrNeedState, missingAtomsForShadowTurn, type ShadowMissingAtom, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { shadowTurnKeyFromTranscript } from "../core/turn-key";
+import type { ShadowTurnKey } from "../core/turn-key";
 import type { ObjRef, WooValue } from "../core/types";
 import { createV2BrowserExecutionNodeFromTransfers, type V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 
@@ -33,6 +34,8 @@ export type V2BrowserLocalTurnResult =
       ok: false;
       reason: "no_executable_state" | "missing_state" | "commit_rejected";
       missing_atoms?: ShadowMissingAtom[];
+      key?: ShadowTurnKey;
+      request?: ShadowTurnExecRequest;
     };
 
 export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Promise<V2BrowserLocalTurnResult> {
@@ -57,9 +60,6 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
   };
   const planned = await runShadowTurnCallTranscript(executionNode.serialized, call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
-  const missing = missingAtomsForShadowTurn(executionNode, key);
-  if (missing.length > 0) return { ok: false, reason: "missing_state", missing_atoms: missing };
-
   const request: ShadowTurnExecRequest = {
     kind: "woo.turn.exec.request.shadow.v1",
     id: input.id,
@@ -73,9 +73,11 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     },
     persistence: input.persistence
   };
+  const missing = missingAtomsForShadowTurn(executionNode, key);
+  if (missing.length > 0) return { ok: false, reason: "missing_state", missing_atoms: missing, key, request };
   const executed = await executeShadowTurnCallOrNeedState(executionNode, request);
   if (executed.ok === false) {
-    if (executed.reason === "missing_state") return { ok: false, reason: "missing_state", missing_atoms: executed.missing_atoms };
+    if (executed.reason === "missing_state") return { ok: false, reason: "missing_state", missing_atoms: executed.missing_atoms, key, request };
     return { ok: false, reason: "commit_rejected" };
   }
   return {

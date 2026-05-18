@@ -18,6 +18,7 @@ import {
   type ShadowTurnCallRun,
   type ShadowTurnCallTranscriptRun
 } from "./shadow-turn-call";
+import type { ShadowCapabilityAd } from "./capability-ad";
 import {
   submitShadowCommit,
   type ShadowCommitAccepted,
@@ -212,6 +213,8 @@ export type ShadowTurnExecReply =
       outcome: { result?: WooValue; error?: WooValue };
       transcript: EffectTranscript;
       commit?: ShadowCommitAccepted | ShadowCommitAcceptedWire;
+      state_transfer?: ShadowStateTransfer;
+      ads?: ShadowCapabilityAd[];
     }
   | {
       kind: "woo.turn.exec.reply.shadow.v1";
@@ -221,6 +224,8 @@ export type ShadowTurnExecReply =
       missing_atoms?: ShadowMissingAtom[];
       transcript?: EffectTranscript;
       commit?: ShadowCommitConflict;
+      state_transfer?: ShadowStateTransfer;
+      ads?: ShadowCapabilityAd[];
     };
 
 export type ShadowTurnExecutionOptions = {
