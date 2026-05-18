@@ -219,6 +219,23 @@ describe("v2 browser cache reducer", () => {
     ]);
   });
 
+  it("persists standalone capability-ad frames from gossip", () => {
+    const ad = {
+      kind: "woo.exec_capability_ad.shadow.v1",
+      node: "gossip-executor",
+      scope: "the_dubspace",
+      epoch: "1",
+      covers: { m: 8, k: 1, bits_hex: "ff" },
+      accepts: { m: 8, k: 1, bits_hex: "ff" },
+      effects: 0,
+      factor: 0.2
+    };
+
+    expect(v2BrowserCacheMutationsForEnvelope(envelopeFor("woo.exec_capability_ad.shadow.v1", ad))).toEqual([
+      { kind: "execution_ad", record: expect.objectContaining({ node: "gossip-executor", scope: "the_dubspace", ad }) }
+    ]);
+  });
+
   it("persists executable cell pages for later browser-side planning", () => {
     const page: ShadowStatePage = {
       kind: "woo.state_page.object_live.shadow.v1",

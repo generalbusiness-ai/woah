@@ -35,6 +35,29 @@ describe("shadow envelope codec", () => {
     expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
   });
 
+  it("accepts standalone execution capability advertisements", () => {
+    const envelope: ShadowEnvelope = {
+      v: 2,
+      type: "woo.exec_capability_ad.shadow.v1",
+      id: "ad-1",
+      from: "near-executor",
+      to: "browser-node",
+      auth: { mode: "anonymous_advisory" },
+      body: {
+        kind: "woo.exec_capability_ad.shadow.v1",
+        node: "near-executor",
+        scope: "the_dubspace",
+        epoch: "1",
+        covers: { m: 8, k: 1, bits_hex: "ff" },
+        accepts: { m: 8, k: 1, bits_hex: "ff" },
+        effects: 0,
+        factor: 0.2
+      }
+    };
+
+    expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
+  });
+
   it("rejects malformed envelopes before dispatch", () => {
     expect(() => decodeEnvelope("{")).toThrow(/malformed/);
     expect(() => decodeEnvelope(JSON.stringify({ v: 1, type: "woo.transport.ping.v1", id: "x", from: "a", auth: { mode: "session", token: "t" }, body: {} }))).toThrow(/version/);

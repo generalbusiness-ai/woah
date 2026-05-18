@@ -1,5 +1,6 @@
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowBrowserStateTransfer, ShadowScopeProjectionPatch } from "../core/shadow-browser-node";
+import type { ShadowCapabilityAd } from "../core/capability-ad";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
@@ -36,6 +37,9 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
   }
   if (envelope.type === "woo.state.transfer.shadow.v1") {
     return stateTransferMutations(envelope.body as ShadowBrowserStateTransfer);
+  }
+  if (envelope.type === "woo.exec_capability_ad.shadow.v1") {
+    return [{ kind: "execution_ad", record: v2ExecutionAdRecord(envelope.body as ShadowCapabilityAd) }];
   }
   if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
     const reply = envelope.body as ShadowTurnExecReply;
