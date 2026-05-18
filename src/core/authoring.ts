@@ -380,7 +380,7 @@ export function installVerbAs(world: WooWorld, actor: ObjRef, obj: ObjRef, name:
 }
 
 function installVerbWithOwner(world: WooWorld, obj: ObjRef, name: string, source: string, expectedVersion: number | null, owner: ObjRef, options: AuthoringOptions = {}): InstallResult {
-  const target = world.object(obj);
+  world.object(obj);
   world.object(owner);
   const current = world.ownVerbExact(obj, name);
   if ((current?.version ?? null) !== expectedVersion) {

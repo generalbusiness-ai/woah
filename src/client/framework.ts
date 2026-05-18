@@ -366,7 +366,7 @@ export class CatalogUiRegistry {
     const candidates: ResolvedFrame[] = [];
     for (const pkg of this.catalogs.values()) {
       for (const frame of pkg.ui.frames ?? []) {
-        const rank = frameRank(frame, subject, view);
+        const rank = frameRank(frame, view);
         if (rank === undefined) continue;
         if (frame.subject === subject) {
           candidates.push({ catalog: pkg, frame, rank, distance: 0 });
@@ -1301,7 +1301,7 @@ function resolveCatalogRef(pkg: CatalogUiPackage, value: string): string {
   return pkg.objects?.[local] ?? local;
 }
 
-function frameRank(frame: UiFrameDecl, subject: string, view: string | undefined): number | undefined {
+function frameRank(frame: UiFrameDecl, view: string | undefined): number | undefined {
   const requested = view && view !== "default" ? view : undefined;
   const frameView = frame.view && frame.view !== "default" ? frame.view : undefined;
   if (requested && frameView !== requested) return undefined;

@@ -153,13 +153,6 @@ export type CatalogManifestStatus = {
   issues: CatalogStatusIssue[];
 };
 
-const DYNAMIC_SEED_PROPERTIES = new Set([
-  "next_seq",
-  "subscribers",
-  "operators",
-  "last_snapshot_seq"
-]);
-
 export type InstallCatalogOptions = {
   actor?: ObjRef;
   tap?: string;
@@ -1052,9 +1045,9 @@ function reconcileSeedObject(
   // Seed-hook properties are *initial* values — they bootstrap a fresh seed.
   // The unconditional set_if_missing path at the repair call site (line 510)
   // already handles "manifest added a new property; existing seed lacks it".
-  // Anything beyond that, including the DYNAMIC_SEED_PROPERTIES list, would
-  // overwrite live runtime state (next_z, layout, tempo, transport, exits...)
-  // on every host's cold init, which silently wipes user data.
+  // Updating existing overrides here would overwrite live runtime state
+  // (next_z, layout, tempo, transport, exits...) on every host's cold init,
+  // which silently wipes user data.
   for (const [name, value] of Object.entries(hook.properties ?? {})) {
     if (obj.properties.has(name)) continue;
     world.setProp(id, name, resolveCatalogValue(world, value, localObjects, localSeeds, existing));

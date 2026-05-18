@@ -1,14 +1,8 @@
-import { test, expect, type APIRequestContext, type Locator } from "@playwright/test";
+import { test, expect, type Locator } from "@playwright/test";
 
 async function boxKey(locator: Locator): Promise<string> {
   const box = await locator.boundingBox();
   return box ? `${Math.round(box.x)}:${Math.round(box.y)}:${Math.round(box.width)}:${Math.round(box.height)}` : "";
-}
-
-async function authHeaders(request: APIRequestContext): Promise<Record<string, string>> {
-  const response = await request.post("/api/auth", { data: { token: `guest:e2e-${crypto.randomUUID()}` } });
-  const body = await response.json();
-  return { authorization: `Session ${body.session}` };
 }
 
 async function continueAsGuestIfPrompted(page: { getByRole: (role: "button", options: { name: string }) => Locator }): Promise<void> {

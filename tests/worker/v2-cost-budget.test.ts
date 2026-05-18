@@ -11,7 +11,6 @@ import {
 } from "../../src/core/shadow-browser-node";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
-import type { SerializedWorld } from "../../src/core/repository";
 import type { WooWorld } from "../../src/core/world";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
@@ -418,10 +417,6 @@ function writeRowsByTable(state: FakeDurableObjectState): Record<string, number>
     counts[table] = (counts[table] ?? 0) + entry.changes;
   }
   return counts;
-}
-
-function sqlRows<T>(cursor: { toArray(): Record<string, unknown>[] }): T[] {
-  return cursor.toArray() as T[];
 }
 
 function writeTable(query: string): string | null {

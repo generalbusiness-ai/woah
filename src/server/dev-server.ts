@@ -39,7 +39,7 @@ import {
   shadowBrowserTransportHello,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
-import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting } from "./dev-v2-routing";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";

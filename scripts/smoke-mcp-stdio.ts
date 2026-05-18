@@ -66,6 +66,11 @@ async function main(): Promise<void> {
     }) as ToolResult);
     if (!hasObservation(said, "said")) throw new Error("woo_call say returned no said observation");
 
+    assertOk("woo_call southeast", await client.callTool({
+      name: "woo_call",
+      arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+    }) as ToolResult);
+
     assertOk("woo_focus", await client.callTool({
       name: "woo_focus",
       arguments: { target: "the_pinboard" }

@@ -329,7 +329,7 @@ export function buildShadowObjectRecordTransfer(input: {
     };
   });
   const inlineObjects = requiredObjects
-    .filter((obj, index) => objectPages[index]?.inline === true)
+    .filter((_, index) => objectPages[index]?.inline === true)
     .map((obj) => structuredClone(obj) as SerializedObject);
   const sessions = input.serialized.sessions
     .filter((session) => session.id === input.session || session.actor === input.key.actor)
@@ -383,7 +383,7 @@ export function buildShadowCellPageTransfer(input: {
     return { ...ref, inline: !knownPageHashes.has(ref.hash) };
   });
   const inlinePages = requiredPages
-    .filter((page, index) => pageRefs[index]?.inline === true)
+    .filter((_, index) => pageRefs[index]?.inline === true)
     .map((page) => structuredClone(page) as ShadowStatePage);
   const transfer = {
     kind: "woo.state.transfer.shadow.v1",

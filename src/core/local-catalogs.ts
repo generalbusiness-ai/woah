@@ -1554,7 +1554,6 @@ function isLocalCatalogName(name: string): name is LocalCatalogName {
 }
 
 function sortCatalogNames(names: readonly string[]): string[] {
-  const selected = new Set(names);
   const visited = new Set<string>();
   const visiting = new Set<string>();
   const sorted: string[] = [];

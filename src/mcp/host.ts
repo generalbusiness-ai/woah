@@ -807,7 +807,7 @@ export class McpHost {
 
   private async toolRefreshDecisionAfterInvoke(
     actor: ObjRef,
-    tool: McpTool,
+    _tool: McpTool,
     transcript: EffectTranscript | undefined,
     baseline: McpToolRefreshBaseline
   ): Promise<McpToolRefreshDecision> {

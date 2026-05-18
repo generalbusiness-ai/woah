@@ -46,7 +46,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
   private transactionDepth = 0;
   private savepointCounter = 0;
 
-  constructor(private filename: string) {
+  constructor(filename: string) {
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.db = new DatabaseSync(filename);
     this.db.exec("PRAGMA journal_mode = WAL");

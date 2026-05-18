@@ -12,8 +12,7 @@ import {
   executeShadowRecordedTurnOrNeedState,
   executeShadowTurnCallOrNeedState,
   installShadowStateTransfer,
-  missingAtomsForShadowTurn,
-  shadowObjectRecordHash
+  missingAtomsForShadowTurn
 } from "../src/core/shadow-turn-exec";
 import { shadowStatePageHash } from "../src/core/shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
