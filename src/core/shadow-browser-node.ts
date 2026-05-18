@@ -836,6 +836,16 @@ export function publishShadowBrowserAcceptedFrame(
   transcript: EffectTranscript
 ): void {
   rememberShadowBrowserAcceptedFrame(relay, accepted, transcript);
+  // Drop per-session live snapshots so the next live/direct call rebases on
+  // the freshly committed scope state instead of a stale pre-commit view.
+  // Without this, after a sequenced commit on the same scope, a subsequent
+  // direct read (e.g. `the_outline:list_items` immediately after `:add`)
+  // runs against the cached `live_session_serialized` and returns the
+  // pre-commit value — making the new row look like it was never written.
+  // The live snapshot only matters for chained live-only gestures (e.g.
+  // dubspace cue → local control); rebasing on commit is correct because
+  // those gestures were never authoritative anyway.
+  relay.live_session_serialized.clear();
   // Commit fan-out is subscription-gated; browsers outside the scope must ask
   // for later state transfer rather than receiving every accepted frame.
   for (const browser of relay.browsers.values()) {

@@ -45,6 +45,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private editing: { id: string; original: string } | null = null;
   private dragSourceId: string | null = null;
   private hydrating = false;
+  private hydratePending = false;
   private hydrateAttempted = false;
   private bound = false;
 
@@ -74,28 +75,42 @@ export class WooOutlinerTreeElement extends HTMLElement {
   }
 
   async hydrate(): Promise<void> {
-    if (this.hydrating || !this.woo || !this.subject) return;
+    if (!this.woo || !this.subject) return;
+    if (this.hydrating) {
+      // Coalesce a concurrent caller — typical race: observation reducer
+      // fires `outline_item_added` while the initial hydrate is still
+      // resolving list_items. Dropping the second hydrate would freeze the
+      // UI on the pre-mutation snapshot.
+      this.hydratePending = true;
+      return;
+    }
     this.hydrating = true;
     this.hydrateAttempted = true;
     try {
-      const items = await this.woo.call(this.subject, "list_items", []);
-      const projection = this.woo.observe(this.subject);
-      const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
-      const actor = this.woo.actor;
-      const focus = actor ? focusMap[actor] ?? null : null;
-      // The display title is the object's own name (e.g. "Outline" from the
-      // seed). `props.name` is not the same field — for inherited classes it
-      // can surface the parent class's own name (e.g. "$space") and produce
-      // the wrong title in the header.
-      const objectName = projection?.name;
-      this.model = {
-        outlinerId: this.subject,
-        outlinerName: typeof objectName === "string" && objectName ? objectName : "Outline",
-        items: Array.isArray(items) ? (items as OutlinerItem[]) : [],
-        focus,
-        actor
-      };
-      this.render();
+      do {
+        this.hydratePending = false;
+        // Read-side query: directCall resolves with the verb's actual return
+        // value. (`woo.call` is fire-and-forget and resolves with the request
+        // id — the reply lands via the observation reducer, not this promise.)
+        const items = await this.woo.directCall(this.subject, "list_items", []);
+        const projection = this.woo.observe(this.subject);
+        const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
+        const actor = this.woo.actor;
+        const focus = actor ? focusMap[actor] ?? null : null;
+        // The display title is the object's own name (e.g. "Outline" from the
+        // seed). `props.name` is not the same field — for inherited classes it
+        // can surface the parent class's own name (e.g. "$space") and produce
+        // the wrong title in the header.
+        const objectName = projection?.name;
+        this.model = {
+          outlinerId: this.subject,
+          outlinerName: typeof objectName === "string" && objectName ? objectName : "Outline",
+          items: Array.isArray(items) ? (items as OutlinerItem[]) : [],
+          focus,
+          actor
+        };
+        this.render();
+      } while (this.hydratePending);
     } finally {
       this.hydrating = false;
     }
@@ -119,6 +134,18 @@ export class WooOutlinerTreeElement extends HTMLElement {
       ? data.items.find((it) => it.id === data.focus)?.text ?? data.focus
       : "(root)";
     const preservedPanel = preserveAmbientCompanionPanel(this, outlinerId);
+    // Preserve in-flight form input across re-renders. Without this, a
+    // hydrate (or any observation-triggered re-render) wipes the user's
+    // typed text mid-keystroke and any submit afterwards fires with an
+    // empty value. The renderRow path handles its own edit form because
+    // the editing target id is tracked in `this.editing`.
+    const addInputValue = this.querySelector<HTMLInputElement>("[data-outliner-add] input[name=text]")?.value ?? "";
+    const focusedSelector = (() => {
+      const active = document.activeElement;
+      if (!active || !this.contains(active)) return null;
+      if (active.matches("[data-outliner-add] input[name=text]")) return "add";
+      return null;
+    })();
     const tree = `
       <section class="outliner">
         <header class="outliner-header">
@@ -134,7 +161,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
           </div>
         </header>
         <form class="outliner-add" data-outliner-add>
-          <input type="text" name="text" placeholder="add an item…" autocomplete="off">
+          <input type="text" name="text" placeholder="add an item…" autocomplete="off" value="${escapeHtml(addInputValue)}">
           <button type="submit">Add</button>
         </form>
         <ul class="outliner-rows" data-outliner-rows>
@@ -146,6 +173,15 @@ export class WooOutlinerTreeElement extends HTMLElement {
       ? renderAmbientCompanionShell(outlinerId, `<section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${tree}</section>`)
       : tree;
     restoreAmbientCompanionPanel(this, preservedPanel);
+    if (focusedSelector === "add") {
+      const input = this.querySelector<HTMLInputElement>("[data-outliner-add] input[name=text]");
+      if (input) {
+        input.focus();
+        // Restore caret to end so typing continues naturally.
+        const end = input.value.length;
+        input.setSelectionRange(end, end);
+      }
+    }
   }
 
   private computeVisibleItems(items: OutlinerItem[]): Array<OutlinerItem & { depth: number }> {

@@ -486,9 +486,21 @@ async function handleV2ShadowFrame(
     const callScope = routing?.scope ?? null;
     const callTarget = routing?.target ?? null;
     const crossScope = !!callScope && callScope !== browser.relay.commit_scope.scope;
+    // Verbs commonly iterate `contents(this)` and call isa/prop reads on each
+    // member (e.g. $outliner:list_items, $room:look_self). The relay's
+    // serialized snapshot must therefore include those contained objects, not
+    // just the target itself — otherwise isa throws E_OBJNF on items created
+    // by earlier commits in the same session. The REST path's per-request
+    // relay reuses a fully-refreshed shim so it hits this naturally; the WS
+    // path's persistent relay misses it unless we ask explicitly.
+    const baseTarget = crossScope ? callScope! : browser.relay.commit_scope.scope;
+    const containerForContents = callTarget ?? baseTarget;
+    const containerContents = world.objects.has(containerForContents)
+      ? Array.from(world.object(containerForContents).contents)
+      : [];
     const explicitRows: ObjRef[] = crossScope
-      ? [callScope!, ...(callTarget && callTarget !== callScope ? [callTarget] : []), session.actor]
-      : [browser.relay.commit_scope.scope, ...(callTarget ? [callTarget] : []), session.actor];
+      ? [callScope!, ...(callTarget && callTarget !== callScope ? [callTarget] : []), session.actor, ...containerContents]
+      : [browser.relay.commit_scope.scope, ...(callTarget ? [callTarget] : []), session.actor, ...containerContents];
     const targetRelay = crossScope ? v2RelayForScope(callScope!) : browser.relay;
     // Refresh wipes session_auth and then re-registers wire tokens only
     // for browsers tracked in `relay.browsers`. The WS-bound `browser` is
