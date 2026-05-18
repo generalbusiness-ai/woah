@@ -1036,7 +1036,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
       const state = readState();
       // wrangler tail filters by --search (substring against the log
       // line). We string-join filter values into one search term so a
-      // typical narrow filter (e.g. host_key=the_chatroom) zeroes in on
+      // typical narrow host_key filter zeroes in on
       // its emissions. wrangler tail can't time-travel, so the user
       // gets a live tail tuned to the same filter axis they were
       // looking at; copy → paste into a terminal.

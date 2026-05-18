@@ -6,13 +6,13 @@
 // directly or via imports, must work in a browser/Worker context. The bundler
 // is the ultimate authority, but the bundler only runs during `npm run build`,
 // which fails late in deploy. This guard walks the static import graph from
-// the client entry and flags any `import ... from "node:<x>"` it sees on the
+// the client entry and flags any Node builtin import it sees on the
 // way. It catches the common failure of an existing module suddenly being
 // pulled into the browser because a worker-side file started importing a
 // runtime symbol from a Node-side module.
 //
 // What this guard does NOT do:
-//   - Detect dynamic imports.
+//   - Detect non-literal dynamic imports.
 //   - Detect runtime feature checks (e.g. `if (process)`).
 //   - Replace `npm run build`. Bundlers can fail for many other reasons.
 //
@@ -20,6 +20,7 @@
 // import so the fix path is obvious.
 
 import { readFileSync, statSync } from "node:fs";
+import { builtinModules } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 
 const root = process.cwd();
@@ -32,6 +33,15 @@ const entries = [
 
 const visited = new Set();
 const violations = [];
+const nodeBuiltinSpecifiers = new Set(
+  builtinModules.flatMap((specifier) => specifier.startsWith("node:")
+    ? [specifier, specifier.slice("node:".length)]
+    : [specifier, `node:${specifier}`])
+);
+
+function isNodeBuiltinSpecifier(specifier) {
+  return nodeBuiltinSpecifiers.has(specifier);
+}
 
 function tryResolveModule(specifier, fromFile) {
   // Relative or absolute path: resolve against the importing file's directory.
@@ -48,8 +58,8 @@ function tryResolveModule(specifier, fromFile) {
     }
     return null;
   }
-  // node:*, package imports: not a project-local source file, so the guard
-  // either flags it (for node:*) or treats it as opaque (for npm packages —
+  // Node builtins, package imports: not a project-local source file, so the
+  // guard either flags it (for Node builtins) or treats it as opaque (for npm packages —
   // those are vetted at install time and bundled separately).
   return null;
 }
@@ -94,7 +104,7 @@ function walk(file) {
   }
   const rel = relative(root, file);
   for (const specifier of specifiersFromSource(source)) {
-    if (specifier.startsWith("node:")) {
+    if (isNodeBuiltinSpecifier(specifier)) {
       violations.push({ file: rel, line: lineOf(source, specifier), specifier });
       continue;
     }
@@ -108,7 +118,7 @@ for (const entry of entries) walk(join(root, entry));
 if (violations.length > 0) {
   console.error("Client bundle pulls in Node-only modules:");
   console.error("(remove the import, or move the symbol behind a runtime");
-  console.error(" branch that does not statically import node:* code)");
+  console.error(" branch that does not statically import Node builtin code)");
   console.error();
   for (const { file, line, specifier } of violations) {
     console.error(`  ${file}:${line}: import from "${specifier}"`);
