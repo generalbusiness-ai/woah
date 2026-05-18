@@ -130,7 +130,11 @@ function utf8Encode(source: string): Uint8Array {
       if (low >= 0xdc00 && low <= 0xdfff) {
         code = 0x10000 + (((code - 0xd800) << 10) | (low - 0xdc00));
         i += 1;
+      } else {
+        code = 0xfffd;
       }
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      code = 0xfffd;
     }
     if (code < 0x80) {
       bytes.push(code);

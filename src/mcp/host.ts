@@ -814,7 +814,7 @@ export class McpHost {
   // observation any verb produced during the call — including forwards
   // to other spaces (e.g. `$transparent:say` re-emits to `location(this)`
   // for actors in the parent room). Without this filter, an MCP client
-  // sees two `said` events for a single `the_dubspace:say` even though
+  // sees two `said` events for a single proxied space `say` even though
   // its own audience only contains one. See notes/2026-05-16-online-
   // walkthrough.md Bug 5.
   //

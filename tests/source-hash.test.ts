@@ -1,5 +1,5 @@
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { constantTimeEqual, hashSource, randomHex } from "../src/core/source-hash";
 
@@ -54,6 +54,9 @@ describe("source-hash SHA-256 implementation", () => {
       "é́", // 'e' + combining acute (NFD form), tests multi-byte handling
       "字符串", // Chinese, three 3-byte UTF-8 codepoints
       "🦊🌒", // supplementary-plane codepoints
+      "\ud800", // lone high surrogate must hash like TextEncoder/Node: U+FFFD
+      "\udc00", // lone low surrogate must hash like TextEncoder/Node: U+FFFD
+      "a\ud800b",
       "a".repeat(63),
       "a".repeat(64),
       "a".repeat(65),
@@ -131,6 +134,24 @@ describe("randomHex", () => {
     expect(() => randomHex(-1)).toThrow(RangeError);
     expect(() => randomHex(1.5)).toThrow(RangeError);
     expect(() => randomHex(Number.NaN)).toThrow(RangeError);
+  });
+});
+
+describe("source-hash fallback UTF-8 encoder", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("matches node:crypto when TextEncoder is unavailable and input has lone surrogates", async () => {
+    vi.stubGlobal("TextEncoder", undefined);
+    const fallbackModulePath = `../src/core/source-hash.ts?fallback=${Date.now()}`;
+    const { hashSource: fallbackHashSource } = await import(fallbackModulePath);
+    const corpus = ["\ud800", "\udc00", "a\ud800b", "\ud800\udc00", "ok🦊"];
+
+    for (const input of corpus) {
+      const expected = createHash("sha256").update(input, "utf8").digest("hex");
+      expect(fallbackHashSource(input), JSON.stringify(input)).toBe(expected);
+    }
   });
 });
 
