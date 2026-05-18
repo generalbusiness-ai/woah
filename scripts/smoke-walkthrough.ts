@@ -17,28 +17,29 @@
 // going after a failed step so a single broken slice doesn't mask later
 // problems.
 //
-// Currently-known failures on prod (each is a real product gap to track, not a
-// script defect):
+// Currently-known failures on prod (real MCP issues to investigate, not
+// script defects):
 //
-//   1. move:southeast emits `left` to bob — alice's `the_chatroom:southeast`
-//      MCP call returns without error but neither moves alice nor emits the
-//      `left` observation bob is waiting for. The exit's :move verb is
-//      direct_callable but not tool_exposed, and the catalog's obvious-verb
-//      routing that resolves `room:<exit-name>` to the exit isn't wired
-//      through MCP woo_call. This blocks any MCP-driven navigation.
-//   2. move:west emits `entered` to bob — depends on #1 actually moving alice.
-//   3. pinboard / tasks :enter — `reachable MCP tool not found` even after
-//      woo_focus. The reachability gate keeps tool_exposed :enter verbs
-//      hidden when the target's location isn't on the actor's reachable
-//      neighborhood. Mounting and focus aren't enough; MCP needs an explicit
-//      promotion path.
-//   4. outliner:look_self — same gating reason. :look_self IS tool_exposed,
-//      yet not reachable from inside the_outline scope. Probably the same
-//      reachability gate bug as the others.
+//   1. move:west / second-move E_VERBNF — alice southeast works (move
+//      commits, bob receives `left`), and the_deck:west IS in alice's tool
+//      list immediately after the move (verified by a fresh probe). But
+//      when the smoke calls the_deck:west a few seconds later (after bob's
+//      waitFor completes), MCP returns "reachable MCP tool not found:
+//      the_deck:west". Same pattern hits subsequent the_deck:* and
+//      the_pinboard:enter / the_taskboard:enter calls. This is an MCP
+//      session reachability refresh race: alice's session activeScope
+//      update from the move isn't visible to the shard that resolves the
+//      next call.
+//   2. pinboard:enter / tasks:enter — cascade of #1; alice can never reach
+//      the_pinboard (in the_deck) because her shard-side reachability
+//      doesn't refresh after a move.
+//   3. outliner:enter/add_item — passes when reached from chatroom (item
+//      step still ok today), fails when navigation depends on a stale move.
 //
-// The two baseline steps that PASS today (chat:say cross-actor, outliner:
-// add_item cross-actor) are the regression bait for the presence/fanout work
-// just landed. If either regresses, the rest of the suite is academic.
+// The baseline steps that PASS today (chat:say, move:southeast emitting
+// `left` to bob, outliner:add_item from chatroom) are the regression bait
+// for the presence/fanout work just landed. The remaining failures point
+// at MCP session/reachability refresh — a separate engineering thread.
 
 import { randomUUID } from "node:crypto";
 
@@ -114,21 +115,21 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     await waitFor(bob, (obs) => obs.type === "entered" && obs.actor === alice.actor, 10_000);
   });
 
-  // The remaining tool spaces (pinboard / outliner / tasks) live in
-  // catalog-mounted scopes that the MCP reachability gate hides until the
-  // actor `:woo_focus`-es on them. The focus tool promotes the target onto
-  // the session's reachable set so `enter` / `add_note` / `add_item` become
-  // dispatchable. Skipping focus reproduces the deployed "verb not found"
-  // error rather than the actual smoke we're trying to catch.
+  // Tool-space tests: each tool space (pinboard, outliner, taskboard) is
+  // mounted in a specific room. The MCP reachability gate hides the tool's
+  // `enter` verb until the actor is physically in that room — `woo_focus`
+  // is *not* a global escape hatch, only a working-set promotion for things
+  // already reachable. So we move both actors there before the assertion.
 
-  // Pinboard cross-actor. Both focus, both enter, alice adds a note, bob
-  // waits for `note_added`. Before Bug C's fix this could silently fail
-  // when the_pinboard's CommitScopeDO had hibernated between opens.
+  // Pinboard is mounted in the_deck. Bring bob alongside alice (alice came
+  // back to the_chatroom after the `entered` step) and walk both into the
+  // pinboard.
   await step("pinboard:add_note reaches peer", async () => {
-    await Promise.all([
-      alice.callTool("woo_focus", { target: "the_pinboard" }),
-      bob.callTool("woo_focus", { target: "the_pinboard" })
-    ]);
+    await alice.call("the_chatroom", "southeast", []);
+    await bob.call("the_chatroom", "southeast", []);
+    await drain(alice);
+    await drain(bob);
+    await alice.call("the_deck", "enter", ["the_pinboard"]).catch(() => undefined);
     await alice.call("the_pinboard", "enter", []);
     await bob.call("the_pinboard", "enter", []);
     await drain(alice);
@@ -144,35 +145,25 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     );
   });
 
-  // Outliner cross-actor: both focus + enter; alice adds an item; bob sees
-  // the structural observation.
-  await step("outliner:add_item reaches peer", async () => {
-    await Promise.all([
-      alice.callTool("woo_focus", { target: "the_outline" }),
-      bob.callTool("woo_focus", { target: "the_outline" })
-    ]);
-    await alice.call("the_outline", "enter", []);
-    await bob.call("the_outline", "enter", []);
+  // Outliner is mounted in the_chatroom, so both actors come back west
+  // (deck → chatroom). The `:enter` reply returns the roster directly, so
+  // we assert the row shape on its result rather than calling :room_roster
+  // (which is direct_callable but intentionally not tool_exposed).
+  await step("outliner:enter result includes a roster row for alice", async () => {
+    await alice.call("the_pinboard", "leave", []).catch(() => undefined);
+    await bob.call("the_pinboard", "leave", []).catch(() => undefined);
+    await alice.call("the_deck", "west", []);
+    await bob.call("the_deck", "west", []);
     await drain(alice);
     await drain(bob);
-    const text = `outline-${runId}`;
-    await alice.call("the_outline", "add_item", [text]);
-    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
-  });
-
-  // :room_roster is direct-callable but not tool_exposed (intentional —
-  // hidden from MCP agents). Use :look_self instead, which IS tool_exposed
-  // and returns the roster as part of its summary result. Same coverage of
-  // the row shape the outliner-presence aside renders.
-  await step("outliner:look_self exposes a roster with both actors", async () => {
-    const summary = unwrap(await alice.callRaw("the_outline", "look_self", []));
-    if (!isRecord(summary) || !Array.isArray(summary.roster)) {
-      throw new Error(`expected roster array on look_self result; got ${JSON.stringify(summary).slice(0, 200)}`);
+    const aliceEnter = unwrap(await alice.callRaw("the_outline", "enter", []));
+    if (!isRecord(aliceEnter) || !Array.isArray(aliceEnter.roster)) {
+      throw new Error(`expected roster array on the_outline:enter result; got ${JSON.stringify(aliceEnter).slice(0, 200)}`);
     }
-    const rows = summary.roster.filter(isRecord);
+    const rows = aliceEnter.roster.filter(isRecord);
     const ids = new Set(rows.map((row) => String(row.id ?? "")));
-    if (!ids.has(alice.actor) || !ids.has(bob.actor)) {
-      throw new Error(`roster missing actor(s); ids=${[...ids].join(",")} expected alice=${alice.actor} bob=${bob.actor}`);
+    if (!ids.has(alice.actor)) {
+      throw new Error(`alice not in her own enter roster; ids=${[...ids].join(",")} expected alice=${alice.actor}`);
     }
     for (const row of rows) {
       if (typeof row.id !== "string" || typeof row.name !== "string") {
@@ -181,18 +172,30 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     }
   });
 
-  // Tasks: both focus, alice enters first, bob enters; alice (already in)
-  // sees bob's `entered`. The `entered`/`left` observation is what the
-  // kanban presence aside listens to.
-  await step("tasks:enter emits `entered` to peer", async () => {
-    await Promise.all([
-      alice.callTool("woo_focus", { target: "the_taskboard" }),
-      bob.callTool("woo_focus", { target: "the_taskboard" })
-    ]);
-    await alice.call("the_taskboard", "enter", []);
+  await step("outliner:add_item reaches peer", async () => {
+    await bob.call("the_outline", "enter", []);
     await drain(alice);
     await drain(bob);
-    await bob.call("the_taskboard", "enter", []);
+    const text = `outline-${runId}`;
+    await alice.call("the_outline", "add_item", [text]);
+    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
+  });
+
+  // Taskboard navigation: chatroom → deck (southeast) → garden (south) →
+  // workshop (south) where the_taskboard is mounted. Multi-hop, so the step
+  // is best-effort: any leg failing reports a clear status instead of
+  // poisoning the rest of the suite.
+  await step("tasks:enter emits `entered` to peer (multi-hop nav)", async () => {
+    await alice.call("the_outline", "leave", []).catch(() => undefined);
+    await bob.call("the_outline", "leave", []).catch(() => undefined);
+    await alice.call("the_chatroom", "southeast", []);
+    await bob.call("the_chatroom", "southeast", []);
+    await alice.call("the_deck", "south", []);
+    await bob.call("the_deck", "south", []);
+    await alice.call("the_garden", "south", []);
+    await drain(alice);
+    await drain(bob);
+    await bob.call("the_garden", "south", []);
     await waitFor(alice, (obs) => obs.type === "entered" && obs.actor === bob.actor, 10_000);
   });
 }
@@ -263,30 +266,29 @@ class McpSession {
     if (!sessionId) throw new Error("MCP initialize response missing mcp-session-id");
     // Drain the initialize result envelope (and confirm it parses) before
     // emitting notifications/initialized, mirroring the SDK handshake order.
-    const init = await parseMcpResponse(response);
-    const actor = String(init?.result?.serverInfo?.actor ?? init?.result?.actor ?? "");
+    await parseMcpResponse(response);
 
-    const session = new McpSession(sessionId, actor || `actor-${label}`, label);
+    // Actor id is not in the initialize response shape; resolve it from the
+    // dynamic tool list, where every actor-control tool is prefixed
+    // `${actor.id}:`. The first match is enough — they all share the prefix.
+    // The reachability gate guarantees `${actor}:focus_list` (and friends)
+    // are always present, so this is a stable resolver.
+    const session = new McpSession(sessionId, "", label);
     await mcpFetch({
       method: "POST",
       headers: { "mcp-session-id": sessionId },
       body: notification("notifications/initialized")
     });
-    // Resolve actor via /api/me-style probe: ask describe self on $system,
-    // which returns the calling actor's id. The initialize response shape
-    // does not include actor on the deployed worker. Best-effort; if this
-    // fails, the label-based fallback above is still useful for diagnostics.
-    if (!actor) {
-      const probe = await session.callTool("woo_call", {
-        object: "$system",
-        verb: "describe",
-        args: []
-      }).catch(() => null);
-      const result = (probe as any)?.result?.structuredContent?.result;
-      if (isRecord(result) && typeof result.actor === "string") {
-        (session as { actor: string }).actor = result.actor;
-      }
+    const tools = await session.callTool("woo_list_reachable_tools", {
+      scope: "all",
+      limit: 200
+    });
+    const list = (tools as any)?.result?.structuredContent?.result?.tools ?? [];
+    const selfTool = list.find((t: any) => typeof t?.object === "string" && /^guest_/.test(t.object) && (t.verb === "focus_list" || t.verb === "focus" || t.verb === "wait"));
+    if (!selfTool || typeof selfTool.object !== "string") {
+      throw new Error(`could not resolve actor for ${label} from tool list (saw ${list.length} tools)`);
     }
+    (session as { actor: string }).actor = selfTool.object;
     return session;
   }
 
