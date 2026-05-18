@@ -309,16 +309,17 @@ function buildFootprintSql(input: FootprintSqlInput): string {
   // Sample-aware aggregates — `_sample_interval * double2` is the
   // per-point reconstruction multiplier (AE adaptive sampling × our
   // 1-in-N manual sampling). `quantileWeighted` lets us recover an
-  // accurate latency percentile even after sampling. The `blob8 =
-  // 'error'` selector picks up only the status=error rows for the
-  // error-rate ratio.
+  // accurate latency percentile even after sampling. The
+  // `toUInt8(blob8 = 'error')` selector picks up only the status=error
+  // rows for the error-rate ratio — AE's SQL refuses to multiply
+  // Double × Boolean, so we cast the comparison to a numeric.
   return [
     `SELECT`,
     `  ${groupColumn} AS k,`,
     `  SUM(_sample_interval * double2) AS samples,`,
     `  quantileWeighted(0.5)(double1, toUInt32(_sample_interval * double2)) AS p50,`,
     `  quantileWeighted(0.95)(double1, toUInt32(_sample_interval * double2)) AS p95,`,
-    `  SUM(_sample_interval * double2 * (blob8 = 'error')) / SUM(_sample_interval * double2) AS err_rate`,
+    `  SUM(_sample_interval * double2 * toUInt8(blob8 = 'error')) / SUM(_sample_interval * double2) AS err_rate`,
     `FROM ${dataset}`,
     `WHERE ${where}`,
     `GROUP BY k`,

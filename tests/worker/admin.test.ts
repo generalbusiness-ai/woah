@@ -230,7 +230,8 @@ describe("/admin/footprint", () => {
     expect(sql).toContain("SUM(_sample_interval * double2) AS samples");
     expect(sql).toContain("quantileWeighted(0.5)(double1, toUInt32(_sample_interval * double2)) AS p50");
     expect(sql).toContain("quantileWeighted(0.95)(double1, toUInt32(_sample_interval * double2)) AS p95");
-    expect(sql).toContain("blob8 = 'error'");
+    // toUInt8 cast guards against AE refusing Double*Boolean.
+    expect(sql).toContain("toUInt8(blob8 = 'error')");
     // Default groupBy is class → blob3.
     expect(sql).toContain("blob3 AS k");
     expect(sql).toContain("LIMIT 50");
