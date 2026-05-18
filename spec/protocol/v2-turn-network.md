@@ -841,6 +841,14 @@ cache as described in VTN14.4. Production v2 uses browser-built keys and
 browser-submitted `TurnExecRequest` messages once the worker can reconstruct
 executable state from verified pages.
 
+A scope open SHOULD emit at least one standalone `ExecCapabilityAd` envelope for
+the opened scope when the relay has an executor route it is willing to serve.
+Such a scope-level cold-start ad MAY have empty `covers` and `accepts` filters:
+the browser can use it only before deriving an exact `TurnKey`, and relay-side
+planning plus executor `missing_state` checks remain the authority for the
+resulting delegated turn. Reply-bundled ads MAY continue to carry exact coverage
+for later local-planned turns.
+
 Every internal open/envelope forwarded to a CommitScopeDO SHOULD carry an
 authority slice:
 

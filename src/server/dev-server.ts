@@ -273,6 +273,19 @@ v2wss.on("connection", (ws, req) => {
       auth: { mode: "session", token },
       body: opened.transfer
     } satisfies ShadowEnvelope<typeof opened.transfer>));
+    for (const ad of opened.ads) {
+      ws.send(encodeEnvelope({
+        v: 2,
+        type: ad.kind,
+        id: `dev-relay:exec-ad:${randomUUID()}`,
+        from: browser.relay.node,
+        to: browser.node,
+        actor: session.actor,
+        session: session.id,
+        auth: { mode: "anonymous_advisory" },
+        body: ad
+      } satisfies ShadowEnvelope<typeof ad>));
+    }
   }).catch((err) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     ws.send(encodeEnvelope(buildTransportErrorEnvelope({

@@ -7,6 +7,7 @@
 // hot envelope retries rewrite only the state families that actually changed.
 
 import type { EffectTranscript } from "../core/effect-transcript";
+import type { ShadowCapabilityAd } from "../core/capability-ad";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   buildShadowBrowserProjectionTransfer,
@@ -149,7 +150,8 @@ export class CommitScopeDO {
             relay: relay.node,
             hello,
             head: relay.commit_scope.head,
-            transfer: opened.transfer
+            transfer: opened.transfer,
+            ads: opened.ads
           } satisfies CommitScopeOpenResponse);
         } catch (err) {
           this.emitMetric({ kind: "v2_open", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, ...metricErrorFields(err) });
@@ -876,6 +878,7 @@ type CommitScopeOpenResponse = {
   hello: ShadowTransportHello;
   head: ShadowScopeHead;
   transfer: ShadowBrowserStateTransfer;
+  ads: ShadowCapabilityAd[];
 };
 
 type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {

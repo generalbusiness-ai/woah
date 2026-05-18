@@ -32,5 +32,6 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("preserves `selected_ad`");
     expect(spec).toContain("scope-matching");
     expect(spec).toContain("gossiped `ExecCapabilityAd`");
+    expect(spec).toContain("scope open SHOULD emit at least one standalone `ExecCapabilityAd` envelope");
   });
 });

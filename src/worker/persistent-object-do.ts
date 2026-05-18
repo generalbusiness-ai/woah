@@ -43,6 +43,7 @@ import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Messa
 import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
+import type { ShadowCapabilityAd } from "../core/capability-ad";
 import {
   createShadowBrowserRelayShim,
   shadowLiveEventsForTranscriptRelay,
@@ -124,6 +125,7 @@ type CommitScopeOpenResponse = {
     features: string[];
   };
   transfer: ShadowBrowserStateTransfer;
+  ads?: ShadowCapabilityAd[];
 };
 
 type CommitScopeEnvelopeResponse = {
@@ -2631,6 +2633,19 @@ export class PersistentObjectDO {
         auth: { mode: "session", token },
         body: transfer
       } satisfies ShadowEnvelope<typeof transfer>));
+      for (const ad of opened.ads ?? []) {
+        server.send(encodeEnvelope({
+          v: 2,
+          type: ad.kind,
+          id: `${this.durableHostKey()}:exec-ad:${crypto.randomUUID()}`,
+          from: opened.relay,
+          to: node,
+          actor: session.actor,
+          session: session.id,
+          auth: { mode: "anonymous_advisory" },
+          body: ad
+        } satisfies ShadowEnvelope<typeof ad>));
+      }
     } catch (err) {
       world.detachSocket(session.id, socketId);
       this.indexRemoveSocket(session.id, session.actor, server);

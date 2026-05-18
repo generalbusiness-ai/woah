@@ -51,6 +51,14 @@ describe("shadow browser node shim", () => {
     });
 
     expect(opened.preseeded_objects).toBeGreaterThan(0);
+    expect(opened.ads).toEqual([
+      expect.objectContaining({
+        kind: "woo.exec_capability_ad.shadow.v1",
+        node: "browser-relay:executor",
+        scope: "the_dubspace",
+        epoch: expect.stringMatching(/^[a-f0-9]{64}$/)
+      })
+    ]);
     expect(turn.network.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
     expect(turn.result).toMatchObject({
       ok: true,

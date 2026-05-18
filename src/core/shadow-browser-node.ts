@@ -13,9 +13,10 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
-import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
+import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
+import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
@@ -286,6 +287,7 @@ export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
+  ads: ShadowCapabilityAd[];
   preseeded_objects: number;
   transfer_mode: "projection" | "delta";
 };
@@ -601,9 +603,22 @@ export async function openShadowBrowserScope(
   return {
     projection: browser.cache.projections.get(browser.scope) ?? (transfer.mode === "projection" ? transfer.projection : null),
     transfer,
+    ads: shadowBrowserScopeExecutionAds(browser.relay, browser.scope),
     preseeded_objects: preseed.length,
     transfer_mode: transfer.mode
   };
+}
+
+export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCapabilityAd[] {
+  // A scope ad is a cold-start routing hint only. Its empty Bloom filters are
+  // intentionally unusable for exact-key local delegation; after relay-side
+  // planning, the selected executor still has to execute or return missing_state.
+  return [buildShadowScopeTurnExecAd({
+    node: shadowRelayDefaultExecutorNode(relay),
+    scope,
+    epoch: relay.commit_scope.head.hash,
+    factor: 1
+  })];
 }
 
 export function subscribeShadowBrowserNode(browser: ShadowBrowserNode, scope: ObjRef = browser.scope): void {
@@ -1015,7 +1030,7 @@ export function shadowBrowserTransportHello(browser: ShadowBrowserNode, now = Da
     max_message_bytes: 1024 * 1024,
     idempotency_window_ms: browser.relay.idempotency_window_ms,
     planes: ["execution", "commit", "state", "live"],
-    features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"]
+    features: ["shadow-envelope", "shadow-catchup", "shadow-exec-ads", "shadow-multiplex"]
   };
 }
 
@@ -1253,7 +1268,7 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
   // missing_state.
   if (selected) return selected;
 
-  const nodeId = `${relay.node}:executor`;
+  const nodeId = shadowRelayDefaultExecutorNode(relay);
   let executor = relay.executors.find((node) => node.node === nodeId);
   const needsRefresh = !executor ||
     executor.scope !== request.key.scope ||
@@ -1279,6 +1294,10 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
   // actual atoms trigger the normal state-plane retry path.
   for (const hash of request.key.atom_hashes) executor.atom_hashes.add(hash);
   return executor;
+}
+
+function shadowRelayDefaultExecutorNode(relay: ShadowBrowserRelayShim): string {
+  return `${relay.node}:executor`;
 }
 
 function shadowBrowserWireTurnExecReply(reply: ShadowTurnExecReply): ShadowTurnExecReply {
@@ -1716,7 +1735,7 @@ export function shadowBrowserSessionClaimsValue(
     issued_at: session.started,
     expires_at: session.expiresAt ?? session.started + 15 * 60 * 1000,
     scopes,
-    features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"],
+    features: ["shadow-envelope", "shadow-catchup", "shadow-exec-ads", "shadow-multiplex"],
     rev
   };
 }
