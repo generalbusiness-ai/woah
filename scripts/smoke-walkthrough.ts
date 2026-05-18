@@ -62,12 +62,22 @@ const results: StepResult[] = [];
 
 async function main(): Promise<void> {
   console.log(`smoke-walkthrough base=${baseUrl} run=${runId}`);
-  const alice = await McpSession.open(`guest:walkthrough-alice-${runId}`, "alice");
-  const bob = await McpSession.open(`guest:walkthrough-bob-${runId}`, "bob");
+  // Filter wrangler tail with: `wrangler tail --search=smoke-walkthrough/${runId}`
+  // — `clientInfo.name` carries the run id and lands in MCP request logs as
+  // `client_info.name`, so a tail can scope to exactly this invocation.
+  console.log(`wrangler tail filter: clientInfo name = smoke-walkthrough/${runId}/<actor>`);
+
+  // Open sessions inside try/finally so a partial open still runs cleanup on
+  // whatever did succeed. Without this, a failing bob.open() leaks alice's
+  // session for the remainder of the MCP idle timeout.
+  let alice: McpSession | null = null;
+  let bob: McpSession | null = null;
   try {
+    alice = await McpSession.open(`guest:walkthrough-alice-${runId}`, "alice");
+    bob = await McpSession.open(`guest:walkthrough-bob-${runId}`, "bob");
     await runWalkthrough(alice, bob);
   } finally {
-    await Promise.allSettled([alice.close(), bob.close()]);
+    await Promise.allSettled([alice?.close(), bob?.close()]);
   }
 
   const passed = results.filter((r) => r.ok).length;
@@ -110,7 +120,16 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // seconds for the durable round-trip, so we widen the wait.
   await step("move:southeast emits `left` to bob (origin room)", async () => {
     await alice.call("the_chatroom", "southeast", []);
-    await waitFor(bob, (obs) => obs.type === "left" && obs.actor === alice.actor, 10_000);
+    // Tighter predicate: only the `left` that actually came from this move.
+    // A loose `type === "left"` would also satisfy itself with a stale
+    // departure event from earlier navigation or a peer in this scope.
+    await waitFor(bob, (obs) =>
+      obs.type === "left" &&
+      obs.actor === alice.actor &&
+      obs.source === "the_chatroom" &&
+      obs.destination === "the_deck" &&
+      obs.exit === "southeast",
+    10_000);
   });
 
   // The other side of the move: alice is now in the_deck (her commit scope).
@@ -120,7 +139,13 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // scopes is what makes it work.
   await step("move:west emits `entered` to bob (destination room)", async () => {
     await alice.call("the_deck", "west", []);
-    await waitFor(bob, (obs) => obs.type === "entered" && obs.actor === alice.actor, 10_000);
+    await waitFor(bob, (obs) =>
+      obs.type === "entered" &&
+      obs.actor === alice.actor &&
+      obs.source === "the_chatroom" &&
+      obs.origin === "the_deck" &&
+      obs.exit === "west",
+    10_000);
   });
 
   // Tool-space tests: each tool space (pinboard, outliner, taskboard) is
@@ -204,14 +229,26 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     await drain(alice);
     await drain(bob);
     await bob.call("the_deck", "south", []);
-    await waitFor(alice, (obs) => obs.type === "entered" && obs.actor === bob.actor, 10_000);
+    await waitFor(alice, (obs) =>
+      obs.type === "entered" &&
+      obs.actor === bob.actor &&
+      obs.source === "the_taskboard",
+    10_000);
   });
 }
 
+// Step-level watchdog. Even if every per-RPC fetch has a deadline, a step
+// that loops over many short calls could still drift long. The watchdog is
+// the hard upper bound and aborts the body if the step itself is stuck.
+const STEP_TIMEOUT_MS = 60_000;
 async function step(name: string, body: () => Promise<void>): Promise<void> {
   const startedAt = Date.now();
   try {
-    await body();
+    await raceWithTimeout(
+      body(),
+      STEP_TIMEOUT_MS,
+      `step "${name}" exceeded ${STEP_TIMEOUT_MS}ms watchdog`
+    );
     const ms = Date.now() - startedAt;
     results.push({ name, ok: true, ms });
     console.log(`  ok    ${name} (${ms}ms)`);
@@ -223,11 +260,36 @@ async function step(name: string, body: () => Promise<void>): Promise<void> {
   }
 }
 
-// Drain pending observations from a session's wait queue so the next assertion
-// only sees events emitted after this point. Best-effort; a short timeout is
-// enough — anything older that hasn't landed in ~250ms isn't going to.
+function raceWithTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    handle = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => {
+    if (handle) clearTimeout(handle);
+  });
+}
+
+// Drain pending observations from a session's wait queue so the next
+// assertion only sees events emitted after this point. The deployed fan-out
+// can take 1–2 seconds in tail percentiles, so a single 250ms poll is too
+// optimistic — keep polling until either the queue reports empty (zero
+// observations) or a bounded budget elapses. Errors are swallowed; drain is
+// best-effort cleanup and must not fail a step.
+const DRAIN_TOTAL_BUDGET_MS = 3000;
+const DRAIN_POLL_MS = 500;
 async function drain(session: McpSession): Promise<void> {
-  await session.callTool("woo_wait", { timeout_ms: 250, limit: 100 }).catch(() => undefined);
+  const started = Date.now();
+  while (Date.now() - started < DRAIN_TOTAL_BUDGET_MS) {
+    try {
+      const result = await session.callTool("woo_wait", { timeout_ms: DRAIN_POLL_MS, limit: 100 });
+      const obs = waitObservationsOf(result);
+      if (obs.length === 0) return;
+      if (verbose) console.log(`    [${session.label}] drained ${obs.length} stale obs: ${obs.map((o: any) => o.type).join(",")}`);
+    } catch {
+      return;
+    }
+  }
 }
 
 // Poll `woo_wait` until `match` returns true for one of the observations, or
@@ -264,10 +326,13 @@ class McpSession {
   ) {}
 
   static async open(token: string, label: string): Promise<McpSession> {
+    // `clientInfo.name` is logged server-side as `client_info.name` on every
+    // MCP request, so encoding the runId here lets a wrangler tail filter
+    // narrow to exactly this invocation: `--search smoke-walkthrough/<runId>`.
     const response = await mcpFetch({
       method: "POST",
       headers: { "mcp-token": token },
-      body: rpc(1, "initialize", initializeParams(`smoke-walkthrough-${label}`))
+      body: rpc(1, "initialize", initializeParams(`smoke-walkthrough/${runId}/${label}`))
     });
     if (!response.ok) throw new Error(`MCP initialize failed: ${response.status} ${await response.text().catch(() => "")}`);
     const sessionId = response.headers.get("mcp-session-id");
@@ -315,7 +380,16 @@ class McpSession {
       body: rpc(this.nextId++, "tools/call", { name, arguments: params })
     });
     if (!response.ok) throw new Error(`tools/call ${name} ${response.status}: ${await response.text().catch(() => "")}`);
-    return await parseMcpResponse(response);
+    const body = await parseMcpResponse(response);
+    // JSON-RPC envelope errors (transport / protocol level — e.g. unknown
+    // session, malformed request) surface as `body.error` and would otherwise
+    // be swallowed: parseMcpResponse returns the envelope, every caller
+    // reaches into `result.*` and finds undefined. Make it loud here.
+    if (body && typeof body === "object" && "error" in body && body.error) {
+      const err = body.error as any;
+      throw new Error(`tools/call ${name} JSON-RPC error: ${JSON.stringify(err)}`);
+    }
+    return body;
   }
 
   async close(): Promise<void> {
@@ -338,11 +412,19 @@ function waitObservationsOf(body: any): unknown[] {
   return body?.result?.structuredContent?.result?.observations ?? [];
 }
 
+// Hard per-RPC deadline. The worker should normally respond in under a
+// second; the only reason to wait longer is the woo_wait long-poll, which
+// peaks around 1000ms. 20s leaves multiple seconds of headroom even for
+// p99 fanout latency and ensures a stuck connection cannot strand the
+// step watchdog (which has its own 60s envelope).
+const RPC_TIMEOUT_MS = 20_000;
+
 async function mcpFetch(input: {
   method: string;
   headers?: Record<string, string>;
   body?: unknown;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }): Promise<Response> {
   const headers = new Headers({
     accept: "application/json, text/event-stream",
@@ -353,12 +435,45 @@ async function mcpFetch(input: {
     headers.set("content-type", "application/json");
     body = JSON.stringify(input.body);
   }
-  return await fetch(`${baseUrl}/mcp`, {
-    method: input.method,
-    headers,
-    body,
-    signal: input.signal
-  });
+
+  // Compose the caller's optional signal with our timeout signal so either
+  // an explicit abort or the deadline tears the request down promptly.
+  const timeoutMs = input.timeoutMs ?? RPC_TIMEOUT_MS;
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(new Error(`MCP request exceeded ${timeoutMs}ms deadline`)), timeoutMs);
+  const signal = mergeSignals(input.signal, timeoutController.signal);
+
+  try {
+    return await fetch(`${baseUrl}/mcp`, {
+      method: input.method,
+      headers,
+      body,
+      signal
+    });
+  } catch (err) {
+    if (timeoutController.signal.aborted) {
+      throw new Error(`MCP ${input.method} ${baseUrl}/mcp timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function mergeSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
+  if (!a) return b;
+  // AbortSignal.any is widely available on modern Node, but fall back to a
+  // manual relay if the runtime is older — the script targets tsx so this
+  // should never trip in CI, but the fallback keeps developer machines safe.
+  const anyImpl = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof anyImpl === "function") return anyImpl([a, b]);
+  const merged = new AbortController();
+  const relay = () => merged.abort();
+  if (a.aborted) merged.abort();
+  else a.addEventListener("abort", relay, { once: true });
+  if (b.aborted) merged.abort();
+  else b.addEventListener("abort", relay, { once: true });
+  return merged.signal;
 }
 
 async function parseMcpResponse(response: Response): Promise<any> {
