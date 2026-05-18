@@ -15,18 +15,21 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, ErrorValue, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
-import type { SerializedAuthoritySlice, SerializedObject } from "../core/repository";
+import type { SerializedAuthoritySlice } from "../core/repository";
 import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
-import { encodeEnvelope, decodeEnvelope } from "../core/shadow-envelope";
 import {
-  buildShadowTurnIntentEnvelope,
   createShadowBrowserRelayShim,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, applyShadowTranscriptToCommittedState, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import {
+  mergeV2TurnGatewayAuthority,
+  submitTurnIntent,
+  v2TurnGatewayAuthorityPayload
+} from "../core/v2-turn-gateway";
 
 const MCP_TOKEN_HEADER = "mcp-token";
 const MCP_SESSION_HEADER = "mcp-session-id";
@@ -439,40 +442,36 @@ export class McpGateway {
     const entry = this.sessions.get(sessionId);
     if (!entry) throw new Error(`MCP session is not bound: ${sessionId}`);
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
-    const client = await this.ensureV2ScopeClient(entry, scope);
-    // MCP submits intent envelopes so CommitScopeDO plans against its live
-    // head. Keep the local relay's session authority fresh for applying the
-    // accepted transcript and serving later local cache reads.
-    const sessions = this.world.exportSessions();
-    const authority = this.world.exportAuthoritySlice(sessions, [scope, target]);
-    refreshSerializedSessionAuthority(client.relay.commit_scope.serialized, authority.sessions, authority.objects);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-    const envelope = buildShadowTurnIntentEnvelope({
-      node: this.v2NodeFor(entry),
-      actor,
-      session: entry.woo.id,
-      token: entry.v2Token,
-      id,
-      route,
-      scope,
-      target,
-      verb,
-      args,
-      persistence: "durable"
+    const submitted = await submitTurnIntent<V2ScopeClient, McpV2EnvelopeResult>({
+      input: {
+        id,
+        route,
+        scope,
+        session: entry.woo.id,
+        actor,
+        target,
+        verb,
+        args,
+        persistence: "durable",
+        token: entry.v2Token
+      },
+      strategy: "intent",
+      ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
+      clientNode: () => this.v2NodeFor(entry),
+      nextTurnId: () => id,
+      authorityPayload: (_submitScope, extraObjectIds) => {
+        const payload = v2TurnGatewayAuthorityPayload(this.world, extraObjectIds);
+        const client = this.v2Scopes.get(scope);
+        if (client) mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, payload.authority);
+        return payload;
+      },
+      submitEnvelope: async (submitScope, body) => await hooks.envelope(submitScope, body)
     });
-    const result = await hooks.envelope(scope, {
-      scope,
-      node: this.v2NodeFor(entry),
-      token: entry.v2Token,
-      session: entry.woo.id,
-      actor,
-      sessions: authority.sessions,
-      session_objects: authority.objects,
-      authority,
-      envelope: encodeEnvelope(envelope)
-    });
-    const replyEnvelope = result.reply ? decodeEnvelope<ShadowTurnExecReply>(result.reply) : null;
-    const reply = replyEnvelope?.body;
+    if (submitted.kind === "local_frame") return submitted.frame;
+    const result = submitted.result;
+    const reply = submitted.reply;
+    const client = submitted.client;
     if (!reply) {
       if (result.head) client.relay.commit_scope.head = result.head;
       return { op: "error", id, error: { code: "E_INTERNAL", message: "v2 MCP turn produced no reply" } };
@@ -583,26 +582,6 @@ function mcpV2Token(woo: Session): string {
 
 function remoteAcceptedKey(commit: ShadowCommitAccepted): string {
   return `${commit.position.scope}:${commit.position.seq}`;
-}
-
-function refreshSerializedSessionAuthority(
-  serialized: { sessions: ReturnType<WooWorld["exportSessions"]>; objects: SerializedObject[] },
-  sessions: ReturnType<WooWorld["exportSessions"]>,
-  authorityObjects: SerializedObject[]
-): void {
-  serialized.sessions = sessions;
-  // Despite the historical helper name, authority objects now include session
-  // actors plus active rooms and explicit turn rows needed for planning.
-  const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
-  for (const obj of authorityObjects) {
-    const index = byId.get(obj.id);
-    if (index === undefined) {
-      byId.set(obj.id, serialized.objects.length);
-      serialized.objects.push(obj);
-    } else {
-      serialized.objects[index] = obj;
-    }
-  }
 }
 
 function mcpFrameFromTurnReply(scope: ObjRef, reply: Extract<ShadowTurnExecReply, { ok: true }>): AppliedFrame | DirectResultFrame | ErrorFrame {

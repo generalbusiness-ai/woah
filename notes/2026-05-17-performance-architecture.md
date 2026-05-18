@@ -1,4 +1,66 @@
 
+## Decision - first significant refactoring
+
+Start with a shared v2 turn gateway, before the resident-VM or row-map
+rewrites.
+
+This is the right first refactor because dev WS, REST, MCP, Worker, and browser
+shim paths already duplicate scope routing, authority refresh, relay lifetime,
+retry decisions, transcript application, and fanout shaping. That duplication
+has produced real cross-scope/auth drift. Centralizing ingress first gives the
+later hot execution and row-index work one path to optimize instead of several
+nearly-equivalent paths to keep in sync.
+
+Initial boundary:
+
+- Add a transport-neutral `submitTurnIntent(...)` gateway surface with
+  host-provided hooks for relay/client lookup, authority export, envelope
+  submission, local transcript application, and fanout delivery.
+- The gateway owns scope/target routing, authority-slice construction,
+  open/refresh behavior, live vs durable dispatch, retry on missing state or
+  stale heads, reply decoding, and frame shaping.
+- Adapters keep only transport concerns: parsing the incoming request/frame,
+  authenticating or carrying the token/session, and sending the final transport
+  response.
+- Preserve current execution semantics first. Existing `runShadowTurnCall`,
+  serialized snapshots, and CommitScopeDO envelope handling remain underneath
+  this gateway until ingress behavior is single-sourced.
+
+First implementation slice:
+
+1. Extract shared authority payload construction, relay repair/retry
+   classification, and successful reply-to-frame conversion.
+2. Move REST durable/live and MCP intent submission onto that shared code.
+3. Move dev WS/dev REST and Worker WS through the same gateway hook surface.
+
+Primary verification targets:
+
+- `tests/dev-v2-cross-scope-routing.test.ts`
+- `tests/v2-mcp-e2e.test.ts`
+- Worker REST v2 cases in `tests/worker/cf-repository.test.ts`
+- `tests/worker/v2-cost-budget.test.ts`
+
+Implemented in this worktree:
+
+- Added `src/core/v2-turn-gateway.ts` as the shared substrate module for v2
+  ingress mechanics: authority payload export, serialized authority merge,
+  explicit turn-row planning, retry classification, retry envelope ids, intent
+  and exec envelope construction, reply decoding, and the `submitTurnIntent`
+  retry loop.
+- Moved Worker REST live and durable turn submission onto `submitTurnIntent`.
+  Durable REST still plans locally before posting to the authoritative commit
+  scope, preserving cross-scope commit routing.
+- Moved MCP v2 intent submission onto `submitTurnIntent` while preserving
+  CommitScopeDO-side planning and MCP-local accepted-frame caching.
+- MCP authority refresh now intentionally includes the actor row with the
+  scope and target rows, matching the shared REST/WS authority-id planner.
+- Moved dev REST envelope construction and dev WS explicit authority-row
+  selection onto the shared helpers. Worker WS still handles pre-built socket
+  envelopes in its transport handler, but uses the shared authority payload
+  contract for CommitScopeDO posts.
+- No resident-world, row-map, or cell-slice semantics were changed in this
+  slice.
+
 • Best Opportunities
 
 1. Unify all turn ingress behind one v2 “turn gateway” module
