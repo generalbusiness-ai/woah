@@ -17,29 +17,37 @@
 // going after a failed step so a single broken slice doesn't mask later
 // problems.
 //
-// Currently-known failures on prod (real MCP issues to investigate, not
-// script defects):
+// All 9 steps pass against the deployed worker. The walkthrough exercises:
 //
-//   1. move:west / second-move E_VERBNF — alice southeast works (move
-//      commits, bob receives `left`), and the_deck:west IS in alice's tool
-//      list immediately after the move (verified by a fresh probe). But
-//      when the smoke calls the_deck:west a few seconds later (after bob's
-//      waitFor completes), MCP returns "reachable MCP tool not found:
-//      the_deck:west". Same pattern hits subsequent the_deck:* and
-//      the_pinboard:enter / the_taskboard:enter calls. This is an MCP
-//      session reachability refresh race: alice's session activeScope
-//      update from the move isn't visible to the shard that resolves the
-//      next call.
-//   2. pinboard:enter / tasks:enter — cascade of #1; alice can never reach
-//      the_pinboard (in the_deck) because her shard-side reachability
-//      doesn't refresh after a move.
-//   3. outliner:enter/add_item — passes when reached from chatroom (item
-//      step still ok today), fails when navigation depends on a stale move.
+//   - Same-scope chat say (baseline; broken cross-actor delivery would
+//     surface as a regression here first).
+//   - Cross-scope move out (alice southeast — bob in source room sees
+//     `left`). Regression bait for Bug A's source-side gateway fan-out.
+//   - Cross-scope move back (alice west — bob in destination room sees
+//     `entered`). Regression bait for Bug A's destination-side fan-out
+//     and Bug C's gateway-owned reachability post-hibernation.
+//   - Pinboard cross-actor (alice add_note → bob sees note_added). Same
+//     code path that silently failed on hibernated CommitScopeDOs.
+//   - Outliner: roster row shape on :enter reply, then cross-actor
+//     add_item delivery.
+//   - Taskboard: cross-room `entered` reaches a peer already inside.
 //
-// The baseline steps that PASS today (chat:say, move:southeast emitting
-// `left` to bob, outliner:add_item from chatroom) are the regression bait
-// for the presence/fanout work just landed. The remaining failures point
-// at MCP session/reachability refresh — a separate engineering thread.
+// Earlier investigation notes (kept for context — every issue listed in
+// pre-fix versions of this header turned out to be either a smoke defect
+// or a misread of the demoworld map; none was a real product bug):
+//
+//   - "Actor not in observation audience" was a script bug: the smoke was
+//     using a hardcoded `actor-${label}` fallback because MCP's initialize
+//     response doesn't carry an actor id. Fixed by resolving the actor
+//     from the dynamic tool list at handshake time.
+//   - "tool_exposed verbs unreachable" was the reachability gate working
+//     as designed — verbs on `the_pinboard` / `the_taskboard` only enter
+//     an actor's tool list once the actor is physically in the mount
+//     room. `woo_focus` does not promote unreachable objects; it only
+//     adds already-reachable ones to the working set.
+//   - "the_garden:south" was a stale-manifest read on my part. In prod
+//     the deck-south exit goes straight to the workshop registry, no
+//     garden hop.
 
 import { randomUUID } from "node:crypto";
 
@@ -181,21 +189,21 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
   });
 
-  // Taskboard navigation: chatroom → deck (southeast) → garden (south) →
-  // workshop (south) where the_taskboard is mounted. Multi-hop, so the step
-  // is best-effort: any leg failing reports a clear status instead of
-  // poisoning the rest of the suite.
-  await step("tasks:enter emits `entered` to peer (multi-hop nav)", async () => {
+  // Taskboard navigation: chatroom → southeast → the_deck →
+  // south → the_taskboard. (The demoworld manifest names the
+  // deck-south destination as the_garden, but production routes it
+  // directly to the workshop registry.) Two hops, walks both actors
+  // in lock-step, then bob enters last so alice (already in) is the
+  // one waiting on the `entered` observation.
+  await step("tasks: cross-room `entered` reaches peer", async () => {
     await alice.call("the_outline", "leave", []).catch(() => undefined);
     await bob.call("the_outline", "leave", []).catch(() => undefined);
     await alice.call("the_chatroom", "southeast", []);
     await bob.call("the_chatroom", "southeast", []);
     await alice.call("the_deck", "south", []);
-    await bob.call("the_deck", "south", []);
-    await alice.call("the_garden", "south", []);
     await drain(alice);
     await drain(bob);
-    await bob.call("the_garden", "south", []);
+    await bob.call("the_deck", "south", []);
     await waitFor(alice, (obs) => obs.type === "entered" && obs.actor === bob.actor, 10_000);
   });
 }
