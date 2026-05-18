@@ -55,3 +55,20 @@ export function selectV2DelegatedExecutor(input: {
   if (!record) return { ok: false, reason: "no_executor" };
   return { ok: true, record, ad: selected };
 }
+
+// A cold browser cannot derive exact atom coverage yet. Scope-level selection
+// is intentionally weaker and must be followed by relay-side planning and the
+// normal exact missing-state checks before any delegated execution is accepted.
+export function selectV2DelegatedScopeExecutor(input: {
+  records: readonly V2ExecutionAdRecord[];
+  scope: string;
+}): V2DelegationSelection {
+  const selected = input.records
+    .filter((record) => record.scope === input.scope)
+    .map((record) => record.ad)
+    .sort((a, b) => a.factor - b.factor || a.node.localeCompare(b.node))[0];
+  if (!selected) return { ok: false, reason: "no_executor" };
+  const record = input.records.find((item) => item.ad.node === selected.node && item.scope === selected.scope);
+  if (!record) return { ok: false, reason: "no_executor" };
+  return { ok: true, record, ad: selected };
+}

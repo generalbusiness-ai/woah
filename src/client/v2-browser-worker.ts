@@ -7,7 +7,7 @@ import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
-import { selectV2DelegatedExecutor } from "./v2-browser-delegation";
+import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-browser-delegation";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { planV2BrowserLocalTurn } from "./v2-browser-local-turn";
@@ -289,6 +289,14 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     args: Array.isArray(command.args) ? command.args as WooValue[] : [],
     persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
   };
+  const scopeDelegation = selectV2DelegatedScopeExecutor({
+    records: await allExecutionAds(),
+    scope: body.scope
+  });
+  if (scopeDelegation.ok) {
+    body.selected_ad = scopeDelegation.ad.node;
+    postMessage({ kind: "local_turn_delegated", id: command.id, node: scopeDelegation.ad.node, reason: "scope_ad" });
+  }
   const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
     v: 2,
     type: body.kind,

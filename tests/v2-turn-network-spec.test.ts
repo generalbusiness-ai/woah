@@ -29,5 +29,8 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("rank gossiped ExecCapabilityAds and delegate the whole turn");
     expect(spec).toContain("delegation moves the actor-local cache forward");
     expect(spec).toContain("Gossiped whole-turn delegation");
+    expect(spec).toContain("preserves `selected_ad`");
+    expect(spec).toContain("scope-matching");
+    expect(spec).toContain("gossiped `ExecCapabilityAd`");
   });
 });

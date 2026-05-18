@@ -321,6 +321,7 @@ export type ShadowTurnIntentRequest = {
   args?: WooValue[];
   body?: Record<string, WooValue>;
   persistence?: ShadowTurnExecRequest["persistence"];
+  selected_ad?: string;
 };
 
 export function buildShadowTurnIntentEnvelope(input: {
@@ -337,6 +338,7 @@ export function buildShadowTurnIntentEnvelope(input: {
   args: WooValue[];
   body?: Record<string, WooValue>;
   persistence?: ShadowTurnExecRequest["persistence"];
+  selected_ad?: string;
 }): ShadowEnvelope<ShadowTurnIntentRequest> {
   const body: ShadowTurnIntentRequest = {
     kind: "woo.turn.intent.request.shadow.v1",
@@ -347,7 +349,8 @@ export function buildShadowTurnIntentEnvelope(input: {
     verb: input.verb,
     args: input.args,
     body: input.body,
-    persistence: input.persistence
+    persistence: input.persistence,
+    ...(input.selected_ad ? { selected_ad: input.selected_ad } : {})
   };
   return {
     v: 2,
@@ -1180,7 +1183,8 @@ async function shadowTurnExecRequestFromIntent(
     call,
     key: shadowTurnKeyFromTranscript(planned.transcript),
     expected: browser.relay.commit_scope.head,
-    persistence: intent.persistence ?? "durable"
+    persistence: intent.persistence ?? "durable",
+    ...(intent.selected_ad ? { selected_ad: intent.selected_ad } : {})
   };
 }
 

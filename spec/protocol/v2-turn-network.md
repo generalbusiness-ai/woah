@@ -827,14 +827,19 @@ type ExecCapabilityAd = {
 
 During the browser migration, a relay MAY also accept
 `woo.turn.intent.request.v1` from a browser node. The intent contains `id`,
-`route`, `scope`, `target`, `verb`, `args`, and optional `persistence`, but not
-a `TurnKey`. It is a transitional server-assisted planning message: the
-CommitScopeDO plans the deterministic transcript against its authoritative
-scope state, derives the `TurnKey`, and then processes the turn through the same
+`route`, `scope`, `target`, `verb`, `args`, optional `persistence`, and optional
+`selected_ad`, but not a `TurnKey`. It is a transitional server-assisted
+planning message: the CommitScopeDO plans the deterministic transcript against
+its authoritative scope state, derives the `TurnKey`, preserves `selected_ad`
+onto the derived `TurnExecRequest`, and then processes the turn through the same
 `TurnExecRequest`/`TurnExecReply` path. Browsers MUST treat this as
 server-assisted planning, not as proof that local closure execution is complete.
-Production v2 uses browser-built keys and browser-submitted `TurnExecRequest`
-messages once the worker can reconstruct executable state from verified pages.
+If the browser has no executable state yet, it MAY choose a scope-matching
+gossiped `ExecCapabilityAd` for `selected_ad`; exact atom coverage is still
+checked after planning, and the delegated reply still has to warm the browser
+cache as described in VTN14.4. Production v2 uses browser-built keys and
+browser-submitted `TurnExecRequest` messages once the worker can reconstruct
+executable state from verified pages.
 
 Every internal open/envelope forwarded to a CommitScopeDO SHOULD carry an
 authority slice:

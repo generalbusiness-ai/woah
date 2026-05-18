@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { selectV2DelegatedExecutor, v2ExecutionAdRecord } from "../src/client/v2-browser-delegation";
+import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor, v2ExecutionAdRecord } from "../src/client/v2-browser-delegation";
 import { buildShadowCapabilityAd } from "../src/core/capability-ad";
 import { createWorld } from "../src/core/bootstrap";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
@@ -31,6 +31,20 @@ describe("v2 browser delegation", () => {
     });
 
     expect(selected).toEqual({ ok: false, reason: "no_executor" });
+  });
+
+  it("selects a scope-level executor before the browser can derive an exact turn key", async () => {
+    const key = await plannedDubspaceKey();
+    const selected = selectV2DelegatedScopeExecutor({
+      scope: key.scope,
+      records: [
+        v2ExecutionAdRecord(buildShadowCapabilityAd({ node: "scope-slow", scope: key.scope, atom_hashes: [], factor: 4 }), 1),
+        v2ExecutionAdRecord(buildShadowCapabilityAd({ node: "scope-near", scope: key.scope, atom_hashes: [], factor: 0.4 }), 2),
+        v2ExecutionAdRecord(buildShadowCapabilityAd({ node: "other", scope: "the_pinboard", atom_hashes: [], factor: 0.1 }), 3)
+      ]
+    });
+
+    expect(selected).toMatchObject({ ok: true, ad: { node: "scope-near" } });
   });
 });
 

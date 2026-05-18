@@ -1415,6 +1415,50 @@ describe("shadow browser node shim", () => {
     });
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
   });
+
+  it("carries selected delegated executors through server-assisted intent planning", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-selected-intent-executor", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const planningCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-selected-intent-executor-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.39]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(browser.relay.commit_scope.serialized, planningCall)).transcript);
+    browser.relay.executors.push(createShadowExecutionNode({
+      node: "near-intent-executor",
+      scope: key.scope,
+      serialized: browser.relay.commit_scope.serialized,
+      atom_hashes: key.atom_hashes
+    }));
+    const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: planningCall.id,
+      route: "sequenced" as const,
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.39],
+      selected_ad: "near-intent-executor",
+      persistence: "durable" as const
+    }, "browser-selected-intent-executor-env");
+
+    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+
+    expect(reply?.body).toMatchObject({
+      ok: true,
+      state_transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
+      ads: [expect.objectContaining({ node: "near-intent-executor" })]
+    });
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.39);
+  });
 });
 
 async function browserForScope<T = undefined>(
