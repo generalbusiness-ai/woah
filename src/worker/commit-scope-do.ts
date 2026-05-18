@@ -30,7 +30,15 @@ import {
   type ShadowBrowserStateTransfer,
   type ShadowTransportHello
 } from "../core/shadow-browser-node";
-import { transcriptLogEntry, transcriptSessionActiveScope, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import {
+  shadowCommitScopeObject,
+  shadowCommitScopeSession,
+  transcriptLogEntry,
+  transcriptSessionActiveScope,
+  transcriptTouchedObjectIds,
+  type ShadowCommitAccepted,
+  type ShadowScopeHead
+} from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
@@ -552,7 +560,7 @@ export class CommitScopeDO {
       }
       if (willSaveMeta && body && body.ok === true && body.commit && body.transcript) {
         this.saveMeta(relay, now);
-        this.saveTranscriptDelta(relay.commit_scope.serialized, body.transcript, now);
+        this.saveTranscriptDelta(relay, body.transcript, now);
         this.saveAcceptedFrame(body.commit, now);
         this.saveTranscript(body.transcript, now);
         this.pruneAcceptedFrames(relay);
@@ -615,16 +623,14 @@ export class CommitScopeDO {
     }
   }
 
-  private saveTranscriptDelta(serialized: SerializedWorld, transcript: EffectTranscript, now: number): void {
+  private saveTranscriptDelta(relay: ShadowBrowserRelayShim, transcript: EffectTranscript, now: number): void {
     for (const id of transcriptTouchedObjectIds(transcript)) {
-      // Typical turns touch only a few objects. If this path grows to many
-      // touched ids per turn, build a one-shot id->object map before the loop.
-      const obj = serialized.objects.find((item) => item.id === id);
+      const obj = shadowCommitScopeObject(relay.commit_scope, id);
       if (obj) this.saveObjectRow(obj, now);
     }
     const sessionUpdate = transcriptSessionActiveScope(transcript);
     if (sessionUpdate) {
-      const session = serialized.sessions.find((item) => item.id === sessionUpdate.session && item.actor === sessionUpdate.actor);
+      const session = shadowCommitScopeSession(relay.commit_scope, sessionUpdate.session, sessionUpdate.actor);
       if (session) this.saveSessionRow(session, now);
     }
     const log = transcriptLogEntry(transcript);

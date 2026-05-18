@@ -23,9 +23,24 @@ export function shadowCommitReceipt(
   extraErrors: string[] = [],
   precomputedValidation?: TranscriptValidation
 ): ShadowCommitReceipt {
-  const validation = precomputedValidation ?? validateTranscriptAgainstSerializedWorld(serializedBefore, transcript);
+  return shadowCommitReceiptFromTouchedStateHashes(
+    transcript,
+    transcriptTouchedStateHash(serializedBefore, transcript),
+    transcriptTouchedStateHash(serializedAfter, transcript),
+    extraErrors,
+    precomputedValidation ?? validateTranscriptAgainstSerializedWorld(serializedBefore, transcript)
+  );
+}
+
+export function shadowCommitReceiptFromTouchedStateHashes(
+  transcript: EffectTranscript,
+  preStateHash: string,
+  postStateHash: string,
+  extraErrors: string[] = [],
+  precomputedValidation: TranscriptValidation = { ok: true, errors: [] }
+): ShadowCommitReceipt {
   const errors = [
-    ...validation.errors,
+    ...precomputedValidation.errors,
     ...extraErrors,
     ...(transcript.complete ? [] : transcript.incompleteReasons.map((reason) => `incomplete:${reason}`))
   ];
@@ -36,8 +51,8 @@ export function shadowCommitReceipt(
     scope: transcript.scope,
     seq: transcript.seq,
     transcript_hash: transcript.hash,
-    pre_state_hash: transcriptTouchedStateHash(serializedBefore, transcript),
-    post_state_hash: transcriptTouchedStateHash(serializedAfter, transcript),
+    pre_state_hash: preStateHash,
+    post_state_hash: postStateHash,
     accepted: errors.length === 0,
     errors
   };

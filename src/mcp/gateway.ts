@@ -23,7 +23,7 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, applyShadowTranscriptToCommittedState, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, applyShadowTranscriptToCommitScopeCache, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   mergeV2TurnGatewayAuthority,
@@ -553,10 +553,7 @@ export class McpGateway {
   private propagateTranscriptToOtherScopes(originScope: ObjRef, transcript: EffectTranscript): void {
     for (const [scope, client] of this.v2Scopes) {
       if (scope === originScope) continue;
-      client.relay.commit_scope.serialized = applyShadowTranscriptToCommittedState(
-        client.relay.commit_scope.serialized,
-        transcript
-      );
+      applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
     }
   }
 

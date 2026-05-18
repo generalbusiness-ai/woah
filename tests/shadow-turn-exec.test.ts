@@ -489,6 +489,65 @@ describe("shadow turn execution", () => {
     expect(committed.getProp("merge_box", "feedback")).toBe(0.37);
   });
 
+  it("applies durable commits through indexed scope state without full array indexing phases", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-indexed-commit");
+    const actor = session.actor;
+    anchor.createObject({ id: "indexed_box", name: "Indexed Box", parent: "$thing", owner: actor });
+    anchor.defineProperty("indexed_box", { name: "wet", defaultValue: 0, owner: actor, perms: "rw", typeHint: "num" });
+    expect(installVerb(anchor, "indexed_box", "set_wet", `verb :set_wet(value) rxd {
+      this.wet = value;
+      return this.wet;
+    }`, null).ok).toBe(true);
+    for (let index = 0; index < 130; index += 1) {
+      anchor.createObject({ id: `indexed_filler_${index}`, name: `Indexed Filler ${index}`, parent: "$thing", owner: actor });
+    }
+
+    const serializedBefore = anchor.exportWorld();
+    serializedBefore.tombstones = [];
+    expect(serializedBefore.objects.length).toBeGreaterThan(100);
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-indexed-commit-wet",
+      route: "direct",
+      scope: "indexed_box",
+      session: session.id,
+      actor,
+      target: "indexed_box",
+      verb: "set_wet",
+      args: [0.41]
+    };
+    const run = await runShadowTurnCallTranscript(serializedBefore, call);
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: run.transcript.scope, serialized: serializedBefore });
+    const steps: Array<{ phase: string; objects: number }> = [];
+    const accepted = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "shadow-indexed-commit-wet",
+      scope: run.transcript.scope,
+      expected: structuredClone(commitScope.head),
+      transcript: run.transcript,
+      profile: (event) => steps.push({ phase: event.phase, objects: event.objects })
+    });
+
+    expect(accepted.kind).toBe("woo.commit.accepted.shadow.v1");
+    expect(steps.map((step) => step.phase)).toEqual([
+      "apply_creates",
+      "collect_writes",
+      "apply_writes",
+      "apply_session",
+      "apply_log",
+      "counters",
+      "total"
+    ]);
+    expect(steps.map((step) => step.phase)).not.toEqual(expect.arrayContaining(["clone_world", "index_objects", "sort_objects"]));
+    expect(steps.every((step) => step.objects === serializedBefore.objects.length)).toBe(true);
+    expect(commitScope.state.objectsById.size).toBe(serializedBefore.objects.length);
+    expect(commitScope.state.snapshots).not.toBe(serializedBefore.snapshots);
+    expect(commitScope.state.parkedTasks).not.toBe(serializedBefore.parkedTasks);
+    expect(commitScope.state.tombstones).not.toBe(serializedBefore.tombstones);
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("indexed_box", "wet")).toBe(0.41);
+  });
+
   it("rejects tampered writes that borrow authority from an unrelated verb read", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-write-authority");
