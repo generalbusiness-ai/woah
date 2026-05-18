@@ -2,12 +2,13 @@ import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/sha
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { applyShadowScopeProjectionPatch, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
+import { planV2BrowserLocalTurn } from "./v2-browser-local-turn";
 import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2TurnResultMessageFromReply } from "./v2-browser-messages";
 import { v2BrowserWebSocketUrl } from "./v2-browser-url";
 
@@ -270,6 +271,10 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     postMessage({ kind: "error", error: "v2 browser call requires an authenticated actor" });
     return;
   }
+  if (await sendLocalTurnExec(command)) {
+    postStatus();
+    return;
+  }
   const body: ShadowTurnIntentRequest = {
     kind: "woo.turn.intent.request.shadow.v1",
     id: command.id,
@@ -300,6 +305,66 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
   });
   sendEncoded(encoded);
   postStatus();
+}
+
+async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call" }>): Promise<boolean> {
+  if (!current || !current.actor) return false;
+  const scope = command.scope || current.scope;
+  const cachedHead = scope ? await getMeta<unknown>(`head:${scope}`) : undefined;
+  if (!isShadowScopeHead(cachedHead)) {
+    postMessage({ kind: "local_turn_fallback", id: command.id, reason: "no_head" });
+    return false;
+  }
+  const local = await planV2BrowserLocalTurn({
+    node: current.node,
+    actor: current.actor,
+    session: current.session ?? null,
+    head: cachedHead,
+    id: command.id,
+    route: command.route,
+    scope,
+    target: command.target,
+    verb: command.verb,
+    args: Array.isArray(command.args) ? command.args as WooValue[] : [],
+    persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable"),
+    transfers: await allExecutionTransfers()
+  });
+  if (!local.ok) {
+    postMessage({
+      kind: "local_turn_fallback",
+      id: command.id,
+      reason: local.reason,
+      missing_atoms: local.missing_atoms?.map((atom) => atom.hash) ?? []
+    });
+    return false;
+  }
+  const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
+    v: 2,
+    type: local.request.kind,
+    id: command.id,
+    from: current.node,
+    actor: current.actor,
+    ...(current.session ? { session: current.session } : {}),
+    auth: { mode: "session", token: current.token },
+    body: local.request
+  };
+  const encoded = encodeEnvelope(envelope);
+  await putPending({
+    id: envelope.id,
+    encoded,
+    created_at: Date.now(),
+    auth_token: current.token,
+    from: current.node
+  });
+  postMessage({
+    kind: "local_turn_planned",
+    id: command.id,
+    transcript_hash: local.transcript_hash,
+    observation_count: local.observation_count,
+    result_known: local.result_known
+  });
+  sendEncoded(encoded);
+  return true;
 }
 
 function sendEncoded(encoded: string): void {
