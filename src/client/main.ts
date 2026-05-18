@@ -468,6 +468,10 @@ function ensureV2BrowserWorker() {
       if (message.frame.op === "result") receiveDirectResultFrame(message.frame);
       else receiveErrorFrame(message.frame);
     }
+    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated") {
+      window.dispatchEvent(new CustomEvent(`woo.v2.${event.data.kind}`, { detail: event.data }));
+      console.debug(`woo.v2.${event.data.kind}`, event.data);
+    }
     if (event.data?.kind === "live_event") {
       const observation = event.data.event?.observation;
       if (observation) {

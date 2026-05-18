@@ -1247,6 +1247,10 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
   const selected = request.selected_ad
     ? relay.executors.find((node) => node.node === request.selected_ad && node.scope === request.key.scope)
     : undefined;
+  // Selected ads name an executor that owns its advertised cache. Unlike the
+  // relay-local fallback below, the relay must not silently refresh or expand
+  // that executor's atom set; exact coverage is proven by execution or
+  // missing_state.
   if (selected) return selected;
 
   const nodeId = `${relay.node}:executor`;
