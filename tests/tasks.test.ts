@@ -387,3 +387,45 @@ describe("tasks catalog", () => {
     expect(world.object(taskRef).location).toBe("the_taskboard");
   });
 });
+
+describe("tasks catalog: room_roster (presence aside)", () => {
+  // The kanban UI fetches $task_registry:room_roster on every refresh tick to
+  // populate the presence aside. $task_registry inherits :room_roster from
+  // $room (chat catalog) — these tests pin that the verb is reachable through
+  // inheritance and returns the row shape the UI expects.
+  it("returns an empty list when no one is in the registry", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:tasks-roster-empty");
+    const r = await world.directCall("roster-empty", session.actor, "the_taskboard", "room_roster", []);
+    expect(r.op).toBe("result");
+    if (r.op !== "result") return;
+    expect(r.result).toEqual([]);
+  });
+
+  it("includes a row per actor currently inside the registry", async () => {
+    const world = setupWorld();
+    const a = world.auth("guest:tasks-roster-a");
+    const b = world.auth("guest:tasks-roster-b");
+    await world.directCall("enter-a", a.actor, "the_taskboard", "enter", []);
+    await world.directCall("enter-b", b.actor, "the_taskboard", "enter", []);
+    const r = await world.directCall("roster", a.actor, "the_taskboard", "room_roster", []);
+    expect(r.op).toBe("result");
+    if (r.op !== "result") return;
+    const rows = r.result as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(2);
+    const ids = rows.map((row) => row.id).sort();
+    expect(ids).toEqual([a.actor, b.actor].sort());
+    for (const row of rows) {
+      expect(row).toMatchObject({ id: expect.any(String), name: expect.any(String) });
+    }
+  });
+
+  it("entering the registry fans an `entered` observation that drives kanban roster refresh", async () => {
+    const world = setupWorld();
+    const a = world.auth("guest:tasks-roster-enter");
+    const entered = await world.directCall("enter", a.actor, "the_taskboard", "enter", []);
+    expect(entered.op).toBe("result");
+    if (entered.op !== "result") return;
+    expect(entered.observations.map((o) => o.type)).toContain("entered");
+  });
+});

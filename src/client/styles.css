@@ -1490,6 +1490,26 @@ input[type="range"] {
   overflow: auto;
 }
 
+/* Outliner and tasks reuse the side-fixed split-layout primitive with a
+   240px right-hand presence aside, matching chat-layout / dubspace-layout.
+   The aside lives inside the ambient-companion shell, so the mini-chat panel
+   docks further right via the shell's own column. */
+.outliner-layout,
+.woo-tasks-layout {
+  --split-side: 240px;
+  --split-cols: minmax(360px, 1fr) var(--split-side);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.outliner-presence,
+.woo-tasks-presence {
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+
 .pinboard-layout {
   height: calc(100dvh - 5.25rem - var(--space-chat-h, 280px) - 0.8rem);
   min-height: 0;
@@ -1674,7 +1694,9 @@ woo-outliner-tree {
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  /* Two rows now (add-form + rows). The header hoisted out of the shell —
+     see outliner-tree.ts render() comment — so this grid no longer owns it. */
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 0.65rem;
   overflow: hidden;
 }
@@ -1690,6 +1712,12 @@ woo-outliner-tree {
   gap: 0.75rem;
   align-items: center;
   justify-content: space-between;
+  /* The shared `.toolbar` class contributes ~3rem of chrome (min-height
+     2.125rem + 1rem margin-bottom) above the ambient-companion-shell on
+     other tools; match that envelope so the shell's calc(100dvh - 5.25rem)
+     budget lines up and the mini-chat panel anchors to the viewport bottom. */
+  min-height: 2.125rem;
+  margin-bottom: 1rem;
 }
 
 .outliner-header h2 {

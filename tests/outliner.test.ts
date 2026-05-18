@@ -537,3 +537,42 @@ describe("outliner catalog: $transparent chat verbs route through", () => {
     expect(plan.result).toMatchObject({ ok: true, target: "the_outline", verb: "hide_command" });
   });
 });
+
+describe("outliner catalog: room_roster (presence aside)", () => {
+  // The right-side presence aside in the outliner UI reads from
+  // $outliner:room_roster. These tests pin the verb's directly-callable
+  // contract (rxd / skip_presence_check) and the row shape the UI consumes
+  // — id and human-readable name. A regression on either would silently
+  // empty the aside.
+  it("returns an empty list when no actor has entered the outliner", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:roster-empty");
+    const r = await expectResult(call(world, session.actor, "the_outline", "room_roster", []));
+    expect(r.result).toEqual([]);
+  });
+
+  it("includes a row with id + name for each present actor", async () => {
+    const world = setupWorld();
+    const a = world.auth("guest:roster-a");
+    const b = world.auth("guest:roster-b");
+    await expectResult(call(world, a.actor, "the_outline", "enter", []));
+    await expectResult(call(world, b.actor, "the_outline", "enter", []));
+    const r = await expectResult(call(world, a.actor, "the_outline", "room_roster", []));
+    const rows = r.result as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(2);
+    const ids = rows.map((row) => row.id).sort();
+    expect(ids).toEqual([a.actor, b.actor].sort());
+    for (const row of rows) {
+      expect(row).toMatchObject({ id: expect.any(String), name: expect.any(String) });
+    }
+  });
+
+  it("emits outliner_entered / outliner_left observations the UI uses to trigger re-hydrate", async () => {
+    const world = setupWorld();
+    const a = world.auth("guest:roster-enter");
+    const entered = await expectResult(call(world, a.actor, "the_outline", "enter", []));
+    expect(entered.observations.map((o) => o.type)).toContain("outliner_entered");
+    const left = await expectResult(call(world, a.actor, "the_outline", "leave", []));
+    expect(left.observations.map((o) => o.type)).toContain("outliner_left");
+  });
+});

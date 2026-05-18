@@ -89,6 +89,15 @@ export type RegistryObligation = {
   criterion: string;
 };
 
+// Roster row delivered by $task_registry:room_roster (inherited from $room).
+// Same shape chat / outliner / dubspace use.
+export type KanbanRosterRow = {
+  id: string;
+  name?: string;
+  presence?: string;
+  idle_seconds?: number;
+};
+
 export type KanbanData = {
   registryId: string;
   registryName: string;
@@ -100,6 +109,7 @@ export type KanbanData = {
   roles: RegistryRole[];
   obligations: RegistryObligation[];
   policiesMap: Record<string, string[]>;
+  roster: KanbanRosterRow[];
 };
 
 function emptyKanbanData(): KanbanData {
@@ -113,7 +123,8 @@ function emptyKanbanData(): KanbanData {
     isOwner: false,
     roles: [],
     obligations: [],
-    policiesMap: {}
+    policiesMap: {},
+    roster: []
   };
 }
 
@@ -414,7 +425,10 @@ function normalizeKanbanData(previous: KanbanData, value: unknown): KanbanData {
     isOwner: typeof record.isOwner === "boolean" ? record.isOwner : registryChanged ? false : previous.isOwner,
     roles: Array.isArray(record.roles) ? record.roles as RegistryRole[] : rolesFrom(props.roles) ?? (registryChanged ? [] : previous.roles),
     obligations: Array.isArray(record.obligations) ? record.obligations as RegistryObligation[] : obligationsFrom(props.obligations) ?? (registryChanged ? [] : previous.obligations),
-    policiesMap
+    policiesMap,
+    roster: Array.isArray(record.roster)
+      ? (record.roster as KanbanRosterRow[]).filter((row): row is KanbanRosterRow => !!row && typeof row.id === "string")
+      : registryChanged ? [] : previous.roster
   };
 }
 
@@ -600,7 +614,12 @@ const TASK_OBSERVATION_TYPES = [
   "obligation_orphaned",
   "registry_role_changed",
   "registry_obligation_changed",
-  "registry_policy_changed"
+  "registry_policy_changed",
+  // Presence changes (the registry is a $room, so :enter/:leave fan out the
+  // generic `entered` / `left` observation types). Re-running refresh after
+  // each one keeps the right-side presence aside in sync.
+  "entered",
+  "left"
 ];
 
 export class WooTasksKanbanElement extends HTMLElement {
@@ -757,8 +776,16 @@ export class WooTasksKanbanElement extends HTMLElement {
     this.closeModal();
   };
 
-  private handleTasksRefresh = (): void => {
+  private handleTasksRefresh = (event: Event): void => {
     if (!this.isConnected || !this.woo) return;
+    // Filter when the dispatcher pinned the observation to a specific room
+    // (entered/left). Task_* events have detail.room === undefined and refresh
+    // unconditionally — they're always relevant to whatever registry mounted.
+    const detail = (event as CustomEvent<{ room?: string }>).detail;
+    if (detail && typeof detail.room === "string" && detail.room) {
+      const mySubject = this.subject ?? this.model.registryId;
+      if (mySubject && detail.room !== mySubject) return;
+    }
     this.scheduleRefresh();
   };
 
@@ -794,9 +821,17 @@ export class WooTasksKanbanElement extends HTMLElement {
     const registryName = projected?.name ?? this.model.registryName ?? subject;
     const actor = woo.actor ?? this.model.actor;
     const actorNames = this.collectActorNames(woo, projected);
+    // Roster is server-authoritative via $task_registry:room_roster (inherited
+    // from $room). Fetched alongside the task listing; an empty array means
+    // either no one's in the registry or the call failed — both surface the
+    // same "No one is in this registry." placeholder.
     let listing: unknown;
+    let roster: unknown;
     try {
-      listing = await woo.directCall(subject, "listing", []);
+      [listing, roster] = await Promise.all([
+        woo.directCall(subject, "listing", []),
+        woo.directCall(subject, "room_roster", []).catch(() => [])
+      ]);
     } catch {
       this.scheduleRefreshRetry(700);
       return;
@@ -880,7 +915,10 @@ export class WooTasksKanbanElement extends HTMLElement {
       isOwner,
       roles,
       obligations,
-      policiesMap
+      policiesMap,
+      roster: Array.isArray(roster)
+        ? (roster as KanbanRosterRow[]).filter((row): row is KanbanRosterRow => !!row && typeof row.id === "string")
+        : []
     };
     if (this.refreshRetryTimer !== null && typeof window !== "undefined") {
       window.clearTimeout(this.refreshRetryTimer);
@@ -1624,14 +1662,21 @@ export class WooTasksKanbanElement extends HTMLElement {
           <section class="woo-tasks-kanban" aria-label="Task board">
             <div class="woo-tasks-kanban-columns">${columnsHtml}</div>
           </section>`;
+    // Layout mirrors chat / dubspace / outliner: a 1fr + fixed-side split with
+    // the board on the left and a presence aside on the right, all inside the
+    // ambient-companion shell so the mini-chat panel docks further right when
+    // the viewer is in the registry.
     const workspace = `
       <section class="woo-tasks-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(registryId)}">
-        <div class="woo-tasks-workarea">
-          <div class="woo-tasks-board${this.adminOpen ? " has-admin" : ""}">
-            ${boardContent}
+        <section class="split split--side-fixed woo-tasks-layout">
+          <div class="woo-tasks-workarea">
+            <div class="woo-tasks-board${this.adminOpen ? " has-admin" : ""}">
+              ${boardContent}
+            </div>
+            ${!this.adminOpen && this.openDetail ? this.renderDetailPanel(actorNames) : ""}
           </div>
-          ${!this.adminOpen && this.openDetail ? this.renderDetailPanel(actorNames) : ""}
-        </div>
+          ${this.renderPresence()}
+        </section>
       </section>
     `;
     const preservedPanel = preserveAmbientCompanionPanel(this, registryId);
@@ -1900,6 +1945,35 @@ export class WooTasksKanbanElement extends HTMLElement {
         ${adminBtn}
       </section>
     `;
+  }
+
+  // Right-side presence aside, same visual shape as chat / outliner / dubspace.
+  // Roster is server-authoritative via $task_registry:room_roster, refreshed
+  // on every kanban refresh tick (which fires on entered/left observations).
+  private renderPresence(): string {
+    const rows = Array.isArray(this.model.roster) ? this.model.roster : [];
+    const buttons = rows.map((row) => {
+      const id = typeof row?.id === "string" ? row.id : "";
+      if (!id) return "";
+      return `<button disabled>${escapeHtml(this.rosterActorLabel(row))}<span>${escapeHtml(id)}</span></button>`;
+    }).join("");
+    return `
+      <aside class="card woo-tasks-presence">
+        <h2>Present</h2>
+        <div class="presence-list">
+          ${buttons || "<p>No one is in this registry.</p>"}
+        </div>
+      </aside>
+    `;
+  }
+
+  private rosterActorLabel(row: KanbanRosterRow): string {
+    if (row?.name) return String(row.name);
+    const fromMap = this.model.actorNames[row.id];
+    if (fromMap) return fromMap;
+    const projected = this.woo?.observe(row.id);
+    if (projected?.name) return String(projected.name);
+    return String(row?.id ?? "unknown");
   }
 
   private renderFilterBar(): string {
@@ -2227,9 +2301,17 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   registry.observation({
     types: TASK_OBSERVATION_TYPES,
     route: "both",
-    reduce: () => {
+    reduce: (_draft, envelope) => {
       if (typeof window === "undefined" || typeof CustomEvent === "undefined") return;
-      window.dispatchEvent(new CustomEvent(TASKS_REFRESH_EVENT));
+      // `entered` / `left` fire for any room move in the world. Carry the
+      // observation's room id so mounted kanbans can ignore refreshes whose
+      // subject isn't theirs; task_* observations don't need this filter and
+      // pass through (detail.room === undefined ⇒ refresh).
+      const obs = envelope?.observation as Record<string, unknown> | undefined;
+      const room = typeof obs?.room === "string"
+        ? obs.room
+        : typeof obs?.source === "string" ? obs.source : undefined;
+      window.dispatchEvent(new CustomEvent(TASKS_REFRESH_EVENT, { detail: { room } }));
     }
   });
 }

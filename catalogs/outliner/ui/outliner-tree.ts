@@ -23,12 +23,22 @@ export type OutlinerItem = {
   has_children: boolean;
 };
 
+// One row delivered by $outliner:room_roster — the same shape chat/dubspace
+// use. `presence` ("online" / "idle" / "offline") drives the dot class.
+export type OutlinerRosterRow = {
+  id: string;
+  name?: string;
+  presence?: string;
+  idle_seconds?: number;
+};
+
 export type OutlinerData = {
   outlinerId: string;
   outlinerName: string;
   items: OutlinerItem[];
   focus: string | null;
   actor: string | null;
+  roster: OutlinerRosterRow[];
 };
 
 // Component-local UI state lives on the element itself (collapse, edit,
@@ -38,7 +48,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   woo?: WooContext;
   subject?: string;
 
-  private model: OutlinerData = { outlinerId: "", outlinerName: "Outline", items: [], focus: null, actor: null };
+  private model: OutlinerData = { outlinerId: "", outlinerName: "Outline", items: [], focus: null, actor: null, roster: [] };
   private companionVisible = false;
   private collapsed = new Set<string>();
   private showHidden = false;
@@ -92,7 +102,12 @@ export class WooOutlinerTreeElement extends HTMLElement {
         // Read-side query: directCall resolves with the verb's actual return
         // value. (`woo.call` is fire-and-forget and resolves with the request
         // id — the reply lands via the observation reducer, not this promise.)
-        const items = await this.woo.directCall(this.subject, "list_items", []);
+        // Roster fetched in parallel with list_items — both are independent
+        // RX verbs on the outliner space.
+        const [items, roster] = await Promise.all([
+          this.woo.directCall(this.subject, "list_items", []),
+          this.woo.directCall(this.subject, "room_roster", []).catch(() => [])
+        ]);
         const projection = this.woo.observe(this.subject);
         const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
         const actor = this.woo.actor;
@@ -107,7 +122,8 @@ export class WooOutlinerTreeElement extends HTMLElement {
           outlinerName: typeof objectName === "string" && objectName ? objectName : "Outline",
           items: Array.isArray(items) ? (items as OutlinerItem[]) : [],
           focus,
-          actor
+          actor,
+          roster: Array.isArray(roster) ? (roster as OutlinerRosterRow[]) : []
         };
         this.render();
       } while (this.hydratePending);
@@ -146,20 +162,28 @@ export class WooOutlinerTreeElement extends HTMLElement {
       if (active.matches("[data-outliner-add] input[name=text]")) return "add";
       return null;
     })();
+    // Header lives OUTSIDE the ambient-companion-shell — same as
+    // pinboard / dubspace / tasks. The shell's `height: calc(100dvh - 5.25rem)`
+    // assumes ~5.25rem of chrome (top padding + tool toolbar) sits above it;
+    // if the header is inside the shell that budget is wrong and the mini-chat
+    // panel ends up floating ~3rem above the viewport bottom instead of
+    // anchoring to it like every other tool.
+    const header = `
+      <header class="outliner-header">
+        <h2>${escapeHtml(data.outlinerName)}</h2>
+        <div class="outliner-toolbar">
+          <button type="button" data-outliner-presence="${this.companionVisible ? "leave" : "enter"}">${this.companionVisible ? "Leave" : "Enter"}</button>
+          <label class="outliner-toggle">
+            <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
+            show hidden
+          </label>
+          <button type="button" data-outliner-action="undo">Undo</button>
+          <span class="outliner-focus">focus: ${escapeHtml(focusLabel)}</span>
+        </div>
+      </header>
+    `;
     const tree = `
       <section class="outliner">
-        <header class="outliner-header">
-          <h2>${escapeHtml(data.outlinerName)}</h2>
-          <div class="outliner-toolbar">
-            <button type="button" data-outliner-presence="${this.companionVisible ? "leave" : "enter"}">${this.companionVisible ? "Leave" : "Enter"}</button>
-            <label class="outliner-toggle">
-              <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
-              show hidden
-            </label>
-            <button type="button" data-outliner-action="undo">Undo</button>
-            <span class="outliner-focus">focus: ${escapeHtml(focusLabel)}</span>
-          </div>
-        </header>
         <form class="outliner-add" data-outliner-add>
           <input type="text" name="text" placeholder="add an item…" autocomplete="off" value="${escapeHtml(addInputValue)}">
           <button type="submit">Add</button>
@@ -169,9 +193,18 @@ export class WooOutlinerTreeElement extends HTMLElement {
         </ul>
       </section>
     `;
+    // Layout mirrors chat / dubspace: main content + right-side presence aside,
+    // wrapped in the ambient-companion shell (which docks the mini-chat panel
+    // beneath the split when the actor is in-room).
+    const splitInner = `
+      <section class="split split--side-fixed outliner-layout">
+        ${tree}
+        ${this.renderPresence(data)}
+      </section>
+    `;
     this.innerHTML = this.companionVisible
-      ? renderAmbientCompanionShell(outlinerId, `<section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${tree}</section>`)
-      : tree;
+      ? `${header}${renderAmbientCompanionShell(outlinerId, `<section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${splitInner}</section>`)}`
+      : `${header}<section class="outliner-workspace">${splitInner}</section>`;
     restoreAmbientCompanionPanel(this, preservedPanel);
     if (focusedSelector === "add") {
       const input = this.querySelector<HTMLInputElement>("[data-outliner-add] input[name=text]");
@@ -182,6 +215,36 @@ export class WooOutlinerTreeElement extends HTMLElement {
         input.setSelectionRange(end, end);
       }
     }
+  }
+
+  // Right-side presence aside, same shape as chat-presence / dubspace-presence.
+  // The roster comes from `room_roster()` on the outliner (server-authoritative
+  // list of $actors currently in the space); we don't try to reconcile with
+  // a client-side scoped projection here because the outliner is browsable
+  // before the viewer enters, and the chat presence list is the wrong scope
+  // in that case.
+  private renderPresence(data: OutlinerData): string {
+    const rows = Array.isArray(data.roster) ? data.roster : [];
+    const buttons = rows.map((row) => {
+      const id = typeof row?.id === "string" ? row.id : "";
+      if (!id) return "";
+      return `<button disabled>${escapeHtml(this.actorLabel(row))}<span>${escapeHtml(id)}</span></button>`;
+    }).join("");
+    return `
+      <aside class="card outliner-presence">
+        <h2>Present</h2>
+        <div class="presence-list">
+          ${buttons || "<p>No one is in this outline.</p>"}
+        </div>
+      </aside>
+    `;
+  }
+
+  private actorLabel(row: OutlinerRosterRow): string {
+    if (row?.name) return String(row.name);
+    const projected = this.woo?.observe(row.id);
+    if (projected?.name) return String(projected.name);
+    return String(row?.id ?? "unknown");
   }
 
   private computeVisibleItems(items: OutlinerItem[]): Array<OutlinerItem & { depth: number }> {
@@ -401,7 +464,11 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
     "outline_item_hidden",
     "outline_focus_changed",
     "outline_undone",
-    "note_edited"
+    "note_edited",
+    // Presence changes re-hydrate so the right-side aside (room_roster) stays
+    // in sync. Hydrate already fans this out to every mounted tree.
+    "outliner_entered",
+    "outliner_left"
   ];
   registry.observation({
     types: STRUCTURAL_TYPES,
