@@ -924,6 +924,59 @@ describe("shadow turn execution", () => {
     if (!routed.result.ok) throw new Error(`read-time retry failed: ${routed.result.reason}`);
     expect(createWorldFromSerialized(routed.result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.67);
   });
+
+  it("forwards engine metrics from the ephemeral executor world when onMetric is supplied", async () => {
+    // The v2 hot path runs verbs on an ephemeral world created from a
+    // serialized snapshot. That world has no metrics hook by default,
+    // so direct_call/applied/dispatch_resolved events are dropped
+    // unless callers thread their host's metric sink into
+    // ShadowTurnCallOptions.onMetric. /admin/ footprint-by-verb is
+    // permanently empty without this forwarder.
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-metric-forward");
+    const actor = session.actor;
+    anchor.createObject({ id: "metric_box", name: "Metric Box", parent: "$thing", owner: actor });
+    anchor.defineProperty("metric_box", { name: "n", defaultValue: 0, owner: actor, perms: "rw", typeHint: "num" });
+    expect(installVerb(anchor, "metric_box", "bump", `verb :bump(value) rxd {
+      this.n = value;
+      return this.n;
+    }`, null).ok).toBe(true);
+
+    const serializedBefore = anchor.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-metric-forward",
+      route: "direct",
+      scope: "metric_box",
+      session: session.id,
+      actor,
+      target: "metric_box",
+      verb: "bump",
+      args: [0.5]
+    };
+    const events: Array<{ kind: string; verb?: string; target?: string }> = [];
+
+    // Baseline: without onMetric, no events arrive. The frame op
+    // depends on the route — direct routes produce a "result" frame
+    // and emit `direct_call` via recordMetric; sequenced routes
+    // produce an "applied" frame and emit `applied`. We use the
+    // direct route here so the metric kind is unambiguous.
+    const _without = await runShadowTurnCallTranscript(serializedBefore, call);
+    expect(_without.frame.op).toBe("result");
+
+    // With onMetric, the engine's direct_call event reaches the
+    // forwarder. The test would silently regress (with no DOM coverage
+    // of the dashboard either) if anyone removed the
+    // world.setMetricsHook call from runShadowTurnCallTranscript.
+    const run = await runShadowTurnCallTranscript(serializedBefore, call, {
+      onMetric: (event) => events.push({ kind: event.kind, verb: (event as { verb?: string }).verb, target: (event as { target?: string }).target })
+    });
+    expect(run.frame.op).toBe("result");
+    const directCall = events.find((e) => e.kind === "direct_call");
+    expect(directCall, "expected a direct_call event from the executor world").toBeDefined();
+    expect(directCall?.verb).toBe("bump");
+    expect(directCall?.target).toBe("metric_box");
+  });
 });
 
 function shadowTurnKeyWithoutPreimage(key: ShadowTurnKey, removed: string): ShadowTurnKey {

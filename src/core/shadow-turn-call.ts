@@ -1,7 +1,7 @@
 import { createWorldFromSerialized } from "./bootstrap";
 import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
 import type { SerializedWorld } from "./repository";
-import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, WooValue } from "./types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, MetricEvent, ObjRef, WooValue } from "./types";
 import { wooError } from "./types";
 import {
   InMemoryTurnRecorder,
@@ -39,6 +39,13 @@ export type ShadowTurnCallTranscriptRun = Omit<ShadowTurnCallRun, "serializedAft
 
 export type ShadowTurnCallOptions = {
   allowed_atom_hashes?: Iterable<string>;
+  // Optional forwarder for engine metric events. The ephemeral executor
+  // world has no metrics hook by default, so events like `direct_call`,
+  // `applied`, and `dispatch_resolved` get dropped on the v2 hot path
+  // unless the caller threads its host's metric sink in here. Without
+  // this, footprint-by-verb on /admin/ is permanently empty for v2
+  // traffic. See notes/2026-05-18-v2-verb-metrics.md.
+  onMetric?: (event: MetricEvent) => void;
 };
 
 export async function runShadowTurnCall(
@@ -47,6 +54,7 @@ export async function runShadowTurnCall(
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
   const world = createWorldFromSerialized(serializedBefore, { persist: false });
+  if (options.onMetric) world.setMetricsHook(options.onMetric);
   return await runShadowTurnCallOnWorld(world, call, options);
 }
 
@@ -59,6 +67,7 @@ export async function runShadowTurnCallTranscript(
   // commit-scope execution should not pay for a full executor post-state export
   // unless a caller explicitly needs that snapshot.
   const world = createWorldFromSerialized(serializedBefore, { persist: false });
+  if (options.onMetric) world.setMetricsHook(options.onMetric);
   return await runShadowTurnCallOnWorldTranscript(world, call, options);
 }
 

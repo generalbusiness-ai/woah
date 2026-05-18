@@ -8,7 +8,7 @@ import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTr
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import { type ShadowScopeHead } from "./shadow-commit-scope";
 import { shadowTurnKeyFromTranscript } from "./turn-key";
-import type { AppliedFrame, DirectResultFrame, ErrorFrame, ObjRef, WooValue } from "./types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
 import type { WooWorld } from "./world";
 
 export type V2TurnGatewayAuthorityPayload = {
@@ -81,6 +81,12 @@ export type SubmitTurnIntentOptions<Client, Result extends V2TurnGatewayEnvelope
   submitEnvelope(scope: ObjRef, body: V2TurnGatewayEnvelopeBody): Promise<Result>;
   authorityObjectIds?(input: V2TurnGatewayCallInput, commitScope: ObjRef): ObjRef[];
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
+  // Forwarder for engine metric events recorded during planning-phase
+  // verb execution (the ephemeral world built from clientSerialized).
+  // Lets host metric sinks see `direct_call`, `applied`,
+  // `dispatch_resolved`, and `broadcast` events for v2 traffic; without
+  // it those kinds never land in AE and footprint-by-verb is empty.
+  onMetric?: (event: MetricEvent) => void;
 };
 
 export function v2TurnGatewayAuthorityPayload(
@@ -274,7 +280,7 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
     const call = buildV2TurnGatewayCall(options.input, turnId);
     const serialized = options.clientSerialized?.(planningClient);
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
-    const planned = await runShadowTurnCallTranscript(serialized, call);
+    const planned = await runShadowTurnCallTranscript(serialized, call, { onMetric: options.onMetric });
     if (planned.frame.op === "error") return { kind: "local_frame", frame: planned.frame, call, planned };
 
     const key = shadowTurnKeyFromTranscript(planned.transcript);

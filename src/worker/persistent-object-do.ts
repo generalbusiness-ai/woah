@@ -2769,7 +2769,10 @@ export class PersistentObjectDO {
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => v2TurnGatewayEnvelopeId(id, attempt, () => crypto.randomUUID()),
       authorityPayload: (_scope, extraObjectIds) => v2TurnGatewayAuthorityPayload(world, extraObjectIds),
-      submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body)
+      submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body),
+      // Forward planning-phase verb metrics to the host world's metrics
+      // hook so /admin/ footprint-by-verb sees v2 traffic.
+      onMetric: (event) => world.recordMetric(event)
     });
     if (submitted.kind === "local_frame") return submitted.frame;
     const delivery = await this.deliverV2Fanout(world, submitted.commitScope, submitted.result, input.session.id);
@@ -2808,6 +2811,11 @@ export class PersistentObjectDO {
       verb: input.verb,
       args: input.args,
       body: input.body
+    }, {
+      // The ephemeral world has no metrics hook by default; forward to
+      // the host world's hook so verb-level events from in-process REST
+      // fallbacks land in AE alongside the v2 turn-network path.
+      onMetric: (event) => world.recordMetric(event)
     });
     if (run.frame.op === "error") return run.frame;
     if (input.persistence === "durable") {

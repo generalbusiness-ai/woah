@@ -466,7 +466,11 @@ export class McpGateway {
         if (client) mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, payload.authority);
         return payload;
       },
-      submitEnvelope: async (submitScope, body) => await hooks.envelope(submitScope, body)
+      submitEnvelope: async (submitScope, body) => await hooks.envelope(submitScope, body),
+      // Forward planning-phase verb metrics to the gateway world's metrics
+      // hook so direct_call/applied/dispatch_resolved/broadcast events land
+      // in AE and drive the /admin/ footprint-by-verb view.
+      onMetric: (event) => this.world.recordMetric(event)
     });
     if (submitted.kind === "local_frame") return submitted.frame;
     const result = submitted.result;
