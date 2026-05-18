@@ -505,6 +505,10 @@ const ADMIN_HTML = String.raw`<!doctype html>
     .panel { border: 1px solid var(--border); padding: 0.5rem; background: var(--bg); }
     canvas { display: block; width: 100%; height: 180px; background: white; cursor: crosshair; }
     canvas.wide { height: 200px; }
+    .pivot-charts { display: flex; gap: 0.5rem; align-items: stretch; }
+    .pivot-charts .area { flex: 1 1 auto; min-width: 0; }
+    .pivot-charts .pie  { flex: 0 0 130px; }
+    .pivot-charts .pie canvas { height: 130px; cursor: pointer; }
     .legend { font-size: 0.75rem; margin-top: 0.25rem; display: flex; gap: 0.5rem; flex-wrap: wrap; max-height: 4.5em; overflow: auto; }
     .legend .item { display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; padding: 0 0.25rem; }
     .legend .item:hover { background: #eee; }
@@ -538,17 +542,26 @@ const ADMIN_HTML = String.raw`<!doctype html>
   <div class="grid">
     <div class="panel">
       <h2>by host_key</h2>
-      <canvas data-pivot="host_key"></canvas>
+      <div class="pivot-charts">
+        <div class="area"><canvas data-pivot="host_key"></canvas></div>
+        <div class="pie"><canvas data-pie="host_key" title="totals over selected period"></canvas></div>
+      </div>
       <div class="legend" data-pivot-legend="host_key"></div>
     </div>
     <div class="panel">
       <h2>by kind</h2>
-      <canvas data-pivot="kind"></canvas>
+      <div class="pivot-charts">
+        <div class="area"><canvas data-pivot="kind"></canvas></div>
+        <div class="pie"><canvas data-pie="kind" title="totals over selected period"></canvas></div>
+      </div>
       <div class="legend" data-pivot-legend="kind"></div>
     </div>
     <div class="panel">
       <h2>by class</h2>
-      <canvas data-pivot="class"></canvas>
+      <div class="pivot-charts">
+        <div class="area"><canvas data-pivot="class"></canvas></div>
+        <div class="pie"><canvas data-pie="class" title="totals over selected period"></canvas></div>
+      </div>
       <div class="legend" data-pivot-legend="class"></div>
     </div>
   </div>
@@ -767,6 +780,93 @@ const ADMIN_HTML = String.raw`<!doctype html>
       return { ts, xAt, padL, padR, padT, padB, w, h, cssW, cssH };
     }
 
+    // Companion to drawArea: a small pie of period-totals for the same
+    // series array (already top-N collapsed via compactSeries by the
+    // caller). Same color cache so wedges align with area-chart bands.
+    // Returns an array of { key, start, end } slices in canvas-CSS-pixel
+    // coordinates so click-to-filter can hit-test without re-deriving.
+    function drawPie(canvas, series, onPick) {
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.clientWidth || 130, cssH = canvas.clientHeight || 130;
+      canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr); ctx.clearRect(0, 0, cssW, cssH);
+
+      const totals = series.map(s => ({ key: s.key, value: s.points.reduce((a, [, v]) => a + v, 0) }))
+        .filter(t => t.value > 0);
+      const grand = totals.reduce((a, t) => a + t.value, 0);
+      const cx = cssW / 2, cy = cssH / 2;
+      const r = Math.min(cx, cy) - 6;
+
+      if (grand <= 0 || totals.length === 0) {
+        ctx.fillStyle = '#bbb';
+        ctx.font = '11px system-ui';
+        const msg = 'no totals';
+        ctx.fillText(msg, cx - ctx.measureText(msg).width / 2, cy);
+        canvas._slices = [];
+        return;
+      }
+
+      const slices = [];
+      let angle = -Math.PI / 2;  // start at 12 o'clock so the largest wedge reads top-first
+      for (const t of totals) {
+        const sweep = (t.value / grand) * 2 * Math.PI;
+        const color = t.key.startsWith('(other') ? '#bbb' : colorFor(t.key);
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, r, angle, angle + sweep);
+        ctx.closePath();
+        ctx.fillStyle = color + 'cc';
+        ctx.fill();
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        slices.push({ key: t.key, value: t.value, start: angle, end: angle + sweep });
+        angle += sweep;
+      }
+
+      // Grand-total label in the middle so the chart is self-explanatory
+      // without legend reference. Compact suffix (k/M) once large.
+      ctx.fillStyle = '#444';
+      ctx.font = '11px system-ui';
+      const label = formatCompact(Math.round(grand));
+      ctx.fillText(label, cx - ctx.measureText(label).width / 2, cy + 4);
+
+      canvas._slices = slices;
+      canvas._pieGeom = { cx, cy, r };
+
+      // Click-to-filter: rebound idempotently. Mirrors legend-click
+      // behavior so the user can pin a filter from either the legend or
+      // a pie wedge.
+      if (!canvas._pickBound && typeof onPick === 'function') {
+        canvas._pickBound = true;
+        canvas.addEventListener('click', (e) => {
+          const slices = canvas._slices || [];
+          const geom = canvas._pieGeom;
+          if (!slices.length || !geom) return;
+          const rect = canvas.getBoundingClientRect();
+          const x = e.clientX - rect.left - geom.cx;
+          const y = e.clientY - rect.top - geom.cy;
+          if (Math.hypot(x, y) > geom.r) return;  // outside the pie
+          // atan2 returns (-π, π]; the pie starts at -π/2 (12 o'clock).
+          // Normalize to a monotonically-increasing angle from the
+          // pie's start so hit-test against slice ranges is direct.
+          let a = Math.atan2(y, x);
+          if (a < -Math.PI / 2) a += 2 * Math.PI;
+          const hit = slices.find(sl => a >= sl.start && a < sl.end);
+          if (hit && !hit.key.startsWith('(other')) onPick(hit.key);
+        });
+      }
+    }
+
+    // Compact number formatter — keeps the pie center label readable
+    // when totals reach the thousands or millions.
+    function formatCompact(n) {
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+      return String(n);
+    }
+
     function renderLegend(node, series, opts) {
       node.innerHTML = '';
       for (const s of series) {
@@ -897,18 +997,19 @@ const ADMIN_HTML = String.raw`<!doctype html>
 
     function paintPivot(pivot, data, state) {
       const canvas = document.querySelector('canvas[data-pivot="' + pivot + '"]');
+      const pieCanvas = document.querySelector('canvas[data-pie="' + pivot + '"]');
       const legend = document.querySelector('[data-pivot-legend="' + pivot + '"]');
       const { kept, other } = compactSeries(data.series);
       const seriesForChart = other ? kept.concat([other]) : kept;
       const geom = drawArea(canvas, { ...data, series: seriesForChart }, {});
       geometriesByPivot.set(pivot, geom);
-      renderLegend(legend, seriesForChart, {
-        onPick: (key) => {
-          state.filters[pivot] = key;
-          writeState(state);
-          render();
-        }
-      });
+      const pickFilter = (key) => {
+        state.filters[pivot] = key;
+        writeState(state);
+        render();
+      };
+      if (pieCanvas) drawPie(pieCanvas, seriesForChart, pickFilter);
+      renderLegend(legend, seriesForChart, { onPick: pickFilter });
       // Bind zoom once per canvas (idempotent — checks a marker).
       if (!canvas._zoomBound) {
         canvas._zoomBound = true;

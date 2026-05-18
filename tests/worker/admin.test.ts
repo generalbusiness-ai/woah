@@ -61,6 +61,13 @@ describe("admin auth gate", () => {
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
     expect(html).toContain("<title>woah admin</title>");
+    // Each pivot panel carries an area + a period-total pie. If any of
+    // the three pie canvases ever disappears the HTML smoke fails
+    // loudly rather than silently regressing the dashboard to one
+    // chart per pivot.
+    expect(html).toContain('data-pie="host_key"');
+    expect(html).toContain('data-pie="kind"');
+    expect(html).toContain('data-pie="class"');
   });
 
   it("returns 404 for an unknown /admin/ subpath", async () => {
