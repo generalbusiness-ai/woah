@@ -50,15 +50,18 @@ CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-# Force the Worker to run before static-asset routing for /admin/*.
-# Without this, Cloudflare's `single-page-application` not-found handling
-# serves the SPA's index.html for /admin/ (no matching asset) without
-# ever invoking the Worker, so the dashboard is unreachable from a
-# browser — curl with a JSON Accept header happens to bypass the
-# heuristic but a browser Accept gets the SPA. The Worker handles auth
-# and serves the inline HTML; everything else falls through to
-# env.ASSETS.fetch.
-run_worker_first = ["/admin", "/admin/*"]
+# Force the Worker to run before static-asset routing for every
+# request. With `not_found_handling = single-page-application`,
+# Cloudflare's SPA fallback serves `index.html` for any path that
+# doesn't match a literal asset — which silently swallows our API
+# surfaces (/healthz, /mcp, /v2/*, /api/*, /admin/*) the moment the
+# edge cache warms a SPA-shell response for them. Symptoms include
+# /mcp POST returning 405 (static routes only accept GET) and
+# /healthz returning the SPA HTML. The Worker entry already calls
+# env.ASSETS.fetch explicitly for non-API paths, so making the Worker
+# authoritative for all routes preserves SPA serving while keeping
+# API routes reachable.
+run_worker_first = true
 
 [[durable_objects.bindings]]
 name = "WOO"
