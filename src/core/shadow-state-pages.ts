@@ -1,6 +1,6 @@
 import type { SerializedObject, SerializedWorld } from "./repository";
 import { stableShadowJson } from "./shadow-cell-version";
-import { hashSource } from "./source-hash";
+import { hashSource, utf8ByteLength } from "./source-hash";
 import type { ObjRef, PropertyDef, VerbDef, WooValue } from "./types";
 
 // Shadow state pages are deliberately below object granularity: a node can
@@ -157,7 +157,7 @@ export function shadowStatePageRef(page: ShadowStatePage, inline: boolean): Shad
     page: page.page,
     ...("name" in page ? { name: page.name } : {}),
     hash: hashSource(json),
-    bytes: Buffer.byteLength(json, "utf8"),
+    bytes: utf8ByteLength(json),
     inline
   };
 }

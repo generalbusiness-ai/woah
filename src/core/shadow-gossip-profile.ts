@@ -1,4 +1,5 @@
 import type { SerializedWorld } from "./repository";
+import { utf8ByteLength } from "./source-hash";
 import { buildShadowCapabilityAd, rankCapabilityAdsForTurn } from "./capability-ad";
 import { createShadowCommitScope } from "./shadow-commit-scope";
 import {
@@ -248,11 +249,11 @@ function rejectedProfile(shape: ShadowNetworkShape, totalLatencyMs: number, step
 }
 
 export function estimateShadowTransferBytes(serialized: SerializedWorld): number {
-  return Buffer.byteLength(JSON.stringify(serialized), "utf8");
+  return utf8ByteLength(JSON.stringify(serialized));
 }
 
 export function estimateShadowStateTransferBytes(transfer: ShadowStateTransfer): number {
-  return Buffer.byteLength(JSON.stringify(transfer), "utf8");
+  return utf8ByteLength(JSON.stringify(transfer));
 }
 
 function missingAtomsFromExecutionResult(result: ShadowTurnExecutionResult): ShadowMissingAtom[] {

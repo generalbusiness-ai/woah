@@ -18,7 +18,7 @@ export function v2ServerAssistedIntentPolicy(input: {
   selectedScopeAd?: string | null;
 }): V2ServerAssistedIntentPolicy {
   // Durable turns must not drift back to opaque server-side planning. They need
-  // either browser-built execution or an explicit executor selected by gossip.
+  // either browser-built execution or a scope executor selected by gossip.
   const persistence = input.persistence ?? (input.route === "direct" ? "live" : "durable");
   if (persistence === "live") return { ok: true, reason: "live_turn" };
   if (input.selectedScopeAd) return { ok: true, reason: "scope_ad", selected_ad: input.selectedScopeAd };

@@ -548,6 +548,67 @@ describe("shadow turn execution", () => {
     expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("indexed_box", "wet")).toBe(0.41);
   });
 
+  it("deduplicates submissions by intent id and transcript hash", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-submit-transcript-key");
+    const actor = session.actor;
+    anchor.createObject({ id: "submit_box", name: "Submit Box", parent: "$thing", owner: actor });
+    anchor.defineProperty("submit_box", { name: "value", defaultValue: 0, owner: actor, perms: "rw", typeHint: "num" });
+    expect(installVerb(anchor, "submit_box", "set_value", `verb :set_value(value) rxd {
+      this.value = value;
+      return this.value;
+    }`, null).ok).toBe(true);
+
+    const firstCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "same-user-action",
+      route: "direct",
+      scope: "submit_box",
+      session: session.id,
+      actor,
+      target: "submit_box",
+      verb: "set_value",
+      args: [1]
+    };
+    const serializedBefore = anchor.exportWorld();
+    const firstRun = await runShadowTurnCall(serializedBefore, firstCall);
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: firstRun.transcript.scope, serialized: serializedBefore });
+    const firstAccepted = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "same-user-action",
+      scope: firstRun.transcript.scope,
+      expected: structuredClone(commitScope.head),
+      transcript: firstRun.transcript
+    });
+    expect(firstAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("submit_box", "value")).toBe(1);
+
+    const replayedCall: ShadowTurnCall = {
+      ...firstCall,
+      args: [2]
+    };
+    const replayedRun = await runShadowTurnCall(commitScope.serialized, replayedCall);
+    expect(replayedRun.transcript.hash).not.toBe(firstRun.transcript.hash);
+    const replayedAccepted = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "same-user-action",
+      scope: replayedRun.transcript.scope,
+      expected: structuredClone(commitScope.head),
+      transcript: replayedRun.transcript
+    });
+
+    expect(replayedAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("submit_box", "value")).toBe(2);
+    const duplicate = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "same-user-action",
+      scope: replayedRun.transcript.scope,
+      expected: structuredClone(commitScope.head),
+      transcript: replayedRun.transcript
+    });
+    expect(duplicate).toEqual(replayedAccepted);
+  });
+
   it("rejects tampered writes that borrow authority from an unrelated verb read", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-write-authority");

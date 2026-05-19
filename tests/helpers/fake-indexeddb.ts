@@ -89,6 +89,10 @@ class FakeIDBObjectStore {
     return successfulRequest(Array.from(this.store.rows.values()).map((value) => structuredClone(value)));
   }
 
+  getAllKeys(): FakeRequest<IDBValidKey[]> {
+    return successfulRequest(Array.from(this.store.rows.keys()));
+  }
+
   delete(key: IDBValidKey): FakeRequest<undefined> {
     this.store.rows.delete(key);
     return successfulRequest(undefined);

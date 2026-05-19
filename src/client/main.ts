@@ -20,8 +20,10 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
-import { v2ProjectionSnapshotFromMessage, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
+import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
+import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
@@ -277,6 +279,7 @@ const spaceChatCollapsedKey = "woo.spaceChat.collapsed";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 const chatHistoryLimit = 80;
+const chatFeedLimit = 160;
 const drumVoices = [
   { id: "kick", label: "Kick" },
   { id: "snare", label: "Snare" },
@@ -292,7 +295,7 @@ const TONE_TRACK_SEMITONES = [19, 22, 24, 27];
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const directThrottle = new Map<string, number>();
 const pendingDirect = new Map<string, (result: any) => void>();
-const pendingFrameErrors = new Map<string, (error: any) => void>();
+const pendingFrameErrors = new Map<string, (error: unknown) => void>();
 const pendingCommands = new Map<string, { space: string; text: string; action?: ChatCommandUiAction }>();
 const pendingNetworkTurns = new Set<string>();
 let pinboardNotesRefreshPending = false;
@@ -465,10 +468,38 @@ function ensureV2BrowserWorker() {
       const message = event.data as V2TurnResultMessage;
       window.dispatchEvent(new CustomEvent("woo.v2.turn_result", { detail: message }));
       if (v2TestHooksEnabled) console.debug("woo.v2.turn_result", message);
-      if (message.frame.op === "result") receiveDirectResultFrame(message.frame);
-      else receiveErrorFrame(message.frame);
+      switch (v2TurnResultRoute(message)) {
+        case "optimistic_result":
+          receiveOptimisticResultFrame(message.frame);
+          break;
+        case "optimistic_error":
+          receiveOptimisticErrorFrame(message.frame);
+          break;
+        case "final_result":
+          receiveDirectResultFrame(message.frame);
+          break;
+        case "final_error":
+          receiveErrorFrame(message.frame);
+          break;
+      }
     }
-    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed") {
+    if (event.data?.kind === "local_turn_invalidated") {
+      window.dispatchEvent(new CustomEvent("woo.v2.local_turn_invalidated", { detail: event.data }));
+      const error = settleInvalidatedOptimisticTurns(event.data as V2LocalTurnInvalidatedMessage, {
+        failOptimisticCall: (id) => ui.failOptimisticCall(id),
+        pendingDirect,
+        pendingFrameErrors,
+        pendingCommands,
+        completeNetworkWait: completeV2TurnNetworkWait
+      });
+      if (error) {
+        state.observations.unshift({ error });
+        trimObservations();
+        render();
+      }
+      console.debug("woo.v2.local_turn_invalidated", event.data);
+    }
+    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed" || event.data?.kind === "shadow_browser_compose_view" || event.data?.kind === "shadow_browser_execution_checkpoint") {
       window.dispatchEvent(new CustomEvent(`woo.v2.${event.data.kind}`, { detail: event.data }));
       console.debug(`woo.v2.${event.data.kind}`, event.data);
     }
@@ -510,6 +541,7 @@ function syncV2BrowserWorkerScope(scopeOverride?: string) {
 
 function receiveDirectResultFrame(frame: any) {
   completeV2TurnNetworkWait(frame.id);
+  const clearedProvisional = typeof frame.id === "string" ? clearProvisionalChatForTurn(frame.id, false) : false;
   const handler = pendingDirect.get(frame.id);
   if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
   for (const observation of frame.observations ?? []) {
@@ -529,11 +561,45 @@ function receiveDirectResultFrame(frame: any) {
       renderChatCommandResult(commandContext.action ?? chatCommandUiActionFromPlan(frame.command), frame.result, commandContext.text);
     }
   }
+  if (clearedProvisional && currentTabHasChatPanel()) render();
+}
+
+function receiveOptimisticResultFrame(frame: any) {
+  // Optimistic frames are display-only previews of the verb's intended effects
+  // — the worker emits them right after local planning, before the relay has
+  // confirmed the commit. They surface observations and projection-shaped move
+  // results so controls can advance against the local tentative journal, but
+  // they MUST NOT fire the pendingDirect/onResult handler: those callbacks gate
+  // committed side effects such as refreshes and external hydration.
+  for (const observation of frame.observations ?? []) {
+    ui.ingestLiveObservation(observation);
+    receiveLiveEvent(observation);
+  }
+  applyScopedMoveResult(frame.result);
+  render();
+}
+
+function receiveOptimisticErrorFrame(frame: any) {
+  // Optimistic errors are provisional local-cache previews. A missing object can
+  // be repaired by a state fetch or delegated execution, so show the local
+  // answer as retractable chat output without settling command handlers.
+  window.dispatchEvent(new CustomEvent("woo.v2.optimistic_error", { detail: frame }));
+  if (v2TestHooksEnabled) console.debug("woo.v2.optimistic_error", frame);
+  const id = typeof frame.id === "string" ? frame.id : "";
+  const commandContext = id ? pendingCommands.get(id) : undefined;
+  if (!id || !commandContext) return;
+  state.chatFeed = upsertProvisionalChatLine(
+    state.chatFeed,
+    provisionalChatErrorLine({ turnId: id, source: commandContext.space, error: frame.error }),
+    chatFeedLimit
+  );
+  if (currentTabHasChatPanel()) render();
 }
 
 function receiveErrorFrame(frame: any, socket?: WebSocket) {
   completeV2TurnNetworkWait(frame.id);
   const errorHandler = typeof frame.id === "string" ? pendingFrameErrors.get(frame.id) : undefined;
+  if (typeof frame.id === "string") clearProvisionalChatForTurn(frame.id, false);
   if (typeof frame.id === "string") {
     ui.failOptimisticCall(frame.id);
     pendingDirect.delete(frame.id);
@@ -561,6 +627,7 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
 
 function receiveAppliedFrame(frame: any) {
   completeV2TurnNetworkWait(frame.id);
+  if (typeof frame.id === "string") clearProvisionalChatForTurn(frame.id, false);
   ui.ingestAppliedFrame(frame);
   applyScopedMoveResult(frame.result);
   const needsScopedDeferredLook = frame.result
@@ -1971,15 +2038,25 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
   return planId;
 }
 
-function callWithError(space: string, target: string, verb: string, args: unknown[] = [], onError?: (error: any) => void, options?: ProjectionCallOptions) {
+function callWithError(space: string, target: string, verb: string, args: unknown[] = [], onError?: (error: any) => void, options?: ProjectionCallOptions): Promise<unknown> {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) {
-    ui.failOptimisticCall(id);
-    pendingFrameErrors.delete(id);
-  }
-  return id;
+  return new Promise((resolve, reject) => {
+    pendingDirect.set(id, resolve);
+    pendingFrameErrors.set(id, (error: any) => {
+      pendingDirect.delete(id);
+      onError?.(error);
+      reject(error);
+    });
+    if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) {
+      const error = { code: "E_V2_SEND_FAILED", message: "failed to send v2 turn intent" };
+      ui.failOptimisticCall(id);
+      pendingDirect.delete(id);
+      pendingFrameErrors.delete(id);
+      onError?.(error);
+      reject(error);
+    }
+  });
 }
 
 function actorPresenceList(actor: string): string[] {
@@ -3258,8 +3335,16 @@ function chatObservationSource(observation: any): string | undefined {
 }
 
 function pushChatLine(line: ChatLine, shouldRender = true) {
-  state.chatFeed = [...state.chatFeed, line].slice(-160);
+  state.chatFeed = [...state.chatFeed, line].slice(-chatFeedLimit);
   if (shouldRender && currentTabHasChatPanel()) render();
+}
+
+function clearProvisionalChatForTurn(turnId: string, shouldRender = true): boolean {
+  const cleared = clearProvisionalChatLines(state.chatFeed, turnId);
+  if (!cleared.removed) return false;
+  state.chatFeed = cleared.feed;
+  if (shouldRender && currentTabHasChatPanel()) render();
+  return true;
 }
 
 function pushChatSeparator(source: string, shouldRender = true) {
@@ -4729,6 +4814,13 @@ function enterOutliner() {
 function enterPinboard() {
   const board = pinboardSpace();
   if (!board || !canSendPinboardV2()) return;
+  if (pinboardActorPresent()) {
+    void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
+      if (state.tab === "pinboard") render();
+    });
+    requestSpaceChatFocus(board);
+    return;
+  }
   v2Turn({
     scope: board,
     route: "sequenced",

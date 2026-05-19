@@ -31,11 +31,12 @@ import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
-import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
+import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 import { readObjectPropertyValue } from "./property-read";
 import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
 import {
+  applyTranscriptContentsWriteRefs,
   finalWritesByCell,
   mergeTranscriptLogEntry,
   nextObjectCounterForCreates,
@@ -589,6 +590,10 @@ export class WooWorld {
       direct_callable: verb.direct_callable,
       ...(verb.kind === "native" ? { native: verb.native } : {})
     });
+  }
+
+  recordTurnStateProbe(cell: RecordedCell): void {
+    this.recordTurnEvent({ kind: "state_probe", cell });
   }
 
   private recordedEventWithWriter(event: TurnRecorderEvent): TurnRecorderEvent {
@@ -1326,6 +1331,7 @@ export class WooWorld {
     while (current) {
       const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
       if (!obj) break;
+      if (current !== startRef) this.recordTurnStateProbe({ kind: "verb", object: current, name });
       const verb = this.ownVerbNamed(current, name);
       if (verb) return { definer: current, verb };
       current = obj.parent;
@@ -3372,14 +3378,13 @@ export class WooWorld {
     return (this.logs.get(space) ?? []).filter((entry) => entry.seq >= from).slice(0, limit);
   }
 
-    async applyCall(id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
-      const repo = this.activeObjectRepository();
-      if (repo) return await this.applyCallRepository(repo, id, spaceRef, message, sessionId);
+  async applyCall(id: string | undefined, spaceRef: ObjRef, message: Message, sessionId: string | null = null): Promise<AppliedFrame> {
+    const repo = this.activeObjectRepository();
+    if (repo) return await this.applyCallRepository(repo, id, spaceRef, message, sessionId);
     const startedAt = Date.now();
     const frame = await this.withPersistencePaused(async () => {
       this.validateMessage(message);
       const space = this.object(spaceRef);
-      await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
       // Sequenced calls use the same catalog-level presence override as
       // direct calls. The check runs before the recorder opens, so ignoring
       // skip_presence_check here would make v2 commit-scope turns fail with no
@@ -3441,6 +3446,10 @@ export class WooWorld {
           { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
           async (activeRecorder) => {
             if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
+            // Live-presence scrub is ordinary gateway maintenance. The helper
+            // no-ops under shadow recording so user-turn transcripts do not
+            // gain hidden system-authority writes.
+            await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef), ctx.hostMemo);
             await this.withBehaviorSavepoint(async () => {
               result = await this.dispatch(ctx, message.target, message.verb, message.args);
               result = await this.enrichScopedMoveResult(ctx, result);
@@ -3490,7 +3499,6 @@ export class WooWorld {
       const frame = await this.withPersistencePaused(async () => {
         this.validateMessage(message);
         const space = this.object(spaceRef);
-        await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef));
         // Match the in-memory apply path: verb metadata decides whether the
         // pre-recording presence gate applies to sequenced calls.
         let skipPresenceCheck = false;
@@ -3549,9 +3557,13 @@ export class WooWorld {
 
         try {
           await this.withTurnRecording(
-          { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
+            { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
             async (activeRecorder) => {
               if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
+              // Same maintenance boundary as the in-memory path: repository
+              // hosts may clean stale live rows, but recorded shadow turns
+              // must not carry those cleanup writes.
+              await this.scrubStaleSubscribersForSpace(spaceRef, message.actor, this.chatPresent(spaceRef), ctx.hostMemo);
               await this.withBehaviorSavepoint(async () => {
                 result = await this.dispatch(ctx, message.target, message.verb, message.args);
                 result = await this.enrichScopedMoveResult(ctx, result);
@@ -6292,7 +6304,7 @@ export class WooWorld {
       if (!belongsHere(write.cell.object)) continue;
       const target = this.objects.get(write.cell.object);
       if (!target) continue;
-      this.applyTranscriptWriteInPlace(write, objectTimestamp);
+      this.applyTranscriptWriteInPlace(write, objectTimestamp, transcript);
       writesApplied += 1;
       if (write.cell.kind === "prop") {
         if (write.op === "remove") markObject(write.cell.object);
@@ -6405,7 +6417,7 @@ export class WooWorld {
     stepStartedAt = Date.now();
     for (const write of writes) {
       if (skippedHostPredicates?.belongsHere(write.cell.object)) continue;
-      this.applyTranscriptWriteInPlace(write, objectTimestamp);
+      this.applyTranscriptWriteInPlace(write, objectTimestamp, transcript);
     }
     profile?.("apply_writes", stepStartedAt);
 
@@ -6457,7 +6469,7 @@ export class WooWorld {
     };
   }
 
-  private applyTranscriptWriteInPlace(write: TranscriptWrite, objectTimestamp: number): void {
+  private applyTranscriptWriteInPlace(write: TranscriptWrite, objectTimestamp: number, transcript: EffectTranscript): void {
     const target = this.objects.get(write.cell.object);
     if (!target) return;
     // Keep this live-object materializer parallel with
@@ -6475,7 +6487,12 @@ export class WooWorld {
         return;
       case "contents":
         if (Array.isArray(write.value)) {
-          target.contents = new Set(write.value.filter((item): item is ObjRef => typeof item === "string"));
+          target.contents = new Set(applyTranscriptContentsWriteRefs(
+            Array.from(target.contents),
+            write,
+            transcript,
+            (event) => this.recordMetric(event)
+          ));
           target.modified = objectTimestamp;
         }
         return;
@@ -8909,6 +8926,11 @@ export class WooWorld {
   private async scrubStaleSubscribersForSpace(space: ObjRef, progr: ObjRef, subscribers: ObjRef[], memo?: HostOperationMemo): Promise<ObjRef[]> {
     void progr;
     if (!this.objects.has(space)) return subscribers;
+    // Subscriber rows are live-presence maintenance, not user-turn semantics.
+    // Shadow/local execution records only VM-authorized effects; letting a
+    // browser-planned turn carry gateway cleanup writes would require granting
+    // hidden system authority to an otherwise ordinary verb transcript.
+    if (this.turnRecorder || this.activeTurnRecorder) return subscribers;
     const now = Date.now();
     const last = this.lastSubscriberScrubAt.get(space) ?? 0;
     if (now - last < SUBSCRIBER_SCRUB_FLOOR_MS) return subscribers;

@@ -740,6 +740,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       if (isVmSuspendSignal(err)) throw err;
       if (isVmReadSignal(err)) throw err;
       const error = attachVmTrace(normalizeVmError(err), frames, currentPc);
+      if (error.code === "E_NEED_STATE") throw error;
       if (!raise(error)) throw error;
     }
   }

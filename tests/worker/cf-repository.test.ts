@@ -1017,7 +1017,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(response.status).toBe(101);
       expect(response.headers.get("sec-websocket-protocol")).toBe("woo-v2.turn-network.json");
       expect(gatewayState.acceptedWebSockets).toHaveLength(1);
-      expect(sent).toHaveLength(3);
+      expect(sent).toHaveLength(4);
       expect(decodeEnvelope(sent[0])).toMatchObject({
         type: "woo.transport.hello.v1",
         to: "browser:upgrade-test",
@@ -1033,6 +1033,15 @@ describe("CFObjectRepository production-shape coverage", () => {
         }
       });
       expect(decodeEnvelope(sent[2])).toMatchObject({
+        type: "woo.state.transfer.shadow.v1",
+        to: "browser:upgrade-test",
+        body: {
+          kind: "woo.state.transfer.shadow.v1",
+          mode: "cell_pages",
+          scope: "$wiz"
+        }
+      });
+      expect(decodeEnvelope(sent[3])).toMatchObject({
         type: "woo.exec_capability_ad.shadow.v1",
         to: "browser:upgrade-test",
         auth: { mode: "anonymous_advisory" },

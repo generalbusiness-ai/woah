@@ -547,11 +547,11 @@ or repurposed.
 | `blobs[12]` | `host`      | `cross_host_rpc.host`, `dispatch_resolved.host`, `host_schema_sync.host` |
 | `blobs[13]` | `actor`     | `mcp_tool_refresh_*.actor`, `dispatch_resolved.actor` |
 | `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating` |
-| `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason` |
+| `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `shadow_transcript_anomaly.reason` |
 | `blobs[16]` | `error_detail` | bounded diagnostic detail for uncoded internal errors |
 | `doubles[0]` | `ms`         | latency, when present |
 | `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
-| `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects` |
+| `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects`, `bytes`, or anomaly event count |
 
 The canonical event union is `MetricEvent` in `src/core/types.ts`. That
 union is the source of truth for which kinds exist and which fields they
@@ -682,12 +682,13 @@ read-only migration source; after a legacy scope opens successfully, the DO
 rewrites the state into row tables and clears the blob value.
 
 CommitScopeDO snapshots are materialized planning caches, not independent
-owners of live session presence. Each signed `/v2/open` and `/v2/envelope`
-request carries a narrow `woo.authority_slice.shadow.v1` containing current
-session rows, session actor objects, the sessions' active rooms, and any
-explicit turn scope/target rows. The DO refreshes those rows before planning so
-cross-scope movement accepted by one CommitScopeDO is visible to the next
-scope without a full-world transfer.
+owners of live session presence. Each signed `/v2/open`, `/v2/envelope`, and
+`/v2/state-transfer` request carries a narrow `woo.authority_slice.shadow.v1`
+containing current session rows, session actor objects, the sessions' active
+rooms, and any explicit turn scope/target rows. The DO refreshes those rows
+before planning or serving recipient-bound transfer state so cross-scope
+movement accepted by one CommitScopeDO is visible to the next scope without a
+full-world transfer.
 
 Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to the in-memory relay, then the storage transaction upserts only

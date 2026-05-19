@@ -35,6 +35,7 @@ export type ShadowCommitSubmit = {
   transcript: EffectTranscript;
   executor?: string;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  metric?: (event: MetricEvent) => void;
 };
 
 export type ShadowCommitAccepted = {
@@ -110,6 +111,7 @@ type ShadowCommitScopeSerializedRefs = {
 export type ShadowTranscriptApplyOptions = {
   objectTimestamp?: number;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  metric?: (event: MetricEvent) => void;
 };
 
 export function createShadowCommitScope(input: {
@@ -153,16 +155,17 @@ export function shadowScopeHeadForSerialized(scope: ObjRef, epoch: number, seria
 }
 
 export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommitSubmit): ShadowCommitResult {
-  const submissionId = submit.id ?? submit.transcript.id;
-  if (submissionId) {
-    const existing = scope.submissions.get(submissionId);
+  const submissionId = shadowSubmissionId(submit);
+  const submissionCacheKey = shadowSubmissionCacheKey(submit);
+  if (submissionCacheKey) {
+    const existing = scope.submissions.get(submissionCacheKey);
     if (existing) return existing;
   }
 
   const stateBefore = ensureShadowCommitScopeState(scope);
   const beforeReader = createCommitScopeStateCellReader(stateBefore);
   const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
-  const mergedState = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile });
+  const mergedState = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile, metric: submit.metric });
   const afterReader = createCommitScopeStateCellReader(mergedState);
   const extraErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
   extraErrors.push(...validateShadowPostState(afterReader, submit.transcript));
@@ -185,7 +188,15 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
       errors: receipt.errors,
       receipt
     };
-    if (submissionId) scope.submissions.set(submissionId, conflict);
+    // `stale_head` is a transient conflict: the same submission id can succeed
+    // on a later retry once the caller resubmits against the new head (or the
+    // relay's `executeShadowTurnCallAcrossInProcessNetwork` re-runs the verb
+    // and updates `expected` automatically). Caching the rejection by id would
+    // serve the stale conflict to every retry, which makes the convergence
+    // loop fail even though the underlying transcript would commit. Permanent
+    // rejections (post-state mismatch, permission, invariant) stay cached so
+    // re-submissions don't retry doomed work.
+    if (submissionCacheKey && conflict.reason !== "stale_head") scope.submissions.set(submissionCacheKey, conflict);
     return conflict;
   }
 
@@ -204,7 +215,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     observations: submit.transcript.observations,
     receipt
   };
-  if (submissionId) scope.submissions.set(submissionId, accepted);
+  if (submissionCacheKey) scope.submissions.set(submissionCacheKey, accepted);
   return accepted;
 }
 
@@ -218,11 +229,24 @@ export function applyAcceptedShadowFrame(
   // and authority head without running the expensive authority checks again.
   applyShadowTranscriptToCommitScopeCache(scope, transcript);
   scope.head = structuredClone(accepted.position) as ShadowScopeHead;
-  if (accepted.id) scope.submissions.set(accepted.id, structuredClone(accepted) as ShadowCommitAccepted);
+  if (accepted.id) scope.submissions.set(`${accepted.id}:${accepted.transcript_hash}`, structuredClone(accepted) as ShadowCommitAccepted);
 }
 
-export function applyShadowTranscriptToCommitScopeCache(scope: ShadowCommitScope, transcript: EffectTranscript): void {
-  const state = applyShadowTranscriptToIndexedState(ensureShadowCommitScopeState(scope), transcript);
+function shadowSubmissionId(submit: ShadowCommitSubmit): string | undefined {
+  return submit.id ?? submit.transcript.id;
+}
+
+function shadowSubmissionCacheKey(submit: ShadowCommitSubmit): string | undefined {
+  const id = shadowSubmissionId(submit);
+  return id ? `${id}:${submit.transcript.hash}` : undefined;
+}
+
+export function applyShadowTranscriptToCommitScopeCache(
+  scope: ShadowCommitScope,
+  transcript: EffectTranscript,
+  options: ShadowTranscriptApplyOptions = {}
+): void {
+  const state = applyShadowTranscriptToIndexedState(ensureShadowCommitScopeState(scope), transcript, options);
   scope.serialized = commitShadowCommitScopeState(scope, state);
 }
 
@@ -268,7 +292,7 @@ function validateShadowPostState(reader: TranscriptCellReader, transcript: Effec
     if (write.next !== undefined && actual.version !== write.next) {
       errors.push(`post_state_mismatch ${cellLabel(write.cell)} version: transcript=${write.next} actual=${actual.version ?? "none"}`);
     }
-    if (!writeValueMatchesPostState(write, actual.value)) {
+    if (!writeValueMatchesPostState(write, actual.value, transcript)) {
       errors.push(`post_state_mismatch ${cellLabel(write.cell)} value`);
     }
   }
@@ -477,7 +501,7 @@ function applyShadowTranscriptToIndexedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, options.objectTimestamp);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
@@ -614,7 +638,7 @@ export function applyShadowTranscriptToCommittedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, options.objectTimestamp);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
@@ -745,7 +769,8 @@ type SpaceLogEntryLike = SerializedWorld["logs"][number][1][number];
 export function applyTranscriptWriteToSerializedObject(
   target: SerializedObject,
   write: TranscriptWrite,
-  objectTimestamp: number | undefined
+  transcript: EffectTranscript,
+  options: ShadowTranscriptApplyOptions = {}
 ): void {
   // Keep this serialized-object materializer parallel with
   // WooWorld.applyTranscriptWriteInPlace. The storage shapes differ, but the
@@ -753,15 +778,15 @@ export function applyTranscriptWriteToSerializedObject(
   switch (write.cell.kind) {
     case "prop":
       applyPropWrite(target, write);
-      touchSerializedObject(target, objectTimestamp);
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     case "location":
       if (typeof write.value === "string" || write.value === null) target.location = write.value;
-      touchSerializedObject(target, objectTimestamp);
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     case "contents":
-      if (Array.isArray(write.value)) target.contents = write.value.filter((item): item is ObjRef => typeof item === "string");
-      touchSerializedObject(target, objectTimestamp);
+      applyTranscriptContentsWrite(target, write, transcript, options.metric);
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     case "lifecycle": {
       // Recycle/delete materialization is still outside the shadow applier.
@@ -774,6 +799,75 @@ export function applyTranscriptWriteToSerializedObject(
       // accepted verb-edit materialization is intentionally not implemented.
       return;
   }
+}
+
+function applyTranscriptContentsWrite(
+  target: SerializedObject,
+  write: TranscriptWrite,
+  transcript: EffectTranscript,
+  metric?: (event: MetricEvent) => void
+): void {
+  target.contents = applyTranscriptContentsWriteRefs(target.contents, write, transcript, metric);
+}
+
+export function applyTranscriptContentsWriteRefs(
+  current: readonly ObjRef[],
+  write: TranscriptWrite,
+  transcript: EffectTranscript,
+  metric?: (event: MetricEvent) => void
+): ObjRef[] {
+  // Move/create transcripts record whole post-write contents arrays for
+  // validation, but committed replay must merge the operation intent. Replacing
+  // the array here would drop concurrent adds already accepted into the base.
+  const refs = transcriptContentsWriteRefs(write);
+  if (write.op === "add") {
+    const next = current.slice();
+    const added = transcriptContentAddsForContainer(transcript, write.cell.object);
+    for (const ref of (added.length > 0 ? added : refs)) addUniqueObjectRef(next, ref);
+    return next;
+  }
+  if (write.op === "remove") {
+    const removed = transcriptContentRemovesForContainer(transcript, write.cell.object);
+    if (removed.length > 0) {
+      const remove = new Set(removed);
+      return current.filter((ref) => !remove.has(ref));
+    }
+    metric?.({
+      kind: "shadow_transcript_anomaly",
+      scope: transcript.scope,
+      route: transcript.route,
+      reason: "contents_remove_without_move",
+      object: write.cell.object,
+      ...(transcript.id ? { id: transcript.id } : {})
+    });
+    return current.slice();
+  }
+  return refs;
+}
+
+function transcriptContentsWriteRefs(write: TranscriptWrite): ObjRef[] {
+  return Array.isArray(write.value)
+    ? write.value.filter((item): item is ObjRef => typeof item === "string")
+    : [];
+}
+
+function transcriptContentAddsForContainer(transcript: EffectTranscript, container: ObjRef): ObjRef[] {
+  const refs = new Set<ObjRef>();
+  for (const move of transcript.moves) {
+    if (move.to === container) refs.add(move.object);
+  }
+  for (const create of transcript.creates) {
+    if (create.location === container) refs.add(create.object);
+  }
+  return Array.from(refs).sort();
+}
+
+function transcriptContentRemovesForContainer(transcript: EffectTranscript, container: ObjRef): ObjRef[] {
+  const refs = new Set<ObjRef>();
+  for (const move of transcript.moves) {
+    if (move.from === container) refs.add(move.object);
+  }
+  return Array.from(refs).sort();
 }
 
 function touchSerializedObject(target: SerializedObject, objectTimestamp: number | undefined): void {
@@ -917,8 +1011,24 @@ function isWizard(index: SerializedAuthorityIndex, id: ObjRef): boolean {
   return serializedObject(index, id)?.flags.wizard === true;
 }
 
-function writeValueMatchesPostState(write: TranscriptWrite, actual: WooValue): boolean {
+function writeValueMatchesPostState(write: TranscriptWrite, actual: WooValue, transcript: EffectTranscript): boolean {
   if (write.cell.kind === "lifecycle" && write.op === "create") return actual === "present";
+  if (write.cell.kind === "contents") return contentsWriteMatchesPostState(write, actual, transcript);
+  return stableShadowJson(write.value) === stableShadowJson(actual);
+}
+
+function contentsWriteMatchesPostState(write: TranscriptWrite, actual: WooValue, transcript: EffectTranscript): boolean {
+  if (!Array.isArray(actual)) return false;
+  const actualRefs = new Set(actual.filter((item): item is ObjRef => typeof item === "string"));
+  if (write.op === "add") {
+    const added = transcriptContentAddsForContainer(transcript, write.cell.object);
+    const required = added.length > 0 ? added : transcriptContentsWriteRefs(write);
+    return required.every((ref) => actualRefs.has(ref));
+  }
+  if (write.op === "remove") {
+    const removed = transcriptContentRemovesForContainer(transcript, write.cell.object);
+    if (removed.length > 0) return removed.every((ref) => !actualRefs.has(ref));
+  }
   return stableShadowJson(write.value) === stableShadowJson(actual);
 }
 

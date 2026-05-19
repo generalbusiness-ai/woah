@@ -1,7 +1,7 @@
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { constantTimeEqual, hashSource, randomHex } from "../src/core/source-hash";
+import { constantTimeEqual, hashSource, randomHex, utf8ByteLength } from "../src/core/source-hash";
 
 // FIPS 180-4 SHA-256 conformance vectors. These are the canonical test
 // vectors from the SHA-256 specification — every conforming implementation
@@ -134,6 +134,14 @@ describe("randomHex", () => {
     expect(() => randomHex(-1)).toThrow(RangeError);
     expect(() => randomHex(1.5)).toThrow(RangeError);
     expect(() => randomHex(Number.NaN)).toThrow(RangeError);
+  });
+});
+
+describe("utf8ByteLength", () => {
+  it("matches Node Buffer byte lengths for ASCII and multibyte input", () => {
+    for (const input of ["", "abc", "é́", "字符串", "ok🦊", "\ud800", "a\ud800b"]) {
+      expect(utf8ByteLength(input), JSON.stringify(input)).toBe(Buffer.byteLength(input, "utf8"));
+    }
   });
 });
 

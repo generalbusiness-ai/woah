@@ -686,7 +686,10 @@ browser UI's add-child path passes its parent explicitly. The two
 states can diverge — that is intentional. If you switch from chat to
 browser (or vice versa) you re-establish "where I'm working" via the
 new tool's idiom.
-- Drag-handle on each row. Drop targets: above/below siblings (calls
+
+Other component-owned surfaces:
+
+- Drag/drop on each row. Drop targets: above/below siblings (calls
   `reorder_item`) and onto a node (calls `move_item` with that node
   as new parent, index = end). Visual indicator only between rows.
 - Hidden checkbox on each row. Routes to `outliner:hide(item, on)` — never to `item:set_hidden` directly. (Item-side write verbs are internal building blocks that don't emit observations or write the undo slot; only the outliner-side composer is on the user-facing path.)

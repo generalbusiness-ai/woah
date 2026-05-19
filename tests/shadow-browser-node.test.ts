@@ -1508,6 +1508,50 @@ describe("shadow browser node shim", () => {
     expect(reply?.body.mode === "cell_pages" ? reply.body.inline_pages.length : 0).toBeGreaterThan(0);
     expect(browser.relay.commit_scope.head.seq).toBe(0);
   });
+
+  it("does not let a stale browser close remove replacement node auth", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-reload-auth");
+    await anchor.directCall("browser-reload-auth-enter", session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay",
+      scope: "the_dubspace",
+      serialized: anchor.exportWorld()
+    });
+    const token = `session:${session.id}`;
+    const stale = createShadowBrowserNode({
+      node: "browser-reload",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay
+    });
+    setShadowBrowserSessionToken(stale, token);
+    await openShadowBrowserScope(stale, { preseed_catalog_pages: true });
+    const replacement = createShadowBrowserNode({
+      node: stale.node,
+      scope: stale.scope,
+      actor: stale.actor,
+      session: stale.session,
+      relay
+    });
+    setShadowBrowserSessionToken(replacement, token);
+    await openShadowBrowserScope(replacement, { preseed_catalog_pages: true });
+
+    disposeShadowBrowserNode(stale);
+
+    expect(relay.browsers.get(stale.node)).toBe(replacement);
+    expect(() => shadowBrowserEnvelope(replacement, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "browser-reload-auth-intent",
+      route: "sequenced" as const,
+      scope: replacement.scope,
+      target: "the_dubspace",
+      verb: "look",
+      args: [],
+      persistence: "durable" as const
+    })).not.toThrow();
+  });
 });
 
 async function browserForScope<T = undefined>(

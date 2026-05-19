@@ -160,6 +160,7 @@ function missingAtomsForRecorderEvent(
 function shadowAtomPreimagesForRecorderEvent(event: TurnRecorderEvent): string[] {
   switch (event.kind) {
     case "cell_read":
+    case "state_probe":
       return [shadowReadCellPreimage(event.cell)];
     case "cell_write":
       return [shadowWriteCellPreimage(event.cell)];

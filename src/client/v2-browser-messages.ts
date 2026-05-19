@@ -32,7 +32,10 @@ export type V2AppliedFrameMessage = {
 export type V2TurnResultMessage = {
   kind: "turn_result";
   frame: DirectResultFrame | ErrorFrame;
+  optimistic?: boolean;
 };
+
+export type V2TurnResultRoute = "final_result" | "final_error" | "optimistic_result" | "optimistic_error";
 
 export type V2ProjectionSnapshot = {
   scope: string;
@@ -40,6 +43,11 @@ export type V2ProjectionSnapshot = {
   cursor?: { spaces?: Record<string, { next_seq?: number }> };
   subject?: Record<string, unknown> | null;
 };
+
+export function v2TurnResultRoute(message: V2TurnResultMessage): V2TurnResultRoute {
+  if (message.frame.op === "result") return message.optimistic === true ? "optimistic_result" : "final_result";
+  return message.optimistic === true ? "optimistic_error" : "final_error";
+}
 
 export function v2ProjectionMessageFromRow(row: unknown, options: { cached?: boolean } = {}): V2ProjectionMessage | undefined {
   if (!row || typeof row !== "object" || Array.isArray(row)) return undefined;

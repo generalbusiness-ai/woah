@@ -794,8 +794,8 @@ test("outliner shares committed items with another user and survives reload", as
     await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-    const firstTree = first.locator("woo-outliner-tree[data-generic-tool-workspace]");
-    const secondTree = second.locator("woo-outliner-tree[data-generic-tool-workspace]");
+    const firstTree = first.locator("woo-outliner-tree").first();
+    const secondTree = second.locator("woo-outliner-tree").first();
     await expect(firstTree).toBeVisible({ timeout: 5_000 });
     await expect(secondTree).toBeVisible({ timeout: 5_000 });
 

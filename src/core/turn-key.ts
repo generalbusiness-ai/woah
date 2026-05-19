@@ -44,6 +44,11 @@ export function shadowTurnKeyFromTranscript(transcript: EffectTranscript): Shado
     readPreimages.add(preimage);
     preimages.add(preimage);
   }
+  for (const cell of transcript.stateProbes ?? []) {
+    const preimage = shadowReadCellPreimage(cell);
+    readPreimages.add(preimage);
+    preimages.add(preimage);
+  }
   for (const write of transcript.writes) {
     const preimage = shadowWriteCellPreimage(write.cell);
     writePreimages.add(preimage);

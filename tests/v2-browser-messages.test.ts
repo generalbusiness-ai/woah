@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2ProjectionSnapshotFromMessage, v2TurnResultMessageFromReply } from "../src/client/v2-browser-messages";
+import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2ProjectionSnapshotFromMessage, v2TurnResultMessageFromReply, v2TurnResultRoute } from "../src/client/v2-browser-messages";
 
 describe("v2 browser worker messages", () => {
   it("builds projection messages only from well-shaped cached rows", () => {
@@ -162,5 +162,39 @@ describe("v2 browser worker messages", () => {
         audience: null
       }
     });
+  });
+
+  it("routes optimistic error frames separately from final errors", () => {
+    expect(v2TurnResultRoute({
+      kind: "turn_result",
+      optimistic: true,
+      frame: {
+        op: "error",
+        id: "drop-1",
+        error: { code: "E_OBJNF", message: "object not found: the_towel" }
+      }
+    })).toBe("optimistic_error");
+
+    expect(v2TurnResultRoute({
+      kind: "turn_result",
+      frame: {
+        op: "error",
+        id: "drop-1",
+        error: { code: "E_OBJNF", message: "object not found: the_towel" }
+      }
+    })).toBe("final_error");
+
+    expect(v2TurnResultRoute({
+      kind: "turn_result",
+      optimistic: true,
+      frame: {
+        op: "result",
+        id: "drop-1",
+        command: { actor: "me", target: "the_towel", verb: "drop", args: [] },
+        result: null,
+        observations: [],
+        audience: null
+      }
+    })).toBe("optimistic_result");
   });
 });

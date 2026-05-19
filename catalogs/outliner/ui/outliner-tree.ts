@@ -149,9 +149,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
     try {
       do {
         this.hydratePending = false;
-        // Read-side query: directCall resolves with the verb's actual return
-        // value. (`woo.call` is fire-and-forget and resolves with the request
-        // id — the reply lands via the observation reducer, not this promise.)
         // Roster fetched in parallel with list_items — both are independent
         // RX verbs on the outliner space.
         const [items, roster] = await Promise.all([
@@ -413,9 +410,9 @@ export class WooOutlinerTreeElement extends HTMLElement {
     `;
   }
 
-  // Pseudo-row rendered directly below the selected row when addingChild
-  // is true. The submit handler passes the selected row id as the parent
-  // explicitly, so this is purely a visual surface.
+  // Pseudo-row rendered directly below the selected row when addingChild is
+  // true. The submit handler calls `add_item(text, selectedId)` explicitly, so
+  // this browser-local selection never depends on server-side focus.
   //
   // A single twistie-column spacer sits before the form so the input
   // column-aligns with where the new child's text will land once it's

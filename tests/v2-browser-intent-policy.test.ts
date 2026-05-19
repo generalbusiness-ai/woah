@@ -10,7 +10,7 @@ describe("v2 browser intent fallback policy", () => {
     });
   });
 
-  it("allows cold durable delegation only when a scope ad has selected an executor", () => {
+  it("allows selected durable intent through explicit scope delegation", () => {
     expect(v2ServerAssistedIntentPolicy({
       route: "sequenced",
       persistence: "durable",

@@ -51,6 +51,8 @@ import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
+const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
+
 export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
   private snapshotLoaded = false;
@@ -137,6 +139,25 @@ export class CommitScopeDO {
             this.needsFullSave = false;
             fullSave = true;
           }
+          const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
+          this.emitMetric({
+            kind: "shadow_open_executable_seed_bytes",
+            scope,
+            node,
+            bytes: opened.executable_transfer_bytes,
+            pages: opened.executable_transfer_pages,
+            inline_pages: opened.executable_transfer_inline_pages,
+            status: seedStatus
+          });
+          if (seedStatus === "warn") {
+            console.warn("woo.shadow_open_executable_seed_bytes.warn", {
+              scope,
+              node,
+              bytes: opened.executable_transfer_bytes,
+              pages: opened.executable_transfer_pages,
+              inline_pages: opened.executable_transfer_inline_pages
+            });
+          }
           this.emitMetric({
             kind: "v2_open",
             scope,
@@ -152,6 +173,7 @@ export class CommitScopeDO {
             hello,
             head: relay.commit_scope.head,
             transfer: opened.transfer,
+            executable_transfer: opened.executable_transfer,
             ads: opened.ads
           } satisfies CommitScopeOpenResponse);
         } catch (err) {
@@ -882,6 +904,7 @@ type CommitScopeOpenResponse = {
   hello: ShadowTransportHello;
   head: ShadowScopeHead;
   transfer: ShadowBrowserStateTransfer;
+  executable_transfer: ShadowBrowserStateTransfer;
   ads: ShadowCapabilityAd[];
 };
 

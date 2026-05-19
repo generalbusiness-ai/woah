@@ -166,4 +166,16 @@ describe("chat catalog UI components", () => {
     expect(container.textContent).not.toContain("the_dubspace");
     expect(container.textContent).not.toContain("zzzz");
   });
+
+  it("marks provisional error lines as retractable chat output", () => {
+    const html = renderChatLineHtml(
+      { kind: "error", source: "the_deck", turnId: "drop-1", provisional: true, text: "object not found: the_towel", ts: 1 },
+      (id) => id || "unknown"
+    );
+
+    const container = document.createElement("div");
+    container.innerHTML = html;
+    expect(container.querySelector(".chat-line.error.provisional")).toBeTruthy();
+    expect(container.textContent).toContain("object not found: the_towel");
+  });
 });

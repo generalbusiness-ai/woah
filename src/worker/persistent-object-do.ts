@@ -125,6 +125,7 @@ type CommitScopeOpenResponse = {
     features: string[];
   };
   transfer: ShadowBrowserStateTransfer;
+  executable_transfer?: ShadowBrowserStateTransfer;
   ads?: ShadowCapabilityAd[];
 };
 
@@ -2642,6 +2643,20 @@ export class PersistentObjectDO {
         auth: { mode: "session", token },
         body: transfer
       } satisfies ShadowEnvelope<typeof transfer>));
+      const executableTransfer = opened.executable_transfer;
+      if (executableTransfer) {
+        server.send(encodeEnvelope({
+          v: 2,
+          type: executableTransfer.kind,
+          id: `${this.durableHostKey()}:exec-state:${crypto.randomUUID()}`,
+          from: opened.relay,
+          to: node,
+          actor: session.actor,
+          session: session.id,
+          auth: { mode: "session", token },
+          body: executableTransfer
+        } satisfies ShadowEnvelope<typeof executableTransfer>));
+      }
       for (const ad of opened.ads ?? []) {
         server.send(encodeEnvelope({
           v: 2,

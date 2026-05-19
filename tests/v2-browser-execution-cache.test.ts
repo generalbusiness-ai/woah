@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { createWorld } from "../src/core/bootstrap";
+import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowCellPageTransfer, buildShadowClosureTransfer, createShadowExecutionNode, installShadowStateTransfer } from "../src/core/shadow-turn-exec";
 import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
-import { createV2BrowserExecutionNodeFromTransfers, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
+import { createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTransfers, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
 
 describe("v2 browser executable cache", () => {
   it("reconstructs an execution node from persisted executable transfers", () => {
@@ -77,6 +78,36 @@ describe("v2 browser executable cache", () => {
     });
     expect(rebuilt.serialized?.objects.find((object) => object.id === "the_dubspace")).toBeTruthy();
   });
+
+  it("uses a checkpoint as the replay base and skips older executable transfers", () => {
+    const key = turnKey("#room");
+    const base = buildShadowClosureTransfer({ serialized: serializedWorld(), key });
+    const oldRecord = v2ExecutableTransferRecord(base, 100);
+    const first = propTranscript("turn-1", 1, "checkpointed");
+    const checkpoint = createV2BrowserExecutionCheckpoint({
+      node: "browser:test",
+      scope: "#room",
+      records: [oldRecord],
+      committed_transcripts: [first],
+      through_seq: 1,
+      updated_at: 200
+    });
+    expect(checkpoint?.transfer_high_watermark).toBe(100);
+
+    const second = propTranscript("turn-2", 2, "tail");
+    const composed = createV2BrowserExecutionNodeFromTransfers({
+      node: "browser:test",
+      scope: "#room",
+      // Reinstalling this old closure over the checkpoint would erase the
+      // checkpointed property. The checkpoint high-watermark makes it history.
+      records: [oldRecord],
+      checkpoint,
+      committed_transcripts: [second]
+    });
+
+    const room = composed.serialized?.objects.find((object) => object.id === "#room");
+    expect(room?.properties).toContainEqual(["marker", "tail"]);
+  });
 });
 
 function turnKey(scope: string): ShadowTurnKey {
@@ -131,5 +162,38 @@ function objectRecord(id: string, name: string, location: string | null): Serial
     children: [],
     contents: [],
     eventSchemas: []
+  };
+}
+
+function propTranscript(id: string, seq: number, value: string): EffectTranscript {
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    id,
+    route: "sequenced",
+    scope: "#room",
+    seq,
+    session: "session-1",
+    call: {
+      actor: "#actor",
+      target: "#room",
+      verb: "set_marker",
+      args: [value],
+      body: undefined
+    },
+    reads: [],
+    writes: [{
+      cell: { kind: "prop", object: "#room", name: "marker" },
+      value,
+      op: "set",
+      next: `marker:${seq}`
+    }],
+    creates: [],
+    moves: [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: `hash:${id}`
   };
 }
