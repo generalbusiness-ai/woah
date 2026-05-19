@@ -643,8 +643,20 @@ The component owns:
 - Enter/Leave controls. These call the outliner's normal `$space`
   `enter`/`leave` verbs; when present, the host mounts the shared
   minichat into the component's ambient companion slot.
-- Inline text editing on click (single-line input that grows for long
-  text). No popup; commit on blur or Enter. Routes to `set_item_text`.
+- **Click-row-to-focus, click-again-to-edit.** A single click on an
+  unfocused row calls `focus_on` (the row's id). A click on the
+  already-focused row enters inline text editing — single-line input,
+  commit on blur or Enter, routes to `set_item_text`. There is no
+  separate focus button; the row itself is the affordance.
+- **Create-in-place.** When a row is focused, the top "add an item…"
+  form is hidden and the focus row carries a `+` button. Clicking it
+  opens an inline new-child editor immediately below the focus row at
+  the next indent level — making it visually obvious where the new
+  item will land. Submitting calls `add(text)`, which on the server
+  defaults the parent to the actor's current focus. Pressing Escape
+  or submitting empty text cancels. When focus is null/root the top
+  add form is shown (no per-row `+`); to add at root from a focused
+  state, the toolbar's focus chip is clickable and returns to root.
 - Drag-handle on each row. Drop targets: above/below siblings (calls
   `reorder_item`) and onto a node (calls `move_item` with that node
   as new parent, index = end). Visual indicator only between rows.

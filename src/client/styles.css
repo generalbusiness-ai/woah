@@ -1725,10 +1725,57 @@ woo-outliner-tree {
   white-space: nowrap;
 }
 
+/* When focus is set, the chip is a real button so clicking it returns to
+   root. The plain-text variant (focus == null) keeps the same baseline. */
+button.outliner-focus {
+  cursor: pointer;
+}
+
+/* The text cell becomes the row's primary affordance (click row to focus,
+   click again to edit). Keep the bare text looking like text — the row
+   border + focus highlight signal interactivity — but give it a pointer
+   cursor so the hit area still reads as actionable. */
+.outliner-text {
+  cursor: pointer;
+}
+
+/* Click-to-edit affordance is on the whole row now. Show that with a
+   pointer cursor on .outliner-row-inner, except over the form/inputs which
+   carry their own cursor. */
+.outliner-row-inner {
+  cursor: pointer;
+}
+.outliner-row-inner input,
+.outliner-row-inner button,
+.outliner-row-inner form {
+  cursor: auto;
+}
+.outliner-row-inner button {
+  cursor: pointer;
+}
+
+/* The in-place add-child placeholder sits as a child row directly below
+   the focus row. Visually identical to a regular row so the user reads it
+   as "the new item will land here", but with a dashed border to make the
+   pending nature obvious. */
+.outliner-row-pending .outliner-row-inner {
+  border-bottom-style: dashed;
+}
+
 .outliner-add input,
 .outliner-edit input {
   min-width: 0;
   flex: 1 1 auto;
+}
+
+/* The edit form replaces .outliner-text inside .outliner-row-inner's flex
+   row. Without these the form shrinks to the input's intrinsic width and
+   the focus/remove buttons slide up next to it. Matching .outliner-text's
+   flex sizing keeps the buttons at the row's right edge. */
+.outliner-edit {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .outliner-rows {
