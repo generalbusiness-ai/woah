@@ -1,5 +1,7 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { EffectTranscript } from "../core/effect-transcript";
+import type { SerializedObject } from "../core/repository";
+import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { applyShadowScopeProjectionPatch, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
@@ -383,20 +385,29 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     postMessage({ kind: "local_turn_fallback", id: command.id, reason: "no_head" });
     return false;
   }
-  const local = await planV2BrowserLocalTurn({
-    node: current.node,
-    actor: current.actor,
-    session: current.session ?? null,
-    head: cachedHead,
-    id: command.id,
-    route: command.route,
-    scope,
-    target: command.target,
-    verb: command.verb,
-    args: Array.isArray(command.args) ? command.args as WooValue[] : [],
-    persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable"),
-    transfers: await allExecutionTransfers()
-  });
+  let local: V2BrowserLocalTurnResult;
+  try {
+    const executionCache = await executionCacheForScope(scope);
+    local = await planV2BrowserLocalTurn({
+      node: current.node,
+      actor: current.actor,
+      session: current.session ?? null,
+      head: cachedHead,
+      id: command.id,
+      route: command.route,
+      scope,
+      target: command.target,
+      verb: command.verb,
+      args: Array.isArray(command.args) ? command.args as WooValue[] : [],
+      persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable"),
+      transfers: executionCache.records,
+      cached_objects: executionCache.cached_objects,
+      cached_pages: executionCache.cached_pages
+    });
+  } catch (err) {
+    postMessage({ kind: "local_turn_fallback", id: command.id, reason: "local_planning_error", error: errorMessage(err) });
+    return false;
+  }
   if (!local.ok) {
     if (local.reason === "missing_state" && local.request && local.key) {
       if (!repaired && await repairLocalExecutableState(local, command.id)) {
@@ -706,14 +717,62 @@ async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
   return await tx<V2ExecutableTransferRecord[]>(EXECUTION_TRANSFER_STORE, "readonly", (store) => store.getAll());
 }
 
+async function executionCacheForScope(
+  scope: string,
+  records?: readonly V2ExecutableTransferRecord[]
+): Promise<{ records: V2ExecutableTransferRecord[]; cached_objects: SerializedObject[]; cached_pages: ShadowStatePage[] }> {
+  const sourceRecords = records ?? await allExecutionTransfers();
+  const scopedRecords = sourceRecords.filter((record) => record.scope === scope);
+  const objectHashes = new Set<string>();
+  const pageHashes = new Set<string>();
+  for (const record of scopedRecords) {
+    const transfer = record.transfer;
+    if (transfer.mode === "object_records") {
+      for (const page of transfer.object_pages) objectHashes.add(page.hash);
+    } else if (transfer.mode === "cell_pages") {
+      for (const page of transfer.page_refs) pageHashes.add(page.hash);
+    }
+  }
+  return {
+    records: scopedRecords,
+    cached_objects: await cachedObjectsByHash(objectHashes),
+    cached_pages: await cachedStatePagesByHash(pageHashes)
+  };
+}
+
+async function cachedObjectsByHash(hashes: Iterable<string>): Promise<SerializedObject[]> {
+  const objects: SerializedObject[] = [];
+  for (const hash of hashes) {
+    const row = await tx<{ record?: unknown } | undefined>(OBJECT_PAGE_STORE, "readonly", (store) => store.get(hash));
+    if (isSerializedObject(row?.record)) objects.push(row.record);
+  }
+  return objects;
+}
+
+async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowStatePage[]> {
+  const pages: ShadowStatePage[] = [];
+  for (const hash of hashes) {
+    const row = await tx<{ page?: unknown } | undefined>(STATE_PAGE_STORE, "readonly", (store) => store.get(hash));
+    if (isShadowStatePage(row?.page)) pages.push(row.page);
+  }
+  return pages;
+}
+
 async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {
   return await tx<V2ExecutionAdRecord[]>(EXECUTION_AD_STORE, "readonly", (store) => store.getAll());
 }
 
 async function status(): Promise<V2CacheStatus> {
   const executionTransfers = await allExecutionTransfers();
+  const executionCache = current?.scope ? await executionCacheForScope(current.scope, executionTransfers) : undefined;
   const localExecutionReady = current?.scope
-    ? canReconstructExecutionNode(current.node, current.scope, executionTransfers)
+    ? canReconstructExecutionNode(
+      current.node,
+      current.scope,
+      executionCache?.records ?? executionTransfers,
+      executionCache?.cached_objects ?? [],
+      executionCache?.cached_pages ?? []
+    )
     : undefined;
   return {
     connected: socket?.readyState === WebSocket.OPEN,
@@ -738,14 +797,34 @@ function executableScopes(records: readonly V2ExecutableTransferRecord[]): strin
   return Array.from(scopes).sort();
 }
 
-function canReconstructExecutionNode(node: string, scope: string, records: readonly V2ExecutableTransferRecord[]): boolean {
+function canReconstructExecutionNode(
+  node: string,
+  scope: string,
+  records: readonly V2ExecutableTransferRecord[],
+  cachedObjects: readonly SerializedObject[] = [],
+  cachedPages: readonly ShadowStatePage[] = []
+): boolean {
   if (!records.some((record) => record.scope === scope)) return false;
   try {
-    const executionNode = createV2BrowserExecutionNodeFromTransfers({ node, scope, records });
+    const executionNode = createV2BrowserExecutionNodeFromTransfers({
+      node,
+      scope,
+      records,
+      cached_objects: cachedObjects,
+      cached_pages: cachedPages
+    });
     return executionNode.serialized !== undefined;
   } catch {
     return false;
   }
+}
+
+function isSerializedObject(value: unknown): value is SerializedObject {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && typeof (value as { id?: unknown }).id === "string");
+}
+
+function isShadowStatePage(value: unknown): value is ShadowStatePage {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && typeof (value as { kind?: unknown }).kind === "string" && typeof (value as { page?: unknown }).page === "string");
 }
 
 async function countStore(storeName: string): Promise<number> {

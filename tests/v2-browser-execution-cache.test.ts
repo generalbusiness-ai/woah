@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { createV2BrowserExecutionNodeFromTransfers, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
+import { createWorld } from "../src/core/bootstrap";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
-import { buildShadowClosureTransfer } from "../src/core/shadow-turn-exec";
-import { shadowAtomHash, type ShadowTurnKey } from "../src/core/turn-key";
+import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
+import { buildShadowCellPageTransfer, buildShadowClosureTransfer, createShadowExecutionNode, installShadowStateTransfer } from "../src/core/shadow-turn-exec";
+import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
+import { createV2BrowserExecutionNodeFromTransfers, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
 
 describe("v2 browser executable cache", () => {
   it("reconstructs an execution node from persisted executable transfers", () => {
@@ -35,6 +37,45 @@ describe("v2 browser executable cache", () => {
 
     expect(node.serialized).toBeUndefined();
     expect(node.atom_hashes.size).toBe(0);
+  });
+
+  it("rebuilds executable state from compact transfer refs plus cached pages", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-execution-cache");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const serialized = world.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "v2-browser-cache-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor: session.actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.42]
+    };
+    const planned = await runShadowTurnCall(serialized, call);
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    const fullTransfer = buildShadowCellPageTransfer({ serialized, key, session: session.id });
+    const compactTransfer = buildShadowCellPageTransfer({
+      serialized,
+      key,
+      known_page_hashes: fullTransfer.page_refs.map((ref) => ref.hash),
+      session: session.id
+    });
+    expect(compactTransfer.inline_pages).toEqual([]);
+
+    const coldNode = createShadowExecutionNode({ node: "browser:v2-cache", scope: "the_dubspace" });
+    expect(() => installShadowStateTransfer(coldNode, compactTransfer)).toThrow(/missing cached shadow state page/);
+
+    const rebuilt = createV2BrowserExecutionNodeFromTransfers({
+      node: "browser:v2-cache",
+      scope: "the_dubspace",
+      records: [v2ExecutableTransferRecord(compactTransfer)],
+      cached_pages: fullTransfer.inline_pages
+    });
+    expect(rebuilt.serialized?.objects.find((object) => object.id === "the_dubspace")).toBeTruthy();
   });
 });
 

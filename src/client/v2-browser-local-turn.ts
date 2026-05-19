@@ -3,6 +3,8 @@ import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { executeShadowTurnCallOrNeedState, missingAtomsForShadowTurn, type ShadowMissingAtom, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 import type { ShadowTurnKey } from "../core/turn-key";
+import type { SerializedObject } from "../core/repository";
+import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ObjRef, WooValue } from "../core/types";
 import { createV2BrowserExecutionNodeFromTransfers, type V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 
@@ -20,6 +22,8 @@ export type V2BrowserLocalTurnInput = {
   body?: Record<string, WooValue>;
   persistence: "durable" | "live";
   transfers: readonly V2ExecutableTransferRecord[];
+  cached_objects?: readonly SerializedObject[];
+  cached_pages?: readonly ShadowStatePage[];
 };
 
 export type V2BrowserLocalTurnResult =
@@ -42,7 +46,9 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
   const executionNode = createV2BrowserExecutionNodeFromTransfers({
     node: input.node,
     scope: input.scope,
-    records: input.transfers
+    records: input.transfers,
+    cached_objects: input.cached_objects,
+    cached_pages: input.cached_pages
   });
   if (!executionNode.serialized) return { ok: false, reason: "no_executable_state" };
 

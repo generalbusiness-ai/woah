@@ -1,5 +1,7 @@
 import { createShadowExecutionNode, installShadowStateTransfer, type ShadowExecutionNode, type ShadowStateTransfer } from "../core/shadow-turn-exec";
 import { stableShadowJson } from "../core/shadow-cell-version";
+import type { SerializedObject } from "../core/repository";
+import type { ShadowStatePage } from "../core/shadow-state-pages";
 import { hashSource } from "../core/source-hash";
 import type { ObjRef, WooValue } from "../core/types";
 
@@ -36,8 +38,15 @@ export function createV2BrowserExecutionNodeFromTransfers(input: {
   node: string;
   scope: ObjRef;
   records: readonly V2ExecutableTransferRecord[];
+  cached_objects?: readonly SerializedObject[];
+  cached_pages?: readonly ShadowStatePage[];
 }): ShadowExecutionNode {
-  const executionNode = createShadowExecutionNode({ node: input.node, scope: input.scope });
+  const executionNode = createShadowExecutionNode({
+    node: input.node,
+    scope: input.scope,
+    cached_objects: [...(input.cached_objects ?? [])],
+    cached_pages: [...(input.cached_pages ?? [])]
+  });
   const records = input.records
     .filter((record) => record.scope === input.scope)
     .slice()

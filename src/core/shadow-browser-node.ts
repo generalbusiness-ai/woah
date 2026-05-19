@@ -1197,8 +1197,15 @@ async function executeShadowBrowserLivePersistenceIntent(
   // state.
   const sessionKey = request.call.session ?? request.call.actor;
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? browser.relay.commit_scope.serialized;
+  const headHashBefore = browser.relay.commit_scope.head.hash;
   const run = await runShadowTurnCall(serializedBefore, request.call, { onMetric });
-  browser.relay.live_session_serialized.set(sessionKey, run.serializedAfter);
+  // A live/direct read may be started by UI hydration immediately after a
+  // fire-and-forget sequenced write. If that read finishes after the write
+  // commits, caching its pre-commit post-state would resurrect a stale live
+  // snapshot and make follow-up reads hide the accepted write.
+  if (browser.relay.commit_scope.head.hash === headHashBefore) {
+    browser.relay.live_session_serialized.set(sessionKey, run.serializedAfter);
+  }
   for (const event of shadowLiveEventsForTranscript(browser, run.transcript)) {
     publishShadowBrowserLiveEvent(browser.relay, event, { except: browser.node });
   }
