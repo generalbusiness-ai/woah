@@ -1752,24 +1752,41 @@ woo-outliner-tree {
 /* Row icon buttons (twistie, add-child, remove) reuse the shared
    .icon-button shell: flat by default, subtle background tint on hover.
    The per-button rules below just size and tune them for the dense row
-   context — they don't restate the chrome-reset that .icon-button does. */
+   context — they don't restate the chrome-reset that .icon-button does.
+   Default size matches the hide checkbox (1.1rem) so the right-side
+   cluster {add, hide, trash} reads as a uniform set of small icons;
+   the twistie overrides this with a roomier square below. */
 .outliner-row-inner .icon-button {
-  padding: 0.15rem;
-  border-radius: 4px;
-  /* Square footprint so the row baseline doesn't shift when buttons
-     appear/disappear (the + button only renders on the selected row). */
-  width: 1.4rem;
-  height: 1.4rem;
+  padding: 0;
+  border-radius: 3px;
+  width: 1.1rem;
+  height: 1.1rem;
+}
+/* Secondary icons fill the 1.1rem button nearly edge-to-edge — same
+   visual weight as the hide checkbox's "×" glyph sitting next to them.
+   The 24-unit lucide viewBox has ~3-unit padding inside the strokes, so
+   we render the SVG at ~16px (≈91% of the 17.6px button); that lands
+   the stroked content at roughly the same size as the × glyph. */
+.outliner-row-inner .icon-button svg {
+  width: 16px;
+  height: 16px;
 }
 
 /* Twistie is the row's primary structural affordance — it gets a larger
    footprint and a full-weight text colour, while the secondary trash and
    add-child icons stay muted via the inherited .icon-button colour. The
-   bigger chevron SVG (20px) needs a roomier square to breathe in. */
+   bigger chevron SVG (20px) needs a roomier square to breathe in.
+   The svg-size override here re-asserts 20px so the generic
+   .outliner-row-inner .icon-button svg rule (which compacts secondary
+   icons to 12px) doesn't shrink the chevron with them. */
 .outliner-row-inner .icon-button.outliner-twistie {
   width: 1.7rem;
   height: 1.7rem;
   color: var(--color-text);
+}
+.outliner-row-inner .icon-button.outliner-twistie svg {
+  width: 20px;
+  height: 20px;
 }
 
 .outliner-twistie-empty {
@@ -1777,6 +1794,64 @@ woo-outliner-tree {
   display: inline-flex;
   width: 1.7rem;
   height: 1.7rem;
+}
+
+/* Hide toggle. Visually a 16px SVG square (same stroke/viewBox style as
+   the plus-square add-child icon) whose two diagonal × strokes appear
+   only when the underlying checkbox is :checked. The native input is
+   kept for semantics (label-wrapped, click-toggleable, keyboard) but
+   hidden visually; the SVG carries the affordance. */
+.outliner-hide-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative; /* contains the visually-hidden absolute input */
+  width: 1.1rem;
+  height: 1.1rem;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.outliner-hide-toggle input {
+  /* Visually hidden but still focusable and click-toggleable through
+     the label. Don't use display:none — that drops focus handling. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.outliner-hide-glyph {
+  display: block;
+  pointer-events: none;
+}
+
+/* × strokes hidden by default; revealed when the checkbox is checked. */
+.outliner-hide-glyph .outliner-hide-x {
+  opacity: 0;
+}
+
+.outliner-hide-toggle:hover {
+  color: var(--color-text);
+}
+
+.outliner-hide-toggle input:checked + .outliner-hide-glyph .outliner-hide-x {
+  opacity: 1;
+}
+
+.outliner-hide-toggle input:checked + .outliner-hide-glyph {
+  color: var(--color-text);
+}
+
+/* Keep the focus ring visible when the user tabs to the toggle — without
+   this, the visually-hidden input takes focus invisibly. */
+.outliner-hide-toggle input:focus-visible + .outliner-hide-glyph rect {
+  stroke: var(--color-accent, currentColor);
 }
 
 /* Remove icon is destructive — keep it muted by default so it doesn't

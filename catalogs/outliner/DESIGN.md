@@ -690,8 +690,11 @@ new tool's idiom.
   `reorder_item`) and onto a node (calls `move_item` with that node
   as new parent, index = end). Visual indicator only between rows.
 - Hidden checkbox on each row. Routes to `outliner:hide(item, on)` — never to `item:set_hidden` directly. (Item-side write verbs are internal building blocks that don't emit observations or write the undo slot; only the outliner-side composer is on the user-facing path.)
-- Show-hidden toggle (client-local). Off by default: hides items
-  whose `hidden` flag is true, and recursively hides their descendants.
+- Show-hidden toggle (client-local). **On by default** so the per-row
+  hide checkbox reads as a "mark hidden" affordance (strikethrough +
+  muted text) rather than appearing to delete the row. Turning the
+  toggle off hides items whose `hidden` flag is true and recursively
+  hides their descendants.
 - Undo button. Routes to `undo`. Always enabled; the verb is a no-op
   (no observation, no state change) when the slot is empty, so the
   client doesn't need to track slot state.

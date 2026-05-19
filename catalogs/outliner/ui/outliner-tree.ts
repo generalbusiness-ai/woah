@@ -14,8 +14,12 @@ import {
 // stroke in `currentColor` and follow the row's text colour — including
 // the muted look the row picks up when `.is-hidden` strikes the text
 // through. Same lucide vocabulary used by other catalog UIs.
+// viewBox tightened to the actual content extent (lucide icons leave a
+// ~3-unit padding inside the 0..24 box). Cropping that padding lets the
+// glyph fill the rendered SVG, so the icon weight matches the hide
+// checkbox's "×" glyph at the same pixel footprint.
 const ICON_TRASH =
-  `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  `<svg viewBox="3 4 18 18" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
   + `<path d="M3 6h18"/>`
   + `<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`
   + `<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>`
@@ -23,7 +27,7 @@ const ICON_TRASH =
   + `<path d="M14 11v6"/>`
   + `</svg>`;
 const ICON_PLUS_SQUARE =
-  `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  `<svg viewBox="3 3 18 18" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
   + `<rect x="3" y="3" width="18" height="18" rx="2"/>`
   + `<path d="M12 8v8"/>`
   + `<path d="M8 12h8"/>`
@@ -82,7 +86,12 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private model: OutlinerData = { outlinerId: "", outlinerName: "Outline", items: [], focus: null, actor: null, roster: [] };
   private companionVisible = false;
   private collapsed = new Set<string>();
-  private showHidden = false;
+  // Default on. With it off, clicking the per-row "hide" checkbox makes
+  // the row vanish, which is a confusing first encounter — the user
+  // thinks they deleted it. With it on, hidden rows stay visible but
+  // strikethrough/muted (see .outliner-row.is-hidden .outliner-text in
+  // styles.css), so the checkbox reads as a "mark hidden" affordance.
+  private showHidden = true;
   private editing: { id: string; original: string } | null = null;
   // Client-local selection. The row the user has clicked on; drives the
   // is-focused highlight, the inline `+` add-child affordance, and the
@@ -375,29 +384,48 @@ export class WooOutlinerTreeElement extends HTMLElement {
       : "";
     const hiddenClass = item.hidden ? " is-hidden" : "";
     const focusClass = isFocused ? " is-focused" : "";
+    // Right-side cluster: + (selected row only), hide toggle, trash.
+    // The hide toggle is a label-wrapped checkbox; its visible chrome is
+    // an SVG square that matches the plus-square stroke style exactly
+    // (rx 2, stroke-width 2, viewBox 3 3 18 18). The two diagonal × paths
+    // are present in the markup but invisible until :checked — see
+    // .outliner-hide-toggle in styles.css. Using SVG strokes rather than
+    // a font glyph fixes the baseline-drift the × character has (it sits
+    // typographically below centre) and lets the stroke weight match the
+    // sibling icons.
     return `
       <li class="outliner-row${hiddenClass}${focusClass}" data-outliner-row data-id="${escapeHtml(id)}" draggable="true" style="--indent: ${indent}px">
         <span class="outliner-row-inner">
           ${twistie}
-          <input type="checkbox" data-outliner-hide data-id="${escapeHtml(id)}" ${item.hidden ? "checked" : ""} title="hide">
           ${textCell}
           ${addChildBtn}
+          <label class="outliner-hide-toggle" title="hide">
+            <input type="checkbox" data-outliner-hide data-id="${escapeHtml(id)}" ${item.hidden ? "checked" : ""} aria-label="hide">
+            <svg class="outliner-hide-glyph" viewBox="3 3 18 18" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+              <path class="outliner-hide-x" d="M8 8l8 8"/>
+              <path class="outliner-hide-x" d="M16 8l-8 8"/>
+            </svg>
+          </label>
           <button type="button" class="icon-button outliner-remove-btn" data-outliner-action="remove" data-id="${escapeHtml(id)}" aria-label="remove" title="remove">${ICON_TRASH}</button>
         </span>
       </li>
     `;
   }
 
-  // Pseudo-row rendered directly below the focus row when addingChild is
-  // true. The submit handler reads `add` (which defaults parent to the
-  // actor's focus on the server), so we don't need to thread the parent id
-  // through the form.
+  // Pseudo-row rendered directly below the selected row when addingChild
+  // is true. The submit handler passes the selected row id as the parent
+  // explicitly, so this is purely a visual surface.
+  //
+  // A single twistie-column spacer sits before the form so the input
+  // column-aligns with where the new child's text will land once it's
+  // saved (regular rows have twistie, then text — no left-side checkbox).
   private renderAddChildRow(depth: number, value: string): string {
     const indent = depth * 20;
     return `
       <li class="outliner-row outliner-row-pending" data-outliner-add-child-row style="--indent: ${indent}px">
         <span class="outliner-row-inner">
-          <span class="outliner-twistie outliner-twistie-empty">·</span>
+          <span class="outliner-twistie outliner-twistie-empty" aria-hidden="true"></span>
           <form class="outliner-edit outliner-add-child" data-outliner-add-child>
             <input type="text" name="text" placeholder="new child…" autocomplete="off" value="${escapeHtml(value)}">
           </form>
@@ -456,9 +484,11 @@ export class WooOutlinerTreeElement extends HTMLElement {
       return;
     }
     // Row click — select an unselected row, edit an already-selected row.
-    // Skip interactive descendants (buttons, the hide checkbox, any open
-    // form) so clicking those keeps their own behavior.
-    if (target.closest("button, input, form")) return;
+    // Skip interactive descendants (buttons, the hide toggle's label and
+    // its checkbox, any open form) so clicking those keeps their own
+    // behavior. The label is what users actually hit (the input is
+    // visually hidden and the SVG fills the visible box).
+    if (target.closest("button, input, form, label")) return;
     const row = target.closest<HTMLElement>("[data-outliner-row]");
     if (!row) return;
     const id = row.dataset.id;
@@ -526,7 +556,29 @@ export class WooOutlinerTreeElement extends HTMLElement {
       const id = (target as HTMLInputElement).dataset.id;
       if (!id) return;
       const checked = (target as HTMLInputElement).checked;
-      await this.callVerb("hide", [id, checked]);
+      // Hide deserves an optimistic flip. Without it, the user sees the
+      // checkbox light up and then immediately revert because callVerb's
+      // eager hydrate races the mutation — `woo.call` returns the req-id
+      // before the hide actually lands, so the post-call list_items
+      // returns the pre-flip state and clobbers the visible × until the
+      // outline_item_hidden observation arrives a moment later.
+      // Flip locally up front; the observation reducer re-hydrates when
+      // the server confirms. Roll back if the call rejects.
+      const item = this.model.items.find((it) => it.id === id);
+      if (item) item.hidden = checked;
+      this.render();
+      if (!this.woo || !this.subject) return;
+      try {
+        await this.woo.call(this.subject, "hide", [id, checked]);
+      } catch (err) {
+        if (item) item.hidden = !checked;
+        this.render();
+        const banner = document.createElement("div");
+        banner.className = "outliner-error";
+        banner.textContent = `hide: ${(err as Error)?.message ?? String(err)}`;
+        this.prepend(banner);
+        setTimeout(() => banner.remove(), 4000);
+      }
     }
   };
 
