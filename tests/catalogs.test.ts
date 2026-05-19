@@ -1127,6 +1127,42 @@ describe("local catalogs", () => {
     }
   });
 
+  it("repairs dangling pinboard layout entries on local catalog boot", async () => {
+    const migration = "2026-05-19-pinboard-dangling-pins-repair";
+    const world = createWorld();
+    const session = world.auth("guest:pinboard-dangling-layout");
+    await world.directCall("pinboard-dangling-enter", session.actor, "the_pinboard", "enter", []);
+    const added = await world.call("pinboard-dangling-add", session.id, "the_pinboard", {
+      actor: session.actor,
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["still real", "yellow", 48, 48, 180, 110]
+    });
+    expect(added.op).toBe("applied");
+    const pin = String((added as any).result?.id ?? "");
+    expect(pin).toBeTruthy();
+
+    const stale = "obj_the_pinboard_missing";
+    const nonNote = "obj_the_pinboard_not_note";
+    world.createObject({ id: nonNote, name: "not a note", parent: "$thing", owner: "$wiz", location: "$nowhere" });
+    world.object("the_pinboard").contents.add(stale);
+    world.setProp("the_pinboard", "layout", {
+      ...(world.getProp("the_pinboard", "layout") as Record<string, WooValue>),
+      [stale]: { x: 12, y: 24, w: 180, h: 110, z: 99 },
+      [nonNote]: { x: 36, y: 48, w: 180, h: 110, z: 100 }
+    });
+    world.setProp("$system", "applied_migrations", (world.getProp("$system", "applied_migrations") as string[]).filter((id) => id !== migration));
+
+    installLocalCatalogs(world, ["pinboard"]);
+
+    expect(world.object("the_pinboard").contents.has(stale)).toBe(false);
+    expect(world.objects.has(nonNote)).toBe(true);
+    expect(world.getProp("the_pinboard", "layout")).toHaveProperty(pin);
+    expect(world.getProp("the_pinboard", "layout")).not.toHaveProperty(stale);
+    expect(world.getProp("the_pinboard", "layout")).not.toHaveProperty(nonNote);
+    expect(world.getProp("$system", "applied_migrations")).toContain(migration);
+  });
+
   it("plans pinboard chat commands against the current board space", async () => {
     const world = createWorld({ catalogs: false });
     // the_pinboard seed lives in demoworld now (demoworld depends on pinboard).

@@ -20,6 +20,7 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { isPinboardObservation, pinboardObservationNeedsNotesRefresh, pinboardObservationsNeedNotesRefresh } from "./pinboard-refresh";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
@@ -544,9 +545,15 @@ function receiveDirectResultFrame(frame: any) {
   const clearedProvisional = typeof frame.id === "string" ? clearProvisionalChatForTurn(frame.id, false) : false;
   const handler = pendingDirect.get(frame.id);
   if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
-  for (const observation of frame.observations ?? []) {
+  const observations = frame.observations ?? [];
+  const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
+  for (const observation of observations) {
     ui.ingestLiveObservation(observation);
-    receiveLiveEvent(observation);
+    receiveLiveEvent(observation, { suppressPinboardNotesRefresh: true });
+  }
+  if (needsPinboardNotesRefresh) {
+    pinboardNotesRefreshPending = false;
+    refreshPinboardNotes();
   }
   applyScopedMoveResult(frame.result);
   if (typeof frame.id === "string") ui.completeOptimisticCall(frame.id);
@@ -571,9 +578,15 @@ function receiveOptimisticResultFrame(frame: any) {
   // results so controls can advance against the local tentative journal, but
   // they MUST NOT fire the pendingDirect/onResult handler: those callbacks gate
   // committed side effects such as refreshes and external hydration.
-  for (const observation of frame.observations ?? []) {
+  const observations = frame.observations ?? [];
+  const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
+  for (const observation of observations) {
     ui.ingestLiveObservation(observation);
-    receiveLiveEvent(observation);
+    receiveLiveEvent(observation, { suppressPinboardNotesRefresh: true });
+  }
+  if (needsPinboardNotesRefresh) {
+    pinboardNotesRefreshPending = false;
+    refreshPinboardNotes();
   }
   applyScopedMoveResult(frame.result);
   render();
@@ -654,7 +667,7 @@ function receiveAppliedFrame(frame: any) {
     pendingFrameErrors.delete(frame.id);
   }
   const pinboardAnimations = capturePinboardAnimations(observations);
-  const needsPinboardNotesRefresh = observations.some((observation: any) => isPinboardObservation(observation) && pinboardObservationNeedsNotesRefresh(String(observation?.type ?? "")));
+  const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
   if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
   forgetLiveControls(observations);
   for (const observation of observations) applyDubspaceObservationSideEffects(observation);
@@ -1745,7 +1758,10 @@ function pinboardLayoutTombstones(board: any): Set<string> {
 function pinboardProjectedNoteIds(boardId: string, layout: Record<string, any>, legacyNotes: any[] = [], removed = new Set<string>()): string[] {
   const ids = new Set<string>();
   for (const id of Object.keys(layout)) {
-    if (!removed.has(id)) ids.add(id);
+    // Board layout is placement metadata, not proof that a pin still exists.
+    // Older localdev worlds can retain layout keys after the pin object has
+    // disappeared; rendering those keys produces blank white phantom notes.
+    if (!removed.has(id) && hasProjectedPinboardNote(id, boardId)) ids.add(id);
   }
   for (const note of Array.isArray(legacyNotes) ? legacyNotes : []) {
     const id = String(note?.id ?? "");
@@ -1757,6 +1773,14 @@ function pinboardProjectedNoteIds(boardId: string, layout: Record<string, any>, 
     if (id && !removed.has(id) && isPinboardNoteSummary(item, boardId, layout)) ids.add(id);
   }
   return [...ids];
+}
+
+function hasProjectedPinboardNote(id: string, boardId: string): boolean {
+  const projected = ui.observe(id);
+  if (!projected) return false;
+  const noteState = projected.catalogState?.pinboard_note;
+  if (noteState && typeof noteState === "object" && !Array.isArray(noteState) && Object.keys(noteState).length > 0) return true;
+  return isPinboardNoteSummary(projected, boardId, {});
 }
 
 function pinboardProjectedNote(id: string, layoutEntry: any, legacyNotes: any[] = []): any | undefined {
@@ -2223,20 +2247,21 @@ function commitCueControls(target: string) {
   for (const [name, value] of values) callDubspaceMutation("set_control", [target, name, value]);
 }
 
-function receiveLiveEvent(observation: any) {
+function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefresh?: boolean } = {}) {
   if (isPinboardViewportObservation(observation)) {
     receivePinboardViewport(observation);
     return;
   }
-  // Pinboard side effects (window auto-open/close) must fire
+  // Pinboard side effects (window auto-open and viewport cleanup) must fire
   // before the chat-observation branch, because pinboard_* types appear in
   // both observation lists and the chat branch returns early. The board is a
   // focus surface, not a place you travel to (catalogs/pinboard/DESIGN.md);
-  // opening/closing the tab is the chat-side analogue of mounting the board.
+  // text-command exits switch back to chat through command side effects, while
+  // toolbar Leave stays on the board and exposes the Enter control.
   if (isPinboardObservation(observation)) {
     const pinboardAnimations = capturePinboardAnimations([observation]);
     const pinboardType = String(observation?.type ?? "");
-    const needsNoteRefresh = pinboardObservationNeedsNotesRefresh(pinboardType);
+    const needsNoteRefresh = options.suppressPinboardNotesRefresh === true ? false : pinboardObservationNeedsNotesRefresh(pinboardType);
     if (needsNoteRefresh) pinboardNotesRefreshPending = false;
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
     if (String(observation?.actor ?? "") === state.actor) {
@@ -2245,8 +2270,9 @@ function receiveLiveEvent(observation: any) {
         if (state.tab !== "pinboard") setTab("pinboard", { mode: "push", leaveCurrent: false });
         requestSpaceChatFocus(pinboardSpace());
       } else if (observation?.type === "pinboard_left" && state.tab === "pinboard") {
+        // Toolbar Leave means "leave this board presence", not "navigate away";
+        // keep the pinboard mounted so the user sees the Enter control.
         clearPinboardViewports();
-        setTab("chat", { mode: "push", leaveCurrent: false });
       }
     }
     if (needsNoteRefresh) refreshPinboardNotes();
@@ -2975,26 +3001,6 @@ function isDubspaceObservation(observation: any) {
   ].includes(String(observation?.type ?? ""));
 }
 
-function isPinboardObservation(observation: any) {
-  return [
-    "pinboard_entered",
-    "pinboard_left",
-    "pinboard_activity",
-    "pin_added",
-    "pin_removed",
-    "pin_moved",
-    "pin_resized",
-    "pin_recolored",
-    "note_added",
-    "note_moved",
-    "note_resized",
-    "note_edited",
-    "note_color_changed",
-    "note_deleted",
-    "notes_cleared"
-  ].includes(String(observation?.type ?? ""));
-}
-
 function isOutlinerObservation(observation: any) {
   return [
     "outliner_entered",
@@ -3005,19 +3011,6 @@ function isOutlinerObservation(observation: any) {
 
 function isPinboardViewportObservation(observation: any) {
   return String(observation?.type ?? "") === "pinboard_viewport";
-}
-
-function pinboardObservationNeedsNotesRefresh(type: string) {
-  return [
-    "pin_added",
-    "pin_removed",
-    "pin_recolored",
-    "note_added",
-    "note_edited",
-    "note_color_changed",
-    "note_deleted",
-    "notes_cleared"
-  ].includes(type);
 }
 
 function receivePinboardViewport(observation: any) {

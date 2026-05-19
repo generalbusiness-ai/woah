@@ -117,6 +117,7 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION = "2026-05-13-chat-v2-
 const LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION = "2026-05-14-chat-room-roster";
 const LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION = "2026-05-14-pinboard-room-roster";
 const LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION = "2026-05-14-dubspace-room-roster";
+const LOCAL_CATALOG_PINBOARD_DANGLING_PINS_REPAIR_MIGRATION = "2026-05-19-pinboard-dangling-pins-repair";
 // The seeded `the_taskboard` registry was originally minted with name
 // "Taskboard". The tasks tool tab is labeled "Tasks", and the workspace
 // header renders the registry's `name` property — so the chrome ended up
@@ -204,6 +205,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, only: "chat" },
   { id: LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, only: "pinboard" },
   { id: LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, only: "dubspace" },
+  { id: LOCAL_CATALOG_PINBOARD_DANGLING_PINS_REPAIR_MIGRATION, only: "pinboard" },
   { id: LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION },
   { id: LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION },
@@ -454,6 +456,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
   run(LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "pinboard" });
   run(LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
+  runPinboardDanglingPinsRepairMigration(world, names);
   run(LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
   run(LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   run(LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
@@ -639,6 +642,45 @@ function runPinboardV02RepairMigration(world: WooWorld, names: readonly string[]
     if (result.status === "failed") throw new Error(`local catalog schema plan failed: ${result.plan_id}`);
   }
   markMigrationApplied(world, LOCAL_CATALOG_PINBOARD_V02_REPAIR_MIGRATION);
+}
+
+function runPinboardDanglingPinsRepairMigration(world: WooWorld, names: readonly string[]): void {
+  if (!names.includes("pinboard")) return;
+  if (!localCatalogInstalled(world, "pinboard")) return;
+  if (migrationApplied(world, LOCAL_CATALOG_PINBOARD_DANGLING_PINS_REPAIR_MIGRATION)) return;
+  if (!world.objects.has("$pinboard")) {
+    markMigrationApplied(world, LOCAL_CATALOG_PINBOARD_DANGLING_PINS_REPAIR_MIGRATION);
+    return;
+  }
+
+  for (const board of pinboardInstances(world)) {
+    repairPinboardDanglingPins(world, board);
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_PINBOARD_DANGLING_PINS_REPAIR_MIGRATION);
+}
+
+function repairPinboardDanglingPins(world: WooWorld, board: ObjRef): void {
+  const boardObj = world.object(board);
+  let contentsChanged = false;
+  for (const id of Array.from(boardObj.contents)) {
+    if (world.objects.has(id)) continue;
+    boardObj.contents.delete(id);
+    contentsChanged = true;
+  }
+
+  const layout = mapValue(world.propOrNull(board, "layout"));
+  let nextLayout: Record<string, WooValue> | null = null;
+  const hasNoteClass = world.objects.has("$note");
+  for (const id of Object.keys(layout)) {
+    if (world.objects.has(id) && (!hasNoteClass || world.isDescendantOf(id, "$note"))) continue;
+    // `layout` is an index keyed by live pin object id. A dangling key is not
+    // recoverable note content; keeping it makes clients draw phantom notes.
+    nextLayout ??= { ...layout };
+    delete nextLayout[id];
+  }
+
+  if (nextLayout) world.setProp(board, "layout", nextLayout);
+  if (contentsChanged) world.markObjectChanged(board);
 }
 
 function runDropSessionIdPropertyMigration(world: WooWorld): void {
