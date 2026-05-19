@@ -49,7 +49,6 @@ import {
   shadowLiveEventsForTranscriptRelay,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
-  type ShadowLiveAudience,
   type ShadowLiveEvent,
   type ShadowBrowserRelayShim,
   type ShadowBrowserStateTransfer
@@ -60,6 +59,12 @@ import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-tu
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import { isShadowCommitAccepted, isShadowTurnExecReply } from "../core/v2-reply-predicates";
+import {
+  affectedBrowserFanoutScopes,
+  affectedMcpFanoutScopes,
+  shadowLiveEventMatchesPeerScope,
+  withComputedLiveAudience
+} from "../core/v2-fanout-projection";
 import {
   mergeV2TurnGatewayAuthority,
   submitTurnIntent,
@@ -232,19 +237,6 @@ function webSocketProtocols(request: Request): string[] {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-function v2LiveEventMatchesAttachment(event: ShadowLiveEvent, att: V2SocketAttachment): boolean {
-  const audience = event.audience;
-  if (audience) {
-    if (audience.sessions?.includes(att.sessionId)) return true;
-    if (audience.actors?.includes(att.actor)) return true;
-    // An explicit actor/session audience is private unless it also names a
-    // scope. Falling back to event.scope would turn direct replies into room
-    // broadcasts.
-    return typeof audience.scope === "string" && audience.scope === att.scope;
-  }
-  return typeof event.scope === "string" && event.scope === att.scope;
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -3126,7 +3118,7 @@ export class PersistentObjectDO {
       const att = this.attachment(ws);
       if (!att?.node || att.protocol !== "v2-turn-network") continue;
       if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
-      const matching = events.filter((event) => v2LiveEventMatchesAttachment(event, att));
+      const matching = events.filter((event) => shadowLiveEventMatchesPeerScope(event, att));
       // Projection transfers are scoped to the relay head that signs them. Peer
       // scopes receive live events only until their own scope DO can build a
       // self-consistent catch-up transfer.
@@ -3208,7 +3200,7 @@ export class PersistentObjectDO {
       const att = this.attachment(ws);
       if (!att?.node || att.protocol !== "v2-turn-network") continue;
       if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
-      const matching = events.filter((event) => v2LiveEventMatchesAttachment(event, att));
+      const matching = events.filter((event) => shadowLiveEventMatchesPeerScope(event, att));
       for (const event of matching) {
         this.sendV2LiveEvent(ws, att, from, event);
       }
@@ -3818,51 +3810,6 @@ function mcpGatewayShardHost(env: Env, sessionId: string): string {
 function mcpGatewayShardCount(env: Env): number {
   const raw = Number(env.WOO_MCP_GATEWAY_SHARDS ?? DEFAULT_MCP_GATEWAY_SHARDS);
   return Number.isInteger(raw) && raw > 0 && raw <= 256 ? raw : DEFAULT_MCP_GATEWAY_SHARDS;
-}
-
-function affectedMcpFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
-  return affectedTranscriptScopes(scope, transcript);
-}
-
-function affectedBrowserFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
-  return affectedTranscriptScopes(scope, transcript);
-}
-
-function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
-  const scopes = new Set<ObjRef>([scope]);
-  const add = (value: ObjRef | null | undefined): void => {
-    if (value) scopes.add(value);
-  };
-  for (const move of transcript.moves) {
-    add(move.from);
-    add(move.to);
-  }
-  for (const create of transcript.creates) {
-    add(create.location);
-  }
-  for (const write of transcript.writes) {
-    const cell = write.cell;
-    if (cell.kind === "contents") add(cell.object);
-    if (cell.kind === "prop" && (cell.name === "session_subscribers" || cell.name === "subscribers")) {
-      add(cell.object);
-    }
-  }
-  return Array.from(scopes).sort();
-}
-
-function withComputedLiveAudience(event: ShadowLiveEvent, actors: ObjRef[], sessions: string[]): ShadowLiveEvent | null {
-  const audience = computedShadowLiveAudience(actors, sessions);
-  return audience ? { ...event, audience } : null;
-}
-
-function computedShadowLiveAudience(actors: ObjRef[], sessions: string[]): ShadowLiveAudience | null {
-  const uniqueActors = Array.from(new Set(actors.filter(Boolean)));
-  const uniqueSessions = Array.from(new Set(sessions.filter(Boolean)));
-  if (uniqueActors.length === 0 && uniqueSessions.length === 0) return null;
-  return {
-    ...(uniqueActors.length > 0 ? { actors: uniqueActors } : {}),
-    ...(uniqueSessions.length > 0 ? { sessions: uniqueSessions } : {})
-  };
 }
 
 function stableHash(input: string): number {
