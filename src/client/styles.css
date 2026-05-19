@@ -1739,17 +1739,52 @@ woo-outliner-tree {
 
 /* Click-to-edit affordance is on the whole row now. Show that with a
    pointer cursor on .outliner-row-inner, except over the form/inputs which
-   carry their own cursor. */
+   carry their own cursor. (Row-inner buttons use .icon-button, which sets
+   its own pointer cursor.) */
 .outliner-row-inner {
   cursor: pointer;
 }
 .outliner-row-inner input,
-.outliner-row-inner button,
 .outliner-row-inner form {
   cursor: auto;
 }
-.outliner-row-inner button {
-  cursor: pointer;
+
+/* Row icon buttons (twistie, add-child, remove) reuse the shared
+   .icon-button shell: flat by default, subtle background tint on hover.
+   The per-button rules below just size and tune them for the dense row
+   context — they don't restate the chrome-reset that .icon-button does. */
+.outliner-row-inner .icon-button {
+  padding: 0.15rem;
+  border-radius: 4px;
+  /* Square footprint so the row baseline doesn't shift when buttons
+     appear/disappear (the + button only renders on the selected row). */
+  width: 1.4rem;
+  height: 1.4rem;
+}
+
+/* Twistie is the row's primary structural affordance — it gets a larger
+   footprint and a full-weight text colour, while the secondary trash and
+   add-child icons stay muted via the inherited .icon-button colour. The
+   bigger chevron SVG (20px) needs a roomier square to breathe in. */
+.outliner-row-inner .icon-button.outliner-twistie {
+  width: 1.7rem;
+  height: 1.7rem;
+  color: var(--color-text);
+}
+
+.outliner-twistie-empty {
+  /* Same footprint as a real twistie so non-leaf and leaf rows line up. */
+  display: inline-flex;
+  width: 1.7rem;
+  height: 1.7rem;
+}
+
+/* Remove icon is destructive — keep it muted by default so it doesn't
+   shout from every row; redden it on hover so the intent is unmistakable
+   when the user actually points at it. */
+.outliner-remove-btn:hover,
+.outliner-remove-btn:focus-visible {
+  color: var(--color-danger);
 }
 
 /* The in-place add-child placeholder sits as a child row directly below

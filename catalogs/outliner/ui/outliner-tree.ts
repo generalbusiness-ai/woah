@@ -9,6 +9,37 @@ import {
   type WooContext
 } from "../../../src/client/framework";
 
+// Inline SVG icons for the row controls. Kept here (rather than as
+// classes referencing background-image rules in styles.css) so they
+// stroke in `currentColor` and follow the row's text colour — including
+// the muted look the row picks up when `.is-hidden` strikes the text
+// through. Same lucide vocabulary used by other catalog UIs.
+const ICON_TRASH =
+  `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<path d="M3 6h18"/>`
+  + `<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`
+  + `<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>`
+  + `<path d="M10 11v6"/>`
+  + `<path d="M14 11v6"/>`
+  + `</svg>`;
+const ICON_PLUS_SQUARE =
+  `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<rect x="3" y="3" width="18" height="18" rx="2"/>`
+  + `<path d="M12 8v8"/>`
+  + `<path d="M8 12h8"/>`
+  + `</svg>`;
+// Twistie chevrons render larger and bolder than the secondary
+// trash/add-child icons — they're the row's primary structural
+// affordance, so they want visual weight.
+const ICON_CHEVRON_RIGHT =
+  `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<path d="M9 6l6 6-6 6"/>`
+  + `</svg>`;
+const ICON_CHEVRON_DOWN =
+  `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+  + `<path d="M6 9l6 6 6-6"/>`
+  + `</svg>`;
+
 // Single row delivered by $outliner:list_items. Shape mirrors the joined
 // view; positions are server-internal and not exposed here.
 export type OutlinerItem = {
@@ -322,9 +353,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const isEditing = this.editing?.id === id;
     const collapsed = this.collapsed.has(id);
     const indent = item.depth * 20;
+    // The three row controls (twistie, add-child, remove) are icon buttons:
+    // flat by default, subtle background tint on hover. Markup uses the
+    // shared `.icon-button` class so the global `button {…}` chrome
+    // (border, padding, radius) is overridden in one place.
     const twistie = item.has_children
-      ? `<button type="button" class="outliner-twistie" data-outliner-action="toggle-collapse" data-id="${escapeHtml(id)}" aria-label="${collapsed ? "expand" : "collapse"}">${collapsed ? "▸" : "▾"}</button>`
-      : `<span class="outliner-twistie outliner-twistie-empty">·</span>`;
+      ? `<button type="button" class="icon-button outliner-twistie" data-outliner-action="toggle-collapse" data-id="${escapeHtml(id)}" aria-label="${collapsed ? "expand" : "collapse"}">${collapsed ? ICON_CHEVRON_RIGHT : ICON_CHEVRON_DOWN}</button>`
+      : `<span class="outliner-twistie outliner-twistie-empty" aria-hidden="true"></span>`;
     // The row itself is the focus/edit affordance now — clicking the text
     // span bubbles up to the row-level handler, which focuses an unfocused
     // row or starts editing an already-focused row. No data-outliner-action
@@ -332,11 +367,11 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const textCell = isEditing
       ? `<form class="outliner-edit" data-outliner-edit data-id="${escapeHtml(id)}"><input type="text" name="text" value="${escapeHtml(item.text)}" autofocus></form>`
       : `<span class="outliner-text">${escapeHtml(item.text || "(empty)")}</span>`;
-    // The + button only sits on the focus row. Add-in-place means "add a
-    // child of the focus row," so showing the button anywhere else would
-    // be confusing — to add under a different row you focus it first.
+    // The + (plus-square) button only sits on the selected row. Add-in-
+    // place means "add a child of this row," so the button on any other
+    // row would be ambiguous about the parent.
     const addChildBtn = isFocused
-      ? `<button type="button" class="outliner-add-child-btn" data-outliner-action="add-child" data-id="${escapeHtml(id)}" title="add child">+</button>`
+      ? `<button type="button" class="icon-button outliner-add-child-btn" data-outliner-action="add-child" data-id="${escapeHtml(id)}" aria-label="add child" title="add child">${ICON_PLUS_SQUARE}</button>`
       : "";
     const hiddenClass = item.hidden ? " is-hidden" : "";
     const focusClass = isFocused ? " is-focused" : "";
@@ -347,7 +382,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
           <input type="checkbox" data-outliner-hide data-id="${escapeHtml(id)}" ${item.hidden ? "checked" : ""} title="hide">
           ${textCell}
           ${addChildBtn}
-          <button type="button" class="outliner-remove-btn" data-outliner-action="remove" data-id="${escapeHtml(id)}" title="remove">×</button>
+          <button type="button" class="icon-button outliner-remove-btn" data-outliner-action="remove" data-id="${escapeHtml(id)}" aria-label="remove" title="remove">${ICON_TRASH}</button>
         </span>
       </li>
     `;
