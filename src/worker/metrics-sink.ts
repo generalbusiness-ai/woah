@@ -88,6 +88,8 @@ function primaryCount(event: MetricEvent): number {
       return typeof e.fanout === "number" ? e.fanout : 0;
     case "v2_host_apply_fanout":
       return typeof e.hosts === "number" ? e.hosts : 0;
+    case "shadow_open_executable_seed_bytes":
+      return typeof e.bytes === "number" ? e.bytes : 0;
     case "startup_storage":
       return typeof e.objects === "number" ? e.objects : (typeof e.routes === "number" ? e.routes : 0);
     case "shadow_apply_step":
@@ -132,7 +134,7 @@ function primaryCount(event: MetricEvent): number {
 //   doubles[1]  = sample_rate    1 (default) or the 1-in-N multiplier
 //   doubles[2]  = count          primary kind-specific count: rows |
 //                                audience_size | observations | fanout |
-//                                hosts | objects (see primaryCount above)
+//                                hosts | objects | bytes (see primaryCount above)
 export function writeMetricToAnalytics(
   event: MetricEvent,
   hostKey: string,

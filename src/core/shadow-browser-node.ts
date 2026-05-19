@@ -290,6 +290,9 @@ export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
   executable_transfer: ShadowStateTransfer;
+  executable_transfer_bytes: number;
+  executable_transfer_pages: number;
+  executable_transfer_inline_pages: number;
   ads: ShadowCapabilityAd[];
   preseeded_objects: number;
   transfer_mode: "projection" | "delta";
@@ -621,16 +624,25 @@ export async function openShadowBrowserScope(
   const transfer = buildShadowBrowserCatchupTransfer(browser.relay, browser.scope, browser.node, options.last_known_head, shadowProjectionViewer(browser));
   applyShadowBrowserTransfer(browser, transfer);
   const executableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+  // The execution node and browser cache are separate stores: the former runs
+  // local turns, while the latter persists transfer pages through IndexedDB.
   installShadowStateTransfer(browser.execution_node, executableTransfer);
   applyShadowBrowserTransfer(browser, executableTransfer);
   return {
     projection: browser.cache.projections.get(browser.scope) ?? (transfer.mode === "projection" ? transfer.projection : null),
     transfer,
     executable_transfer: executableTransfer,
+    executable_transfer_bytes: shadowStateTransferJsonBytes(executableTransfer),
+    executable_transfer_pages: executableTransfer.mode === "cell_pages" ? executableTransfer.page_refs.length : 0,
+    executable_transfer_inline_pages: executableTransfer.mode === "cell_pages" ? executableTransfer.inline_pages.length : 0,
     ads: shadowBrowserScopeExecutionAds(browser.relay, browser.scope),
     preseeded_objects: preseed.length,
     transfer_mode: transfer.mode
   };
+}
+
+function shadowStateTransferJsonBytes(transfer: ShadowStateTransfer): number {
+  return new TextEncoder().encode(JSON.stringify(transfer)).length;
 }
 
 export function buildShadowBrowserOpenExecutableSeedTransfer(

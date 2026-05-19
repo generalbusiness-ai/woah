@@ -52,6 +52,8 @@ import {
   v2TurnGatewayAuthorityPayload
 } from "../core/v2-turn-gateway";
 
+const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
+
 // Local dev server only: HTTP authoring endpoints require a session and then
 // defer to the world's object-authoring permission checks.
 const repository = new LocalSQLiteRepository(process.env.WOO_DB ?? ".woo/dev.sqlite");
@@ -263,6 +265,27 @@ v2wss.on("connection", (ws, req) => {
     ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
   }).then((opened) => {
     if (ws.readyState !== WebSocket.OPEN) return;
+    const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
+    console.log("woo.metric", JSON.stringify({
+      kind: "shadow_open_executable_seed_bytes",
+      scope,
+      node,
+      bytes: opened.executable_transfer_bytes,
+      pages: opened.executable_transfer_pages,
+      inline_pages: opened.executable_transfer_inline_pages,
+      status: seedStatus,
+      ts: Date.now(),
+      host_key: "dev"
+    }));
+    if (seedStatus === "warn") {
+      console.warn("woo.shadow_open_executable_seed_bytes.warn", {
+        scope,
+        node,
+        bytes: opened.executable_transfer_bytes,
+        pages: opened.executable_transfer_pages,
+        inline_pages: opened.executable_transfer_inline_pages
+      });
+    }
     ws.send(encodeEnvelope({
       v: 2,
       type: opened.transfer.kind,

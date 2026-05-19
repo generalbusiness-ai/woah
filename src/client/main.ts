@@ -21,6 +21,7 @@ import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
+import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
 import { v2ProjectionSnapshotFromMessage, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
@@ -470,6 +471,22 @@ function ensureV2BrowserWorker() {
         else receiveDirectResultFrame(message.frame);
       }
       else receiveErrorFrame(message.frame);
+    }
+    if (event.data?.kind === "local_turn_invalidated") {
+      window.dispatchEvent(new CustomEvent("woo.v2.local_turn_invalidated", { detail: event.data }));
+      const error = settleInvalidatedOptimisticTurns(event.data as V2LocalTurnInvalidatedMessage, {
+        failOptimisticCall: (id) => ui.failOptimisticCall(id),
+        pendingDirect,
+        pendingFrameErrors,
+        pendingCommands,
+        completeNetworkWait: completeV2TurnNetworkWait
+      });
+      if (error) {
+        state.observations.unshift({ error });
+        trimObservations();
+        render();
+      }
+      console.debug("woo.v2.local_turn_invalidated", event.data);
     }
     if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed") {
       window.dispatchEvent(new CustomEvent(`woo.v2.${event.data.kind}`, { detail: event.data }));

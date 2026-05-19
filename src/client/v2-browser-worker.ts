@@ -13,6 +13,7 @@ import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
+import { shouldInvalidateTentativeTurnForCommitReason } from "./v2-browser-optimistic-lifecycle";
 import {
   selectV2PendingTentativeTurns,
   v2BrowserTentativeTurnRecord,
@@ -689,7 +690,9 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
     return;
   }
   if (reply.reason === "commit_rejected") {
-    await invalidateTentativeTurnChain(ids[0], reply.commit?.reason ?? "commit_rejected", ids, reply.transcript?.hash);
+    const reason = reply.commit?.reason ?? "commit_rejected";
+    if (!shouldInvalidateTentativeTurnForCommitReason(reason)) return;
+    await invalidateTentativeTurnChain(ids[0], reason, ids, reply.transcript?.hash);
   }
 }
 
@@ -704,6 +707,9 @@ async function invalidateTentativeTurnChain(id: string, reason: string, ids: rea
   const records = await allTentativeTurns();
   const anchor = records.find((record) => v2TentativeTurnMatches(record, ids, transcriptHash));
   if (!anchor) return;
+  // Phase 1 fails the dependent optimistic chain loudly. The distributed VM
+  // target is to re-plan these dependents over the accepted parent state and
+  // resubmit the same outer intent id with a new transcript hash.
   const invalidated = v2TentativeTurnChainFrom(records, anchor);
   for (const record of invalidated) await deleteTentativeTurn(record.id);
   postMessage({

@@ -99,9 +99,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
     try {
       do {
         this.hydratePending = false;
-        // Read-side query: directCall resolves with the verb's actual return
-        // value. (`woo.call` is fire-and-forget and resolves with the request
-        // id — the reply lands via the observation reducer, not this promise.)
         // Roster fetched in parallel with list_items — both are independent
         // RX verbs on the outliner space.
         const [items, roster] = await Promise.all([

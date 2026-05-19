@@ -110,7 +110,6 @@ type ShadowCommitScopeSerializedRefs = {
 export type ShadowTranscriptApplyOptions = {
   objectTimestamp?: number;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
-  contentWrites?: "replace" | "delta";
 };
 
 export function createShadowCommitScope(input: {
@@ -291,7 +290,7 @@ function validateShadowPostState(reader: TranscriptCellReader, transcript: Effec
     if (write.next !== undefined && actual.version !== write.next) {
       errors.push(`post_state_mismatch ${cellLabel(write.cell)} version: transcript=${write.next} actual=${actual.version ?? "none"}`);
     }
-    if (!writeValueMatchesPostState(write, actual.value)) {
+    if (!writeValueMatchesPostState(write, actual.value, transcript)) {
       errors.push(`post_state_mismatch ${cellLabel(write.cell)} value`);
     }
   }
@@ -500,7 +499,7 @@ function applyShadowTranscriptToIndexedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options.objectTimestamp, options.contentWrites);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options.objectTimestamp);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
@@ -637,7 +636,7 @@ export function applyShadowTranscriptToCommittedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options.objectTimestamp, options.contentWrites);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options.objectTimestamp);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
@@ -769,8 +768,7 @@ export function applyTranscriptWriteToSerializedObject(
   target: SerializedObject,
   write: TranscriptWrite,
   transcript: EffectTranscript,
-  objectTimestamp: number | undefined,
-  contentWrites: ShadowTranscriptApplyOptions["contentWrites"] = "replace"
+  objectTimestamp: number | undefined
 ): void {
   // Keep this serialized-object materializer parallel with
   // WooWorld.applyTranscriptWriteInPlace. The storage shapes differ, but the
@@ -785,8 +783,7 @@ export function applyTranscriptWriteToSerializedObject(
       touchSerializedObject(target, objectTimestamp);
       return;
     case "contents":
-      if (contentWrites === "delta") applyTranscriptContentsWriteDelta(target, write, transcript);
-      else if (Array.isArray(write.value)) target.contents = transcriptContentsWriteRefs(write);
+      applyTranscriptContentsWrite(target, write, transcript);
       touchSerializedObject(target, objectTimestamp);
       return;
     case "lifecycle": {
@@ -802,11 +799,14 @@ export function applyTranscriptWriteToSerializedObject(
   }
 }
 
-function applyTranscriptContentsWriteDelta(
+function applyTranscriptContentsWrite(
   target: SerializedObject,
   write: TranscriptWrite,
   transcript: EffectTranscript
 ): void {
+  // Move/create transcripts record whole post-write contents arrays for
+  // validation, but committed replay must merge the operation intent. Replacing
+  // the array here would drop concurrent adds already accepted into the base.
   const refs = transcriptContentsWriteRefs(write);
   if (write.op === "add") {
     const added = transcriptContentAddsForContainer(transcript, write.cell.object);
@@ -990,8 +990,24 @@ function isWizard(index: SerializedAuthorityIndex, id: ObjRef): boolean {
   return serializedObject(index, id)?.flags.wizard === true;
 }
 
-function writeValueMatchesPostState(write: TranscriptWrite, actual: WooValue): boolean {
+function writeValueMatchesPostState(write: TranscriptWrite, actual: WooValue, transcript: EffectTranscript): boolean {
   if (write.cell.kind === "lifecycle" && write.op === "create") return actual === "present";
+  if (write.cell.kind === "contents") return contentsWriteMatchesPostState(write, actual, transcript);
+  return stableShadowJson(write.value) === stableShadowJson(actual);
+}
+
+function contentsWriteMatchesPostState(write: TranscriptWrite, actual: WooValue, transcript: EffectTranscript): boolean {
+  if (!Array.isArray(actual)) return false;
+  const actualRefs = new Set(actual.filter((item): item is ObjRef => typeof item === "string"));
+  if (write.op === "add") {
+    const added = transcriptContentAddsForContainer(transcript, write.cell.object);
+    const required = added.length > 0 ? added : transcriptContentsWriteRefs(write);
+    return required.every((ref) => actualRefs.has(ref));
+  }
+  if (write.op === "remove") {
+    const removed = transcriptContentRemovesForContainer(transcript, write.cell.object);
+    if (removed.length > 0) return removed.every((ref) => !actualRefs.has(ref));
+  }
   return stableShadowJson(write.value) === stableShadowJson(actual);
 }
 

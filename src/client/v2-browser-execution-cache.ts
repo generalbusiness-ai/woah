@@ -76,7 +76,7 @@ function materializeTranscriptOverlays(
     serialized: executionNode.serialized
   });
   for (const transcript of scoped) {
-    applyShadowTranscriptToCommitScopeCache(commitScope, transcript, { contentWrites: "delta" });
+    applyShadowTranscriptToCommitScopeCache(commitScope, transcript);
     // A later local turn may read a cell written by an accepted transcript or
     // by a pending local predecessor. Treat the transcript's negotiated atoms
     // as materialized in the composed view so the partial-cache guard asks for

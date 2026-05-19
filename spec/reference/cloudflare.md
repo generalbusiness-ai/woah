@@ -551,7 +551,7 @@ or repurposed.
 | `blobs[16]` | `error_detail` | bounded diagnostic detail for uncoded internal errors |
 | `doubles[0]` | `ms`         | latency, when present |
 | `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
-| `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects` |
+| `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects`, or `bytes` |
 
 The canonical event union is `MetricEvent` in `src/core/types.ts`. That
 union is the source of truth for which kinds exist and which fields they
