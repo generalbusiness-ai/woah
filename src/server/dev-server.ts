@@ -28,6 +28,7 @@ import {
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
+  handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserAuthoritySessionState,
@@ -556,6 +557,11 @@ async function handleV2ShadowFrame(
       ? v2ShadowBrowser(browser.node, token, session, callScope!)
       : browser;
     const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
+    const stateReply = handleShadowBrowserStateTransferEnvelope(turnBrowser, receipt);
+    if (stateReply) {
+      ws.send(encodeEnvelope(stateReply));
+      return;
+    }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt);
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
       world.applyCommittedShadowTranscript(reply.body.transcript);

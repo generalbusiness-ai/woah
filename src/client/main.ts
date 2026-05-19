@@ -468,7 +468,7 @@ function ensureV2BrowserWorker() {
       if (message.frame.op === "result") receiveDirectResultFrame(message.frame);
       else receiveErrorFrame(message.frame);
     }
-    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated") {
+    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed") {
       window.dispatchEvent(new CustomEvent(`woo.v2.${event.data.kind}`, { detail: event.data }));
       console.debug(`woo.v2.${event.data.kind}`, event.data);
     }

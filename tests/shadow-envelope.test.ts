@@ -58,6 +58,39 @@ describe("shadow envelope codec", () => {
     expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
   });
 
+  it("accepts executable state transfer requests", () => {
+    const envelope: ShadowEnvelope = {
+      v: 2,
+      type: "woo.state.transfer.request.shadow.v1",
+      id: "state-request-1",
+      from: "browser-node",
+      to: "relay-node",
+      auth: { mode: "session", token: "shadow-session:1:guest_1" },
+      body: {
+        kind: "woo.state.transfer.request.shadow.v1",
+        id: "state-request-1",
+        scope: "the_dubspace",
+        key: {
+          kind: "woo.turn_key.shadow.v1",
+          scope: "the_dubspace",
+          actor: "guest_1",
+          target: "the_dubspace",
+          verb: "look_self",
+          atom_hashes: [],
+          preimages: [],
+          write_atom_hashes: [],
+          write_preimages: [],
+          accept_atom_hashes: [],
+          accept_preimages: []
+        },
+        atom_hashes: [],
+        mode: "cell_pages"
+      }
+    };
+
+    expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
+  });
+
   it("rejects malformed envelopes before dispatch", () => {
     expect(() => decodeEnvelope("{")).toThrow(/malformed/);
     expect(() => decodeEnvelope(JSON.stringify({ v: 1, type: "woo.transport.ping.v1", id: "x", from: "a", auth: { mode: "session", token: "t" }, body: {} }))).toThrow(/version/);

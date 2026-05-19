@@ -1302,6 +1302,12 @@ worker: install executable pages into IndexedDB
 worker: rebuild execution node and retry the same turn id
 ```
 
+The browser worker SHOULD request executable state with an authenticated
+`woo.state.transfer.request.v1` envelope keyed by the planned `TurnKey`. The
+relay replies with a recipient-bound `StateTransfer`; this repair request MUST
+NOT commit or execute the turn. If repair succeeds, the worker retries local
+planning before selecting a delegated executor.
+
 The worker MUST cap retries and transferred bytes. A turn that still cannot be
 executed locally after the negotiated retry/byte budget MUST be delegated to
 the best suitable gossiped executor when one exists. If no suitable executor is

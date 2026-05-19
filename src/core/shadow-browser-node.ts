@@ -326,6 +326,16 @@ export type ShadowTurnIntentRequest = {
   selected_ad?: string;
 };
 
+export type ShadowExecutableStateTransferRequest = {
+  kind: "woo.state.transfer.request.shadow.v1";
+  id?: string;
+  scope: ObjRef;
+  key: ShadowTurnKey;
+  atom_hashes?: string[];
+  known_page_hashes?: string[];
+  mode?: "cell_pages";
+};
+
 export function buildShadowTurnIntentEnvelope(input: {
   node: string;
   actor: ObjRef;
@@ -1107,6 +1117,45 @@ export async function handleShadowBrowserTurnExecEnvelope(
   const response = shadowBrowserTurnExecReplyEnvelope(browser, receipt, request, reply);
   // Idempotency is reply-oriented: a client retrying because it missed the
   // first reply must receive the same answer without re-running the turn.
+  browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(response));
+  trimShadowBrowserIdempotency(browser.relay);
+  return response;
+}
+
+export function handleShadowBrowserStateTransferEnvelope(
+  browser: ShadowBrowserNode,
+  receipt: ShadowBrowserEnvelopeReceipt
+): ShadowEnvelope<ShadowStateTransfer> | null {
+  if (receipt.envelope.type !== "woo.state.transfer.request.shadow.v1") return null;
+  if (!receipt.fresh) {
+    const cached = browser.relay.recent_replies.get(receipt.idempotency_key);
+    return cached ? structuredClone(cached) as ShadowEnvelope<ShadowStateTransfer> : null;
+  }
+  const request = receipt.envelope.body as ShadowExecutableStateTransferRequest;
+  if (request.scope !== browser.relay.commit_scope.scope || request.key.scope !== request.scope) {
+    throw new Error(`state transfer scope mismatch: request=${request.scope} key=${request.key.scope} relay=${browser.relay.commit_scope.scope}`);
+  }
+  if (request.mode && request.mode !== "cell_pages") throw new Error(`unsupported state transfer mode: ${request.mode}`);
+  const transfer = buildShadowCellPageTransfer({
+    serialized: browser.relay.commit_scope.serialized,
+    key: request.key,
+    atom_hashes: request.atom_hashes,
+    known_page_hashes: request.known_page_hashes ?? browser.execution_node.page_hashes,
+    session: browser.session,
+    recipient: browser.node
+  });
+  const response: ShadowEnvelope<ShadowStateTransfer> = {
+    v: 2,
+    type: transfer.kind,
+    id: `${browser.relay.node}:state:${request.id ?? receipt.envelope.id}`,
+    from: browser.relay.node,
+    to: browser.node,
+    actor: browser.actor,
+    ...(browser.session ? { session: browser.session } : {}),
+    reply_to: receipt.envelope.id,
+    auth: shadowBrowserAuth(browser),
+    body: transfer
+  };
   browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(response));
   trimShadowBrowserIdempotency(browser.relay);
   return response;

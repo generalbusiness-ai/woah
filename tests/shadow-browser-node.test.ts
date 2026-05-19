@@ -11,6 +11,7 @@ import {
   disposeShadowBrowserNode,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
+  handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserAuthoritySessionState,
@@ -1466,6 +1467,46 @@ describe("shadow browser node shim", () => {
       ads: [expect.objectContaining({ node: "near-intent-executor" })]
     });
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.39);
+  });
+
+  it("serves executable state transfer requests without committing the turn", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-state-repair", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-state-repair-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.41]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(browser.relay.commit_scope.serialized, call)).transcript);
+    const envelope = shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
+      kind: "woo.state.transfer.request.shadow.v1" as const,
+      id: "browser-state-repair-request",
+      scope: "the_dubspace",
+      key,
+      atom_hashes: [key.atom_hashes[0]],
+      mode: "cell_pages" as const
+    }, "browser-state-repair-env");
+
+    const reply = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+
+    expect(reply).toMatchObject({
+      type: "woo.state.transfer.shadow.v1",
+      reply_to: "browser-state-repair-env",
+      body: {
+        mode: "cell_pages",
+        scope: "the_dubspace",
+        atom_hashes: [key.atom_hashes[0]]
+      }
+    });
+    expect(reply?.body.mode === "cell_pages" ? reply.body.inline_pages.length : 0).toBeGreaterThan(0);
+    expect(browser.relay.commit_scope.head.seq).toBe(0);
   });
 });
 

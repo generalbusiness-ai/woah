@@ -1,7 +1,7 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
-import { applyShadowScopeProjectionPatch, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
+import { applyShadowScopeProjectionPatch, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
@@ -11,7 +11,7 @@ import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
-import { planV2BrowserLocalTurn } from "./v2-browser-local-turn";
+import { planV2BrowserLocalTurn, type V2BrowserLocalTurnResult } from "./v2-browser-local-turn";
 import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2TurnResultMessageFromReply } from "./v2-browser-messages";
 import { v2BrowserWebSocketUrl } from "./v2-browser-url";
 
@@ -69,6 +69,7 @@ let connectReadyResolve: (() => void) | null = null;
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
+const pendingStateTransfers = new Map<string, { resolve: () => void; reject: (err: Error) => void; timer: number }>();
 
 type V2WorkerScope = {
   addEventListener(type: "message", listener: (event: MessageEvent<V2WorkerCommand>) => void): void;
@@ -106,6 +107,7 @@ async function handleCommand(command: V2WorkerCommand): Promise<void> {
       socket = null;
       connecting = false;
       current = null;
+      rejectPendingStateTransfers(new Error("v2 browser disconnected"));
       await putMeta("connected", false);
       postStatus();
       break;
@@ -205,6 +207,7 @@ async function connect(): Promise<void> {
     ws.addEventListener("close", () => {
       if (socket !== ws) return;
       connecting = false;
+      rejectPendingStateTransfers(new Error("v2 browser socket closed"));
       void putMeta("connected", false);
       postStatus();
       scheduleReconnect();
@@ -213,6 +216,7 @@ async function connect(): Promise<void> {
     ws.addEventListener("error", () => {
       if (socket !== ws) return;
       connecting = false;
+      rejectPendingStateTransfers(new Error("v2 browser socket error"));
       void putMeta("connected", false);
       postStatus();
       settle();
@@ -241,6 +245,9 @@ async function receiveFrame(encoded: string): Promise<void> {
   }
   if (envelope.type === "woo.live.event.shadow.v1") {
     postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
+  }
+  if (envelope.type === "woo.state.transfer.shadow.v1" && envelope.reply_to) {
+    resolvePendingStateTransfer(envelope.reply_to);
   }
   if (installedExecutableState || receivedStateTransfer) await replayPending();
   if (receivedStateTransfer || envelope.type === "woo.transport.error.v1") connectReadyResolve?.();
@@ -345,7 +352,7 @@ function postTurnUnavailable(id: string, reason: string): void {
   });
 }
 
-async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call" }>): Promise<boolean> {
+async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call" }>, repaired = false): Promise<boolean> {
   if (!current || !current.actor) return false;
   const scope = command.scope || current.scope;
   const cachedHead = scope ? await getMeta<unknown>(`head:${scope}`) : undefined;
@@ -369,6 +376,9 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
   });
   if (!local.ok) {
     if (local.reason === "missing_state" && local.request && local.key) {
+      if (!repaired && await repairLocalExecutableState(local, command.id)) {
+        return await sendLocalTurnExec(command, true);
+      }
       const delegation = selectV2DelegatedExecutor({
         records: await allExecutionAds(),
         key: local.key
@@ -405,6 +415,76 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     result_known: local.result_known
   });
   return true;
+}
+
+async function repairLocalExecutableState(
+  local: V2BrowserLocalTurnResult,
+  id: string
+): Promise<boolean> {
+  if (local.ok || local.reason !== "missing_state" || !current || !current.actor || !local.key) return false;
+  const key = local.key;
+  const missingAtoms = local.missing_atoms ?? [];
+  const requestId = `${id}:state-repair`;
+  const body: ShadowExecutableStateTransferRequest = {
+    kind: "woo.state.transfer.request.shadow.v1",
+    id: requestId,
+    scope: key.scope,
+    key,
+    atom_hashes: missingAtoms.length > 0 ? missingAtoms.map((atom) => atom.hash) : key.atom_hashes,
+    mode: "cell_pages"
+  };
+  const envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest> = {
+    v: 2,
+    type: body.kind,
+    id: requestId,
+    from: current.node,
+    actor: current.actor,
+    ...(current.session ? { session: current.session } : {}),
+    auth: { mode: "session", token: current.token },
+    body
+  };
+  postMessage({
+    kind: "local_turn_repairing",
+    id,
+    missing_atoms: missingAtoms.map((atom) => atom.hash)
+  });
+  try {
+    await requestStateTransfer(envelope);
+    return true;
+  } catch (err) {
+    postMessage({ kind: "local_turn_repair_failed", id, error: errorMessage(err) });
+    return false;
+  }
+}
+
+async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest>): Promise<void> {
+  const encoded = encodeEnvelope(envelope);
+  const id = envelope.id;
+  const pending = new Promise<void>((resolve, reject) => {
+    const timer = workerScope.setTimeout(() => {
+      pendingStateTransfers.delete(id);
+      reject(new Error("state transfer request timed out"));
+    }, 5000);
+    pendingStateTransfers.set(id, { resolve, reject, timer });
+  });
+  sendEncoded(encoded);
+  await pending;
+}
+
+function resolvePendingStateTransfer(id: string): void {
+  const pending = pendingStateTransfers.get(id);
+  if (!pending) return;
+  pendingStateTransfers.delete(id);
+  workerScope.clearTimeout(pending.timer);
+  pending.resolve();
+}
+
+function rejectPendingStateTransfers(err: Error): void {
+  for (const [id, pending] of pendingStateTransfers) {
+    pendingStateTransfers.delete(id);
+    workerScope.clearTimeout(pending.timer);
+    pending.reject(err);
+  }
 }
 
 async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest): Promise<void> {

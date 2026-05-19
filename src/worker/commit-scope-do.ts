@@ -15,6 +15,7 @@ import {
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   handleShadowBrowserTurnExecEnvelope,
+  handleShadowBrowserStateTransferEnvelope,
   MAX_SHADOW_ACCEPTED_TAIL,
   MAX_SHADOW_IDEMPOTENCY_ENTRIES,
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
@@ -43,7 +44,7 @@ import {
 } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { stableShadowJson } from "../core/shadow-cell-version";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
@@ -172,7 +173,7 @@ export class CommitScopeDO {
           this.ensureSerializedSession(relay, input);
           const browser = this.browserFor(relay, input);
           const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
-          const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, {
+          const turnReply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, {
             profile: (event) => this.emitMetric(event),
             // Forward verb-execution metrics from the ephemeral
             // planning world so direct_call / applied /
@@ -181,6 +182,7 @@ export class CommitScopeDO {
             // envelope regardless of strategy or transport.
             onMetric: (event) => this.emitMetric(event)
           });
+          const reply = turnReply ?? handleShadowBrowserStateTransferEnvelope(browser, receipt);
           if (this.needsFullSave) {
             await this.saveFull(relay);
             this.needsFullSave = false;
@@ -203,7 +205,7 @@ export class CommitScopeDO {
           this.emitShadowCommitMetric(reply, node, fanout.length);
           return jsonResponse({
             ok: true,
-            reply: reply ? encodeEnvelope(reply) : null,
+            reply: reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null,
             head: relay.commit_scope.head,
             fanout
           } satisfies CommitScopeEnvelopeResponse);
@@ -384,9 +386,10 @@ export class CommitScopeDO {
   private fanoutEnvelopes(
     relay: ShadowBrowserRelayShim,
     originNode: string,
-    reply: ShadowEnvelope<ShadowTurnExecReply>
+    reply: ShadowEnvelope<ShadowEnvelopeReplyBody>
   ): Array<{ node: string; envelope: string }> {
     const body = reply.body;
+    if (!isShadowTurnExecReply(body)) return [];
     if (body.ok !== true || !body.transcript) return [];
     if (!body.commit) return this.liveFanoutEnvelopes(relay, originNode, reply);
     // Durable browser fan-out is owned by the gateway, which has the live
@@ -399,10 +402,11 @@ export class CommitScopeDO {
   private liveFanoutEnvelopes(
     relay: ShadowBrowserRelayShim,
     originNode: string,
-    reply: ShadowEnvelope<ShadowTurnExecReply>
+    reply: ShadowEnvelope<ShadowEnvelopeReplyBody>
   ): Array<{ node: string; envelope: string }> {
     const origin = relay.browsers.get(originNode);
     const body = reply.body;
+    if (!isShadowTurnExecReply(body)) return [];
     if (!origin || body.ok !== true || !body.transcript) return [];
     const out: Array<{ node: string; envelope: string }> = [];
     for (const event of shadowLiveEventsForTranscript(origin, body.transcript)) {
@@ -428,9 +432,9 @@ export class CommitScopeDO {
     return out;
   }
 
-  private emitShadowCommitMetric(reply: ShadowEnvelope<ShadowTurnExecReply> | null, node: string | undefined, fanout: number): void {
+  private emitShadowCommitMetric(reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null, node: string | undefined, fanout: number): void {
     const body = reply?.body;
-    if (!body) return;
+    if (!isShadowTurnExecReply(body)) return;
     // Commit outcomes are split out from the endpoint metric so production
     // tails can alert on accept/reject rates without decoding reply envelopes.
     if (body.ok === true && body.commit) {
@@ -568,7 +572,7 @@ export class CommitScopeDO {
   private async saveEnvelopeDelta(
     relay: ShadowBrowserRelayShim,
     receipt: ShadowBrowserEnvelopeReceipt,
-    reply: ShadowEnvelope<ShadowTurnExecReply> | null
+    reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null
   ): Promise<void> {
     // Replayed envelopes authenticate and return the cached reply, but they do
     // not mutate relay state. Skipping storage here makes retry idempotency
@@ -578,7 +582,7 @@ export class CommitScopeDO {
     if (seenAt === undefined) return;
     const now = Date.now();
     const body = reply?.body;
-    const willSaveMeta = body?.ok === true && Boolean(body.commit) && Boolean(body.transcript);
+    const willSaveMeta = isShadowTurnExecReply(body) && body.ok === true && Boolean(body.commit) && Boolean(body.transcript);
     this.state.storage.transactionSync(() => {
       this.saveSeenKey(receipt.idempotency_key, seenAt);
       this.pruneSeenAndReplies(relay, now);
@@ -586,7 +590,7 @@ export class CommitScopeDO {
         this.saveRecentReply(receipt.idempotency_key, reply, now);
         this.pruneRecentReplies();
       }
-      if (willSaveMeta && body && body.ok === true && body.commit && body.transcript) {
+      if (willSaveMeta && body && isShadowTurnExecReply(body) && body.ok === true && body.commit && body.transcript) {
         this.saveMeta(relay, now);
         this.saveTranscriptDelta(relay, body.transcript, now);
         this.saveAcceptedFrame(body.commit, now);
@@ -820,7 +824,7 @@ export class CommitScopeDO {
     }
   }
 
-  private saveRecentReply(key: string, reply: ShadowEnvelope<ShadowTurnExecReply>, now: number): void {
+  private saveRecentReply(key: string, reply: ShadowEnvelope<ShadowEnvelopeReplyBody>, now: number): void {
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO v2_commit_scope_reply(idempotency_key, body, updated_at) VALUES (?, ?, ?)",
       storageKey(key),
@@ -954,9 +958,15 @@ function logsFromRows(rows: Array<{ space: string; body: string }>): SerializedW
 
 type V2EnvelopeReplyMetric = "none" | "accepted" | "live" | "missing_state" | "commit_rejected";
 
-function shadowReplyMetricKind(reply: ShadowEnvelope<ShadowTurnExecReply> | null): V2EnvelopeReplyMetric {
+type ShadowEnvelopeReplyBody = ShadowTurnExecReply | ShadowStateTransfer;
+
+function isShadowTurnExecReply(body: unknown): body is ShadowTurnExecReply {
+  return Boolean(body && typeof body === "object" && !Array.isArray(body) && (body as { kind?: unknown }).kind === "woo.turn.exec.reply.shadow.v1");
+}
+
+function shadowReplyMetricKind(reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null): V2EnvelopeReplyMetric {
   const body = reply?.body;
-  if (!body) return "none";
+  if (!isShadowTurnExecReply(body)) return "none";
   if (body.ok === false) return body.reason;
   return body.commit ? "accepted" : "live";
 }
