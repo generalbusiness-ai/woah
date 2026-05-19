@@ -35,5 +35,6 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("scope open SHOULD emit at least one standalone `ExecCapabilityAd` envelope");
     expect(spec).toContain("MUST NOT submit an unselected durable intent");
     expect(spec).toContain("If repair succeeds, the worker retries local");
+    expect(spec).toContain("MUST NOT release queued durable turns until the");
   });
 });

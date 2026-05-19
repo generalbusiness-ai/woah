@@ -2005,6 +2005,11 @@ processing authority-bearing browser envelopes. This preserves hello-first
 transport semantics while ensuring browser caches install verified state before
 pending turns are replayed.
 
+If the relay emits an open-time `ExecCapabilityAd` for the scope, it SHOULD send
+that ad immediately after the initial state transfer. A browser that disables
+unselected durable intents MUST NOT release queued durable turns until the
+initial state transfer and that execution ad have both been installed.
+
 `TransportHello.actor` is the relay-validated actor from the session token. If
 it differs from the browser's cached actor, the browser MUST treat
 `TransportHello.actor` as authoritative and discard local state bound to the

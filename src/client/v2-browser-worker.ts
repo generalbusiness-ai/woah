@@ -65,7 +65,7 @@ let current: { token: string; node: string; scope: string; actor?: string; sessi
 let reconnectTimer: number | undefined;
 let connecting = false;
 let connectPromise: Promise<void> | null = null;
-let connectReadyResolve: (() => void) | null = null;
+let connectReady: { sawState: boolean; sawAd: boolean; settle: () => void; timer: number } | null = null;
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
@@ -182,14 +182,24 @@ async function connect(): Promise<void> {
   connectPromise = new Promise<void>((resolve) => {
     // WebSocket open is not enough: the dev relay sends TransportHello before
     // openShadowBrowserScope subscribes this node. Resolve connect only after
-    // the state transfer, so immediate turn intents cannot miss accepted-frame
-    // fan-out for their new scope.
+    // the open state transfer and scope execution ad have both been installed,
+    // so the first durable turn can cold-delegate instead of racing the ad's IDB
+    // write and failing with local-execution-unavailable.
     const settle = () => {
+      const ready = connectReady;
+      if (ready?.settle === settle) {
+        workerScope.clearTimeout(ready.timer);
+        connectReady = null;
+      }
       if (connectPromise) connectPromise = null;
-      if (connectReadyResolve === settle) connectReadyResolve = null;
       resolve();
     };
-    connectReadyResolve = settle;
+    connectReady = {
+      sawState: false,
+      sawAd: false,
+      settle,
+      timer: workerScope.setTimeout(settle, 5000)
+    };
     ws.addEventListener("open", () => {
       if (socket !== ws) return;
       connecting = false;
@@ -232,6 +242,7 @@ async function receiveFrame(encoded: string): Promise<void> {
   const envelope = decodeEnvelope(encoded);
   let installedExecutableState = false;
   const receivedStateTransfer = envelope.type === "woo.state.transfer.shadow.v1";
+  const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
   for (const mutation of v2BrowserCacheMutationsForEnvelope(envelope)) {
     const applied = await applyCacheMutation(mutation);
     if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
@@ -250,9 +261,21 @@ async function receiveFrame(encoded: string): Promise<void> {
     resolvePendingStateTransfer(envelope.reply_to);
   }
   if (installedExecutableState || receivedStateTransfer) await replayPending();
-  if (receivedStateTransfer || envelope.type === "woo.transport.error.v1") connectReadyResolve?.();
+  markConnectReady(receivedStateTransfer, receivedExecutionAd, envelope.type === "woo.transport.error.v1");
   postMessage({ kind: "frame", envelope });
   postStatus();
+}
+
+function markConnectReady(receivedStateTransfer: boolean, receivedExecutionAd: boolean, receivedTransportError: boolean): void {
+  const ready = connectReady;
+  if (!ready) return;
+  if (receivedTransportError) {
+    ready.settle();
+    return;
+  }
+  if (receivedStateTransfer) ready.sawState = true;
+  if (receivedExecutionAd) ready.sawAd = true;
+  if (ready.sawState && ready.sawAd) ready.settle();
 }
 
 async function replayPending(): Promise<void> {
