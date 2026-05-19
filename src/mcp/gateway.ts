@@ -61,7 +61,7 @@ export type McpV2OpenBody = {
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
   authority?: SerializedAuthoritySlice;
-  serialized: ReturnType<WooWorld["exportWorld"]>;
+  serialized?: ReturnType<WooWorld["exportWorld"]>;
 };
 
 export type McpV2OpenResult = {
@@ -96,6 +96,7 @@ type V2ScopeClient = {
   scope: ObjRef;
   relay: ShadowBrowserRelayShim;
   openedSessions: Set<string>;
+  openingSessions: Map<string, Promise<void>>;
 };
 
 type RemoteAcceptedCommit = {
@@ -117,6 +118,7 @@ export class McpGateway {
   readonly host: McpHost;
   private sessions = new Map<string, SessionEntry>();
   private v2Scopes = new Map<ObjRef, V2ScopeClient>();
+  private v2ScopeInitializers = new Map<ObjRef, Promise<V2ScopeClient>>();
   private remoteAccepted = new Set<string>();
   private remoteAcceptedOrder: string[] = [];
   private remotePending = new Map<ObjRef, Map<number, RemoteAcceptedCommit>>();
@@ -506,36 +508,78 @@ export class McpGateway {
     const hooks = this.options.v2;
     if (!hooks) throw new Error("MCP v2 client hooks are not configured");
     let client = this.v2Scopes.get(scope);
-    let seeded: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> } | null = null;
     if (!client) {
-      seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
-      client = {
+      client = await this.initializeV2ScopeClient(entry, scope, hooks);
+    }
+    await this.ensureV2ScopeSessionOpen(entry, client, hooks);
+    return client;
+  }
+
+  private async initializeV2ScopeClient(entry: SessionEntry, scope: ObjRef, hooks: McpV2ClientHooks): Promise<V2ScopeClient> {
+    const existing = this.v2Scopes.get(scope);
+    if (existing) return existing;
+    const pending = this.v2ScopeInitializers.get(scope);
+    if (pending) return await pending;
+    // First-open seeding is the expensive path: authority slice plus full
+    // exportWorld plus a serialized /v2/open. Coalesce it per scope so
+    // parallel sessions do not each build and post the same snapshot.
+    const initializer = (async () => {
+      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
+      const client: V2ScopeClient = {
         scope,
         relay: createShadowBrowserRelayShim({
           node: `mcp-v2-relay:${scope}`,
           scope,
           serialized: seeded.serialized
         }),
-        openedSessions: new Set()
+        openedSessions: new Set(),
+        openingSessions: new Map()
       };
+      await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded);
       this.v2Scopes.set(scope, client);
+      return client;
+    })();
+    this.v2ScopeInitializers.set(scope, initializer);
+    try {
+      return await initializer;
+    } finally {
+      if (this.v2ScopeInitializers.get(scope) === initializer) this.v2ScopeInitializers.delete(scope);
     }
-    if (!client.openedSessions.has(entry.woo.id)) {
-      seeded ??= await this.v2SerializedWorld([scope, entry.woo.actor]);
-      mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, seeded.authority.authority);
-      const opened = await hooks.open(scope, {
-        scope,
+  }
+
+  private async ensureV2ScopeSessionOpen(
+    entry: SessionEntry,
+    client: V2ScopeClient,
+    hooks: McpV2ClientHooks,
+    seeded?: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }
+  ): Promise<void> {
+    if (client.openedSessions.has(entry.woo.id)) return;
+    const existing = client.openingSessions.get(entry.woo.id);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const pending = (async () => {
+      const authority = seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor]);
+      mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, authority.authority);
+      const opened = await hooks.open(client.scope, {
+        scope: client.scope,
         node: this.v2NodeFor(entry),
         token: entry.v2Token,
         session: entry.woo.id,
         actor: entry.woo.actor,
-        ...seeded.authority,
-        serialized: seeded.serialized
+        ...authority,
+        ...(seeded ? { serialized: seeded.serialized } : {})
       });
       if (opened.head) client.relay.commit_scope.head = opened.head;
       client.openedSessions.add(entry.woo.id);
+    })();
+    client.openingSessions.set(entry.woo.id, pending);
+    try {
+      await pending;
+    } finally {
+      if (client.openingSessions.get(entry.woo.id) === pending) client.openingSessions.delete(entry.woo.id);
     }
-    return client;
   }
 
   private async v2AuthorityPayload(extraObjectIds: ObjRef[]): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {

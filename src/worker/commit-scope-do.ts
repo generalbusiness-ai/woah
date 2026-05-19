@@ -57,6 +57,8 @@ export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
   private snapshotLoaded = false;
   private needsFullSave = false;
+  private relayInitPromise: Promise<ShadowBrowserRelayShim> | null = null;
+  private fullSavePromise: Promise<void> | null = null;
 
   constructor(
     private readonly state: CommitScopeDurableState,
@@ -134,11 +136,8 @@ export class CommitScopeDO {
             last_known_head: input.last_known_head
           });
           const hello = shadowBrowserTransportHello(browser);
-          if (this.needsFullSave) {
-            await this.saveFull(relay);
-            this.needsFullSave = false;
-            fullSave = true;
-          }
+          // A cold relay seed must be durable before the open is reported.
+          fullSave = await this.saveFullIfNeeded(relay);
           const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
           this.emitMetric({
             kind: "shadow_open_executable_seed_bytes",
@@ -205,11 +204,10 @@ export class CommitScopeDO {
             onMetric: (event) => this.emitMetric(event)
           });
           const reply = turnReply ?? handleShadowBrowserStateTransferEnvelope(browser, receipt);
-          if (this.needsFullSave) {
-            await this.saveFull(relay);
-            this.needsFullSave = false;
-            fullSave = true;
-          } else {
+          // When this envelope initialized a cold relay, the full save already
+          // includes the accepted turn state; otherwise persist only the delta.
+          fullSave = await this.saveFullIfNeeded(relay);
+          if (!fullSave) {
             await this.saveEnvelopeDelta(relay, receipt, reply);
           }
           const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
@@ -300,26 +298,48 @@ export class CommitScopeDO {
   }
 
   private async relayFor(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
-    if (!this.snapshotLoaded) {
-      this.relay = await this.loadSnapshot(input);
-      this.snapshotLoaded = true;
-    }
     if (!this.relay) {
-      if (!input.serialized) {
-        throw wooError("E_PROTOCOL", `commit scope ${input.scope} has no durable snapshot; open the scope before sending envelopes`);
+      if (!this.relayInitPromise) {
+        const pending = this.initializeRelay(input);
+        this.relayInitPromise = pending;
+        try {
+          await pending;
+        } finally {
+          if (this.relayInitPromise === pending) this.relayInitPromise = null;
+        }
+      } else {
+        await this.relayInitPromise;
       }
-      this.relay = createShadowBrowserRelayShim({
-        node: `node:commit-scope:${input.scope}`,
-        scope: input.scope,
-        serialized: input.serialized
-      });
-      this.needsFullSave = true;
     }
+    if (!this.relay) throw wooError("E_INTERNAL", `commit scope ${input.scope} failed to initialize relay`);
     if (this.relay.commit_scope.scope !== input.scope) {
       throw wooError("E_PROTOCOL", `commit scope mismatch: have=${this.relay.commit_scope.scope} want=${input.scope}`);
     }
     this.refreshSessionAuth(this.relay, input);
     return this.relay;
+  }
+
+  private async initializeRelay(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
+    if (this.relay) return this.relay;
+    if (!this.snapshotLoaded) {
+      const loaded = await this.loadSnapshot();
+      this.snapshotLoaded = true;
+      if (loaded) {
+        this.relay = loaded;
+        return loaded;
+      }
+    }
+    if (!input.serialized) {
+      throw wooError("E_PROTOCOL", `commit scope ${input.scope} has no durable snapshot; open the scope before sending envelopes`);
+    }
+    const relay = createShadowBrowserRelayShim({
+      node: `node:commit-scope:${input.scope}`,
+      scope: input.scope,
+      serialized: input.serialized
+    });
+    this.relay = relay;
+    this.needsFullSave = true;
+    return relay;
   }
 
   private refreshSessionAuth(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
@@ -511,11 +531,11 @@ export class CommitScopeDO {
     return String(scope ?? (this.state.id as { name?: string }).name ?? "commit_scope");
   }
 
-  private async loadSnapshot(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim | null> {
-    return await this.loadRowSnapshot(input);
+  private async loadSnapshot(): Promise<ShadowBrowserRelayShim | null> {
+    return await this.loadRowSnapshot();
   }
 
-  private async loadRowSnapshot(input: CommitScopeBaseRequest): Promise<ShadowBrowserRelayShim | null> {
+  private async loadRowSnapshot(): Promise<ShadowBrowserRelayShim | null> {
     const rows = sqlRows<CommitScopeMetaRow>(this.state.storage.sql.exec(
       "SELECT scope, relay_node, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter FROM v2_commit_scope_meta WHERE id = 'current'"
     ));
@@ -544,8 +564,36 @@ export class CommitScopeDO {
     relay.recent_replies = new Map(sqlRows<{ idempotency_key: string; body: string }>(this.state.storage.sql.exec(
       "SELECT idempotency_key, body FROM v2_commit_scope_reply ORDER BY updated_at"
     )).map((row) => [decodeStorageKey(row.idempotency_key), JSON.parse(row.body) as ShadowEnvelope<WooValue>]));
-    this.refreshSessionAuth(relay, input);
     return relay;
+  }
+
+  private async saveFullIfNeeded(relay: ShadowBrowserRelayShim): Promise<boolean> {
+    if (this.fullSavePromise) {
+      await this.fullSavePromise;
+      return false;
+    }
+    if (!this.needsFullSave) return false;
+    this.needsFullSave = false;
+    // Cold /v2/open calls for the same scope can overlap before the first
+    // request finishes materializing rows. Only the first should pay the full
+    // O(scope snapshot) write; the rest wait for that durable boundary.
+    const pending = (async () => {
+      try {
+        await this.saveFull(relay);
+      } catch (err) {
+        this.needsFullSave = true;
+        throw err;
+      }
+    })();
+    // Publish the promise before awaiting it. That is the single-flight
+    // invariant: every overlapping caller must observe and join this exact save.
+    this.fullSavePromise = pending;
+    try {
+      await pending;
+      return true;
+    } finally {
+      if (this.fullSavePromise === pending) this.fullSavePromise = null;
+    }
   }
 
   private loadSerializedWorld(meta: CommitScopeMetaRow): SerializedWorld {
@@ -894,7 +942,7 @@ type CommitScopeBaseRequest = {
 };
 
 type CommitScopeOpenRequest = CommitScopeBaseRequest & {
-  serialized: SerializedWorld;
+  serialized?: SerializedWorld;
   last_known_head?: ShadowScopeHead;
 };
 

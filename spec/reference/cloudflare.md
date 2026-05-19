@@ -680,6 +680,9 @@ counters, accepted frames, transcript tail, idempotency keys, and cached
 replies. The legacy single `v2_commit_scope_meta.serialized` blob column is a
 read-only migration source; after a legacy scope opens successfully, the DO
 rewrites the state into row tables and clears the blob value.
+The first `/v2/open` for a scope must carry `serialized`; once that relay has
+been durably materialized, later session opens for the same scope may omit
+`serialized` and rely on the persisted rows plus the request authority slice.
 
 CommitScopeDO snapshots are materialized planning caches, not independent
 owners of live session presence. Each signed `/v2/open`, `/v2/envelope`, and

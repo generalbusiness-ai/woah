@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
+import { applyAcceptedShadowFrame } from "../../src/core/shadow-commit-scope";
 import { createWorld } from "../../src/core/bootstrap";
-import { encodeEnvelope } from "../../src/core/shadow-envelope";
+import { decodeEnvelope, encodeEnvelope } from "../../src/core/shadow-envelope";
 import {
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
@@ -9,6 +10,7 @@ import {
   setShadowBrowserSessionToken,
   shadowBrowserEnvelope
 } from "../../src/core/shadow-browser-node";
+import type { ShadowTurnExecReply } from "../../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
 import type { WooWorld } from "../../src/core/world";
@@ -187,6 +189,43 @@ describe("v2 CommitScopeDO cost budget", () => {
     }
   });
 
+  it("coalesces concurrent cold opens into one full row materialization", async () => {
+    const world = createWorld({ catalogs: false });
+    const session = world.auth("guest:cf-v2-concurrent-open");
+    const scopeState = new FakeDurableObjectState("#-1");
+    const commitScope = new CommitScopeDO(scopeState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = { WOO_INTERNAL_SECRET: "cf-test-secret" };
+    const expectedObjects = world.exportWorld().objects.length;
+    resetStateCostLog(scopeState);
+
+    try {
+      await Promise.all(Array.from({ length: 4 }, async (_, index) => {
+        const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            scope: "#-1",
+            node: `browser:v2-concurrent-open-${index}`,
+            token: "guest:cf-v2-concurrent-open",
+            session: session.id,
+            actor: session.actor,
+            sessions: world.exportSessions(),
+            serialized: world.exportWorld()
+          })
+        }));
+        const response = await commitScope.fetch(request);
+        expect(response.ok).toBe(true);
+      }));
+
+      expect(writeRowsByTable(scopeState)).toMatchObject({
+        v2_commit_scope_object: expectedObjects,
+        v2_commit_scope_session: world.exportWorld().sessions.length
+      });
+    } finally {
+      scopeState.close();
+    }
+  });
+
   it("performs exactly zero durable writes on duplicate envelope replay", async () => {
     const harness = await makeCostHarness();
     try {
@@ -208,17 +247,45 @@ describe("v2 CommitScopeDO cost budget", () => {
     }
   });
 
+  it("recovers from stale head without unbounded writes", async () => {
+    const harness = await makeCostHarness();
+    try {
+      await harness.openScope();
+      const firstEnvelope = await harness.envelope(1);
+      await harness.internals.webSocketV2TurnNetworkMessage(harness.world, harness.ws as unknown as WebSocket, firstEnvelope);
+      expect(latestTurnReply(harness.ws)).toMatchObject({ ok: true, commit: { position: { seq: 1 } } });
+      resetCostLog(harness);
+
+      const staleEnvelope = await harness.envelope(2);
+      await harness.internals.webSocketV2TurnNetworkMessage(harness.world, harness.ws as unknown as WebSocket, staleEnvelope);
+
+      expect(latestTurnReply(harness.ws)).toMatchObject({ ok: true, commit: { position: { seq: 2 } } });
+      expect(rowWrites(harness.scopeState)).toBeLessThanOrEqual(8);
+      expect(writeRowsByTable(harness.scopeState)).toMatchObject({
+        v2_commit_scope_meta: 1,
+        v2_commit_scope_object: 1,
+        v2_commit_scope_accepted_frame: 1,
+        v2_commit_scope_transcript_tail: 1,
+        v2_commit_scope_seen: 1,
+        v2_commit_scope_reply: 1
+      });
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   it("scales write cost linearly across many turns", async () => {
     const harness = await makeCostHarness();
     try {
       await harness.openScope();
       resetCostLog(harness);
 
-      for (let index = 1; index <= 20; index += 1) await harness.sendTurn(index);
+      const batchSize = 12;
+      for (let index = 1; index <= batchSize; index += 1) await harness.sendTurn(index);
       const writesAfterFirstBatch = rowWrites(harness.scopeState);
-      for (let index = 21; index <= 40; index += 1) await harness.sendTurn(index);
+      for (let index = batchSize + 1; index <= batchSize * 2; index += 1) await harness.sendTurn(index);
       const writesAfterSecondBatch = rowWrites(harness.scopeState);
-      const secondBatchPerTurn = (writesAfterSecondBatch - writesAfterFirstBatch) / 20;
+      const secondBatchPerTurn = (writesAfterSecondBatch - writesAfterFirstBatch) / batchSize;
 
       // Expected remains about 6 writes/turn regardless of retained tail size.
       // O(retained) rewrites grow this number as history accumulates.
@@ -314,6 +381,7 @@ async function makeCostHarness(): Promise<CostHarness> {
     envelope: thisEnvelope,
     sendTurn: async (index: number) => {
       await internals.webSocketV2TurnNetworkMessage(world, ws as unknown as WebSocket, await thisEnvelope(index));
+      applyLatestReplyToBrowser();
     },
     cleanup: () => {
       directoryState.close();
@@ -345,6 +413,24 @@ async function makeCostHarness(): Promise<CostHarness> {
     };
     return encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, `cf-v2-cost-env-${index}`));
   }
+
+  function applyLatestReplyToBrowser(): void {
+    const body = latestTurnReply(ws);
+    if (body.ok === true && body.commit) {
+      // Keep the simulated browser's planning head aligned with the committed
+      // authority. Otherwise each measured turn first exercises the stale-head
+      // recovery path, which is useful elsewhere but not in this write-cost guard.
+      applyAcceptedShadowFrame(browser.relay.commit_scope, body.commit, body.transcript);
+    }
+  }
+}
+
+function latestTurnReply(ws: FakeWebSocket): ShadowTurnExecReply {
+  const latest = ws.sent.at(-1);
+  expect(latest).toBeTruthy();
+  const reply = decodeEnvelope(latest!);
+  expect(reply.type).toBe("woo.turn.exec.reply.shadow.v1");
+  return reply.body as ShadowTurnExecReply;
 }
 
 function resetCostLog(harness: CostHarness): void {

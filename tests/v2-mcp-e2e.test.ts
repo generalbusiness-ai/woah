@@ -250,6 +250,7 @@ describe("v2 MCP e2e", () => {
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
     const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
     const concurrentCalls = 4;
+    const openBodies: McpV2OpenBody[] = [];
     const pendingEnvelopes: Array<() => void> = [];
     const releaseEnvelopeBatch = (): void => {
       const releases = pendingEnvelopes.splice(0);
@@ -257,7 +258,10 @@ describe("v2 MCP e2e", () => {
     };
     const gateway = new McpGateway(world, {
       v2: {
-        open: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/open", body),
+        open: async (commitScope, body) => {
+          openBodies.push(body);
+          return await postCommitScope(scope, env, commitScope, "/v2/open", body);
+        },
         envelope: async (commitScope, body) => {
           // Hold the first batch until every caller has locally reached the
           // commit boundary. Exec envelopes planned at the gateway race here
@@ -294,6 +298,8 @@ describe("v2 MCP e2e", () => {
       const accepted = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
       expect(accepted).toHaveLength(concurrentCalls);
       expect(accepted.map((row) => JSON.parse(row.body).position.seq)).toEqual([1, 2, 3, 4]);
+      expect(openBodies).toHaveLength(concurrentCalls);
+      expect(openBodies.filter((body) => Object.prototype.hasOwnProperty.call(body, "serialized"))).toHaveLength(1);
     } finally {
       releaseEnvelopeBatch();
       scopeState.close();
