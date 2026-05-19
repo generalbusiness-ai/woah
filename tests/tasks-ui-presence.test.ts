@@ -63,7 +63,7 @@ describe("tasks-kanban presence aside", () => {
 
     const aside = element.querySelector(".woo-tasks-presence");
     expect(aside, "tasks-presence aside present").not.toBeNull();
-    expect(aside?.querySelector("h2")?.textContent).toBe("Present");
+    expect(aside?.querySelector("h2")?.textContent).toBe("Presence");
 
     const buttons = aside?.querySelectorAll(".presence-list button") ?? [];
     expect(buttons.length).toBe(2);
@@ -79,7 +79,7 @@ describe("tasks-kanban presence aside", () => {
 
     const aside = element.querySelector(".woo-tasks-presence");
     expect(aside, "presence aside still renders").not.toBeNull();
-    expect(aside?.querySelector(".presence-list")?.textContent).toContain("No one is in this registry");
+    expect(aside?.querySelector(".presence-list")?.textContent).toContain("No one is here");
   });
 
   it("wraps the workarea + aside in .split.split--side-fixed.woo-tasks-layout", () => {

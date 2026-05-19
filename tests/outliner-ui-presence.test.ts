@@ -10,8 +10,8 @@ import type { WooContext } from "../src/client/framework";
 // jsdom render tests for the presence aside introduced by outliner-presence.
 // These pin (a) the .outliner-presence aside exists inside .outliner-layout,
 // (b) actors come through as <button> entries inside .presence-list, and
-// (c) the empty roster falls back to the same "No one is in this outline"
-// placeholder shape as chat-presence / dubspace-presence.
+// (c) the empty roster falls back to the same "No one is here." placeholder
+// shape as chat-presence / tasks-presence.
 
 function ctx(names: Record<string, string> = {}): WooContext {
   return {
@@ -57,7 +57,7 @@ describe("outliner-tree presence aside", () => {
 
     const aside = element.querySelector(".outliner-presence");
     expect(aside, "outliner-presence aside present").not.toBeNull();
-    expect(aside?.querySelector("h2")?.textContent).toBe("Present");
+    expect(aside?.querySelector("h2")?.textContent).toBe("Presence");
 
     const buttons = aside?.querySelectorAll(".presence-list button") ?? [];
     expect(buttons.length).toBe(2);
@@ -66,9 +66,8 @@ describe("outliner-tree presence aside", () => {
     expect(buttons[1].textContent).toContain("Guest Two");
   });
 
-  // Empty roster fallback — the placeholder text mirrors chat-space's
-  // "No actors present." phrasing so the empty state reads the same shape
-  // across tools.
+  // Empty roster fallback — the placeholder text is the same "No one is
+  // here." shape as chat-presence and tasks-presence.
   it("falls back to a placeholder when the roster is empty", () => {
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData };
     element.woo = ctx();
@@ -84,7 +83,7 @@ describe("outliner-tree presence aside", () => {
 
     const aside = element.querySelector(".outliner-presence");
     expect(aside, "presence aside still renders with empty roster").not.toBeNull();
-    expect(aside?.querySelector(".presence-list")?.textContent).toContain("No one is in this outline");
+    expect(aside?.querySelector(".presence-list")?.textContent).toContain("No one is here");
   });
 
   // The presence aside sits as the right column inside .split.split--side-fixed
@@ -117,7 +116,7 @@ describe("outliner-tree presence aside", () => {
   // up floating ~3rem above the viewport bottom. Pin that structurally:
   // .outliner-header must be a sibling of .ambient-companion-shell, not a
   // descendant.
-  it("renders the header outside the ambient-companion-shell so the mini-chat anchors to the viewport bottom", () => {
+  it("renders the toolbar outside the ambient-companion-shell so the mini-chat anchors to the viewport bottom", () => {
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData; showCompanion: boolean };
     element.woo = ctx();
     element.showCompanion = true;
@@ -131,10 +130,15 @@ describe("outliner-tree presence aside", () => {
       roster: []
     };
 
-    const header = element.querySelector(".outliner-header");
+    // Outliner uses the shared .toolbar/h1 envelope just like
+    // pinboard / dubspace / tasks — that's what makes the chat panel
+    // anchor identically across tools. See renderToolFrame in
+    // src/client/framework.ts.
+    const toolbar = element.querySelector(".toolbar.outliner-toolbar");
     const shell = element.querySelector(".ambient-companion-shell");
-    expect(header, "header is rendered").not.toBeNull();
+    expect(toolbar, "toolbar is rendered with the shared .toolbar class").not.toBeNull();
+    expect(toolbar?.querySelector("h1"), "title uses h1 (matches other tools)").not.toBeNull();
     expect(shell, "ambient-companion-shell is rendered when companion visible").not.toBeNull();
-    expect(shell?.contains(header), "header must NOT be a descendant of the shell — keep it as a sibling so the shell's calc(100dvh - 5.25rem) lines up").toBe(false);
+    expect(shell?.contains(toolbar), "toolbar must NOT be a descendant of the shell — keep it as a sibling so the shell's calc(100dvh - 5.25rem) lines up").toBe(false);
   });
 });
