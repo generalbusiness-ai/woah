@@ -506,20 +506,22 @@ export class McpGateway {
     const hooks = this.options.v2;
     if (!hooks) throw new Error("MCP v2 client hooks are not configured");
     let client = this.v2Scopes.get(scope);
+    let seeded: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> } | null = null;
     if (!client) {
+      seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
       client = {
         scope,
         relay: createShadowBrowserRelayShim({
           node: `mcp-v2-relay:${scope}`,
           scope,
-          serialized: (await this.v2SerializedWorld([scope, entry.woo.actor])).serialized
+          serialized: seeded.serialized
         }),
         openedSessions: new Set()
       };
       this.v2Scopes.set(scope, client);
     }
     if (!client.openedSessions.has(entry.woo.id)) {
-      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
+      seeded ??= await this.v2SerializedWorld([scope, entry.woo.actor]);
       mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, seeded.authority.authority);
       const opened = await hooks.open(scope, {
         scope,

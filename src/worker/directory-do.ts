@@ -154,10 +154,6 @@ export class DirectoryDO {
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
       }
 
-      if (request.method === "POST" && url.pathname === "/mcp-shards") {
-        return json({ shards: this.activeMcpShards() });
-      }
-
       if (request.method === "POST" && url.pathname === "/mcp-shards-for-scopes") {
         const body = await readJson(request);
         const scopes = Array.isArray(body.scopes) ? body.scopes : [];
@@ -358,15 +354,6 @@ export class DirectoryDO {
       mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
       updated_at: Number(row.updated_at)
     };
-  }
-
-  private activeMcpShards(): string[] {
-    const now = Date.now();
-    const rows = this.state.storage.sql.exec(
-      "SELECT DISTINCT mcp_shard FROM session_route WHERE mcp_shard IS NOT NULL AND mcp_shard != '' AND expires_at > ? ORDER BY mcp_shard",
-      now
-    ).toArray() as Array<{ mcp_shard?: unknown }>;
-    return rows.map((row) => String(row.mcp_shard)).filter(Boolean);
   }
 
   private mcpShardsForScopes(values: unknown[]): string[] {

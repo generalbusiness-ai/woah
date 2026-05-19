@@ -1994,6 +1994,16 @@ describe("CFObjectRepository production-shape coverage", () => {
       return sessionId!;
     }
 
+    async function unregister(sessionId: string): Promise<void> {
+      const request = await signInternalRequest(env, new Request("https://woo.internal/unregister-session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+      }));
+      const response = await env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")).fetch(request);
+      expect(response.ok, await response.clone().text()).toBe(true);
+    }
+
     try {
       const alice = await initialize("guest:cf-mcp-cross-shard-alice", 1);
       const aliceShard = testMcpShardHost(alice, 8);
@@ -2007,8 +2017,23 @@ describe("CFObjectRepository production-shape coverage", () => {
           bobShard = shard;
           break;
         }
+        await unregister(candidate);
       }
       expect(bob).toBeTruthy();
+
+      let charlie = "";
+      let charlieShard = "";
+      for (let i = 0; i < 16; i += 1) {
+        const candidate = await initialize(`guest:cf-mcp-cross-shard-charlie-${i}`, 40 + i);
+        const shard = testMcpShardHost(candidate, 8);
+        if (shard !== aliceShard && shard !== bobShard) {
+          charlie = candidate;
+          charlieShard = shard;
+          break;
+        }
+        await unregister(candidate);
+      }
+      expect(charlie).toBeTruthy();
 
       const bobReady = await mcp({
         jsonrpc: "2.0",
@@ -2021,9 +2046,22 @@ describe("CFObjectRepository production-shape coverage", () => {
       }, { "mcp-session-id": bob });
       expect(bobReady.result.isError, JSON.stringify(bobReady.result.structuredContent)).not.toBe(true);
 
-      const said = await mcp({
+      const charlieAway = await mcp({
         jsonrpc: "2.0",
         id: 31,
+        method: "tools/call",
+        params: {
+          name: "woo_call",
+          arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+        }
+      }, { "mcp-session-id": charlie });
+      expect(charlieAway.result.isError, JSON.stringify(charlieAway.result.structuredContent)).not.toBe(true);
+      fanoutHosts.length = 0;
+      fanoutRequests.length = 0;
+
+      const said = await mcp({
+        jsonrpc: "2.0",
+        id: 32,
         method: "tools/call",
         params: {
           name: "woo_call",
@@ -2031,13 +2069,14 @@ describe("CFObjectRepository production-shape coverage", () => {
         }
       }, { "mcp-session-id": alice });
       expect(said.result.isError, JSON.stringify(said.result.structuredContent)).not.toBe(true);
-      expect(fanoutHosts, JSON.stringify({ aliceShard, bobShard, fanoutHosts })).toContain(bobShard);
+      expect(fanoutHosts, JSON.stringify({ aliceShard, bobShard, charlieShard, fanoutHosts })).toContain(bobShard);
+      expect(fanoutHosts, JSON.stringify({ aliceShard, bobShard, charlieShard, fanoutHosts })).not.toContain(charlieShard);
       const bobWorld = (wooObjects.get(bobShard) as unknown as { world?: WooWorld }).world;
       expect(bobWorld?.sessions.get(bob)?.activeScope, JSON.stringify({ aliceShard, bobShard, fanoutHosts })).toBe("the_chatroom");
 
       const waited = await mcp({
         jsonrpc: "2.0",
-        id: 32,
+        id: 33,
         method: "tools/call",
         params: {
           name: "woo_wait",
@@ -2055,7 +2094,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(replayResponse.ok, await replayResponse.clone().text()).toBe(true);
       const replayWaited = await mcp({
         jsonrpc: "2.0",
-        id: 33,
+        id: 34,
         method: "tools/call",
         params: {
           name: "woo_wait",
@@ -2192,20 +2231,15 @@ describe("CFObjectRepository production-shape coverage", () => {
       }, { "mcp-session-id": alice });
       expect(aliceMove.result.isError, JSON.stringify(aliceMove.result.structuredContent)).not.toBe(true);
 
-      const bobObject = wooObjects.get(bobShard)! as unknown as {
-        world?: WooWorld;
-        activeMcpShardCache?: { expiresAt: number; hosts: string[] };
-      };
+      const bobObject = wooObjects.get(bobShard)! as unknown as { world?: WooWorld };
       const aliceObject = wooObjects.get(aliceShard)! as unknown as { world?: WooWorld };
       const bobActor = bobObject.world?.sessions.get(bob)?.actor;
       const aliceActor = aliceObject.world?.sessions.get(alice)?.actor;
       expect(bobActor).toBeTruthy();
       expect(aliceActor).toBeTruthy();
 
-      // Force the race deterministically: before the fix, Bob's origin shard
-      // would rely on this stale all-shard cache and miss Alice's shard, even
-      // though Alice's Directory route now says her session is in the_deck.
-      bobObject.activeMcpShardCache = { hosts: [bobShard], expiresAt: Date.now() + 60_000 };
+      // Reset setup fanout; Bob's move must discover Alice's destination
+      // shard from Directory's scoped session index.
       fanoutHosts.length = 0;
       const bobMove = await mcp({
         jsonrpc: "2.0",

@@ -173,7 +173,6 @@ type V2SocketAttachment = {
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
-const MCP_GATEWAY_SHARD_CACHE_TTL_MS = 2_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
@@ -298,7 +297,6 @@ export class PersistentObjectDO {
   private publishedRoutes = new Map<ObjRef, string>();
   private routesRegistered = false;
   private mcpGateway: McpGateway | null = null;
-  private activeMcpShardCache: { expiresAt: number; hosts: string[] } | null = null;
   // Gateway-owned REST relays mirror the browser/MCP open-once shape. Keep a
   // bounded per-DO LRU so agents that touch many scopes do not retain full
   // serialized snapshots for the lifetime of a hot Durable Object instance.
@@ -2817,28 +2815,46 @@ export class PersistentObjectDO {
   }
 
   private async v2GatewayAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {
-    const ids = Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0);
+    const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
     const local = v2TurnGatewayAuthorityPayload(world, ids);
     const byId = new Map<ObjRef, SerializedAuthoritySlice["objects"][number]>(
       local.authority.objects.map((obj) => [obj.id, obj])
     );
     const localHost = this.durableHostKey();
-    const byHost = new Map<string, ObjRef[]>();
-    for (const id of ids) {
-      const host = await this.resolveObjectHostForWorld(world, id, WORLD_HOST);
+    const routesById = new Map(world.objectRoutes().map((route) => [route.id, route] as const));
+    const resolveHost = async (id: ObjRef, fallbackHost: string): Promise<string> => {
+      const localRoute = routesById.get(id) ?? null;
+      const cached = this.routeCache.get(id);
+      if (cached) {
+        if (localRoute && localRoute.host !== cached) return await this.adoptLocalObjectRoute(localRoute);
+        return cached;
+      }
+      if (localRoute) return await this.adoptLocalObjectRoute(localRoute);
+      return await this.resolveObjectHostForWorld(null, id, fallbackHost);
+    };
+
+    const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
+    const byHost = new Map<string, Set<ObjRef>>();
+    for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;
-      const list = byHost.get(host) ?? [];
-      list.push(id);
+      const list = byHost.get(host) ?? new Set<ObjRef>();
+      list.add(id);
       byHost.set(host, list);
     }
-    for (const [host, objects] of byHost) {
-      const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+
+    const remoteSlices = await Promise.all(Array.from(byHost, async ([host, objects]) => ({
+      host,
+      response: await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
         host,
         "/__internal/authority-slice",
-        { objects }
-      );
-      for (const obj of response.authority?.objects ?? []) {
-        const objectHost = await this.resolveObjectHostForWorld(world, obj.id, WORLD_HOST);
+        { objects: Array.from(objects) }
+      )
+    })));
+    for (const { host, response } of remoteSlices) {
+      const objectHosts = await Promise.all((response.authority?.objects ?? []).map(
+        async (obj) => [obj, await resolveHost(obj.id, WORLD_HOST)] as const
+      ));
+      for (const [obj, objectHost] of objectHosts) {
         if (objectHost === host || !byId.has(obj.id)) byId.set(obj.id, obj);
       }
     }
@@ -3210,15 +3226,9 @@ export class PersistentObjectDO {
     // Directory shard discovery as durable commit fanout.
     if (!localAlreadyHandled) this.mcpGateway?.acceptRemoteV2Live(scope, transcript, originSessionId);
     const affectedScopes = affectedMcpFanoutScopes(scope, transcript);
-    const cachedHosts = await this.activeMcpShardHosts();
-    const hosts = new Set(cachedHosts);
     const scopedHosts = await this.mcpShardHostsForScopes(affectedScopes);
+    const hosts = new Set(scopedHosts);
     const localHost = this.durableHostKey();
-    let scopedAdded = 0;
-    for (const host of scopedHosts) {
-      if (host !== localHost && !hosts.has(host)) scopedAdded += 1;
-      hosts.add(host);
-    }
     hosts.delete(localHost);
     if (hosts.size === 0) return;
     const body = {
@@ -3239,9 +3249,7 @@ export class PersistentObjectDO {
       shards: hosts.size,
       observations: transcript.observations.length,
       affected_scopes: affectedScopes.length,
-      cached_shards: cachedHosts.length,
-      scoped_shards: scopedHosts.length,
-      scoped_added: scopedAdded
+      scoped_shards: scopedHosts.length
     });
   }
 
@@ -3290,21 +3298,21 @@ export class PersistentObjectDO {
     transcript: EffectTranscript,
     originSessionId: string | null
   ): Promise<void> {
-    // The broad active-shard cache is only a best-effort accelerator; a shard
-    // can become relevant by moving into a room after this origin cached the
-    // active list. Query Directory freshly for scopes whose presence/contents
-    // changed so co-present MCP sessions receive the accepted transcript before
-    // they plan their next local read.
+    // Query Directory freshly for scopes whose presence/contents changed so
+    // co-present MCP sessions receive the accepted transcript before they plan
+    // their next local read. Do not fan out to every active MCP shard here:
+    // a cold unrelated shard has to hydrate a gateway snapshot before it can
+    // discard the replay, and that turns one room commit into deployment-wide
+    // cold-start work.
     const affectedScopes = affectedMcpFanoutScopes(scope, transcript);
-    const cachedHosts = await this.activeMcpShardHosts();
-    const hosts = new Set(cachedHosts);
     const scopedHosts = await this.mcpShardHostsForScopes(affectedScopes);
+    const hosts = new Set(scopedHosts);
     const localHost = this.durableHostKey();
-    let scopedAdded = 0;
-    for (const host of scopedHosts) {
-      if (host !== localHost && !hosts.has(host)) scopedAdded += 1;
-      hosts.add(host);
-    }
+    // The commit scope's durable fanout list names sessions that subscribed to
+    // this scope explicitly (e.g. through a v2 open). Those recipients may not
+    // appear in Directory's scoped query — a session can subscribe to a scope
+    // without being located there — so we add their gateway shards here in
+    // addition to the scoped-presence shards above.
     for (const item of fanout) {
       const sessionId = mcpSessionIdFromNode(item.node);
       if (!sessionId) continue;
@@ -3331,9 +3339,7 @@ export class PersistentObjectDO {
       shards: hosts.size,
       observations: commit.observations.length,
       affected_scopes: affectedScopes.length,
-      cached_shards: cachedHosts.length,
-      scoped_shards: scopedHosts.length,
-      scoped_added: scopedAdded
+      scoped_shards: scopedHosts.length
     });
   }
 
@@ -3349,25 +3355,6 @@ export class PersistentObjectDO {
     const body = await response.json().catch(() => null) as { shards?: unknown } | null;
     if (!response.ok || !body || !Array.isArray(body.shards)) return [];
     return body.shards.filter((item): item is string => typeof item === "string" && item.startsWith(MCP_GATEWAY_SHARD_PREFIX));
-  }
-
-  private async activeMcpShardHosts(): Promise<string[]> {
-    const now = Date.now();
-    if (this.activeMcpShardCache && this.activeMcpShardCache.expiresAt > now) {
-      return this.activeMcpShardCache.hosts;
-    }
-    const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
-    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/mcp-shards`, {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8" },
-      body: "{}"
-    }));
-    const response = await this.env.DIRECTORY.get(id).fetch(request);
-    const body = await response.json().catch(() => null) as { shards?: unknown } | null;
-    if (!response.ok || !body || !Array.isArray(body.shards)) return [];
-    const hosts = body.shards.filter((item): item is string => typeof item === "string" && item.startsWith(MCP_GATEWAY_SHARD_PREFIX));
-    this.activeMcpShardCache = { hosts, expiresAt: now + MCP_GATEWAY_SHARD_CACHE_TTL_MS };
-    return hosts;
   }
 
     private indexAddSocket(sessionId: string, actor: ObjRef, ws: WebSocket): void {
