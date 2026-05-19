@@ -43,6 +43,7 @@ import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Messa
 import type { SeedWorld, SerializedAuthoritySlice, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
+import type { ShadowCapabilityAd } from "../core/capability-ad";
 import {
   createShadowBrowserRelayShim,
   shadowLiveEventsForTranscriptRelay,
@@ -55,7 +56,7 @@ import {
 } from "../core/shadow-browser-node";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import {
@@ -124,6 +125,7 @@ type CommitScopeOpenResponse = {
     features: string[];
   };
   transfer: ShadowBrowserStateTransfer;
+  ads?: ShadowCapabilityAd[];
 };
 
 type CommitScopeEnvelopeResponse = {
@@ -2640,6 +2642,19 @@ export class PersistentObjectDO {
         auth: { mode: "session", token },
         body: transfer
       } satisfies ShadowEnvelope<typeof transfer>));
+      for (const ad of opened.ads ?? []) {
+        server.send(encodeEnvelope({
+          v: 2,
+          type: ad.kind,
+          id: `${this.durableHostKey()}:exec-ad:${crypto.randomUUID()}`,
+          from: opened.relay,
+          to: node,
+          actor: session.actor,
+          session: session.id,
+          auth: { mode: "anonymous_advisory" },
+          body: ad
+        } satisfies ShadowEnvelope<typeof ad>));
+      }
     } catch (err) {
       world.detachSocket(session.id, socketId);
       this.indexRemoveSocket(session.id, session.actor, server);
@@ -2945,7 +2960,8 @@ export class PersistentObjectDO {
     localHostMaterialized: V2LocalHostMaterialization = null
   ): Promise<void> {
     if (!replyText) return;
-    const reply = decodeEnvelope<ShadowTurnExecReply>(replyText);
+    const reply = decodeEnvelope<ShadowTurnExecReply | ShadowStateTransfer>(replyText);
+    if (!isShadowTurnExecReply(reply.body)) return;
     if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
     const restRelay = this.restV2Relays.get(reply.body.commit.position.scope);
     if (restRelay) applyAcceptedShadowFrame(restRelay.relay.commit_scope, reply.body.commit, reply.body.transcript);
@@ -3023,12 +3039,17 @@ export class PersistentObjectDO {
       this.sendV2Fanout(fanout);
       return { localHostMaterialized: null };
     }
-    const replyEnvelope = decodeEnvelope<ShadowTurnExecReply>(result.reply);
-    const reply = replyEnvelope.body;
+    const replyEnvelope = decodeEnvelope<ShadowTurnExecReply | ShadowStateTransfer>(result.reply);
+    if (!isShadowTurnExecReply(replyEnvelope.body)) {
+      this.sendV2Fanout(fanout);
+      return { localHostMaterialized: null };
+    }
+    const turnReplyEnvelope = replyEnvelope as ShadowEnvelope<ShadowTurnExecReply>;
+    const reply = turnReplyEnvelope.body;
     if (reply.ok !== true || !reply.commit || !reply.transcript) {
       const deliveredNodes = this.sendV2Fanout(fanout);
       if (reply.ok === true && reply.transcript && !reply.commit) {
-        this.sendV2LiveTranscriptFanout(replyEnvelope, deliveredNodes, originNode ?? null);
+        this.sendV2LiveTranscriptFanout(turnReplyEnvelope, deliveredNodes, originNode ?? null);
         await this.deliverMcpLiveFanout(world, scope, reply.transcript, originSessionId ?? null, options.localMcpLiveHandled === true);
       }
       return { localHostMaterialized: null };
@@ -3041,7 +3062,7 @@ export class PersistentObjectDO {
     const observations = "observations" in frame && frame.observations.length > 0
       ? frame.observations
       : reply.commit.observations;
-    await this.sendV2CommitTranscriptFanout(world, replyEnvelope, deliveredNodes, originNode ?? null);
+    await this.sendV2CommitTranscriptFanout(world, turnReplyEnvelope, deliveredNodes, originNode ?? null);
     await this.deliverMcpCommitFanout(world, scope, fanout, { ...reply.commit, observations }, reply.transcript, originSessionId ?? null);
     return { localHostMaterialized };
   }
@@ -3859,6 +3880,10 @@ function isShadowCommitAccepted(value: unknown): value is ShadowCommitAccepted {
     typeof candidate.position.scope === "string" &&
     typeof candidate.position.seq === "number" &&
     Array.isArray(candidate.observations);
+}
+
+function isShadowTurnExecReply(value: unknown): value is ShadowTurnExecReply {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "woo.turn.exec.reply.shadow.v1");
 }
 
 async function workerHashText(text: string): Promise<string> {

@@ -11,6 +11,7 @@ import {
   disposeShadowBrowserNode,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
+  handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserAuthoritySessionState,
@@ -36,6 +37,7 @@ import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../src/core/shadow-commit-scope";
+import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
@@ -50,6 +52,14 @@ describe("shadow browser node shim", () => {
     });
 
     expect(opened.preseeded_objects).toBeGreaterThan(0);
+    expect(opened.ads).toEqual([
+      expect.objectContaining({
+        kind: "woo.exec_capability_ad.shadow.v1",
+        node: "browser-relay:executor",
+        scope: "the_dubspace",
+        epoch: expect.stringMatching(/^[a-f0-9]{64}$/)
+      })
+    ]);
     expect(turn.network.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
     expect(turn.result).toMatchObject({
       ok: true,
@@ -1369,6 +1379,134 @@ describe("shadow browser node shim", () => {
 
     expect(second.body).toMatchObject({ ok: true });
     expect(browser.relay.executors.find((node) => node.node === `${browser.relay.node}:executor`)).not.toBe(executor);
+  });
+
+  it("honors a selected delegated executor and replies with executable cache material", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-selected-executor", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-selected-executor-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.37]
+    };
+    const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    browser.relay.executors.push(createShadowExecutionNode({
+      node: "near-executor",
+      scope: key.scope,
+      serialized: browser.relay.commit_scope.serialized,
+      atom_hashes: key.atom_hashes
+    }));
+    const request = {
+      kind: "woo.turn.exec.request.shadow.v1" as const,
+      id: call.id,
+      call,
+      key,
+      expected: browser.relay.commit_scope.head,
+      selected_ad: "near-executor",
+      persistence: "durable" as const
+    };
+    const envelope = shadowBrowserEnvelope(browser, "woo.turn.exec.request.shadow.v1", request, "browser-selected-executor-env");
+
+    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+
+    expect(reply?.body).toMatchObject({
+      ok: true,
+      state_transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
+      ads: [expect.objectContaining({ node: "near-executor" })]
+    });
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
+  });
+
+  it("carries selected delegated executors through server-assisted intent planning", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-selected-intent-executor", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const planningCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-selected-intent-executor-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.39]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(browser.relay.commit_scope.serialized, planningCall)).transcript);
+    browser.relay.executors.push(createShadowExecutionNode({
+      node: "near-intent-executor",
+      scope: key.scope,
+      serialized: browser.relay.commit_scope.serialized,
+      atom_hashes: key.atom_hashes
+    }));
+    const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: planningCall.id,
+      route: "sequenced" as const,
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.39],
+      selected_ad: "near-intent-executor",
+      persistence: "durable" as const
+    }, "browser-selected-intent-executor-env");
+
+    const reply = await handleShadowBrowserTurnExecEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+
+    expect(reply?.body).toMatchObject({
+      ok: true,
+      state_transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
+      ads: [expect.objectContaining({ node: "near-intent-executor" })]
+    });
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.39);
+  });
+
+  it("serves executable state transfer requests without committing the turn", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-state-repair", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-state-repair-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.41]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(browser.relay.commit_scope.serialized, call)).transcript);
+    const envelope = shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
+      kind: "woo.state.transfer.request.shadow.v1" as const,
+      id: "browser-state-repair-request",
+      scope: "the_dubspace",
+      key,
+      atom_hashes: [key.atom_hashes[0]],
+      mode: "cell_pages" as const
+    }, "browser-state-repair-env");
+
+    const reply = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)));
+
+    expect(reply).toMatchObject({
+      type: "woo.state.transfer.shadow.v1",
+      reply_to: "browser-state-repair-env",
+      body: {
+        mode: "cell_pages",
+        scope: "the_dubspace",
+        atom_hashes: [key.atom_hashes[0]]
+      }
+    });
+    expect(reply?.body.mode === "cell_pages" ? reply.body.inline_pages.length : 0).toBeGreaterThan(0);
+    expect(browser.relay.commit_scope.head.seq).toBe(0);
   });
 });
 

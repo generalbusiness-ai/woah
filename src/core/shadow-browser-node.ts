@@ -1,6 +1,7 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import { createShadowCommitScope, markShadowCommitScopeSerializedChanged, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
+  buildShadowCellPageTransfer,
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
   shadowObjectRecordHash,
@@ -12,9 +13,10 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
-import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
+import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
+import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
@@ -285,6 +287,7 @@ export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
+  ads: ShadowCapabilityAd[];
   preseeded_objects: number;
   transfer_mode: "projection" | "delta";
 };
@@ -320,6 +323,17 @@ export type ShadowTurnIntentRequest = {
   args?: WooValue[];
   body?: Record<string, WooValue>;
   persistence?: ShadowTurnExecRequest["persistence"];
+  selected_ad?: string;
+};
+
+export type ShadowExecutableStateTransferRequest = {
+  kind: "woo.state.transfer.request.shadow.v1";
+  id?: string;
+  scope: ObjRef;
+  key: ShadowTurnKey;
+  atom_hashes?: string[];
+  known_page_hashes?: string[];
+  mode?: "cell_pages";
 };
 
 export function buildShadowTurnIntentEnvelope(input: {
@@ -336,6 +350,7 @@ export function buildShadowTurnIntentEnvelope(input: {
   args: WooValue[];
   body?: Record<string, WooValue>;
   persistence?: ShadowTurnExecRequest["persistence"];
+  selected_ad?: string;
 }): ShadowEnvelope<ShadowTurnIntentRequest> {
   const body: ShadowTurnIntentRequest = {
     kind: "woo.turn.intent.request.shadow.v1",
@@ -346,7 +361,8 @@ export function buildShadowTurnIntentEnvelope(input: {
     verb: input.verb,
     args: input.args,
     body: input.body,
-    persistence: input.persistence
+    persistence: input.persistence,
+    ...(input.selected_ad ? { selected_ad: input.selected_ad } : {})
   };
   return {
     v: 2,
@@ -597,9 +613,22 @@ export async function openShadowBrowserScope(
   return {
     projection: browser.cache.projections.get(browser.scope) ?? (transfer.mode === "projection" ? transfer.projection : null),
     transfer,
+    ads: shadowBrowserScopeExecutionAds(browser.relay, browser.scope),
     preseeded_objects: preseed.length,
     transfer_mode: transfer.mode
   };
+}
+
+export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCapabilityAd[] {
+  // A scope ad is a cold-start routing hint only. Its empty Bloom filters are
+  // intentionally unusable for exact-key local delegation; after relay-side
+  // planning, the selected executor still has to execute or return missing_state.
+  return [buildShadowScopeTurnExecAd({
+    node: shadowRelayDefaultExecutorNode(relay),
+    scope,
+    epoch: relay.commit_scope.head.hash,
+    factor: 1
+  })];
 }
 
 export function subscribeShadowBrowserNode(browser: ShadowBrowserNode, scope: ObjRef = browser.scope): void {
@@ -1011,7 +1040,7 @@ export function shadowBrowserTransportHello(browser: ShadowBrowserNode, now = Da
     max_message_bytes: 1024 * 1024,
     idempotency_window_ms: browser.relay.idempotency_window_ms,
     planes: ["execution", "commit", "state", "live"],
-    features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"]
+    features: ["shadow-envelope", "shadow-catchup", "shadow-exec-ads", "shadow-multiplex"]
   };
 }
 
@@ -1093,6 +1122,45 @@ export async function handleShadowBrowserTurnExecEnvelope(
   return response;
 }
 
+export function handleShadowBrowserStateTransferEnvelope(
+  browser: ShadowBrowserNode,
+  receipt: ShadowBrowserEnvelopeReceipt
+): ShadowEnvelope<ShadowStateTransfer> | null {
+  if (receipt.envelope.type !== "woo.state.transfer.request.shadow.v1") return null;
+  if (!receipt.fresh) {
+    const cached = browser.relay.recent_replies.get(receipt.idempotency_key);
+    return cached ? structuredClone(cached) as ShadowEnvelope<ShadowStateTransfer> : null;
+  }
+  const request = receipt.envelope.body as ShadowExecutableStateTransferRequest;
+  if (request.scope !== browser.relay.commit_scope.scope || request.key.scope !== request.scope) {
+    throw new Error(`state transfer scope mismatch: request=${request.scope} key=${request.key.scope} relay=${browser.relay.commit_scope.scope}`);
+  }
+  if (request.mode && request.mode !== "cell_pages") throw new Error(`unsupported state transfer mode: ${request.mode}`);
+  const transfer = buildShadowCellPageTransfer({
+    serialized: browser.relay.commit_scope.serialized,
+    key: request.key,
+    atom_hashes: request.atom_hashes,
+    known_page_hashes: request.known_page_hashes ?? browser.execution_node.page_hashes,
+    session: browser.session,
+    recipient: browser.node
+  });
+  const response: ShadowEnvelope<ShadowStateTransfer> = {
+    v: 2,
+    type: transfer.kind,
+    id: `${browser.relay.node}:state:${request.id ?? receipt.envelope.id}`,
+    from: browser.relay.node,
+    to: browser.node,
+    actor: browser.actor,
+    ...(browser.session ? { session: browser.session } : {}),
+    reply_to: receipt.envelope.id,
+    auth: shadowBrowserAuth(browser),
+    body: transfer
+  };
+  browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(response));
+  trimShadowBrowserIdempotency(browser.relay);
+  return response;
+}
+
 function shadowBrowserTurnExecReplyEnvelope(
   browser: ShadowBrowserNode,
   receipt: ShadowBrowserEnvelopeReceipt,
@@ -1129,8 +1197,15 @@ async function executeShadowBrowserLivePersistenceIntent(
   // state.
   const sessionKey = request.call.session ?? request.call.actor;
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? browser.relay.commit_scope.serialized;
+  const headHashBefore = browser.relay.commit_scope.head.hash;
   const run = await runShadowTurnCall(serializedBefore, request.call, { onMetric });
-  browser.relay.live_session_serialized.set(sessionKey, run.serializedAfter);
+  // A live/direct read may be started by UI hydration immediately after a
+  // fire-and-forget sequenced write. If that read finishes after the write
+  // commits, caching its pre-commit post-state would resurrect a stale live
+  // snapshot and make follow-up reads hide the accepted write.
+  if (browser.relay.commit_scope.head.hash === headHashBefore) {
+    browser.relay.live_session_serialized.set(sessionKey, run.serializedAfter);
+  }
   for (const event of shadowLiveEventsForTranscript(browser, run.transcript)) {
     publishShadowBrowserLiveEvent(browser.relay, event, { except: browser.node });
   }
@@ -1179,7 +1254,8 @@ async function shadowTurnExecRequestFromIntent(
     call,
     key: shadowTurnKeyFromTranscript(planned.transcript),
     expected: browser.relay.commit_scope.head,
-    persistence: intent.persistence ?? "durable"
+    persistence: intent.persistence ?? "durable",
+    ...(intent.selected_ad ? { selected_ad: intent.selected_ad } : {})
   };
 }
 
@@ -1207,6 +1283,24 @@ async function executeShadowBrowserTurnExecRequest(
 
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
   if (network.result.ok) {
+    const selectedExecutor = browser.relay.executors.find((node) => node.node === network.selected_node);
+    if (selectedExecutor) {
+      // A delegated success must also warm the actor-side executable cache.
+      // Projection deltas update display state, but only execution transfers
+      // let the browser plan the next related turn locally.
+      const stateTransfer = buildShadowCellPageTransfer({
+        serialized: browser.relay.commit_scope.serialized,
+        key: request.key,
+        atom_hashes: request.key.atom_hashes,
+        known_page_hashes: browser.execution_node.page_hashes,
+        session: request.call.session,
+        recipient: browser.node
+      });
+      if (network.result.reply) {
+        network.result.reply.state_transfer = stateTransfer;
+        network.result.reply.ads = [buildShadowTurnExecAdFromNode({ node: selectedExecutor, accepts: request.key, factor: 0.1 })];
+      }
+    }
     executor.committed_head_hash = browser.relay.commit_scope.head.hash;
     executor.serialized_generation = browser.relay.serialized_generation;
     if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
@@ -1221,7 +1315,16 @@ async function executeShadowBrowserTurnExecRequest(
 }
 
 function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: ShadowTurnExecRequest): ShadowExecutionNode {
-  const nodeId = `${relay.node}:executor`;
+  const selected = request.selected_ad
+    ? relay.executors.find((node) => node.node === request.selected_ad && node.scope === request.key.scope)
+    : undefined;
+  // Selected ads name an executor that owns its advertised cache. Unlike the
+  // relay-local fallback below, the relay must not silently refresh or expand
+  // that executor's atom set; exact coverage is proven by execution or
+  // missing_state.
+  if (selected) return selected;
+
+  const nodeId = shadowRelayDefaultExecutorNode(relay);
   let executor = relay.executors.find((node) => node.node === nodeId);
   const needsRefresh = !executor ||
     executor.scope !== request.key.scope ||
@@ -1247,6 +1350,10 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
   // actual atoms trigger the normal state-plane retry path.
   for (const hash of request.key.atom_hashes) executor.atom_hashes.add(hash);
   return executor;
+}
+
+function shadowRelayDefaultExecutorNode(relay: ShadowBrowserRelayShim): string {
+  return `${relay.node}:executor`;
 }
 
 function shadowBrowserWireTurnExecReply(reply: ShadowTurnExecReply): ShadowTurnExecReply {
@@ -1684,7 +1791,7 @@ export function shadowBrowserSessionClaimsValue(
     issued_at: session.started,
     expires_at: session.expiresAt ?? session.started + 15 * 60 * 1000,
     scopes,
-    features: ["shadow-envelope", "shadow-catchup", "shadow-multiplex"],
+    features: ["shadow-envelope", "shadow-catchup", "shadow-exec-ads", "shadow-multiplex"],
     rev
   };
 }

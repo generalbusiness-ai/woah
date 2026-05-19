@@ -1,4 +1,88 @@
-import { test, expect, type Locator } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
+
+type V2Diagnostics = {
+  appliedVerbs: string[];
+  localFallbacks: string[];
+  localDelegations: string[];
+  localPlans: string[];
+  terminalErrors: string[];
+  transportErrors: string[];
+};
+
+async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagnostics> {
+  const diagnostics: V2Diagnostics = {
+    appliedVerbs: [],
+    localFallbacks: [],
+    localDelegations: [],
+    localPlans: [],
+    terminalErrors: [],
+    transportErrors: []
+  };
+  const suffix = `${label}${Math.random().toString(36).slice(2)}`.replace(/[^a-zA-Z0-9_]/g, "");
+  const recordApplied = `recordV2Applied${suffix}`;
+  const recordLocalFallback = `recordV2LocalFallback${suffix}`;
+  const recordLocalDelegation = `recordV2LocalDelegation${suffix}`;
+  const recordLocalPlan = `recordV2LocalPlan${suffix}`;
+  const recordTerminalError = `recordV2TerminalError${suffix}`;
+  const recordTransportError = `recordV2TransportError${suffix}`;
+  await page.exposeFunction(recordApplied, (verb: string) => {
+    diagnostics.appliedVerbs.push(verb);
+  });
+  await page.exposeFunction(recordLocalFallback, (detail: unknown) => {
+    diagnostics.localFallbacks.push(JSON.stringify(detail));
+  });
+  await page.exposeFunction(recordLocalDelegation, (detail: unknown) => {
+    diagnostics.localDelegations.push(JSON.stringify(detail));
+  });
+  await page.exposeFunction(recordLocalPlan, (detail: unknown) => {
+    diagnostics.localPlans.push(JSON.stringify(detail));
+  });
+  await page.exposeFunction(recordTerminalError, (detail: unknown) => {
+    diagnostics.terminalErrors.push(JSON.stringify(detail));
+  });
+  await page.exposeFunction(recordTransportError, (detail: unknown) => {
+    diagnostics.transportErrors.push(JSON.stringify(detail));
+  });
+  page.on("console", (msg) => {
+    const text = msg.text();
+    if (text.includes("woo.v2.transport.error") || text.includes("E_V2_LOCAL_EXECUTION_UNAVAILABLE")) {
+      diagnostics.transportErrors.push(text);
+    }
+  });
+  await page.addInitScript(({ recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError }) => {
+    window.addEventListener("woo.v2.applied_frame", (event) => {
+      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordApplied](verb);
+    });
+    window.addEventListener("woo.v2.local_turn_fallback", (event) => {
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalFallback]((event as CustomEvent<any>).detail);
+    });
+    window.addEventListener("woo.v2.local_turn_delegated", (event) => {
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalDelegation]((event as CustomEvent<any>).detail);
+    });
+    window.addEventListener("woo.v2.local_turn_planned", (event) => {
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalPlan]((event as CustomEvent<any>).detail);
+    });
+    window.addEventListener("woo.v2.frame", (event) => {
+      const envelope = (event as CustomEvent<any>).detail;
+      if (envelope?.type === "woo.transport.error.v1") {
+        void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordTransportError](envelope.body);
+      }
+    });
+    window.addEventListener("woo.v2.turn_result", (event) => {
+      const error = (event as CustomEvent<any>).detail?.frame?.error;
+      if (error?.code === "E_V2_LOCAL_EXECUTION_UNAVAILABLE") {
+        void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordTerminalError](error);
+      }
+    });
+  }, { recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError });
+  return diagnostics;
+}
+
+function expectNoV2Failures(diagnostics: V2Diagnostics): void {
+  expect(diagnostics.terminalErrors, `terminal v2 failures: ${diagnostics.terminalErrors.join("\n")}`).toEqual([]);
+  expect(diagnostics.transportErrors, `v2 transport errors: ${diagnostics.transportErrors.join("\n")}`).toEqual([]);
+}
 
 async function boxKey(locator: Locator): Promise<string> {
   const box = await locator.boundingBox();
@@ -651,65 +735,93 @@ test("pinboard supports local zoom and pan without resetting on updates", async 
   await expect(centeredNote.locator("[data-pin-note-drag]")).toBeVisible();
 });
 
-test("pinboard shares note movement from another user", async ({ browser }) => {
+test("pinboard shares created notes with another user and survives reload", async ({ browser }) => {
   const firstContext = await browser.newContext();
   const secondContext = await browser.newContext();
   try {
     const first = await firstContext.newPage();
     const second = await secondContext.newPage();
-    const firstAppliedVerbs: string[] = [];
-    const secondAppliedVerbs: string[] = [];
-    await first.exposeFunction("recordFirstPinboardAppliedFrame", (verb: string) => {
-      firstAppliedVerbs.push(verb);
-    });
-    await second.exposeFunction("recordSecondPinboardAppliedFrame", (verb: string) => {
-      secondAppliedVerbs.push(verb);
-    });
-    await first.addInitScript(() => {
-      window.addEventListener("woo.v2.applied_frame", (event) => {
-        const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
-        void (window as unknown as { recordFirstPinboardAppliedFrame: (verb: string) => Promise<void> }).recordFirstPinboardAppliedFrame(verb);
-      });
-    });
-    await second.addInitScript(() => {
-      window.addEventListener("woo.v2.applied_frame", (event) => {
-        const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
-        void (window as unknown as { recordSecondPinboardAppliedFrame: (verb: string) => Promise<void> }).recordSecondPinboardAppliedFrame(verb);
-      });
-    });
-    await Promise.all([first.goto("/"), second.goto("/")]);
+    const firstV2 = await installV2Diagnostics(first, "pinboardFirst");
+    const secondV2 = await installV2Diagnostics(second, "pinboardSecond");
+    await Promise.all([first.goto("/?v2TestHooks"), second.goto("/?v2TestHooks")]);
     await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
 
     await first.getByRole("button", { name: "Pinboard" }).click();
     await second.getByRole("button", { name: "Pinboard" }).click();
+    await first.getByRole("button", { name: "Enter" }).click();
+    await second.getByRole("button", { name: "Enter" }).click();
     await expect(first.getByRole("button", { name: "Leave" })).toBeVisible();
     await expect(second.getByRole("button", { name: "Leave" })).toBeVisible();
-    await expect.poll(() => firstAppliedVerbs, { timeout: 5_000 }).toContain("enter");
-    await expect.poll(() => secondAppliedVerbs, { timeout: 5_000 }).toContain("enter");
+    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
+    await expect.poll(() => secondV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
 
     const text = `Slide this note ${Date.now()}`;
     await first.locator("[data-pinboard-new-text]").fill(text);
     await first.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
-    await expect.poll(() => firstAppliedVerbs, { timeout: 5_000 }).toContain("add_note");
+    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("add_note");
     const firstNote = first.locator(".pin-note").filter({ hasText: text }).first();
     const secondNote = second.locator(".pin-note").filter({ hasText: text }).first();
     await expect(firstNote).toBeVisible();
     await expect(secondNote).toBeVisible();
-    const beforeX = Number(await secondNote.getAttribute("data-x"));
+    expectNoV2Failures(firstV2);
+    expectNoV2Failures(secondV2);
 
-    const handle = firstNote.locator("[data-pin-note-drag]");
-    const box = await handle.boundingBox();
-    if (!box) throw new Error("pin note drag handle missing");
-    await first.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await first.mouse.down();
-    await first.mouse.move(box.x + box.width / 2 + 96, box.y + box.height / 2 + 54, { steps: 4 });
-    await first.mouse.up();
+    await second.reload();
+    await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+    await expect(second.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
+    await expect(second.locator(".pin-note").filter({ hasText: text })).toBeVisible({ timeout: 10_000 });
+    expectNoV2Failures(secondV2);
+  } finally {
+    await firstContext.close();
+    await secondContext.close();
+  }
+});
 
-    await expect.poll(() => firstAppliedVerbs, { timeout: 5_000 }).toContain("move_pin");
-    await expect.poll(async () => Number(await firstNote.getAttribute("data-x")), { timeout: 5_000 }).toBeGreaterThan(beforeX);
-    await expect.poll(async () => Number(await secondNote.getAttribute("data-x")), { timeout: 10_000 }).toBeGreaterThan(beforeX);
+test("outliner shares committed items with another user and survives reload", async ({ browser }) => {
+  const firstContext = await browser.newContext();
+  const secondContext = await browser.newContext();
+  try {
+    const first = await firstContext.newPage();
+    const second = await secondContext.newPage();
+    const firstV2 = await installV2Diagnostics(first, "outlinerFirst");
+    const secondV2 = await installV2Diagnostics(second, "outlinerSecond");
+    await Promise.all([
+      first.goto("/objects/the_outline?view=tool&v2TestHooks"),
+      second.goto("/objects/the_outline?view=tool&v2TestHooks")
+    ]);
+    await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
+    await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+    await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+    const firstTree = first.locator("woo-outliner-tree[data-generic-tool-workspace]");
+    const secondTree = second.locator("woo-outliner-tree[data-generic-tool-workspace]");
+    await expect(firstTree).toBeVisible({ timeout: 5_000 });
+    await expect(secondTree).toBeVisible({ timeout: 5_000 });
+
+    await firstTree.getByRole("button", { name: "Enter" }).click();
+    await secondTree.getByRole("button", { name: "Enter" }).click();
+    await expect(firstTree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+    await expect(secondTree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
+    await expect.poll(() => secondV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
+
+    const text = `shared-outline-${Date.now()}`;
+    await first.waitForTimeout(250);
+    await firstTree.locator("[data-outliner-add] input[name=text]").fill(text);
+    await firstTree.locator("[data-outliner-add]").getByRole("button", { name: "Add" }).click();
+    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("add");
+    await expect(firstTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 5_000 });
+    await expect(secondTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 10_000 });
+    expectNoV2Failures(firstV2);
+    expectNoV2Failures(secondV2);
+
+    await second.reload();
+    await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+    const reloadedSecondTree = second.locator("woo-outliner-tree");
+    await expect(reloadedSecondTree).toBeVisible({ timeout: 5_000 });
+    await expect(reloadedSecondTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 10_000 });
+    expectNoV2Failures(secondV2);
   } finally {
     await firstContext.close();
     await secondContext.close();

@@ -1,11 +1,19 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { EffectTranscript } from "../core/effect-transcript";
+import type { SerializedObject } from "../core/repository";
+import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
-import { applyShadowScopeProjectionPatch, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import { applyShadowScopeProjectionPatch, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
+import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
+import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
+import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-browser-delegation";
+import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
+import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
+import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
+import { planV2BrowserLocalTurn, type V2BrowserLocalTurnResult } from "./v2-browser-local-turn";
 import { v2AppliedFrameMessageFromFrame, v2ProjectionMessageFromRow, v2TurnResultMessageFromReply } from "./v2-browser-messages";
 import { v2BrowserWebSocketUrl } from "./v2-browser-url";
 
@@ -33,12 +41,16 @@ type V2CacheStatus = {
   transcript_tail: number;
   object_pages: number;
   state_pages: number;
+  execution_transfers: number;
+  execution_ads: number;
+  executable_scopes: string[];
+  local_execution_ready?: boolean;
   last_hello?: unknown;
   catchup_required?: boolean;
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 3;
+const DB_VERSION = 5;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const PROJECTION_STORE = "projections";
@@ -46,6 +58,8 @@ const APPLIED_STORE = "applied_frames";
 const TRANSCRIPT_STORE = "transcript_tail";
 const OBJECT_PAGE_STORE = "object_pages";
 const STATE_PAGE_STORE = "state_pages";
+const EXECUTION_TRANSFER_STORE = "execution_transfers";
+const EXECUTION_AD_STORE = "execution_ads";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -53,10 +67,11 @@ let current: { token: string; node: string; scope: string; actor?: string; sessi
 let reconnectTimer: number | undefined;
 let connecting = false;
 let connectPromise: Promise<void> | null = null;
-let connectReadyResolve: (() => void) | null = null;
+let connectReady: { sawState: boolean; sawAd: boolean; settle: () => void; timer: number } | null = null;
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
+const pendingStateTransfers = new Map<string, { resolve: () => void; reject: (err: Error) => void; timer: number }>();
 
 type V2WorkerScope = {
   addEventListener(type: "message", listener: (event: MessageEvent<V2WorkerCommand>) => void): void;
@@ -94,6 +109,7 @@ async function handleCommand(command: V2WorkerCommand): Promise<void> {
       socket = null;
       connecting = false;
       current = null;
+      rejectPendingStateTransfers(new Error("v2 browser disconnected"));
       await putMeta("connected", false);
       postStatus();
       break;
@@ -168,14 +184,24 @@ async function connect(): Promise<void> {
   connectPromise = new Promise<void>((resolve) => {
     // WebSocket open is not enough: the dev relay sends TransportHello before
     // openShadowBrowserScope subscribes this node. Resolve connect only after
-    // the state transfer, so immediate turn intents cannot miss accepted-frame
-    // fan-out for their new scope.
+    // the open state transfer and scope execution ad have both been installed,
+    // so the first durable turn can cold-delegate instead of racing the ad's IDB
+    // write and failing with local-execution-unavailable.
     const settle = () => {
+      const ready = connectReady;
+      if (ready?.settle === settle) {
+        workerScope.clearTimeout(ready.timer);
+        connectReady = null;
+      }
       if (connectPromise) connectPromise = null;
-      if (connectReadyResolve === settle) connectReadyResolve = null;
       resolve();
     };
-    connectReadyResolve = settle;
+    connectReady = {
+      sawState: false,
+      sawAd: false,
+      settle,
+      timer: workerScope.setTimeout(settle, 5000)
+    };
     ws.addEventListener("open", () => {
       if (socket !== ws) return;
       connecting = false;
@@ -193,6 +219,7 @@ async function connect(): Promise<void> {
     ws.addEventListener("close", () => {
       if (socket !== ws) return;
       connecting = false;
+      rejectPendingStateTransfers(new Error("v2 browser socket closed"));
       void putMeta("connected", false);
       postStatus();
       scheduleReconnect();
@@ -201,6 +228,7 @@ async function connect(): Promise<void> {
     ws.addEventListener("error", () => {
       if (socket !== ws) return;
       connecting = false;
+      rejectPendingStateTransfers(new Error("v2 browser socket error"));
       void putMeta("connected", false);
       postStatus();
       settle();
@@ -216,6 +244,7 @@ async function receiveFrame(encoded: string): Promise<void> {
   const envelope = decodeEnvelope(encoded);
   let installedExecutableState = false;
   const receivedStateTransfer = envelope.type === "woo.state.transfer.shadow.v1";
+  const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
   for (const mutation of v2BrowserCacheMutationsForEnvelope(envelope)) {
     const applied = await applyCacheMutation(mutation);
     if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
@@ -230,10 +259,25 @@ async function receiveFrame(encoded: string): Promise<void> {
   if (envelope.type === "woo.live.event.shadow.v1") {
     postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
   }
+  if (envelope.type === "woo.state.transfer.shadow.v1" && envelope.reply_to) {
+    resolvePendingStateTransfer(envelope.reply_to);
+  }
   if (installedExecutableState || receivedStateTransfer) await replayPending();
-  if (receivedStateTransfer || envelope.type === "woo.transport.error.v1") connectReadyResolve?.();
+  markConnectReady(receivedStateTransfer, receivedExecutionAd, envelope.type === "woo.transport.error.v1");
   postMessage({ kind: "frame", envelope });
   postStatus();
+}
+
+function markConnectReady(receivedStateTransfer: boolean, receivedExecutionAd: boolean, receivedTransportError: boolean): void {
+  const ready = connectReady;
+  if (!ready) return;
+  if (receivedTransportError) {
+    ready.settle();
+    return;
+  }
+  if (receivedStateTransfer) ready.sawState = true;
+  if (receivedExecutionAd) ready.sawAd = true;
+  if (ready.sawState && ready.sawAd) ready.settle();
 }
 
 async function replayPending(): Promise<void> {
@@ -264,6 +308,10 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     postMessage({ kind: "error", error: "v2 browser call requires an authenticated actor" });
     return;
   }
+  if (await sendLocalTurnExec(command)) {
+    postStatus();
+    return;
+  }
   const body: ShadowTurnIntentRequest = {
     kind: "woo.turn.intent.request.shadow.v1",
     id: command.id,
@@ -274,6 +322,24 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     args: Array.isArray(command.args) ? command.args as WooValue[] : [],
     persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
   };
+  const scopeDelegation = selectV2DelegatedScopeExecutor({
+    records: await allExecutionAds(),
+    scope: body.scope
+  });
+  const fallbackPolicy = v2ServerAssistedIntentPolicy({
+    route: command.route,
+    persistence: body.persistence,
+    selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null
+  });
+  if (!fallbackPolicy.ok) {
+    postTurnUnavailable(command.id, fallbackPolicy.reason);
+    postStatus();
+    return;
+  }
+  if (fallbackPolicy.selected_ad) {
+    body.selected_ad = fallbackPolicy.selected_ad;
+    postMessage({ kind: "local_turn_delegated", id: command.id, node: fallbackPolicy.selected_ad, reason: "scope_ad" });
+  }
   const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
     v: 2,
     type: body.kind,
@@ -294,6 +360,188 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
   });
   sendEncoded(encoded);
   postStatus();
+}
+
+function postTurnUnavailable(id: string, reason: string): void {
+  postMessage({ kind: "local_turn_fallback", id, reason });
+  postMessage({
+    kind: "turn_result",
+    frame: {
+      op: "error",
+      id,
+      error: {
+        code: "E_V2_LOCAL_EXECUTION_UNAVAILABLE",
+        message: reason
+      }
+    }
+  });
+}
+
+async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call" }>, repaired = false): Promise<boolean> {
+  if (!current || !current.actor) return false;
+  const scope = command.scope || current.scope;
+  const cachedHead = scope ? await getMeta<unknown>(`head:${scope}`) : undefined;
+  if (!isShadowScopeHead(cachedHead)) {
+    postMessage({ kind: "local_turn_fallback", id: command.id, reason: "no_head" });
+    return false;
+  }
+  let local: V2BrowserLocalTurnResult;
+  try {
+    const executionCache = await executionCacheForScope(scope);
+    local = await planV2BrowserLocalTurn({
+      node: current.node,
+      actor: current.actor,
+      session: current.session ?? null,
+      head: cachedHead,
+      id: command.id,
+      route: command.route,
+      scope,
+      target: command.target,
+      verb: command.verb,
+      args: Array.isArray(command.args) ? command.args as WooValue[] : [],
+      persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable"),
+      transfers: executionCache.records,
+      cached_objects: executionCache.cached_objects,
+      cached_pages: executionCache.cached_pages
+    });
+  } catch (err) {
+    postMessage({ kind: "local_turn_fallback", id: command.id, reason: "local_planning_error", error: errorMessage(err) });
+    return false;
+  }
+  if (!local.ok) {
+    if (local.reason === "missing_state" && local.request && local.key) {
+      if (!repaired && await repairLocalExecutableState(local, command.id)) {
+        return await sendLocalTurnExec(command, true);
+      }
+      const delegation = selectV2DelegatedExecutor({
+        records: await allExecutionAds(),
+        key: local.key
+      });
+      if (delegation.ok) {
+        const request: ShadowTurnExecRequest = {
+          ...local.request,
+          selected_ad: delegation.ad.node
+        };
+        await sendTurnExecEnvelope(command.id, request);
+        postMessage({
+          kind: "local_turn_delegated",
+          id: command.id,
+          node: delegation.ad.node,
+          missing_atoms: local.missing_atoms?.map((atom) => atom.hash) ?? []
+        });
+        return true;
+      }
+    }
+    postMessage({
+      kind: "local_turn_fallback",
+      id: command.id,
+      reason: local.reason,
+      missing_atoms: local.missing_atoms?.map((atom) => atom.hash) ?? []
+    });
+    return false;
+  }
+  await sendTurnExecEnvelope(command.id, local.request);
+  postMessage({
+    kind: "local_turn_planned",
+    id: command.id,
+    transcript_hash: local.transcript_hash,
+    observation_count: local.observation_count,
+    result_known: local.result_known
+  });
+  return true;
+}
+
+async function repairLocalExecutableState(
+  local: V2BrowserLocalTurnResult,
+  id: string
+): Promise<boolean> {
+  if (local.ok || local.reason !== "missing_state" || !current || !current.actor || !local.key) return false;
+  const key = local.key;
+  const missingAtoms = local.missing_atoms ?? [];
+  const requestId = `${id}:state-repair`;
+  const body: ShadowExecutableStateTransferRequest = {
+    kind: "woo.state.transfer.request.shadow.v1",
+    id: requestId,
+    scope: key.scope,
+    key,
+    atom_hashes: missingAtoms.length > 0 ? missingAtoms.map((atom) => atom.hash) : key.atom_hashes,
+    mode: "cell_pages"
+  };
+  const envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest> = {
+    v: 2,
+    type: body.kind,
+    id: requestId,
+    from: current.node,
+    actor: current.actor,
+    ...(current.session ? { session: current.session } : {}),
+    auth: { mode: "session", token: current.token },
+    body
+  };
+  postMessage({
+    kind: "local_turn_repairing",
+    id,
+    missing_atoms: missingAtoms.map((atom) => atom.hash)
+  });
+  try {
+    await requestStateTransfer(envelope);
+    return true;
+  } catch (err) {
+    postMessage({ kind: "local_turn_repair_failed", id, error: errorMessage(err) });
+    return false;
+  }
+}
+
+async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest>): Promise<void> {
+  const encoded = encodeEnvelope(envelope);
+  const id = envelope.id;
+  const pending = new Promise<void>((resolve, reject) => {
+    const timer = workerScope.setTimeout(() => {
+      pendingStateTransfers.delete(id);
+      reject(new Error("state transfer request timed out"));
+    }, 5000);
+    pendingStateTransfers.set(id, { resolve, reject, timer });
+  });
+  sendEncoded(encoded);
+  await pending;
+}
+
+function resolvePendingStateTransfer(id: string): void {
+  const pending = pendingStateTransfers.get(id);
+  if (!pending) return;
+  pendingStateTransfers.delete(id);
+  workerScope.clearTimeout(pending.timer);
+  pending.resolve();
+}
+
+function rejectPendingStateTransfers(err: Error): void {
+  for (const [id, pending] of pendingStateTransfers) {
+    pendingStateTransfers.delete(id);
+    workerScope.clearTimeout(pending.timer);
+    pending.reject(err);
+  }
+}
+
+async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest): Promise<void> {
+  if (!current || !current.actor) return;
+  const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
+    v: 2,
+    type: request.kind,
+    id,
+    from: current.node,
+    actor: current.actor,
+    ...(current.session ? { session: current.session } : {}),
+    auth: { mode: "session", token: current.token },
+    body: request
+  };
+  const encoded = encodeEnvelope(envelope);
+  await putPending({
+    id: envelope.id,
+    encoded,
+    created_at: Date.now(),
+    auth_token: current.token,
+    from: current.node
+  });
+  sendEncoded(encoded);
 }
 
 function sendEncoded(encoded: string): void {
@@ -340,6 +588,8 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(TRANSCRIPT_STORE)) database.createObjectStore(TRANSCRIPT_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(OBJECT_PAGE_STORE)) database.createObjectStore(OBJECT_PAGE_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(STATE_PAGE_STORE)) database.createObjectStore(STATE_PAGE_STORE, { keyPath: "hash" });
+      if (!database.objectStoreNames.contains(EXECUTION_TRANSFER_STORE)) database.createObjectStore(EXECUTION_TRANSFER_STORE, { keyPath: "id" });
+      if (!database.objectStoreNames.contains(EXECUTION_AD_STORE)) database.createObjectStore(EXECUTION_AD_STORE, { keyPath: "id" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
@@ -398,6 +648,12 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
     case "state_page":
       await putStatePage(mutation.hash, mutation.ref, mutation.page);
       return;
+    case "execution_ad":
+      await putExecutionAd(mutation.record);
+      return;
+    case "execution_transfer":
+      await putExecutionTransfer(mutation.record);
+      return;
   }
 }
 
@@ -449,7 +705,75 @@ async function putStatePage(hash: string, ref: string, page: unknown): Promise<v
   await tx(STATE_PAGE_STORE, "readwrite", (store) => store.put({ hash, ref, page, received_at: Date.now() }));
 }
 
+async function putExecutionTransfer(record: V2ExecutableTransferRecord): Promise<void> {
+  await tx(EXECUTION_TRANSFER_STORE, "readwrite", (store) => store.put(record));
+}
+
+async function putExecutionAd(record: V2ExecutionAdRecord): Promise<void> {
+  await tx(EXECUTION_AD_STORE, "readwrite", (store) => store.put(record));
+}
+
+async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
+  return await tx<V2ExecutableTransferRecord[]>(EXECUTION_TRANSFER_STORE, "readonly", (store) => store.getAll());
+}
+
+async function executionCacheForScope(
+  scope: string,
+  records?: readonly V2ExecutableTransferRecord[]
+): Promise<{ records: V2ExecutableTransferRecord[]; cached_objects: SerializedObject[]; cached_pages: ShadowStatePage[] }> {
+  const sourceRecords = records ?? await allExecutionTransfers();
+  const scopedRecords = sourceRecords.filter((record) => record.scope === scope);
+  const objectHashes = new Set<string>();
+  const pageHashes = new Set<string>();
+  for (const record of scopedRecords) {
+    const transfer = record.transfer;
+    if (transfer.mode === "object_records") {
+      for (const page of transfer.object_pages) objectHashes.add(page.hash);
+    } else if (transfer.mode === "cell_pages") {
+      for (const page of transfer.page_refs) pageHashes.add(page.hash);
+    }
+  }
+  return {
+    records: scopedRecords,
+    cached_objects: await cachedObjectsByHash(objectHashes),
+    cached_pages: await cachedStatePagesByHash(pageHashes)
+  };
+}
+
+async function cachedObjectsByHash(hashes: Iterable<string>): Promise<SerializedObject[]> {
+  const objects: SerializedObject[] = [];
+  for (const hash of hashes) {
+    const row = await tx<{ record?: unknown } | undefined>(OBJECT_PAGE_STORE, "readonly", (store) => store.get(hash));
+    if (isSerializedObject(row?.record)) objects.push(row.record);
+  }
+  return objects;
+}
+
+async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowStatePage[]> {
+  const pages: ShadowStatePage[] = [];
+  for (const hash of hashes) {
+    const row = await tx<{ page?: unknown } | undefined>(STATE_PAGE_STORE, "readonly", (store) => store.get(hash));
+    if (isShadowStatePage(row?.page)) pages.push(row.page);
+  }
+  return pages;
+}
+
+async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {
+  return await tx<V2ExecutionAdRecord[]>(EXECUTION_AD_STORE, "readonly", (store) => store.getAll());
+}
+
 async function status(): Promise<V2CacheStatus> {
+  const executionTransfers = await allExecutionTransfers();
+  const executionCache = current?.scope ? await executionCacheForScope(current.scope, executionTransfers) : undefined;
+  const localExecutionReady = current?.scope
+    ? canReconstructExecutionNode(
+      current.node,
+      current.scope,
+      executionCache?.records ?? executionTransfers,
+      executionCache?.cached_objects ?? [],
+      executionCache?.cached_pages ?? []
+    )
+    : undefined;
   return {
     connected: socket?.readyState === WebSocket.OPEN,
     pending: (await allPending()).length,
@@ -458,9 +782,49 @@ async function status(): Promise<V2CacheStatus> {
     transcript_tail: await countStore(TRANSCRIPT_STORE),
     object_pages: await countStore(OBJECT_PAGE_STORE),
     state_pages: await countStore(STATE_PAGE_STORE),
+    execution_transfers: executionTransfers.length,
+    execution_ads: await countStore(EXECUTION_AD_STORE),
+    executable_scopes: executableScopes(executionTransfers),
+    ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
     last_hello: await getMeta("hello"),
     catchup_required: await getMeta("catchup_required")
   };
+}
+
+function executableScopes(records: readonly V2ExecutableTransferRecord[]): string[] {
+  const scopes = new Set<string>();
+  for (const record of records) scopes.add(record.scope);
+  return Array.from(scopes).sort();
+}
+
+function canReconstructExecutionNode(
+  node: string,
+  scope: string,
+  records: readonly V2ExecutableTransferRecord[],
+  cachedObjects: readonly SerializedObject[] = [],
+  cachedPages: readonly ShadowStatePage[] = []
+): boolean {
+  if (!records.some((record) => record.scope === scope)) return false;
+  try {
+    const executionNode = createV2BrowserExecutionNodeFromTransfers({
+      node,
+      scope,
+      records,
+      cached_objects: cachedObjects,
+      cached_pages: cachedPages
+    });
+    return executionNode.serialized !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function isSerializedObject(value: unknown): value is SerializedObject {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && typeof (value as { id?: unknown }).id === "string");
+}
+
+function isShadowStatePage(value: unknown): value is ShadowStatePage {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && typeof (value as { kind?: unknown }).kind === "string" && typeof (value as { page?: unknown }).page === "string");
 }
 
 async function countStore(storeName: string): Promise<number> {

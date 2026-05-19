@@ -38,6 +38,22 @@ export function buildShadowTurnExecAd(input: {
   });
 }
 
+export function buildShadowScopeTurnExecAd(input: {
+  node: string;
+  scope: ObjRef;
+  epoch?: string;
+  factor?: number;
+}): ShadowCapabilityAd {
+  return buildShadowCapabilityAd({
+    node: input.node,
+    scope: input.scope,
+    epoch: input.epoch,
+    atom_hashes: [],
+    accepts_atom_hashes: [],
+    factor: input.factor
+  });
+}
+
 export function buildShadowTurnExecAdFromNode(input: {
   node: ShadowExecutionNode;
   accepts: ShadowTurnKey;

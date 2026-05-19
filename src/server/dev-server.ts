@@ -28,6 +28,7 @@ import {
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
+  handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserAuthoritySessionState,
@@ -273,6 +274,19 @@ v2wss.on("connection", (ws, req) => {
       auth: { mode: "session", token },
       body: opened.transfer
     } satisfies ShadowEnvelope<typeof opened.transfer>));
+    for (const ad of opened.ads) {
+      ws.send(encodeEnvelope({
+        v: 2,
+        type: ad.kind,
+        id: `dev-relay:exec-ad:${randomUUID()}`,
+        from: browser.relay.node,
+        to: browser.node,
+        actor: session.actor,
+        session: session.id,
+        auth: { mode: "anonymous_advisory" },
+        body: ad
+      } satisfies ShadowEnvelope<typeof ad>));
+    }
   }).catch((err) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     ws.send(encodeEnvelope(buildTransportErrorEnvelope({
@@ -543,6 +557,11 @@ async function handleV2ShadowFrame(
       ? v2ShadowBrowser(browser.node, token, session, callScope!)
       : browser;
     const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
+    const stateReply = handleShadowBrowserStateTransferEnvelope(turnBrowser, receipt);
+    if (stateReply) {
+      ws.send(encodeEnvelope(stateReply));
+      return;
+    }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt);
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
       world.applyCommittedShadowTranscript(reply.body.transcript);
