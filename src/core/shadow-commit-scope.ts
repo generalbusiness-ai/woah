@@ -807,21 +807,30 @@ function applyTranscriptContentsWrite(
   transcript: EffectTranscript,
   metric?: (event: MetricEvent) => void
 ): void {
+  target.contents = applyTranscriptContentsWriteRefs(target.contents, write, transcript, metric);
+}
+
+export function applyTranscriptContentsWriteRefs(
+  current: readonly ObjRef[],
+  write: TranscriptWrite,
+  transcript: EffectTranscript,
+  metric?: (event: MetricEvent) => void
+): ObjRef[] {
   // Move/create transcripts record whole post-write contents arrays for
   // validation, but committed replay must merge the operation intent. Replacing
   // the array here would drop concurrent adds already accepted into the base.
   const refs = transcriptContentsWriteRefs(write);
   if (write.op === "add") {
+    const next = current.slice();
     const added = transcriptContentAddsForContainer(transcript, write.cell.object);
-    for (const ref of (added.length > 0 ? added : refs)) addUniqueObjectRef(target.contents, ref);
-    return;
+    for (const ref of (added.length > 0 ? added : refs)) addUniqueObjectRef(next, ref);
+    return next;
   }
   if (write.op === "remove") {
     const removed = transcriptContentRemovesForContainer(transcript, write.cell.object);
     if (removed.length > 0) {
       const remove = new Set(removed);
-      target.contents = target.contents.filter((ref) => !remove.has(ref));
-      return;
+      return current.filter((ref) => !remove.has(ref));
     }
     metric?.({
       kind: "shadow_transcript_anomaly",
@@ -831,9 +840,9 @@ function applyTranscriptContentsWrite(
       object: write.cell.object,
       ...(transcript.id ? { id: transcript.id } : {})
     });
-    return;
+    return current.slice();
   }
-  target.contents = refs;
+  return refs;
 }
 
 function transcriptContentsWriteRefs(write: TranscriptWrite): ObjRef[] {

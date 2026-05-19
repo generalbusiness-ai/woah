@@ -153,8 +153,69 @@ describe("v2 browser local turn planning", () => {
     });
     expect(local).toMatchObject({
       ok: true,
-      request: { call: { target: "the_pinboard", verb: "enter" } }
+      request: { call: { target: "the_pinboard", verb: "enter" } },
+      optimistic_frame: {
+        op: "result",
+        result: { room: "the_pinboard" }
+      }
     });
+  });
+
+  it("preserves stale subscriber rows while recording local enter presence writes", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-local-outliner-scrub");
+    anchor.setProp("the_outline", "session_subscribers", [{ session: "expired:test", actor: "stale_actor" }]);
+    anchor.setProp("the_outline", "subscribers", ["stale_actor"]);
+    const serialized = anchor.exportWorld();
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:outline-enter-scrub",
+      scope: "the_outline",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_outline",
+      "browser:outline-enter-scrub",
+      session.actor
+    );
+
+    const local = await planV2BrowserLocalTurn({
+      node: "browser:outline-enter-scrub",
+      actor: session.actor,
+      session: session.id,
+      head: { kind: "woo.scope_head.shadow.v1", scope: "the_outline", epoch: 1, seq: 0, hash: "root" },
+      id: "outline-enter-scrub",
+      route: "sequenced",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "enter",
+      args: [],
+      persistence: "durable",
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
+    });
+
+    expect(local).toMatchObject({
+      ok: true,
+      request: { call: { target: "the_outline", verb: "enter" } },
+      optimistic_frame: {
+        op: "result",
+        result: { room: "the_outline" }
+      }
+    });
+    if (!local.ok) throw new Error("expected local outliner enter plan");
+    expect(local.transcript.writes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        cell: { kind: "prop", object: "the_outline", name: "session_subscribers" },
+        value: expect.arrayContaining([
+          expect.objectContaining({ session: "expired:test", actor: "stale_actor" }),
+          expect.objectContaining({ session: session.id, actor: session.actor })
+        ])
+      }),
+      expect.objectContaining({
+        cell: { kind: "prop", object: "the_outline", name: "subscribers" },
+        value: expect.arrayContaining(["stale_actor", session.actor])
+      })
+    ]));
   });
 
   it("plans a local enter over an accepted peer enter transcript", async () => {
@@ -202,7 +263,11 @@ describe("v2 browser local turn planning", () => {
 
     expect(planned).toMatchObject({
       ok: true,
-      request: { call: { target: "the_pinboard", verb: "enter" } }
+      request: { call: { target: "the_pinboard", verb: "enter" } },
+      optimistic_frame: {
+        op: "result",
+        result: { room: "the_pinboard" }
+      }
     });
   });
 
@@ -385,6 +450,134 @@ describe("v2 browser local turn planning", () => {
     expect(local.optimistic_frame.op).toBe("result");
     if (local.optimistic_frame.op !== "result") throw new Error("expected local list result frame");
     expect(JSON.stringify(local.optimistic_frame.result)).toContain("accepted outline item");
+  });
+
+  it("keeps optimistic outliner item text visible in dependent local reads", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-outline-tentative-text");
+    const serialized = anchor.exportWorld();
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:outline-tentative-text",
+      scope: "the_outline",
+      serialized
+    });
+    const seed = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tentative-text", session.actor);
+    const entered = await runShadowTurnCall(serialized, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "outline-tentative-enter-reference",
+      route: "sequenced",
+      scope: "the_outline",
+      session: session.id,
+      actor: session.actor,
+      target: "the_outline",
+      verb: "enter",
+      args: []
+    });
+    const added = await runShadowTurnCall(entered.serializedAfter, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "outline-tentative-add-reference",
+      route: "sequenced",
+      scope: "the_outline",
+      session: session.id,
+      actor: session.actor,
+      target: "the_outline",
+      verb: "add",
+      args: ["tentative outline item"]
+    });
+    const addTransfer = buildShadowClosureTransfer({
+      serialized,
+      key: shadowTurnKeyFromTranscript(added.transcript)
+    });
+    const transfers = [
+      v2ExecutableTransferRecord(seed, 1),
+      v2ExecutableTransferRecord(addTransfer, 2)
+    ];
+    const head = { kind: "woo.scope_head.shadow.v1" as const, scope: "the_outline", epoch: 1, seq: 0, hash: "root" };
+    const localEnter = await planV2BrowserLocalTurn({
+      node: "browser:outline-tentative-text",
+      actor: session.actor,
+      session: session.id,
+      head,
+      id: "outline-tentative-enter",
+      route: "sequenced",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "enter",
+      args: [],
+      persistence: "durable",
+      transfers
+    });
+    expect(localEnter).toMatchObject({ ok: true, request: { call: { verb: "enter" } } });
+    if (!localEnter.ok) throw new Error("expected local outliner enter");
+
+    const localAdd = await planV2BrowserLocalTurn({
+      node: "browser:outline-tentative-text",
+      actor: session.actor,
+      session: session.id,
+      head,
+      id: "outline-tentative-add",
+      route: "sequenced",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "add",
+      args: ["tentative outline item"],
+      persistence: "durable",
+      transfers,
+      tentative_transcripts: [localEnter.transcript]
+    });
+    expect(localAdd).toMatchObject({ ok: true, request: { call: { verb: "add" } } });
+    if (!localAdd.ok) throw new Error("expected local outliner add");
+
+    const firstList = await planV2BrowserLocalTurn({
+      node: "browser:outline-tentative-text",
+      actor: session.actor,
+      session: session.id,
+      head,
+      id: "outline-tentative-list",
+      route: "direct",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "list_items",
+      args: [],
+      persistence: "live",
+      transfers,
+      tentative_transcripts: [localEnter.transcript, localAdd.transcript]
+    });
+    expect(firstList).toMatchObject({
+      ok: false,
+      reason: "missing_state",
+      request: { call: { target: "the_outline", verb: "list_items" } }
+    });
+    if (firstList.ok || !firstList.key) throw new Error("expected repairable local list_items plan");
+
+    const repairTransfer = buildShadowClosureTransfer({
+      serialized: added.serializedAfter,
+      key: firstList.key
+    });
+    const localList = await planV2BrowserLocalTurn({
+      node: "browser:outline-tentative-text",
+      actor: session.actor,
+      session: session.id,
+      head,
+      id: "outline-tentative-list-repaired",
+      route: "direct",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "list_items",
+      args: [],
+      persistence: "live",
+      transfers: [...transfers, v2ExecutableTransferRecord(repairTransfer, 3)],
+      tentative_transcripts: [localEnter.transcript, localAdd.transcript]
+    });
+
+    expect(localList).toMatchObject({
+      ok: true,
+      request: { call: { target: "the_outline", verb: "list_items" } }
+    });
+    if (!localList.ok) throw new Error("expected local list_items");
+    expect(localList.optimistic_frame.op).toBe("result");
+    if (localList.optimistic_frame.op !== "result") throw new Error("expected local result frame");
+    expect(JSON.stringify(localList.optimistic_frame.result)).toContain("tentative outline item");
   });
 
   it("plans dependent durable turns against a tentative transcript chain", async () => {

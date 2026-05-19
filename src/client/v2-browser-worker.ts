@@ -10,8 +10,8 @@ import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
 import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-browser-delegation";
-import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
-import { createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
+import type { V2BrowserExecutionCheckpoint, V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
+import { createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
 import { shouldInvalidateTentativeTurnForCommitReason } from "./v2-browser-optimistic-lifecycle";
 import {
@@ -63,6 +63,7 @@ type V2CacheStatus = {
   state_pages: number;
   execution_transfers: number;
   execution_ads: number;
+  execution_checkpoints: number;
   tentative_turns: number;
   executable_scopes: string[];
   local_execution_ready?: boolean;
@@ -71,7 +72,7 @@ type V2CacheStatus = {
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const PROJECTION_STORE = "projections";
@@ -82,6 +83,8 @@ const STATE_PAGE_STORE = "state_pages";
 const EXECUTION_TRANSFER_STORE = "execution_transfers";
 const EXECUTION_AD_STORE = "execution_ads";
 const TENTATIVE_TURN_STORE = "tentative_turns";
+const EXECUTION_CHECKPOINT_STORE = "execution_checkpoints";
+const V2_BROWSER_COMMITTED_TRANSCRIPT_CHECKPOINT_INTERVAL = 8;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -190,10 +193,10 @@ async function connectTo(next: { token: string; node: string; scope: string; act
 /**
  * Opens the v2 transport for `current`.
  *
- * The returned promise resolves when the relay has delivered the initial state
- * transfer for this scope, or when the socket errors/closes before that point.
- * Once a socket has already reached that state-transfer boundary, later callers
- * return immediately.
+ * The returned promise resolves when the relay has delivered the display
+ * catch-up, executable seed, and execution ad for this scope, or when the
+ * socket errors/closes before that point. Once a socket has already reached
+ * that local-execution boundary, later callers return immediately.
  */
 async function connect(): Promise<void> {
   const target = current;
@@ -510,8 +513,14 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
       transfers: executionCache.records,
       cached_objects: executionCache.cached_objects,
       cached_pages: executionCache.cached_pages,
+      execution_checkpoint: executionCache.checkpoint,
       committed_transcripts: executionCache.committed_transcripts,
-      tentative_transcripts: v2TentativeTranscriptChain(tentativeRecords, selector)
+      tentative_transcripts: v2TentativeTranscriptChain(tentativeRecords, selector),
+      onCompose: (stats) => postMessage({
+        kind: "shadow_browser_compose_view",
+        ...turnDiagnostic(command, persistence),
+        ...stats
+      })
     });
   } catch {
     // Local planning genuinely throws (e.g. a pre-recording substrate check
@@ -794,6 +803,7 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(EXECUTION_TRANSFER_STORE)) database.createObjectStore(EXECUTION_TRANSFER_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(EXECUTION_AD_STORE)) database.createObjectStore(EXECUTION_AD_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(TENTATIVE_TURN_STORE)) database.createObjectStore(TENTATIVE_TURN_STORE, { keyPath: "id" });
+      if (!database.objectStoreNames.contains(EXECUTION_CHECKPOINT_STORE)) database.createObjectStore(EXECUTION_CHECKPOINT_STORE, { keyPath: "scope" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
@@ -832,6 +842,7 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
       return;
     case "projection":
       await putProjection(mutation.scope, mutation.head, mutation.projection);
+      if (mutation.reset_execution_overlay) await resetCommittedExecutionOverlay(mutation.scope);
       return;
     case "projection_patch": {
       const row = await getProjection(mutation.scope);
@@ -842,9 +853,13 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
     }
     case "applied_frame":
       await putAppliedFrame(mutation.frame);
-      if (mutation.transcript) await putTranscript(mutation.transcript, mutation.frame.position.seq);
+      if (mutation.transcript) {
+        await putTranscript(mutation.transcript, mutation.frame.position.seq);
+        await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
+      }
       return;
     case "transcript":
+      if (await transcriptCoveredByCheckpoint(mutation.transcript)) return;
       await putTranscript(mutation.transcript);
       return;
     case "object_page":
@@ -916,6 +931,11 @@ async function putTranscript(transcript: EffectTranscript, acceptedSeq?: number)
   await tx(TRANSCRIPT_STORE, "readwrite", (store) => store.put(row));
 }
 
+async function transcriptCoveredByCheckpoint(transcript: EffectTranscript): Promise<boolean> {
+  const checkpoint = await getExecutionCheckpoint(transcript.scope);
+  return Boolean(checkpoint && transcript.seq <= checkpoint.through_seq);
+}
+
 async function putObjectPage(hash: string, object: unknown): Promise<void> {
   await tx(OBJECT_PAGE_STORE, "readwrite", (store) => store.put({ hash, object: (object as { id?: unknown }).id, record: object, received_at: Date.now() }));
 }
@@ -932,6 +952,19 @@ async function putExecutionAd(record: V2ExecutionAdRecord): Promise<void> {
   await tx(EXECUTION_AD_STORE, "readwrite", (store) => store.put(record));
 }
 
+async function putExecutionCheckpoint(record: V2BrowserExecutionCheckpoint): Promise<void> {
+  await tx(EXECUTION_CHECKPOINT_STORE, "readwrite", (store) => store.put(record));
+}
+
+async function getExecutionCheckpoint(scope: string): Promise<V2BrowserExecutionCheckpoint | undefined> {
+  if (!scope) return undefined;
+  return await tx<V2BrowserExecutionCheckpoint | undefined>(EXECUTION_CHECKPOINT_STORE, "readonly", (store) => store.get(scope));
+}
+
+async function deleteExecutionCheckpoint(scope: string): Promise<void> {
+  await tx(EXECUTION_CHECKPOINT_STORE, "readwrite", (store) => store.delete(scope));
+}
+
 async function putTentativeTurn(record: V2BrowserTentativeTurnRecord): Promise<void> {
   await tx(TENTATIVE_TURN_STORE, "readwrite", (store) => store.put(record));
 }
@@ -944,13 +977,69 @@ async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
   return await tx<V2ExecutableTransferRecord[]>(EXECUTION_TRANSFER_STORE, "readonly", (store) => store.getAll());
 }
 
-async function committedTranscriptsForScope(scope: string): Promise<EffectTranscript[]> {
+async function transcriptRowsForScope(scope: string): Promise<TranscriptTailRow[]> {
   const rows = await tx<TranscriptTailRow[]>(TRANSCRIPT_STORE, "readonly", (store) => store.getAll());
   return rows
-    .filter((row) => row.scope === scope && typeof row.accepted_seq === "number")
+    .filter((row) => row.scope === scope)
     .slice()
-    .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash))
+    .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash));
+}
+
+async function committedTranscriptRowsForScope(scope: string, afterSeq = -1): Promise<TranscriptTailRow[]> {
+  return (await transcriptRowsForScope(scope))
+    .filter((row) => typeof row.accepted_seq === "number" && (row.accepted_seq ?? row.seq) > afterSeq);
+}
+
+async function committedTranscriptsForScope(scope: string, afterSeq = -1): Promise<EffectTranscript[]> {
+  return (await committedTranscriptRowsForScope(scope, afterSeq))
     .map((row) => structuredClone(row.transcript) as EffectTranscript);
+}
+
+async function deleteCommittedTranscriptsThrough(scope: string, throughSeq: number): Promise<number> {
+  const rows = await committedTranscriptRowsForScope(scope);
+  const doomed = rows.filter((row) => (row.accepted_seq ?? row.seq) <= throughSeq);
+  if (doomed.length === 0) return 0;
+  await deleteStoreKeys(TRANSCRIPT_STORE, doomed.map((row) => row.hash));
+  return doomed.length;
+}
+
+async function resetCommittedExecutionOverlay(scope: string): Promise<void> {
+  // A full projection/open seed is an authoritative snapshot boundary. The
+  // committed transcript tail and checkpoint describe how to advance an older
+  // executable seed; keeping them would replay already-included commits over
+  // the new seed on the next local plan. Verified executable transfers remain
+  // usable until the replacement executable seed arrives.
+  const rows = await transcriptRowsForScope(scope);
+  await deleteStoreKeys(TRANSCRIPT_STORE, rows.map((row) => row.hash));
+  await deleteExecutionCheckpoint(scope);
+}
+
+async function maybeCheckpointCommittedTranscripts(scope: string): Promise<void> {
+  const checkpoint = await getExecutionCheckpoint(scope);
+  const rows = await committedTranscriptRowsForScope(scope, checkpoint?.through_seq ?? -1);
+  if (rows.length < V2_BROWSER_COMMITTED_TRANSCRIPT_CHECKPOINT_INTERVAL) return;
+  const cache = await executionCacheForScope(scope, undefined, { skip_checkpoint_build: true });
+  const throughSeq = rows[rows.length - 1]!.accepted_seq ?? rows[rows.length - 1]!.seq;
+  const next = createV2BrowserExecutionCheckpoint({
+    node: current?.node ?? "browser:checkpoint",
+    scope,
+    records: cache.records,
+    cached_objects: cache.cached_objects,
+    cached_pages: cache.cached_pages,
+    checkpoint,
+    committed_transcripts: rows.map((row) => structuredClone(row.transcript) as EffectTranscript),
+    through_seq: throughSeq
+  });
+  if (!next) return;
+  await putExecutionCheckpoint(next);
+  const pruned = await deleteCommittedTranscriptsThrough(scope, throughSeq);
+  postMessage({
+    kind: "shadow_browser_execution_checkpoint",
+    scope,
+    through_seq: throughSeq,
+    transcript_count: rows.length,
+    pruned
+  });
 }
 
 async function allTentativeTurns(): Promise<V2BrowserTentativeTurnRecord[]> {
@@ -960,13 +1049,24 @@ async function allTentativeTurns(): Promise<V2BrowserTentativeTurnRecord[]> {
 
 async function executionCacheForScope(
   scope: string,
-  records?: readonly V2ExecutableTransferRecord[]
-): Promise<{ records: V2ExecutableTransferRecord[]; cached_objects: SerializedObject[]; cached_pages: ShadowStatePage[]; committed_transcripts: EffectTranscript[] }> {
+  records?: readonly V2ExecutableTransferRecord[],
+  options: { skip_checkpoint_build?: boolean } = {}
+): Promise<{
+  records: V2ExecutableTransferRecord[];
+  cached_objects: SerializedObject[];
+  cached_pages: ShadowStatePage[];
+  checkpoint?: V2BrowserExecutionCheckpoint;
+  committed_transcripts: EffectTranscript[];
+}> {
   const sourceRecords = records ?? await allExecutionTransfers();
+  const checkpoint = options.skip_checkpoint_build ? undefined : await getExecutionCheckpoint(scope);
   const scopedRecords = sourceRecords.filter((record) => record.scope === scope);
+  const recordsToInstall = checkpoint
+    ? scopedRecords.filter((record) => record.received_at > checkpoint.transfer_high_watermark)
+    : scopedRecords;
   const objectHashes = new Set<string>();
   const pageHashes = new Set<string>();
-  for (const record of scopedRecords) {
+  for (const record of recordsToInstall) {
     const transfer = record.transfer;
     if (transfer.mode === "object_records") {
       for (const page of transfer.object_pages) objectHashes.add(page.hash);
@@ -978,7 +1078,8 @@ async function executionCacheForScope(
     records: scopedRecords,
     cached_objects: await cachedObjectsByHash(objectHashes),
     cached_pages: await cachedStatePagesByHash(pageHashes),
-    committed_transcripts: await committedTranscriptsForScope(scope)
+    ...(checkpoint ? { checkpoint } : {}),
+    committed_transcripts: await committedTranscriptsForScope(scope, checkpoint?.through_seq ?? -1)
   };
 }
 
@@ -1013,7 +1114,8 @@ async function status(): Promise<V2CacheStatus> {
       current.scope,
       executionCache?.records ?? executionTransfers,
       executionCache?.cached_objects ?? [],
-      executionCache?.cached_pages ?? []
+      executionCache?.cached_pages ?? [],
+      executionCache?.checkpoint
     )
     : undefined;
   return {
@@ -1026,6 +1128,7 @@ async function status(): Promise<V2CacheStatus> {
     state_pages: await countStore(STATE_PAGE_STORE),
     execution_transfers: executionTransfers.length,
     execution_ads: await countStore(EXECUTION_AD_STORE),
+    execution_checkpoints: await countStore(EXECUTION_CHECKPOINT_STORE),
     tentative_turns: await countStore(TENTATIVE_TURN_STORE),
     executable_scopes: executableScopes(executionTransfers),
     ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
@@ -1045,16 +1148,18 @@ function canReconstructExecutionNode(
   scope: string,
   records: readonly V2ExecutableTransferRecord[],
   cachedObjects: readonly SerializedObject[] = [],
-  cachedPages: readonly ShadowStatePage[] = []
+  cachedPages: readonly ShadowStatePage[] = [],
+  checkpoint?: V2BrowserExecutionCheckpoint
 ): boolean {
-  if (!records.some((record) => record.scope === scope)) return false;
+  if (!checkpoint && !records.some((record) => record.scope === scope)) return false;
   try {
     const executionNode = createV2BrowserExecutionNodeFromTransfers({
       node,
       scope,
       records,
       cached_objects: cachedObjects,
-      cached_pages: cachedPages
+      cached_pages: cachedPages,
+      checkpoint
     });
     return executionNode.serialized !== undefined;
   } catch {
@@ -1072,6 +1177,15 @@ function isShadowStatePage(value: unknown): value is ShadowStatePage {
 
 async function countStore(storeName: string): Promise<number> {
   return await tx<number>(storeName, "readonly", (store) => store.count());
+}
+
+async function deleteStoreKeys(storeName: string, keys: readonly IDBValidKey[]): Promise<void> {
+  if (keys.length === 0) return;
+  await tx<undefined>(storeName, "readwrite", (store) => {
+    let request: IDBRequest<undefined> | null = null;
+    for (const key of keys) request = store.delete(key);
+    return request ?? store.delete(keys[0]!);
+  });
 }
 
 function postStatus(): void {

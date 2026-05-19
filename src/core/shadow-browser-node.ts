@@ -693,6 +693,7 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   const scopeObj = byId.get(scope);
   const actorObj = actor ? byId.get(actor) : undefined;
   const actorLocationObj = actorObj?.location ? byId.get(actorObj.location) : undefined;
+  for (const id of openSeedLinkedObjectRefs(serialized, scope, actor)) add(`target:${id}`);
   if (scopeObj) addOpenSeedObjectCells(scopeObj, add, { writeProps: true, writeContents: true });
   if (actorObj) addOpenSeedObjectCells(actorObj, add, { writeLocation: true });
   if (actorLocationObj) {
@@ -825,6 +826,7 @@ function shadowBrowserOpenExecutableSeedSerialized(
   addWithLineage(scope);
   addWithLineage(actor);
   for (const content of byId.get(scope)?.contents ?? []) addWithLineage(content);
+  for (const linked of openSeedLinkedObjectRefs(serialized, scope, actor)) addWithLineage(linked);
   return {
     version: serialized.version,
     objectCounter: serialized.objectCounter,
@@ -847,6 +849,35 @@ function shadowBrowserOpenExecutableSeedSerialized(
     parkedTasks: [],
     tombstones: [...(serialized.tombstones ?? [])].sort()
   };
+}
+
+function openSeedLinkedObjectRefs(serialized: SerializedWorld, scope: ObjRef, actor?: ObjRef): ObjRef[] {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const refs = new Set<ObjRef>();
+  const add = (value: unknown): void => {
+    if (typeof value === "string" && byId.has(value)) refs.add(value);
+  };
+  const addPropRefs = (obj: SerializedObject | undefined): void => {
+    if (!obj) return;
+    for (const name of ["mount_room", "home"] as const) {
+      add(obj.properties.find(([prop]) => prop === name)?.[1]);
+    }
+  };
+  const scopeObj = byId.get(scope);
+  const actorObj = actor ? byId.get(actor) : undefined;
+  add(actorObj?.location ?? null);
+  addPropRefs(scopeObj);
+  addPropRefs(actorObj);
+  for (const session of serialized.sessions) {
+    if (!actor || session.actor !== actor) continue;
+    add(session.activeScope ?? null);
+  }
+  // These linked spaces are not direct transcript cells, but first-turn tool
+  // verbs routinely route observations or moves through them. Seeding their
+  // lineage keeps local optimistic execution from turning a missing lineage
+  // page into a catalog-visible E_TYPE.
+  for (const ref of Array.from(refs)) addPropRefs(byId.get(ref));
+  return Array.from(refs).sort();
 }
 
 function serializedFeatureRefs(obj: SerializedObject): ObjRef[] {
@@ -882,8 +913,13 @@ export function unsubscribeShadowBrowserNode(browser: ShadowBrowserNode, scope: 
 }
 
 export function disposeShadowBrowserNode(browser: ShadowBrowserNode, scope: ObjRef = browser.scope): void {
+  const registered = browser.relay.browsers.get(browser.node);
+  // Browser node ids are durable across reloads. A stale transport can close
+  // after a replacement node has subscribed with the same id; disposing the
+  // stale object must not remove the replacement's subscription or wire token.
+  if (registered && registered !== browser) return;
   unsubscribeShadowBrowserNode(browser, scope);
-  browser.relay.browsers.delete(browser.node);
+  if (registered === browser) browser.relay.browsers.delete(browser.node);
   if (browser.session_token) browser.relay.session_auth.delete(browser.session_token);
 }
 

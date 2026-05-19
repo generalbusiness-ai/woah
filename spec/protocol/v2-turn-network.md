@@ -1191,6 +1191,7 @@ rights:
 | `projections` | `woo.scope_projection.v1` rows and patches | No | Yes, for the named scope/head | state authority proof |
 | `applied_frames` | accepted commit frames by `(scope, seq)` | No | Yes, via reducer | commit receipt |
 | `transcript_tail` | recent accepted transcripts | Only after page verification | Indirectly | commit receipt |
+| `execution_checkpoints` | per-scope materialized executable snapshots through an accepted seq | Yes, as a replay base | No | derived from state proofs and commit receipts |
 | `object_pages` | verified object-record pages | Yes | No | state proof |
 | `state_pages` | verified cell/bytecode/metadata pages | Yes | No | state proof |
 
@@ -1232,6 +1233,18 @@ cache miss, reconnect, conflict, or actor/session change. The worker MUST NOT
 persist VM-mutated post-state as authoritative executable pages until the turn
 is accepted or a verified state transfer supplies the matching pages. Tentative
 post-state lives only in the pending-turn/optimistic layer.
+
+Accepted transcripts may be replayed over the executable seed, but this replay
+tail MUST be bounded. A browser worker SHOULD periodically materialize a
+per-scope execution checkpoint through an accepted sequence number, then prune
+older transcript-tail rows covered by that checkpoint. A later local execution
+view starts from the checkpoint, installs only executable transfers received
+after the checkpoint's transfer high-watermark, and replays only accepted
+transcripts newer than the checkpoint plus current tentative turns. A full
+projection/open fallback is a new authoritative snapshot boundary and MUST
+discard the prior checkpoint and committed transcript tail for that scope.
+Implementations SHOULD expose compose-view timing and replay counts so local
+execution cost regressions are visible before they become user-visible.
 
 The browser execution node has narrow authority:
 
@@ -1579,7 +1592,8 @@ spreading.
 3. **IndexedDB execution cache.** The browser worker persists verified
    executable pages with proof metadata, installs an open-time executable seed
    for the current scope, reconstructs an execution node from IndexedDB, and
-   refuses to use projection rows for VM reads.
+   refuses to use projection rows for VM reads. Accepted transcript replay is
+   bounded by per-scope execution checkpoints.
 4. **Missing-state repair.** Browser local execution requests closure
    transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
    same turn id locally before delegation.

@@ -12,6 +12,8 @@ import {
   shadowBrowserTransportHello
 } from "../src/core/shadow-browser-node";
 import { createWorld } from "../src/core/bootstrap";
+import type { EffectTranscript } from "../src/core/effect-transcript";
+import type { ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
 
 describe("v2 browser worker integration", () => {
   afterEach(() => {
@@ -368,6 +370,157 @@ describe("v2 browser worker integration", () => {
     });
     expect(socket.sent).toHaveLength(sentAfterEnter);
   });
+
+  it("keeps the verified executable seed across a full projection overlay reset", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-overlay-reset");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-overlay-reset",
+      scope: "the_pinboard",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-overlay-reset",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-overlay-reset"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-overlay-reset",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-overlay-reset", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-overlay-reset-open", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-overlay-reset-open", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-overlay-reset-open", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    posted.length = 0;
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-overlay-reset-boundary", opened.transfer.kind, opened.transfer)));
+    expect(await waitForMessage(posted, (message) => isStatusWithExecutionTransfers(message, 1))).toMatchObject({
+      status: { execution_transfers: 1, local_execution_ready: true }
+    });
+
+    scope.dispatch({
+      kind: "call",
+      id: "overlay-reset-enter",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "overlay-reset-enter"))).toMatchObject({
+      kind: "local_turn_planned"
+    });
+  });
+
+  it("checkpoints accepted transcript replay and reports compose-view stats", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-checkpoint");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-checkpoint",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-checkpoint",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-checkpoint"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-checkpoint",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-checkpoint", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-checkpoint", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-checkpoint", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-checkpoint", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    for (let seq = 1; seq <= 8; seq++) {
+      const accepted = syntheticAccepted("the_dubspace", seq);
+      const transcript = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, seq);
+      socket.receive(encodeEnvelope(relayEnvelope(browser, `accepted-checkpoint-${seq}`, "woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: true,
+        id: transcript.id,
+        outcome: { result: null },
+        transcript,
+        commit: accepted
+      })));
+    }
+
+    const checkpoint = await waitForMessage(posted, (message) => isKind(message, "shadow_browser_execution_checkpoint") || isKind(message, "error"));
+    expect(checkpoint).not.toMatchObject({ kind: "error" });
+    expect(checkpoint).toMatchObject({
+      kind: "shadow_browser_execution_checkpoint",
+      scope: "the_dubspace",
+      transcript_count: 8,
+      pruned: 8
+    });
+
+    scope.dispatch({
+      kind: "call",
+      id: "checkpoint-control-after",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.99],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
+    expect(await waitForMessage(posted, (message) => isComposeViewFor(message, "checkpoint-control-after"))).toMatchObject({
+      kind: "shadow_browser_compose_view",
+      checkpoint_seq: 8,
+      committed_transcript_count: 0
+    });
+  });
 });
 
 class FakeWorkerScope {
@@ -484,6 +637,69 @@ function relayEnvelope<T>(
   } as ShadowEnvelope<T>;
 }
 
+function syntheticAccepted(scope: string, seq: number): ShadowCommitAccepted {
+  return {
+    kind: "woo.commit.accepted.shadow.v1",
+    id: `synthetic-checkpoint-${seq}`,
+    position: {
+      kind: "woo.scope_head.shadow.v1",
+      scope,
+      epoch: 1,
+      seq,
+      hash: `synthetic-head-${seq}`
+    },
+    receipt: {
+      kind: "woo.commit_receipt.shadow.v1",
+      id: `synthetic-checkpoint-${seq}`,
+      route: "sequenced",
+      scope,
+      seq,
+      transcript_hash: `synthetic-transcript-${seq}`,
+      pre_state_hash: `synthetic-pre-${seq}`,
+      post_state_hash: `synthetic-post-${seq}`,
+      accepted: true,
+      errors: []
+    },
+    transcript_hash: `synthetic-transcript-${seq}`,
+    post_state_hash: `synthetic-post-${seq}`,
+    observations: []
+  };
+}
+
+function syntheticCheckpointTranscript(scope: string, actor: string, session: string, seq: number): EffectTranscript {
+  const id = `synthetic-checkpoint-${seq}`;
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    id,
+    route: "sequenced",
+    scope,
+    seq,
+    session,
+    call: {
+      actor,
+      target: scope,
+      verb: "checkpoint_marker",
+      args: [seq],
+      body: undefined
+    },
+    reads: [],
+    writes: [{
+      cell: { kind: "prop", object: scope, name: "checkpoint_marker" },
+      value: seq,
+      op: "set",
+      next: `checkpoint-marker:${seq}`
+    }],
+    creates: [],
+    moves: [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: `synthetic-transcript-${seq}`
+  };
+}
+
 function isKind(message: unknown, kind: string): boolean {
   return Boolean(message && typeof message === "object" && (message as { kind?: unknown }).kind === kind);
 }
@@ -500,6 +716,19 @@ function isLocalTurnCommitted(message: unknown, id: string): boolean {
   return isKind(message, "local_turn_committed") &&
     Array.isArray((message as { ids?: unknown }).ids) &&
     ((message as { ids: unknown[] }).ids).includes(id);
+}
+
+function isComposeViewFor(message: unknown, id: string): boolean {
+  return isKind(message, "shadow_browser_compose_view") && (message as { id?: unknown }).id === id;
+}
+
+function isReadyStatus(message: unknown): boolean {
+  return isKind(message, "status") && (message as { status?: { local_execution_ready?: unknown } }).status?.local_execution_ready === true;
+}
+
+function isStatusWithExecutionTransfers(message: unknown, count: number): boolean {
+  return isKind(message, "status") &&
+    (message as { status?: { execution_transfers?: unknown } }).status?.execution_transfers === count;
 }
 
 async function waitForMessage(messages: unknown[], predicate: (message: unknown) => boolean): Promise<unknown> {

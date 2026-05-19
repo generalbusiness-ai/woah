@@ -15,7 +15,7 @@ describe("v2 browser cache reducer", () => {
     });
 
     expect(v2BrowserCacheMutationsForEnvelope(envelope)).toEqual([
-      { kind: "projection", scope: "the_dubspace", head: envelope.body.to, projection: envelope.body.projection },
+      { kind: "projection", scope: "the_dubspace", head: envelope.body.to, projection: envelope.body.projection, reset_execution_overlay: true },
       { kind: "meta", key: "head:the_dubspace", value: envelope.body.to },
       { kind: "meta", key: "catchup_required", value: false }
     ]);

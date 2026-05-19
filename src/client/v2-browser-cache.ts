@@ -15,7 +15,7 @@ import { v2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 export type V2BrowserCacheMutation =
   | { kind: "meta"; key: string; value: unknown }
   | { kind: "pending_delete"; id: string }
-  | { kind: "projection"; scope: string; head: ShadowScopeHead; projection: WooValue }
+  | { kind: "projection"; scope: string; head: ShadowScopeHead; projection: WooValue; reset_execution_overlay?: boolean }
   | { kind: "projection_patch"; scope: string; head: ShadowScopeHead; patch: ShadowScopeProjectionPatch }
   | { kind: "applied_frame"; frame: ShadowCommitAccepted; transcript?: EffectTranscript }
   | { kind: "transcript"; transcript: EffectTranscript }
@@ -94,7 +94,7 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
   const projectionMutation: V2BrowserCacheMutation | null = transfer.mode === "delta" && transfer.projection_patch
     ? { kind: "projection_patch", scope: transfer.scope, head: transfer.to, patch: transfer.projection_patch }
     : transfer.projection
-      ? { kind: "projection", scope: transfer.scope, head: transfer.to, projection: transfer.projection }
+      ? { kind: "projection", scope: transfer.scope, head: transfer.to, projection: transfer.projection, ...(transfer.mode === "projection" ? { reset_execution_overlay: true } : {}) }
       : null;
   if (!projectionMutation) return [];
   const common: V2BrowserCacheMutation[] = [

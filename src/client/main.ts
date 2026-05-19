@@ -293,7 +293,7 @@ const TONE_TRACK_SEMITONES = [19, 22, 24, 27];
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const directThrottle = new Map<string, number>();
 const pendingDirect = new Map<string, (result: any) => void>();
-const pendingFrameErrors = new Map<string, (error: any) => void>();
+const pendingFrameErrors = new Map<string, (error: unknown) => void>();
 const pendingCommands = new Map<string, { space: string; text: string; action?: ChatCommandUiAction }>();
 const pendingNetworkTurns = new Set<string>();
 let pinboardNotesRefreshPending = false;
@@ -488,7 +488,7 @@ function ensureV2BrowserWorker() {
       }
       console.debug("woo.v2.local_turn_invalidated", event.data);
     }
-    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed") {
+    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed" || event.data?.kind === "shadow_browser_compose_view" || event.data?.kind === "shadow_browser_execution_checkpoint") {
       window.dispatchEvent(new CustomEvent(`woo.v2.${event.data.kind}`, { detail: event.data }));
       console.debug(`woo.v2.${event.data.kind}`, event.data);
     }
@@ -4774,6 +4774,14 @@ function enterOutliner() {
 function enterPinboard() {
   const board = pinboardSpace();
   if (!board || !canSendPinboardV2()) return;
+  if (pinboardActorPresent()) {
+    void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
+      if (state.tab === "pinboard") render();
+    });
+    refreshPinboardNotes({ force: true });
+    requestSpaceChatFocus(board);
+    return;
+  }
   v2Turn({
     scope: board,
     route: "sequenced",

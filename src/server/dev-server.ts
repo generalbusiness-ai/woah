@@ -43,6 +43,7 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
+import { materializeDevV2CommitLocally } from "./dev-v2-commit";
 import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting } from "./dev-v2-routing";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
@@ -524,8 +525,8 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
   const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, { onMetric: emitDevMetric });
   if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-  if (reply.body.commit && reply.body.transcript) {
-    world.applyCommittedShadowTranscript(reply.body.transcript);
+  if (reply.body.ok === true && reply.body.commit && reply.body.transcript) {
+    materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript);
   }
   sendDevV2Fanout(browser, reply);
   return restFrameFromTurnReply(input.scope, reply.body);
@@ -602,7 +603,7 @@ async function handleV2ShadowFrame(
     }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
-      world.applyCommittedShadowTranscript(reply.body.transcript);
+      materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript);
     }
     if (reply) {
       ws.send(encodeEnvelope(reply));

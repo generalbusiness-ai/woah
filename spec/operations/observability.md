@@ -67,6 +67,7 @@ Each persistent host emits standard metrics:
 - `shadow_apply_step` events partition authoritative shadow transcript application, including `clone_world`, object indexing, write collection/application, log application, counters, and total time. Operators use these to explain expensive `/v2/envelope` commits without guessing whether `structuredClone(SerializedWorld)` dominated.
 - `shadow_transcript_anomaly` records malformed transcript shapes that are rejected or no-op materialized instead of being silently applied, such as a `contents:remove` write with no corresponding move record.
 - `shadow_gateway_apply_step` events partition the gateway-cache side of an accepted v2 transcript: runtime-session capture, `exportWorld`, the serialized applier phases, `importWorld`, runtime-session restore, and total time. These are the production probe for the temporary export → serialized apply → import path; they include object/property/session/log counts so operators can confirm whether gateway cache apply cost scales with whole-world size rather than transcript size.
+- Browser workers emit `woo.v2.shadow_browser_compose_view` and `woo.v2.shadow_browser_execution_checkpoint` diagnostics to the page for local execution-cache composition. These are client-side probes rather than Analytics Engine events; they report compose milliseconds, installed transfer count, committed/tentative replay counts, checkpoint sequence, and checkpoint pruning.
 - `parked_tasks` (gauge)
 - `inbound_rate_drops` (counter)
 - `outbound_overflow_drops` (counter)
