@@ -20,7 +20,7 @@ import {
   V2_BROWSER_TENTATIVE_JOURNAL_LIMIT,
   v2TentativeJournalHasCapacity,
   v2TentativeTranscriptChain,
-  v2TentativeTurnChainFrom,
+  v2TentativeTurnForInvalidation,
   v2TentativeTurnMatches,
   type V2BrowserTentativeTurnRecord
 } from "./v2-browser-journal";
@@ -309,7 +309,7 @@ async function receiveFrame(encoded: string): Promise<void> {
     if (message) postMessage(message);
   }
   if (envelope.type === "woo.transport.error.v1" && envelope.reply_to) {
-    await invalidateTentativeTurnChain(envelope.reply_to, "transport_error");
+    await invalidateTentativeTurn(envelope.reply_to, "transport_error");
   }
   if (envelope.type === "woo.live.event.shadow.v1") {
     postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
@@ -692,7 +692,7 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
   if (reply.reason === "commit_rejected") {
     const reason = reply.commit?.reason ?? "commit_rejected";
     if (!shouldInvalidateTentativeTurnForCommitReason(reason)) return;
-    await invalidateTentativeTurnChain(ids[0], reason, ids, reply.transcript?.hash);
+    await invalidateTentativeTurn(ids[0], reason, ids, reply.transcript?.hash);
   }
 }
 
@@ -703,20 +703,16 @@ async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHa
   return matched;
 }
 
-async function invalidateTentativeTurnChain(id: string, reason: string, ids: readonly string[] = [id], transcriptHash?: string): Promise<void> {
+async function invalidateTentativeTurn(id: string, reason: string, ids: readonly string[] = [id], transcriptHash?: string): Promise<void> {
   const records = await allTentativeTurns();
-  const anchor = records.find((record) => v2TentativeTurnMatches(record, ids, transcriptHash));
+  const anchor = v2TentativeTurnForInvalidation(records, ids, transcriptHash);
   if (!anchor) return;
-  // Phase 1 fails the dependent optimistic chain loudly. The distributed VM
-  // target is to re-plan these dependents over the accepted parent state and
-  // resubmit the same outer intent id with a new transcript hash.
-  const invalidated = v2TentativeTurnChainFrom(records, anchor);
-  for (const record of invalidated) await deleteTentativeTurn(record.id);
+  await deleteTentativeTurn(anchor.id);
   postMessage({
     kind: "local_turn_invalidated",
     id,
     reason,
-    invalidated_ids: invalidated.map((record) => record.id)
+    invalidated_ids: [anchor.id]
   });
 }
 

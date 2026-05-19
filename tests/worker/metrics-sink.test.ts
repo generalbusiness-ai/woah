@@ -169,6 +169,24 @@ describe("metrics-sink", () => {
       expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(604_906);
     });
 
+    it("stores transcript anomaly reason and event count", () => {
+      const { binding, calls } = fakeAnalytics();
+      const event: MetricEvent = {
+        kind: "shadow_transcript_anomaly",
+        scope: "the_pinboard",
+        route: "sequenced",
+        reason: "contents_remove_without_move",
+        object: "the_pinboard",
+        id: "turn-bad-remove"
+      };
+      writeMetricToAnalytics(event, "the_pinboard", binding);
+      expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("shadow_transcript_anomaly");
+      expect(calls[0]!.blobs?.[SLOT_SCOPE]).toBe("the_pinboard");
+      expect(calls[0]!.blobs?.[SLOT_ROUTE]).toBe("sequenced");
+      expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("contents_remove_without_move");
+      expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(1);
+    });
+
     it("populates space+verb for applied so per-space verb activity is queryable", () => {
       const { binding, calls } = fakeAnalytics();
       const event: MetricEvent = { kind: "applied", space: "the_chatroom", seq: 695, verb: "southeast", ms: 7 };

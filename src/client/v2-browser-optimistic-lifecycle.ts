@@ -8,7 +8,7 @@ export type V2LocalTurnInvalidatedMessage = {
 export type V2OptimisticLifecycleHooks = {
   failOptimisticCall(id: string): void;
   pendingDirect: Map<string, (result: unknown) => void>;
-  pendingFrameErrors: Map<string, (error: V2TentativeInvalidatedError) => void>;
+  pendingFrameErrors: Map<string, (error: unknown) => void>;
   pendingCommands?: Map<string, unknown>;
   completeNetworkWait?: (id: string) => void;
 };

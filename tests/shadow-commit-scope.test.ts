@@ -7,6 +7,7 @@ import {
   applyShadowTranscriptToCommitScopeCache,
   createShadowCommitScope
 } from "../src/core/shadow-commit-scope";
+import type { MetricEvent } from "../src/core/types";
 
 describe("shadow commit scope", () => {
   it("applies content add/remove writes as deltas in committed materializers", () => {
@@ -19,6 +20,34 @@ describe("shadow commit scope", () => {
     const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: before });
     applyShadowTranscriptToCommitScopeCache(scope, transcript);
     expect(scope.serialized.objects.find((obj) => obj.id === "room")?.contents).toEqual(["created_b", "existing_a", "third_party"]);
+  });
+
+  it("does not replace contents for malformed remove writes without move records", () => {
+    const metrics: MetricEvent[] = [];
+    const before = serializedWorld();
+    const transcript = {
+      ...addChildTranscript(),
+      id: "bad-remove",
+      hash: "transcript:bad-remove",
+      creates: [],
+      writes: [{
+        cell: { kind: "contents" as const, object: "room" },
+        value: ["existing_a"],
+        op: "remove" as const
+      }]
+    };
+
+    const committed = applyShadowTranscriptToCommittedState(before, transcript, { metric: (event) => metrics.push(event) });
+
+    expect(committed.objects.find((obj) => obj.id === "room")?.contents).toEqual(["existing_a", "third_party"]);
+    expect(metrics).toContainEqual({
+      kind: "shadow_transcript_anomaly",
+      scope: "room",
+      route: "sequenced",
+      reason: "contents_remove_without_move",
+      object: "room",
+      id: "bad-remove"
+    });
   });
 });
 

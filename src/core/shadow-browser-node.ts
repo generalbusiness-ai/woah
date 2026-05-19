@@ -1509,7 +1509,7 @@ async function shadowTurnExecRequestFromIntent(
 async function executeShadowBrowserTurnExecRequest(
   browser: ShadowBrowserNode,
   request: ShadowTurnExecRequest,
-  options: { profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void } = {}
+  options: Pick<ShadowBrowserTurnExecEnvelopeOptions, "profile" | "onMetric"> = {}
 ): Promise<ShadowTurnExecutionResult> {
   validateShadowBrowserNodeAuth(browser);
   const executor = shadowRelayExecutorForRequest(browser.relay, request);
@@ -1525,7 +1525,8 @@ async function executeShadowBrowserTurnExecRequest(
       serialized: browser.relay.commit_scope.serialized
     },
     commitScope: browser.relay.commit_scope,
-    profile: options.profile
+    profile: options.profile,
+    metric: options.onMetric
   });
 
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);

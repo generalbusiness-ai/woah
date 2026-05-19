@@ -239,6 +239,7 @@ export type ShadowTurnExecReply =
 export type ShadowTurnExecutionOptions = {
   commitScope?: ShadowCommitScope;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  metric?: (event: MetricEvent) => void;
 };
 
 export function createShadowExecutionNode(input: {
@@ -597,7 +598,8 @@ export async function executeShadowTurnCallOrNeedState(
         expected: request.expected ?? options.commitScope.head,
         transcript: run.transcript,
         executor: node.node,
-        profile: options.profile
+        profile: options.profile,
+        metric: options.metric
       })
     : null;
   const receipt = commit

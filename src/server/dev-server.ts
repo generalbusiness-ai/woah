@@ -15,6 +15,7 @@ import {
   type AppliedFrame,
   type DirectResultFrame,
   type LiveEventFrame,
+  type MetricEvent,
   type ObjRef,
   type Session,
   type WooValue
@@ -60,7 +61,7 @@ const repository = new LocalSQLiteRepository(process.env.WOO_DB ?? ".woo/dev.sql
 const world = createWorld({ repository, catalogs: parseAutoInstallCatalogs(process.env.WOO_AUTO_INSTALL_CATALOGS) });
 ensureLocaldevWizardApiKey();
 if (process.env.WOO_METRICS !== "off") {
-  world.setMetricsHook((event) => console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: "dev" })));
+  world.setMetricsHook(emitDevMetric);
 }
 const v2RelaysByScope = new Map<ObjRef, ShadowBrowserRelayShim>();
 const v2SocketsByNode = new Map<string, WebSocket>();
@@ -77,6 +78,11 @@ let socketCounter = 1;
 const port = Number(process.env.PORT ?? 5173);
 const hmrPort = Number(process.env.VITE_HMR_PORT ?? port + 10_000);
 const MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024;
+
+function emitDevMetric(event: MetricEvent): void {
+  if (process.env.WOO_METRICS === "off") return;
+  console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: "dev" }));
+}
 
 const vite = await createViteServer({
   server: { middlewareMode: true, hmr: { port: hmrPort } },
@@ -266,17 +272,15 @@ v2wss.on("connection", (ws, req) => {
   }).then((opened) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
-    console.log("woo.metric", JSON.stringify({
+    emitDevMetric({
       kind: "shadow_open_executable_seed_bytes",
       scope,
       node,
       bytes: opened.executable_transfer_bytes,
       pages: opened.executable_transfer_pages,
       inline_pages: opened.executable_transfer_inline_pages,
-      status: seedStatus,
-      ts: Date.now(),
-      host_key: "dev"
-    }));
+      status: seedStatus
+    });
     if (seedStatus === "warn") {
       console.warn("woo.shadow_open_executable_seed_bytes.warn", {
         scope,
@@ -518,7 +522,7 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
     turnId: input.id
   });
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
-  const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
+  const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, { onMetric: emitDevMetric });
   if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
   if (reply.body.commit && reply.body.transcript) {
     world.applyCommittedShadowTranscript(reply.body.transcript);
@@ -596,7 +600,7 @@ async function handleV2ShadowFrame(
       ws.send(encodeEnvelope(stateReply));
       return;
     }
-    const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt);
+    const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
       world.applyCommittedShadowTranscript(reply.body.transcript);
     }

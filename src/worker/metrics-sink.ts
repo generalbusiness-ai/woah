@@ -70,7 +70,8 @@ const DOUBLE_SLOTS = 3;
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
 // dashboard queries can `SUM(double2)` to get totals without knowing which
 // kind they're aggregating over. Kinds that carry no natural primary count
-// (do_constructor, init, etc.) leave it at 0.
+// (do_constructor, init, etc.) leave it at 0. Diagnostic anomaly kinds use
+// one event as the count so dashboards can sum incidents directly.
 function primaryCount(event: MetricEvent): number {
   const e = event as Record<string, unknown>;
   switch (event.kind) {
@@ -90,6 +91,8 @@ function primaryCount(event: MetricEvent): number {
       return typeof e.hosts === "number" ? e.hosts : 0;
     case "shadow_open_executable_seed_bytes":
       return typeof e.bytes === "number" ? e.bytes : 0;
+    case "shadow_transcript_anomaly":
+      return 1;
     case "startup_storage":
       return typeof e.objects === "number" ? e.objects : (typeof e.routes === "number" ? e.routes : 0);
     case "shadow_apply_step":
@@ -128,13 +131,15 @@ function primaryCount(event: MetricEvent): number {
 //   blobs[13]   = actor          mcp_tool_refresh_*.actor, dispatch_resolved.actor
 //   blobs[14]   = path           dispatch_resolved.path: "local"|"read"|"mutating"
 //   blobs[15]   = reason         mcp_tool_refresh_*.reason, shadow_commit_rejected.reason,
-//                                rest_v2_in_process_fallback.reason
+//                                rest_v2_in_process_fallback.reason,
+//                                shadow_transcript_anomaly.reason
 //   blobs[16]   = error_detail   bounded diagnostic detail for uncoded errors
 //   doubles[0]  = ms             latency (when present)
 //   doubles[1]  = sample_rate    1 (default) or the 1-in-N multiplier
 //   doubles[2]  = count          primary kind-specific count: rows |
 //                                audience_size | observations | fanout |
-//                                hosts | objects | bytes (see primaryCount above)
+//                                hosts | objects | bytes | anomaly events
+//                                (see primaryCount above)
 export function writeMetricToAnalytics(
   event: MetricEvent,
   hostKey: string,

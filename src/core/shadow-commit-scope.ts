@@ -35,6 +35,7 @@ export type ShadowCommitSubmit = {
   transcript: EffectTranscript;
   executor?: string;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  metric?: (event: MetricEvent) => void;
 };
 
 export type ShadowCommitAccepted = {
@@ -110,6 +111,7 @@ type ShadowCommitScopeSerializedRefs = {
 export type ShadowTranscriptApplyOptions = {
   objectTimestamp?: number;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  metric?: (event: MetricEvent) => void;
 };
 
 export function createShadowCommitScope(input: {
@@ -163,7 +165,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   const stateBefore = ensureShadowCommitScopeState(scope);
   const beforeReader = createCommitScopeStateCellReader(stateBefore);
   const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
-  const mergedState = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile });
+  const mergedState = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile, metric: submit.metric });
   const afterReader = createCommitScopeStateCellReader(mergedState);
   const extraErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
   extraErrors.push(...validateShadowPostState(afterReader, submit.transcript));
@@ -499,7 +501,7 @@ function applyShadowTranscriptToIndexedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options.objectTimestamp);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
@@ -636,7 +638,7 @@ export function applyShadowTranscriptToCommittedState(
   stepStartedAt = Date.now();
   for (const write of writes) {
     const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options.objectTimestamp);
+    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
@@ -768,7 +770,7 @@ export function applyTranscriptWriteToSerializedObject(
   target: SerializedObject,
   write: TranscriptWrite,
   transcript: EffectTranscript,
-  objectTimestamp: number | undefined
+  options: ShadowTranscriptApplyOptions = {}
 ): void {
   // Keep this serialized-object materializer parallel with
   // WooWorld.applyTranscriptWriteInPlace. The storage shapes differ, but the
@@ -776,15 +778,15 @@ export function applyTranscriptWriteToSerializedObject(
   switch (write.cell.kind) {
     case "prop":
       applyPropWrite(target, write);
-      touchSerializedObject(target, objectTimestamp);
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     case "location":
       if (typeof write.value === "string" || write.value === null) target.location = write.value;
-      touchSerializedObject(target, objectTimestamp);
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     case "contents":
-      applyTranscriptContentsWrite(target, write, transcript);
-      touchSerializedObject(target, objectTimestamp);
+      applyTranscriptContentsWrite(target, write, transcript, options.metric);
+      touchSerializedObject(target, options.objectTimestamp);
       return;
     case "lifecycle": {
       // Recycle/delete materialization is still outside the shadow applier.
@@ -802,7 +804,8 @@ export function applyTranscriptWriteToSerializedObject(
 function applyTranscriptContentsWrite(
   target: SerializedObject,
   write: TranscriptWrite,
-  transcript: EffectTranscript
+  transcript: EffectTranscript,
+  metric?: (event: MetricEvent) => void
 ): void {
   // Move/create transcripts record whole post-write contents arrays for
   // validation, but committed replay must merge the operation intent. Replacing
@@ -820,6 +823,15 @@ function applyTranscriptContentsWrite(
       target.contents = target.contents.filter((ref) => !remove.has(ref));
       return;
     }
+    metric?.({
+      kind: "shadow_transcript_anomaly",
+      scope: transcript.scope,
+      route: transcript.route,
+      reason: "contents_remove_without_move",
+      object: write.cell.object,
+      ...(transcript.id ? { id: transcript.id } : {})
+    });
+    return;
   }
   target.contents = refs;
 }

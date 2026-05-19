@@ -83,6 +83,18 @@ export function v2TentativeTurnMatches(
   return ids.includes(record.id) || (transcriptHash !== undefined && record.transcript_hash === transcriptHash);
 }
 
+export function v2TentativeTurnForInvalidation(
+  records: readonly V2BrowserTentativeTurnRecord[],
+  ids: readonly string[],
+  transcriptHash?: string
+): V2BrowserTentativeTurnRecord | null {
+  // Phase 1 has no wire-level depends_on field, so the relay treats later
+  // locally planned turns as independent submissions. Only the directly
+  // rejected tentative can be invalidated without inventing dependency
+  // semantics the server does not yet enforce.
+  return records.find((record) => v2TentativeTurnMatches(record, ids, transcriptHash)) ?? null;
+}
+
 export function v2TentativeTurnChainFrom(
   records: readonly V2BrowserTentativeTurnRecord[],
   anchor: V2BrowserTentativeTurnRecord

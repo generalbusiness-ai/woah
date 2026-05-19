@@ -81,6 +81,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   maxStaleHeadRetries?: number;
   commitScope?: ShadowCommitScope;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
+  metric?: (event: MetricEvent) => void;
 }): Promise<ShadowInProcessNetworkResult> {
   const ranked = rankCapabilityAdsForTurn(input.ads, input.request.key);
   const selectedAd = ranked[0];
@@ -101,7 +102,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   // Cloning the request lets us bump `expected` per retry without mutating the
   // caller's input.
   let activeRequest: ShadowTurnExecRequest = input.request;
-  const first = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile });
+  const first = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile, metric: input.metric });
   let result = first;
   const transfers: ShadowStateTransfer[] = [];
   const maxTransfers = input.maxTransfers ?? 3;
@@ -166,7 +167,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     } else {
       break;
     }
-    result = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile });
+    result = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile, metric: input.metric });
   }
 
   if (transfers.length === 0) {
