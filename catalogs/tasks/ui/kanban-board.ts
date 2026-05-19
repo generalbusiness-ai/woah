@@ -1,7 +1,7 @@
 import {
   escapeHtml,
   preserveAmbientCompanionPanel,
-  renderAmbientCompanionShell,
+  renderToolFrame,
   restoreAmbientCompanionPanel,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -824,7 +824,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     // Roster is server-authoritative via $task_registry:room_roster (inherited
     // from $room). Fetched alongside the task listing; an empty array means
     // either no one's in the registry or the call failed — both surface the
-    // same "No one is in this registry." placeholder.
+    // same "No one is here." placeholder.
     let listing: unknown;
     let roster: unknown;
     try {
@@ -1662,33 +1662,27 @@ export class WooTasksKanbanElement extends HTMLElement {
           <section class="woo-tasks-kanban" aria-label="Task board">
             <div class="woo-tasks-kanban-columns">${columnsHtml}</div>
           </section>`;
-    // Layout mirrors chat / dubspace / outliner: a 1fr + fixed-side split with
-    // the board on the left and a presence aside on the right, all inside the
-    // ambient-companion shell so the mini-chat panel docks further right when
-    // the viewer is in the registry.
-    const workspace = `
-      <section class="woo-tasks-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(registryId)}">
-        <section class="split split--side-fixed woo-tasks-layout">
-          <div class="woo-tasks-workarea">
-            <div class="woo-tasks-board${this.adminOpen ? " has-admin" : ""}">
-              ${boardContent}
-            </div>
-            ${!this.adminOpen && this.openDetail ? this.renderDetailPanel(actorNames) : ""}
-          </div>
-          ${this.renderPresence()}
-        </section>
-      </section>
+    // Layout mirrors chat / dubspace / pinboard / outliner: a 1fr + fixed-side
+    // split with the board on the left and a presence aside on the right.
+    // renderToolFrame owns the toolbar + ambient-companion-shell pairing so
+    // the chat panel anchors identically across tools.
+    const layoutBody = `
+      <div class="woo-tasks-workarea">
+        <div class="woo-tasks-board${this.adminOpen ? " has-admin" : ""}">
+          ${boardContent}
+        </div>
+        ${!this.adminOpen && this.openDetail ? this.renderDetailPanel(actorNames) : ""}
+      </div>
+      ${this.renderPresence()}
     `;
     const preservedPanel = preserveAmbientCompanionPanel(this, registryId);
-    // Toolbar lives at the top of the custom element, outside the ambient-companion
-    // shell — same structure as pinboard (`<section class="toolbar pinboard-toolbar">`
-    // before `<section class="ambient-companion-shell">`). Putting it inside the
-    // shell would push the toolbar inside the companion-grid and shift y-position
-    // versus other tools.
-    this.innerHTML = `
-      ${this.renderHeader(registryName || "Tasks")}
-      ${renderAmbientCompanionShell(registryId, workspace)}
-    `;
+    this.innerHTML = renderToolFrame({
+      subject: registryId,
+      toolbar: this.renderHeader(registryName || "Tasks"),
+      layoutClass: "woo-tasks-layout",
+      layoutBody,
+      showChat: true
+    });
     restoreAmbientCompanionPanel(this, preservedPanel);
     this.dispatchEvent(new CustomEvent("woo-tasks-rendered", { bubbles: true }));
   }
@@ -1959,9 +1953,9 @@ export class WooTasksKanbanElement extends HTMLElement {
     }).join("");
     return `
       <aside class="card woo-tasks-presence">
-        <h2>Present</h2>
+        <h2>Presence</h2>
         <div class="presence-list">
-          ${buttons || "<p>No one is in this registry.</p>"}
+          ${buttons || "<p>No one is here.</p>"}
         </div>
       </aside>
     `;

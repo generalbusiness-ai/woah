@@ -716,7 +716,7 @@
       "kind": "create_instance",
       "class": "$task_registry",
       "as": "the_taskboard",
-      "name": "Taskboard",
+      "name": "Tasks",
       "description": "A registry that coordinates work items through a role-gated obligation cursor. Operators populate roles, obligations, and policies via the admin verbs (or :seed_minimal_policy for tests).",
       "properties": {
         "host_placement": "self"

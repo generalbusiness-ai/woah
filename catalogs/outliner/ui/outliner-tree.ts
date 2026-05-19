@@ -1,7 +1,7 @@
 import {
   escapeHtml,
   preserveAmbientCompanionPanel,
-  renderAmbientCompanionShell,
+  renderToolFrame,
   restoreAmbientCompanionPanel,
   type ChatFormatterRegistry,
   type ObservationRegistry,
@@ -162,25 +162,21 @@ export class WooOutlinerTreeElement extends HTMLElement {
       if (active.matches("[data-outliner-add] input[name=text]")) return "add";
       return null;
     })();
-    // Header lives OUTSIDE the ambient-companion-shell — same as
-    // pinboard / dubspace / tasks. The shell's `height: calc(100dvh - 5.25rem)`
-    // assumes ~5.25rem of chrome (top padding + tool toolbar) sits above it;
-    // if the header is inside the shell that budget is wrong and the mini-chat
-    // panel ends up floating ~3rem above the viewport bottom instead of
-    // anchoring to it like every other tool.
-    const header = `
-      <header class="outliner-header">
-        <h2>${escapeHtml(data.outlinerName)}</h2>
-        <div class="outliner-toolbar">
-          <button type="button" data-outliner-presence="${this.companionVisible ? "leave" : "enter"}">${this.companionVisible ? "Leave" : "Enter"}</button>
-          <label class="outliner-toggle">
-            <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
-            show hidden
-          </label>
-          <button type="button" data-outliner-action="undo">Undo</button>
-          <span class="outliner-focus">focus: ${escapeHtml(focusLabel)}</span>
-        </div>
-      </header>
+    // Toolbar uses the shared `.toolbar` shape — same as
+    // pinboard / dubspace / tasks. The ambient-companion-shell's height budget
+    // (calc(100dvh - 5.25rem)) is tuned to the .toolbar envelope; any bespoke
+    // header drifts the chat panel anchor, so route through renderToolFrame.
+    const toolbar = `
+      <section class="toolbar outliner-toolbar">
+        <h1>${escapeHtml(data.outlinerName)}</h1>
+        <button type="button" data-outliner-presence="${this.companionVisible ? "leave" : "enter"}">${this.companionVisible ? "Leave" : "Enter"}</button>
+        <label class="outliner-toggle">
+          <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
+          show hidden
+        </label>
+        <button type="button" data-outliner-action="undo">Undo</button>
+        <span class="outliner-focus">focus: ${escapeHtml(focusLabel)}</span>
+      </section>
     `;
     const tree = `
       <section class="outliner">
@@ -193,18 +189,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
         </ul>
       </section>
     `;
-    // Layout mirrors chat / dubspace: main content + right-side presence aside,
-    // wrapped in the ambient-companion shell (which docks the mini-chat panel
-    // beneath the split when the actor is in-room).
-    const splitInner = `
-      <section class="split split--side-fixed outliner-layout">
-        ${tree}
-        ${this.renderPresence(data)}
-      </section>
-    `;
-    this.innerHTML = this.companionVisible
-      ? `${header}${renderAmbientCompanionShell(outlinerId, `<section class="outliner-workspace has-ambient-companion" data-space-chat-layout="${escapeHtml(outlinerId)}">${splitInner}</section>`)}`
-      : `${header}<section class="outliner-workspace">${splitInner}</section>`;
+    this.innerHTML = renderToolFrame({
+      subject: outlinerId,
+      toolbar,
+      layoutClass: "outliner-layout",
+      layoutBody: `${tree}${this.renderPresence(data)}`,
+      showChat: this.companionVisible
+    });
     restoreAmbientCompanionPanel(this, preservedPanel);
     if (focusedSelector === "add") {
       const input = this.querySelector<HTMLInputElement>("[data-outliner-add] input[name=text]");
@@ -232,9 +223,9 @@ export class WooOutlinerTreeElement extends HTMLElement {
     }).join("");
     return `
       <aside class="card outliner-presence">
-        <h2>Present</h2>
+        <h2>Presence</h2>
         <div class="presence-list">
-          ${buttons || "<p>No one is in this outline.</p>"}
+          ${buttons || "<p>No one is here.</p>"}
         </div>
       </aside>
     `;

@@ -1,6 +1,6 @@
 import {
   escapeHtml,
-  renderAmbientCompanionShell,
+  renderToolFrame,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -84,63 +84,72 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
       return;
     }
     if (!data.inSpace) {
-      this.innerHTML = `
-        <section class="toolbar">
-          <h1>${escapeHtml(data.spaceName || "Dubspace")}</h1>
-          <button data-dubspace-enter ${data.canSend ? "" : "disabled"}>Enter</button>
-        </section>
-        <section class="split split--side-fixed dubspace-layout">
+      this.innerHTML = renderToolFrame({
+        subject: spaceId,
+        toolbar: `
+          <section class="toolbar dubspace-toolbar">
+            <h1>${escapeHtml(data.spaceName || "Dubspace")}</h1>
+            <button data-dubspace-enter ${data.canSend ? "" : "disabled"}>Enter</button>
+          </section>
+        `,
+        layoutClass: "dubspace-layout",
+        layoutBody: `
           <div class="card">
             <p>${escapeHtml(data.spaceDescription || "Enter the dubspace to work at the controls.")}</p>
           </div>
           ${this.renderPresence()}
-        </section>
-      `;
+        `,
+        showChat: false
+      });
       this.bind();
       return;
     }
     const delay = props(data.controls[data.delay]);
     const drum = props(data.controls[data.drum]);
     const pattern = normalizePattern(drum.pattern);
-    const workspace = `
-      <section class="split split--side-fixed dubspace-layout has-ambient-companion" data-space-chat-layout="${escapeHtml(spaceId)}">
-        <div class="dubspace-work">
-          <div class="grid">
-            <article class="card sequencer">
-              <div class="card-head">
-                <h2>Percussion</h2>
-                <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
-              </div>
-              <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(numberProp(drum.bpm, 118)))}"><span>${escapeHtml(String(numberProp(drum.bpm, 118)))}</span></label>
-              <div class="steps">
-                ${DRUM_VOICES.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
-              </div>
-            </article>
-            <article class="card loop-console-panel">
-              <div class="card-head"><h2>Loops</h2></div>
-              <div class="loop-console">${data.slots.map((id, index) => this.renderLoopStrip(id, index + 1)).join("")}${this.renderFilterStrip()}</div>
-            </article>
-            <article class="card">
-              <h2>Delay</h2>
-              ${slider(data.delay, "send", numberProp(delay.send, 0.3))}
-              ${slider(data.delay, "time", numberProp(delay.time, 0.25))}
-              ${slider(data.delay, "feedback", numberProp(delay.feedback, 0.35))}
-              ${slider(data.delay, "wet", numberProp(delay.wet, 0.4))}
-            </article>
-          </div>
-        </div>
-        ${this.renderPresence()}
-      </section>
-    `;
-    this.innerHTML = `
+    const toolbar = `
       <section class="toolbar dubspace-toolbar">
         <h1>${escapeHtml(data.spaceName || "Dubspace")}</h1>
         <button class="${data.audioOn ? "active" : ""}" data-audio aria-pressed="${data.audioOn}">Audio ${data.audioOn ? "On" : "Off"}</button>
         <button data-save-scene>Save Scene</button>
         <button data-recall-scene>Recall Scene</button>
       </section>
-      ${renderAmbientCompanionShell(spaceId, workspace)}
     `;
+    const layoutBody = `
+      <div class="dubspace-work">
+        <div class="grid">
+          <article class="card sequencer">
+            <div class="card-head">
+              <h2>Percussion</h2>
+              <button data-transport="${drum.playing ? "stop" : "start"}">${drum.playing ? "Stop" : "Start"}</button>
+            </div>
+            <label>BPM <input data-tempo type="range" min="60" max="200" step="1" value="${escapeHtml(String(numberProp(drum.bpm, 118)))}"><span>${escapeHtml(String(numberProp(drum.bpm, 118)))}</span></label>
+            <div class="steps">
+              ${DRUM_VOICES.map((voice) => renderStepRow(voice.id, voice.label, pattern[voice.id])).join("")}
+            </div>
+          </article>
+          <article class="card loop-console-panel">
+            <div class="card-head"><h2>Loops</h2></div>
+            <div class="loop-console">${data.slots.map((id, index) => this.renderLoopStrip(id, index + 1)).join("")}${this.renderFilterStrip()}</div>
+          </article>
+          <article class="card">
+            <h2>Delay</h2>
+            ${slider(data.delay, "send", numberProp(delay.send, 0.3))}
+            ${slider(data.delay, "time", numberProp(delay.time, 0.25))}
+            ${slider(data.delay, "feedback", numberProp(delay.feedback, 0.35))}
+            ${slider(data.delay, "wet", numberProp(delay.wet, 0.4))}
+          </article>
+        </div>
+      </div>
+      ${this.renderPresence()}
+    `;
+    this.innerHTML = renderToolFrame({
+      subject: spaceId,
+      toolbar,
+      layoutClass: "dubspace-layout",
+      layoutBody,
+      showChat: true
+    });
     this.bind();
   }
 

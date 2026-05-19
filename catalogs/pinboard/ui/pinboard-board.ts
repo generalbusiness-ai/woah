@@ -1,6 +1,6 @@
 import {
   escapeHtml,
-  renderAmbientCompanionShell,
+  renderToolFrame,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -111,32 +111,34 @@ export class WooPinboardBoardElement extends HTMLElement {
           : `<button data-pinboard-enter ${this.model.canSend ? "" : "disabled"}>Enter</button>`}
       </section>
     `;
-    const layout = `
-      <section class="split split--side-fixed pinboard-layout ${this.model.inBoard ? "has-ambient-companion" : ""}" data-space-chat-layout="${escapeHtml(boardId)}">
-        <div class="pinboard-work">
-          ${this.model.inBoard ? this.renderCreate() : `<div class="card pinboard-create pinboard-create-placeholder" aria-hidden="true"></div>`}
-          <div class="card pinboard-stage-panel">
-            <div class="pinboard-stage" data-pinboard-stage style="${pinboardStageStyle(width, height, this.model.view)}">
-              <div class="card card--pre pinboard-zoom-controls" aria-label="Pinboard zoom controls">
-                <button data-pinboard-zoom="out" aria-label="Zoom out">-</button>
-                <span data-pinboard-zoom-label>${Math.round(this.model.view.scale * 100)}%</span>
-                <button data-pinboard-zoom="in" aria-label="Zoom in">+</button>
-              </div>
-              <div class="pinboard-canvas" data-pinboard-canvas style="${pinboardViewStyle(this.model.view)}">
-                ${this.model.notes.map((note) => this.renderNote(note)).join("") || `<div class="pinboard-empty">${escapeHtml(this.model.inBoard ? "Add a note to start." : "Enter the pinboard to add or move notes.")}</div>`}
-              </div>
+    const layoutBody = `
+      <div class="pinboard-work">
+        ${this.model.inBoard ? this.renderCreate() : `<div class="card pinboard-create pinboard-create-placeholder" aria-hidden="true"></div>`}
+        <div class="card pinboard-stage-panel">
+          <div class="pinboard-stage" data-pinboard-stage style="${pinboardStageStyle(width, height, this.model.view)}">
+            <div class="card card--pre pinboard-zoom-controls" aria-label="Pinboard zoom controls">
+              <button data-pinboard-zoom="out" aria-label="Zoom out">-</button>
+              <span data-pinboard-zoom-label>${Math.round(this.model.view.scale * 100)}%</span>
+              <button data-pinboard-zoom="in" aria-label="Zoom in">+</button>
+            </div>
+            <div class="pinboard-canvas" data-pinboard-canvas style="${pinboardViewStyle(this.model.view)}">
+              ${this.model.notes.map((note) => this.renderNote(note)).join("") || `<div class="pinboard-empty">${escapeHtml(this.model.inBoard ? "Add a note to start." : "Enter the pinboard to add or move notes.")}</div>`}
             </div>
           </div>
         </div>
-        <aside class="card pinboard-presence">
-          <h2>Presence</h2>
-          <div data-pinboard-map-shell>${this.renderMap(width, height)}</div>
-        </aside>
-      </section>
+      </div>
+      <aside class="card pinboard-presence">
+        <h2>Presence</h2>
+        <div data-pinboard-map-shell>${this.renderMap(width, height)}</div>
+      </aside>
     `;
-    this.innerHTML = this.model.inBoard
-      ? `${toolbar}${renderAmbientCompanionShell(boardId, layout)}`
-      : `${toolbar}${layout}`;
+    this.innerHTML = renderToolFrame({
+      subject: boardId,
+      toolbar,
+      layoutClass: "pinboard-layout",
+      layoutBody,
+      showChat: this.model.inBoard
+    });
     this.bind();
   }
 

@@ -1694,43 +1694,35 @@ woo-outliner-tree {
   height: 100%;
   min-height: 0;
   display: grid;
-  /* Two rows now (add-form + rows). The header hoisted out of the shell —
-     see outliner-tree.ts render() comment — so this grid no longer owns it. */
+  /* Two rows: add-form + rows. The toolbar lives at the workspace
+     element top, outside this grid. */
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0.65rem;
   overflow: hidden;
 }
 
-.outliner-workspace {
-  min-height: 0;
-  height: 100%;
-  overflow: hidden;
-}
-
-.outliner-header {
-  display: flex;
-  gap: 0.75rem;
-  align-items: center;
-  justify-content: space-between;
-  /* The shared `.toolbar` class contributes ~3rem of chrome (min-height
-     2.125rem + 1rem margin-bottom) above the ambient-companion-shell on
-     other tools; match that envelope so the shell's calc(100dvh - 5.25rem)
-     budget lines up and the mini-chat panel anchors to the viewport bottom. */
-  min-height: 2.125rem;
-  margin-bottom: 1rem;
-}
-
-.outliner-header h2 {
-  margin: 0;
-}
-
-.outliner-toolbar,
 .outliner-add,
 .outliner-row-inner {
   display: flex;
   gap: 0.45rem;
   align-items: center;
   min-width: 0;
+}
+
+/* Toolbar inline controls. The shared .toolbar puts everything on one row
+   with `display: flex; align-items: center`. The label/span here must not
+   let their own inline content wrap — otherwise the toolbar height jumps
+   past the 2.125rem `.toolbar` envelope that .ambient-companion-shell's
+   `calc(100dvh - 5.25rem)` budget assumes, and the chat panel drifts. */
+.outliner-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.outliner-focus {
+  white-space: nowrap;
 }
 
 .outliner-add input,
@@ -2046,22 +2038,12 @@ woo-outliner-tree {
   touch-action: none;
 }
 
-.woo-tasks-workspace {
-  height: calc(100dvh - 5.25rem);
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  gap: 0.8rem;
-  overflow: hidden;
-}
-
-.woo-tasks-workspace.has-ambient-companion {
-  height: 100%;
-}
-
 /* Tasks header uses the shared `.toolbar` layout — no kanban-specific
    overrides. `.toolbar h1 { margin-right: auto }` already pushes any
-   trailing button (e.g. ⚙ Admin) to the right. */
+   trailing button (e.g. ⚙ Admin) to the right. The `.woo-tasks-workspace`
+   wrapper was deleted on 2026-05-18 when the tool-frame primitive landed;
+   `.split.has-ambient-companion` (height: 100%; min-height: 0;
+   overflow: hidden) supplies the same envelope for every tool. */
 
 .woo-tasks-status-nav,
 .woo-tasks-overview-counts {
@@ -3205,7 +3187,12 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .woo-tasks-workspace {
+  /* On mobile, let the tasks split grow and scroll naturally instead of
+     being trapped inside the clipped ambient-companion shell envelope.
+     Mirrors the .dubspace-layout / .pinboard-layout mobile relaxation. */
+  .woo-tasks-layout,
+  .woo-tasks-layout.has-ambient-companion {
+    grid-template-columns: 1fr;
     height: auto;
     overflow: visible;
   }

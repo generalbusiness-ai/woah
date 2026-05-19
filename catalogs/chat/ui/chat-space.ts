@@ -113,9 +113,9 @@ export class WooChatSpaceElement extends HTMLElement {
           </form>
         </div>
         <aside class="card chat-presence">
-          <h2>Present</h2>
+          <h2>Presence</h2>
           <div class="presence-list">
-            ${this.model.present.map((id) => `<button data-chat-recipient="${escapeHtml(id)}">${escapeHtml(this.actorLabel(id))}<span>${escapeHtml(id)}</span></button>`).join("") || "<p>No actors present.</p>"}
+            ${this.model.present.map((id) => `<button data-chat-recipient="${escapeHtml(id)}">${escapeHtml(this.actorLabel(id))}<span>${escapeHtml(id)}</span></button>`).join("") || "<p>No one is here.</p>"}
           </div>
         </aside>
       </section>
