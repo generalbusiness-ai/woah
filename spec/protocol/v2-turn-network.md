@@ -1284,6 +1284,17 @@ commit scope: validate, rerun or receipt-check, then accept/conflict
 worker -> UI: confirm, rollback, rebase, or retry
 ```
 
+For live/direct turns, a locally executed transcript may produce an optimistic
+`turn_result` for immediate UI feedback, but that result is not canonical unless
+the verb is explicitly marked safe for local-only finalization. Catalog verbs
+that return canonical lists of durable objects, such as board or outline item
+hydration reads, MUST be confirmed by an authoritative relay response before the
+UI treats their result as a replacement for existing canonical state. The
+current implementation has no local-only finalization opt-ins: successful local
+live reads are emitted only as optimistic results, then the worker sends the
+browser-built `TurnExecRequest` and publishes the relay reply as the final
+result.
+
 The browser may send `woo.turn.intent.request.v1` only for live turns or for a
 cold durable delegation that names a selected scope-level `ExecCapabilityAd`.
 It MUST NOT submit an unselected durable intent as a silent server-assisted

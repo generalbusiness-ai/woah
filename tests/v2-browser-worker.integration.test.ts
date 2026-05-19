@@ -13,7 +13,7 @@ import {
 } from "../src/core/shadow-browser-node";
 import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import type { ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
+import { createShadowCommitScope, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
 
 describe("v2 browser worker integration", () => {
   afterEach(() => {
@@ -289,7 +289,7 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "outline-add-journal"));
   });
 
-  it("satisfies read-only live turns from the local tentative view without relay traffic", async () => {
+  it("routes read-only live turns to authority before publishing a canonical result", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
     vi.stubGlobal("self", scope);
@@ -332,6 +332,33 @@ describe("v2 browser worker integration", () => {
     socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-live-read", opened.executable_transfer.kind, opened.executable_transfer)));
     socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-live-read", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
 
+    // The browser's executable seed was opened from the empty board above.
+    // Advance authority afterwards so a local-only list would incorrectly
+    // finalize as empty, while the relay can return the durable note.
+    const authoritativeText = "authority-only pinboard note";
+    const entered = await world.call("seed-live-read-enter", session.id, "the_pinboard", {
+      actor: session.actor,
+      target: "the_pinboard",
+      verb: "enter",
+      args: []
+    });
+    expect(entered.op).toBe("applied");
+    const added = await world.call("seed-live-read-note", session.id, "the_pinboard", {
+      actor: session.actor,
+      target: "the_pinboard",
+      verb: "add_note",
+      args: [authoritativeText, "yellow", 48, 48, 180, 110]
+    });
+    expect(added.op).toBe("applied");
+    relay.commit_scope = createShadowCommitScope({
+      node: relay.node,
+      scope: "the_pinboard",
+      serialized: world.exportWorld()
+    });
+    relay.executors.length = 0;
+    relay.live_session_serialized.clear();
+    relay.serialized_generation++;
+
     scope.dispatch({
       kind: "call",
       id: "pinboard-enter-before-local-list",
@@ -347,7 +374,7 @@ describe("v2 browser worker integration", () => {
 
     scope.dispatch({
       kind: "call",
-      id: "pinboard-local-list",
+      id: "pinboard-authority-list",
       route: "direct",
       scope: "the_pinboard",
       target: "the_pinboard",
@@ -356,19 +383,42 @@ describe("v2 browser worker integration", () => {
       persistence: "live"
     });
 
-    const result = await waitForMessage(posted, (message) => {
+    const listRequest = await waitForBrowserBuiltExecRequest(browser, socket, "list_notes");
+    expect(socket.sent.length).toBeGreaterThan(sentAfterEnter);
+    expect(listRequest).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
+      body: { persistence: "live", call: { verb: "list_notes" } }
+    });
+    const optimisticResult = await waitForMessage(posted, (message) => {
       return isKind(message, "turn_result") &&
-        (message as { frame?: { id?: unknown } }).frame?.id === "pinboard-local-list";
+        (message as { frame?: { id?: unknown } }).frame?.id === "pinboard-authority-list" &&
+        (message as { optimistic?: unknown }).optimistic === true;
     });
-    expect(result).toMatchObject({
+    expect(optimisticResult).toMatchObject({
       kind: "turn_result",
-      frame: { op: "result", id: "pinboard-local-list", result: [] }
+      frame: { op: "result", id: "pinboard-authority-list", result: [] },
+      optimistic: true
     });
-    expect((result as { optimistic?: unknown }).optimistic).toBeUndefined();
-    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-local-list"))).toMatchObject({
-      local_only: true
+    const planned = await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-authority-list"));
+    expect(planned).toMatchObject({ result_known: true });
+    expect((planned as { local_only?: unknown }).local_only).toBeUndefined();
+
+    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(listRequest))));
+    const authoritativeResult = await waitForMessage(posted, (message) => {
+      if (!isKind(message, "turn_result")) return false;
+      const candidate = message as { optimistic?: unknown; frame?: { id?: unknown; result?: unknown } };
+      return candidate.optimistic !== true &&
+        candidate.frame?.id === "pinboard-authority-list" &&
+        JSON.stringify(candidate.frame.result).includes(authoritativeText);
     });
-    expect(socket.sent).toHaveLength(sentAfterEnter);
+    expect(authoritativeResult).toMatchObject({
+      kind: "turn_result",
+      frame: {
+        op: "result",
+        id: "pinboard-authority-list",
+        result: [expect.objectContaining({ text: authoritativeText })]
+      }
+    });
   });
 
   it("keeps the verified executable seed across a full projection overlay reset", async () => {

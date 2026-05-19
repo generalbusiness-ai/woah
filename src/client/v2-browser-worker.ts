@@ -564,18 +564,6 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     });
     return false;
   }
-  if (persistence === "live" && isLocallyFinalLiveResult(local)) {
-    postMessage({ kind: "turn_result", frame: local.optimistic_frame });
-    postMessage({
-      kind: "local_turn_planned",
-      ...turnDiagnostic(command, persistence),
-      transcript_hash: local.transcript_hash,
-      observation_count: local.observation_count,
-      result_known: local.result_known,
-      local_only: true
-    });
-    return true;
-  }
   if (persistence === "durable") {
     await putTentativeTurn(v2BrowserTentativeTurnRecord({
       id: command.id,
@@ -598,17 +586,6 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     result_known: local.result_known
   });
   return true;
-}
-
-function isLocallyFinalLiveResult(local: Extract<V2BrowserLocalTurnResult, { ok: true }>): boolean {
-  const transcript = local.transcript;
-  return local.result_known &&
-    transcript.writes.length === 0 &&
-    transcript.creates.length === 0 &&
-    transcript.moves.length === 0 &&
-    transcript.observations.length === 0 &&
-    transcript.logicalInputs.length === 0 &&
-    transcript.untrackedEffects.length === 0;
 }
 
 async function repairLocalExecutableState(
