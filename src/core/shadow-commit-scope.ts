@@ -908,17 +908,9 @@ function setSerializedPropertyVersion(target: SerializedObject, name: string, ve
 }
 
 function addUniqueObjectRef(list: ObjRef[] | undefined, id: ObjRef): void {
-  if (!list) return;
-  let low = 0;
-  let high = list.length;
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    const current = list[mid]!;
-    if (current === id) return;
-    if (current < id) low = mid + 1;
-    else high = mid;
-  }
-  list.splice(low, 0, id);
+  if (!list || list.includes(id)) return;
+  list.push(id);
+  list.sort();
 }
 
 export function nextObjectCounterForCreates(current: number, creates: TranscriptCreate[]): number {
