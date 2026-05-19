@@ -172,4 +172,4 @@ Loose docs alongside the spec layers and bundled catalogs:
 - Catalog-owned design docs for bundled catalogs (see [spec/discovery/catalogs.md §CT15](spec/discovery/catalogs.md#ct15-bundled-catalogs-in-this-repo) for the role of each):
   - **Foundational utilities** — [help](catalogs/help/DESIGN.md), [chat](catalogs/chat/DESIGN.md), [note](catalogs/note/DESIGN.md), [prog](catalogs/prog/DESIGN.md).
   - **Demo seed** — [demoworld](catalogs/demoworld/DESIGN.md).
-  - **Demo applications** — [dubspace](catalogs/dubspace/DESIGN.md), [tasks](catalogs/tasks/DESIGN.md), [pinboard](catalogs/pinboard/DESIGN.md).
+  - **Demo applications** — [dubspace](catalogs/dubspace/DESIGN.md), [tasks](catalogs/tasks/DESIGN.md), [pinboard](catalogs/pinboard/DESIGN.md), [outliner](catalogs/outliner/DESIGN.md).

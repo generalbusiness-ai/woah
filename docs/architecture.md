@@ -9,6 +9,7 @@ a sketch, not the canonical reference — for normative behavior, see
 flowchart TD
     subgraph Clients
         Browser["Browser SPA<br/>(src/client)"]
+        BrowserWorker["v2 browser worker<br/>local VM + IndexedDB cache"]
         Agent["LLM agent<br/>(MCP)"]
         Curl["REST / scripts"]
     end
@@ -37,8 +38,9 @@ flowchart TD
         DO["Cloudflare DOs<br/>(persistent-object, directory, commit-scope)"]
     end
 
-    Browser -->|WS / REST| Worker
-    Browser -->|WS / REST| Dev
+    Browser --> BrowserWorker
+    BrowserWorker -->|v2 WS / REST| Worker
+    BrowserWorker -->|v2 WS / REST| Dev
     Agent -->|stdio / HTTP| MCP
     Curl -->|HTTPS| Worker
     Curl -->|HTTP| Dev
@@ -54,14 +56,18 @@ flowchart TD
     World -. seeded by .-> Seed
     World -->|read / commit| Store
 
-    Gateway -. "observations (audience fan-out)" .-> Browser
+    Gateway -. "accepted frames / live observations" .-> BrowserWorker
+    BrowserWorker -. "projection + optimistic state" .-> Browser
     Gateway -. observations .-> Agent
 ```
 
 ## How to read it
 
 **Clients** are anything that originates a call: a person in a browser,
-an LLM agent speaking MCP, or a script hitting REST.
+an LLM agent speaking MCP, or a script hitting REST. The browser path is
+not just a renderer: the v2 worker keeps an IndexedDB execution cache,
+can execute deterministic turns locally for optimistic UI, and then
+confirms sequencing through the authoritative network path.
 
 **Transport edge.** Three edges accept calls and produce observations.
 The Cloudflare Worker is the production deployment. The dev server is
@@ -72,13 +78,13 @@ three converge on the same gateway — the difference is wire format,
 not semantics.
 
 **Substrate (`src/core`).** Catalog-agnostic. The turn gateway is the
-single funnel for verb calls — once a call reaches it, the rest of the
-path is the same regardless of how it arrived. The `World` owns
-objects and the audience/move chains; the `Tiny VM` executes verb
-bytecode compiled from the Woo DSL; native primitives are the small
-set of functions the DSL invokes for things it cannot express. The
-seed graph is the minimal object set delivered before any catalog
-installs.
+authoritative funnel for network-submitted verb calls. Browser workers
+may run the same deterministic turn locally first, but accepted durable
+state still comes from the commit scope's sequencing and validation. The
+`World` owns objects and the audience/move chains; the `Tiny VM` executes
+verb bytecode compiled from the Woo DSL; native primitives are the small
+set of functions the DSL invokes for things it cannot express. The seed
+graph is the minimal object set delivered before any catalog installs.
 
 **Superstructure (`catalogs/`).** All user-visible behavior lives here
 as woocode — classes, verbs, properties, schemas, seed_hooks — declared
@@ -93,9 +99,12 @@ self-contained deployments), or Cloudflare Durable Objects
 `commit-scope` classes). The gateway and substrate above are the same
 code in all three modes.
 
-**Observations** are the return path. The gateway fans them out to the
-audience the call computed (typically the actor and others in the same
-space) over whichever transport each recipient is on.
+**Observations** are the return path. The gateway fans accepted frames
+and live observations out to the audience the call computed (typically
+the actor and others in the same space) over whichever transport each
+recipient is on. Browser workers reduce those frames into projection
+state and reconcile any local optimistic layer they produced before the
+authoritative frame arrived.
 
 ## Where to dig deeper
 

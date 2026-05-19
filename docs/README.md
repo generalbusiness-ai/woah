@@ -60,7 +60,9 @@ docs/
 - `obj:verb(args)` — a verb call, the way woocode itself talks. The
   same call goes over MCP as `woo_call("obj", "verb", [args])`, over
   REST as `POST /api/objects/obj/calls/verb`, and from the browser as a
-  v2 turn-network intent.
+  v2 turn-network call. When the browser worker has verified executable
+  state, it runs the turn locally for optimistic UI and then confirms
+  the sequence authoritatively through the network.
 - `;expr` — programmer-only inline eval (`$programmer:eval(expr)`,
   expression mode). `;;stmts` is the statement-block form. Don't
   type the leading `;` in ordinary command input. See

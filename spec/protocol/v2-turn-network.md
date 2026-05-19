@@ -1187,10 +1187,11 @@ rights:
 | Store | Contents | May drive VM reads? | May overwrite UI projection? | Authority |
 |---|---|---:|---:|---|
 | `meta` | node id, session, current scope, scope heads, cache epoch | No | No | relay/session claims |
-| `pending` | outbound envelopes and optimistic turn records | No | Only through optimistic layer | browser-local |
+| `pending` | outbound envelopes retained for idempotent reconnect/retry | No | No | browser-local |
 | `projections` | `woo.scope_projection.v1` rows and patches | No | Yes, for the named scope/head | state authority proof |
 | `applied_frames` | accepted commit frames by `(scope, seq)` | No | Yes, via reducer | commit receipt |
 | `transcript_tail` | recent accepted transcripts | Only after page verification | Indirectly | commit receipt |
+| `tentative_turns` | pending local committed transcripts with base head, actor/session, and transcript hash | Yes, as an overlay for later local plans | Only through optimistic layer | browser-local until accepted |
 | `execution_checkpoints` | per-scope materialized executable snapshots through an accepted seq | Yes, as a replay base | No | derived from state proofs and commit receipts |
 | `object_pages` | verified object-record pages | Yes | No | state proof |
 | `state_pages` | verified cell/bytecode/metadata pages | Yes | No | state proof |
@@ -1245,6 +1246,12 @@ projection/open fallback is a new authoritative snapshot boundary and MUST
 discard the prior checkpoint and committed transcript tail for that scope.
 Implementations SHOULD expose compose-view timing and replay counts so local
 execution cost regressions are visible before they become user-visible.
+
+The current browser worker checkpoints a scope after a bounded batch of accepted
+transcripts, stores the checkpointed serialized execution view and transfer
+high-watermark, then prunes transcript-tail rows whose accepted sequence is
+covered by the checkpoint. This keeps each later local plan from replaying an
+unbounded commit history.
 
 The browser execution node has narrow authority:
 
@@ -1383,6 +1390,43 @@ accepted frame confirms, invalidates, or is independent of each optimistic turn:
 turn id, base head, predicted atoms, read cells, write cells, transcript hash,
 and UI patch id.
 
+#### VTN14.5.1 Phase 1 tentative journal
+
+The current browser worker implements the dependency-chain model locally before
+wire-level dependency metadata exists. For each durable local transcript it
+stores a `tentative_turns` row keyed by turn id and scoped by actor/session. A
+later local plan materializes:
+
+```text
+verified executable seed or checkpoint
++ executable transfers newer than the checkpoint
++ accepted transcripts newer than the checkpoint
++ pending tentative transcripts for the same actor/session/scope
+```
+
+This means a same-actor chain such as `enter` followed immediately by
+`add_note` or `add` can execute locally against the tentative post-state of
+`enter` without waiting for the authoritative `enter` frame. The authoritative
+network still sequences both turns; the journal is a local composed read view,
+not a commit authority.
+
+When the authoritative reply accepts a turn, the browser removes the matching
+tentative row by turn id or transcript hash, stores the accepted frame and
+accepted transcript, and lets future plans compose from the committed tail or a
+new checkpoint. A `stale_head` conflict is a convergence signal and MUST NOT
+invalidate the tentative row by itself; an authoritative executor may re-run the
+turn against the newer head, while a non-authoritative delegated executor may
+surface the conflict for a later browser re-plan.
+
+Permanent conflicts are narrower in Phase 1 than in the final dependency-wire
+model. Because `depends_on` is not yet carried on the wire, the server treats
+later locally planned turns as independent submissions. The browser therefore
+invalidates only the directly rejected tentative turn and reports
+`E_V2_TENTATIVE_INVALIDATED` to the optimistic UI. Cascading invalidation or
+automatic downstream replay is reserved for the dependency metadata milestone;
+failing an entire local suffix before the server understands that suffix as a
+dependency chain would create client/server divergence.
+
 ### VTN14.6 Reconnect and cold-open behavior
 
 On startup or reconnect, the worker posts cached projection to the UI only as
@@ -1518,6 +1562,25 @@ and projection hydration are direct live-persistence calls; they MUST NOT carry
 durable writes. Pinboard embedded chat uses the catalog `command_plan` verb over
 v2 so aliases and object matching remain catalog-owned.
 
+Browser-node outliner flow:
+
+```text
+UI -> worker: TurnIntent(route=sequenced, enter())
+commit scope -> browser: AppliedFrame(outliner_entered)
+UI -> worker: TurnIntent(route=sequenced, add/add_item/hide/move_item/...)
+commit scope -> browser: AppliedFrame(outline_item_added/outline_item_hidden/...)
+UI selection/collapse/create-in-place state remains browser-local
+```
+
+Outliner items are durable first-class objects under the `$outliner` scope.
+Server-side focus remains a catalog feature for chat and agent workflows, but
+the browser UI's selected row is local-only: clicking a row selects it without a
+network call, and create-in-place passes the selected parent id explicitly to
+`add_item`. The browser worker must therefore support the same same-actor
+dependency chain as pinboard: `enter` can be tentative while `add` or
+`add_item` plans against the local journal, then both turns reconcile against
+authoritative accepted frames.
+
 Browser-node chat flow:
 
 ```text
@@ -1557,17 +1620,31 @@ scenarios for the existing bundled workloads.
 - board mini-chat remains live-only unless a durable chat feature is installed;
 - large boards can be opened through projection before full closure transfer.
 
-Prototype status: browser-shim coverage currently commits pinboard
+### Outliner
+
+- outline rows are first-class `$outline_item` objects contained by an
+  `$outliner`;
+- entering the outliner, adding items, editing text, hiding/unhiding, moving,
+  reordering, removing, and undoing are committed turns;
+- row selection, collapse state, and create-in-place editor state are
+  browser-local affordances and do not update server-side focus;
+- server-side focus remains available for chat/MCP commands and ordinary
+  `add <text>` workflows;
+- a fresh open or reload must reconstruct the item tree from durable contents
+  and item properties, not from a stale projection-only cache.
+
+Prototype status: current in-process and browser-worker coverage commits pinboard
 `add_note`, `move_pin`, `resize_pin`, pin `set_color`, `set_text`, `take`,
-and `drop`, plus taskspace `create_task`, task `claim`, and task
-`set_status`. Same-turn object creation is validated against transcript
-create/write facts rather than the pre-turn world. Deterministic native helpers
-are admitted only when a `woo.native_primitive_contract.v1` contract
-declares the handler transcript-tracked and deterministic, including the state
-families it reads, writes, and emits. Native dispatches without such a contract
-make the transcript incomplete. Runtime cross-host bridge boundaries are also
-explicitly incomplete in the v2 protocol; mergeable remote sub-transcripts are
-deferred until the execution plane exists.
+and `drop`, outliner `enter` and `add`/`add_item`, plus taskspace
+`create_task`, task `claim`, and task `set_status`. Same-turn object creation
+is validated against transcript create/write facts rather than the pre-turn
+world. Deterministic native helpers are admitted only when a
+`woo.native_primitive_contract.v1` contract declares the handler
+transcript-tracked and deterministic, including the state families it reads,
+writes, and emits. Native dispatches without such a contract make the
+transcript incomplete. Runtime cross-host bridge boundaries are also explicitly
+incomplete in the v2 protocol; mergeable remote sub-transcripts are deferred
+until the execution plane exists.
 
 ### Dubspace
 

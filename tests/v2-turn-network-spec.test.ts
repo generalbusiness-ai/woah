@@ -24,6 +24,7 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("### VTN14.3 Optimistic local turn flow");
     expect(spec).toContain("### VTN14.4 Missing-state repair");
     expect(spec).toContain("### VTN14.5 Optimistic UI and reconciliation");
+    expect(spec).toContain("#### VTN14.5.1 Phase 1 tentative journal");
     expect(spec).toContain("### VTN14.7 Completion test gates");
     expect(spec).toContain("## VTN16. Completion milestones");
     expect(spec).toContain("rank gossiped ExecCapabilityAds and delegate the whole turn");
@@ -38,5 +39,9 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("submit browser-built");
     expect(spec).toContain("If repair succeeds, the worker retries local");
     expect(spec).toContain("MUST NOT release queued durable turns until the");
+    expect(spec).toContain("can execute locally against the tentative post-state");
+    expect(spec).toContain("invalidates only the directly rejected tentative turn");
+    expect(spec).toContain("### Outliner");
+    expect(spec).toContain("row selection, collapse state, and create-in-place editor state are");
   });
 });

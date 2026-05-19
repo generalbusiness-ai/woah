@@ -385,10 +385,9 @@ export class WooOutlinerTreeElement extends HTMLElement {
     `;
   }
 
-  // Pseudo-row rendered directly below the focus row when addingChild is
-  // true. The submit handler reads `add` (which defaults parent to the
-  // actor's focus on the server), so we don't need to thread the parent id
-  // through the form.
+  // Pseudo-row rendered directly below the selected row when addingChild is
+  // true. The submit handler calls `add_item(text, selectedId)` explicitly, so
+  // this browser-local selection never depends on server-side focus.
   private renderAddChildRow(depth: number, value: string): string {
     const indent = depth * 20;
     return `
