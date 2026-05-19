@@ -20,7 +20,9 @@ import {
 } from "./shadow-turn-call";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import {
+  shadowCommitScopeObject,
   submitShadowCommit,
+  transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
   type ShadowCommitAcceptedWire,
   type ShadowCommitConflict,
@@ -34,7 +36,6 @@ import type { WooWorld } from "./world";
 import {
   cacheShadowStatePages,
   mergeShadowStatePagesIntoSerialized,
-  serializedStatePageHashes,
   shadowObjectLineagePage,
   shadowObjectLivePage,
   shadowPropertyCellPage,
@@ -254,11 +255,21 @@ export function createShadowExecutionNode(input: {
   serialized?: SerializedWorld;
   authoritative_state?: boolean;
 }): ShadowExecutionNode {
-  let serialized = input.serialized ? structuredClone(input.serialized) as SerializedWorld : undefined;
+  const authoritativeSerialized = input.authoritative_state === true && input.serialized !== undefined;
+  // Authoritative relay executors already share the commit-scope state. Cloning
+  // and hashing every object at construction only duplicates the authority's
+  // resident state and puts full-world work back on the first user turn.
+  let serialized = input.serialized
+    ? authoritativeSerialized
+      ? input.serialized
+      : structuredClone(input.serialized) as SerializedWorld
+    : undefined;
   const objectCache = new Map<string, SerializedObject>();
-  for (const obj of serialized?.objects ?? []) cacheShadowObjectRecord(objectCache, obj);
   const pageCache = new Map<string, ShadowStatePage>();
-  for (const obj of serialized?.objects ?? []) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
+  if (!authoritativeSerialized) {
+    for (const obj of serialized?.objects ?? []) cacheShadowObjectRecord(objectCache, obj);
+    for (const obj of serialized?.objects ?? []) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
+  }
   const cachedObjects = input.cached_objects ?? [];
   for (const obj of cachedObjects) cacheShadowObjectRecord(objectCache, obj);
   for (const obj of cachedObjects) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
@@ -280,10 +291,8 @@ export function createShadowExecutionNode(input: {
 }
 
 export function installShadowCachedObjectRecords(node: ShadowExecutionNode, objects: SerializedObject[]): void {
-  for (const obj of objects) cacheShadowObjectRecord(node.object_cache, obj);
-  for (const obj of objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
+  for (const obj of objects) cacheShadowMaterializedObject(node, obj);
   if (objects.length > 0) node.serialized = mergeCachedObjectRecords(node.serialized, objects);
-  refreshNodeObjectHashes(node);
 }
 
 export function missingAtomsForShadowTurn(node: ShadowExecutionNode, key: ShadowTurnKey): ShadowMissingAtom[] {
@@ -433,9 +442,7 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
   if (transfer.mode === "closure") {
     node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
     node.world = undefined;
-    for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
-    for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
-    refreshNodeObjectHashes(node);
+    for (const obj of node.serialized.objects) cacheShadowMaterializedObject(node, obj);
     return;
   }
   if (transfer.mode === "cell_pages") {
@@ -444,16 +451,14 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     // WooWorld was built from the old cell versions, so replay must rebuild
     // before recording the retry transcript.
     node.world = undefined;
-    for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
-    for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
-    refreshNodeObjectHashes(node);
+    for (const ref of transfer.page_refs) node.page_hashes.add(ref.hash);
+    cacheShadowObjectsById(node, new Set(transfer.page_refs.map((ref) => ref.object)));
     return;
   }
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
   node.world = undefined;
-  for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
-  for (const obj of node.serialized.objects) cacheShadowStatePages(node.page_cache, shadowStatePagesForObject(obj));
-  refreshNodeObjectHashes(node);
+  for (const page of transfer.object_pages) node.object_hashes.add(page.hash);
+  cacheShadowObjectsById(node, new Set(transfer.object_pages.map((page) => page.id)));
 }
 
 export async function executeShadowRecordedTurnOrNeedState(
@@ -486,10 +491,9 @@ export async function executeShadowRecordedTurnOrNeedState(
     };
   }
 
-  node.serialized = structuredClone(replay.serializedAfter) as SerializedWorld;
+  node.serialized = replay.serializedAfter;
   for (const hash of key.atom_hashes) node.atom_hashes.add(hash);
-  for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
-  refreshNodeObjectHashes(node);
+  cacheShadowTranscriptObjects(node, transcript);
   return {
     ok: true,
     attempted: true,
@@ -497,6 +501,100 @@ export async function executeShadowRecordedTurnOrNeedState(
     transcript,
     receipt,
     serializedAfter: replay.serializedAfter
+  };
+}
+
+export async function executeAuthoritativeShadowTurnCall(
+  node: ShadowExecutionNode,
+  input: {
+    id?: string;
+    call: ShadowTurnCall;
+    expected?: ShadowScopeHead;
+    persistence?: "durable" | "live";
+    commitScope: ShadowCommitScope;
+  } & ShadowTurnExecutionOptions
+): Promise<ShadowTurnExecutionResult> {
+  if (node.authoritative_state !== true || !node.serialized) {
+    throw new Error(`authoritative shadow fast path requires full authoritative state: ${node.node}`);
+  }
+  if (node.scope !== input.call.scope) {
+    throw new Error(`authoritative shadow fast path scope mismatch: node=${node.scope} call=${input.call.scope}`);
+  }
+  if (input.persistence === "live") {
+    throw new Error("authoritative shadow fast path is durable-only; live intents use the live snapshot path");
+  }
+
+  const world = shadowExecutionWorld(node);
+  let run: ShadowTurnCallTranscriptRun;
+  try {
+    // The authoritative relay owns all cells for the scope, so it can execute an
+    // intent once and use the resulting transcript as the commit contract. This
+    // removes the old plan-then-execute double VM run for server-assisted turns.
+    run = await runShadowTurnCallOnWorldTranscript(world, input.call, { onMetric: input.metric });
+  } catch (err) {
+    node.world = undefined;
+    throw err;
+  }
+
+  const key = shadowTurnKeyFromTranscript(run.transcript);
+  const request: ShadowTurnExecRequest = {
+    kind: "woo.turn.exec.request.shadow.v1",
+    id: input.id ?? input.call.id,
+    call: input.call,
+    key,
+    expected: input.expected ?? input.commitScope.head,
+    persistence: "durable"
+  };
+  const commit = submitShadowCommit(input.commitScope, {
+    kind: "woo.commit.submit.shadow.v1",
+    id: request.id ?? input.call.id,
+    scope: input.call.scope,
+    expected: request.expected ?? input.commitScope.head,
+    transcript: run.transcript,
+    executor: node.node,
+    profile: input.profile,
+    metric: input.metric
+  });
+  const receipt = commit.receipt;
+  if (!receipt.accepted) {
+    node.world = undefined;
+    const conflict = commit.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
+    if (typeof console !== "undefined") {
+      console.log("woo.commit_rejected.errors", JSON.stringify({
+        scope: run.transcript.scope,
+        verb: run.transcript.call?.verb,
+        target: run.transcript.call?.target,
+        actor: run.transcript.call?.actor,
+        errors: receipt.errors
+      }));
+    }
+    return {
+      ok: false,
+      reason: "commit_rejected",
+      attempted: true,
+      frame: run.frame,
+      transcript: run.transcript,
+      receipt,
+      commit: conflict,
+      reply: commitRejectedReply(request, run.transcript, conflict)
+    };
+  }
+  if (commit.kind !== "woo.commit.accepted.shadow.v1") {
+    throw new Error("accepted authoritative shadow commit returned a conflict result");
+  }
+
+  node.serialized = input.commitScope.serialized;
+  for (const hash of key.atom_hashes) node.atom_hashes.add(hash);
+  cacheShadowTranscriptObjects(node, run.transcript, input.commitScope);
+  return {
+    ok: true,
+    attempted: true,
+    frame: run.frame,
+    transcript: run.transcript,
+    receipt,
+    commit,
+    serializedAfter: input.commitScope.serialized,
+    reply: successReply(request, run.transcript, commit)
   };
 }
 
@@ -547,7 +645,10 @@ export async function executeShadowTurnCallOrNeedState(
   const commitScopeExecution = !!options.commitScope && request.persistence !== "live";
   let run: ShadowTurnCallRun | ShadowTurnCallTranscriptRun;
   try {
-    const runOptions = skipAtomChecks ? {} : { allowed_atom_hashes: node.atom_hashes };
+    const runOptions = {
+      ...(skipAtomChecks ? {} : { allowed_atom_hashes: node.atom_hashes }),
+      ...(options.metric ? { onMetric: options.metric } : {})
+    };
     // With a durable commit scope, the transcript is the contract and the
     // commit scope owns authoritative post-state construction.
     run = commitScopeExecution
@@ -638,7 +739,7 @@ export async function executeShadowTurnCallOrNeedState(
     : livePersistence
       ? serializedBefore
       : requireSerializedAfter(run);
-  node.serialized = structuredClone(serializedAfter) as SerializedWorld;
+  node.serialized = serializedAfter;
   // Live-persistence turns are live/direct observations, not authority-bearing
   // state transitions. Keep their reply transcript, but discard the executor's
   // speculative world so the next durable turn plans against the commit scope.
@@ -649,8 +750,7 @@ export async function executeShadowTurnCallOrNeedState(
   // inspects the node after the turn.
   const acceptedKey = shadowTurnKeyFromTranscript(run.transcript);
   for (const hash of acceptedKey.atom_hashes) node.atom_hashes.add(hash);
-  for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
-  refreshNodeObjectHashes(node);
+  if (!livePersistence) cacheShadowTranscriptObjects(node, run.transcript, options.commitScope);
   return {
     ok: true,
     attempted: true,
@@ -813,19 +913,49 @@ function shadowTransferSignature(root: string, secret: string): string {
   return hashSource(`shadow.anchor_mac.v1:${secret}:${root}`);
 }
 
-function serializedObjectHashes(serialized: SerializedWorld | undefined): string[] {
-  return serialized?.objects.map((obj) => shadowObjectRecordHash(obj)) ?? [];
+function cacheShadowTranscriptObjects(
+  node: ShadowExecutionNode,
+  transcript: EffectTranscript,
+  commitScope?: ShadowCommitScope
+): void {
+  cacheShadowObjectsById(node, transcriptMaterializedObjectIds(transcript), commitScope);
 }
 
-function refreshNodeObjectHashes(node: ShadowExecutionNode): void {
-  node.object_hashes = new Set([
-    ...serializedObjectHashes(node.serialized),
-    ...node.object_cache.keys()
-  ]);
-  node.page_hashes = new Set([
-    ...serializedStatePageHashes(node.serialized),
-    ...node.page_cache.keys()
-  ]);
+function transcriptMaterializedObjectIds(transcript: EffectTranscript): Set<ObjRef> {
+  const ids = transcriptTouchedObjectIds(transcript);
+  for (const move of transcript.moves) {
+    ids.add(move.object);
+    if (move.from) ids.add(move.from);
+    ids.add(move.to);
+  }
+  return ids;
+}
+
+function cacheShadowObjectsById(
+  node: ShadowExecutionNode,
+  ids: Iterable<ObjRef>,
+  commitScope?: ShadowCommitScope
+): void {
+  const byId = commitScope
+    ? undefined
+    : node.serialized
+      ? new Map(node.serialized.objects.map((obj) => [obj.id, obj] as const))
+      : undefined;
+  for (const id of ids) {
+    const obj = commitScope ? shadowCommitScopeObject(commitScope, id) : byId?.get(id);
+    if (obj) cacheShadowMaterializedObject(node, obj);
+  }
+}
+
+function cacheShadowMaterializedObject(node: ShadowExecutionNode, obj: SerializedObject): void {
+  const objectHash = shadowObjectRecordHash(obj);
+  node.object_hashes.add(objectHash);
+  node.object_cache.set(objectHash, structuredClone(obj) as SerializedObject);
+  for (const page of shadowStatePagesForObject(obj)) {
+    const pageHash = shadowStatePageHash(page);
+    node.page_hashes.add(pageHash);
+    node.page_cache.set(pageHash, structuredClone(page) as ShadowStatePage);
+  }
 }
 
 function cacheShadowObjectRecord(cache: Map<string, SerializedObject>, obj: SerializedObject): void {

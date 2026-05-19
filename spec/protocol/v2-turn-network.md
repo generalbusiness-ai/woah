@@ -119,6 +119,13 @@ A `ScopeHead` names a commit-scope epoch and the last accepted transcript in
 that epoch. Epochs fence sequencer/commit-scope migration. Messages that carry
 an epoch MUST be rejected if the receiver knows that epoch is stale.
 
+The initial head for an epoch MAY include a full-state digest, but an accepted
+commit position is a chain position, not a request to rehash the whole serialized
+world. Its `hash` MUST change with the prior head, `seq`, accepted transcript,
+and accepted `post_state_hash`; implementations SHOULD derive it from those
+commit-position inputs so ordinary turns remain proportional to the touched
+state, not to total world size.
+
 `ScopeRef` is a v2 protocol identifier. An implementation may store the scope
 as the existing `ObjRef` directly while local storage is being migrated, with
 `scope:<objRef>` as the canonical wire spelling. This is a storage shortcut, not

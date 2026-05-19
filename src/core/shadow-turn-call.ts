@@ -54,7 +54,7 @@ export async function runShadowTurnCall(
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
   const world = createWorldFromSerialized(serializedBefore, { persist: false });
-  if (options.onMetric) world.setMetricsHook(options.onMetric);
+  world.setMetricsHook(options.onMetric ?? null);
   return await runShadowTurnCallOnWorld(world, call, options);
 }
 
@@ -88,6 +88,7 @@ export async function runShadowTurnCallOnWorldTranscript(
   call: ShadowTurnCall,
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallTranscriptRun> {
+  if (options.onMetric) world.setMetricsHook(options.onMetric);
   const recorder = new InMemoryTurnRecorder();
   world.setTurnRecorder(options.allowed_atom_hashes
     ? new ShadowStateGuardTurnRecorder(recorder, new Set(options.allowed_atom_hashes))

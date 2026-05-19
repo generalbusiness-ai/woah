@@ -9,12 +9,13 @@ import {
   buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   createShadowExecutionNode,
+  executeAuthoritativeShadowTurnCall,
   executeShadowRecordedTurnOrNeedState,
   executeShadowTurnCallOrNeedState,
   installShadowStateTransfer,
   missingAtomsForShadowTurn
 } from "../src/core/shadow-turn-exec";
-import { shadowStatePageHash } from "../src/core/shadow-state-pages";
+import { shadowObjectLivePage, shadowStatePageHash } from "../src/core/shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
@@ -421,6 +422,124 @@ describe("shadow turn execution", () => {
     expect(createWorldFromSerialized(staleNode.serialized!, { persist: false }).getProp("delay_1", "wet")).not.toBe(0.65);
   });
 
+  it("runs authoritative relay intents against one VM pass and rejects stale expected heads", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-authoritative-stale");
+    const actor = session.actor;
+    await anchor.directCall("shadow-authoritative-stale-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    anchor.setProp("the_dubspace", "operators", [actor]);
+
+    const serializedBefore = anchor.exportWorld();
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const initialHead = structuredClone(commitScope.head);
+    const acceptedNode = createShadowExecutionNode({
+      node: "authoritative-accepted",
+      scope: "the_dubspace",
+      serialized: commitScope.serialized,
+      authoritative_state: true
+    });
+    const acceptedCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-authoritative-accepted",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.71]
+    };
+    const accepted = await executeAuthoritativeShadowTurnCall(acceptedNode, {
+      id: acceptedCall.id,
+      call: acceptedCall,
+      expected: initialHead,
+      commitScope
+    });
+    expect(accepted).toMatchObject({ ok: true, attempted: true, commit: { position: { seq: 1 } } });
+
+    const staleNode = createShadowExecutionNode({
+      node: "authoritative-stale",
+      scope: "the_dubspace",
+      serialized: serializedBefore,
+      authoritative_state: true
+    });
+    const staleCall: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-authoritative-stale",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.72]
+    };
+    const stale = await executeAuthoritativeShadowTurnCall(staleNode, {
+      id: staleCall.id,
+      call: staleCall,
+      expected: initialHead,
+      commitScope
+    });
+
+    expect(stale).toMatchObject({
+      ok: false,
+      reason: "commit_rejected",
+      commit: { kind: "woo.commit.conflict.shadow.v1", reason: "stale_head" }
+    });
+    expect(staleNode.world).toBeUndefined();
+    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.71);
+  });
+
+  it("refreshes authoritative executor caches only for moved objects and containers", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-authoritative-move");
+    const actor = session.actor;
+    await anchor.directCall("shadow-authoritative-move-enter", actor, "the_chatroom", "enter", [], { sessionId: session.id });
+
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_chatroom", serialized: anchor.exportWorld() });
+    const node = createShadowExecutionNode({
+      node: "authoritative-move",
+      scope: "the_chatroom",
+      serialized: commitScope.serialized,
+      authoritative_state: true
+    });
+    expect(node.page_hashes.size).toBe(0);
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-authoritative-take",
+      route: "sequenced",
+      scope: "the_chatroom",
+      session: session.id,
+      actor,
+      target: "the_chatroom",
+      verb: "take",
+      args: ["mug"]
+    };
+
+    const result = await executeAuthoritativeShadowTurnCall(node, {
+      id: call.id,
+      call,
+      expected: commitScope.head,
+      commitScope
+    });
+
+    expect(result).toMatchObject({ ok: true, attempted: true });
+    if (!result.ok) throw new Error("expected authoritative move to commit");
+    const moved = result.transcript.moves[0]?.object;
+    if (!moved) throw new Error("expected take to record a move");
+    const byId = new Map(commitScope.serialized.objects.map((obj) => [obj.id, obj] as const));
+    const actorObj = byId.get(actor);
+    const roomObj = byId.get("the_chatroom");
+    const mugObj = byId.get(moved);
+    if (!actorObj || !roomObj || !mugObj) throw new Error("expected actor, room, and mug serialized objects");
+    expect(mugObj.location).toBe(actor);
+    expect(actorObj.contents).toContain(moved);
+    expect(roomObj.contents).not.toContain(moved);
+    expect(node.page_hashes.has(shadowStatePageHash(shadowObjectLivePage(actorObj)))).toBe(true);
+    expect(node.page_hashes.has(shadowStatePageHash(shadowObjectLivePage(roomObj)))).toBe(true);
+    expect(node.page_hashes.has(shadowStatePageHash(shadowObjectLivePage(mugObj)))).toBe(true);
+  });
+
   it("merges accepted commit state at cell granularity", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-cell-merge");
@@ -681,7 +800,7 @@ describe("shadow turn execution", () => {
     expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("admin_box", "value")).toBe(0);
   });
 
-  it("uses cached state pages so a second real dubspace turn transfers only page refs", async () => {
+  it("uses cached state pages so a second real dubspace turn transfers only newly missing pages", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-page-cache");
     const actor = session.actor;
@@ -740,9 +859,13 @@ describe("shadow turn execution", () => {
     expect(secondRouted.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
     if (!secondRouted.transfer || secondRouted.transfer.mode !== "cell_pages") throw new Error("expected cached cell-page transfer");
     expect(secondRouted.transfer.preimages).toEqual(["write:cell:prop:delay_1.feedback"]);
-    expect(secondRouted.transfer.inline_pages).toEqual([]);
+    expect(secondRouted.transfer.inline_pages).toEqual([
+      expect.objectContaining({ object: "$delay", page: "property_cell", name: "feedback" })
+    ]);
     expect(secondRouted.transfer.page_refs.length).toBeGreaterThan(0);
-    expect(secondRouted.transfer.page_refs.every((page) => page.inline === false)).toBe(true);
+    expect(secondRouted.transfer.page_refs.filter((page) => page.inline === true)).toEqual([
+      expect.objectContaining({ object: "$delay", page: "property_cell", name: "feedback" })
+    ]);
     expect(Buffer.byteLength(JSON.stringify(secondRouted.transfer), "utf8")).toBeLessThan(
       Buffer.byteLength(JSON.stringify(firstRouted.transfer), "utf8") / 5
     );
