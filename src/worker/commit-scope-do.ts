@@ -44,9 +44,14 @@ import {
 } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { stableShadowJson } from "../core/shadow-cell-version";
-import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
+import {
+  isShadowTurnExecReply,
+  shadowReplyMetricKind,
+  type ShadowEnvelopeReplyBody
+} from "../core/v2-reply-predicates";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
@@ -1025,21 +1030,6 @@ function logsFromRows(rows: Array<{ space: string; body: string }>): SerializedW
     space,
     entries.sort((a, b) => a.seq - b.seq)
   ]);
-}
-
-type V2EnvelopeReplyMetric = "none" | "accepted" | "live" | "missing_state" | "commit_rejected";
-
-type ShadowEnvelopeReplyBody = ShadowTurnExecReply | ShadowStateTransfer;
-
-function isShadowTurnExecReply(body: unknown): body is ShadowTurnExecReply {
-  return Boolean(body && typeof body === "object" && !Array.isArray(body) && (body as { kind?: unknown }).kind === "woo.turn.exec.reply.shadow.v1");
-}
-
-function shadowReplyMetricKind(reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null): V2EnvelopeReplyMetric {
-  const body = reply?.body;
-  if (!isShadowTurnExecReply(body)) return "none";
-  if (body.ok === false) return body.reason;
-  return body.commit ? "accepted" : "live";
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

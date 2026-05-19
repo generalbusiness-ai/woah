@@ -59,6 +59,7 @@ import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type Shado
 import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { isShadowCommitAccepted, isShadowTurnExecReply } from "../core/v2-reply-predicates";
 import {
   mergeV2TurnGatewayAuthority,
   submitTurnIntent,
@@ -3871,21 +3872,6 @@ function stableHash(input: string): number {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash >>> 0;
-}
-
-function isShadowCommitAccepted(value: unknown): value is ShadowCommitAccepted {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const candidate = value as Partial<ShadowCommitAccepted>;
-  return candidate.kind === "woo.commit.accepted.shadow.v1" &&
-    !!candidate.position &&
-    typeof candidate.position === "object" &&
-    typeof candidate.position.scope === "string" &&
-    typeof candidate.position.seq === "number" &&
-    Array.isArray(candidate.observations);
-}
-
-function isShadowTurnExecReply(value: unknown): value is ShadowTurnExecReply {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "woo.turn.exec.reply.shadow.v1");
 }
 
 async function workerHashText(text: string): Promise<string> {
