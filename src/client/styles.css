@@ -1721,20 +1721,18 @@ woo-outliner-tree {
   white-space: nowrap;
 }
 
-.outliner-focus {
+/* Toolbar "clear selection" button. Only rendered when a row is selected.
+   No reference to server-side focus here — the browser UI's selection is
+   client-local; see catalogs/outliner/DESIGN.md. */
+.outliner-clear-selection {
   white-space: nowrap;
-}
-
-/* When focus is set, the chip is a real button so clicking it returns to
-   root. The plain-text variant (focus == null) keeps the same baseline. */
-button.outliner-focus {
   cursor: pointer;
 }
 
-/* The text cell becomes the row's primary affordance (click row to focus,
-   click again to edit). Keep the bare text looking like text — the row
-   border + focus highlight signal interactivity — but give it a pointer
-   cursor so the hit area still reads as actionable. */
+/* The text cell is the row's primary affordance: click to select, click
+   again on the selected row to enter inline edit. The bare text still
+   looks like text — row border + selection highlight signal interactivity
+   — but a pointer cursor lets the hit area read as actionable. */
 .outliner-text {
   cursor: pointer;
 }
@@ -1755,9 +1753,9 @@ button.outliner-focus {
 }
 
 /* The in-place add-child placeholder sits as a child row directly below
-   the focus row. Visually identical to a regular row so the user reads it
-   as "the new item will land here", but with a dashed border to make the
-   pending nature obvious. */
+   the selected row. Visually identical to a regular row so the user reads
+   it as "the new item will land here", but with a dashed border to make
+   the pending nature obvious. */
 .outliner-row-pending .outliner-row-inner {
   border-bottom-style: dashed;
 }

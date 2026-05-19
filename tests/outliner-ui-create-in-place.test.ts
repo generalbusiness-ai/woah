@@ -7,13 +7,24 @@ import {
 } from "../catalogs/outliner/ui/outliner-tree";
 import type { WooContext } from "../src/client/framework";
 
-// jsdom tests for the "create in place" interaction:
-//   - top "add item…" form is only shown when focus is null/root
-//   - the focus row carries a + button that opens an inline new-child editor
-//   - clicking an unfocused row calls focus_on; clicking the focused row
-//     enters edit mode (the explicit ⊙ focus button is gone)
-//   - submitting the inline new-child editor calls add(text) (which the
-//     server defaults to the actor's current focus as parent)
+// jsdom tests for the outliner's client-local selection and the
+// "create in place" interaction. Selection is a UI-only affordance — no
+// server round-trip — so these tests assert what the component does
+// locally rather than what verbs it calls. Server-side $outliner.focus
+// remains a separate capability for chat/MCP and is intentionally not
+// touched by clicking a row in the browser.
+//
+// Pinned contract:
+//   - top "add an item…" form only appears when nothing is selected
+//   - the selected row carries a `+` button that opens an inline new-child
+//     editor immediately below it
+//   - clicking an unselected row selects it locally (no server call)
+//   - clicking the already-selected row enters edit mode
+//   - submitting the inline new-child editor calls add_item(text, parent_id)
+//     with the selected row id as the parent
+//   - the "clear selection" toolbar button (and Escape with no editor open)
+//     resets the local selection
+//   - the hide checkbox keeps its own behavior and does not select/edit
 
 type Calls = Array<{ subject: string; verb: string; args: unknown[] }>;
 
@@ -49,6 +60,13 @@ function mount(data: OutlinerData, calls: Calls): WooOutlinerTreeElement {
   return element;
 }
 
+// Click the text span inside a row to drive the row-click handler.
+function clickRow(el: WooOutlinerTreeElement, id: string): void {
+  const row = el.querySelector<HTMLElement>(`[data-outliner-row][data-id='${id}']`);
+  if (!row) throw new Error(`row ${id} not in DOM`);
+  row.querySelector<HTMLElement>(".outliner-text")!.click();
+}
+
 const SAMPLE: OutlinerData = {
   outlinerId: "the_outline",
   outlinerName: "Outline",
@@ -61,7 +79,7 @@ const SAMPLE: OutlinerData = {
   roster: []
 };
 
-describe("outliner-tree create-in-place", () => {
+describe("outliner-tree create-in-place (client-local selection)", () => {
   beforeAll(() => {
     if (!customElements.get("woo-outliner-tree")) {
       customElements.define("woo-outliner-tree", WooOutlinerTreeElement);
@@ -72,120 +90,142 @@ describe("outliner-tree create-in-place", () => {
     document.body.innerHTML = "";
   });
 
-  it("renders the top add form when focus is null/root", () => {
+  it("renders the top add form when nothing is selected, and no per-row + buttons", () => {
     const el = mount(SAMPLE, []);
-    expect(el.querySelector("[data-outliner-add]"), "top add form is present at root").not.toBeNull();
-    // No add-child button at root — only the focus row carries one.
+    expect(el.querySelector("[data-outliner-add]"), "top add form present at root").not.toBeNull();
     expect(el.querySelector("[data-outliner-action='add-child']")).toBeNull();
+    // No clear-selection button until something is selected.
+    expect(el.querySelector(".outliner-clear-selection")).toBeNull();
   });
 
-  it("hides the top add form when a row is focused, and shows a + on the focused row", () => {
+  it("server-side focus does not paint a selected row — only a UI click does", () => {
+    // Server says focus is item_a (a chat user did `focus alpha`). The
+    // browser UI should NOT pick that up as a selection — selection is
+    // a separate, UI-only capability.
     const el = mount({ ...SAMPLE, focus: "item_a" }, []);
-    expect(el.querySelector("[data-outliner-add]"), "top add form is hidden when focused").toBeNull();
-    const plus = el.querySelector<HTMLElement>("[data-outliner-action='add-child']");
-    expect(plus, "focus row carries a + button").not.toBeNull();
-    expect(plus?.dataset.id).toBe("item_a");
-    // Exactly one + button, only on the focus row.
-    const allPlus = el.querySelectorAll("[data-outliner-action='add-child']");
-    expect(allPlus.length).toBe(1);
+    expect(el.querySelector(".outliner-row.is-focused"), "no row painted as selected from server focus alone").toBeNull();
+    expect(el.querySelector("[data-outliner-action='add-child']"), "no + button from server focus alone").toBeNull();
+    expect(el.querySelector("[data-outliner-add]"), "top add form still visible").not.toBeNull();
   });
 
-  it("clicking + opens an inline new-child editor directly below the focus row", () => {
-    const el = mount({ ...SAMPLE, focus: "item_a" }, []);
+  it("clicking an unselected row selects it locally — no server call", async () => {
+    const calls: Calls = [];
+    const el = mount(SAMPLE, calls);
+    calls.length = 0;
+    clickRow(el, "item_a");
+    await Promise.resolve();
+
+    // No server call.
+    expect(calls.length, "no verbs called").toBe(0);
+    // is-focused class indicates UI selection in CSS.
+    const selected = el.querySelector<HTMLElement>(".outliner-row.is-focused");
+    expect(selected?.dataset.id).toBe("item_a");
+    // The + button appeared on the selected row only.
+    const plus = el.querySelectorAll("[data-outliner-action='add-child']");
+    expect(plus.length).toBe(1);
+    expect((plus[0] as HTMLElement).dataset.id).toBe("item_a");
+    // The top add form is hidden.
+    expect(el.querySelector("[data-outliner-add]")).toBeNull();
+    // Clear-selection button appears.
+    expect(el.querySelector(".outliner-clear-selection")).not.toBeNull();
+  });
+
+  it("clicking + opens an inline new-child editor directly below the selected row", () => {
+    const el = mount(SAMPLE, []);
+    clickRow(el, "item_a");
     const plus = el.querySelector<HTMLElement>("[data-outliner-action='add-child']")!;
     plus.click();
 
     const placeholder = el.querySelector<HTMLElement>("[data-outliner-add-child-row]");
-    expect(placeholder, "inline placeholder row appears after click").not.toBeNull();
-    // It sits as the immediate next sibling of the focus row in the DOM.
-    const focusRow = el.querySelector<HTMLElement>(`[data-outliner-row][data-id='item_a']`)!;
-    expect(focusRow.nextElementSibling).toBe(placeholder);
+    expect(placeholder, "placeholder row appears").not.toBeNull();
+    const selectedRow = el.querySelector<HTMLElement>(`[data-outliner-row][data-id='item_a']`)!;
+    expect(selectedRow.nextElementSibling, "placeholder is the next sibling of the selected row").toBe(placeholder);
 
     const form = placeholder!.querySelector<HTMLFormElement>("[data-outliner-add-child]");
-    expect(form, "placeholder hosts the add-child form").not.toBeNull();
+    expect(form).not.toBeNull();
     expect(form!.querySelector("input[name='text']")).not.toBeNull();
   });
 
-  it("submitting the inline editor calls add(text) — server defaults parent to the actor's focus", async () => {
+  it("submitting the inline editor calls add_item(text, parent_id) with the selected row as parent", async () => {
     const calls: Calls = [];
-    const el = mount({ ...SAMPLE, focus: "item_a" }, calls);
+    const el = mount(SAMPLE, calls);
+    clickRow(el, "item_a");
     el.querySelector<HTMLElement>("[data-outliner-action='add-child']")!.click();
     const input = el.querySelector<HTMLInputElement>("[data-outliner-add-child] input[name='text']")!;
     input.value = "first child";
     el.querySelector<HTMLFormElement>("[data-outliner-add-child]")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
-    // The submit handler is async; let microtasks settle so the queued
-    // callVerb has actually appended to `calls`.
     await Promise.resolve();
     await Promise.resolve();
 
-    const addCall = calls.find((c) => c.verb === "add");
-    expect(addCall, "add(text) was issued").not.toBeUndefined();
-    expect(addCall!.args).toEqual(["first child"]);
+    const addCall = calls.find((c) => c.verb === "add_item");
+    expect(addCall, "add_item was issued").not.toBeUndefined();
+    // Pass parent explicitly so we don't depend on server-side focus.
+    expect(addCall!.args).toEqual(["first child", "item_a"]);
     expect(addCall!.subject).toBe("the_outline");
+    // Old "add" verb (which relied on server focus default) should NOT be
+    // called from this path.
+    expect(calls.find((c) => c.verb === "add")).toBeUndefined();
   });
 
-  it("clicking an unfocused row calls focus_on(id)", async () => {
+  it("clicking the already-selected row enters edit mode (no spurious server call)", async () => {
     const calls: Calls = [];
     const el = mount(SAMPLE, calls);
-    const row = el.querySelector<HTMLElement>("[data-outliner-row][data-id='item_a']")!;
-    // Click on the text span — the row-click handler matches `[data-outliner-row]`.
-    row.querySelector<HTMLElement>(".outliner-text")!.click();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    const focusCall = calls.find((c) => c.verb === "focus_on");
-    expect(focusCall, "focus_on issued").not.toBeUndefined();
-    expect(focusCall!.args).toEqual(["item_a"]);
-  });
-
-  it("clicking the already-focused row enters edit mode (no focus_on, no add-child)", async () => {
-    const calls: Calls = [];
-    const el = mount({ ...SAMPLE, focus: "item_a" }, calls);
-    // Reset calls collected by the auto-hydrate that fires on connect.
+    clickRow(el, "item_a");
     calls.length = 0;
-    const row = el.querySelector<HTMLElement>("[data-outliner-row][data-id='item_a']")!;
-    row.querySelector<HTMLElement>(".outliner-text")!.click();
+    clickRow(el, "item_a");
     await Promise.resolve();
 
-    // No focus_on was issued — we were already focused on this row.
-    expect(calls.find((c) => c.verb === "focus_on")).toBeUndefined();
-    // The edit form replaced the text span.
-    expect(el.querySelector<HTMLElement>(`[data-outliner-edit][data-id='item_a']`)).not.toBeNull();
+    // No server call from the second click either — it just enters edit.
+    expect(calls.length, "second click made no server call").toBe(0);
+    expect(el.querySelector("[data-outliner-edit]"), "edit form is now in the row").not.toBeNull();
   });
 
-  it("focus changing from underneath closes a pending add-child surface", () => {
-    const el = mount({ ...SAMPLE, focus: "item_a" }, []);
-    el.querySelector<HTMLElement>("[data-outliner-action='add-child']")!.click();
-    expect(el.querySelector("[data-outliner-add-child-row]")).not.toBeNull();
-    // Simulate a remote focus shift — e.g. another tab issuing a chat
-    // `focus` command. The component should drop the placeholder rather
-    // than dangle it under a stale row.
-    (el as WooOutlinerTreeElement & { data: OutlinerData }).data = { ...SAMPLE, focus: "item_b" };
-    expect(el.querySelector("[data-outliner-add-child-row]"), "placeholder closed on focus change").toBeNull();
-  });
-
-  it("clear-focus button on the toolbar calls focus_on(null)", async () => {
+  it("clear-selection toolbar button resets the selection — no server call", async () => {
     const calls: Calls = [];
-    const el = mount({ ...SAMPLE, focus: "item_a" }, calls);
+    const el = mount(SAMPLE, calls);
+    clickRow(el, "item_a");
     calls.length = 0;
-    const chip = el.querySelector<HTMLElement>(".outliner-focus[data-outliner-action='clear-focus']");
-    expect(chip, "focus chip is a button when something is focused").not.toBeNull();
-    chip!.click();
+    const clearBtn = el.querySelector<HTMLElement>("[data-outliner-action='clear-selection']");
+    expect(clearBtn, "clear-selection button visible while selected").not.toBeNull();
+    clearBtn!.click();
     await Promise.resolve();
-    await Promise.resolve();
-    const call = calls.find((c) => c.verb === "focus_on");
-    expect(call?.args).toEqual([null]);
+
+    expect(calls.length, "clear-selection makes no server call").toBe(0);
+    expect(el.querySelector(".outliner-row.is-focused")).toBeNull();
+    expect(el.querySelector("[data-outliner-add]"), "top add form returns when selection cleared").not.toBeNull();
+  });
+
+  it("if the selected item disappears from the tree, selection clears automatically", () => {
+    const el = mount(SAMPLE, []);
+    clickRow(el, "item_a");
+    expect(el.querySelector(".outliner-row.is-focused")).not.toBeNull();
+    // Simulate a hydrate where item_a was removed (e.g. another actor
+    // removed it). The selection should fall back to nothing rather than
+    // dangle on a missing id.
+    const withoutA: OutlinerData = { ...SAMPLE, items: [SAMPLE.items[1]] };
+    (el as WooOutlinerTreeElement & { data: OutlinerData }).data = withoutA;
+    expect(el.querySelector(".outliner-row.is-focused")).toBeNull();
+    expect(el.querySelector("[data-outliner-add-child-row]"), "pending placeholder closed too").toBeNull();
   });
 
   it("does not start editing when the click lands on the hide checkbox", async () => {
     const calls: Calls = [];
-    const el = mount({ ...SAMPLE, focus: "item_a" }, calls);
+    const el = mount(SAMPLE, calls);
+    clickRow(el, "item_a");
     calls.length = 0;
     const checkbox = el.querySelector<HTMLInputElement>("[data-outliner-hide][data-id='item_a']")!;
     checkbox.click();
     await Promise.resolve();
-    // No edit form, and no spurious focus_on either.
-    expect(el.querySelector(`[data-outliner-edit][data-id='item_a']`)).toBeNull();
-    expect(calls.find((c) => c.verb === "focus_on")).toBeUndefined();
+
+    // The row stays selected, but the click does not enter edit mode.
+    expect(el.querySelector("[data-outliner-edit]")).toBeNull();
+    // Selection was not disturbed by the hide click.
+    expect(el.querySelector<HTMLElement>(".outliner-row.is-focused")?.dataset.id).toBe("item_a");
+    // The only verb that may have fired is `hide` (the checkbox's own
+    // handler). No focus_on, no add_item, no add, no clear-selection
+    // round-trip — those would indicate the row-click handler stole the
+    // event from the checkbox.
+    const unexpected = calls.filter((c) => c.verb !== "hide" && c.verb !== "list_items" && c.verb !== "room_roster");
+    expect(unexpected, "no extra verbs called").toEqual([]);
   });
 });

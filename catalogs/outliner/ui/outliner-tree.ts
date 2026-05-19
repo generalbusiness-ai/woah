@@ -53,14 +53,16 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private collapsed = new Set<string>();
   private showHidden = false;
   private editing: { id: string; original: string } | null = null;
-  // True while the inline new-child editor (anchored below the focus row) is
-  // open. Always paired with a non-null `model.focus`; render() resets this
-  // whenever focus shifts so the placeholder can't drift onto an unrelated row.
+  // Client-local selection. The row the user has clicked on; drives the
+  // is-focused highlight, the inline `+` add-child affordance, and the
+  // click-again-to-edit gesture. NOT round-tripped through the server —
+  // server-side $outliner.focus_by_actor is a separate capability for
+  // chat/MCP users who don't have a live selection state of their own.
+  // Clears automatically if the selected item disappears from the tree.
+  private selectedId: string | null = null;
+  // True while the inline new-child editor (anchored below the selected
+  // row) is open. Always paired with a non-null `selectedId`.
   private addingChild = false;
-  // Last focus value handed to render(). Lets render() detect focus changes
-  // (from a chat `focus` command, a remote `outline_focus_changed`, or a
-  // local `focus_on` call) and clear the pending add-child surface.
-  private lastRenderedFocus: string | null | undefined = undefined;
   private dragSourceId: string | null = null;
   private hydrating = false;
   private hydratePending = false;
@@ -153,18 +155,16 @@ export class WooOutlinerTreeElement extends HTMLElement {
       this.addEventListener("dragend", this.onDragEnd);
     }
     const data = this.model;
-    // Focus shifted out from under any pending add-child surface — close it
-    // so the inline editor can't drift onto an unrelated row after a chat
-    // `focus` command or a directed `outline_focus_changed`.
-    if (this.lastRenderedFocus !== undefined && this.lastRenderedFocus !== data.focus) {
+    // If the selected item is no longer in the tree (someone deleted it,
+    // or it moved to a different outliner) drop the selection so the
+    // is-focused highlight and inline + don't dangle. Also closes any
+    // pending add-child surface that was anchored to it.
+    if (this.selectedId && !data.items.some((it) => it.id === this.selectedId)) {
+      this.selectedId = null;
       this.addingChild = false;
     }
-    this.lastRenderedFocus = data.focus;
     const outlinerId = data.outlinerId || this.subject || "";
     const visibleItems = this.computeVisibleItems(data.items);
-    const focusLabel = data.focus
-      ? data.items.find((it) => it.id === data.focus)?.text ?? data.focus
-      : "(root)";
     const preservedPanel = preserveAmbientCompanionPanel(this, outlinerId);
     // Preserve in-flight form input across re-renders. Without this, a
     // hydrate (or any observation-triggered re-render) wipes the user's
@@ -187,9 +187,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // pinboard / dubspace / tasks. The ambient-companion-shell's height budget
     // (calc(100dvh - 5.25rem)) is tuned to the .toolbar envelope; any bespoke
     // header drifts the chat panel anchor, so route through renderToolFrame.
-    const focusChip = data.focus
-      ? `<button type="button" class="outliner-focus" data-outliner-action="clear-focus" title="back to root">focus: ${escapeHtml(focusLabel)} ✕</button>`
-      : `<span class="outliner-focus">focus: ${escapeHtml(focusLabel)}</span>`;
+    // When something is selected, a small "clear selection" button gives
+    // the user a discoverable way back to "nothing selected" (the keyboard
+    // alternative is Escape). No reference to server-side focus appears
+    // here — that's a separate capability used by chat/MCP, not by this UI.
+    const clearSelection = this.selectedId
+      ? `<button type="button" class="outliner-clear-selection" data-outliner-action="clear-selection" title="clear selection">clear selection ✕</button>`
+      : "";
     const toolbar = `
       <section class="toolbar outliner-toolbar">
         <h1>${escapeHtml(data.outlinerName)}</h1>
@@ -199,26 +203,26 @@ export class WooOutlinerTreeElement extends HTMLElement {
           show hidden
         </label>
         <button type="button" data-outliner-action="undo">Undo</button>
-        ${focusChip}
+        ${clearSelection}
       </section>
     `;
-    // Top add form is only useful at root. When focus is on an item, the
-    // user creates new children "in place" via the + button on the focus
-    // row, so hiding the top form removes the ambiguity about which parent
-    // a new item lands under.
-    const topAdd = data.focus == null
+    // Top add form is only useful at root. When something is selected, the
+    // user creates children "in place" via the + button on the selected
+    // row, so hiding the top form removes ambiguity about which parent a
+    // new item would land under.
+    const topAdd = this.selectedId == null
       ? `<form class="outliner-add" data-outliner-add>
           <input type="text" name="text" placeholder="add an item…" autocomplete="off" value="${escapeHtml(addInputValue)}">
           <button type="submit">Add</button>
         </form>`
       : "";
     // Walk visibleItems once and splice the add-child placeholder in right
-    // after the focus row. Building this inline (rather than overriding
+    // after the selected row. Building this inline (rather than overriding
     // computeVisibleItems) keeps the placeholder a UI-only concern.
     const rowsHtml: string[] = [];
     for (const item of visibleItems) {
       rowsHtml.push(this.renderRow(item, data));
-      if (this.addingChild && data.focus && item.id === data.focus) {
+      if (this.addingChild && this.selectedId && item.id === this.selectedId) {
         rowsHtml.push(this.renderAddChildRow(item.depth + 1, addChildInputValue));
       }
     }
@@ -312,9 +316,9 @@ export class WooOutlinerTreeElement extends HTMLElement {
     return out;
   }
 
-  private renderRow(item: OutlinerItem & { depth: number }, data: OutlinerData): string {
+  private renderRow(item: OutlinerItem & { depth: number }, _data: OutlinerData): string {
     const id = item.id;
-    const isFocused = data.focus === id;
+    const isFocused = this.selectedId === id;
     const isEditing = this.editing?.id === id;
     const collapsed = this.collapsed.has(id);
     const indent = item.depth * 20;
@@ -395,28 +399,28 @@ export class WooOutlinerTreeElement extends HTMLElement {
         await this.callVerb("undo", []);
         return;
       }
-      if (action === "clear-focus") {
-        // Closes any pending add-child surface synchronously so it doesn't
-        // briefly render against a stale focus before the hydrate completes.
+      if (action === "clear-selection") {
+        // Pure client-side state reset — no server call, no round trip.
+        this.selectedId = null;
         this.addingChild = false;
-        await this.callVerb("focus_on", [null]);
+        this.render();
         return;
       }
       if (action === "add-child" && id) {
-        // Only the focus row carries this button; refuse to open the
-        // placeholder against a stale id in case the focus moved between
+        // Only the selected row carries this button; refuse to open the
+        // placeholder against a stale id in case selection changed between
         // render and click.
-        if (this.model.focus !== id) return;
+        if (this.selectedId !== id) return;
         this.addingChild = !this.addingChild;
-        // Expand the focus row when opening, so the new child is visible
-        // when it arrives. Closing leaves the collapse state alone.
+        // Expand the selected row when opening, so the new child is
+        // visible when it arrives. Closing leaves collapse state alone.
         if (this.addingChild) this.collapsed.delete(id);
         this.render();
         return;
       }
       return;
     }
-    // Row click — focus an unfocused row, edit an already-focused row.
+    // Row click — select an unselected row, edit an already-selected row.
     // Skip interactive descendants (buttons, the hide checkbox, any open
     // form) so clicking those keeps their own behavior.
     if (target.closest("button, input, form")) return;
@@ -425,9 +429,9 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const id = row.dataset.id;
     if (!id) return;
     event.preventDefault();
-    if (this.model.focus === id) {
-      // Already focused: enter edit mode. Bail if we're already editing
-      // this row so a stray click on the row doesn't restart the editor.
+    if (this.selectedId === id) {
+      // Already selected: enter edit mode. Bail if we're already editing
+      // this row so a stray click doesn't restart the editor.
       if (this.editing?.id === id) return;
       const item = this.model.items.find((it) => it.id === id);
       if (!item) return;
@@ -443,17 +447,19 @@ export class WooOutlinerTreeElement extends HTMLElement {
       input?.addEventListener("blur", () => this.commitEdit(input.value, id), { once: true });
       return;
     }
-    // Not focused: focus it. Drop any pending add-child surface up front
-    // so a fast hydrate doesn't briefly render the placeholder under the
-    // old focus row.
+    // Not selected: select it (client-local). No server call, no waiting
+    // for a hydrate — the highlight and the + button appear immediately.
+    this.selectedId = id;
     this.addingChild = false;
-    await this.callVerb("focus_on", [id]);
+    this.render();
   };
 
   // Component-level Escape handler. Closes the active inline editor — the
   // existing edit form keeps its own per-click blur binding for commit, but
   // routing Escape through one place lets the new add-child surface share
-  // the same cancel gesture without re-binding on every render.
+  // the same cancel gesture without re-binding on every render. When no
+  // editor is open, Escape clears the row selection as a keyboard-only
+  // alternative to the toolbar's "clear selection" button.
   private onKeyDown = (event: KeyboardEvent): void => {
     if (event.key !== "Escape") return;
     const target = event.target as HTMLElement;
@@ -464,6 +470,12 @@ export class WooOutlinerTreeElement extends HTMLElement {
     }
     if (target.closest("[data-outliner-edit]")) {
       this.editing = null;
+      this.render();
+      return;
+    }
+    if (this.selectedId) {
+      this.selectedId = null;
+      this.addingChild = false;
       this.render();
     }
   };
@@ -500,17 +512,19 @@ export class WooOutlinerTreeElement extends HTMLElement {
       const text = input?.value.trim() ?? "";
       if (!text) {
         // Empty submit acts as cancel — closes the inline editor rather
-        // than calling `add` (which would just raise E_INVARG).
+        // than raising E_INVARG on the server.
         this.addingChild = false;
         this.render();
         return;
       }
-      // Close the surface first so the post-add hydrate doesn't briefly
+      // The selected row is the new item's parent. Snapshot it and close
+      // the surface up front so the post-add hydrate doesn't briefly
       // re-render the placeholder with the just-submitted text.
+      const parentId = this.selectedId;
       this.addingChild = false;
-      // `add(text)` defaults the parent to the actor's current focus on
-      // the server, which is exactly the row this placeholder hangs under.
-      await this.callVerb("add", [text]);
+      // Pass the parent explicitly so this doesn't depend on the actor's
+      // server-side focus (which the browser UI no longer drives).
+      await this.callVerb("add_item", [text, parentId]);
       return;
     }
     if (form.matches?.("[data-outliner-edit]")) {
