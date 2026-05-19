@@ -1,11 +1,12 @@
 import { runShadowTurnCallTranscript } from "../core/shadow-turn-call";
+import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { executeShadowTurnCallOrNeedState, missingAtomsForShadowTurn, type ShadowMissingAtom, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 import type { ShadowTurnKey } from "../core/turn-key";
 import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
-import type { ObjRef, WooValue } from "../core/types";
+import type { AppliedFrame, DirectResultFrame, ErrorFrame, ObjRef, WooValue } from "../core/types";
 import { createV2BrowserExecutionNodeFromTransfers, type V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
 
 export type V2BrowserLocalTurnInput = {
@@ -24,12 +25,16 @@ export type V2BrowserLocalTurnInput = {
   transfers: readonly V2ExecutableTransferRecord[];
   cached_objects?: readonly SerializedObject[];
   cached_pages?: readonly ShadowStatePage[];
+  committed_transcripts?: readonly EffectTranscript[];
+  tentative_transcripts?: readonly EffectTranscript[];
 };
 
 export type V2BrowserLocalTurnResult =
   | {
       ok: true;
       request: ShadowTurnExecRequest;
+      optimistic_frame: DirectResultFrame | ErrorFrame;
+      transcript: EffectTranscript;
       transcript_hash: string;
       observation_count: number;
       result_known: boolean;
@@ -48,7 +53,9 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     scope: input.scope,
     records: input.transfers,
     cached_objects: input.cached_objects,
-    cached_pages: input.cached_pages
+    cached_pages: input.cached_pages,
+    committed_transcripts: input.committed_transcripts,
+    tentative_transcripts: input.tentative_transcripts
   });
   if (!executionNode.serialized) return { ok: false, reason: "no_executable_state" };
 
@@ -89,8 +96,27 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
   return {
     ok: true,
     request,
+    optimistic_frame: optimisticTurnResultFrame(executed.frame, input.id),
+    transcript: executed.transcript,
     transcript_hash: executed.transcript.hash,
     observation_count: executed.transcript.observations.length,
     result_known: executed.transcript.result !== undefined || executed.transcript.error !== undefined
+  };
+}
+
+function optimisticTurnResultFrame(
+  frame: AppliedFrame | DirectResultFrame | ErrorFrame,
+  id: string
+): DirectResultFrame | ErrorFrame {
+  if (frame.op === "result" || frame.op === "error") return frame;
+  return {
+    op: "result",
+    id: frame.id ?? id,
+    command: frame.message,
+    result: frame.result ?? null,
+    observations: frame.observations,
+    audience: frame.space,
+    ...(frame.audienceSessions ? { audienceSessions: frame.audienceSessions } : {}),
+    ...(frame.observationSessionAudiences ? { observationSessionAudiences: frame.observationSessionAudiences } : {})
   };
 }

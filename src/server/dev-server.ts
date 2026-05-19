@@ -274,6 +274,17 @@ v2wss.on("connection", (ws, req) => {
       auth: { mode: "session", token },
       body: opened.transfer
     } satisfies ShadowEnvelope<typeof opened.transfer>));
+    ws.send(encodeEnvelope({
+      v: 2,
+      type: opened.executable_transfer.kind,
+      id: `dev-relay:exec-state:${randomUUID()}`,
+      from: browser.relay.node,
+      to: browser.node,
+      actor: session.actor,
+      session: session.id,
+      auth: { mode: "session", token },
+      body: opened.executable_transfer
+    } satisfies ShadowEnvelope<typeof opened.executable_transfer>));
     for (const ad of opened.ads) {
       ws.send(encodeEnvelope({
         v: 2,

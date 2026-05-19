@@ -78,6 +78,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   };
   transferMode?: "closure" | "object_records" | "cell_pages";
   maxTransfers?: number;
+  maxStaleHeadRetries?: number;
   commitScope?: ShadowCommitScope;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
 }): Promise<ShadowInProcessNetworkResult> {
@@ -92,40 +93,80 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     serialized: input.anchor.serialized
   });
 
-  const first = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope, profile: input.profile });
+  // `request.expected` is the browser's optimistic concurrency token. When two
+  // browsers race a commit on the same scope, the loser sees stale_head; for an
+  // authoritative executor that has the post-winning-commit state in serialized,
+  // re-running the verb against the new head is the correct convergence — the
+  // browser's `key` was a planning artifact and `request.id` keeps idempotency.
+  // Cloning the request lets us bump `expected` per retry without mutating the
+  // caller's input.
+  let activeRequest: ShadowTurnExecRequest = input.request;
+  const first = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile });
   let result = first;
   const transfers: ShadowStateTransfer[] = [];
   const maxTransfers = input.maxTransfers ?? 3;
+  const maxStaleHeadRetries = input.maxStaleHeadRetries ?? 3;
   const transferMode = input.transferMode ?? "cell_pages";
 
-  for (let i = 0; i < maxTransfers && !result.ok && result.reason === "missing_state"; i++) {
-    const transfer = transferMode === "closure"
-      ? buildShadowClosureTransfer({
-          serialized: input.anchor.serialized,
-          key: input.request.key,
-          atom_hashes: result.missing_atoms.map((atom) => atom.hash),
-          recipient: selected.node
-        })
-      : transferMode === "object_records"
-        ? buildShadowObjectRecordTransfer({
-          serialized: input.anchor.serialized,
-          key: input.request.key,
-          missing_atoms: result.missing_atoms,
-          known_object_hashes: selected.object_hashes,
-          session: input.request.call.session,
-          recipient: selected.node
-        })
-        : buildShadowCellPageTransfer({
-          serialized: input.anchor.serialized,
-          key: input.request.key,
-          missing_atoms: result.missing_atoms,
-          known_page_hashes: selected.page_hashes,
-          session: input.request.call.session,
-          recipient: selected.node
-        });
-    installShadowStateTransfer(selected, transfer);
-    transfers.push(transfer);
-    result = await executeShadowTurnCallOrNeedState(selected, input.request, { commitScope, profile: input.profile });
+  let missingStateRounds = 0;
+  let staleHeadRounds = 0;
+  while (!result.ok) {
+    if (result.reason === "missing_state") {
+      if (missingStateRounds >= maxTransfers) break;
+      missingStateRounds += 1;
+      const missingAtoms = result.missing_atoms;
+      const transfer = transferMode === "closure"
+        ? buildShadowClosureTransfer({
+            serialized: input.anchor.serialized,
+            key: activeRequest.key,
+            atom_hashes: missingAtoms.map((atom) => atom.hash),
+            recipient: selected.node
+          })
+        : transferMode === "object_records"
+          ? buildShadowObjectRecordTransfer({
+            serialized: input.anchor.serialized,
+            key: activeRequest.key,
+            missing_atoms: missingAtoms,
+            known_object_hashes: selected.object_hashes,
+            session: activeRequest.call.session,
+            recipient: selected.node
+          })
+          : buildShadowCellPageTransfer({
+            serialized: input.anchor.serialized,
+            key: activeRequest.key,
+            missing_atoms: missingAtoms,
+            known_page_hashes: selected.page_hashes,
+            session: activeRequest.call.session,
+            recipient: selected.node
+          });
+      installShadowStateTransfer(selected, transfer);
+      transfers.push(transfer);
+    } else if (result.reason === "commit_rejected" && result.commit?.reason === "stale_head") {
+      // Stale-head retry is only safe when the executor owns the full
+      // authoritative scope state. For a selected/gossiped executor whose
+      // serialized is a verified partial shard advertised by an `ExecCapabilityAd`,
+      // mutating `selected.serialized` from the relay's commit-scope would
+      // silently overwrite the executor's owned cache and violate the
+      // selected-ad asymmetry — the executor is supposed to prove coverage by
+      // executing or returning `missing_state`, not to inherit relay state.
+      // Bail in that case and surface the stale-head conflict to the caller,
+      // which can re-plan against a fresh head if it wants to retry.
+      if (selected.authoritative_state !== true) break;
+      if (staleHeadRounds >= maxStaleHeadRetries) break;
+      staleHeadRounds += 1;
+      // Update `expected` AND resync the executor's serialized snapshot to the
+      // current commit-scope authority. Concurrent requests each snapshot the
+      // pre-race state when their executor is created, so after the winner's
+      // commit the loser's executor still carries pre-race cell versions — a
+      // re-run on stale serialized would just produce another transcript with
+      // the same (now-pre-state-mismatched) reads.
+      selected.serialized = structuredClone(commitScope.serialized) as SerializedWorld;
+      selected.world = undefined;
+      activeRequest = { ...activeRequest, expected: commitScope.head };
+    } else {
+      break;
+    }
+    result = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile });
   }
 
   if (transfers.length === 0) {

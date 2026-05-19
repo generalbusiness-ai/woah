@@ -30,10 +30,12 @@ describe("v2 turn-network spec", () => {
     expect(spec).toContain("delegation moves the actor-local cache forward");
     expect(spec).toContain("Gossiped whole-turn delegation");
     expect(spec).toContain("preserves `selected_ad`");
-    expect(spec).toContain("scope-matching");
-    expect(spec).toContain("gossiped `ExecCapabilityAd`");
+    expect(spec).toContain("Normal durable browser surfaces MUST NOT use selected-ad intents");
+    expect(spec).toContain("installs the open executable seed, plans locally");
+    expect(spec).toContain("The browser can use it only after it has derived an exact `TurnKey`");
     expect(spec).toContain("scope open SHOULD emit at least one standalone `ExecCapabilityAd` envelope");
     expect(spec).toContain("MUST NOT submit an unselected durable intent");
+    expect(spec).toContain("submit browser-built");
     expect(spec).toContain("If repair succeeds, the worker retries local");
     expect(spec).toContain("MUST NOT release queued durable turns until the");
   });

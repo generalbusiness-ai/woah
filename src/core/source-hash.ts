@@ -159,6 +159,10 @@ export function hashSource(source: string): string {
   return bytesToHex(sha256Bytes(utf8Encode(source)));
 }
 
+export function utf8ByteLength(source: string): number {
+  return utf8Encode(source).byteLength;
+}
+
 // Minimal type for the Web Crypto bit we actually need. The worker tsconfig
 // excludes the DOM lib; this avoids pulling in the whole DOM typing surface
 // just to type-check `crypto.getRandomValues`.

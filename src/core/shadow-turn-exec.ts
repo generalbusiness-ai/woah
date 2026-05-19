@@ -10,7 +10,7 @@ import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effec
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
-import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import {
   runShadowTurnCallOnWorld,
   runShadowTurnCallOnWorldTranscript,
@@ -27,7 +27,7 @@ import {
   type ShadowCommitScope,
   type ShadowScopeHead
 } from "./shadow-commit-scope";
-import { constantTimeEqual, hashSource } from "./source-hash";
+import { constantTimeEqual, hashSource, utf8ByteLength } from "./source-hash";
 import { stableShadowJson } from "./shadow-cell-version";
 import { createWorldFromSerialized } from "./bootstrap";
 import type { WooWorld } from "./world";
@@ -146,6 +146,14 @@ export type ShadowExecutionNode = {
   world?: WooWorld;
   committed_head_hash?: string;
   serialized_generation?: number;
+  // When true, the executor owns the full authoritative scope state and the
+  // atom-guard checks (pre-run `missingAtomsForShadowTurn`, in-run
+  // `ShadowStateGuardTurnRecorder`, post-run `missingActualAtoms`) are skipped:
+  // every cell already materializes from `serialized`, so a request that only
+  // negotiated a subset of atoms must not be rejected with `missing_state`.
+  // The atom-guard remains the authority for delegate executors that hold a
+  // verified partial cache.
+  authoritative_state?: boolean;
 };
 
 export type ShadowTurnExecutionResult =
@@ -243,6 +251,7 @@ export function createShadowExecutionNode(input: {
   cached_pages?: ShadowStatePage[];
   trusted_transfer_authorities?: Record<string, string>;
   serialized?: SerializedWorld;
+  authoritative_state?: boolean;
 }): ShadowExecutionNode {
   let serialized = input.serialized ? structuredClone(input.serialized) as SerializedWorld : undefined;
   const objectCache = new Map<string, SerializedObject>();
@@ -264,7 +273,8 @@ export function createShadowExecutionNode(input: {
     object_cache: objectCache,
     page_cache: pageCache,
     trusted_transfer_authorities: trustedTransferAuthorities(input.trusted_transfer_authorities),
-    serialized
+    serialized,
+    ...(input.authoritative_state === true ? { authoritative_state: true } : {})
   };
 }
 
@@ -329,7 +339,7 @@ export function buildShadowObjectRecordTransfer(input: {
     return {
       id: obj.id,
       hash,
-      bytes: Buffer.byteLength(stableShadowJson(obj as unknown as WooValue), "utf8"),
+      bytes: utf8ByteLength(stableShadowJson(obj as unknown as WooValue)),
       inline: !knownObjectHashes.has(hash)
     };
   });
@@ -382,6 +392,7 @@ export function buildShadowCellPageTransfer(input: {
 } & ShadowTransferSigning): ShadowCellPageTransfer {
   const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
   const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage));
+  const granted = transferAtomsForPages(selected, requiredPages);
   const knownPageHashes = new Set(input.known_page_hashes ?? []);
   const pageRefs = requiredPages.map((page) => {
     const ref = shadowStatePageRef(page, true);
@@ -394,8 +405,8 @@ export function buildShadowCellPageTransfer(input: {
     kind: "woo.state.transfer.shadow.v1",
     mode: "cell_pages",
     scope: input.key.scope,
-    atom_hashes: selected.map((item) => item.hash),
-    preimages: selected.map((item) => item.preimage),
+    atom_hashes: granted.map((item) => item.hash),
+    preimages: granted.map((item) => item.preimage),
     page_refs: pageRefs,
     inline_pages: inlinePages,
     ...shadowTransferWorldTail(input.serialized, input.key, input.session),
@@ -493,17 +504,40 @@ export async function executeShadowTurnCallOrNeedState(
   request: ShadowTurnExecRequest,
   options: ShadowTurnExecutionOptions = {}
 ): Promise<ShadowTurnExecutionResult> {
-  const missing = missingAtomsForShadowTurn(node, request.key);
-  if (missing.length > 0 || !node.serialized) {
-    const missingAtoms = missing.length > 0
-      ? missing
-      : request.key.atom_hashes.map((hash, index) => ({ hash, preimage: request.key.preimages[index] }));
+  // Authoritative executors own the full scope's serialized state, so every
+  // cell the verb might touch already materializes. Skipping the atom-guard
+  // pre-check, the in-run `ShadowStateGuardTurnRecorder`, and the post-run
+  // `missingActualAtoms` check prevents the relay from rejecting a turn with
+  // `missing_state` for cells it actually has — which would otherwise loop the
+  // browser through doomed repair rounds for atoms the relay was never going
+  // to declare missing. Commit-scope validation (`submitShadowCommit`) is
+  // still the gate that decides whether the transcript is accepted.
+  const skipAtomChecks = node.authoritative_state === true && node.serialized !== undefined;
+
+  if (!skipAtomChecks) {
+    const missing = missingAtomsForShadowTurn(node, request.key);
+    if (missing.length > 0 || !node.serialized) {
+      const missingAtoms = missing.length > 0
+        ? missing
+        : request.key.atom_hashes.map((hash, index) => ({ hash, preimage: request.key.preimages[index] }));
+      return {
+        ok: false,
+        reason: "missing_state",
+        attempted: false,
+        missing_atoms: missingAtoms,
+        reply: missingStateReply(request, missingAtoms)
+      };
+    }
+  } else if (!node.serialized) {
+    // Defensive: an authoritative node without serialized state is malformed,
+    // but report it as missing_state rather than letting `shadowExecutionWorld`
+    // throw an opaque error.
     return {
       ok: false,
       reason: "missing_state",
       attempted: false,
-      missing_atoms: missingAtoms,
-      reply: missingStateReply(request, missingAtoms)
+      missing_atoms: request.key.atom_hashes.map((hash, index) => ({ hash, preimage: request.key.preimages[index] })),
+      reply: missingStateReply(request, request.key.atom_hashes.map((hash, index) => ({ hash, preimage: request.key.preimages[index] })))
     };
   }
 
@@ -512,7 +546,7 @@ export async function executeShadowTurnCallOrNeedState(
   const commitScopeExecution = !!options.commitScope && request.persistence !== "live";
   let run: ShadowTurnCallRun | ShadowTurnCallTranscriptRun;
   try {
-    const runOptions = { allowed_atom_hashes: node.atom_hashes };
+    const runOptions = skipAtomChecks ? {} : { allowed_atom_hashes: node.atom_hashes };
     // With a durable commit scope, the transcript is the contract and the
     // commit scope owns authoritative post-state construction.
     run = commitScopeExecution
@@ -525,32 +559,34 @@ export async function executeShadowTurnCallOrNeedState(
     node.world = undefined;
     throw err;
   }
-  const needState = missingAtomsFromNeedStateTranscript(run.transcript);
-  if (needState.length > 0) {
-    node.world = undefined;
-    return {
-      ok: false,
-      reason: "missing_state",
-      attempted: true,
-      missing_atoms: needState,
-      frame: run.frame,
-      transcript: run.transcript,
-      reply: missingStateReply(request, needState, run.transcript)
-    };
-  }
-  const actualKey = shadowTurnKeyFromTranscript(run.transcript);
-  const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes);
-  if (unmaterialized.length > 0) {
-    node.world = undefined;
-    return {
-      ok: false,
-      reason: "missing_state",
-      attempted: true,
-      missing_atoms: unmaterialized,
-      frame: run.frame,
-      transcript: run.transcript,
-      reply: missingStateReply(request, unmaterialized, run.transcript)
-    };
+  if (!skipAtomChecks) {
+    const needState = missingAtomsFromNeedStateTranscript(run.transcript);
+    if (needState.length > 0) {
+      node.world = undefined;
+      return {
+        ok: false,
+        reason: "missing_state",
+        attempted: true,
+        missing_atoms: needState,
+        frame: run.frame,
+        transcript: run.transcript,
+        reply: missingStateReply(request, needState, run.transcript)
+      };
+    }
+    const actualKey = shadowTurnKeyFromTranscript(run.transcript);
+    const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes);
+    if (unmaterialized.length > 0) {
+      node.world = undefined;
+      return {
+        ok: false,
+        reason: "missing_state",
+        attempted: true,
+        missing_atoms: unmaterialized,
+        frame: run.frame,
+        transcript: run.transcript,
+        reply: missingStateReply(request, unmaterialized, run.transcript)
+      };
+    }
   }
 
   const commit = options.commitScope && request.persistence !== "live"
@@ -605,7 +641,12 @@ export async function executeShadowTurnCallOrNeedState(
   // state transitions. Keep their reply transcript, but discard the executor's
   // speculative world so the next durable turn plans against the commit scope.
   if (livePersistence) node.world = undefined;
-  for (const hash of actualKey.atom_hashes) node.atom_hashes.add(hash);
+  // Even when the atom-guard was skipped (authoritative executor), recording
+  // the actual touched atoms keeps `node.atom_hashes` aligned with what just
+  // executed — useful for any non-authoritative downstream consumer that
+  // inspects the node after the turn.
+  const acceptedKey = shadowTurnKeyFromTranscript(run.transcript);
+  for (const hash of acceptedKey.atom_hashes) node.atom_hashes.add(hash);
   for (const obj of node.serialized.objects) cacheShadowObjectRecord(node.object_cache, obj);
   refreshNodeObjectHashes(node);
   return {
@@ -635,15 +676,42 @@ function selectedTransferAtoms(
   atomHashes: string[] | undefined,
   missingAtoms: ShadowMissingAtom[] | undefined
 ): Array<{ hash: string; preimage: string }> {
-  if (missingAtoms) {
-    return missingAtoms
-      .filter((atom): atom is { hash: string; preimage: string } => typeof atom.preimage === "string")
-      .sort((a, b) => a.hash.localeCompare(b.hash));
+  const selected = new Map<string, { hash: string; preimage: string }>();
+  if (atomHashes !== undefined || !missingAtoms) {
+    const requested = new Set(atomHashes ?? key.atom_hashes);
+    for (let index = 0; index < key.preimages.length; index++) {
+      const preimage = key.preimages[index];
+      const hash = key.atom_hashes[index];
+      if (requested.has(hash)) selected.set(preimage, { preimage, hash });
+    }
   }
-  const requested = new Set(atomHashes ?? key.atom_hashes);
-  return key.preimages
-    .map((preimage, index) => ({ preimage, hash: key.atom_hashes[index] }))
-    .filter((item) => requested.has(item.hash));
+  for (const atom of missingAtoms ?? []) {
+    if (typeof atom.preimage === "string") selected.set(atom.preimage, { hash: atom.hash, preimage: atom.preimage });
+  }
+  return Array.from(selected.values()).sort((a, b) => a.hash.localeCompare(b.hash));
+}
+
+function transferAtomsForPages(
+  selected: Array<{ hash: string; preimage: string }>,
+  pages: readonly ShadowStatePage[]
+): Array<{ hash: string; preimage: string }> {
+  const byPreimage = new Map<string, { hash: string; preimage: string }>();
+  for (const item of selected) byPreimage.set(item.preimage, item);
+  for (const page of pages) {
+    for (const preimage of readPreimagesForStatePage(page)) {
+      byPreimage.set(preimage, { preimage, hash: shadowAtomHash(preimage) });
+    }
+  }
+  return Array.from(byPreimage.values()).sort((a, b) => a.hash.localeCompare(b.hash));
+}
+
+function readPreimagesForStatePage(page: ShadowStatePage): string[] {
+  switch (page.page) {
+    case "verb_bytecode":
+      return [`read:cell:verb:${page.object}:${page.name}`];
+    default:
+      return [];
+  }
 }
 
 function trustedTransferAuthorities(input: Record<string, string> | undefined): Map<string, string> {
@@ -863,8 +931,13 @@ function objectClosureForPreimages(serialized: SerializedWorld, preimages: strin
 
 function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[]): ShadowStatePage[] {
   const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const catalogObjects = serialized.objects
+    .filter((obj) => obj.id.startsWith("$"))
+    .sort((a, b) => a.id.localeCompare(b.id));
   const selectedObjects = objectClosureForPreimages(serialized, preimages);
   const pages = new Map<string, ShadowStatePage>();
+  const visitedLookups = new Set<string>();
+  const expandedVerbPages = new Set<string>();
 
   const addPage = (page: ShadowStatePage): void => {
     pages.set(shadowStatePageHash(page), page);
@@ -911,12 +984,39 @@ function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[
       if (page.page === "property_cell") addPage(page);
     }
   };
-  const addVerbPage = (object: ObjRef, name: string): void => {
-    const obj = byId.get(object);
-    const verb = obj?.verbs.find((item) => item.name === name);
-    if (!obj || !verb) return;
-    const page = shadowVerbBytecodePages(obj).find((item) => item.name === name);
-    if (page) addPage(page);
+  const addVerbLookupClosure = (object: ObjRef, name: string): void => {
+    const lookupKey = `${object}:${name}`;
+    if (visitedLookups.has(lookupKey)) return;
+    visitedLookups.add(lookupKey);
+    let current: ObjRef | null | undefined = object;
+    while (current) {
+      const obj = byId.get(current);
+      if (!obj) return;
+      addObjectScaffold(current);
+      const page = shadowVerbBytecodePages(obj).find((item) => item.name === name);
+      if (page) {
+        addPage(page);
+        addVerbCallClosure(page, object);
+        return;
+      }
+      current = obj.parent;
+    }
+  };
+  const addCatalogVerbLookups = (name: string): void => {
+    for (const obj of catalogObjects) {
+      if (obj.verbs.some((verb) => verb.name === name || verb.aliases.includes(name))) {
+        addVerbLookupClosure(obj.id, name);
+      }
+    }
+  };
+  const addVerbCallClosure = (page: Extract<ShadowStatePage, { page: "verb_bytecode" }>, receiver: ObjRef): void => {
+    const pageKey = `${page.object}:${page.name}`;
+    if (expandedVerbPages.has(pageKey)) return;
+    expandedVerbPages.add(pageKey);
+    for (const call of page.verb.calls ?? []) {
+      if (call.this_call) addVerbLookupClosure(receiver, call.name);
+      else addCatalogVerbLookups(call.name);
+    }
   };
 
   for (const id of selectedObjects) addLineage(id);
@@ -929,7 +1029,7 @@ function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[
     const prop = propCellFromTurnKeyPreimage(preimage);
     if (prop) addPropertyLookupPages(prop.object, prop.name);
     const verb = verbCellFromTurnKeyPreimage(preimage);
-    if (verb) addVerbPage(verb.object, verb.name);
+    if (verb) addVerbLookupClosure(verb.object, verb.name);
     const structural = structuralObjectFromTurnKeyPreimage(preimage);
     if (structural) addObjectScaffold(structural);
   }

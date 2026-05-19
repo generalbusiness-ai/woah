@@ -32,6 +32,7 @@ export type V2AppliedFrameMessage = {
 export type V2TurnResultMessage = {
   kind: "turn_result";
   frame: DirectResultFrame | ErrorFrame;
+  optimistic?: boolean;
 };
 
 export type V2ProjectionSnapshot = {

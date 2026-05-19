@@ -4,8 +4,10 @@ import {
   buildShadowCellPageTransfer,
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
+  installShadowStateTransfer,
   shadowObjectRecordHash,
   type ShadowExecutionNode,
+  type ShadowMissingAtom,
   type ShadowStateTransfer,
   type ShadowTurnExecRequest,
   type ShadowTurnExecReply,
@@ -14,7 +16,7 @@ import {
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
-import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -287,6 +289,7 @@ export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
+  executable_transfer: ShadowStateTransfer;
   ads: ShadowCapabilityAd[];
   preseeded_objects: number;
   transfer_mode: "projection" | "delta";
@@ -331,7 +334,14 @@ export type ShadowExecutableStateTransferRequest = {
   id?: string;
   scope: ObjRef;
   key: ShadowTurnKey;
+  // Hashes are sufficient when the requested atoms appear in `key.preimages`
+  // (the planned transcript saw them). When the request originates from an
+  // `E_NEED_STATE` throw, the recorder bailed before recording the access, so
+  // the planned key has no entry for those atoms; in that case the requester
+  // MUST send `missing_atoms` with explicit preimages so the relay can build
+  // the cell-page closure without inventing it from the partial key.
   atom_hashes?: string[];
+  missing_atoms?: ShadowMissingAtom[];
   known_page_hashes?: string[];
   mode?: "cell_pages";
 };
@@ -610,13 +620,227 @@ export async function openShadowBrowserScope(
   // every cache fill goes through the same recipient-bound verification path.
   const transfer = buildShadowBrowserCatchupTransfer(browser.relay, browser.scope, browser.node, options.last_known_head, shadowProjectionViewer(browser));
   applyShadowBrowserTransfer(browser, transfer);
+  const executableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+  installShadowStateTransfer(browser.execution_node, executableTransfer);
+  applyShadowBrowserTransfer(browser, executableTransfer);
   return {
     projection: browser.cache.projections.get(browser.scope) ?? (transfer.mode === "projection" ? transfer.projection : null),
     transfer,
+    executable_transfer: executableTransfer,
     ads: shadowBrowserScopeExecutionAds(browser.relay, browser.scope),
     preseeded_objects: preseed.length,
     transfer_mode: transfer.mode
   };
+}
+
+export function buildShadowBrowserOpenExecutableSeedTransfer(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  recipient: string,
+  actor?: ObjRef
+): ShadowStateTransfer {
+  // Scope open needs enough executable material for the browser to plan the
+  // first durable turn locally. This seed grants only coarse structural atom
+  // coverage for the scope/actor/content scaffold; after planning derives the
+  // exact TurnKey, ordinary missing-state repair installs the specific verb and
+  // property cells before the browser submits a TurnExecRequest.
+  const preimages = shadowBrowserOpenExecutableSeedPreimages(relay.commit_scope.serialized, scope, actor);
+  const key: ShadowTurnKey = {
+    kind: "woo.turn_key.shadow.v1",
+    scope,
+    actor: actor ?? "",
+    target: scope,
+    verb: "__open_executable_seed__",
+    preimages,
+    atom_hashes: preimages.map(shadowAtomHash),
+    read_preimages: preimages,
+    read_atom_hashes: preimages.map(shadowAtomHash),
+    write_preimages: [],
+    write_atom_hashes: [],
+    accept_preimages: preimages,
+    accept_atom_hashes: preimages.map(shadowAtomHash)
+  };
+  return buildShadowCellPageTransfer({
+    serialized: shadowBrowserOpenExecutableSeedSerialized(relay.commit_scope.serialized, scope, actor),
+    key,
+    recipient
+  });
+}
+
+function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, scope: ObjRef, actor?: ObjRef): string[] {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const preimages = new Set<string>();
+  const add = (preimage: string): void => {
+    preimages.add(preimage);
+  };
+  add(`scope:${scope}`);
+  add(`target:${scope}`);
+  if (actor) add(`actor:${actor}`);
+  for (const id of byId.get(scope)?.contents ?? []) add(`target:${id}`);
+
+  const scopeObj = byId.get(scope);
+  const actorObj = actor ? byId.get(actor) : undefined;
+  const actorLocationObj = actorObj?.location ? byId.get(actorObj.location) : undefined;
+  if (scopeObj) addOpenSeedObjectCells(scopeObj, add, { writeProps: true, writeContents: true });
+  if (actorObj) addOpenSeedObjectCells(actorObj, add, { writeLocation: true });
+  if (actorLocationObj) {
+    addOpenSeedObjectCells(actorLocationObj, add, { writeContents: true });
+    // A first local `enter` moves the actor out of their current room before
+    // entering the tool scope. The generic movement chain probes
+    // oldLocation:exitfunc even when no concrete hook exists, so seed that
+    // inherited verb lookup at open instead of forcing the first click through
+    // a repair round.
+    addOpenSeedVerbLookupCells(serialized, actorLocationObj.id, ["exitfunc"], add);
+  }
+
+  // Catalog lineage and property cells are executable metadata: they let a
+  // partial browser shard interpret objects that arrive later from accepted
+  // transcripts. Without these pages, `isa()` and inherited property walks can
+  // degrade to false/not-found inside a syntactically valid local world. Verb
+  // bytecode remains exact-repair driven because all bundled catalog bytecode is
+  // too large for the open envelope.
+  addOpenSeedCatalogExecutableCells(serialized, add);
+
+  // The browser cannot derive a first-turn key without the selected verb's
+  // bytecode. Scope-lineage verb pages cover normal tool controls while keeping
+  // large content-object catalogs out of the open envelope; content-specific
+  // verbs still arrive through exact missing-state repair after the key exists.
+  let current: ObjRef | null | undefined = scope;
+  while (current) {
+    const obj = byId.get(current);
+    if (!obj) break;
+    for (const verb of obj.verbs) {
+      add(`read:cell:verb:${obj.id}:${verb.name}`);
+      add(`call:${scope}:${verb.name}`);
+    }
+    current = obj.parent;
+  }
+  return [
+    ...preimages
+  ].sort();
+}
+
+function addOpenSeedVerbLookupCells(
+  serialized: SerializedWorld,
+  receiver: ObjRef,
+  names: readonly string[],
+  add: (preimage: string) => void
+): void {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const wanted = new Set(names);
+  let current: ObjRef | null | undefined = receiver;
+  const seen = new Set<ObjRef>();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    const obj = byId.get(current);
+    if (!obj) return;
+    for (const name of wanted) add(`read:cell:verb:${obj.id}:${name}`);
+    current = obj.parent;
+  }
+  // Verb lookup can also pass through catalog feature/mixin classes that are
+  // not on the single parent chain. The open seed already ships catalog
+  // objects; for a tiny fixed hook set, include their lookup cells too so a
+  // missing inherited no-op hook never stalls the first local movement turn.
+  for (const obj of shadowBrowserCatalogObjects(serialized)) {
+    for (const name of wanted) add(`read:cell:verb:${obj.id}:${name}`);
+  }
+}
+
+function addOpenSeedCatalogExecutableCells(
+  serialized: SerializedWorld,
+  add: (preimage: string) => void
+): void {
+  for (const obj of shadowBrowserCatalogObjects(serialized)) {
+    add(`read:cell:lifecycle:${obj.id}`);
+    addOpenSeedObjectCells(obj, add);
+  }
+}
+
+function addOpenSeedObjectCells(
+  obj: SerializedObject,
+  add: (preimage: string) => void,
+  options: { writeProps?: boolean; writeLocation?: boolean; writeContents?: boolean } = {}
+): void {
+  for (const name of openSeedPropertyNames(obj)) {
+    add(`read:cell:prop:${obj.id}.${name}`);
+    if (options.writeProps === true) add(`write:cell:prop:${obj.id}.${name}`);
+  }
+  if (options.writeLocation === true) {
+    add(`read:cell:location:${obj.id}`);
+    add(`write:cell:location:${obj.id}`);
+  }
+  if (options.writeContents === true) {
+    add(`read:cell:contents:${obj.id}`);
+    add(`write:cell:contents:${obj.id}`);
+  }
+}
+
+function openSeedPropertyNames(obj: SerializedObject): string[] {
+  const names = new Set<string>([
+    "name",
+    "description",
+    "aliases",
+    "mount_room",
+    "subscribers",
+    "session_subscribers",
+    "focus_by_actor",
+    "last_undo"
+  ]);
+  for (const [name] of obj.properties) names.add(name);
+  for (const def of obj.propertyDefs) names.add(def.name);
+  return Array.from(names).sort();
+}
+
+function shadowBrowserOpenExecutableSeedSerialized(
+  serialized: SerializedWorld,
+  scope: ObjRef,
+  actor?: ObjRef
+): SerializedWorld {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const keep = new Set<ObjRef>();
+  const addWithLineage = (id: ObjRef | null | undefined): void => {
+    let current = id;
+    while (current) {
+      if (keep.has(current)) return;
+      const obj = byId.get(current);
+      if (!obj) return;
+      keep.add(current);
+      for (const feature of serializedFeatureRefs(obj)) addWithLineage(feature);
+      current = obj.parent;
+    }
+  };
+  for (const obj of shadowBrowserCatalogObjects(serialized)) keep.add(obj.id);
+  addWithLineage(scope);
+  addWithLineage(actor);
+  for (const content of byId.get(scope)?.contents ?? []) addWithLineage(content);
+  return {
+    version: serialized.version,
+    objectCounter: serialized.objectCounter,
+    parkedTaskCounter: serialized.parkedTaskCounter,
+    sessionCounter: serialized.sessionCounter,
+    objects: serialized.objects
+      .filter((obj) => keep.has(obj.id))
+      .map((obj) => structuredClone(obj) as SerializedObject)
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    sessions: serialized.sessions
+      .filter((session) => session.actor === actor)
+      .map((session) => structuredClone(session) as SerializedSession)
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    logs: serialized.logs
+      .filter(([space]) => space === scope)
+      .map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]] as SerializedWorld["logs"][number]),
+    snapshots: serialized.snapshots
+      .filter((snapshot) => snapshot.space_id === scope)
+      .map((snapshot) => structuredClone(snapshot)),
+    parkedTasks: [],
+    tombstones: [...(serialized.tombstones ?? [])].sort()
+  };
+}
+
+function serializedFeatureRefs(obj: SerializedObject): ObjRef[] {
+  const value = obj.properties.find(([name]) => name === "features")?.[1];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is ObjRef => typeof item === "string");
 }
 
 export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCapabilityAd[] {
@@ -1136,11 +1360,22 @@ export function handleShadowBrowserStateTransferEnvelope(
     throw new Error(`state transfer scope mismatch: request=${request.scope} key=${request.key.scope} relay=${browser.relay.commit_scope.scope}`);
   }
   if (request.mode && request.mode !== "cell_pages") throw new Error(`unsupported state transfer mode: ${request.mode}`);
+  // `missing_atoms` (with preimages) wins over `atom_hashes` when both are
+  // present: the request originates from an `E_NEED_STATE` throw whose recorder
+  // bailed before recording the access, so the planned key has no entry for
+  // those atoms and a hash-only lookup against `key.preimages` returns nothing.
+  // Passing the preimages through `missing_atoms` lets the transfer builder
+  // resolve the exact cell pages directly.
   const transfer = buildShadowCellPageTransfer({
     serialized: browser.relay.commit_scope.serialized,
     key: request.key,
     atom_hashes: request.atom_hashes,
-    known_page_hashes: request.known_page_hashes ?? browser.execution_node.page_hashes,
+    missing_atoms: request.missing_atoms,
+    // Only the requester can say which IndexedDB pages it already possesses.
+    // The relay's in-process execution node may have the same pages from open
+    // seeding, but treating that server-local cache as client possession makes
+    // cold repair replies reference pages the browser never stored.
+    known_page_hashes: request.known_page_hashes ?? [],
     session: browser.session,
     recipient: browser.node
   });
@@ -1335,7 +1570,15 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
       node: nodeId,
       scope: request.key.scope,
       serialized: relay.commit_scope.serialized,
-      atom_hashes: request.key.atom_hashes
+      atom_hashes: request.key.atom_hashes,
+      // The relay-default executor owns the full authoritative serialized
+      // state for its commit scope. Marking it authoritative disables the
+      // atom-guard that exists to detect partial-cache misses on delegate
+      // executors — without this, a browser-built request whose planned key
+      // omits cells the verb's actual run touches drives the network-side
+      // repair loop to its bound and returns `missing_state` to the browser
+      // even though the cells exist in serialized.
+      authoritative_state: true
     });
     fresh.committed_head_hash = relay.commit_scope.head.hash;
     fresh.serialized_generation = relay.serialized_generation;

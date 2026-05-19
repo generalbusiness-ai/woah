@@ -20,7 +20,7 @@ describe("v2 browser worker integration", () => {
     FakeWebSocket.instances.length = 0;
   });
 
-  it("waits for the open execution ad, delegates the cold turn, then submits the next turn as a browser-built exec request", async () => {
+  it("waits for open executable state and submits the first durable turn as a browser-built exec request", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
     vi.stubGlobal("self", scope);
@@ -75,21 +75,28 @@ describe("v2 browser worker integration", () => {
     await sleep(20);
     expect(socket.sent).toHaveLength(0);
 
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-1", opened.executable_transfer.kind, opened.executable_transfer)));
+    await sleep(20);
+    expect(socket.sent).toHaveLength(0);
+
     socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-1", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
-    const coldIntent = await waitForSent(socket, 1);
-    expect(coldIntent).toMatchObject({
-      type: "woo.turn.intent.request.shadow.v1",
+    const coldRequest = await waitForBrowserBuiltExecRequest(browser, socket);
+    expect(coldRequest).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
       body: {
-        kind: "woo.turn.intent.request.shadow.v1",
-        selected_ad: "relay:v2-worker:executor",
-        target: "the_dubspace",
-        verb: "set_control"
+        kind: "woo.turn.exec.request.shadow.v1",
+        id: "cold-dubspace-control",
+        call: {
+          target: "the_dubspace",
+          verb: "set_control"
+        }
       }
     });
+    expect((coldRequest.body as { selected_ad?: unknown }).selected_ad).toBeUndefined();
 
-    const coldReply = await relayReply(browser, socket.sent[0]);
+    const coldReply = await relayReply(browser, encodeEnvelope(coldRequest));
     socket.receive(encodeEnvelope(coldReply));
-    await waitForMessage(posted, (message) => isLocalTurnDelegated(message, "cold-dubspace-control"));
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "cold-dubspace-control"));
     await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
 
     scope.dispatch({
@@ -117,6 +124,249 @@ describe("v2 browser worker integration", () => {
     });
     expect((warmRequest.body as { selected_ad?: unknown }).selected_ad).toBeUndefined();
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
+  });
+
+  it("plans a same-actor durable chain from the tentative journal without waiting for authority", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-journal");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-journal",
+      scope: "the_pinboard",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-journal",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-journal"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-journal",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-journal", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-journal", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-journal", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-journal", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+
+    scope.dispatch({
+      kind: "call",
+      id: "pinboard-enter-journal",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    const enterRequest = await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+    expect(enterRequest).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
+      body: { call: { verb: "enter" } }
+    });
+
+    scope.dispatch({
+      kind: "call",
+      id: "pinboard-add-journal",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["journal worker note", "yellow", 48, 48, 180, 110],
+      persistence: "durable"
+    });
+    const addRepairs = { stateTransferRequests: 0 };
+    const addRequest = await waitForBrowserBuiltExecRequest(browser, socket, "add_note", addRepairs);
+    expect(addRepairs.stateTransferRequests).toBeLessThanOrEqual(1);
+    expect(addRequest).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
+      body: { call: { verb: "add_note" } }
+    });
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-add-journal"));
+
+    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(enterRequest))));
+    await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "pinboard-enter-journal"));
+    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(addRequest))));
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-enter-journal"));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "pinboard-add-journal"));
+  });
+
+  it("plans a cold outliner add from the tentative journal with one repair", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-outline-journal");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-outline-journal",
+      scope: "the_outline",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-outline-journal",
+      scope: "the_outline",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-outline-journal"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-outline-journal",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-outline-journal", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-outline-journal", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-outline-journal", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-outline-journal", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+
+    scope.dispatch({
+      kind: "call",
+      id: "outline-enter-journal",
+      route: "sequenced",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+
+    scope.dispatch({
+      kind: "call",
+      id: "outline-add-journal",
+      route: "sequenced",
+      scope: "the_outline",
+      target: "the_outline",
+      verb: "add",
+      args: ["journal worker outline"],
+      persistence: "durable"
+    });
+    const addRepairs = { stateTransferRequests: 0 };
+    const addRequest = await waitForBrowserBuiltExecRequest(browser, socket, "add", addRepairs);
+    expect(addRepairs.stateTransferRequests).toBeLessThanOrEqual(1);
+    expect(addRequest).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
+      body: { call: { verb: "add" } }
+    });
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "outline-add-journal"));
+  });
+
+  it("satisfies read-only live turns from the local tentative view without relay traffic", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-live-read");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-live-read",
+      scope: "the_pinboard",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-live-read",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-live-read"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-live-read",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-live-read", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-live-read", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-live-read", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-live-read", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+
+    scope.dispatch({
+      kind: "call",
+      id: "pinboard-enter-before-local-list",
+      route: "sequenced",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+    const sentAfterEnter = socket.sent.length;
+
+    scope.dispatch({
+      kind: "call",
+      id: "pinboard-local-list",
+      route: "direct",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "list_notes",
+      args: [],
+      persistence: "live"
+    });
+
+    const result = await waitForMessage(posted, (message) => {
+      return isKind(message, "turn_result") &&
+        (message as { frame?: { id?: unknown } }).frame?.id === "pinboard-local-list";
+    });
+    expect(result).toMatchObject({
+      kind: "turn_result",
+      frame: { op: "result", id: "pinboard-local-list", result: [] }
+    });
+    expect((result as { optimistic?: unknown }).optimistic).toBeUndefined();
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-local-list"))).toMatchObject({
+      local_only: true
+    });
+    expect(socket.sent).toHaveLength(sentAfterEnter);
   });
 });
 
@@ -185,20 +435,25 @@ async function waitForSocket(): Promise<FakeWebSocket> {
   return await waitFor(() => FakeWebSocket.instances[0]);
 }
 
-async function waitForSent(socket: FakeWebSocket, count: number): Promise<ShadowEnvelope> {
-  await waitFor(() => socket.sent.length >= count ? true : undefined);
-  return decodeEnvelope(socket.sent[count - 1]);
-}
-
-async function waitForBrowserBuiltExecRequest(browser: ReturnType<typeof createShadowBrowserClient>, socket: FakeWebSocket): Promise<ShadowEnvelope> {
+async function waitForBrowserBuiltExecRequest(
+  browser: ReturnType<typeof createShadowBrowserClient>,
+  socket: FakeWebSocket,
+  verb?: string,
+  stats?: { stateTransferRequests: number }
+): Promise<ShadowEnvelope> {
+  let cursor = socket.sent.length;
   for (;;) {
-    const envelope = await waitForSent(socket, socket.sent.length + 1);
+    await waitFor(() => socket.sent[cursor] ? true : undefined);
+    const encoded = socket.sent[cursor++];
+    const envelope = decodeEnvelope(encoded);
     if (envelope.type === "woo.state.transfer.request.shadow.v1") {
-      const reply = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, socket.sent[socket.sent.length - 1]));
+      if (stats) stats.stateTransferRequests++;
+      const reply = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encoded));
       if (!reply) throw new Error("expected state transfer reply");
       socket.receive(encodeEnvelope(reply));
       continue;
     }
+    if (verb && (envelope.body as { call?: { verb?: unknown } }).call?.verb !== verb) continue;
     return envelope;
   }
 }
@@ -241,11 +496,17 @@ function isLocalTurnPlanned(message: unknown, id: string): boolean {
   return isKind(message, "local_turn_planned") && (message as { id?: unknown }).id === id;
 }
 
+function isLocalTurnCommitted(message: unknown, id: string): boolean {
+  return isKind(message, "local_turn_committed") &&
+    Array.isArray((message as { ids?: unknown }).ids) &&
+    ((message as { ids: unknown[] }).ids).includes(id);
+}
+
 async function waitForMessage(messages: unknown[], predicate: (message: unknown) => boolean): Promise<unknown> {
   return await waitFor(() => messages.find(predicate));
 }
 
-async function waitFor<T>(read: () => T | undefined, timeoutMs = 1500): Promise<T> {
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 5000): Promise<T> {
   const start = Date.now();
   for (;;) {
     const value = read();

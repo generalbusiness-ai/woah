@@ -825,7 +825,8 @@ type ExecCapabilityAd = {
 };
 ```
 
-During the browser migration, a relay MAY also accept
+During the browser migration, a relay MAY also accept, behind an explicit
+compatibility flag,
 `woo.turn.intent.request.v1` from a browser node. The intent contains `id`,
 `route`, `scope`, `target`, `verb`, `args`, optional `persistence`, and optional
 `selected_ad`, but not a `TurnKey`. It is a transitional server-assisted
@@ -834,20 +835,19 @@ its authoritative scope state, derives the `TurnKey`, preserves `selected_ad`
 onto the derived `TurnExecRequest`, and then processes the turn through the same
 `TurnExecRequest`/`TurnExecReply` path. Browsers MUST treat this as
 server-assisted planning, not as proof that local closure execution is complete.
-If the browser has no executable state yet, it MAY choose a scope-matching
-gossiped `ExecCapabilityAd` for `selected_ad`; exact atom coverage is still
-checked after planning, and the delegated reply still has to warm the browser
-cache as described in VTN14.4. Production v2 uses browser-built keys and
-browser-submitted `TurnExecRequest` messages once the worker can reconstruct
-executable state from verified pages.
+Production v2 uses browser-built keys and browser-submitted `TurnExecRequest`
+messages once the worker can reconstruct executable state from verified pages.
+Normal durable browser surfaces MUST NOT use selected-ad intents; when the
+browser is cold it first installs the open executable seed, plans locally, and
+then repairs exact missing atoms or delegates a complete `TurnExecRequest`.
 
 A scope open SHOULD emit at least one standalone `ExecCapabilityAd` envelope for
 the opened scope when the relay has an executor route it is willing to serve.
-Such a scope-level cold-start ad MAY have empty `covers` and `accepts` filters:
-the browser can use it only before deriving an exact `TurnKey`, and relay-side
-planning plus executor `missing_state` checks remain the authority for the
-resulting delegated turn. Reply-bundled ads MAY continue to carry exact coverage
-for later local-planned turns.
+Such a scope-level cold-start ad MAY have empty `covers` and `accepts` filters.
+The browser can use it only after it has derived an exact `TurnKey`; the empty
+filters advertise executor reachability for the opened scope, not proof of atom
+coverage. Reply-bundled ads MAY continue to carry exact coverage for later
+local-planned turns.
 
 Every internal open/envelope forwarded to a CommitScopeDO SHOULD carry an
 authority slice:
@@ -1249,7 +1249,8 @@ The completed browser path for a committed UI action is:
 
 ```text
 UI -> worker: TurnIntent or direct TurnCall
-worker: reconstruct execution node from verified pages
+relay -> worker: open projection/catch-up transfer and executable seed transfer
+worker: reconstruct execution node from verified executable pages
 worker: build or reuse TurnCall
 worker: run command planning if needed
 worker: if local cache covers the TurnKey, execute VM turn locally in transcript mode
@@ -1404,9 +1405,9 @@ An implementation does not claim browser-edge v2 completion until tests cover:
   outliner contents through a gateway/cache-only projection;
 - reconnect from a stale head falls back to projection without confirming or
   deleting unresolved optimistic turns;
-- unselected durable `woo.turn.intent.request.v1` usage is disabled; remaining
-  server-assisted intents are limited to live turns and selected cold
-  delegation.
+- durable `woo.turn.intent.request.v1` usage is disabled for normal browser
+  surfaces; remaining server-assisted intents are limited to live turns and
+  explicit compatibility-mode selected cold delegation.
 
 Implementation status: the in-process v2 simulator includes a browser-shaped
 node/relay shim with an object-page cache, scope projection cache, pending-turn
@@ -1576,15 +1577,16 @@ spreading.
    `woo.effect_transcript.v1` with `base`, `vm`, logical inputs, complete read
    and write facts, and pre/post state hashes.
 3. **IndexedDB execution cache.** The browser worker persists verified
-   executable pages with proof metadata, reconstructs an execution node from
-   IndexedDB, and refuses to use projection rows for VM reads.
+   executable pages with proof metadata, installs an open-time executable seed
+   for the current scope, reconstructs an execution node from IndexedDB, and
+   refuses to use projection rows for VM reads.
 4. **Missing-state repair.** Browser local execution requests closure
    transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
    same turn id locally before delegation.
 5. **Browser-planned committed turns.** Chat movement/carrying, pinboard,
    kanban, and dubspace committed controls submit browser-built
    `TurnExecRequest` messages by default. `woo.turn.intent.request.v1` remains
-   only as a measured fallback.
+   only behind an explicit compatibility flag for durable turns.
 6. **Gossiped whole-turn delegation.** When the browser cannot execute locally,
    it ranks `ExecCapabilityAd`s, delegates the whole turn to the best suitable
    executor, verifies the returned transcript/state transfer, and installs the

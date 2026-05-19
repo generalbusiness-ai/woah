@@ -152,6 +152,7 @@ export class CommitScopeDO {
             hello,
             head: relay.commit_scope.head,
             transfer: opened.transfer,
+            executable_transfer: opened.executable_transfer,
             ads: opened.ads
           } satisfies CommitScopeOpenResponse);
         } catch (err) {
@@ -882,6 +883,7 @@ type CommitScopeOpenResponse = {
   hello: ShadowTransportHello;
   head: ShadowScopeHead;
   transfer: ShadowBrowserStateTransfer;
+  executable_transfer: ShadowBrowserStateTransfer;
   ads: ShadowCapabilityAd[];
 };
 

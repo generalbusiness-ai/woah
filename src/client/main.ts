@@ -465,7 +465,10 @@ function ensureV2BrowserWorker() {
       const message = event.data as V2TurnResultMessage;
       window.dispatchEvent(new CustomEvent("woo.v2.turn_result", { detail: message }));
       if (v2TestHooksEnabled) console.debug("woo.v2.turn_result", message);
-      if (message.frame.op === "result") receiveDirectResultFrame(message.frame);
+      if (message.frame.op === "result") {
+        if (message.optimistic === true) receiveOptimisticResultFrame(message.frame);
+        else receiveDirectResultFrame(message.frame);
+      }
       else receiveErrorFrame(message.frame);
     }
     if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed") {
@@ -529,6 +532,21 @@ function receiveDirectResultFrame(frame: any) {
       renderChatCommandResult(commandContext.action ?? chatCommandUiActionFromPlan(frame.command), frame.result, commandContext.text);
     }
   }
+}
+
+function receiveOptimisticResultFrame(frame: any) {
+  // Optimistic frames are display-only previews of the verb's intended effects
+  // — the worker emits them right after local planning, before the relay has
+  // confirmed the commit. They surface observations and projection-shaped move
+  // results so controls can advance against the local tentative journal, but
+  // they MUST NOT fire the pendingDirect/onResult handler: those callbacks gate
+  // committed side effects such as refreshes and external hydration.
+  for (const observation of frame.observations ?? []) {
+    ui.ingestLiveObservation(observation);
+    receiveLiveEvent(observation);
+  }
+  applyScopedMoveResult(frame.result);
+  render();
 }
 
 function receiveErrorFrame(frame: any, socket?: WebSocket) {
@@ -1971,15 +1989,25 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
   return planId;
 }
 
-function callWithError(space: string, target: string, verb: string, args: unknown[] = [], onError?: (error: any) => void, options?: ProjectionCallOptions) {
+function callWithError(space: string, target: string, verb: string, args: unknown[] = [], onError?: (error: any) => void, options?: ProjectionCallOptions): Promise<unknown> {
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
-  if (onError) pendingFrameErrors.set(id, onError);
-  if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) {
-    ui.failOptimisticCall(id);
-    pendingFrameErrors.delete(id);
-  }
-  return id;
+  return new Promise((resolve, reject) => {
+    pendingDirect.set(id, resolve);
+    pendingFrameErrors.set(id, (error: any) => {
+      pendingDirect.delete(id);
+      onError?.(error);
+      reject(error);
+    });
+    if (!sendV2TurnIntent({ id, route: "sequenced", scope: space, target, verb, args, persistence: "durable" })) {
+      const error = { code: "E_V2_SEND_FAILED", message: "failed to send v2 turn intent" };
+      ui.failOptimisticCall(id);
+      pendingDirect.delete(id);
+      pendingFrameErrors.delete(id);
+      onError?.(error);
+      reject(error);
+    }
+  });
 }
 
 function actorPresenceList(actor: string): string[] {

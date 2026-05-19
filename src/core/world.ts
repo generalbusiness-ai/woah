@@ -31,7 +31,7 @@ import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
-import { objectCreateEvent, type ActiveTurnRecorder, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
+import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 import { readObjectPropertyValue } from "./property-read";
 import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
@@ -589,6 +589,10 @@ export class WooWorld {
       direct_callable: verb.direct_callable,
       ...(verb.kind === "native" ? { native: verb.native } : {})
     });
+  }
+
+  recordTurnStateProbe(cell: RecordedCell): void {
+    this.recordTurnEvent({ kind: "state_probe", cell });
   }
 
   private recordedEventWithWriter(event: TurnRecorderEvent): TurnRecorderEvent {
@@ -1326,6 +1330,7 @@ export class WooWorld {
     while (current) {
       const obj = startRef !== null ? this.parentWalkLookup(startRef, current) : this.objects.get(current) ?? null;
       if (!obj) break;
+      if (current !== startRef) this.recordTurnStateProbe({ kind: "verb", object: current, name });
       const verb = this.ownVerbNamed(current, name);
       if (verb) return { definer: current, verb };
       current = obj.parent;

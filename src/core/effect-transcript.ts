@@ -59,6 +59,11 @@ export type EffectTranscript = {
   session?: string | null;
   call: Pick<TurnStart, "actor" | "target" | "verb" | "args" | "body">;
   reads: TranscriptRead[];
+  // State probes are materialization dependencies, not user-visible reads.
+  // They capture negative lookup edges such as "$pin has no text verb, so
+  // dispatch fell through to $note:text"; a partial executor must have these
+  // cells before it can safely replay the turn locally.
+  stateProbes?: TranscriptCell[];
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];
   moves: TranscriptMove[];
@@ -91,6 +96,7 @@ export type TranscriptCellReader = {
 export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTranscript {
   const reads: TranscriptRead[] = [];
   const writes: TranscriptWrite[] = [];
+  const stateProbes: TranscriptCell[] = [];
   const creates: TranscriptCreate[] = [];
   const moves: TranscriptMove[] = [];
   const observations: Observation[] = [];
@@ -187,6 +193,9 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           incompleteReasons.add(`native:${event.target}:${event.verb}`);
         }
         break;
+      case "state_probe":
+        stateProbes.push(event.cell);
+        break;
       case "untracked_effect":
         untrackedEffects.push({
           name: event.name,
@@ -218,6 +227,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
       ...(turn.start.body !== undefined ? { body: turn.start.body } : {})
     },
     reads,
+    ...(stateProbes.length > 0 ? { stateProbes: uniqueCells(stateProbes) } : {}),
     writes,
     creates,
     moves,
@@ -316,6 +326,18 @@ function sameTurnReadMatchesOwnWrite(transcript: EffectTranscript, read: Transcr
     (write.next === undefined || write.next === read.version) &&
     stableJson(write.value) === stableJson(read.value)
   );
+}
+
+function uniqueCells(cells: TranscriptCell[]): TranscriptCell[] {
+  const seen = new Set<string>();
+  const out: TranscriptCell[] = [];
+  for (const cell of cells) {
+    const key = stableJson(cell as unknown as WooValue);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cell);
+  }
+  return out.sort((a, b) => stableJson(a as unknown as WooValue).localeCompare(stableJson(b as unknown as WooValue)));
 }
 
 function lastMoveForObject(transcript: EffectTranscript, object: ObjRef): TranscriptMove | undefined {
