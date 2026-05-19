@@ -580,9 +580,15 @@ function receiveOptimisticResultFrame(frame: any) {
   // committed side effects such as refreshes and external hydration.
   const observations = frame.observations ?? [];
   const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
+  // Tag chat lines pushed from optimistic observations with the turn id so
+  // the authoritative reply (receiveAppliedFrame for durable verbs,
+  // receiveDirectResultFrame for live verbs) can clear them before pushing
+  // its own copy. Without this, every durable command shows two chat lines:
+  // one from the local preview and one from the committed transcript.
+  const provisionalTurnId = typeof frame.id === "string" ? frame.id : undefined;
   for (const observation of observations) {
     ui.ingestLiveObservation(observation);
-    receiveLiveEvent(observation, { suppressPinboardNotesRefresh: true });
+    receiveLiveEvent(observation, { suppressPinboardNotesRefresh: true, provisionalTurnId });
   }
   if (needsPinboardNotesRefresh) {
     pinboardNotesRefreshPending = false;
@@ -2247,7 +2253,7 @@ function commitCueControls(target: string) {
   for (const [name, value] of values) callDubspaceMutation("set_control", [target, name, value]);
 }
 
-function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefresh?: boolean } = {}) {
+function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefresh?: boolean; provisionalTurnId?: string } = {}) {
   if (isPinboardViewportObservation(observation)) {
     receivePinboardViewport(observation);
     return;
@@ -2305,7 +2311,7 @@ function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefr
     }
   }
   if (isChatObservation(observation)) {
-    receiveChatEvent(observation);
+    receiveChatEvent(observation, true, { provisionalTurnId: options.provisionalTurnId });
     return;
   }
   if (isDubspaceStateObservation(observation)) {
@@ -3145,7 +3151,7 @@ function clearPinboardViewports() {
   refreshPinboardMap();
 }
 
-function receiveChatEvent(observation: any, shouldRender = true) {
+function receiveChatEvent(observation: any, shouldRender = true, options: { provisionalTurnId?: string } = {}) {
   // `text` is a directed observation (spec/semantics/events.md §12.7.1) — it
   // belongs in its target's feed only. We still see other actors' lines in
   // our own DirectResultFrame.observations envelope (the originator gets the
@@ -3191,6 +3197,13 @@ function receiveChatEvent(observation: any, shouldRender = true) {
     ? formatterResult.text
     : (typeof observation.text === "string" ? observation.text : undefined);
   const kind = formatterResult?.kind ?? type;
+  // Optimistic-preview chat lines are tagged with the turn id so the authoritative
+  // applied/direct frame's `clearProvisionalChatForTurn(frame.id)` removes them
+  // before its own observations land; otherwise the same line appears twice
+  // (once from the local preview, once from the server reply).
+  const provisionalFields = options.provisionalTurnId
+    ? { provisional: true as const, turnId: options.provisionalTurnId }
+    : {};
   pushChatLine({
     kind,
     actor: typeof (formatterResult?.actor ?? observation.actor) === "string" ? (formatterResult?.actor ?? observation.actor) : undefined,
@@ -3200,7 +3213,8 @@ function receiveChatEvent(observation: any, shouldRender = true) {
     reason: typeof observation.reason === "string" ? observation.reason : undefined,
     source: chatObservationSource(observation),
     text: lineText,
-    ts: typeof observation.ts === "number" ? observation.ts : undefined
+    ts: typeof observation.ts === "number" ? observation.ts : undefined,
+    ...provisionalFields
   }, shouldRender);
 }
 

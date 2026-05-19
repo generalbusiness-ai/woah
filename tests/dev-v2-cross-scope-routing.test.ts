@@ -595,6 +595,42 @@ describe("dev v2 cross-scope WS routing", () => {
     expect(plan.space).toBe("the_pinboard");
   });
 
+  it("plans 'enter tub' (chatroom → chatroom) with plan.space === target so the SPA does not submit on the source room", async () => {
+    // Regression for the user-visible bug: standing on the_deck, typing
+    // `enter tub` in chat was returning `commit_rejected: scope_mismatch
+    // submit=the_hot_tub transcript=the_hot_tub scope=the_deck`. Root cause:
+    // chat:enter's arg_spec.command was missing `route: "sequenced"`, so the
+    // planner defaulted route="direct" and left plan.space=null. The SPA
+    // then submitted with intent.scope=the_deck (caller's chat room) while
+    // the executor ran the verb body against the_hot_tub — the validator
+    // saw submit.scope vs transcript.scope vs commitScope.scope all
+    // disagree. Adding `route: sequenced` to chat:enter mirrors the fix
+    // already in place for pinboard:enter and outliner:enter.
+    const world = createWorld();
+    const session = world.auth("guest:enter-tub-plan-space");
+    await world.directCall("setup:enter-chatroom-tub", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    await world.directCall("setup:goto-deck-tub", session.actor, "exit_living_room_southeast", "move", [session.actor], { sessionId: session.id });
+
+    const planFrame = await world.directCall(
+      "plan-enter-tub",
+      session.actor,
+      "the_deck",
+      "command_plan",
+      ["enter tub"],
+      { sessionId: session.id }
+    );
+    expect(planFrame.op).toBe("result");
+    if (planFrame.op !== "result") return;
+    const plan = planFrame.result as { ok?: boolean; route?: string; space?: string | null; target?: string; verb?: string };
+    expect(plan).toMatchObject({
+      ok: true,
+      route: "sequenced",
+      target: "the_hot_tub",
+      verb: "enter"
+    });
+    expect(plan.space).toBe("the_hot_tub");
+  });
+
   it("refreshes the destination relay's scope/target/actor rows when routing to a pre-existing cross-scope relay (regression: explicit-rows authority slice)", async () => {
     // Aligns the dev WS path with the explicit-rows authority-slice
     // contract the REST and MCP paths follow (`[input.scope, input.target,

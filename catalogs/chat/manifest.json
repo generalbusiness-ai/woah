@@ -1,6 +1,6 @@
 {
   "name": "chat",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "spec_version": "v1",
   "description": "Foundational chat primitives: $conversational feature, $match scaffolding, sentinel match objects, $room/$exit geography, $chatroom template class, and the $portable/$furniture base classes other catalogs build on. No instances seeded — install @local:demoworld for the bundled Living Room demo.",
   "license": "MIT",
@@ -819,7 +819,7 @@
             "args": [
               "actor?"
             ],
-            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced", "persistence": "durable" }
           },
           "source": "verb :enter(who) rxd { let old = location(actor); if (old != null && old != this && old != $nowhere) { try { observe_to_space(old, { type: \"left\", actor: actor, room: old, destination: this, text: actor.name + \" left.\", ts: now() }); } except err { } } moveto(actor, this); observe_to_space(this, { type: \"entered\", actor: actor, room: this, origin: old, text: actor.name + \" entered.\", ts: now() }); return { room: this, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
         },

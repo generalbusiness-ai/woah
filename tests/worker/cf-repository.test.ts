@@ -1811,7 +1811,10 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const tubPlan = await post("/api/objects/the_deck/calls/command_plan", { args: ["enter tub"] }, session);
       expect(tubPlan.status).toBe(200);
-      expect(tubPlan.body.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "enter", args: [] });
+      // chat:enter is sequenced (see catalogs/chat/manifest.json); cross-room
+      // `enter <space>` must plan on the target's scope or the commit submits
+      // on the caller's chatroom and rejects as scope_mismatch.
+      expect(tubPlan.body.result).toMatchObject({ ok: true, route: "sequenced", space: "the_hot_tub", target: "the_hot_tub", verb: "enter", args: [] });
 
       const pinboardPlan = await post("/api/objects/the_deck/calls/command_plan", { args: ["enter pinboard"] }, session);
       expect(pinboardPlan.status).toBe(200);
@@ -2703,7 +2706,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(planned).toMatchObject({ status: 200 });
       expect(planned.body.result).toMatchObject({
         ok: true,
-        route: "direct",
+        route: "sequenced",
         target: expect.any(String),
         verb: "enter"
       });

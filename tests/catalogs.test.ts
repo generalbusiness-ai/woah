@@ -2017,7 +2017,10 @@ describe("local catalogs", () => {
     const chatBareEnterPlan = await world.directCall("plan-chat-bare-enter", first.actor, "the_chatroom", "command_plan", ["enter"]);
     expect(chatBareEnterPlan.op).toBe("result");
     if (chatBareEnterPlan.op === "result") {
-      expect(chatBareEnterPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_chatroom", verb: "enter", args: [] });
+      // chat:enter is sequenced so cross-room `enter <space>` plans on the
+      // target's scope; same-scope `enter` (target === caller) also routes
+      // sequenced — plan.space === the_chatroom matches the caller's scope.
+      expect(chatBareEnterPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_chatroom", target: "the_chatroom", verb: "enter", args: [] });
     }
 
     const dubspaceFilterPlanBeforeEnter = await world.directCall("plan-dubspace-filter-before-enter", first.actor, "the_dubspace", "command_plan", ["`filter 500"]);
@@ -2055,7 +2058,9 @@ describe("local catalogs", () => {
     const dubspaceBareEnterPlan = await world.directCall("plan-dubspace-bare-enter", first.actor, "the_dubspace", "command_plan", ["enter"]);
     expect(dubspaceBareEnterPlan.op).toBe("result");
     if (dubspaceBareEnterPlan.op === "result") {
-      expect(dubspaceBareEnterPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "enter", args: [], persistence: "durable" });
+      // dubspace:enter is sequenced (matching pinboard/outliner/chat) so
+      // cross-room `enter dubspace` plans on the dubspace's scope.
+      expect(dubspaceBareEnterPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_dubspace", target: "the_dubspace", verb: "enter", args: [], persistence: "durable" });
     }
 
     const dubspaceBpmPlan = await world.directCall("plan-dubspace-bpm-direct", first.actor, "$match", "plan_command", ["bpm 142", "the_dubspace"]);
@@ -2442,7 +2447,10 @@ describe("local catalogs", () => {
     const enterTubPlan = await world.directCall("plan-enter-tub", session.actor, "the_deck", "command_plan", ["enter tub"]);
     expect(enterTubPlan.op).toBe("result");
     if (enterTubPlan.op === "result") {
-      expect(enterTubPlan.result).toMatchObject({ ok: true, route: "direct", target: "the_hot_tub", verb: "enter", args: [], persistence: "durable" });
+      // chat:enter carries `route: "sequenced"`, so cross-room `enter <space>`
+      // plans on the target's scope (the_hot_tub). Without this hint the
+      // intent submits on the caller's chatroom and rejects as scope_mismatch.
+      expect(enterTubPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_hot_tub", target: "the_hot_tub", verb: "enter", args: [], persistence: "durable" });
     }
 
     const takeTowel = await world.directCall("take-towel", session.actor, "the_deck", "take", ["towel"]);
