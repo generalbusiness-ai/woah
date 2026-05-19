@@ -10,6 +10,8 @@ export type ChatLine = {
   actor?: string;
   from?: string;
   to?: string;
+  turnId?: string;
+  provisional?: boolean;
   style?: string;
   reason?: string;
   source?: string;
@@ -337,7 +339,7 @@ export function renderChatLineHtml(line: ChatLine, actorLabel: ActorLabeler): st
     const detail = typeof line.reason === "string" && line.reason ? line.reason : "I don't understand that.";
     return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(detail)}</span></div>`;
   }
-  if (line.kind === "error") return `<div class="chat-line error"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "That didn't work.")}</span></div>`;
+  if (line.kind === "error") return `<div class="chat-line error${line.provisional ? " provisional" : ""}"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(line.text ?? "That didn't work.")}</span></div>`;
   if (line.kind === "entered" || line.kind === "left") {
     const text = line.text ?? `${actorLabel(line.actor)} ${line.kind === "entered" ? "entered" : "left"}.`;
     return `<div class="chat-line system"><span class="chat-time">${escapeHtml(time)}</span><span>${escapeHtml(text)}</span></div>`;

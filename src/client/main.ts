@@ -20,9 +20,10 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
-import { v2ProjectionSnapshotFromMessage, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
+import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
@@ -278,6 +279,7 @@ const spaceChatCollapsedKey = "woo.spaceChat.collapsed";
 const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("scopedProjectionSmoke");
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 const chatHistoryLimit = 80;
+const chatFeedLimit = 160;
 const drumVoices = [
   { id: "kick", label: "Kick" },
   { id: "snare", label: "Snare" },
@@ -466,11 +468,20 @@ function ensureV2BrowserWorker() {
       const message = event.data as V2TurnResultMessage;
       window.dispatchEvent(new CustomEvent("woo.v2.turn_result", { detail: message }));
       if (v2TestHooksEnabled) console.debug("woo.v2.turn_result", message);
-      if (message.frame.op === "result") {
-        if (message.optimistic === true) receiveOptimisticResultFrame(message.frame);
-        else receiveDirectResultFrame(message.frame);
+      switch (v2TurnResultRoute(message)) {
+        case "optimistic_result":
+          receiveOptimisticResultFrame(message.frame);
+          break;
+        case "optimistic_error":
+          receiveOptimisticErrorFrame(message.frame);
+          break;
+        case "final_result":
+          receiveDirectResultFrame(message.frame);
+          break;
+        case "final_error":
+          receiveErrorFrame(message.frame);
+          break;
       }
-      else receiveErrorFrame(message.frame);
     }
     if (event.data?.kind === "local_turn_invalidated") {
       window.dispatchEvent(new CustomEvent("woo.v2.local_turn_invalidated", { detail: event.data }));
@@ -530,6 +541,7 @@ function syncV2BrowserWorkerScope(scopeOverride?: string) {
 
 function receiveDirectResultFrame(frame: any) {
   completeV2TurnNetworkWait(frame.id);
+  const clearedProvisional = typeof frame.id === "string" ? clearProvisionalChatForTurn(frame.id, false) : false;
   const handler = pendingDirect.get(frame.id);
   if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
   for (const observation of frame.observations ?? []) {
@@ -549,6 +561,7 @@ function receiveDirectResultFrame(frame: any) {
       renderChatCommandResult(commandContext.action ?? chatCommandUiActionFromPlan(frame.command), frame.result, commandContext.text);
     }
   }
+  if (clearedProvisional && currentTabHasChatPanel()) render();
 }
 
 function receiveOptimisticResultFrame(frame: any) {
@@ -566,9 +579,27 @@ function receiveOptimisticResultFrame(frame: any) {
   render();
 }
 
+function receiveOptimisticErrorFrame(frame: any) {
+  // Optimistic errors are provisional local-cache previews. A missing object can
+  // be repaired by a state fetch or delegated execution, so show the local
+  // answer as retractable chat output without settling command handlers.
+  window.dispatchEvent(new CustomEvent("woo.v2.optimistic_error", { detail: frame }));
+  if (v2TestHooksEnabled) console.debug("woo.v2.optimistic_error", frame);
+  const id = typeof frame.id === "string" ? frame.id : "";
+  const commandContext = id ? pendingCommands.get(id) : undefined;
+  if (!id || !commandContext) return;
+  state.chatFeed = upsertProvisionalChatLine(
+    state.chatFeed,
+    provisionalChatErrorLine({ turnId: id, source: commandContext.space, error: frame.error }),
+    chatFeedLimit
+  );
+  if (currentTabHasChatPanel()) render();
+}
+
 function receiveErrorFrame(frame: any, socket?: WebSocket) {
   completeV2TurnNetworkWait(frame.id);
   const errorHandler = typeof frame.id === "string" ? pendingFrameErrors.get(frame.id) : undefined;
+  if (typeof frame.id === "string") clearProvisionalChatForTurn(frame.id, false);
   if (typeof frame.id === "string") {
     ui.failOptimisticCall(frame.id);
     pendingDirect.delete(frame.id);
@@ -596,6 +627,7 @@ function receiveErrorFrame(frame: any, socket?: WebSocket) {
 
 function receiveAppliedFrame(frame: any) {
   completeV2TurnNetworkWait(frame.id);
+  if (typeof frame.id === "string") clearProvisionalChatForTurn(frame.id, false);
   ui.ingestAppliedFrame(frame);
   applyScopedMoveResult(frame.result);
   const needsScopedDeferredLook = frame.result
@@ -3303,8 +3335,16 @@ function chatObservationSource(observation: any): string | undefined {
 }
 
 function pushChatLine(line: ChatLine, shouldRender = true) {
-  state.chatFeed = [...state.chatFeed, line].slice(-160);
+  state.chatFeed = [...state.chatFeed, line].slice(-chatFeedLimit);
   if (shouldRender && currentTabHasChatPanel()) render();
+}
+
+function clearProvisionalChatForTurn(turnId: string, shouldRender = true): boolean {
+  const cleared = clearProvisionalChatLines(state.chatFeed, turnId);
+  if (!cleared.removed) return false;
+  state.chatFeed = cleared.feed;
+  if (shouldRender && currentTabHasChatPanel()) render();
+  return true;
 }
 
 function pushChatSeparator(source: string, shouldRender = true) {
