@@ -2653,6 +2653,11 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect((await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session)).status).toBe(200);
       const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session);
       expect(goDeck.status, JSON.stringify(goDeck.body)).toBe(200);
+      // The assertion below is about bounded read-only planning, not satellite
+      // cold-start cost. Warm the routed deck host before stalling the nested
+      // destination host so the 1s race measures only the planning fan-out.
+      const warmDeck = await post("/api/objects/the_deck/calls/look", { args: [] }, session);
+      expect(warmDeck.status, JSON.stringify(warmDeck.body)).toBe(200);
       stallHotTub = true;
       env.WOO_HOST_READ_TIMEOUT_MS = "25";
 
