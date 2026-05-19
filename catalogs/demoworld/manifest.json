@@ -628,7 +628,7 @@
       "class": "$portable",
       "as": "the_towel",
       "name": "Deck Towel",
-      "description": "A striped towel folded over the deck rail, dry for now and ready to be taken along.",
+      "description": "A largish bath towel from Marks and Spencer. You can wave your towel in emergencies as a distress signal, and of course dry yourself off with it if it still seems to be clean enough.",
       "location": "the_deck",
       "properties": {
         "aliases": [
