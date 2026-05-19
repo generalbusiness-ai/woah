@@ -161,7 +161,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
       // commit the loser's executor still carries pre-race cell versions — a
       // re-run on stale serialized would just produce another transcript with
       // the same (now-pre-state-mismatched) reads.
-      selected.serialized = structuredClone(commitScope.serialized) as SerializedWorld;
+      selected.serialized = commitScope.serialized;
       selected.world = undefined;
       activeRequest = { ...activeRequest, expected: commitScope.head };
     } else {

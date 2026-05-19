@@ -154,6 +154,35 @@ export function shadowScopeHeadForSerialized(scope: ObjRef, epoch: number, seria
   };
 }
 
+function shadowScopeHeadForAcceptedCommit(
+  scope: ObjRef,
+  epoch: number,
+  previous: ShadowScopeHead,
+  transcriptHash: string,
+  postStateHash: string
+): ShadowScopeHead {
+  const seq = previous.seq + 1;
+  // The epoch root still hashes a full serialized state. Accepted heads only
+  // need to name the ordered commit position, so chaining from the previous head
+  // avoids re-hashing the whole world on every interaction.
+  const material = {
+    kind: "woo.scope_head_commit_material.shadow.v1",
+    scope,
+    epoch,
+    seq,
+    prev_hash: previous.hash,
+    transcript_hash: transcriptHash,
+    post_state_hash: postStateHash
+  };
+  return {
+    kind: "woo.scope_head.shadow.v1",
+    scope,
+    epoch,
+    seq,
+    hash: hashSource(stableShadowJson(material as unknown as WooValue))
+  };
+}
+
 export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommitSubmit): ShadowCommitResult {
   const submissionId = shadowSubmissionId(submit);
   const submissionCacheKey = shadowSubmissionCacheKey(submit);
@@ -204,7 +233,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   // Shadow commit scopes sequence accepted transcripts independently of the
   // legacy durable space log. The serialized state is still in the hash, but
   // browser catch-up needs every accepted v2 commit to advance the head.
-  scope.head = shadowScopeHeadForSerialized(scope.scope, scope.epoch, scope.serialized, scope.head.seq + 1);
+  scope.head = shadowScopeHeadForAcceptedCommit(scope.scope, scope.epoch, scope.head, submit.transcript.hash, receipt.post_state_hash);
   const accepted: ShadowCommitAccepted = {
     kind: "woo.commit.accepted.shadow.v1",
     id: submissionId,

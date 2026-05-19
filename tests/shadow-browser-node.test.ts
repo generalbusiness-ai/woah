@@ -32,7 +32,7 @@ import {
   type ShadowLiveEvent
 } from "../src/core/shadow-browser-node";
 import { hashSource } from "../src/core/source-hash";
-import type { ObjRef, WooValue } from "../src/core/types";
+import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
@@ -1423,6 +1423,38 @@ describe("shadow browser node shim", () => {
       ads: [expect.objectContaining({ node: "near-executor" })]
     });
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
+  });
+
+  it("executes default server-assisted intents with one authoritative VM run", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-authoritative-intent", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const metrics: MetricEvent[] = [];
+    const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "browser-authoritative-intent-wet",
+      route: "sequenced" as const,
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.38],
+      persistence: "durable" as const
+    }, "browser-authoritative-intent-env");
+
+    const reply = await handleShadowBrowserTurnExecEnvelope(
+      browser,
+      receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope)),
+      { onMetric: (event) => metrics.push(event) }
+    );
+
+    expect(reply?.body).toMatchObject({
+      ok: true,
+      commit: { kind: "woo.commit.accepted.shadow.v1", position: { scope: "the_dubspace", seq: 1 } },
+      ads: [expect.objectContaining({ node: "browser-relay:executor" })]
+    });
+    expect(reply?.body.state_transfer).toBeUndefined();
+    expect(metrics.filter((event) => event.kind === "applied" && event.verb === "set_control")).toHaveLength(1);
+    expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.38);
   });
 
   it("carries selected delegated executors through server-assisted intent planning", async () => {
