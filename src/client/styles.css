@@ -1694,37 +1694,13 @@ woo-outliner-tree {
   height: 100%;
   min-height: 0;
   display: grid;
-  /* Two rows now (add-form + rows). The header hoisted out of the shell —
-     see outliner-tree.ts render() comment — so this grid no longer owns it. */
+  /* Two rows: add-form + rows. The toolbar lives at the workspace
+     element top, outside this grid. */
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0.65rem;
   overflow: hidden;
 }
 
-.outliner-workspace {
-  min-height: 0;
-  height: 100%;
-  overflow: hidden;
-}
-
-.outliner-header {
-  display: flex;
-  gap: 0.75rem;
-  align-items: center;
-  justify-content: space-between;
-  /* The shared `.toolbar` class contributes ~3rem of chrome (min-height
-     2.125rem + 1rem margin-bottom) above the ambient-companion-shell on
-     other tools; match that envelope so the shell's calc(100dvh - 5.25rem)
-     budget lines up and the mini-chat panel anchors to the viewport bottom. */
-  min-height: 2.125rem;
-  margin-bottom: 1rem;
-}
-
-.outliner-header h2 {
-  margin: 0;
-}
-
-.outliner-toolbar,
 .outliner-add,
 .outliner-row-inner {
   display: flex;
@@ -1733,10 +1709,106 @@ woo-outliner-tree {
   min-width: 0;
 }
 
+/* Toolbar inline controls. The shared .toolbar puts everything on one row
+   with `display: flex; align-items: center`. The label/span here must not
+   let their own inline content wrap — otherwise the toolbar height jumps
+   past the 2.125rem `.toolbar` envelope that .ambient-companion-shell's
+   `calc(100dvh - 5.25rem)` budget assumes, and the chat panel drifts. */
+.outliner-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+/* Toolbar "clear selection" button. Only rendered when a row is selected.
+   No reference to server-side focus here — the browser UI's selection is
+   client-local; see catalogs/outliner/DESIGN.md. */
+.outliner-clear-selection {
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* The text cell is the row's primary affordance: click to select, click
+   again on the selected row to enter inline edit. The bare text still
+   looks like text — row border + selection highlight signal interactivity
+   — but a pointer cursor lets the hit area read as actionable. */
+.outliner-text {
+  cursor: pointer;
+}
+
+/* Click-to-edit affordance is on the whole row now. Show that with a
+   pointer cursor on .outliner-row-inner, except over the form/inputs which
+   carry their own cursor. (Row-inner buttons use .icon-button, which sets
+   its own pointer cursor.) */
+.outliner-row-inner {
+  cursor: pointer;
+}
+.outliner-row-inner input,
+.outliner-row-inner form {
+  cursor: auto;
+}
+
+/* Row icon buttons (twistie, add-child, remove) reuse the shared
+   .icon-button shell: flat by default, subtle background tint on hover.
+   The per-button rules below just size and tune them for the dense row
+   context — they don't restate the chrome-reset that .icon-button does. */
+.outliner-row-inner .icon-button {
+  padding: 0.15rem;
+  border-radius: 4px;
+  /* Square footprint so the row baseline doesn't shift when buttons
+     appear/disappear (the + button only renders on the selected row). */
+  width: 1.4rem;
+  height: 1.4rem;
+}
+
+/* Twistie is the row's primary structural affordance — it gets a larger
+   footprint and a full-weight text colour, while the secondary trash and
+   add-child icons stay muted via the inherited .icon-button colour. The
+   bigger chevron SVG (20px) needs a roomier square to breathe in. */
+.outliner-row-inner .icon-button.outliner-twistie {
+  width: 1.7rem;
+  height: 1.7rem;
+  color: var(--color-text);
+}
+
+.outliner-twistie-empty {
+  /* Same footprint as a real twistie so non-leaf and leaf rows line up. */
+  display: inline-flex;
+  width: 1.7rem;
+  height: 1.7rem;
+}
+
+/* Remove icon is destructive — keep it muted by default so it doesn't
+   shout from every row; redden it on hover so the intent is unmistakable
+   when the user actually points at it. */
+.outliner-remove-btn:hover,
+.outliner-remove-btn:focus-visible {
+  color: var(--color-danger);
+}
+
+/* The in-place add-child placeholder sits as a child row directly below
+   the selected row. Visually identical to a regular row so the user reads
+   it as "the new item will land here", but with a dashed border to make
+   the pending nature obvious. */
+.outliner-row-pending .outliner-row-inner {
+  border-bottom-style: dashed;
+}
+
 .outliner-add input,
 .outliner-edit input {
   min-width: 0;
   flex: 1 1 auto;
+}
+
+/* The edit form replaces .outliner-text inside .outliner-row-inner's flex
+   row. Without these the form shrinks to the input's intrinsic width and
+   the focus/remove buttons slide up next to it. Matching .outliner-text's
+   flex sizing keeps the buttons at the row's right edge. */
+.outliner-edit {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .outliner-rows {
@@ -2046,22 +2118,12 @@ woo-outliner-tree {
   touch-action: none;
 }
 
-.woo-tasks-workspace {
-  height: calc(100dvh - 5.25rem);
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  gap: 0.8rem;
-  overflow: hidden;
-}
-
-.woo-tasks-workspace.has-ambient-companion {
-  height: 100%;
-}
-
 /* Tasks header uses the shared `.toolbar` layout — no kanban-specific
    overrides. `.toolbar h1 { margin-right: auto }` already pushes any
-   trailing button (e.g. ⚙ Admin) to the right. */
+   trailing button (e.g. ⚙ Admin) to the right. The `.woo-tasks-workspace`
+   wrapper was deleted on 2026-05-18 when the tool-frame primitive landed;
+   `.split.has-ambient-companion` (height: 100%; min-height: 0;
+   overflow: hidden) supplies the same envelope for every tool. */
 
 .woo-tasks-status-nav,
 .woo-tasks-overview-counts {
@@ -3205,7 +3267,12 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .woo-tasks-workspace {
+  /* On mobile, let the tasks split grow and scroll naturally instead of
+     being trapped inside the clipped ambient-companion shell envelope.
+     Mirrors the .dubspace-layout / .pinboard-layout mobile relaxation. */
+  .woo-tasks-layout,
+  .woo-tasks-layout.has-ambient-companion {
+    grid-template-columns: 1fr;
     height: auto;
     overflow: visible;
   }

@@ -60,35 +60,29 @@ describe("bundled catalog UI components", () => {
   });
 
   it("keeps the ambient-companion-shell-enabled layouts vertically consistent across tools", () => {
-    // Ambient-companion-shell sizing now goes through the shared
-    // `.split.has-ambient-companion` primitive (used by dubspace + pinboard
-    // via `.split.split--side-fixed`) and the tasks workspace's own
-    // `.woo-tasks-workspace.has-ambient-companion` rule. Both must resolve
-    // to `height: 100%` so the layout fills the grid row that
-    // `.ambient-companion-shell` reserves for it.
+    // Every tool routes its workspace through renderToolFrame (see
+    // src/client/framework.ts), which puts `has-ambient-companion` on the
+    // `.split.split--side-fixed` element. The shared
+    // `.split.has-ambient-companion` rule (height: 100%; min-height: 0;
+    // overflow: hidden) supplies the envelope for pinboard / dubspace /
+    // tasks / outliner alike — the previous per-tool wrappers
+    // (.woo-tasks-workspace, .outliner-workspace) were deleted on
+    // 2026-05-18 when this rule became canonical.
     const css = readFileSync(resolve(process.cwd(), "src/client/styles.css"), "utf8");
     const splitMatch = css.match(/\.split\.has-ambient-companion\s*\{([\s\S]*?)\}/);
-    const tasksMatch = css.match(/\.woo-tasks-workspace\.has-ambient-companion\s*\{([\s\S]*?)\}/);
-    const outlinerMatch = css.match(/\.outliner-workspace\s*\{([\s\S]*?)\}/);
-
     expect(splitMatch, "split has-ambient-companion primitive present").not.toBeNull();
-    expect(tasksMatch, "tasks has-ambient-companion rule present").not.toBeNull();
-    expect(outlinerMatch, "outliner workspace rule present").not.toBeNull();
 
     const splitBlock = splitMatch?.[1] ?? "";
-    const tasksBlock = tasksMatch?.[1] ?? "";
-    const outlinerBlock = outlinerMatch?.[1] ?? "";
-
     expect(splitBlock).toMatch(/height:\s*100%/);
-    expect(tasksBlock).toMatch(/height:\s*100%/);
-    expect(outlinerBlock).toMatch(/height:\s*100%/);
+    expect(splitBlock).toMatch(/min-height:\s*0/);
+    expect(splitBlock).toMatch(/overflow:\s*hidden/);
 
-    const splitPanelMatch = splitBlock.match(/(?:^|\n)\s*height:\s*([^;]+);/);
-    const tasksPanelMatch = tasksBlock.match(/(?:^|\n)\s*height:\s*([^;]+);/);
-    const outlinerPanelMatch = outlinerBlock.match(/(?:^|\n)\s*height:\s*([^;]+);/);
-    expect(splitPanelMatch?.[1]).toBe("100%");
-    expect(tasksPanelMatch?.[1]).toBe("100%");
-    expect(outlinerPanelMatch?.[1]).toBe("100%");
+    // No tool may resurrect its own ambient-companion wrapper. If a future
+    // tool needs a different envelope, change `.split.has-ambient-companion`
+    // (or document the divergence in tool-ui.md) — don't re-introduce
+    // per-tool drift.
+    expect(css).not.toMatch(/\.woo-tasks-workspace\.has-ambient-companion/);
+    expect(css).not.toMatch(/\.outliner-workspace\b/);
   });
 
   it("keeps first-party tool workspace frames on the shared minichat path", () => {

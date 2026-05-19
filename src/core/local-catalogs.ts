@@ -117,6 +117,15 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION = "2026-05-13-chat-v2-
 const LOCAL_CATALOG_CHAT_ROOM_ROSTER_MIGRATION = "2026-05-14-chat-room-roster";
 const LOCAL_CATALOG_PINBOARD_ROOM_ROSTER_MIGRATION = "2026-05-14-pinboard-room-roster";
 const LOCAL_CATALOG_DUBSPACE_ROOM_ROSTER_MIGRATION = "2026-05-14-dubspace-room-roster";
+// The seeded `the_taskboard` registry was originally minted with name
+// "Taskboard". The tasks tool tab is labeled "Tasks", and the workspace
+// header renders the registry's `name` property — so the chrome ended up
+// changing from "Tasks" (the fallback) to "Taskboard" once the projection
+// hydrated. The manifest was repointed to seed with name "Tasks" so fresh
+// worlds match the tab; this migration patches pre-existing worlds where
+// the registry was already minted with the old name. Idempotent: only
+// rewrites instances whose current name is still the literal "Taskboard".
+const LOCAL_CATALOG_TASKS_TASKBOARD_RENAME_MIGRATION = "2026-05-18-tasks-taskboard-rename";
 const LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION = "2026-05-15-rest-live-persistence-metadata";
 const LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION = "2026-05-18-dispenser-next-pending-live";
 const LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION = "2026-05-15-roster-presentation-reconcile";
@@ -188,6 +197,7 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_WIZ_PROGRAMMER_PARENT_MIGRATION, only: "prog" },
   { id: LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION, only: "tasks" },
   { id: LOCAL_CATALOG_TASK_REGISTRY_ROOM_PARENT_MIGRATION, only: "tasks" },
+  { id: LOCAL_CATALOG_TASKS_TASKBOARD_RENAME_MIGRATION, only: "tasks" },
   { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION, only: "dubspace" },
   { id: LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, only: "dubspace" },
   { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_MIGRATION, only: "chat" },
@@ -436,6 +446,7 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   runWizProgrammerParentMigration(world, names);
   runTasksTrackedBackfillMigration(world, names);
   runTaskRegistryRoomParentMigration(world, names);
+  runTasksTaskboardRenameMigration(world, names);
   runTaskspaceCatalogDropMigration(world);
   runDubspaceV2ControlPresenceMigration(world, names);
   run(LOCAL_CATALOG_DUBSPACE_V2_CONTROL_AUTHORITY_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dubspace" });
@@ -756,6 +767,25 @@ function runTasksTrackedBackfillMigration(world: WooWorld, names: readonly strin
   }
   backfillTaskRegistryTrackedTasks(world);
   markMigrationApplied(world, LOCAL_CATALOG_TASKS_TRACKED_BACKFILL_MIGRATION);
+}
+
+// Patch the_taskboard's display name from the legacy "Taskboard" to "Tasks"
+// so the workspace header matches the tool tab label. Idempotent: only
+// rewrites instances whose current name is still the literal "Taskboard"
+// — a user who renamed their registry to something else is left alone.
+function runTasksTaskboardRenameMigration(world: WooWorld, names: readonly string[]): void {
+  if (migrationApplied(world, LOCAL_CATALOG_TASKS_TASKBOARD_RENAME_MIGRATION)) return;
+  if (!names.includes("tasks") || !localCatalogInstalled(world, "tasks")) {
+    markMigrationApplied(world, LOCAL_CATALOG_TASKS_TASKBOARD_RENAME_MIGRATION);
+    return;
+  }
+  if (world.objects.has("the_taskboard")) {
+    const current = world.propOrNull("the_taskboard", "name");
+    if (current === "Taskboard") {
+      world.setProp("the_taskboard", "name", "Tasks" as WooValue);
+    }
+  }
+  markMigrationApplied(world, LOCAL_CATALOG_TASKS_TASKBOARD_RENAME_MIGRATION);
 }
 
 // Properties the v0.3 taskspace catalog defined on its `$task` class

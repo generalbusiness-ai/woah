@@ -58,6 +58,48 @@ export function renderAmbientCompanionShell(subject: string, workspaceHtml: stri
   return `<section class="ambient-companion-shell" data-ambient-companion-shell="${escapeHtml(subject)}">${workspaceHtml}<div data-ambient-companion></div></section>`;
 }
 
+export type ToolFrameOptions = {
+  // Subject ref the workspace acts on — the space/board/registry id. Used by
+  // the chat slot (data-space-chat-space) and by the layout
+  // (data-space-chat-layout). Identical at both points by contract.
+  subject: string;
+  // Pre-rendered <section class="toolbar TOOL-toolbar">...</section>. Owns the
+  // <h1> title plus any tool-specific buttons. Every tool MUST use the shared
+  // .toolbar class so the ambient-companion-shell's height budget
+  // (calc(100dvh - 5.25rem)) lines up — bespoke headers drift, see the
+  // 2026-05-18 outliner-header incident.
+  toolbar: string;
+  // Tool-specific layout class applied alongside `.split.split--side-fixed`.
+  // Examples: "pinboard-layout", "dubspace-layout", "woo-tasks-layout",
+  // "outliner-layout". Owns column sizes and inner work-area styling.
+  layoutClass: string;
+  // Inner HTML of the .split section — the work area on the left and the
+  // presence aside on the right. The helper provides the wrapping section
+  // and the `has-ambient-companion` toggle.
+  layoutBody: string;
+  // True when the actor is present in the space and the mini-chat panel
+  // should dock under the workspace. False renders the layout bare (no chat
+  // slot, no `has-ambient-companion` class).
+  showChat: boolean;
+};
+
+// Canonical tool-frame structure used by every catalog workspace component.
+// Produces, in order: the toolbar; then either an ambient-companion shell
+// (wrapping the split + chat slot) or the bare split. Centralizing this
+// pairing here is what stops per-tool drift in chat-panel anchoring; see
+// notes/2026-05-08-layering.md item #11.
+export function renderToolFrame(opts: ToolFrameOptions): string {
+  const splitClasses = [
+    "split",
+    "split--side-fixed",
+    opts.layoutClass,
+    opts.showChat ? "has-ambient-companion" : ""
+  ].filter(Boolean).join(" ");
+  const layout = `<section class="${splitClasses}" data-space-chat-layout="${escapeHtml(opts.subject)}">${opts.layoutBody}</section>`;
+  if (!opts.showChat) return `${opts.toolbar}${layout}`;
+  return `${opts.toolbar}${renderAmbientCompanionShell(opts.subject, layout)}`;
+}
+
 export function preserveAmbientCompanionPanel(root: ParentNode, subject: string): HTMLElement | null {
   const existing = root.querySelector<HTMLElement>(AMBIENT_COMPANION_PANEL_SELECTOR);
   if (existing && existing.dataset.spaceChatSpace !== subject) existing.remove();

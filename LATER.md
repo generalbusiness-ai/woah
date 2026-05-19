@@ -7,6 +7,14 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+- tasks: presence panel: height should be full available (like pinboard and dubspace).  Another instance of feature drift between catalog tools, we need to build a system that prevents this sort of drift, not just fix the issue.
+
+- Outliner chat panel dimensions are still significantly broken, and different from the other tools.  We need to prevent this sort of drift.
+
+- Perf in browser.  Entering the outline tool see wait cursor for many minutes.
+
+
+
 syntax for @-someone
 
 want to integrate this as a hermes plugin

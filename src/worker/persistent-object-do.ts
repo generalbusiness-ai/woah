@@ -40,7 +40,7 @@ import {
 import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SeedWorld, SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedAuthoritySlice, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
@@ -259,6 +259,7 @@ function v2LiveEventMatchesAttachment(event: ShadowLiveEvent, att: V2SocketAttac
 const COALESCEABLE_INTERNAL_PATHS: ReadonlySet<string> = new Set([
   "/__internal/object-summaries",
   "/__internal/object-summary",
+  "/__internal/authority-slice",
   "/__internal/remote-describe-many",
   "/__internal/remote-get-prop",
   "/__internal/replay",
@@ -728,7 +729,8 @@ export class PersistentObjectDO {
             const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
             const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, { localMcpLiveHandled: true });
             return { ...result, local_host_materialized: delivery.localHostMaterialized };
-          }
+          },
+          authorityPayload: async (extraObjectIds) => await this.v2GatewayAuthorityPayload(world, extraObjectIds)
         },
         broadcasts: {}
       });
@@ -1950,6 +1952,13 @@ export class PersistentObjectDO {
         return jsonResponse(built.seed, 200, { "x-woo-seed-digest": built.digest });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/authority-slice") {
+        const objects = Array.isArray(body.objects)
+          ? body.objects.filter((item): item is ObjRef => typeof item === "string" && item.length > 0)
+          : [];
+        return jsonResponse({ authority: world.exportAuthoritySlice([], objects) });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/apply-host-seed") {
         if (hostKey === WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "host seed apply is only available on object hosts");
         const host = String(body.host ?? "") as ObjRef;
@@ -2599,15 +2608,15 @@ export class PersistentObjectDO {
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
     try {
-      const authority = v2TurnGatewayAuthorityPayload(world, [commitScope, session.actor]);
+      const seeded = await this.v2GatewayState(world, [commitScope, session.actor]);
       const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
         scope: commitScope,
         node,
         token,
         session: session.id,
         actor: session.actor,
-        ...authority,
-        serialized: world.exportWorld(),
+        ...seeded.authority,
+        serialized: seeded.serialized,
         ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
       });
       const hello = opened.hello;
@@ -2768,36 +2777,77 @@ export class PersistentObjectDO {
   ): Promise<RestV2RelayClient> {
     if (forceReopen) this.restV2Relays.delete(scope);
     let client = this.restV2Relays.get(scope);
-    const authorityPayload = v2TurnGatewayAuthorityPayload(world, [scope, input.target, input.actor]);
+    const seeded = await this.v2GatewayState(world, [scope, input.target, input.actor]);
     if (!client) {
-      const snapshot = world.exportWorld();
       client = {
         scope,
         node: `${this.durableHostKey()}:rest:${scope}`,
         relay: createShadowBrowserRelayShim({
           node: `${this.durableHostKey()}:rest-relay:${scope}`,
           scope,
-          serialized: snapshot
+          serialized: seeded.serialized
         }),
         openedAt: Date.now(),
         nextTurn: 0
       };
       const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", {
-        ...authorityPayload,
+        ...seeded.authority,
         scope,
         node: client.node,
         token,
         session: input.session.id,
         actor: input.actor,
-        serialized: snapshot
+        serialized: seeded.serialized
       });
       if (opened.head) client.relay.commit_scope.head = opened.head;
       this.rememberRestV2Relay(scope, client);
       return client;
     }
     this.rememberRestV2Relay(scope, client);
-    mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, authorityPayload.authority, { clone: true });
+    mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, seeded.authority.authority, { clone: true });
     return client;
+  }
+
+  private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }> {
+    const ids = Array.from(extraObjectIds);
+    const authority = await this.v2GatewayAuthorityPayload(world, ids);
+    const serialized = world.exportWorld();
+    mergeV2TurnGatewayAuthority(serialized, authority.authority, { clone: true });
+    return { serialized, authority };
+  }
+
+  private async v2GatewayAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {
+    const ids = Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0);
+    const local = v2TurnGatewayAuthorityPayload(world, ids);
+    const byId = new Map<ObjRef, SerializedAuthoritySlice["objects"][number]>(
+      local.authority.objects.map((obj) => [obj.id, obj])
+    );
+    const localHost = this.durableHostKey();
+    const byHost = new Map<string, ObjRef[]>();
+    for (const id of ids) {
+      const host = await this.resolveObjectHostForWorld(world, id, WORLD_HOST);
+      if (!host || host === localHost) continue;
+      const list = byHost.get(host) ?? [];
+      list.push(id);
+      byHost.set(host, list);
+    }
+    for (const [host, objects] of byHost) {
+      const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+        host,
+        "/__internal/authority-slice",
+        { objects }
+      );
+      for (const obj of response.authority?.objects ?? []) {
+        const objectHost = await this.resolveObjectHostForWorld(world, obj.id, WORLD_HOST);
+        if (objectHost === host || !byId.has(obj.id)) byId.set(obj.id, obj);
+      }
+    }
+    const authority: SerializedAuthoritySlice = {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: local.authority.sessions,
+      objects: Array.from(byId.values())
+    };
+    return { sessions: authority.sessions, session_objects: authority.objects, authority };
   }
 
   private rememberRestV2Relay(scope: ObjRef, client: RestV2RelayClient): void {
@@ -2838,7 +2888,7 @@ export class PersistentObjectDO {
       clientSerialized: (client) => client.relay.commit_scope.serialized,
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => v2TurnGatewayEnvelopeId(id, attempt, () => crypto.randomUUID()),
-      authorityPayload: (_scope, extraObjectIds) => v2TurnGatewayAuthorityPayload(world, extraObjectIds),
+      authorityPayload: async (_scope, extraObjectIds) => await this.v2GatewayAuthorityPayload(world, extraObjectIds),
       submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body),
       // Forward planning-phase verb metrics to the host world's metrics
       // hook so /admin/ footprint-by-verb sees v2 traffic.

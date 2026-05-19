@@ -37,6 +37,7 @@ You are **building things**:
 ```
 docs/
 ├── README.md                 (this file)
+├── architecture.md           the moving parts at a glance
 ├── getting-started.md        first contact for any new arrival
 ├── agents/                   for LLM agents using MCP
 ├── using/                    everyday verbs every actor can use

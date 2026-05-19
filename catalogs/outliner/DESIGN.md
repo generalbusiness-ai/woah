@@ -643,8 +643,49 @@ The component owns:
 - Enter/Leave controls. These call the outliner's normal `$space`
   `enter`/`leave` verbs; when present, the host mounts the shared
   minichat into the component's ambient companion slot.
-- Inline text editing on click (single-line input that grows for long
-  text). No popup; commit on blur or Enter. Routes to `set_item_text`.
+- **Click-row-to-select, click-again-to-edit.** Selection in the
+  browser UI is **client-local** — a per-tab affordance for "the row I'm
+  pointing at right now," not round-tripped through the server. A single
+  click on an unselected row selects it (no network call); a click on
+  the already-selected row enters inline text editing — single-line
+  input, commit on blur or Enter, routes to `set_item_text`. There is
+  no separate focus button; the row itself is the affordance.
+- **Create-in-place.** When a row is selected, the top "add an item…"
+  form is hidden and the selected row carries a `+` button. Clicking
+  it opens an inline new-child editor immediately below the selected
+  row at the next indent level — making it visually obvious where the
+  new item will land. Submitting calls `add_item(text, parent_id)`
+  with the selected row id passed **explicitly**, so the browser UI
+  does not depend on the actor's server-side focus. Pressing Escape
+  or submitting empty text cancels. When nothing is selected the top
+  add form is shown (no per-row `+`).
+- **Clearing selection.** A "clear selection" button appears in the
+  toolbar while a row is selected; pressing Escape with no editor open
+  does the same thing. Both are pure client-side state resets.
+
+### UI selection vs. server-side focus
+
+The browser UI's selection state and `$outliner.focus_by_actor` are
+**two separate capabilities** that happen to share a similar shape:
+
+- **Server-side focus** (`focus_by_actor`, `:focus_on`, the chat
+  `focus` command) is the parent default used by `:add(text)` and the
+  natural way for chat/MCP users to express "where I'm working" when
+  they don't have a live click-to-select gesture available. It is
+  persisted on the outliner, visible to other clients via
+  `outline_focus_changed`, and survives across the actor's session.
+- **Browser UI selection** is per-tab, never sent to the server,
+  invisible to other clients, and resets on tab close. It exists so
+  the user can click a row to point at it and get immediate visual
+  feedback without paying network latency on every selection.
+
+Clicking a row in the browser UI does **not** call `:focus_on` and
+does **not** alter the server-side focus map. Chat `add` and MCP
+`add(text)` continue to use the server-side focus default; the
+browser UI's add-child path passes its parent explicitly. The two
+states can diverge — that is intentional. If you switch from chat to
+browser (or vice versa) you re-establish "where I'm working" via the
+new tool's idiom.
 - Drag-handle on each row. Drop targets: above/below siblings (calls
   `reorder_item`) and onto a node (calls `move_item` with that node
   as new parent, index = end). Visual indicator only between rows.

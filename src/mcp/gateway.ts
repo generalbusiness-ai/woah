@@ -49,6 +49,7 @@ type SessionEntry = {
 export type McpV2ClientHooks = {
   open: (scope: ObjRef, body: McpV2OpenBody) => Promise<McpV2OpenResult>;
   envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
+  authorityPayload?: (extraObjectIds: ObjRef[]) => Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>>;
 };
 
 export type McpV2OpenBody = {
@@ -469,8 +470,8 @@ export class McpGateway {
       ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
       clientNode: () => this.v2NodeFor(entry),
       nextTurnId: () => id,
-      authorityPayload: (_submitScope, extraObjectIds) => {
-        const payload = v2TurnGatewayAuthorityPayload(this.world, extraObjectIds);
+      authorityPayload: async (_submitScope, extraObjectIds) => {
+        const payload = await this.v2AuthorityPayload(extraObjectIds);
         const client = this.v2Scopes.get(scope);
         if (client) mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, payload.authority);
         return payload;
@@ -511,30 +512,39 @@ export class McpGateway {
         relay: createShadowBrowserRelayShim({
           node: `mcp-v2-relay:${scope}`,
           scope,
-          serialized: this.world.exportWorld()
+          serialized: (await this.v2SerializedWorld([scope, entry.woo.actor])).serialized
         }),
         openedSessions: new Set()
       };
       this.v2Scopes.set(scope, client);
     }
     if (!client.openedSessions.has(entry.woo.id)) {
-      const sessions = this.world.exportSessions();
-      const authority = this.world.exportAuthoritySlice(sessions, [scope, entry.woo.actor]);
+      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
+      mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, seeded.authority.authority);
       const opened = await hooks.open(scope, {
         scope,
         node: this.v2NodeFor(entry),
         token: entry.v2Token,
         session: entry.woo.id,
         actor: entry.woo.actor,
-        sessions: authority.sessions,
-        session_objects: authority.objects,
-        authority,
-        serialized: this.world.exportWorld()
+        ...seeded.authority,
+        serialized: seeded.serialized
       });
       if (opened.head) client.relay.commit_scope.head = opened.head;
       client.openedSessions.add(entry.woo.id);
     }
     return client;
+  }
+
+  private async v2AuthorityPayload(extraObjectIds: ObjRef[]): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {
+    return await (this.options.v2?.authorityPayload?.(extraObjectIds) ?? Promise.resolve(v2TurnGatewayAuthorityPayload(this.world, extraObjectIds)));
+  }
+
+  private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }> {
+    const authority = await this.v2AuthorityPayload(extraObjectIds);
+    const serialized = this.world.exportWorld();
+    mergeV2TurnGatewayAuthority(serialized, authority.authority, { clone: true });
+    return { serialized, authority };
   }
 
   private acceptV2Commit(

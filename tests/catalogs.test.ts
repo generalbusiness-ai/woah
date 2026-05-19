@@ -225,7 +225,43 @@ describe("local catalogs", () => {
     const gardenSouthAliases = world.getProp("exit_garden_south", "aliases");
     expect(Array.isArray(gardenSouthAliases)).toBe(true);
     expect(gardenSouthAliases as string[]).toEqual(expect.arrayContaining(["south", "s", "santa's workshop", "workshop"]));
-    expect(world.getProp("the_taskboard", "name")).toBe("Taskboard");
+    expect(world.getProp("the_taskboard", "name")).toBe("Tasks");
+  });
+
+  it("renames pre-existing the_taskboard from 'Taskboard' to 'Tasks' to match the tool tab label", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    // Simulate a world that was bootstrapped before the rename: the
+    // registry exists with the legacy name and the rename-migration marker
+    // is not yet recorded.
+    world.setProp("the_taskboard", "name", "Taskboard");
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-18-tasks-taskboard-rename");
+    world.setProp("$system", "applied_migrations", ledger);
+
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    expect(world.getProp("the_taskboard", "name")).toBe("Tasks");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-18-tasks-taskboard-rename");
+  });
+
+  it("leaves the_taskboard alone when the user has already renamed it to something else", async () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    // A user who renamed their registry should NOT be silently rewritten
+    // to "Tasks" on next boot — the migration only patches the literal
+    // legacy "Taskboard" name.
+    world.setProp("the_taskboard", "name", "My Custom Board");
+    const ledger = (world.getProp("$system", "applied_migrations") as string[])
+      .filter((id) => id !== "2026-05-18-tasks-taskboard-rename");
+    world.setProp("$system", "applied_migrations", ledger);
+
+    installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+    expect(world.getProp("the_taskboard", "name")).toBe("My Custom Board");
+    expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-18-tasks-taskboard-rename");
   });
 
   it("repairs older demoworld installs where the garden missed $conversational", async () => {
