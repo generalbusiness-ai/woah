@@ -2802,7 +2802,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(tubStateBody.session?.current_location).toBe("the_hot_tub");
 
       const dropTowel = await post("/api/objects/the_hot_tub/calls/drop", { args: ["towel"] }, session);
-      expect(dropTowel.status).toBe(200);
+      expect(dropTowel.status, JSON.stringify(dropTowel.body)).toBe(200);
       expect(dropTowel.body.result).toMatchObject({ item: "the_towel", room: "the_hot_tub" });
       expect(dropTowel.body.observations).toContainEqual(expect.objectContaining({ type: "dropped", item: "the_towel", room: "the_hot_tub" }));
 
@@ -2841,6 +2841,49 @@ describe("CFObjectRepository production-shape coverage", () => {
       const listed = await post("/api/objects/the_pinboard/calls/list_notes", { args: [] }, session);
       expect(listed.status).toBe(200);
       expect(listed.body.result).toContainEqual(expect.objectContaining({ id: pin, text: "CF smoke edited", color: "blue", x: 80, y: 96 }));
+
+      const pinboardWorld = await (wooObjects.get("the_pinboard") as any).getWorld("the_pinboard") as WooWorld;
+      const hostOnlyPin = pinboardWorld.createRuntimeObject("$pin", "$wiz", "the_pinboard", {
+        progr: "$wiz",
+        location: "the_pinboard",
+        name: "sticky note",
+        description: "A sticky note."
+      });
+      pinboardWorld.setProp(hostOnlyPin, "text", "host-only pinboard note");
+      pinboardWorld.setProp(hostOnlyPin, "color", "green");
+      pinboardWorld.setProp("the_pinboard", "layout", {
+        ...(pinboardWorld.getProp("the_pinboard", "layout") as Record<string, WooValue>),
+        [hostOnlyPin]: { x: 42, y: 84, w: 180, h: 110, z: 99 }
+      });
+      const listedAfterHostOnlyPin = await post("/api/objects/the_pinboard/calls/list_notes", { args: [] }, session);
+      expect(listedAfterHostOnlyPin.status).toBe(200);
+      expect(listedAfterHostOnlyPin.body.result).toContainEqual(expect.objectContaining({
+        id: hostOnlyPin,
+        text: "host-only pinboard note",
+        color: "green",
+        x: 42,
+        y: 84
+      }));
+
+      await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_outline" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_outline" }
+      })));
+      const outlineWorld = await (wooObjects.get("the_outline") as any).getWorld("the_outline") as WooWorld;
+      const hostOnlyItem = outlineWorld.createRuntimeObject("$outline_item", "$wiz", "the_outline", {
+        progr: "$wiz",
+        location: "the_outline",
+        name: ""
+      });
+      outlineWorld.setProp(hostOnlyItem, "parent", null);
+      outlineWorld.setProp(hostOnlyItem, "position", 1);
+      outlineWorld.setProp(hostOnlyItem, "text", "host-only outline item");
+      const listedOutline = await post("/api/objects/the_outline/calls/list_items", { args: [] }, session);
+      expect(listedOutline.status).toBe(200);
+      expect(listedOutline.body.result).toContainEqual(expect.objectContaining({
+        id: hostOnlyItem,
+        text: "host-only outline item",
+        index: 0
+      }));
     } finally {
       logSpy.mockRestore();
       directoryState.close();

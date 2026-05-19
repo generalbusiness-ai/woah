@@ -77,7 +77,7 @@ export type SubmitTurnIntentOptions<Client, Result extends V2TurnGatewayEnvelope
   clientSerialized?(client: Client): SerializedWorld;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
-  authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): V2TurnGatewayAuthorityPayload;
+  authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): V2TurnGatewayAuthorityPayload | Promise<V2TurnGatewayAuthorityPayload>;
   submitEnvelope(scope: ObjRef, body: V2TurnGatewayEnvelopeBody): Promise<Result>;
   authorityObjectIds?(input: V2TurnGatewayCallInput, commitScope: ObjRef): ObjRef[];
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
@@ -254,11 +254,12 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
       });
       const authorityObjectIds = options.authorityObjectIds?.(options.input, options.input.scope)
         ?? v2TurnGatewayAuthorityObjectIds(options.input);
+      const authority = await options.authorityPayload(options.input.scope, authorityObjectIds);
       const result = await options.submitEnvelope(options.input.scope, v2TurnGatewayEnvelopeBody({
         scope: options.input.scope,
         node: options.clientNode(client),
         turn: options.input,
-        authority: options.authorityPayload(options.input.scope, authorityObjectIds),
+        authority,
         envelope
       }));
       const replyEnvelope = decodeV2TurnGatewayReply(result.reply);
@@ -312,11 +313,12 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
     });
     const authorityObjectIds = options.authorityObjectIds?.(options.input, commitScope)
       ?? v2TurnGatewayAuthorityObjectIds(options.input, commitScope);
+    const authority = await options.authorityPayload(commitScope, authorityObjectIds);
     const result = await options.submitEnvelope(commitScope, v2TurnGatewayEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
       turn: options.input,
-      authority: options.authorityPayload(commitScope, authorityObjectIds),
+      authority,
       envelope
     }));
     const replyEnvelope = decodeV2TurnGatewayReply(result.reply);
