@@ -65,6 +65,7 @@ import {
   shadowLiveEventMatchesPeerScope,
   withComputedLiveAudience
 } from "../core/v2-fanout-projection";
+import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
 import {
   mergeV2TurnGatewayAuthority,
   submitTurnIntent,
@@ -1933,7 +1934,17 @@ export class PersistentObjectDO {
         const commit = body.commit as ShadowCommitAccepted;
         const transcript = body.transcript as EffectTranscript;
         if (commit.position.scope !== scope || transcript.scope !== scope) throw wooError("E_INVARG", "apply-v2-commit scope mismatch");
-        return jsonResponse(world.applyCommittedShadowTranscriptToHost(hostKey, transcript, { gatewayHost: hostKey === WORLD_HOST }));
+        // Satellite write-through: apply to the local host slice. The
+        // ShadowApplyTarget abstraction supplies only `applyTranscript`
+        // here — the originating gateway already did session/api-key
+        // housekeeping before fanning out, so there's nothing to mirror.
+        let applyResult: ReturnType<WooWorld["applyCommittedShadowTranscriptToHost"]> | null = null;
+        await runShadowApply(transcript, {
+          applyTranscript: (t) => {
+            applyResult = world.applyCommittedShadowTranscriptToHost(hostKey, t, { gatewayHost: hostKey === WORLD_HOST });
+          }
+        });
+        return jsonResponse(applyResult);
       }
 
       if (request.method === "POST" && pathname === "/__internal/host-seed") {
@@ -2436,6 +2447,40 @@ export class PersistentObjectDO {
       this.closeLocalApiKeySessions(world, id);
       await this.unregisterApiKeySessionRoutes(id);
     }
+  }
+
+  // Adapter for gateway-side apply (full housekeeping: api-key revocation
+  // diff + per-session route mirroring). Used by REST/MCP/WS reply paths.
+  private buildGatewayApplyTarget(
+    world: WooWorld,
+    options: { skipObjectHost?: V2LocalHostMaterialization } = {}
+  ): ShadowApplyTarget {
+    return {
+      applyTranscript: (transcript) => {
+        world.applyCommittedShadowTranscript(transcript, options.skipObjectHost
+          ? { skipObjectHost: options.skipObjectHost }
+          : {});
+      },
+      revokedApiKeyIdsBefore: () => this.revokedApiKeyIds(world),
+      cleanupRevokedApiKeys: (revokedBefore) => this.cleanupNewlyRevokedApiKeys(world, revokedBefore),
+      sessionHousekeeping: async (sessionId, result) => {
+        const session = world.sessions.get(sessionId);
+        if (!session) return;
+        this.mirrorResultRoomToSession(world, session, result);
+        await this.registerSessionRoute(session);
+      }
+    };
+  }
+
+  // Adapter for host-side apply (write-through to a specific host slice or
+  // satellite fanout target). No session housekeeping — the originating
+  // gateway already did that for the session before fanning out.
+  private buildHostApplyTarget(world: WooWorld, hostKey: string): ShadowApplyTarget {
+    return {
+      applyTranscript: (transcript) => {
+        world.applyCommittedShadowTranscriptToHost(hostKey, transcript, { gatewayHost: hostKey === WORLD_HOST });
+      }
+    };
   }
 
   private requireRestSession(world: WooWorld, request: Request): Session {
@@ -2948,14 +2993,10 @@ export class PersistentObjectDO {
     });
     if (run.frame.op === "error") return run.frame;
     if (input.persistence === "durable") {
-      const revokedBefore = this.revokedApiKeyIds(world);
-      world.applyCommittedShadowTranscript(run.transcript);
-      await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
-      const session = world.sessions.get(input.session.id);
-      if (session) {
-        this.mirrorResultRoomToSession(world, session, run.frame.result);
-        await this.registerSessionRoute(session);
-      }
+      await runShadowApply(run.transcript, this.buildGatewayApplyTarget(world), {
+        sessionId: input.session.id,
+        result: run.frame.result
+      });
       const seq = this.committedScopeSeq(world, input.scope);
       if (seq === null) return run.frame;
       return {
@@ -2996,16 +3037,11 @@ export class PersistentObjectDO {
       ? reply.body.transcript.call.scope as ObjRef
       : null;
     if (callScope && callScope !== reply.body.commit.position.scope) this.restV2Relays.delete(callScope);
-    const revokedBefore = this.revokedApiKeyIds(world);
-    world.applyCommittedShadowTranscript(reply.body.transcript, localHostMaterialized
-      ? { skipObjectHost: localHostMaterialized }
-      : {});
-    await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
-    const session = world.sessions.get(sessionId);
-    if (session) {
-      this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
-      await this.registerSessionRoute(session);
-    }
+    await runShadowApply(
+      reply.body.transcript,
+      this.buildGatewayApplyTarget(world, { skipObjectHost: localHostMaterialized }),
+      { sessionId, result: reply.body.outcome.result ?? reply.body.transcript.result }
+    );
   }
 
   private mirrorResultRoomToSession(world: WooWorld, session: Session, result: unknown): void {
@@ -3264,7 +3300,7 @@ export class PersistentObjectDO {
         if (host) hosts.add(host);
       }
       if (hosts.has(localHost)) {
-        world.applyCommittedShadowTranscriptToHost(localHost, transcript, { gatewayHost: localHost === WORLD_HOST });
+        await runShadowApply(transcript, this.buildHostApplyTarget(world, localHost));
         hosts.delete(localHost);
         localApplied = true;
       }
