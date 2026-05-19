@@ -60,9 +60,9 @@ export type EffectTranscript = {
   call: Pick<TurnStart, "actor" | "target" | "verb" | "args" | "body">;
   reads: TranscriptRead[];
   // State probes are materialization dependencies, not user-visible reads.
-  // They capture negative lookup edges such as "$pin has no text verb, so
-  // dispatch fell through to $note:text"; a partial executor must have these
-  // cells before it can safely replay the turn locally.
+  // They capture negative lookup edges such as "the receiver has no `text`
+  // verb, so dispatch fell through to its parent"; a partial executor must
+  // have these cells before it can safely replay the turn locally.
   stateProbes?: TranscriptCell[];
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];

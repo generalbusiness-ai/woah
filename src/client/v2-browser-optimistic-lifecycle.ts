@@ -5,7 +5,7 @@ export type V2LocalTurnInvalidatedMessage = {
   invalidated_ids?: unknown;
 };
 
-export type V2OptimisticLifecycleHooks = {
+type V2OptimisticLifecycleHooks = {
   failOptimisticCall(id: string): void;
   pendingDirect: Map<string, (result: unknown) => void>;
   pendingFrameErrors: Map<string, (error: unknown) => void>;
@@ -13,7 +13,7 @@ export type V2OptimisticLifecycleHooks = {
   completeNetworkWait?: (id: string) => void;
 };
 
-export type V2TentativeInvalidatedError = {
+type V2TentativeInvalidatedError = {
   code: "E_V2_TENTATIVE_INVALIDATED";
   message: string;
   reason: string;

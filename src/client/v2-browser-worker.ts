@@ -407,8 +407,7 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
   const fallbackPolicy = v2ServerAssistedIntentPolicy({
     route: command.route,
     persistence: body.persistence,
-    selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null,
-    allowSelectedDurableIntent: true
+    selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null
   });
   if (!fallbackPolicy.ok) {
     postTurnUnavailable(command, fallbackPolicy.reason);
@@ -627,11 +626,10 @@ async function repairLocalExecutableState(
   // envelope id per attempt so each round gets its own cell-page closure.
   const requestId = `${id}:state-repair:${crypto.randomUUID()}`;
   // Missing atoms reported via `E_NEED_STATE` carry their preimage; the planned
-  // key does NOT (the recorder threw before recording the access). Send the
-  // (hash, preimage) pairs explicitly so the relay can build a cell-page
-  // closure for atoms that never made it into the planned transcript. Atom
-  // hashes are still sent for backward compatibility with relays/tests that
-  // resolve hashes through `key.preimages` alone.
+  // key does NOT (the recorder threw before recording the access). When we
+  // have those preimages, ask only for that missing closure. Otherwise fall
+  // back to the planned key's hash set, which the relay can resolve through
+  // key.preimages.
   const missingAtomsWithPreimage = missingAtoms.filter(
     (atom): atom is { hash: string; preimage: string } => typeof atom.preimage === "string"
   );
@@ -640,8 +638,9 @@ async function repairLocalExecutableState(
     id: requestId,
     scope: key.scope,
     key,
-    atom_hashes: key.atom_hashes,
+    ...(missingAtomsWithPreimage.length > 0 ? {} : { atom_hashes: key.atom_hashes }),
     ...(missingAtomsWithPreimage.length > 0 ? { missing_atoms: missingAtomsWithPreimage } : {}),
+    known_page_hashes: await cachedStatePageHashes(),
     mode: "cell_pages"
   };
   const envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest> = {
@@ -1099,6 +1098,11 @@ async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowS
     if (isShadowStatePage(row?.page)) pages.push(row.page);
   }
   return pages;
+}
+
+async function cachedStatePageHashes(): Promise<string[]> {
+  const keys = await tx<IDBValidKey[]>(STATE_PAGE_STORE, "readonly", (store) => store.getAllKeys());
+  return keys.filter((key): key is string => typeof key === "string");
 }
 
 async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {

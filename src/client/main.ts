@@ -4818,7 +4818,6 @@ function enterPinboard() {
     void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
       if (state.tab === "pinboard") render();
     });
-    refreshPinboardNotes({ force: true });
     requestSpaceChatFocus(board);
     return;
   }

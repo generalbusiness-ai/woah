@@ -10,12 +10,11 @@ describe("v2 browser intent fallback policy", () => {
     });
   });
 
-  it("keeps selected durable intent behind an explicit compatibility flag", () => {
+  it("allows selected durable intent through explicit scope delegation", () => {
     expect(v2ServerAssistedIntentPolicy({
       route: "sequenced",
       persistence: "durable",
-      selectedScopeAd: "node:commit-scope:the_dubspace:executor",
-      allowSelectedDurableIntent: true
+      selectedScopeAd: "node:commit-scope:the_dubspace:executor"
     })).toEqual({
       ok: true,
       reason: "scope_ad",
@@ -25,17 +24,6 @@ describe("v2 browser intent fallback policy", () => {
 
   it("blocks bare durable server-assisted planning", () => {
     expect(v2ServerAssistedIntentPolicy({ route: "sequenced", persistence: "durable" })).toEqual({
-      ok: false,
-      reason: "server_assisted_durable_disabled"
-    });
-  });
-
-  it("blocks selected durable server-assisted planning by default", () => {
-    expect(v2ServerAssistedIntentPolicy({
-      route: "sequenced",
-      persistence: "durable",
-      selectedScopeAd: "node:commit-scope:the_dubspace:executor"
-    })).toEqual({
       ok: false,
       reason: "server_assisted_durable_disabled"
     });

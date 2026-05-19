@@ -5,23 +5,18 @@ import type { WooWorld } from "../core/world";
 
 const DEV_WORLD_HOST = "world";
 
-export type DevV2LocalCommitMaterialization = {
-  hosts: string[];
-};
-
 export function materializeDevV2CommitLocally(
   world: WooWorld,
   scope: ObjRef,
   transcript: EffectTranscript
-): DevV2LocalCommitMaterialization {
+): void {
   const hosts = devV2LocalCommitHosts(world, scope, transcript);
   for (const host of hosts) {
     world.applyCommittedShadowTranscriptToHost(host, transcript, { gatewayHost: host === DEV_WORLD_HOST });
   }
-  return { hosts };
 }
 
-export function devV2LocalCommitHosts(world: WooWorld, scope: ObjRef, transcript: EffectTranscript): string[] {
+function devV2LocalCommitHosts(world: WooWorld, scope: ObjRef, transcript: EffectTranscript): string[] {
   const routeHost = new Map(world.objectRoutes().map((route) => [route.id, route.host] as const));
   const createdIds = new Set(transcript.creates.map((create) => create.object));
   const hosts = new Set<string>();

@@ -1408,12 +1408,10 @@ export function handleShadowBrowserStateTransferEnvelope(
     throw new Error(`state transfer scope mismatch: request=${request.scope} key=${request.key.scope} relay=${browser.relay.commit_scope.scope}`);
   }
   if (request.mode && request.mode !== "cell_pages") throw new Error(`unsupported state transfer mode: ${request.mode}`);
-  // `missing_atoms` (with preimages) wins over `atom_hashes` when both are
-  // present: the request originates from an `E_NEED_STATE` throw whose recorder
-  // bailed before recording the access, so the planned key has no entry for
-  // those atoms and a hash-only lookup against `key.preimages` returns nothing.
-  // Passing the preimages through `missing_atoms` lets the transfer builder
-  // resolve the exact cell pages directly.
+  // `missing_atoms` carries preimages for `E_NEED_STATE` throws whose recorder
+  // bailed before recording the access. `atom_hashes` still selects atoms from
+  // the planned key; when both are present the transfer builder serves the
+  // union.
   const transfer = buildShadowCellPageTransfer({
     serialized: browser.relay.commit_scope.serialized,
     key: request.key,

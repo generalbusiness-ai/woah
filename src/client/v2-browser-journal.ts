@@ -95,22 +95,6 @@ export function v2TentativeTurnForInvalidation(
   return records.find((record) => v2TentativeTurnMatches(record, ids, transcriptHash)) ?? null;
 }
 
-export function v2TentativeTurnChainFrom(
-  records: readonly V2BrowserTentativeTurnRecord[],
-  anchor: V2BrowserTentativeTurnRecord
-): V2BrowserTentativeTurnRecord[] {
-  return records
-    .filter((record) =>
-      record.status === "pending" &&
-      record.scope === anchor.scope &&
-      record.actor === anchor.actor &&
-      record.session === anchor.session &&
-      record.created_at >= anchor.created_at
-    )
-    .slice()
-    .sort(compareTentativeTurns);
-}
-
 function compareTentativeTurns(a: V2BrowserTentativeTurnRecord, b: V2BrowserTentativeTurnRecord): number {
   return a.created_at - b.created_at || a.id.localeCompare(b.id);
 }
