@@ -196,6 +196,66 @@ describe("v2 browser worker integration", () => {
     await sleep(100);
   });
 
+  it("reads cached state pages for execution cache in one IndexedDB transaction", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-state-page-read");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-state-page-read",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-state-page-read",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-state-page-read"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-state-page-read",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-state-page-read", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-state-page-read", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-page-read", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-state-page-read", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    posted.length = 0;
+    scope.dispatch({ kind: "cache_status" });
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    const statePageReads = posted
+      .map(browserMetric)
+      .filter((metric): metric is Record<string, unknown> =>
+        metric?.phase === "idb_tx" && metric.what === "state_pages" && metric.method === "readonly"
+      );
+    const cacheReads = statePageReads.filter((metric) => Number(metric.count) > 1);
+    expect(cacheReads).toHaveLength(1);
+    expect(Number(cacheReads[0]!.count)).toBeGreaterThan(1);
+    // One bulk getAll for cached pages plus one count() for the status payload.
+    expect(statePageReads).toHaveLength(2);
+  });
+
   it("plans a same-actor durable chain from the tentative journal without waiting for authority", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -843,6 +903,12 @@ function isComposeViewFor(message: unknown, id: string): boolean {
 function isBrowserMetricPhase(message: unknown, phase: string): boolean {
   return isKind(message, "browser_metric") &&
     (message as { metric?: { phase?: unknown } }).metric?.phase === phase;
+}
+
+function browserMetric(message: unknown): Record<string, unknown> | undefined {
+  if (!isKind(message, "browser_metric")) return undefined;
+  const metric = (message as { metric?: unknown }).metric;
+  return metric && typeof metric === "object" && !Array.isArray(metric) ? metric as Record<string, unknown> : undefined;
 }
 
 function isReadyStatus(message: unknown): boolean {

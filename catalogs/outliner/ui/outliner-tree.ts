@@ -239,7 +239,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (!projected || projected.location !== this.subject) return null;
     const props = projected.props ?? {};
     const ancestors = Array.isArray(projected.ancestors) ? projected.ancestors.map(String) : [];
-    const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item") || props.position !== undefined || props.hidden !== undefined;
+    const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item");
     if (!looksLikeOutlineItem) return null;
     return {
       id: projected.id,
@@ -836,8 +836,47 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   registry.observation({
     types: STRUCTURAL_TYPES,
     route: "sequenced",
-    reduce: (_draft, envelope) => {
+    reduce: (draft, envelope) => {
+      const type = String(envelope.observation.type ?? "");
       const outlinerId = String(envelope.observation.outliner ?? envelope.observation.source ?? "");
+      if (type === "outline_item_added") {
+        const id = String(envelope.observation.item ?? "");
+        if (id && outlinerId) {
+          draft.patchObject(id, {
+            name: id,
+            owner: typeof envelope.observation.actor === "string" ? envelope.observation.actor : undefined,
+            parent: "$outline_item",
+            location: outlinerId
+          });
+          draft.patchObjectProps(id, {
+            text: typeof envelope.observation.text === "string" ? envelope.observation.text : "",
+            parent: outlinerParent(envelope.observation.parent_id),
+            position: outlinerIndex(envelope.observation.index, 0),
+            hidden: false
+          });
+        }
+      } else if (type === "outline_item_removed") {
+        const id = String(envelope.observation.item ?? "");
+        if (id) draft.patchObject(id, { location: null });
+      } else if (type === "outline_item_moved") {
+        const id = String(envelope.observation.item ?? "");
+        if (id) draft.patchObjectProps(id, {
+          parent: outlinerParent(envelope.observation.to_parent),
+          position: outlinerIndex(envelope.observation.to_index, 0)
+        });
+      } else if (type === "outline_item_reordered") {
+        const id = String(envelope.observation.item ?? "");
+        if (id) draft.patchObjectProps(id, {
+          parent: outlinerParent(envelope.observation.parent_id),
+          position: outlinerIndex(envelope.observation.to_index, 0)
+        });
+      } else if (type === "outline_item_hidden") {
+        const id = String(envelope.observation.item ?? "");
+        if (id) draft.patchObjectProps(id, { hidden: Boolean(envelope.observation.hidden) });
+      }
+      // Optimistic frames are represented by projection patches so failure can
+      // roll them back. DOM-local model edits are reserved for accepted frames.
+      if (envelope.delivered.optimistic === true) return;
       if (!outlinerId) return;
       for (const el of document.querySelectorAll<WooOutlinerTreeElement>(`woo-outliner-tree`)) {
         if (el.subject === outlinerId) el.applyObservation(envelope.observation);

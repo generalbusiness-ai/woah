@@ -1499,12 +1499,12 @@ async function cachedObjectsByHash(hashes: Iterable<string>): Promise<Serialized
 }
 
 async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowStatePage[]> {
-  const pages: ShadowStatePage[] = [];
-  for (const hash of hashes) {
-    const row = await tx<{ page?: unknown } | undefined>(STATE_PAGE_STORE, "readonly", (store) => store.get(hash));
-    if (isShadowStatePage(row?.page)) pages.push(row.page);
-  }
-  return pages;
+  const wanted = new Set(hashes);
+  if (wanted.size === 0) return [];
+  const rows = await tx<Array<{ hash?: unknown; page?: unknown }>>(STATE_PAGE_STORE, "readonly", (store) => store.getAll(), { count: wanted.size });
+  return rows
+    .filter((row) => typeof row?.hash === "string" && wanted.has(row.hash) && isShadowStatePage(row.page))
+    .map((row) => row.page as ShadowStatePage);
 }
 
 async function cachedStatePageHashes(): Promise<string[]> {

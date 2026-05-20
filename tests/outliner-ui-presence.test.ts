@@ -173,6 +173,33 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector(".presence-list")?.textContent).toContain("Guest One");
   });
 
+  it("does not classify unrelated projected objects as outline rows by props alone", async () => {
+    const directCall = vi.fn(async () => []);
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; subject: string };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["not_an_outline_item"],
+      directCall,
+      projections: {
+        not_an_outline_item: {
+          id: "not_an_outline_item",
+          name: "positioned thing",
+          parent: "$thing",
+          ancestors: ["$thing"],
+          location: "the_outline",
+          props: { position: 1, hidden: false, text: "not a row" },
+          catalogState: {}
+        }
+      }
+    });
+    document.body.append(element);
+
+    await element.hydrate();
+
+    expect(directCall).not.toHaveBeenCalled();
+    expect(element.querySelector("[data-outliner-row]")).toBeNull();
+  });
+
   it("applies outline_item_added without rehydrating", () => {
     const directCall = vi.fn(async () => []);
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData; subject: string; applyObservation: (observation: Record<string, unknown>) => void };
