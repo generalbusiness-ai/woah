@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import type { SerializedWorld } from "../src/core/repository";
+import type { SerializedObject, SerializedSession, SerializedWorld } from "../src/core/repository";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import type { ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
@@ -11,6 +12,7 @@ import {
   submitTurnIntent,
   v2TurnGatewayAuthorityPayload,
   v2TurnGatewayEnvelopeId,
+  v2TurnGatewayAuthorityObjectIds,
   v2TurnGatewayReplyNeedsRepair,
   type V2TurnGatewayEnvelopeBody
 } from "../src/core/v2-turn-gateway";
@@ -24,9 +26,12 @@ describe("v2 turn gateway", () => {
 
     const serialized = world.exportWorld();
     serialized.objects = serialized.objects.filter((obj) => !["the_outline", "$outliner"].includes(obj.id));
+    const payload = v2TurnGatewayAuthorityPayload(world, ["the_chatroom", session.actor]);
+    expect(payload.authority.kind).toBe("woo.authority_slice.cells.shadow.v1");
+    expect(payload.session_objects).toEqual([]);
     mergeV2TurnGatewayAuthority(
       serialized,
-      v2TurnGatewayAuthorityPayload(world, ["the_chatroom", session.actor]).authority,
+      payload.authority,
       { clone: true }
     );
 
@@ -92,7 +97,7 @@ describe("v2 turn gateway", () => {
     expect(v2TurnGatewayReplyNeedsRepair(okReply("turn"))).toBe(false);
   });
 
-  it("merges authority rows into serialized state without duplicating objects", () => {
+  it("merges versioned authority cells into serialized state without duplicating objects", () => {
     const serialized = {
       sessions: [{ id: "old", actor: "$old" as ObjRef, started: 1, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$old-room" as ObjRef }],
       objects: [
@@ -100,20 +105,52 @@ describe("v2 turn gateway", () => {
         serializedObject("$two", "two", 1)
       ]
     };
-    mergeV2TurnGatewayAuthority(serialized, {
+    const authority = buildSerializedAuthorityCellSlice({
       sessions: [{ id: "new", actor: "$actor" as ObjRef, started: 2, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$room" as ObjRef }],
       objects: [
-        { ...serialized.objects[1], name: "two updated" },
+        { ...serialized.objects[1], name: "two updated", properties: [["value", 2]], propertyVersions: [["value", 2]] },
         serializedObject("$three", "three", 3)
-      ]
+      ],
+      counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 },
+      tombstones: ["$gone" as ObjRef]
     });
+    mergeV2TurnGatewayAuthority(serialized, authority);
 
     expect(serialized.sessions.map((session) => session.id)).toEqual(["new"]);
-    expect(serialized.objects.map((object) => [object.id, object.name])).toEqual([
+    expect(new Map(serialized.objects.map((object) => [object.id, object.name]))).toEqual(new Map([
       ["$one", "one"],
       ["$two", "two updated"],
       ["$three", "three"]
-    ]);
+    ]));
+    expect(serialized.objects.find((object) => object.id === "$two")?.properties).toEqual([["value", 2]]);
+  });
+
+  it("does not duplicate legacy object-row authority through session_objects", () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-authority-no-session-object-echo");
+    const actor = world.exportObjects([session.actor])[0];
+    const payload = v2TurnGatewayAuthorityPayload({
+      exportSessions: () => [session],
+      exportAuthoritySlice: (sessions: SerializedSession[]) => ({
+        kind: "woo.authority_slice.shadow.v1",
+        sessions,
+        objects: [actor]
+      })
+    } as never, [session.actor]);
+
+    expect(payload.authority.kind).toBe("woo.authority_slice.shadow.v1");
+    expect(payload.authority).toMatchObject({ objects: [actor] });
+    expect(payload.session_objects).toEqual([]);
+  });
+
+  it("includes argument and body strings in explicit authority roots", () => {
+    expect(v2TurnGatewayAuthorityObjectIds({
+      scope: "$room" as ObjRef,
+      target: "$tool" as ObjRef,
+      actor: "$actor" as ObjRef,
+      args: ["$arg_obj", ["plain text", "$nested_arg"]],
+      body: { selected: "$body_obj", refs: ["$nested_body"] }
+    })).toEqual(["$room", "$tool", "$actor", "$arg_obj", "plain text", "$nested_arg", "$body_obj", "$nested_body"]);
   });
 
   it("submits intent turns through one retry loop with refreshed authority", async () => {
@@ -157,7 +194,7 @@ describe("v2 turn gateway", () => {
     expect(result.reply?.ok).toBe(true);
     expect(attempts).toEqual([0, 1]);
     expect(envelopes.map((body) => body.node)).toEqual(["client-0", "client-1"]);
-    expect(envelopes.map((body) => body.authority.objects.map((object) => object.id))).toEqual([
+    expect(envelopes.map((body) => authorityObjectIds(body.authority))).toEqual([
       ["$room", "$target", "$actor"],
       ["$room", "$target", "$actor"]
     ]);
@@ -211,7 +248,7 @@ describe("v2 turn gateway", () => {
       auth: { mode: "shadow_local", actor: session.actor, session: session.id },
       persistence: "durable"
     });
-    expect(submitted.body.authority.objects.map((object) => object.id)).toEqual(["the_dubspace", session.actor]);
+    expect(authorityObjectIds(submitted.body.authority)).toEqual(["the_dubspace", session.actor, "delay_1"]);
     expect(result.reply?.ok).toBe(true);
   });
 
@@ -263,7 +300,7 @@ describe("v2 turn gateway", () => {
       expected: scopeHead("the_dubspace"),
       auth: { mode: "shadow_local", actor: session.actor, session: session.id }
     });
-    expect(submitted.body.authority.objects.map((object) => object.id)).toEqual([
+    expect(authorityObjectIds(submitted.body.authority)).toEqual([
       "the_dubspace",
       "the_chatroom",
       session.actor
@@ -290,6 +327,7 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
   const clients = new Map<ObjRef, PlannedGatewayClient>();
   const ensureScopes: ObjRef[] = [];
   const submissions: PlannedGatewaySubmission[] = [];
+  const knownObjectIds = new Set(serialized.objects.map((obj) => obj.id));
   const clientFor = (scope: ObjRef): PlannedGatewayClient => {
     let client = clients.get(scope);
     if (!client) {
@@ -317,7 +355,9 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
         authority: {
           kind: "woo.authority_slice.shadow.v1" as const,
           sessions: [],
-          objects: extraObjectIds.map((id, index) => serializedObject(id, id, index))
+          objects: extraObjectIds
+            .filter((id) => knownObjectIds.has(id))
+            .map((id, index) => serializedObject(id, id, index))
         }
       }),
       submitEnvelope: async (scope: ObjRef, body: V2TurnGatewayEnvelopeBody) => {
@@ -339,7 +379,7 @@ function scopeHead(scope: ObjRef, seq = 0): ShadowScopeHead {
   };
 }
 
-function serializedObject(id: string, name: string, ts: number) {
+function serializedObject(id: string, name: string, ts: number): SerializedObject {
   return {
     id: id as ObjRef,
     name,
@@ -358,6 +398,10 @@ function serializedObject(id: string, name: string, ts: number) {
     contents: [],
     eventSchemas: []
   };
+}
+
+function authorityObjectIds(authority: V2TurnGatewayEnvelopeBody["authority"]): ObjRef[] {
+  return Array.from(authoritySliceObjectIds(authority));
 }
 
 function receipt(accepted: boolean) {

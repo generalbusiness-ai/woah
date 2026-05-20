@@ -4,6 +4,7 @@ import { parse } from "node:url";
 import { createServer as createViteServer } from "vite";
 import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
+import { mergeSerializedAuthoritySlice } from "../core/authority-slice";
 import { createWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
 import { handleRestProtocolRequest, restFrameFromTurnReply, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
@@ -33,7 +34,6 @@ import {
   handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   markShadowBrowserRelaySerializedChanged,
-  mergeShadowBrowserAuthoritySessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserSessionBearer,
@@ -436,12 +436,9 @@ function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds
     const claims = relay.session_auth.get(shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor }));
     if (claims) relay.session_auth.set(browser.session_token, claims);
   }
-  const mergedSessions = mergeShadowBrowserAuthoritySessionState(relay.commit_scope.serialized.sessions, authority.sessions);
-  if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
-    relay.commit_scope.serialized.sessions = mergedSessions;
+  if (mergeSerializedAuthoritySlice(relay.commit_scope.serialized, authority, { clone: true })) {
     markShadowBrowserRelaySerializedChanged(relay);
   }
-  refreshDevV2SerializedObjects(relay, authority.objects);
 }
 
 function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Session): void {

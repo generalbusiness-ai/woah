@@ -2631,11 +2631,13 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const chatOpens = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/open");
       const chatEnvelopes = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/envelope");
-      expect(chatOpens).toHaveLength(2);
+      expect(chatOpens).toHaveLength(1);
       expect(chatOpens[0].body).not.toHaveProperty("serialized");
-      expect(chatOpens[1].body).toHaveProperty("serialized");
+      expect(chatOpens[0].body.session_objects).toEqual([]);
+      expect((chatOpens[0].body.authority as { kind?: string } | undefined)?.kind).toBe("woo.authority_slice.cells.shadow.v1");
       expect(chatEnvelopes).toHaveLength(2);
       expect(chatEnvelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toBe(true);
+      expect(chatEnvelopes.every((post) => Array.isArray(post.body.session_objects) && post.body.session_objects.length === 0)).toBe(true);
     } finally {
       logSpy.mockRestore();
       directoryState.close();
@@ -2745,9 +2747,9 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const chatOpens = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/open");
       const chatEnvelopes = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/envelope");
-      expect(chatOpens).toHaveLength(3);
-      expect(chatOpens.filter((post) => Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toHaveLength(1);
-      expect(chatOpens[2].body).not.toHaveProperty("serialized");
+      expect(chatOpens).toHaveLength(2);
+      expect(chatOpens.filter((post) => Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toHaveLength(0);
+      expect(chatOpens[1].body).not.toHaveProperty("serialized");
       expect(chatEnvelopes).toHaveLength(3);
       expect(new Set(chatEnvelopes.map((post) => decodeEnvelope(String(post.body.envelope)).id)).size).toBe(3);
     } finally {

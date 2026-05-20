@@ -25,6 +25,7 @@ import {
   wooError
 } from "./types";
 import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
+import { buildSerializedAuthorityCellSlice } from "./authority-slice";
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -6018,6 +6019,19 @@ export class WooWorld {
     const ids: ObjRef[] = [];
     const seen = new Set<ObjRef>();
     const contentsExpanded = new Set<ObjRef>();
+    const pushValueRefs = (value: WooValue): void => {
+      if (typeof value === "string") {
+        if (this.objects.has(value as ObjRef)) push(value as ObjRef);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) pushValueRefs(item);
+        return;
+      }
+      if (value && typeof value === "object") {
+        for (const item of Object.values(value)) pushValueRefs(item);
+      }
+    };
     const push = (id: ObjRef | null | undefined, includeContents = false): void => {
       if (!id) return;
       const obj = this.objects.get(id);
@@ -6026,6 +6040,13 @@ export class WooWorld {
         seen.add(id);
         ids.push(id);
         if (obj.parent) push(obj.parent);
+        push(obj.owner);
+        for (const def of obj.propertyDefs.values()) {
+          push(def.owner);
+          pushValueRefs(def.defaultValue);
+        }
+        for (const [, value] of obj.properties) pushValueRefs(value);
+        for (const verb of obj.verbs) push(verb.owner);
         for (const feature of this.safeFeatureList(id)) push(feature);
       }
       if (!includeContents || contentsExpanded.has(id)) return;
@@ -6039,11 +6060,22 @@ export class WooWorld {
       const actor = this.objects.get(session.actor);
       if (actor?.location) push(actor.location, true);
     }
-    return {
-      kind: "woo.authority_slice.shadow.v1",
-      sessions: structuredClone(sessions) as SerializedSession[],
-      objects: this.exportObjects(ids)
-    };
+    // Catalog/helper objects are code dependencies rather than visible room
+    // contents. Partial authority seeds need them for bytecode call targets
+    // such as $match and $help even when the caller did not name those objects.
+    for (const id of this.objects.keys()) {
+      if (id.startsWith("$")) push(id);
+    }
+    return buildSerializedAuthorityCellSlice({
+      sessions,
+      objects: this.exportObjects(ids),
+      counters: {
+        objectCounter: this.objectCounter,
+        parkedTaskCounter: this.parkedTaskCounter,
+        sessionCounter: this.sessionCounter
+      },
+      tombstones: Array.from(this.tombstones)
+    });
   }
 
   /**

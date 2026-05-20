@@ -1,3 +1,4 @@
+import type { ShadowStatePage, ShadowStatePageRef } from "./shadow-state-pages";
 import { wooError, type ErrorValue, type Message, type ObjRef, type Observation, type PropertyDef, type SpaceLogEntry, type VerbDef, type WooObject, type WooValue } from "./types";
 
 export type SerializedObject = {
@@ -37,11 +38,23 @@ export type SerializedSession = {
   apikeyId?: string;
 };
 
-export type SerializedAuthoritySlice = {
+export type SerializedAuthorityObjectSlice = {
   kind: "woo.authority_slice.shadow.v1";
   sessions: SerializedSession[];
   objects: SerializedObject[];
 };
+
+export type SerializedAuthorityCellSlice = {
+  kind: "woo.authority_slice.cells.shadow.v1";
+  sessions: SerializedSession[];
+  page_refs: ShadowStatePageRef[];
+  inline_pages: ShadowStatePage[];
+  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  tombstones: ObjRef[];
+  source_object_count: number;
+};
+
+export type SerializedAuthoritySlice = SerializedAuthorityObjectSlice | SerializedAuthorityCellSlice;
 
 export type SpaceSnapshotRecord = {
   space_id: ObjRef;

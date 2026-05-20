@@ -84,7 +84,8 @@ export function shadowObjectLineagePage(obj: SerializedObject): ShadowObjectLine
     flags: structuredClone(obj.flags) as SerializedObject["flags"],
     created: obj.created,
     modified: obj.modified,
-    eventSchemas: structuredClone(obj.eventSchemas) as SerializedObject["eventSchemas"]
+    eventSchemas: (structuredClone(obj.eventSchemas) as SerializedObject["eventSchemas"])
+      .sort(([a], [b]) => a.localeCompare(b))
   };
 }
 
@@ -155,7 +156,7 @@ export function shadowStatePageRef(page: ShadowStatePage, inline: boolean): Shad
   return {
     object: page.object,
     page: page.page,
-    ...("name" in page ? { name: page.name } : {}),
+    ...(page.page === "property_cell" || page.page === "verb_bytecode" ? { name: page.name } : {}),
     hash: hashSource(json),
     bytes: utf8ByteLength(json),
     inline

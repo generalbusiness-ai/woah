@@ -1,4 +1,5 @@
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
+import { mergeSerializedAuthoritySlice, type MergeSerializedAuthorityInput } from "./authority-slice";
 import {
   buildShadowTurnExecEnvelope,
   buildShadowTurnIntentEnvelope
@@ -15,6 +16,7 @@ export const V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED = "E_SNAPSHOT_REQUIRED";
 
 export type V2TurnGatewayAuthorityPayload = {
   sessions: SerializedSession[];
+  /** Legacy fallback for pre-authority callers. Authority-bearing payloads MUST leave this empty. */
   session_objects: SerializedObject[];
   authority: SerializedAuthoritySlice;
 };
@@ -40,6 +42,7 @@ export type V2TurnGatewayEnvelopeBody = {
   session: string;
   actor: ObjRef;
   sessions: SerializedSession[];
+  /** Legacy fallback for pre-authority callers. Authority-bearing payloads MUST leave this empty. */
   session_objects: SerializedObject[];
   authority: SerializedAuthoritySlice;
   envelope: string;
@@ -100,32 +103,23 @@ export function v2TurnGatewayAuthorityPayload(
   // callers so later cell-slice shrinking has one contract to change.
   const sessions = world.exportSessions();
   const authority = world.exportAuthoritySlice(sessions, extraObjectIds);
-  return { sessions: authority.sessions, session_objects: authority.objects, authority };
+  return {
+    sessions: authority.sessions,
+    session_objects: [],
+    authority
+  };
 }
 
 export function mergeV2TurnGatewayAuthority(
   serialized: { sessions: SerializedSession[]; objects: SerializedObject[] },
-  authority: Pick<SerializedAuthoritySlice, "sessions" | "objects">,
+  authority: MergeSerializedAuthorityInput,
   options: { clone?: boolean } = {}
 ): void {
-  serialized.sessions = options.clone
-    ? structuredClone(authority.sessions) as SerializedSession[]
-    : authority.sessions;
-  const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
-  for (const obj of authority.objects) {
-    const next = options.clone ? structuredClone(obj) as SerializedObject : obj;
-    const index = byId.get(next.id);
-    if (index === undefined) {
-      byId.set(next.id, serialized.objects.length);
-      serialized.objects.push(next);
-    } else {
-      serialized.objects[index] = next;
-    }
-  }
+  mergeSerializedAuthoritySlice(serialized, authority, options);
 }
 
 export function v2TurnGatewayAuthorityObjectIds(
-  input: { scope: ObjRef; target?: ObjRef | null; actor: ObjRef },
+  input: { scope: ObjRef; target?: ObjRef | null; actor: ObjRef; args?: readonly WooValue[]; body?: Record<string, WooValue> },
   commitScope: ObjRef = input.scope
 ): ObjRef[] {
   const ids: ObjRef[] = [];
@@ -135,10 +129,25 @@ export function v2TurnGatewayAuthorityObjectIds(
     seen.add(id);
     ids.push(id);
   };
+  const pushValueRefs = (value: unknown): void => {
+    if (typeof value === "string") {
+      push(value as ObjRef);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) pushValueRefs(item);
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const item of Object.values(value)) pushValueRefs(item);
+    }
+  };
   push(commitScope);
   push(input.scope);
   push(input.target);
   push(input.actor);
+  pushValueRefs(input.args ?? []);
+  pushValueRefs(input.body ?? {});
   return ids;
 }
 

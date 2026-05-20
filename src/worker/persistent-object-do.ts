@@ -28,6 +28,12 @@
 //   private repos and content-hash caching are deferred.
 
 import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld } from "../core/bootstrap";
+import {
+  authoritySliceObjectIds,
+  combineSerializedAuthoritySlices,
+  filterSerializedAuthoritySliceObjects,
+  serializedWorldFromAuthoritySlice
+} from "../core/authority-slice";
 import type { EffectTranscript } from "../core/effect-transcript";
 import { parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
@@ -70,6 +76,7 @@ import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   mergeV2TurnGatewayAuthority,
   submitTurnIntent,
+  v2TurnGatewayAuthorityObjectIds,
   v2TurnGatewayAuthorityPayload,
   v2TurnGatewayEnvelopeId
 } from "../core/v2-turn-gateway";
@@ -2787,8 +2794,9 @@ export class PersistentObjectDO {
     }
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
+      const authorityIds = v2SocketEnvelopeAuthorityObjectIds(encoded, att.scope, att.actor);
       const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
-        ...v2TurnGatewayAuthorityPayload(world, [att.scope, att.actor]),
+        ...v2TurnGatewayAuthorityPayload(world, authorityIds),
         scope: att.scope,
         node: att.node,
         token: att.token,
@@ -2861,7 +2869,13 @@ export class PersistentObjectDO {
   ): Promise<RestV2RelayClient> {
     if (forceReopen) this.restV2Relays.delete(scope);
     let client = this.restV2Relays.get(scope);
-    const seedObjectIds = [scope, input.target, input.actor];
+    const seedObjectIds = v2TurnGatewayAuthorityObjectIds({
+      scope: input.scope,
+      target: input.target,
+      actor: input.actor,
+      args: input.args,
+      body: input.body
+    }, scope);
     const seeded = await this.v2GatewayState(world, seedObjectIds);
     if (!client) {
       client = {
@@ -2895,17 +2909,14 @@ export class PersistentObjectDO {
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }> {
     const ids = Array.from(extraObjectIds);
     const authority = await this.v2GatewayAuthorityPayload(world, ids);
-    const serialized = world.exportWorld();
-    mergeV2TurnGatewayAuthority(serialized, authority.authority, { clone: true });
+    const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
   }
 
   private async v2GatewayAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {
     const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
     const local = v2TurnGatewayAuthorityPayload(world, ids);
-    const byId = new Map<ObjRef, SerializedAuthoritySlice["objects"][number]>(
-      local.authority.objects.map((obj) => [obj.id, obj])
-    );
+    const localObjectIds = authoritySliceObjectIds(local.authority);
     const localHost = this.durableHostKey();
     const routesById = new Map(world.objectRoutes().map((route) => [route.id, route] as const));
     const resolveHost = async (id: ObjRef, fallbackHost: string): Promise<string> => {
@@ -2936,20 +2947,24 @@ export class PersistentObjectDO {
         { objects: Array.from(objects) }
       )
     })));
+    const slices: SerializedAuthoritySlice[] = [local.authority];
     for (const { host, response } of remoteSlices) {
-      const objectHosts = await Promise.all((response.authority?.objects ?? []).map(
-        async (obj) => [obj, await resolveHost(obj.id, WORLD_HOST)] as const
+      const accepted = new Set<ObjRef>();
+      const responseObjectIds = Array.from(authoritySliceObjectIds(response.authority));
+      const objectHosts = await Promise.all(responseObjectIds.map(
+        async (id) => [id, await resolveHost(id, WORLD_HOST)] as const
       ));
-      for (const [obj, objectHost] of objectHosts) {
-        if (objectHost === host || !byId.has(obj.id)) byId.set(obj.id, obj);
+      for (const [id, objectHost] of objectHosts) {
+        if (objectHost === host || !localObjectIds.has(id)) accepted.add(id);
       }
+      slices.push(filterSerializedAuthoritySliceObjects(response.authority, (id) => accepted.has(id)));
     }
-    const authority: SerializedAuthoritySlice = {
-      kind: "woo.authority_slice.shadow.v1",
-      sessions: local.authority.sessions,
-      objects: Array.from(byId.values())
+    const authority = combineSerializedAuthoritySlices(local.authority.sessions, slices);
+    return {
+      sessions: authority.sessions,
+      session_objects: [],
+      authority
     };
-    return { sessions: authority.sessions, session_objects: authority.objects, authority };
   }
 
   private rememberRestV2Relay(scope: ObjRef, client: RestV2RelayClient): void {
@@ -3900,6 +3915,39 @@ function isReadAvailabilityError(err: unknown): boolean {
 
 function sessionActiveScope(record: Record<string, unknown>): ObjRef | undefined {
   return (sessionActiveScopeFromRecord(record) as ObjRef | null) ?? undefined;
+}
+
+function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjRef, fallbackActor: ObjRef): ObjRef[] {
+  try {
+    const envelope = decodeEnvelope(encoded);
+    const body = envelope.body;
+    if (!isRecord(body)) return v2TurnGatewayAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
+    const call = isRecord(body.call) ? body.call : null;
+    const scope = objRefFromUnknown(call?.scope) ?? objRefFromUnknown(body.scope) ?? fallbackScope;
+    const target = objRefFromUnknown(call?.target) ?? objRefFromUnknown(body.target);
+    const actor = objRefFromUnknown(call?.actor) ?? objRefFromUnknown(envelope.actor) ?? fallbackActor;
+    const args = Array.isArray(call?.args)
+      ? call.args as WooValue[]
+      : Array.isArray(body.args)
+      ? body.args as WooValue[]
+      : undefined;
+    const requestBody = isRecord(call?.body)
+      ? call.body as Record<string, WooValue>
+      : isRecord(body.body)
+      ? body.body as Record<string, WooValue>
+      : undefined;
+    return v2TurnGatewayAuthorityObjectIds({ scope, target, actor, args, body: requestBody }, fallbackScope);
+  } catch {
+    return v2TurnGatewayAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function objRefFromUnknown(value: unknown): ObjRef | undefined {
+  return typeof value === "string" && value.length > 0 ? value as ObjRef : undefined;
 }
 
 function isMcpGatewayShardHost(hostKey: string): boolean {

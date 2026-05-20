@@ -433,9 +433,11 @@ CREATE TABLE v2_commit_scope_reply (
 ```
 
 The `serialized` column remains nullable/empty so old scopes whose current row
-contains a gzip or raw JSON world can be loaded once. After the first successful
-open, implementations SHOULD rewrite the scope into the row tables and clear
-`serialized`; new commits MUST NOT store the full world in that column.
+contains a gzip or raw JSON world can be loaded once. New cold opens SHOULD
+materialize row state from `woo.authority_slice.cells.shadow.v1` page values
+rather than from a whole-world request snapshot. After the first successful
+legacy open, implementations SHOULD rewrite the scope into the row tables and
+clear `serialized`; new commits MUST NOT store the full world in that column.
 
 ---
 

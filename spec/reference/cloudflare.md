@@ -673,36 +673,37 @@ and resumes the MCP transport from the forwarded session, while actual durable
 turn execution still commits through `CommitScopeDO`.
 
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
-a scope it materializes the gateway-supplied `SerializedWorld` into
-row-shaped DO SQLite state: one row per serialized object, one row per session,
-one row per sequenced log entry, and small metadata/tail tables for the head,
-counters, accepted frames, transcript tail, idempotency keys, and cached
-replies. The legacy single `v2_commit_scope_meta.serialized` blob column is a
-read-only migration source; after a legacy scope opens successfully, the DO
-rewrites the state into row tables and clears the blob value.
-The first successful `/v2/open` for a scope must carry `serialized` if the
-CommitScopeDO has no durable row snapshot. Gateways MAY optimistically omit
-`serialized`; a CommitScopeDO without a durable snapshot rejects that open with
-`E_SNAPSHOT_REQUIRED`, and the gateway retries with the seed snapshot. Once the
-relay has been durably materialized, later session opens for the same scope
-SHOULD omit `serialized` and rely on the persisted rows plus the request
-authority slice.
+a scope it materializes the gateway-supplied authority seed into row-shaped DO
+SQLite state: one row per materialized object, one row per session, one row per
+sequenced log entry, and small metadata/tail tables for the head, counters,
+accepted frames, transcript tail, idempotency keys, and cached replies. New
+opens seed from `woo.authority_slice.cells.shadow.v1`, whose `page_refs` name
+exact object-lineage, live-object, property-cell, and verb-bytecode page hashes
+and whose `inline_pages` carry the page values needed for a cold relay. The
+legacy single `v2_commit_scope_meta.serialized` blob column and `/v2/open`
+`serialized` request field are compatibility inputs: a gateway MAY retry with a
+materialized seed snapshot when an older or empty commit authority rejects an
+authority-only open with `E_SNAPSHOT_REQUIRED`. After a legacy scope opens
+successfully, the DO rewrites the state into row tables and clears the blob
+value. Once the relay has been durably materialized, later session opens for the
+same scope SHOULD omit `serialized` and rely on the persisted rows plus the
+request authority slice.
 
 CommitScopeDO snapshots are materialized planning caches, not independent
 owners of live session presence. Each signed `/v2/open`, `/v2/envelope`, and
-`/v2/state-transfer` request carries a narrow `woo.authority_slice.shadow.v1`
-containing current session rows, session actor objects, the sessions' active
-rooms, and any explicit turn scope/target rows. The DO refreshes those rows
-before planning or serving recipient-bound transfer state so cross-scope
-movement accepted by one CommitScopeDO is visible to the next scope without a
-full-world transfer.
+`/v2/state-transfer` request carries the current authority slice: live session
+rows, versioned cells for session actors, the sessions' active rooms, explicit
+turn scope/target rows, and their required owner/class/feature/catalog support
+cells. The DO refreshes those cells before planning or serving recipient-bound
+transfer state so cross-scope movement accepted by one CommitScopeDO is visible
+to the next scope without a full-world transfer.
 
 Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to the in-memory relay, then the storage transaction upserts only
 object rows named by transcript creates/writes plus any changed session active
 scope and sequenced log row. This keeps steady-state commit storage cost
 proportional to the turn delta, not to the scope's world size. Cold opens still
-write O(world-size) rows once for a new or migrated scope.
+write O(authority-seed-size) rows once for a new or migrated scope.
 
 After `CommitScopeDO` accepts a v2 commit, the origin `PersistentObjectDO` must
 synchronously materialize the accepted transcript into every routed object host

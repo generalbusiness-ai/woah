@@ -13,6 +13,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
+import { serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, ErrorValue, Message, ObjRef, Session, WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice } from "../core/repository";
@@ -536,10 +537,10 @@ export class McpGateway {
     if (existing) return existing;
     const pending = this.v2ScopeInitializers.get(scope);
     if (pending) return await pending;
-    // First-open seeding is the expensive path: authority slice plus full
-    // exportWorld for the local relay and, only if CommitScopeDO lacks a
-    // durable row snapshot, a serialized /v2/open retry. Coalesce it per scope
-    // so parallel sessions do not each build and post the same snapshot.
+    // First-open seeding builds a narrow versioned authority seed for the
+    // local relay and, only if CommitScopeDO lacks a durable row snapshot, a
+    // materialized /v2/open retry. Coalesce it per scope so parallel sessions
+    // do not each build and post the same seed.
     const initializer = (async () => {
       const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
       const client: V2ScopeClient = {
@@ -611,8 +612,7 @@ export class McpGateway {
 
   private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }> {
     const authority = await this.v2AuthorityPayload(extraObjectIds);
-    const serialized = this.world.exportWorld();
-    mergeV2TurnGatewayAuthority(serialized, authority.authority, { clone: true });
+    const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
   }
 

@@ -8,6 +8,7 @@
 
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
+import { mergeSerializedAuthoritySlice, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   applyShadowBrowserTransfer,
@@ -22,7 +23,6 @@ import {
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
   MAX_SHADOW_TRANSCRIPT_TAIL,
   markShadowBrowserRelaySerializedChanged,
-  mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -343,13 +343,14 @@ export class CommitScopeDO {
         return loaded;
       }
     }
-    if (!input.serialized) {
+    const serialized = input.serialized ?? (input.authority ? serializedWorldFromAuthoritySlice(input.authority) : null);
+    if (!serialized) {
       throw wooError(V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, `commit scope ${input.scope} has no durable snapshot; retry /v2/open with serialized seed state`);
     }
     const relay = createShadowBrowserRelayShim({
       node: `node:commit-scope:${input.scope}`,
       scope: input.scope,
-      serialized: input.serialized
+      serialized
     });
     this.relay = relay;
     this.needsFullSave = true;
@@ -363,7 +364,6 @@ export class CommitScopeDO {
     // working set before the envelope is decoded.
     const authority = input.authority;
     const sessionRows = authority?.sessions ?? input.sessions;
-    const objectRows = authority?.objects ?? input.session_objects ?? [];
     const auth = buildShadowBrowserSessionAuth({
       sessions: sessionRows,
       scope: input.scope,
@@ -372,14 +372,18 @@ export class CommitScopeDO {
     });
     relay.session_auth = auth.session_auth;
     relay.session_revs = auth.session_revs;
-    const mergedSessions = authority
-      ? mergeShadowBrowserAuthoritySessionState(relay.commit_scope.serialized.sessions, sessionRows)
-      : mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, sessionRows);
+    if (authority) {
+      if (mergeSerializedAuthoritySlice(relay.commit_scope.serialized, authority, { clone: true })) {
+        markShadowBrowserRelaySerializedChanged(relay);
+      }
+      return;
+    }
+    const mergedSessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, sessionRows);
     if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
       relay.commit_scope.serialized.sessions = mergedSessions;
       markShadowBrowserRelaySerializedChanged(relay);
     }
-    this.refreshSerializedObjects(relay, objectRows);
+    this.refreshSerializedObjects(relay, input.session_objects ?? []);
   }
 
   private ensureSerializedSession(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {

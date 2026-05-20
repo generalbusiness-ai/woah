@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
+import { serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
 import { applyAcceptedShadowFrame } from "../../src/core/shadow-commit-scope";
 import { createWorld } from "../../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../../src/core/shadow-envelope";
@@ -14,6 +15,7 @@ import {
 import type { ShadowTurnExecReply } from "../../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
+import { v2TurnGatewayAuthorityPayload } from "../../src/core/v2-turn-gateway";
 import type { WooWorld } from "../../src/core/world";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
@@ -48,7 +50,7 @@ type CostHarness = {
   gatewayState: FakeDurableObjectState;
   scopeState: FakeDurableObjectState;
   commitScopeNamespace: FakeDurableObjectNamespace;
-  openScope: () => Promise<void>;
+  openScope: () => Promise<{ objects: number; sessions: number }>;
   envelope: (index: number) => Promise<string>;
   sendTurn: (index: number) => Promise<void>;
   cleanup: () => void;
@@ -167,12 +169,12 @@ describe("v2 CommitScopeDO cost budget", () => {
   it("stores cold-start state as object rows, then keeps the first envelope delta-sized", async () => {
     const harness = await makeCostHarness();
     try {
-      await harness.openScope();
+      const seed = await harness.openScope();
       const openWrites = writeRowsByTable(harness.scopeState);
       expect(openWrites).toMatchObject({
         v2_commit_scope_meta: 1,
-        v2_commit_scope_object: harness.world.exportWorld().objects.length,
-        v2_commit_scope_session: harness.world.exportWorld().sessions.length
+        v2_commit_scope_object: seed.objects,
+        v2_commit_scope_session: seed.sessions
       });
       resetCostLog(harness);
 
@@ -196,7 +198,9 @@ describe("v2 CommitScopeDO cost budget", () => {
     const scopeState = new FakeDurableObjectState("#-1");
     const commitScope = new CommitScopeDO(scopeState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const env = { WOO_INTERNAL_SECRET: "cf-test-secret" };
-    const expectedObjects = world.exportWorld().objects.length;
+    const authority = v2TurnGatewayAuthorityPayload(world, ["#-1", session.actor]);
+    const expectedObjects = serializedWorldFromAuthoritySlice(authority.authority).objects.length;
+    const expectedSessions = authority.sessions.length;
     resetStateCostLog(scopeState);
 
     try {
@@ -210,8 +214,7 @@ describe("v2 CommitScopeDO cost budget", () => {
             token: "guest:cf-v2-concurrent-open",
             session: session.id,
             actor: session.actor,
-            sessions: world.exportSessions(),
-            serialized: world.exportWorld()
+            ...authority
           })
         }));
         const response = await commitScope.fetch(request);
@@ -220,7 +223,7 @@ describe("v2 CommitScopeDO cost budget", () => {
 
       expect(writeRowsByTable(scopeState)).toMatchObject({
         v2_commit_scope_object: expectedObjects,
-        v2_commit_scope_session: world.exportWorld().sessions.length
+        v2_commit_scope_session: expectedSessions
       });
     } finally {
       scopeState.close();
@@ -241,6 +244,7 @@ describe("v2 CommitScopeDO cost budget", () => {
     });
 
     const open = async (node: string, executableSeedDigest?: string, lastKnownHead?: Record<string, any>): Promise<Record<string, any>> => {
+      const authority = v2TurnGatewayAuthorityPayload(world, ["the_dubspace", session.actor]);
       const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -250,8 +254,7 @@ describe("v2 CommitScopeDO cost budget", () => {
           token: "guest:cf-v2-open-seed-cache",
           session: session.id,
           actor: session.actor,
-          sessions: world.exportSessions(),
-          serialized: world.exportWorld(),
+          ...authority,
           ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
           ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
         })
@@ -425,11 +428,12 @@ async function makeCostHarness(): Promise<CostHarness> {
     this.value = value;
     return this.value;
   }`, null).ok).toBe(true);
+  const initialAuthority = v2TurnGatewayAuthorityPayload(world, ["#-1", "cf_v2_cost_box", session.actor]);
 
   const relay = createShadowBrowserRelayShim({
     node: "node:commit-scope:#-1",
     scope: "#-1",
-    serialized: world.exportWorld()
+    serialized: serializedWorldFromAuthoritySlice(initialAuthority.authority)
   });
   const browser = createShadowBrowserNode({
     node: "browser:v2-cost",
@@ -458,6 +462,7 @@ async function makeCostHarness(): Promise<CostHarness> {
     scopeState,
     commitScopeNamespace,
     openScope: async () => {
+      const authority = v2TurnGatewayAuthorityPayload(world, ["#-1", "cf_v2_cost_box", session.actor]);
       const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -467,12 +472,15 @@ async function makeCostHarness(): Promise<CostHarness> {
           token: "guest:cf-v2-cost",
           session: session.id,
           actor: session.actor,
-          sessions: world.exportSessions(),
-          serialized: world.exportWorld()
+          ...authority
         })
       }));
       const response = await commitScopeNamespace.get(commitScopeNamespace.idFromName("#-1")).fetch(request);
       expect(response.ok).toBe(true);
+      return {
+        objects: serializedWorldFromAuthoritySlice(authority.authority).objects.length,
+        sessions: authority.sessions.length
+      };
     },
     envelope: thisEnvelope,
     sendTurn: async (index: number) => {

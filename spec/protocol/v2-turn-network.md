@@ -860,23 +860,35 @@ Every internal open/envelope forwarded to a CommitScopeDO SHOULD carry an
 authority slice:
 
 ```ts
-type AuthoritySlice = {
-  kind: "woo.authority_slice.v1";
+type AuthorityObjectSlice = {
+  kind: "woo.authority_slice.v1"; // legacy compatibility
   sessions: SerializedSession[];
   objects: SerializedObject[];
+};
+
+type AuthorityCellSlice = {
+  kind: "woo.authority_slice.cells.v1";
+  sessions: SerializedSession[];
+  page_refs: AuthorityStatePageRef[];
+  inline_pages: AuthorityStatePage[];
+  counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
+  tombstones: ObjRef[];
+  source_object_count: number;
 };
 ```
 
 The slice is not a full-world snapshot. It is the gateway/owner-provided
 working set that is authoritative for planning this message: live session
 rows, the session actors, the sessions' active rooms, and any explicit
-turn-scope/target rows the gateway knows are relevant. A CommitScopeDO MUST
-refresh these rows before planning an intent. When an authority slice is
-present, its `sessions[*].activeScope` replaces any older per-scope value in
-the CommitScopeDO snapshot; otherwise a cross-scope move accepted in one scope
-can leave another scope planning against stale presence. Legacy
-`session_objects` remains a compatibility projection of `AuthoritySlice.objects`
-for older relays.
+turn-scope/target rows the gateway knows are relevant, plus owner, class,
+feature, property-reference, and catalog/helper support cells needed to execute
+that working set. A CommitScopeDO MUST refresh these cells before planning an
+intent. When an authority slice is present, its `sessions[*].activeScope`
+replaces any older per-scope value in the CommitScopeDO snapshot; otherwise a
+cross-scope move accepted in one scope can leave another scope planning against
+stale presence. `session_objects` is a compatibility request field for older
+callers that do not send `authority`; authority-bearing requests MUST leave it
+empty, including when the authority itself is a legacy object-row slice.
 
 `covers` means "this node probably has the state, code, metadata, and log tail."
 `accepts` means "this node is willing to run this target/verb/scope shape."
