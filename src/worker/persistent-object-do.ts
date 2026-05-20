@@ -37,7 +37,7 @@ import {
   type RestProtocolHost,
   type RestProtocolRequest
 } from "../core/protocol";
-import type { MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, WooValue } from "../core/types";
+import type { ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SeedWorld, SerializedAuthoritySlice, SerializedWorld, TombstoneRecord } from "../core/repository";
@@ -67,6 +67,7 @@ import {
 } from "../core/v2-fanout-projection";
 import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
 import {
+  V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   mergeV2TurnGatewayAuthority,
   submitTurnIntent,
   v2TurnGatewayAuthorityPayload,
@@ -239,6 +240,27 @@ function webSocketProtocols(request: Request): string[] {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function commitScopeErrorFromPayload(payload: unknown): ErrorValue | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const error = (payload as { error?: unknown }).error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return null;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code !== "string" || !code) return null;
+  const message = (error as { message?: unknown }).message;
+  const value = (error as { value?: unknown }).value;
+  return {
+    code,
+    ...(typeof message === "string" ? { message } : {}),
+    ...(value === undefined ? {} : { value: value as WooValue })
+  };
+}
+
+function isCommitScopeSnapshotRequiredError(err: unknown): boolean {
+  const error = normalizeError(err);
+  if (error.code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED) return true;
+  return commitScopeErrorFromPayload(error.value)?.code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED;
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -2646,18 +2668,18 @@ export class PersistentObjectDO {
     this.state.acceptWebSocket(server);
     this.indexAddSocket(session.id, session.actor, server);
     try {
-      const seeded = await this.v2GatewayState(world, [commitScope, session.actor]);
-      const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(commitScope, "/v2/open", {
+      const seedObjectIds = [commitScope, session.actor];
+      const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds);
+      const opened = await this.v2CommitScopeOpen(world, commitScope, {
         scope: commitScope,
         node,
         token,
         session: session.id,
         actor: session.actor,
-        ...seeded.authority,
-        serialized: seeded.serialized,
+        ...authority,
         ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
         ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
-      });
+      }, seedObjectIds);
       const hello = opened.hello;
       server.send(encodeEnvelope({
         v: 2,
@@ -2803,9 +2825,31 @@ export class PersistentObjectDO {
       body: JSON.stringify(body)
     }));
     const response = await this.env.COMMIT_SCOPE.get(id).fetch(request);
-    const payload = await response.json() as Record<string, unknown>;
-    if (!response.ok) throw wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
+    const payload = await response.json().catch(() => null) as unknown;
+    if (!response.ok) {
+      throw commitScopeErrorFromPayload(payload) ?? wooError("E_INTERNAL", `CommitScopeDO ${path} failed`, payload as WooValue);
+    }
     return payload as T;
+  }
+
+  private async v2CommitScopeOpen(
+    world: WooWorld,
+    scope: ObjRef,
+    body: Record<string, unknown>,
+    seedObjectIds: Iterable<ObjRef>,
+    seed?: { serialized: SerializedWorld; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }
+  ): Promise<CommitScopeOpenResponse> {
+    try {
+      return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", body);
+    } catch (err) {
+      if (!isCommitScopeSnapshotRequiredError(err) || Object.prototype.hasOwnProperty.call(body, "serialized")) throw err;
+      const seeded = seed ?? await this.v2GatewayState(world, seedObjectIds);
+      return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", {
+        ...body,
+        ...seeded.authority,
+        serialized: seeded.serialized
+      });
+    }
   }
 
   private async ensureRestV2Relay(
@@ -2817,7 +2861,8 @@ export class PersistentObjectDO {
   ): Promise<RestV2RelayClient> {
     if (forceReopen) this.restV2Relays.delete(scope);
     let client = this.restV2Relays.get(scope);
-    const seeded = await this.v2GatewayState(world, [scope, input.target, input.actor]);
+    const seedObjectIds = [scope, input.target, input.actor];
+    const seeded = await this.v2GatewayState(world, seedObjectIds);
     if (!client) {
       client = {
         scope,
@@ -2830,15 +2875,14 @@ export class PersistentObjectDO {
         openedAt: Date.now(),
         nextTurn: 0
       };
-      const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", {
+      const opened = await this.v2CommitScopeOpen(world, scope, {
         ...seeded.authority,
         scope,
         node: client.node,
         token,
         session: input.session.id,
-        actor: input.actor,
-        serialized: seeded.serialized
-      });
+        actor: input.actor
+      }, seedObjectIds, seeded);
       if (opened.head) client.relay.commit_scope.head = opened.head;
       this.rememberRestV2Relay(scope, client);
       return client;

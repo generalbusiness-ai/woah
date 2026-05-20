@@ -50,6 +50,7 @@ import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
+import { V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED } from "../core/v2-turn-gateway";
 import {
   isShadowTurnExecReply,
   shadowReplyMetricKind,
@@ -343,7 +344,7 @@ export class CommitScopeDO {
       }
     }
     if (!input.serialized) {
-      throw wooError("E_PROTOCOL", `commit scope ${input.scope} has no durable snapshot; open the scope before sending envelopes`);
+      throw wooError(V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, `commit scope ${input.scope} has no durable snapshot; retry /v2/open with serialized seed state`);
     }
     const relay = createShadowBrowserRelayShim({
       node: `node:commit-scope:${input.scope}`,

@@ -27,6 +27,7 @@ import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import { applyAcceptedShadowFrame, applyShadowTranscriptToCommitScopeCache, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
+  V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   mergeV2TurnGatewayAuthority,
   submitTurnIntent,
   v2TurnGatewayAuthorityPayload
@@ -38,6 +39,17 @@ const AUTHORIZATION_HEADER = "authorization";
 const REMOTE_ACCEPTED_LRU_LIMIT = 8192;
 const REMOTE_PENDING_LIMIT = 1024;
 const REMOTE_PENDING_MAX_AGE_MS = 60_000;
+
+function isV2CommitScopeSnapshotRequiredError(err: unknown): boolean {
+  if (!err || typeof err !== "object" || Array.isArray(err)) return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED) return true;
+  const value = (err as { value?: unknown }).value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const nested = (value as { error?: unknown }).error;
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) return false;
+  return (nested as { code?: unknown }).code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED;
+}
 
 type SessionEntry = {
   woo: Session;
@@ -525,8 +537,9 @@ export class McpGateway {
     const pending = this.v2ScopeInitializers.get(scope);
     if (pending) return await pending;
     // First-open seeding is the expensive path: authority slice plus full
-    // exportWorld plus a serialized /v2/open. Coalesce it per scope so
-    // parallel sessions do not each build and post the same snapshot.
+    // exportWorld for the local relay and, only if CommitScopeDO lacks a
+    // durable row snapshot, a serialized /v2/open retry. Coalesce it per scope
+    // so parallel sessions do not each build and post the same snapshot.
     const initializer = (async () => {
       const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
       const client: V2ScopeClient = {
@@ -566,15 +579,21 @@ export class McpGateway {
     const pending = (async () => {
       const authority = seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor]);
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
-      const opened = await hooks.open(client.scope, {
+      const openBody: McpV2OpenBody = {
         scope: client.scope,
         node: this.v2NodeFor(entry),
         token: entry.v2Token,
         session: entry.woo.id,
         actor: entry.woo.actor,
-        ...authority,
-        ...(seeded ? { serialized: seeded.serialized } : {})
-      });
+        ...authority
+      };
+      let opened: McpV2OpenResult;
+      try {
+        opened = await hooks.open(client.scope, openBody);
+      } catch (err) {
+        if (!seeded || !isV2CommitScopeSnapshotRequiredError(err)) throw err;
+        opened = await hooks.open(client.scope, { ...openBody, serialized: seeded.serialized });
+      }
       if (opened.head) client.relay.commit_scope.head = opened.head;
       client.openedSessions.add(entry.woo.id);
     })();

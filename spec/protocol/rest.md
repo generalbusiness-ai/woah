@@ -174,13 +174,14 @@ are committed instead of silently simulated.
 
 Distributed implementations that use a CommitScopeDO-style v2 commit authority
 SHOULD keep REST itself request-response while reusing an internal relay per
-commit scope. The first call for a scope opens the relay with an authoritative
-serialized snapshot; later calls for the same hot scope send only the
-authority-bearing v2 envelope plus the same narrow authority slice used by the
-turn-network transport: live session rows, session actors, active rooms, and
-the turn's explicit scope/target rows. REST clients still see the R6
-request/response contract and MUST NOT depend on full-world snapshots being
-transferred per verb call.
+commit scope. The first successful call for a scope opens the relay with an
+authoritative serialized snapshot only if the commit authority lacks a durable
+row snapshot; warm opens send only the narrow authority slice. Later calls for
+the same hot scope send only the authority-bearing v2 envelope plus the same
+narrow authority slice used by the turn-network transport: live session rows,
+session actors, active rooms, and the turn's explicit scope/target rows. REST
+clients still see the R6 request/response contract and MUST NOT depend on
+full-world snapshots being transferred per verb call.
 
 The natural agent shape is sequenced: `POST /api/objects/$task_42/calls/transition` with body `{ args: ["design-review"], space: "$task_registry" }`. The same call without `space` is rejected because `:transition` is not direct-callable. This makes "mutate through a space" the obvious path, not something callers must remember to wrap.
 

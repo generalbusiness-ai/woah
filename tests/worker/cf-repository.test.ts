@@ -2573,7 +2573,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
-  it("keeps REST v2 relay snapshots on open instead of every envelope", async () => {
+  it("sends REST v2 relay snapshots only when CommitScopeDO asks for a seed", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const wooStates = new Map<string, FakeDurableObjectState>();
@@ -2631,8 +2631,9 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const chatOpens = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/open");
       const chatEnvelopes = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/envelope");
-      expect(chatOpens).toHaveLength(1);
-      expect(chatOpens[0].body).toHaveProperty("serialized");
+      expect(chatOpens).toHaveLength(2);
+      expect(chatOpens[0].body).not.toHaveProperty("serialized");
+      expect(chatOpens[1].body).toHaveProperty("serialized");
       expect(chatEnvelopes).toHaveLength(2);
       expect(chatEnvelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toBe(true);
     } finally {
@@ -2744,7 +2745,9 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const chatOpens = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/open");
       const chatEnvelopes = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/envelope");
-      expect(chatOpens).toHaveLength(2);
+      expect(chatOpens).toHaveLength(3);
+      expect(chatOpens.filter((post) => Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toHaveLength(1);
+      expect(chatOpens[2].body).not.toHaveProperty("serialized");
       expect(chatEnvelopes).toHaveLength(3);
       expect(new Set(chatEnvelopes.map((post) => decodeEnvelope(String(post.body.envelope)).id)).size).toBe(3);
     } finally {

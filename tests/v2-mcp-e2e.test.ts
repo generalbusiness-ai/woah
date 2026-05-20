@@ -298,8 +298,10 @@ describe("v2 MCP e2e", () => {
       const accepted = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
       expect(accepted).toHaveLength(concurrentCalls);
       expect(accepted.map((row) => JSON.parse(row.body).position.seq)).toEqual([1, 2, 3, 4]);
-      expect(openBodies).toHaveLength(concurrentCalls);
+      expect(openBodies).toHaveLength(concurrentCalls + 1);
       expect(openBodies.filter((body) => Object.prototype.hasOwnProperty.call(body, "serialized"))).toHaveLength(1);
+      expect(openBodies[0]).not.toHaveProperty("serialized");
+      expect(openBodies[1]).toHaveProperty("serialized");
     } finally {
       releaseEnvelopeBatch();
       scopeState.close();

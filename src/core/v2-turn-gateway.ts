@@ -11,6 +11,8 @@ import { shadowTurnKeyFromTranscript } from "./turn-key";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
 import type { WooWorld } from "./world";
 
+export const V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED = "E_SNAPSHOT_REQUIRED";
+
 export type V2TurnGatewayAuthorityPayload = {
   sessions: SerializedSession[];
   session_objects: SerializedObject[];
