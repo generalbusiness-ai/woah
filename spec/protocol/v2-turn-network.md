@@ -902,7 +902,8 @@ that surface catalog helpers in the slice should do so by precise reachability
 (verb bytecode literal scan; one-hop property-value tracing from explicit
 roots; class-chain walk) rather than by name prefix or by enumerating the
 whole `objects` map — a catalog-wide sweep inflates the cross-host RPC body
-into multi-megabyte territory and trips read-timeout deadlines on cold opens. When an authority slice is present, its `sessions[*].activeScope`
+into multi-megabyte territory and trips read-timeout deadlines on cold opens.
+When an authority slice is present, its `sessions[*].activeScope`
 replaces any older per-scope value in the CommitScopeDO snapshot; otherwise a
 cross-scope move accepted in one scope can leave another scope planning against
 stale presence. `session_objects` is a compatibility request field for older
