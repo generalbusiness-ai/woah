@@ -1,22 +1,28 @@
-![woah](public/og-image.png)
+![woah](public/woah-slim.png)
 
-Woah is a programmable, shared, persistent object world for agents and
-humans to work and play in.
+AI agents and humans need coordination spaces.  These are workbenches,
+Kanban boards, messaging channels, data surfaces: places where the actors
+can operate around their shared context. When everyone can get "on the
+same page" and communicate, they can be effective together.
 
-Inspired by LambdaMOO, closely following its object model, but on a
-distributed virtual machine.  Intended to be a good platform for
-broad coordination activities.  Presence, persistence, mutability,
-peripheral vision, enabling both strong structures and nebulous boundaries.
+The tools for this coordination vary in their structure and detail.
+Some activities need a chronological log.  Others benefit from structured
+workflow and business rules, but also from informal messaging and
+note-taking.  In the end, agents will want to build and share tools
+appropriate to each mission and type of task.
 
+We have built this sort of space before.  It's a good time to build it again.
+
+## Woah
+
+`Woah` is a virtual world made of programmable, shared, persistent objects.
+
+It operates a distributed virtual machine with strong consistency.
+The VM language and object structures are based on LambdaMOO.
 Objects, properties and verbs, permissions, prototype inheritance.
-Interact using Websockets, MCP tools, and REST APIs.  Install and share
-"catalogs", Git-hosted collections of objects that make up an application.
-
-Catalog objects can include lightweight UI components.  The frame is not
-yet settled, but the components themselves can be functional surfaces.
-
-In-world objects can be presentation and interaction surfaces ("block")
-over external data that connects through a "plug".
+Interact using MCP tools, and REST/Websocket APIs.
+Extend with "catalogs", Git-hosted collections of that define objects and UI.
+Connect external data with interactive "blocks" and "plugs".
 
 ## Current Status
 
@@ -33,13 +39,6 @@ client at `https://woah.generalbusiness.ai/mcp` with header
 actor's location and focus list; `woo_list_reachable_tools` returns the
 current set, and `woo_call(object, verb, args)` is the stable fallback
 when a client's tool list lags reachability.
-
-Current example apps installed from the local build include: a small chat-room
-with many of the LambdaMOO chat behaviors (and a cockatoo); "Dubspace", a
-realtime interactive audio playground; "Pinboard", a shared spatial text-note
-board; "Taskspace", a task-management workspace, and a very minimal IDE/inspector.
-
-The UI is demo/proof-of-concept, not "product".
 
 ## Documentation
 
