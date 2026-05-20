@@ -52,9 +52,10 @@ function ctx(calls: Calls): WooContext {
 }
 
 function mount(data: OutlinerData, calls: Calls): WooOutlinerTreeElement {
-  const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData };
+  const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData; showCompanion: boolean };
   element.woo = ctx(calls);
   element.subject = data.outlinerId;
+  element.showCompanion = true;
   document.body.append(element);
   element.data = data;
   return element;

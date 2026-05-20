@@ -122,6 +122,7 @@ const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
 let inboundFrameQueue: Promise<void> = Promise.resolve();
 const pendingStateTransfers = new Map<string, { resolve: () => void; reject: (err: Error) => void; timer: number }>();
+const postedAppliedFrameKeys = new Set<string>();
 
 type V2WorkerScope = {
   addEventListener(type: "message", listener: (event: MessageEvent<V2WorkerCommand>) => void): void;
@@ -249,6 +250,7 @@ async function connectTo(next: { token: string; node: string; scope: string; act
     socket = null;
     connecting = false;
     connectReady?.settle("superseded");
+    postedAppliedFrameKeys.clear();
     previous?.close(1000, "v2 browser scope changed");
     await putMeta("connected", false);
   }
@@ -456,8 +458,8 @@ async function receiveFrame(encoded: string): Promise<void> {
       const applied = await applyCacheMutation(mutation);
       if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
       if (applied?.kind === "projection") postProjection(applied.scope, applied.head, applied.projection);
-      if (mutation.kind === "applied_frame") postAppliedFrame(mutation.frame, mutation.transcript);
-      if (mutation.kind === "object_page" || mutation.kind === "state_page") installedExecutableState = true;
+      if (applied?.kind === "applied_frame") postAppliedFrame(applied.frame, applied.transcript);
+      if (mutation.kind === "object_page" || mutation.kind === "state_page" || mutation.kind === "state_pages") installedExecutableState = true;
     }
     if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
       const reply = envelope.body as ShadowTurnExecReply;
@@ -1125,7 +1127,11 @@ async function allPending(): Promise<PendingEnvelope[]> {
   return pending.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
 }
 
-async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ kind: "projection"; scope: string; head: ShadowScopeHead; projection: unknown } | void> {
+async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
+  | { kind: "projection"; scope: string; head: ShadowScopeHead; projection: unknown }
+  | { kind: "applied_frame"; frame: ShadowCommitAccepted; transcript?: EffectTranscript }
+  | void
+> {
   const startedAt = metricNow();
   let failed: unknown;
   try {
@@ -1147,13 +1153,15 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
         await putProjection(mutation.scope, mutation.head, projection);
         return { kind: "projection", scope: mutation.scope, head: mutation.head, projection };
       }
-      case "applied_frame":
+      case "applied_frame": {
         await putAppliedFrame(mutation.frame);
         if (mutation.transcript) {
           await putTranscript(mutation.transcript, mutation.frame.position.seq);
           await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
         }
+        if (mutation.transcript && rememberAppliedFramePost(mutation.frame)) return { kind: "applied_frame", frame: mutation.frame, transcript: mutation.transcript };
         return;
+      }
       case "transcript":
         if (await transcriptCoveredByCheckpoint(mutation.transcript)) return;
         await putTranscript(mutation.transcript);
@@ -1163,6 +1171,9 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
         return;
       case "state_page":
         await putStatePage(mutation.hash, mutation.ref, mutation.page);
+        return;
+      case "state_pages":
+        await putStatePages(mutation.pages);
         return;
       case "execution_ad":
         await putExecutionAd(mutation.record);
@@ -1182,7 +1193,7 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ k
       scope: mutationScope(mutation),
       ms: metricElapsed(startedAt),
       status: failed ? "error" : "ok",
-      count: 1,
+      count: mutationCount(mutation),
       bytes: mutationApproxBytes(mutation),
       ...(failed ? { error: "E_BROWSER_CACHE_MUTATION", error_detail: errorMessage(failed) } : {})
     });
@@ -1201,10 +1212,16 @@ function mutationScope(mutation: V2BrowserCacheMutation): string | undefined {
 function mutationApproxBytes(mutation: V2BrowserCacheMutation): number | undefined {
   if (mutation.kind === "object_page") return jsonBytes(mutation.object);
   if (mutation.kind === "state_page") return jsonBytes(mutation.page);
+  if (mutation.kind === "state_pages") return mutation.pages.reduce((total, page) => total + jsonBytes(page.page), 0);
   if (mutation.kind === "projection") return jsonBytes(mutation.projection);
   if (mutation.kind === "projection_patch") return jsonBytes(mutation.patch);
   if (mutation.kind === "execution_transfer") return jsonBytes(mutation.record.transfer);
   return undefined;
+}
+
+function mutationCount(mutation: V2BrowserCacheMutation): number {
+  if (mutation.kind === "state_pages") return mutation.pages.length;
+  return 1;
 }
 
 async function putProjection(scope: string, head: unknown, projection: unknown): Promise<void> {
@@ -1238,8 +1255,23 @@ function postAppliedFrame(frame: ShadowCommitAccepted, transcript?: EffectTransc
   if (message) postMessage(message);
 }
 
+function appliedFrameKey(frame: ShadowCommitAccepted): string {
+  return `${frame.position.scope}:${frame.position.seq}`;
+}
+
+function rememberAppliedFramePost(frame: ShadowCommitAccepted): boolean {
+  const key = appliedFrameKey(frame);
+  if (postedAppliedFrameKeys.has(key)) return false;
+  postedAppliedFrameKeys.add(key);
+  return true;
+}
+
 async function putAppliedFrame(frame: ShadowCommitAccepted): Promise<void> {
-  const key = `${frame.position.scope}:${frame.position.seq}`;
+  const key = appliedFrameKey(frame);
+  // The same accepted frame can arrive in the direct reply and in one or more
+  // catch-up transfers. Persist it once; delivery coalescing is session-local.
+  const existing = await tx<{ id?: string } | undefined>(APPLIED_STORE, "readonly", (store) => store.get(key));
+  if (existing) return;
   await tx(APPLIED_STORE, "readwrite", (store) => store.put({ id: key, scope: frame.position.scope, seq: frame.position.seq, frame, received_at: Date.now() }));
 }
 
@@ -1272,6 +1304,16 @@ async function putObjectPage(hash: string, object: unknown): Promise<void> {
 
 async function putStatePage(hash: string, ref: string, page: unknown): Promise<void> {
   await tx(STATE_PAGE_STORE, "readwrite", (store) => store.put({ hash, ref, page, received_at: Date.now() }));
+}
+
+async function putStatePages(pages: readonly { hash: string; ref: string; page: unknown }[]): Promise<void> {
+  if (pages.length === 0) return;
+  const receivedAt = Date.now();
+  await tx<IDBValidKey>(STATE_PAGE_STORE, "readwrite", (store) => {
+    let request: IDBRequest<IDBValidKey> | null = null;
+    for (const { hash, ref, page } of pages) request = store.put({ hash, ref, page, received_at: receivedAt });
+    return request!;
+  }, { count: pages.length });
 }
 
 async function putExecutionTransfer(record: V2ExecutableTransferRecord): Promise<void> {
@@ -1457,12 +1499,15 @@ async function cachedObjectsByHash(hashes: Iterable<string>): Promise<Serialized
 }
 
 async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowStatePage[]> {
-  const pages: ShadowStatePage[] = [];
-  for (const hash of hashes) {
-    const row = await tx<{ page?: unknown } | undefined>(STATE_PAGE_STORE, "readonly", (store) => store.get(hash));
-    if (isShadowStatePage(row?.page)) pages.push(row.page);
-  }
-  return pages;
+  const wanted = new Set(hashes);
+  if (wanted.size === 0) return [];
+  // Tool entry normally needs almost every cached state page. One bulk read
+  // keeps IndexedDB metrics and main-thread postMessage volume bounded; do not
+  // restore per-hash transactions unless sparse cache reads become dominant.
+  const rows = await tx<Array<{ hash?: unknown; page?: unknown }>>(STATE_PAGE_STORE, "readonly", (store) => store.getAll(), { count: wanted.size });
+  return rows
+    .filter((row) => typeof row?.hash === "string" && wanted.has(row.hash) && isShadowStatePage(row.page))
+    .map((row) => row.page as ShadowStatePage);
 }
 
 async function cachedStatePageHashes(): Promise<string[]> {
@@ -1637,7 +1682,8 @@ function errorMessage(err: unknown): string {
 async function tx<T>(
   storeName: string,
   mode: IDBTransactionMode,
-  op: (store: IDBObjectStore) => IDBRequest<T>
+  op: (store: IDBObjectStore) => IDBRequest<T>,
+  options: { count?: number } = {}
 ): Promise<T> {
   const database = await db();
   const startedAt = metricNow();
@@ -1653,7 +1699,7 @@ async function tx<T>(
         what: storeName,
         ms: metricElapsed(startedAt),
         status,
-        count: 1,
+        count: options.count ?? 1,
         ...(err ? { error: "E_BROWSER_IDB_TX", error_detail: errorMessage(err) } : {})
       });
     };

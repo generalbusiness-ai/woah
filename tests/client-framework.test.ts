@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
 import { registerWooObservationHandlers as registerDubspaceObservationHandlers } from "../catalogs/dubspace/ui/dubspace-workspace";
+import { registerWooObservationHandlers as registerOutlinerObservationHandlers } from "../catalogs/outliner/ui/outliner-tree";
 import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
 import {
   CatalogUiRegistry,
@@ -21,8 +22,13 @@ import {
 function createWooClientFramework() {
   const ui = createBareWooClientFramework();
   registerDubspaceObservationHandlers(ui.observations);
+  registerOutlinerObservationHandlers(ui.observations);
   registerPinboardObservationHandlers(ui.observations);
   return ui;
+}
+
+function v2SnapshotKey(scope: string, headSeq: number): string {
+  return `v2:${scope}:${headSeq}`;
 }
 
 describe("client UI framework projection", () => {
@@ -171,6 +177,93 @@ describe("client UI framework projection", () => {
 
     expect(ui.observe("note_1")?.catalogState.pinboard_note).toMatchObject({ text: "hello", x: 12, y: 24 });
     expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: { x: 12, y: 24, w: 180, h: 110, z: 3 } });
+  });
+
+  it("previews added pinboard notes from optimistic frames and rolls back on error", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+    const frame = {
+      id: "call-add-note",
+      op: "result",
+      space: "the_pinboard",
+      observations: [{
+        type: "note_added",
+        board: "the_pinboard",
+        pin: "note_optimistic",
+        note: { id: "note_optimistic", name: "Note", text: "fast note", x: 12, y: 24, w: 180, h: 110, z: 3 }
+      }]
+    };
+
+    ui.applyOptimisticFrame("call-add-note", frame);
+
+    expect(ui.observe("note_optimistic")?.catalogState.pinboard_note).toMatchObject({ text: "fast note", x: 12, y: 24 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_optimistic: { x: 12, y: 24, w: 180, h: 110, z: 3 } });
+
+    ui.failOptimisticCall("call-add-note");
+
+    expect(ui.observe("note_optimistic")).toBeUndefined();
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toBeUndefined();
+  });
+
+  it("keeps added pinboard notes after accepted frame clears the optimistic layer", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+    const frame = {
+      id: "call-add-note",
+      op: "applied",
+      seq: 21,
+      space: "the_pinboard",
+      observations: [{
+        type: "note_added",
+        board: "the_pinboard",
+        pin: "note_accepted",
+        note: { id: "note_accepted", name: "Note", text: "accepted note", x: 12, y: 24, w: 180, h: 110, z: 3 }
+      }]
+    };
+
+    ui.applyOptimisticFrame("call-add-note", frame);
+    ui.ingestAppliedFrame(frame);
+    ui.completeOptimisticCall("call-add-note");
+
+    expect(ui.observe("note_accepted")?.catalogState.pinboard_note).toMatchObject({ text: "accepted note", x: 12, y: 24 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_accepted: { x: 12, y: 24, w: 180, h: 110, z: 3 } });
+  });
+
+  it("previews added outliner rows from optimistic frames and rolls back on error", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot(v2SnapshotKey("the_outline", 0), [
+      { id: "the_outline", name: "Outline", props: {} }
+    ]);
+
+    ui.applyOptimisticFrame("call-add-outline", {
+      id: "call-add-outline",
+      op: "result",
+      space: "the_outline",
+      observations: [{
+        type: "outline_item_added",
+        outliner: "the_outline",
+        item: "outline_item_optimistic",
+        parent_id: null,
+        index: 0,
+        text: "fast row",
+        actor: "guest_1"
+      }]
+    });
+
+    expect(ui.refs()).toContain("outline_item_optimistic");
+    expect(ui.observe("outline_item_optimistic")).toMatchObject({
+      parent: "$outline_item",
+      location: "the_outline",
+      props: { text: "fast row", parent: null, position: 0, hidden: false }
+    });
+
+    ui.failOptimisticCall("call-add-outline");
+
+    expect(ui.observe("outline_item_optimistic")).toBeUndefined();
   });
 
   it("keeps pinboard layout overlays sparse across sequential partial updates", () => {

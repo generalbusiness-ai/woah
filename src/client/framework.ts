@@ -120,6 +120,7 @@ export type DeliveredObservation = {
   space?: string;
   frameId?: string;
   receivedAt: number;
+  optimistic?: boolean;
 };
 
 export type ObservationEnvelope = {
@@ -567,6 +568,8 @@ export class ClientProjection {
     const optimistic = options?.optimistic;
     const id = String(callId ?? "");
     if (!id || !optimistic || optimistic.patches.length === 0) return;
+    const prior = this.optimisticCalls.get(id);
+    if (prior) this.clearOptimistic(prior.layerId, prior.revision);
     const layerId = String(optimistic.id ?? `call:${id}`);
     const revision = this.applyOptimistic(layerId, optimistic.patches, optimistic.ttlMs ?? OPTIMISTIC_TTL_MS);
     this.optimisticCalls.set(id, { layerId, revision, reconcile: optimistic.reconcile ?? "drop_on_applied" });
@@ -607,6 +610,18 @@ export class ClientProjection {
   prune(now = Date.now()): boolean {
     const changed = new Set<string>();
     return this.pruneExpired(now, changed);
+  }
+
+  refs(): string[] {
+    const refs = new Set<string>(this.canonical.keys());
+    for (const id of this.sequenced.keys()) refs.add(id);
+    for (const layer of this.live.values()) {
+      for (const id of layer.patches.keys()) refs.add(id);
+    }
+    for (const layer of this.optimistic.values()) {
+      for (const id of layer.patches.keys()) refs.add(id);
+    }
+    return [...refs];
   }
 
   private applyTimedLayer(target: Map<string, ProjectionLayer>, id: string, patches: ProjectionPatch[], expiresMs: number): number {
@@ -721,6 +736,23 @@ export class ObservationRegistry {
     if (patches.length === 0 && authoritativeClears.length === 0) return;
     for (const subject of authoritativeClears) this.projection.clearAuthoritative(subject, { notify: patches.length === 0 });
     this.projection.applySequenced(patches);
+  }
+
+  optimisticPatches(observations: unknown[], delivered: DeliveredObservation): ProjectionPatch[] {
+    const draft = new ProjectionDraft();
+    for (const observation of Array.isArray(observations) ? observations : []) {
+      if (!observation || typeof observation !== "object" || Array.isArray(observation)) continue;
+      const record = observation as Record<string, unknown>;
+      const type = String(record?.type ?? "");
+      if (!type) continue;
+      const envelope = { observation: record, delivered: { ...delivered, optimistic: true } };
+      for (const handler of this.handlers) {
+        if (!handler.types.includes(type)) continue;
+        if (handler.route && handler.route !== "both" && handler.route !== delivered.route) continue;
+        handler.reduce(draft, envelope);
+      }
+    }
+    return draft.consume();
   }
 }
 
@@ -892,6 +924,28 @@ export class WooClientFramework {
     this.projection.applyOptimisticCall(callId, options);
   }
 
+  applyOptimisticFrame(callId: string, frame: any, options: { ttlMs?: number } = {}) {
+    const id = String(callId || frame?.id || "");
+    if (!id) return;
+    const patches = this.observations.optimisticPatches(frame?.observations ?? [], {
+      route: "sequenced",
+      seq: typeof frame?.seq === "number" ? frame.seq : undefined,
+      space: typeof frame?.space === "string" ? frame.space : undefined,
+      frameId: typeof frame?.id === "string" ? frame.id : undefined,
+      receivedAt: Date.now(),
+      optimistic: true
+    });
+    if (patches.length === 0) return;
+    this.applyOptimisticCall(id, {
+      optimistic: {
+        id: `optimistic-frame:${id}`,
+        patches,
+        ttlMs: options.ttlMs,
+        reconcile: "drop_on_applied"
+      }
+    });
+  }
+
   applyCanonical(patches: ProjectionPatch[], options?: ApplyCanonicalOptions) {
     this.projection.applyCanonical(patches, options);
   }
@@ -910,6 +964,10 @@ export class WooClientFramework {
 
   prune(now = Date.now()) {
     return this.projection.prune(now);
+  }
+
+  refs() {
+    return this.projection.refs();
   }
 }
 

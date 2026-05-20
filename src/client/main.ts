@@ -20,7 +20,7 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
-import { isPinboardObservation, pinboardObservationNeedsNotesRefresh, pinboardObservationsNeedNotesRefresh } from "./pinboard-refresh";
+import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
@@ -322,6 +322,8 @@ const pendingDirect = new Map<string, (result: any) => void>();
 const pendingFrameErrors = new Map<string, (error: unknown) => void>();
 const pendingCommands = new Map<string, { space: string; text: string; action?: ChatCommandUiAction }>();
 const pendingNetworkTurns = new Set<string>();
+const pendingToolEnters = new Set<string>();
+const pendingToolEnterTimers = new Map<string, number>();
 let pinboardNotesRefreshPending = false;
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
@@ -364,6 +366,7 @@ let lastPinboardViewportPublishAt = 0;
 let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
 const pinNoteClientZ = new Map<string, number>();
 const PINBOARD_OPTIMISTIC_TTL_MS = 5_000;
+const TOOL_ENTER_PENDING_TIMEOUT_MS = 8_000;
 let pinboardTextHydrationRequestedBoard = "";
 let pinboardTextHydrationRequestedSignature = "";
 let pinboardTextHydrationRequested = false;
@@ -503,6 +506,34 @@ function completeV2TurnNetworkWait(id: unknown) {
   endNetworkWait();
 }
 
+function beginPendingToolEnter(space: string) {
+  if (!space) return;
+  pendingToolEnters.add(space);
+  const existing = pendingToolEnterTimers.get(space);
+  if (existing !== undefined) window.clearTimeout(existing);
+  // Enter acknowledgements can be lost during a worker reconnect or session
+  // change. Bound the gate so tool mutation controls cannot stay disabled.
+  pendingToolEnterTimers.set(space, window.setTimeout(() => {
+    clearPendingToolEnter(space);
+    if (state.tab === "pinboard" || state.tab === "outliner") render();
+  }, TOOL_ENTER_PENDING_TIMEOUT_MS));
+}
+
+function clearPendingToolEnter(space: string) {
+  pendingToolEnters.delete(space);
+  const timer = pendingToolEnterTimers.get(space);
+  if (timer !== undefined) window.clearTimeout(timer);
+  pendingToolEnterTimers.delete(space);
+}
+
+function clearPendingToolEnters(options: { render?: boolean } = {}) {
+  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0) return;
+  for (const timer of pendingToolEnterTimers.values()) window.clearTimeout(timer);
+  pendingToolEnters.clear();
+  pendingToolEnterTimers.clear();
+  if (options.render) render();
+}
+
 function connect() {
   if (state.authStatus !== "authenticated") return;
   if (connectInFlight) return;
@@ -545,7 +576,10 @@ function ensureV2BrowserWorker() {
   if (v2TestHooksEnabled) (window as unknown as { __wooV2BrowserWorker?: Worker }).__wooV2BrowserWorker = v2BrowserWorker;
   v2BrowserWorker.addEventListener("message", (event) => {
     if (event.data?.kind === "browser_metric") queueBrowserMetric(event.data.metric);
-    if (event.data?.kind === "status") console.debug("woo.v2", event.data.status);
+    if (event.data?.kind === "status") {
+      console.debug("woo.v2", event.data.status);
+      if (event.data.status?.connected === false) clearPendingToolEnters({ render: state.tab === "pinboard" || state.tab === "outliner" });
+    }
     if (event.data?.kind === "projection") {
       const startedAt = performance.now();
       let failed: unknown;
@@ -658,14 +692,9 @@ function receiveDirectResultFrame(frame: any) {
   const handler = pendingDirect.get(frame.id);
   if (typeof frame.id === "string") pendingFrameErrors.delete(frame.id);
   const observations = frame.observations ?? [];
-  const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
   for (const observation of observations) {
     ui.ingestLiveObservation(observation);
-    receiveLiveEvent(observation, { suppressPinboardNotesRefresh: true });
-  }
-  if (needsPinboardNotesRefresh) {
-    pinboardNotesRefreshPending = false;
-    refreshPinboardNotes();
+    receiveLiveEvent(observation);
   }
   applyScopedMoveResult(frame.result);
   if (typeof frame.id === "string") ui.completeOptimisticCall(frame.id);
@@ -691,7 +720,7 @@ function receiveOptimisticResultFrame(frame: any) {
   // they MUST NOT fire the pendingDirect/onResult handler: those callbacks gate
   // committed side effects such as refreshes and external hydration.
   const observations = frame.observations ?? [];
-  const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
+  if (typeof frame.id === "string") ui.applyOptimisticFrame(frame.id, frame);
   // Tag chat lines pushed from optimistic observations with the turn id so
   // the authoritative reply (receiveAppliedFrame for durable verbs,
   // receiveDirectResultFrame for live verbs) can clear them before pushing
@@ -700,11 +729,7 @@ function receiveOptimisticResultFrame(frame: any) {
   const provisionalTurnId = typeof frame.id === "string" ? frame.id : undefined;
   for (const observation of observations) {
     ui.ingestLiveObservation(observation);
-    receiveLiveEvent(observation, { suppressPinboardNotesRefresh: true, provisionalTurnId });
-  }
-  if (needsPinboardNotesRefresh) {
-    pinboardNotesRefreshPending = false;
-    refreshPinboardNotes();
+    receiveLiveEvent(observation, { provisionalTurnId });
   }
   applyScopedMoveResult(frame.result);
   render();
@@ -785,8 +810,6 @@ function receiveAppliedFrame(frame: any) {
     pendingFrameErrors.delete(frame.id);
   }
   const pinboardAnimations = capturePinboardAnimations(observations);
-  const needsPinboardNotesRefresh = pinboardObservationsNeedNotesRefresh(observations);
-  if (needsPinboardNotesRefresh) pinboardNotesRefreshPending = false;
   forgetLiveControls(observations);
   for (const observation of observations) applyDubspaceObservationSideEffects(observation);
   if (observations.some((observation: any) => isDubspaceStateObservation(observation))) syncDubspaceProjectionEffects();
@@ -796,7 +819,6 @@ function receiveAppliedFrame(frame: any) {
   rememberSeq(frame.space, frame.seq);
   render();
   if (needsScopedDeferredLook) void refresh().then(() => focusChatInput());
-  if (needsPinboardNotesRefresh) refreshPinboardNotes();
   animatePinboardNotes(pinboardAnimations);
 }
 
@@ -843,6 +865,7 @@ function storeSession(session: string | undefined) {
 }
 
 function clearSession() {
+  clearPendingToolEnters();
   try {
     sessionStorage.removeItem(sessionKey);
     localStorage.removeItem(sessionKey);
@@ -1320,9 +1343,11 @@ async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean
   const subject = overlaySubjectForTab(tab);
   if (!subject) return;
   const key = `${tab}:${subject}`;
-  if (!options.force && state.scopedProjection?.overlaySnapshots?.[key]) return;
   const pending = pendingOverlaySnapshots.get(key);
-  if (pending && !options.force) return await pending;
+  // `force` means bypass the cached snapshot; it must not start a second REST
+  // fetch while an identical overlay request is already in flight.
+  if (pending) return await pending;
+  if (!options.force && state.scopedProjection?.overlaySnapshots?.[key]) return;
   const request = (async () => {
     const response = await trackedFetch(`/api/objects/${encodeURIComponent(subject)}/ui-snapshot?surface=${encodeURIComponent(tab)}`, { headers: authHeaders() });
     if (!response.ok) throw new Error(`/api/objects/${subject}/ui-snapshot ${response.status}`);
@@ -2365,7 +2390,7 @@ function commitCueControls(target: string) {
   for (const [name, value] of values) callDubspaceMutation("set_control", [target, name, value]);
 }
 
-function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefresh?: boolean; provisionalTurnId?: string } = {}) {
+function receiveLiveEvent(observation: any, options: { provisionalTurnId?: string } = {}) {
   if (isPinboardViewportObservation(observation)) {
     receivePinboardViewport(observation);
     return;
@@ -2378,9 +2403,6 @@ function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefr
   // toolbar Leave stays on the board and exposes the Enter control.
   if (isPinboardObservation(observation)) {
     const pinboardAnimations = capturePinboardAnimations([observation]);
-    const pinboardType = String(observation?.type ?? "");
-    const needsNoteRefresh = options.suppressPinboardNotesRefresh === true ? false : pinboardObservationNeedsNotesRefresh(pinboardType);
-    if (needsNoteRefresh) pinboardNotesRefreshPending = false;
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
     if (String(observation?.actor ?? "") === state.actor) {
       if (observation?.type === "pinboard_entered") {
@@ -2393,7 +2415,6 @@ function receiveLiveEvent(observation: any, options: { suppressPinboardNotesRefr
         clearPinboardViewports();
       }
     }
-    if (needsNoteRefresh) refreshPinboardNotes();
     animatePinboardNotes(pinboardAnimations);
   }
   if (isDubspaceObservation(observation)) {
@@ -3790,7 +3811,7 @@ function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData })
 function createChatWooContext(subject: string, extraRefs: string[] = []): WooContext {
   const frameId = `chat:${subject || "room"}`;
   ui.frames.ensureFrame(frameId, subject, "default");
-  const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...(state.actor ? [state.actor] : [])].filter(Boolean));
+  const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...v2ProjectionObjectRefs(subject), ...uiProjectionObjectRefs(subject), ...(state.actor ? [state.actor] : [])].filter(Boolean));
   return {
     actor: state.actor ?? null,
     frame: {
@@ -3817,6 +3838,25 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
     }),
     emit: (action) => ui.frames.emit(action)
   };
+}
+
+function v2ProjectionObjectRefs(scope: string): string[] {
+  if (!scope || state.v2Projection?.scope !== scope) return [];
+  const projection = state.v2Projection.projection;
+  if (!projection || typeof projection !== "object" || Array.isArray(projection)) return [];
+  const objects = Array.isArray((projection as { objects?: unknown }).objects) ? (projection as { objects: unknown[] }).objects : [];
+  return objects.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+    return typeof (item as { id?: unknown }).id === "string" ? (item as { id: string }).id : "";
+  }).filter(Boolean);
+}
+
+function uiProjectionObjectRefs(scope: string): string[] {
+  if (!scope) return [];
+  return ui.refs().filter((ref) => {
+    if (!ref || ref === scope) return false;
+    return ui.observe(ref)?.location === scope;
+  });
 }
 
 function chatLinesForSpace(space: string): ChatLine[] {
@@ -3925,8 +3965,8 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
   if (verb === "enter" && target === pinboardSpace()) {
     setPinboardPresent(result);
     setTab("pinboard", { mode: "push", leaveCurrent: false });
-    void ensureScopedOverlayForTab("pinboard", { force: true });
-    refreshPinboardNotes({ force: true });
+    // The v2 projection/accepted frame already carries the board and note
+    // projection. Do not queue list_notes or another overlay fetch on entry.
     requestSpaceChatFocus(target);
     return;
   }
@@ -4352,22 +4392,20 @@ function mountGenericToolComponent() {
 }
 
 function mountOutlinerComponent() {
-  const element = document.querySelector<WooElement & { subject?: string; hydrate?: () => Promise<void>; showCompanion?: boolean }>("[data-outliner-tree]");
+  const element = document.querySelector<WooElement & { subject?: string; hydrate?: () => Promise<void>; syncFromProjection?: () => void; showCompanion?: boolean; entering?: boolean }>("[data-outliner-tree]");
   if (!element) return;
   const id = outlinerSpace();
   if (!id) return;
   const subjectChanged = element.subject !== id;
   element.subject = id;
   element.woo = createChatWooContext(id);
+  element.entering = pendingToolEnters.has(id);
   element.showCompanion = actorPresentInSpace(id);
-  // Only kick the initial hydrate once per mounted element. The SPA writes
-  // markup, then patches subject+woo in here, so the component's own
-  // connectedCallback can't auto-hydrate on first insert. After that, the
-  // element is preserved across rerenders (see `render()`), and the
-  // observation reducer in outliner-tree.ts triggers re-hydrates on
-  // structural changes. Re-hydrating on every render would spin a 3-7Hz
-  // server loop because each list_items call produces an applied frame
-  // that triggers another render.
+  element.syncFromProjection?.();
+  // The outliner renders from the v2 projection and applied-frame
+  // observations. Keep the one-time hydrate hook for standalone component
+  // compatibility, but do not let SPA renders create list_items/room_roster
+  // turns.
   if (subjectChanged || element.dataset.outlinerHydrated !== "true") {
     element.dataset.outlinerHydrated = "true";
     void element.hydrate?.();
@@ -4940,10 +4978,12 @@ function enterOutliner() {
   // so repeat tab clicks don't trigger redundant enter intents.
   const space = outlinerSpace();
   if (!space || !canSendV2Browser()) return;
-  if (actorPresentInSpace(space)) {
+  if (actorPresentInSpace(space) || pendingToolEnters.has(space)) {
     requestSpaceChatFocus(space);
     return;
   }
+  beginPendingToolEnter(space);
+  if (state.tab === "outliner") render();
   v2Turn({
     scope: space,
     route: "direct",
@@ -4952,7 +4992,12 @@ function enterOutliner() {
     args: [],
     persistence: "durable",
     onResult: () => {
+      clearPendingToolEnter(space);
       requestSpaceChatFocus(space);
+    },
+    onError: () => {
+      clearPendingToolEnter(space);
+      if (state.tab === "outliner") render();
     }
   });
 }
@@ -4960,13 +5005,15 @@ function enterOutliner() {
 function enterPinboard() {
   const board = pinboardSpace();
   if (!board || !canSendPinboardV2()) return;
-  if (pinboardActorPresent()) {
-    void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
+  if (pinboardActorPresent() || pendingToolEnters.has(board)) {
+    void ensureScopedOverlayForTab("pinboard").then(() => {
       if (state.tab === "pinboard") render();
     });
     requestSpaceChatFocus(board);
     return;
   }
+  beginPendingToolEnter(board);
+  if (state.tab === "pinboard") render();
   v2Turn({
     scope: board,
     route: "sequenced",
@@ -4975,13 +5022,17 @@ function enterPinboard() {
     args: [],
     persistence: "durable",
     onResult: (result) => {
+      clearPendingToolEnter(board);
       applyScopedMoveResult(result);
       setPinboardPresent(result);
-      void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
-        if (state.tab === "pinboard") render();
-      });
-      refreshPinboardNotes({ force: true });
+      // The committed frame updates the projection; forcing list_notes here
+      // puts the next user turn behind a redundant read storm.
+      if (state.tab === "pinboard") render();
       requestSpaceChatFocus(board);
+    },
+    onError: () => {
+      clearPendingToolEnter(board);
+      if (state.tab === "pinboard") render();
     }
   });
 }
@@ -5008,6 +5059,8 @@ function leavePinboard(done?: () => void) {
       setPinboardPresent(result);
       clearPinboardViewports();
       done?.();
+      // Leaving removes this session from the board viewport snapshot; force the
+      // overlay refresh so stale self-presence does not linger on the map.
       void ensureScopedOverlayForTab("pinboard", { force: true });
       if (state.tab === "pinboard") render();
     },
@@ -5053,6 +5106,8 @@ function pinboardTargetCall(target: string, verb: string, args: any[] = [], opti
 function refreshPinboardNotes(options: { force?: boolean } = {}) {
   const board = pinboardSpace();
   if (!board || !canSendPinboardV2()) return;
+  // Only the missing-text compatibility path should call this now. Mutating
+  // pinboard turns render from projection/applied observations instead.
   if (pinboardNotesRefreshPending && options.force !== true) return;
   pinboardNotesRefreshPending = true;
   window.setTimeout(() => {

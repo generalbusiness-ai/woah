@@ -687,6 +687,16 @@ frames and projection updates together. `CatchupRequest.wants` uses
 `"transcript"` instead because catch-up may explicitly ask for audit/replay
 material rather than display projection.
 
+Browser-local optimistic turn results MAY be reduced into temporary projection
+layers before the corresponding `AppliedFrame` arrives. These layers are keyed
+by the pending call id, are not durable protocol state, and MUST be removed
+when the call fails, expires, or is superseded by catch-up. When the accepted
+applied frame arrives, the client reduces the frame through the same catalog
+observation rules and drops the optimistic layer so canonical or sequenced
+projection owns the display. A catalog UI that uses optimistic projection MUST
+keep its optimistic projection reducer aligned with the reducer used for
+accepted frames.
+
 After a browser reconnects, it MUST NOT assume the relay buffered frames while
 the socket was absent. For every subscribed scope, the browser sends
 `CatchupRequest { from: last_known_scope_head, wants: "applied" }` or
@@ -1225,6 +1235,12 @@ executable pages and session/scope metadata whose proof chain is valid for the
 authenticated actor. UI code may render projection rows immediately, but those
 rows do not satisfy `TurnKey` atoms.
 
+Accepted frame delivery is keyed by `(scope, seq)`. A browser may receive the
+same accepted frame from the direct reply and from catch-up/state transfers, but
+the UI reducer must see it once. Duplicate receipts may refresh cache metadata
+or transcript tails, but they must not trigger another page-level
+`applied_frame` delivery.
+
 Each executable page installed into IndexedDB MUST record:
 
 - page hash and codec;
@@ -1234,6 +1250,11 @@ Each executable page installed into IndexedDB MUST record:
 - source scope/head or owner host identity;
 - proof root, authority, key id, recipient, and verification status;
 - insertion time and last-used time for eviction.
+
+Executable page transfers may contain hundreds of verified state pages. Browser
+workers should install the pages from one transfer in a single store transaction
+where the local storage API permits it, and report the batch size in
+diagnostics, rather than emitting one transaction and one metric per page.
 
 A browser MUST discard executable pages whose proof recipient does not match
 the browser node, whose session/actor authorization no longer matches
