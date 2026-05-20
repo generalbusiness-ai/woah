@@ -130,6 +130,72 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
   });
 
+  it("posts duplicate accepted frames to the page once per scope sequence", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-dedupe");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-dedupe",
+      scope: "the_pinboard",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-dedupe",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-dedupe"
+    });
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-dedupe",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-dedupe", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+
+    const accepted = syntheticAccepted("the_pinboard", 1);
+    const transcript = syntheticCheckpointTranscript("the_pinboard", session.actor, session.id, 1);
+    const reply = {
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true,
+      id: transcript.id,
+      outcome: { result: null },
+      transcript,
+      commit: accepted
+    };
+
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "accepted-dedupe-1", "woo.turn.exec.reply.shadow.v1", reply)));
+    await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
+    await waitForMessage(posted, (message) => isBrowserMetricPhase(message, "frame_process"));
+    await waitForMessage(posted, (message) => isKind(message, "status"));
+    posted.length = 0;
+
+    const frameProcessCount = () => posted.filter((message) => isBrowserMetricPhase(message, "frame_process")).length;
+    const statusCount = () => posted.filter((message) => isKind(message, "status")).length;
+
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "accepted-dedupe-2", "woo.turn.exec.reply.shadow.v1", reply)));
+    await waitFor(() => frameProcessCount() > 0);
+    await waitFor(() => statusCount() > 0);
+    expect(posted.filter((message) => isKind(message, "applied_frame"))).toHaveLength(0);
+    await sleep(100);
+  });
+
   it("plans a same-actor durable chain from the tentative journal without waiting for authority", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();

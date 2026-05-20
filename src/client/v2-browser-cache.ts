@@ -21,6 +21,7 @@ export type V2BrowserCacheMutation =
   | { kind: "transcript"; transcript: EffectTranscript }
   | { kind: "object_page"; hash: string; object: SerializedObject }
   | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage }
+  | { kind: "state_pages"; scope: string; pages: Array<{ hash: string; ref: string; page: ShadowStatePage }> }
   | { kind: "execution_ad"; record: V2ExecutionAdRecord }
   | { kind: "execution_transfer"; record: V2ExecutableTransferRecord };
 
@@ -78,15 +79,16 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
   }
   if (transfer.mode === "cell_pages") {
     const hashByRef = new Map(transfer.page_refs.map((ref) => [statePageRefKey(ref), ref.hash]));
-    return [
-      { kind: "execution_transfer" as const, record: v2ExecutableTransferRecord(transfer) },
-      ...transfer.inline_pages
+    const pages = transfer.inline_pages
       .map((page) => {
         const ref = statePageRefKey(page);
         const hash = hashByRef.get(ref);
-        return hash ? { kind: "state_page" as const, hash, ref, page } : null;
+        return hash ? { hash, ref, page } : null;
       })
-      .filter((item): item is Extract<V2BrowserCacheMutation, { kind: "state_page" }> => item !== null)
+      .filter((item): item is { hash: string; ref: string; page: ShadowStatePage } => item !== null);
+    return [
+      { kind: "execution_transfer" as const, record: v2ExecutableTransferRecord(transfer) },
+      ...(pages.length > 0 ? [{ kind: "state_pages" as const, scope: transfer.scope, pages }] : [])
     ];
   }
   if (transfer.mode === "closure") return [{ kind: "execution_transfer", record: v2ExecutableTransferRecord(transfer) }];

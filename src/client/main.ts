@@ -322,6 +322,7 @@ const pendingDirect = new Map<string, (result: any) => void>();
 const pendingFrameErrors = new Map<string, (error: unknown) => void>();
 const pendingCommands = new Map<string, { space: string; text: string; action?: ChatCommandUiAction }>();
 const pendingNetworkTurns = new Set<string>();
+const pendingToolEnters = new Set<string>();
 let pinboardNotesRefreshPending = false;
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
@@ -1320,9 +1321,11 @@ async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean
   const subject = overlaySubjectForTab(tab);
   if (!subject) return;
   const key = `${tab}:${subject}`;
-  if (!options.force && state.scopedProjection?.overlaySnapshots?.[key]) return;
   const pending = pendingOverlaySnapshots.get(key);
-  if (pending && !options.force) return await pending;
+  // `force` means bypass the cached snapshot; it must not start a second REST
+  // fetch while an identical overlay request is already in flight.
+  if (pending) return await pending;
+  if (!options.force && state.scopedProjection?.overlaySnapshots?.[key]) return;
   const request = (async () => {
     const response = await trackedFetch(`/api/objects/${encodeURIComponent(subject)}/ui-snapshot?surface=${encodeURIComponent(tab)}`, { headers: authHeaders() });
     if (!response.ok) throw new Error(`/api/objects/${subject}/ui-snapshot ${response.status}`);
@@ -3786,7 +3789,7 @@ function bindChatComponentEvents(element: WooElement & { data?: ChatSpaceData })
 function createChatWooContext(subject: string, extraRefs: string[] = []): WooContext {
   const frameId = `chat:${subject || "room"}`;
   ui.frames.ensureFrame(frameId, subject, "default");
-  const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...(state.actor ? [state.actor] : [])].filter(Boolean));
+  const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...v2ProjectionObjectRefs(subject), ...(state.actor ? [state.actor] : [])].filter(Boolean));
   return {
     actor: state.actor ?? null,
     frame: {
@@ -3813,6 +3816,17 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
     }),
     emit: (action) => ui.frames.emit(action)
   };
+}
+
+function v2ProjectionObjectRefs(scope: string): string[] {
+  if (!scope || state.v2Projection?.scope !== scope) return [];
+  const projection = state.v2Projection.projection;
+  if (!projection || typeof projection !== "object" || Array.isArray(projection)) return [];
+  const objects = Array.isArray((projection as { objects?: unknown }).objects) ? (projection as { objects: unknown[] }).objects : [];
+  return objects.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+    return typeof (item as { id?: unknown }).id === "string" ? (item as { id: string }).id : "";
+  }).filter(Boolean);
 }
 
 function chatLinesForSpace(space: string): ChatLine[] {
@@ -3921,8 +3935,8 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
   if (verb === "enter" && target === pinboardSpace()) {
     setPinboardPresent(result);
     setTab("pinboard", { mode: "push", leaveCurrent: false });
-    void ensureScopedOverlayForTab("pinboard", { force: true });
-    refreshPinboardNotes({ force: true });
+    // The v2 projection/accepted frame already carries the board and note
+    // projection. Do not queue list_notes or another overlay fetch on entry.
     requestSpaceChatFocus(target);
     return;
   }
@@ -4348,22 +4362,20 @@ function mountGenericToolComponent() {
 }
 
 function mountOutlinerComponent() {
-  const element = document.querySelector<WooElement & { subject?: string; hydrate?: () => Promise<void>; showCompanion?: boolean }>("[data-outliner-tree]");
+  const element = document.querySelector<WooElement & { subject?: string; hydrate?: () => Promise<void>; syncFromProjection?: () => void; showCompanion?: boolean; entering?: boolean }>("[data-outliner-tree]");
   if (!element) return;
   const id = outlinerSpace();
   if (!id) return;
   const subjectChanged = element.subject !== id;
   element.subject = id;
   element.woo = createChatWooContext(id);
+  element.entering = pendingToolEnters.has(id);
   element.showCompanion = actorPresentInSpace(id);
-  // Only kick the initial hydrate once per mounted element. The SPA writes
-  // markup, then patches subject+woo in here, so the component's own
-  // connectedCallback can't auto-hydrate on first insert. After that, the
-  // element is preserved across rerenders (see `render()`), and the
-  // observation reducer in outliner-tree.ts triggers re-hydrates on
-  // structural changes. Re-hydrating on every render would spin a 3-7Hz
-  // server loop because each list_items call produces an applied frame
-  // that triggers another render.
+  element.syncFromProjection?.();
+  // The outliner renders from the v2 projection and applied-frame
+  // observations. Keep the one-time hydrate hook for standalone component
+  // compatibility, but do not let SPA renders create list_items/room_roster
+  // turns.
   if (subjectChanged || element.dataset.outlinerHydrated !== "true") {
     element.dataset.outlinerHydrated = "true";
     void element.hydrate?.();
@@ -4936,10 +4948,12 @@ function enterOutliner() {
   // so repeat tab clicks don't trigger redundant enter intents.
   const space = outlinerSpace();
   if (!space || !canSendV2Browser()) return;
-  if (actorPresentInSpace(space)) {
+  if (actorPresentInSpace(space) || pendingToolEnters.has(space)) {
     requestSpaceChatFocus(space);
     return;
   }
+  pendingToolEnters.add(space);
+  if (state.tab === "outliner") render();
   v2Turn({
     scope: space,
     route: "direct",
@@ -4948,7 +4962,12 @@ function enterOutliner() {
     args: [],
     persistence: "durable",
     onResult: () => {
+      pendingToolEnters.delete(space);
       requestSpaceChatFocus(space);
+    },
+    onError: () => {
+      pendingToolEnters.delete(space);
+      if (state.tab === "outliner") render();
     }
   });
 }
@@ -4956,13 +4975,15 @@ function enterOutliner() {
 function enterPinboard() {
   const board = pinboardSpace();
   if (!board || !canSendPinboardV2()) return;
-  if (pinboardActorPresent()) {
-    void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
+  if (pinboardActorPresent() || pendingToolEnters.has(board)) {
+    void ensureScopedOverlayForTab("pinboard").then(() => {
       if (state.tab === "pinboard") render();
     });
     requestSpaceChatFocus(board);
     return;
   }
+  pendingToolEnters.add(board);
+  if (state.tab === "pinboard") render();
   v2Turn({
     scope: board,
     route: "sequenced",
@@ -4971,13 +4992,17 @@ function enterPinboard() {
     args: [],
     persistence: "durable",
     onResult: (result) => {
+      pendingToolEnters.delete(board);
       applyScopedMoveResult(result);
       setPinboardPresent(result);
-      void ensureScopedOverlayForTab("pinboard", { force: true }).then(() => {
-        if (state.tab === "pinboard") render();
-      });
-      refreshPinboardNotes({ force: true });
+      // The committed frame updates the projection; forcing list_notes here
+      // puts the next user turn behind a redundant read storm.
+      if (state.tab === "pinboard") render();
       requestSpaceChatFocus(board);
+    },
+    onError: () => {
+      pendingToolEnters.delete(board);
+      if (state.tab === "pinboard") render();
     }
   });
 }

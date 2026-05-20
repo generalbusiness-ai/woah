@@ -291,7 +291,7 @@ describe("v2 browser cache reducer", () => {
       }
     });
     expect(mutations.slice(1)).toEqual([
-      { kind: "state_page", hash: "page-hash", ref: "#room:object_live:", page }
+      { kind: "state_pages", scope: "#room", pages: [{ hash: "page-hash", ref: "#room:object_live:", page }] }
     ]);
   });
 });

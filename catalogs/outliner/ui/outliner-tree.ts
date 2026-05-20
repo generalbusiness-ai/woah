@@ -85,6 +85,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   private model: OutlinerData = { outlinerId: "", outlinerName: "Outline", items: [], focus: null, actor: null, roster: [] };
   private companionVisible = false;
+  private enterPending = false;
   private collapsed = new Set<string>();
   // Default on. With it off, clicking the per-row "hide" checkbox makes
   // the row vanish, which is a confusing first encounter — the user
@@ -104,8 +105,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
   // row) is open. Always paired with a non-null `selectedId`.
   private addingChild = false;
   private dragSourceId: string | null = null;
-  private hydrating = false;
-  private hydratePending = false;
   private hydrateAttempted = false;
   private bound = false;
 
@@ -118,6 +117,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const next = Boolean(value);
     if (this.companionVisible === next) return;
     this.companionVisible = next;
+    this.render();
+  }
+
+  set entering(value: boolean) {
+    const next = Boolean(value);
+    if (this.enterPending === next) return;
+    this.enterPending = next;
     this.render();
   }
 
@@ -136,47 +142,175 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   async hydrate(): Promise<void> {
     if (!this.woo || !this.subject) return;
-    if (this.hydrating) {
-      // Coalesce a concurrent caller — typical race: observation reducer
-      // fires `outline_item_added` while the initial hydrate is still
-      // resolving list_items. Dropping the second hydrate would freeze the
-      // UI on the pre-mutation snapshot.
-      this.hydratePending = true;
+    this.hydrateAttempted = true;
+    this.syncFromProjection();
+  }
+
+  syncFromProjection(): void {
+    if (!this.woo || !this.subject) return;
+    const projection = this.woo.observe(this.subject);
+    const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
+    const actor = this.woo.actor;
+    const focus = actor ? focusMap[actor] ?? null : null;
+    const objectName = projection?.name;
+    this.model = {
+      outlinerId: this.subject,
+      outlinerName: typeof objectName === "string" && objectName ? objectName : "Outline",
+      items: this.itemsFromProjection(),
+      focus,
+      actor,
+      roster: this.rosterFromProjection()
+    };
+    this.render();
+  }
+
+  applyObservation(observation: Record<string, unknown>): void {
+    const type = String(observation.type ?? "");
+    if (type === "note_edited") {
+      const item = this.model.items.find((candidate) => candidate.id === String(observation.note ?? observation.id ?? ""));
+      if (item && typeof observation.text === "string") {
+        item.text = observation.text;
+        this.render();
+      }
       return;
     }
-    this.hydrating = true;
-    this.hydrateAttempted = true;
-    try {
-      do {
-        this.hydratePending = false;
-        // Roster fetched in parallel with list_items — both are independent
-        // RX verbs on the outliner space.
-        const [items, roster] = await Promise.all([
-          this.woo.directCall(this.subject, "list_items", []),
-          this.woo.directCall(this.subject, "room_roster", []).catch(() => [])
-        ]);
-        const projection = this.woo.observe(this.subject);
-        const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
-        const actor = this.woo.actor;
-        const focus = actor ? focusMap[actor] ?? null : null;
-        // The display title is the object's own name (e.g. "Outline" from the
-        // seed). `props.name` is not the same field — for inherited classes it
-        // can surface the parent class's own name (e.g. "$space") and produce
-        // the wrong title in the header.
-        const objectName = projection?.name;
-        this.model = {
-          outlinerId: this.subject,
-          outlinerName: typeof objectName === "string" && objectName ? objectName : "Outline",
-          items: Array.isArray(items) ? (items as OutlinerItem[]) : [],
-          focus,
-          actor,
-          roster: Array.isArray(roster) ? (roster as OutlinerRosterRow[]) : []
-        };
-        this.render();
-      } while (this.hydratePending);
-    } finally {
-      this.hydrating = false;
+    const outlinerId = String(observation.outliner ?? observation.source ?? "");
+    if (!this.subject || outlinerId !== this.subject) return;
+    if (type === "outliner_entered" || type === "outliner_left") {
+      this.applyPresenceObservation(type, observation);
+      return;
     }
+    if (type === "outline_item_added") {
+      const id = String(observation.item ?? "");
+      if (!id) return;
+      this.upsertItem({
+        id,
+        name: id,
+        text: typeof observation.text === "string" ? observation.text : "",
+        parent_id: outlinerParent(observation.parent_id),
+        index: outlinerIndex(observation.index, this.model.items.length),
+        hidden: false,
+        owner: String(observation.actor ?? ""),
+        writers: [],
+        has_children: false
+      });
+      return;
+    }
+    if (type === "outline_item_removed") {
+      this.removeItem(String(observation.item ?? ""), outlinerParent(observation.reparented_to));
+      return;
+    }
+    if (type === "outline_item_moved") {
+      this.moveItem(String(observation.item ?? ""), outlinerParent(observation.to_parent), outlinerIndex(observation.to_index, this.model.items.length));
+      return;
+    }
+    if (type === "outline_item_reordered") {
+      this.moveItem(String(observation.item ?? ""), outlinerParent(observation.parent_id), outlinerIndex(observation.to_index, this.model.items.length));
+      return;
+    }
+    if (type === "outline_item_hidden") {
+      const item = this.model.items.find((candidate) => candidate.id === String(observation.item ?? ""));
+      if (item) {
+        item.hidden = Boolean(observation.hidden);
+        this.render();
+      }
+      return;
+    }
+  }
+
+  private itemsFromProjection(): OutlinerItem[] {
+    if (!this.woo || !this.subject) return this.model.items;
+    const rows = this.woo.neighborhood.refs
+      .map((ref) => this.outlinerItemFromProjection(ref))
+      .filter((item): item is OutlinerItem => item !== null);
+    if (rows.length === 0 && this.model.items.length > 0) return this.model.items;
+    if (this.model.items.length === 0) return orderedOutlinerItems(rows);
+    // Projection sync can run before the newly applied item projection is
+    // present in the neighborhood. Preserve rows learned from sequenced
+    // observations so a stale projection snapshot cannot hide a committed
+    // add while the projection catches up.
+    const byId = new Map(this.model.items.map((item) => [item.id, { ...item }]));
+    for (const row of rows) byId.set(row.id, { ...(byId.get(row.id) ?? {}), ...row });
+    return orderedOutlinerItems([...byId.values()]);
+  }
+
+  private outlinerItemFromProjection(ref: string): OutlinerItem | null {
+    const projected = this.woo?.observe(ref);
+    if (!projected || projected.location !== this.subject) return null;
+    const props = projected.props ?? {};
+    const ancestors = Array.isArray(projected.ancestors) ? projected.ancestors.map(String) : [];
+    const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item") || props.position !== undefined || props.hidden !== undefined;
+    if (!looksLikeOutlineItem) return null;
+    return {
+      id: projected.id,
+      name: typeof projected.name === "string" ? projected.name : projected.id,
+      text: typeof props.text === "string" ? props.text : "",
+      parent_id: outlinerParent(props.parent),
+      index: outlinerIndex(props.position, 0),
+      hidden: props.hidden === true,
+      owner: typeof projected.owner === "string" ? projected.owner : "",
+      writers: Array.isArray(props.writers) ? props.writers.filter((item): item is string => typeof item === "string") : [],
+      has_children: false
+    };
+  }
+
+  private rosterFromProjection(): OutlinerRosterRow[] {
+    const props = this.woo?.observe(this.subject ?? "")?.props ?? {};
+    const ids = new Set<string>();
+    for (const row of Array.isArray(props.session_subscribers) ? props.session_subscribers : []) {
+      const actor = typeof row === "object" && row !== null && !Array.isArray(row) ? (row as { actor?: unknown }).actor : row;
+      if (typeof actor === "string" && actor) ids.add(actor);
+    }
+    for (const actor of Array.isArray(props.subscribers) ? props.subscribers : []) {
+      if (typeof actor === "string" && actor) ids.add(actor);
+    }
+    const existing = new Map(this.model.roster.map((row) => [row.id, row]));
+    return [...ids].map((id) => ({
+      ...(existing.get(id) ?? {}),
+      id,
+      name: this.woo?.observe(id)?.name
+    }));
+  }
+
+  private applyPresenceObservation(type: string, observation: Record<string, unknown>): void {
+    const actor = String(observation.actor ?? "");
+    if (!actor) return;
+    if (type === "outliner_left") {
+      this.model.roster = this.model.roster.filter((row) => row.id !== actor);
+      this.render();
+      return;
+    }
+    if (!this.model.roster.some((row) => row.id === actor)) {
+      this.model.roster = [...this.model.roster, { id: actor, name: this.woo?.observe(actor)?.name }];
+      this.render();
+    }
+  }
+
+  private upsertItem(item: OutlinerItem): void {
+    const byId = new Map(this.model.items.map((candidate) => [candidate.id, { ...candidate }]));
+    byId.set(item.id, { ...(byId.get(item.id) ?? {}), ...item });
+    this.model.items = insertOutlinerItemAt(orderedOutlinerItems([...byId.values()].filter((candidate) => candidate.id !== item.id)), item, item.parent_id, item.index);
+    this.render();
+  }
+
+  private removeItem(id: string, reparentedTo: string | null): void {
+    if (!id) return;
+    const removed = this.model.items.find((item) => item.id === id);
+    this.model.items = this.model.items.filter((item) => item.id !== id).map((item) => item.parent_id === id ? { ...item, parent_id: reparentedTo } : item);
+    if (removed) this.model.items = orderedOutlinerItems(this.model.items);
+    this.render();
+  }
+
+  private moveItem(id: string, parent: string | null, index: number): void {
+    const item = this.model.items.find((candidate) => candidate.id === id);
+    if (!item) return;
+    this.model.items = insertOutlinerItemAt(
+      orderedOutlinerItems(this.model.items.filter((candidate) => candidate.id !== id)),
+      { ...item, parent_id: parent },
+      parent,
+      index
+    );
+    this.render();
   }
 
   private render(): void {
@@ -234,7 +368,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const toolbar = `
       <section class="toolbar outliner-toolbar">
         <h1>${escapeHtml(data.outlinerName)}</h1>
-        <button type="button" data-outliner-presence="${this.companionVisible ? "leave" : "enter"}">${this.companionVisible ? "Leave" : "Enter"}</button>
+        <button type="button" data-outliner-presence="${this.enterPending ? "pending" : this.companionVisible ? "leave" : "enter"}" ${this.enterPending ? "disabled" : ""}>${this.enterPending ? "Entering..." : this.companionVisible ? "Leave" : "Enter"}</button>
         <label class="outliner-toggle">
           <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
           show hidden
@@ -247,7 +381,8 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // user creates children "in place" via the + button on the selected
     // row, so hiding the top form removes ambiguity about which parent a
     // new item would land under.
-    const topAdd = this.selectedId == null
+    const canMutate = this.companionVisible && !this.enterPending;
+    const topAdd = canMutate && this.selectedId == null
       ? `<form class="outliner-add" data-outliner-add>
           <input type="text" name="text" placeholder="add an item…" autocomplete="off" value="${escapeHtml(addInputValue)}">
           <button type="submit">Add</button>
@@ -665,9 +800,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (!this.woo || !this.subject) return null;
     try {
       const result = await this.woo.call(this.subject, verb, args);
-      // Re-hydrate after any mutation. Cheap enough for v0 — replace with
-      // observation-driven patching once measurements demand it.
-      void this.hydrate();
       return result;
     } catch (err) {
       // Surface the error to the user as inline status text rather than
@@ -686,10 +818,6 @@ export function registerWooComponents(registry: WooComponentRegistry): void {
   registry.defineTag("woo-outliner-tree", WooOutlinerTreeElement);
 }
 
-// Incremental observations all re-trigger a hydrate on every live
-// `<woo-outliner-tree>` whose subject matches. This is intentionally
-// blunt — the v0 implementation is fetch-on-update; we can replace it
-// with optimistic per-event reducers once the basic flow is measured.
 export function registerWooObservationHandlers(registry: ObservationRegistry): void {
   const STRUCTURAL_TYPES = [
     "outline_item_added",
@@ -712,10 +840,54 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
       const outlinerId = String(envelope.observation.outliner ?? envelope.observation.source ?? "");
       if (!outlinerId) return;
       for (const el of document.querySelectorAll<WooOutlinerTreeElement>(`woo-outliner-tree`)) {
-        if (el.subject === outlinerId) void el.hydrate();
+        if (el.subject === outlinerId) el.applyObservation(envelope.observation);
       }
     }
   });
+}
+
+function outlinerParent(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+function outlinerIndex(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : fallback;
+}
+
+function orderedOutlinerItems(items: OutlinerItem[]): OutlinerItem[] {
+  const byParent = new Map<string | null, OutlinerItem[]>();
+  for (const item of items) {
+    const list = byParent.get(item.parent_id) ?? [];
+    list.push({ ...item });
+    byParent.set(item.parent_id, list);
+  }
+  for (const list of byParent.values()) list.sort((left, right) => left.index - right.index || left.id.localeCompare(right.id));
+  const ordered: OutlinerItem[] = [];
+  const visit = (parent: string | null) => {
+    const siblings = byParent.get(parent) ?? [];
+    siblings.forEach((item, index) => {
+      const children = byParent.get(item.id) ?? [];
+      ordered.push({ ...item, index, has_children: children.length > 0 });
+      visit(item.id);
+    });
+  };
+  visit(null);
+  for (const item of items) {
+    if (!ordered.some((candidate) => candidate.id === item.id)) ordered.push({ ...item, has_children: false });
+  }
+  return ordered;
+}
+
+function insertOutlinerItemAt(items: OutlinerItem[], item: OutlinerItem, parent: string | null, index: number): OutlinerItem[] {
+  const siblings = items.filter((candidate) => candidate.parent_id === parent);
+  const insertAt = Math.max(0, Math.min(index, siblings.length));
+  const orderedSiblings = [...siblings.slice(0, insertAt), { ...item, parent_id: parent }, ...siblings.slice(insertAt)];
+  const siblingIds = new Set(orderedSiblings.map((candidate) => candidate.id));
+  return orderedOutlinerItems([
+    ...items.filter((candidate) => !siblingIds.has(candidate.id)),
+    ...orderedSiblings.map((candidate, siblingIndex) => ({ ...candidate, index: siblingIndex }))
+  ]);
 }
 
 // Chat lines for outliner entry/exit and the umbrella activity event.

@@ -1225,6 +1225,12 @@ executable pages and session/scope metadata whose proof chain is valid for the
 authenticated actor. UI code may render projection rows immediately, but those
 rows do not satisfy `TurnKey` atoms.
 
+Accepted frame delivery is keyed by `(scope, seq)`. A browser may receive the
+same accepted frame from the direct reply and from catch-up/state transfers, but
+the UI reducer must see it once. Duplicate receipts may refresh cache metadata
+or transcript tails, but they must not trigger another page-level
+`applied_frame` delivery.
+
 Each executable page installed into IndexedDB MUST record:
 
 - page hash and codec;
@@ -1234,6 +1240,11 @@ Each executable page installed into IndexedDB MUST record:
 - source scope/head or owner host identity;
 - proof root, authority, key id, recipient, and verification status;
 - insertion time and last-used time for eviction.
+
+Executable page transfers may contain hundreds of verified state pages. Browser
+workers should install the pages from one transfer in a single store transaction
+where the local storage API permits it, and report the batch size in
+diagnostics, rather than emitting one transaction and one metric per page.
 
 A browser MUST discard executable pages whose proof recipient does not match
 the browser node, whose session/actor authorization no longer matches

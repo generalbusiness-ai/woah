@@ -93,8 +93,10 @@ const hmrPort = Number(process.env.VITE_HMR_PORT ?? port + 10_000);
 const MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024;
 const MAX_BROWSER_METRICS_BATCH = 200;
 const MAX_BROWSER_METRIC_STRING = 160;
-const BROWSER_METRICS_SESSION_BUDGET = 60;
-const BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE = 10;
+// Local perf investigations need enough contiguous browser metrics to expose
+// queueing spikes; production-shaped sampling can still be forced with env.
+const BROWSER_METRICS_SESSION_BUDGET = Math.max(60, Number(process.env.WOO_BROWSER_METRICS_SESSION_BUDGET ?? 2000) || 2000);
+const BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE = Math.max(1, Number(process.env.WOO_BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE ?? 10) || 10);
 const BROWSER_METRICS_COUNTER_TTL_MS = 5 * 60_000;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
 
