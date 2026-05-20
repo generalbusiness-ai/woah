@@ -3017,6 +3017,11 @@ function leaveDubspace(done?: () => void) {
     done?.();
     return;
   }
+  // Release the tab switch immediately; the world-side `leave` is best-effort
+  // and proceeds asynchronously. Previously `done?.()` only fired from the
+  // turn's onResult callback, so an errored or stalled leave turn permanently
+  // trapped state.tab at "dubspace" and every subsequent nav click was a no-op.
+  done?.();
   v2Turn({
     scope: space,
     route: "direct",
@@ -3026,7 +3031,6 @@ function leaveDubspace(done?: () => void) {
     persistence: "durable",
     onResult: (result) => {
       setDubspaceOperators(result);
-      done?.();
       void ensureScopedOverlayForTab("dubspace");
       if (state.tab === "dubspace") render();
     },
