@@ -60,6 +60,51 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     expect(ids.size).toBeLessThanOrEqual(50);
   });
 
+  it("expands explicit roots monotonically regardless of order", () => {
+    // Regression: if `the_dubspace` was first reached as a content of
+    // `the_chatroom` (transitive push, no value-trace), a later explicit-root
+    // push could not "upgrade" it to traceValues:"full" because `seen` had
+    // already gated the property walk. So
+    //   exportAuthoritySlice([], ["the_dubspace", "the_chatroom"])
+    // omitted $exit, both living-room exits, and the_deck — while the SAME
+    // roots in the reverse order surfaced them. executor.ts orders the roots
+    // as [commitScope, scope, target, actor, …], so a turn whose target is
+    // nested inside its commit scope would routinely lose exit/destination
+    // refs and dispatch would fail with E_OBJNF.
+    const world = createWorld();
+    const a = world.exportAuthoritySlice([], ["the_dubspace", "the_chatroom"]);
+    const b = world.exportAuthoritySlice([], ["the_chatroom", "the_dubspace"]);
+    const aIds = new Set(authoritySliceObjectIds(a));
+    const bIds = new Set(authoritySliceObjectIds(b));
+    expect(aIds).toEqual(bIds);
+    // And both orderings must include the_chatroom's full one-hop expansion.
+    expect(aIds.has("the_deck")).toBe(true);
+    expect(aIds.has("$exit")).toBe(true);
+  });
+
+  it("surfaces objects named by inherited propertyDef defaults", () => {
+    // Regression bait: `getPropertyValue` falls through to the class
+    // propertyDef's `defaultValue` when an instance does not store its own
+    // value (src/core/property-read.ts). A verb body that reads
+    // `instance.pointer` then gets back the class default's ref. If the
+    // slice does not surface that ref, dispatch fails with E_OBJNF.
+    // Tracing live property-cell values alone misses this case — we must
+    // also follow `propertyDefs[*].defaultValue` refs on every class we
+    // pull in.
+    const world = createWorld();
+    type WorldAny = { createObject: (input: { id: string; parent: string | null }) => unknown; defineProperty: (id: string, def: { name: string; defaultValue: unknown; owner: string; perms: string }) => unknown };
+    const w = world as unknown as WorldAny;
+    w.createObject({ id: "ref_target_obj", parent: "$thing" });
+    w.createObject({ id: "ref_class", parent: "$thing" });
+    w.defineProperty("ref_class", { name: "pointer", defaultValue: "ref_target_obj", owner: "$wiz", perms: "rc" });
+    w.createObject({ id: "ref_instance", parent: "ref_class" });
+    const slice = world.exportAuthoritySlice([], ["ref_instance"]);
+    const ids = new Set(authoritySliceObjectIds(slice));
+    expect(ids.has("ref_instance")).toBe(true);
+    expect(ids.has("ref_class")).toBe(true);
+    expect(ids.has("ref_target_obj")).toBe(true);
+  });
+
   it("includes a $-class when the caller threads it as an explicit root", () => {
     // Native helpers can resolve an object named only as an argument. The
     // executor pre-walks args/body to surface those refs (executor.ts

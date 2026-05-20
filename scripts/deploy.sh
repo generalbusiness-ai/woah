@@ -5,7 +5,13 @@
 # Overrides exist for hotfix flows but should not be the default path.
 #
 # Usage: scripts/deploy.sh [--dry-run] [--dirty] [--allow-branch=<x>]
-#                          [--skip-tests] [--skip-postflight] [--help]
+#                          [--skip-tests] [--skip-postflight] [--skip-smoke]
+#                          [--help]
+#
+# --skip-smoke skips only the cross-actor walkthrough smoke at the end of
+# postflight (healthz / auth / ws / mcp routing still run). Use for
+# emergency redeploys when the walkthrough is flaky against the new
+# deploy but the worker-level checks pass. Equivalent to WOO_DEPLOY_SMOKE=0.
 #
 # --dry-run validates the deploy without uploading: runs preflight gates and
 # build, then `wrangler deploy --dry-run` (no upload, no version id, no
@@ -21,6 +27,7 @@ ALLOW_DIRTY=0
 ALLOW_BRANCH=""
 SKIP_TESTS=0
 SKIP_POSTFLIGHT=0
+SKIP_SMOKE=0
 DRY_RUN=0
 EXPECTED_BRANCH="main"
 WORKER_URL="${WOO_WORKER_URL:-https://woah.generalbusiness.ai}"
@@ -99,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     --allow-branch=*)   ALLOW_BRANCH="${1#--allow-branch=}" ;;
     --skip-tests)       SKIP_TESTS=1 ;;
     --skip-postflight)  SKIP_POSTFLIGHT=1 ;;
+    --skip-smoke)       SKIP_SMOKE=1 ;;
     -h|--help)          usage; exit 0 ;;
     *)                  fail "unknown flag: $1 (try --help)" ;;
   esac
@@ -391,7 +399,7 @@ fi
 # 5s HOST_READ_RPC_TIMEOUT ceiling. The walkthrough is the cheapest
 # real-world coverage we have; allow operators to skip it (env override or
 # --skip-smoke) for emergency redeploys.
-if [[ "${WOO_DEPLOY_SMOKE:-1}" == "0" || "${SKIP_SMOKE:-0}" == "1" ]]; then
+if [[ "${WOO_DEPLOY_SMOKE:-1}" == "0" || $SKIP_SMOKE -eq 1 ]]; then
   warn "deploy smoke skipped (WOO_DEPLOY_SMOKE=0 or SKIP_SMOKE=1)"
 else
   if WOO_SMOKE_BASE_URL="$WORKER_URL" npx --no-install tsx scripts/smoke-walkthrough.ts > /tmp/woo-deploy-smoke.log 2>&1; then

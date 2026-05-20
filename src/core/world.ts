@@ -6064,11 +6064,29 @@ export class WooWorld {
         for (const item of Object.values(value)) pushValueRefs(item, depth + 1, propagate);
       }
     };
+    // Per-object trace mode (off=0 < leaf=1 < full=2). Slice expansion must
+    // be monotonic: a second push that wants a stronger mode upgrades the
+    // mode and re-runs the property-value walk. Without this, root order
+    // would change the slice contents — a target reached first as an
+    // owner/content dependency could never get its explicit-root property
+    // tracing once `seen` had it.
+    const TRACE_MODE_RANK: Record<"off" | "leaf" | "full", number> = { off: 0, leaf: 1, full: 2 };
+    const objectMode = new Map<ObjRef, "off" | "leaf" | "full">();
+    const desiredMode = (id: ObjRef, requested?: "full" | "leaf"): "off" | "leaf" | "full" => {
+      if (requested) return requested;
+      // $-prefixed catalog/helper classes leaf-trace anywhere we reach them.
+      // Catalogs wire themselves together by property ($system.help_dbs →
+      // $help) and the connected graph is small, so leaf-tracing is cheap.
+      return id.startsWith("$") ? "leaf" : "off";
+    };
     const push = (id: ObjRef | null | undefined, options: { includeContents?: boolean; traceValues?: "full" | "leaf" } = {}): void => {
       if (!id) return;
       const obj = this.objects.get(id);
       if (!obj) return;
-      if (!seen.has(id)) {
+      const wantedMode = desiredMode(id, options.traceValues);
+      const currentMode = objectMode.get(id);
+      const isFirstSee = !seen.has(id);
+      if (isFirstSee) {
         seen.add(id);
         ids.push(id);
         // Dispatch dependencies for any reachable object: parent class chain,
@@ -6076,7 +6094,16 @@ export class WooWorld {
         // these chains and must find them in the slice.
         if (obj.parent) push(obj.parent);
         push(obj.owner);
-        for (const def of obj.propertyDefs.values()) push(def.owner);
+        for (const def of obj.propertyDefs.values()) {
+          push(def.owner);
+          // Inherited reads fall through to `propertyDefs[*].defaultValue`
+          // (src/core/property-read.ts) — a class default pointing at an
+          // object ref must surface that object in the slice or dispatch
+          // raises E_OBJNF when an instance reads the inherited property.
+          // Leaf, no-propagation: the ref's row enters the slice but it
+          // does not itself trigger another hop of value tracing.
+          pushValueRefs(def.defaultValue, 0, false);
+        }
         for (const verb of obj.verbs) {
           push(verb.owner);
           // Verb bodies dispatch on shared helper classes ($match, $utils,
@@ -6092,50 +6119,24 @@ export class WooWorld {
           }
         }
         for (const feature of this.safeFeatureList(id)) push(feature);
-        // Property-value tracing decides whether we follow `obj.foo = x` and
-        // pull `x` into the slice too. We trace in two specific cases:
-        //
-        //  - Explicit roots and their one-hop expansion (room/actor/scope/
-        //    contents named by the caller): the verb will dispatch directly
-        //    on their property targets — `exit.dest = the_deck` must
-        //    surface `the_deck` so `:acceptable` can be invoked there.
-        //
-        //  - `$`-prefixed catalog/helper classes anywhere we reach them:
-        //    catalog code wires itself together by property
-        //    (`$system.help_dbs = ["$help"]`, `$match.kinds = […]`). The
-        //    graph between catalogs is small and stable, so following it is
-        //    cheap. Without this, a verb that goes `$system.help_dbs`
-        //    leaves `$help` unreachable from the slice.
-        //
-        // We do NOT trace values on transitive *non-`$`* objects (the_dubspace,
-        // exit objects, etc.): those are runtime instances whose property
-        // graph can sprawl to the entire reachable-room graph and explode
-        // the slice. If a turn needs deeper instance state, the caller must
-        // name it as an explicit root via executor.ts
-        // §executorAuthorityObjectIds, or the satellite raises E_OBJNF and
-        // the caller widens the retry's `objects` list.
-        // Two trace modes:
-        //   options.traceValues === "full": this is an explicit root; walk
-        //     the property graph one logical hop and recurse one more hop
-        //     into the surfaced targets (so `room.exits.southeast = exit`
-        //     then `exit.dest = the_deck` are both reached, but the_deck's
-        //     exits do not pull in another set of rooms).
-        //   options.traceValues === "leaf": this object was reached via a
-        //     full-trace one-hop expansion; surface its direct refs but do
-        //     not propagate trace further. Catalog ($-prefixed) classes
-        //     reached anywhere also leaf-trace — catalogs cross-reference
-        //     each other ($system.help_dbs → $help) and the connected graph
-        //     is small.
-        //   missing/false: no value tracing. The object's row is in the
-        //     slice; deeper dispatch reads the durable cache on the
-        //     satellite.
-        const mode = options.traceValues
-          ? options.traceValues
-          : id.startsWith("$")
-            ? "leaf"
-            : "off";
-        if (mode !== "off") {
-          for (const [, value] of obj.properties) pushValueRefs(value, 0, mode === "full");
+      }
+      // Apply (or upgrade) the property-value trace. The check is monotonic:
+      // if this push wants a higher mode than what's been applied so far,
+      // run the corresponding walk. If equal-or-lower, skip — the stronger
+      // walk has already covered everything this push would do. Modes:
+      //   full: explicit roots and their one-hop targets. Walk property
+      //     values one wrapper level into arrays/maps, surfacing refs at
+      //     leaf mode so the chain stops one hop later (`room.exits →
+      //     exit → the_deck`, not the_deck's exits in turn).
+      //   leaf: catalog $-classes and one-hop targets of explicit roots.
+      //     Walk property values one wrapper level; surfaced refs land in
+      //     the slice at off mode, no further trace.
+      //   off: no value tracing. The object's row is in the slice; deeper
+      //     dispatch reads the durable cache on the satellite.
+      if (TRACE_MODE_RANK[wantedMode] > TRACE_MODE_RANK[currentMode ?? "off"]) {
+        objectMode.set(id, wantedMode);
+        if (wantedMode !== "off") {
+          for (const [, value] of obj.properties) pushValueRefs(value, 0, wantedMode === "full");
         }
       }
       if (!options.includeContents || contentsExpanded.has(id)) return;
