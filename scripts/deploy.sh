@@ -400,7 +400,7 @@ fi
 # real-world coverage we have; allow operators to skip it (env override or
 # --skip-smoke) for emergency redeploys.
 if [[ "${WOO_DEPLOY_SMOKE:-1}" == "0" || $SKIP_SMOKE -eq 1 ]]; then
-  warn "deploy smoke skipped (WOO_DEPLOY_SMOKE=0 or SKIP_SMOKE=1)"
+  warn "deploy smoke skipped (WOO_DEPLOY_SMOKE=0 or --skip-smoke)"
 else
   if WOO_SMOKE_BASE_URL="$WORKER_URL" npx --no-install tsx scripts/smoke-walkthrough.ts > /tmp/woo-deploy-smoke.log 2>&1; then
     ok "smoke walkthrough: 9/9 cross-actor steps passed"
