@@ -65,7 +65,7 @@ The spec is split into layers. Implementation references in semantics and protoc
 Language and runtime foundations: object/verb/value semantics and execution behavior independent of host implementation.
 
 - [core.md](spec/semantics/core.md) — woah core: objects, messages, spaces, actors, observations
-- [distribution.md](spec/semantics/distribution.md) — Execute/Sequence/Hold roles; cell version is freshness; sequencer is order; no node owns objects (DT1–DT7, **draft**)
+- [distribution.md](spec/semantics/distribution.md) — Execute/Sequence/Hold roles; scope = `$space`, sequencer keyed by scope ObjRef; cell version is freshness; no node owns objects (DT1–DT8, **draft**)
 - [values.md](spec/semantics/values.md) — value contract, equality, canonical serialization (V1–V11)
 - [objects.md](spec/semantics/objects.md) — object model, identity, verb dispatch, properties (§4, §5, §9, §10)
 - [sequenced-log.md](spec/semantics/sequenced-log.md) — `$sequenced_log` primitive: atomic seq allocation, durable append-only log (SL1–SL10)
