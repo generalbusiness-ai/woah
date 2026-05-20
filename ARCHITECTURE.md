@@ -54,14 +54,14 @@ The shape, top to bottom:
 4. **Core exposes primitives; catalogs compose them.** When the engine grows
    a new capability (cross-host audience override, presence updates, mounted
    spaces, etc.), it lands as either a `WooWorld` method called by source via
-   a builtin (see `set_presence`, `observe_to_space`) or a `HostBridge`
+   a builtin (see `set_presence`, `observe_to_space`) or an `ExecutorContext`
    contract method. **Not** as a native verb handler tied to one catalog's
    class.
 
 5. **Hosts are pluggable.** `WooWorld` knows nothing about Cloudflare. The CF
-   worker (`src/worker/persistent-object-do.ts`) implements the `HostBridge`
+   worker (`src/worker/persistent-object-do.ts`) implements the `ExecutorContext`
    interface; the dev server (`src/server/dev-server.ts`) does the same with
-   in-process wiring; tests use `LocalHostBridge` (`tests/conformance.test.ts`,
+   in-process wiring; tests use `LocalExecutorContext` (`tests/conformance.test.ts`,
    `tests/core.test.ts`). New hosts implement the bridge; they don't fork the
    engine. Storage is the same: `ObjectRepository` is the only contract.
 
@@ -108,7 +108,7 @@ verbs the actor can reach.
 
 ### `src/worker` — Cloudflare host
 
-Implements `HostBridge` over Durable Object subrequests, `ObjectRepository`
+Implements `ExecutorContext` over Durable Object subrequests, `ObjectRepository`
 over DO storage, and the directory routing (`DirectoryDO`) that maps object
 ids to host ids. Adds the deployment-specific concerns: subrequest depth
 budget, internal-auth signing, host-scoped seed merge on cold start,
@@ -193,7 +193,7 @@ installed against an earlier shape. The discipline:
 The check, every time:
 
 1. Could the same effect ship as a builtin + a catalog source verb?
-2. Could the same effect ship as a `HostBridge` method + a host
+2. Could the same effect ship as an `ExecutorContext` method + a host
    implementation?
 3. Could the same effect ship as a routing/bootstrap primitive that any
    catalog would benefit from?

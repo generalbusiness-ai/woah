@@ -29,7 +29,7 @@ For each **scope** — that is, for each [`$space`](space.md) instance — exact
 
 `$space` is the spec object that makes a sequencer addressable. `$space` is itself a [`$sequenced_log`](sequenced-log.md) subclass — the log is the primitive that owns `next_seq` allocation atomicity (§SL1–§SL2); `$space` adds the subscription, presence, and observation-audience machinery a scope needs to be *participated in*. A bare `$sequenced_log` instance that is not also a `$space` is a log, not a scope.
 
-The sequencer is the **only** authority on order. Two changes to the same scope have a total order if and only if the sequencer assigned one. The model does not preclude later sequencer election or migration; it only requires that there be exactly one sequencer at any moment, known to participants. See §DT2 for the membership and identity rules.
+The sequencer is the **only** authority on order. Two changes to the same scope have a total order if and only if the sequencer assigned one. The model does not preclude later sequencer election or migration; it only requires that there be exactly one sequencer at any moment, known to participants. See §DT2 for the relationship between turn scope, object host, and sequencer identity.
 
 The sequencer is **not** an executor. The sequencer's job is to *order* transcript proposals it receives. It may also be a state holder (the reference implementation is), but that combination is incidental.
 
@@ -43,23 +43,37 @@ State holders include hosted PersistentObjectDOs (durable replicas, `host_placem
 
 ---
 
-## DT2. Scope membership and sequencer identity
+## DT2. Turn scope, object host, and sequencer identity
 
-### Membership: which objects belong to a scope
+The model has two distinct assignment questions that earlier drafts conflated. Distinguish them.
 
-An object `O` belongs to scope `S` (a `$space` instance) when any of the following holds:
+### Turn scope: which sequencer orders a turn
 
-1. `O` *is* `S`.
-2. `O.anchor` resolves transitively to `S`. The `anchor` field is an explicit declaration that `O`'s state lives in the same atomicity cluster as `S` (per [objects.md §4.1](objects.md#41-anchor-and-atomicity-scope)).
-3. `O.location` resolves transitively to `S` (i.e., `O` is contained in `S` or in something `S` contains). This covers actors who have entered a room and items they carry.
+A turn is submitted with an explicit `scope` field naming a `$space` instance. The sequencer for that scope orders the turn, and assigns cell versions for any properties the turn writes. The scope is declared by the executor at submission, not derived from any object's properties.
 
-If none of (1)–(3) hold, `O` is **outside the scope system**. Objects in this category include bootstrap and class objects (`$wiz`, `$system`, `$root`, `$thing`, catalog class definitions, etc.). Changes to those objects do not pass through any scope sequencer — they are sequenced by the world host directly under different rules (see [bootstrap.md](bootstrap.md) and [reference/cloudflare.md](../reference/cloudflare.md)). They are durable but globally rare; ordinary game-world objects always belong to some scope.
+By convention, executors set the turn's scope to the actor's active scope — typically the `$space` the actor is currently operating in (often their `location` if that resolves to a `$space`). This is a convention of how callers choose, not a derivation rule the substrate enforces; the wire-level `scope` field is authoritative.
 
-Membership is **single-valued**: an object belongs to at most one scope at any time. Moving an object across scopes (e.g., a player walking from one room to another) changes the membership atomically as part of the move; cross-scope moves require sequencer-to-sequencer coordination ([v2-turn-network.md](../protocol/v2-turn-network.md)).
+Each scope has its own total order of turns. There is no shared order *between* scopes; concurrent turns in different scopes are unordered with respect to each other unless an explicit cross-scope mechanism (§DT2 cross-scope, below) orders them.
 
-### Identity: which sequencer node handles which scope
+### Object host: which node holds an object's rows
 
-Each scope has exactly one **sequencer identity** at any time. The identity is derived from the scope's ObjRef: `sequencer_id = derive(scope_id)`. This makes the mapping deterministic — any node holding a scope's ObjRef can compute, without consulting any registry, which node sequences that scope.
+Independent of the turn scope, every object has a **host** — the node that holds its persistent rows. Host placement is decided at object creation per [objects.md §4.2](objects.md#42-host-placement):
+
+1. **Self-hosted** instances (`host_placement = "self"`, derived from the class's `instances_self_host`). The object *is* its own host.
+2. **Anchored** instances. The object lives on the host root that its `anchor` chain resolves to.
+3. **Co-resident** instances (no anchor, not self-hosted). The object lives on the host that ran the `create` call.
+
+`location` does **not** participate in host placement (objects.md §4.2). A book carried from one room to another stays on its original host; only `location` updates.
+
+Anchor and location are independent axes (objects.md §4.1). An actor whose home anchor points at their `$player` (self-hosted) but whose `location` is `$room42` has rows on the `$player` host and a position inside `$room42`; those two facts are orthogonal.
+
+### Bootstrap objects: outside the scope-per-turn model
+
+A small set of objects (`$wiz`, `$system`, `$root`, `$thing`, catalog class definitions, etc.) are mutated outside the turn-scope model — bootstrap and catalog-install paths sequence changes to them under different rules (see [bootstrap.md](bootstrap.md) and [reference/cloudflare.md](../reference/cloudflare.md)). At runtime these objects are read but rarely written; their changes do not pass through a `$space` sequencer.
+
+### Sequencer identity: how to find the sequencer for a scope
+
+Each scope has exactly one **sequencer identity** at any time. The identity is derived from the scope's ObjRef: `sequencer_id = derive(scope_id)`. The mapping is deterministic — any node holding a scope's ObjRef can compute, without consulting any registry, which node sequences that scope.
 
 In the v1 Cloudflare reference (§[cloudflare.md R8](../reference/cloudflare.md)), `derive` is `env.COMMIT_SCOPE.idFromName(String(scope))` — the scope's ObjRef *is* the CommitScopeDO instance's name. There is exactly one CommitScopeDO per scope, instantiated lazily on first use; later requests reach the same instance because the derivation is deterministic.
 
@@ -69,19 +83,23 @@ The model permits the derivation function to change in future versions (e.g., to
 - **Single-valued**: at any moment, at most one sequencer is current for a given scope.
 - **Discoverable without enumeration**: a node holding only the scope id can locate the sequencer.
 
-Cross-scope work is coordinated **sequencer-to-sequencer**, not through any central authority. A turn that touches objects in scopes `A` and `B` is planned by an executor and submitted to one of the two sequencers, which then talks to the other; the protocol for that conversation is in [v2-turn-network.md](../protocol/v2-turn-network.md).
+### Cross-scope work
 
-### Why anchor, not host
+A turn ordered by scope `A`'s sequencer may write properties on objects whose host is elsewhere. In v1 those effects propagate via host-to-host RPC during commit fan-out — the originating scope orders the turn, and the remote host applies the resulting writes. Effects in a remote host may themselves trigger follow-up turns sequenced by *that* host's scope (if it is a `$space`); the model does not promise a global total order across the two scopes.
 
-A common confusion: in early Cloudflare-aware code, "scope" sometimes conflated with "which DO holds the object's rows." Those are different facts.
+A turn that needs to *atomically* span two scopes is harder. The full protocol for **mergeable remote sub-transcripts** — sub-turns that execute in another scope and merge their transcripts back into the originating turn — is **deferred** (see [v2-turn-network.md §VTN15](../protocol/v2-turn-network.md), "runtime cross-host bridge boundaries are also explicitly incomplete in the v2 protocol; mergeable remote sub-transcripts are deferred until the execution plane exists"). v1 code that needs cross-scope atomicity either restructures the work to live in one scope or accepts non-atomic propagation.
 
-| Question | Answer | Where it lives |
+### Reading the table
+
+The three questions the §DT2 model separates, and where each is answered:
+
+| Question | Where answered | Where it lives |
 |---|---|---|
-| Which scope *sequences changes to* object `O`? | `O`'s anchor chain (DT2 §Membership). | Object data. |
-| Which node currently *holds rows* for object `O`? | Cache hint, often `host_placement` or a Directory route. | Cache metadata. |
-| Which DO *executes turns* against object `O`? | Any executor with current cell versions for the cells it needs. | Not pinned anywhere. |
+| Which sequencer *orders this turn*? | Turn's `scope` field at submission. | Wire-level, per turn. |
+| Which node *holds the rows* for object `O`? | Object's `anchor` chain plus `host_placement` (objects.md §4.2). | Object data, stamped at create. |
+| Which DO *executes turns* against object `O`? | Any executor with sufficient state to step the verb. | Not pinned anywhere. |
 
-Anchor is durable object data; cache hints are operational and can change. Code that resolves an object's sequencer by reading anchor is correct; code that resolves it by reading host placement may be looking at a stale cache.
+Anchor is durable object data; the turn's scope is a wire-level decision; execution is symmetric across nodes. Code that resolves "where is this object" by reading anchor or host placement is correct; code that derives "what scope sequences changes to this object" is asking a malformed question — scope is a property of turns, not of objects.
 
 ---
 
