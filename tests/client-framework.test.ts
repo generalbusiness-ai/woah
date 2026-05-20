@@ -27,6 +27,10 @@ function createWooClientFramework() {
   return ui;
 }
 
+function v2SnapshotKey(scope: string, headSeq: number): string {
+  return `v2:${scope}:${headSeq}`;
+}
+
 describe("client UI framework projection", () => {
   it("keeps optimistic pinboard placement across stale world refreshes until applied confirmation", () => {
     const ui = createWooClientFramework();
@@ -231,7 +235,7 @@ describe("client UI framework projection", () => {
 
   it("previews added outliner rows from optimistic frames and rolls back on error", () => {
     const ui = createWooClientFramework();
-    ui.ingestSnapshot("v2:the_outline:0", [
+    ui.ingestSnapshot(v2SnapshotKey("the_outline", 0), [
       { id: "the_outline", name: "Outline", props: {} }
     ]);
 

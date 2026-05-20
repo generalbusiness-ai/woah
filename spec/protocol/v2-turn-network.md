@@ -687,6 +687,16 @@ frames and projection updates together. `CatchupRequest.wants` uses
 `"transcript"` instead because catch-up may explicitly ask for audit/replay
 material rather than display projection.
 
+Browser-local optimistic turn results MAY be reduced into temporary projection
+layers before the corresponding `AppliedFrame` arrives. These layers are keyed
+by the pending call id, are not durable protocol state, and MUST be removed
+when the call fails, expires, or is superseded by catch-up. When the accepted
+applied frame arrives, the client reduces the frame through the same catalog
+observation rules and drops the optimistic layer so canonical or sequenced
+projection owns the display. A catalog UI that uses optimistic projection MUST
+keep its optimistic projection reducer aligned with the reducer used for
+accepted frames.
+
 After a browser reconnects, it MUST NOT assume the relay buffered frames while
 the socket was absent. For every subscribed scope, the browser sends
 `CatchupRequest { from: last_known_scope_head, wants: "applied" }` or

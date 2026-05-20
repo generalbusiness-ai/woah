@@ -1501,6 +1501,9 @@ async function cachedObjectsByHash(hashes: Iterable<string>): Promise<Serialized
 async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowStatePage[]> {
   const wanted = new Set(hashes);
   if (wanted.size === 0) return [];
+  // Tool entry normally needs almost every cached state page. One bulk read
+  // keeps IndexedDB metrics and main-thread postMessage volume bounded; do not
+  // restore per-hash transactions unless sparse cache reads become dominant.
   const rows = await tx<Array<{ hash?: unknown; page?: unknown }>>(STATE_PAGE_STORE, "readonly", (store) => store.getAll(), { count: wanted.size });
   return rows
     .filter((row) => typeof row?.hash === "string" && wanted.has(row.hash) && isShadowStatePage(row.page))

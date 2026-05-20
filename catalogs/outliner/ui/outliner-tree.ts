@@ -165,6 +165,8 @@ export class WooOutlinerTreeElement extends HTMLElement {
   }
 
   applyObservation(observation: Record<string, unknown>): void {
+    // Keep this DOM-local reducer aligned with the projection reducer in
+    // registerWooObservationHandlers; accepted frames use both paths.
     const type = String(observation.type ?? "");
     if (type === "note_edited") {
       const item = this.model.items.find((candidate) => candidate.id === String(observation.note ?? observation.id ?? ""));
@@ -837,6 +839,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
     types: STRUCTURAL_TYPES,
     route: "sequenced",
     reduce: (draft, envelope) => {
+      // Keep these projection patches aligned with applyObservation above;
+      // optimistic frames use only this path and accepted frames use both.
       const type = String(envelope.observation.type ?? "");
       const outlinerId = String(envelope.observation.outliner ?? envelope.observation.source ?? "");
       if (type === "outline_item_added") {
