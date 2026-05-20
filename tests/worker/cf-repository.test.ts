@@ -1011,6 +1011,145 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("accepts authenticated browser activity metric batches", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-browser-metrics-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((label: unknown, payload: unknown) => {
+      if (label === "woo.metric" && typeof payload === "string") logs.push(payload);
+    });
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: "wizard:cf-browser-metrics-token" })
+      }));
+      expect(auth.ok).toBe(true);
+      const authBody = await auth.json() as { session: string };
+      const response = await gateway.fetch(new Request("https://woo.test/api/browser-metrics", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Session ${authBody.session}`
+        },
+        body: JSON.stringify({
+          metrics: [
+            {
+              kind: "browser_activity",
+              source: "v2_browser_worker",
+              phase: "idb_tx",
+              path: "indexeddb",
+              method: "readwrite",
+              what: "state_pages",
+              scope: "the_outliner",
+              node: "browser:metric-test",
+              actor: "spoofed_actor",
+              ms: 14,
+              bytes: 2048,
+              status: "ok"
+            }
+          ]
+        })
+      }));
+
+      expect(response.ok).toBe(true);
+      expect(await response.json()).toMatchObject({ ok: true, accepted: 1 });
+      const metrics = logs.map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "browser_activity",
+        source: "v2_browser_worker",
+        phase: "idb_tx",
+        path: "indexeddb",
+        what: "state_pages",
+        scope: "the_outliner",
+        node: "browser:metric-test",
+        actor: "$wiz",
+        bytes: 2048,
+        host_key: "browser"
+      }));
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
+  it("samples browser activity metrics when one session exceeds the per-window budget", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const analyticsCalls: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-browser-metrics-sampling-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      METRICS: { writeDataPoint(point: { indexes?: string[]; blobs?: string[]; doubles?: number[] }) { analyticsCalls.push(point); } },
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      })
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const auth = await gateway.fetch(new Request("https://woo.test/api/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: "wizard:cf-browser-metrics-sampling-token" })
+      }));
+      expect(auth.ok).toBe(true);
+      const authBody = await auth.json() as { session: string };
+      const metricStart = analyticsCalls.length;
+      const response = await gateway.fetch(new Request("https://woo.test/api/browser-metrics", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Session ${authBody.session}`
+        },
+        body: JSON.stringify({
+          metrics: Array.from({ length: 70 }, (_, index) => ({
+            kind: "browser_activity",
+            source: "v2_browser_worker",
+            phase: "frame_process",
+            path: "live",
+            scope: "the_outliner",
+            node: "browser:metric-sampling-test",
+            ms: index,
+            status: "ok"
+          }))
+        })
+      }));
+
+      expect(response.ok).toBe(true);
+      expect(await response.json()).toMatchObject({ ok: true, accepted: 61, sampled: 9 });
+      const browserMetricWrites = analyticsCalls.slice(metricStart).filter((point) => point.blobs?.[0] === "browser_activity");
+      expect(browserMetricWrites).toHaveLength(61);
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("rejects v2 WebSocket upgrades without the required subprotocol", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");

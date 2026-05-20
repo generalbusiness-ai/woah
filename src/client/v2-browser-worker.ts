@@ -71,6 +71,29 @@ type V2CacheStatus = {
   catchup_required?: boolean;
 };
 
+type BrowserActivityMetric = {
+  kind: "browser_activity";
+  source: "v2_browser_worker";
+  phase: string;
+  ms: number;
+  status: "ok" | "error";
+  scope?: string;
+  node?: string;
+  actor?: string;
+  route?: string;
+  method?: string;
+  path?: string;
+  what?: string;
+  reason?: string;
+  count?: number;
+  bytes?: number;
+  records?: number;
+  transfer_mode?: string;
+  executable_transfer_cache?: "hit" | "miss";
+  error?: string;
+  error_detail?: string;
+};
+
 const DB_NAME = "woo-v2-browser";
 const DB_VERSION = 7;
 const META_STORE = "meta";
@@ -92,7 +115,7 @@ let current: { token: string; node: string; scope: string; actor?: string; sessi
 let reconnectTimer: number | undefined;
 let connecting = false;
 let connectPromise: Promise<void> | null = null;
-let connectReady: { sawDisplayState: boolean; sawExecutableState: boolean; sawAd: boolean; settle: () => void; timer: number } | null = null;
+let connectReady: { sawDisplayState: boolean; sawExecutableState: boolean; sawAd: boolean; settle: (reason?: string) => void; timer: number } | null = null;
 let connectGeneration = 0;
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
@@ -108,6 +131,38 @@ type V2WorkerScope = {
 
 const workerScope = self as unknown as V2WorkerScope;
 
+function metricNow(): number {
+  return globalThis.performance?.now ? globalThis.performance.now() : Date.now();
+}
+
+function metricElapsed(startedAt: number): number {
+  return Math.max(0, Math.round((metricNow() - startedAt) * 1000) / 1000);
+}
+
+function postBrowserActivity(input: Omit<BrowserActivityMetric, "kind" | "source" | "scope" | "node" | "actor"> & {
+  scope?: string;
+  node?: string;
+  actor?: string;
+}): void {
+  const metric: BrowserActivityMetric = {
+    kind: "browser_activity",
+    source: "v2_browser_worker",
+    scope: input.scope ?? current?.scope,
+    node: input.node ?? current?.node,
+    actor: input.actor ?? current?.actor,
+    ...input
+  };
+  postMessage({ kind: "browser_metric", metric });
+}
+
+function jsonBytes(value: unknown): number {
+  try {
+    return new TextEncoder().encode(typeof value === "string" ? value : JSON.stringify(value)).length;
+  } catch {
+    return 0;
+  }
+}
+
 workerScope.addEventListener("message", (event: MessageEvent<V2WorkerCommand>) => {
   // Connect and call messages can arrive back-to-back during route changes.
   // Serialize command handling so a turn intent cannot run before the
@@ -120,48 +175,63 @@ workerScope.addEventListener("message", (event: MessageEvent<V2WorkerCommand>) =
 });
 
 async function handleCommand(command: V2WorkerCommand): Promise<void> {
-  switch (command.kind) {
-    case "connect":
-      await connectTo({
-        token: command.token,
-        node: command.node ?? await browserNodeId(),
-        scope: command.scope ?? "",
-        actor: command.actor,
-        session: command.session
-      });
-      break;
-    case "disconnect":
-      clearReconnect();
-      socket?.close();
-      socket = null;
-      connecting = false;
-      current = null;
-      rejectPendingStateTransfers(new Error("v2 browser disconnected"));
-      await putMeta("connected", false);
-      postStatus();
-      break;
-    case "send": {
-      const encoded = encodeEnvelope(command.envelope);
-      await putPending({
-        id: command.envelope.id,
-        encoded,
-        created_at: Date.now(),
-        auth_token: command.envelope.auth.mode === "session" ? command.envelope.auth.token : undefined,
-        from: command.envelope.from
-      });
-      sendEncoded(encoded);
-      postStatus();
-      break;
+  const startedAt = metricNow();
+  let failed: unknown;
+  try {
+    switch (command.kind) {
+      case "connect":
+        await connectTo({
+          token: command.token,
+          node: command.node ?? await browserNodeId(),
+          scope: command.scope ?? "",
+          actor: command.actor,
+          session: command.session
+        });
+        break;
+      case "disconnect":
+        clearReconnect();
+        socket?.close();
+        socket = null;
+        connecting = false;
+        current = null;
+        rejectPendingStateTransfers(new Error("v2 browser disconnected"));
+        await putMeta("connected", false);
+        postStatus();
+        break;
+      case "send": {
+        const encoded = encodeEnvelope(command.envelope);
+        await putPending({
+          id: command.envelope.id,
+          encoded,
+          created_at: Date.now(),
+          auth_token: command.envelope.auth.mode === "session" ? command.envelope.auth.token : undefined,
+          from: command.envelope.from
+        });
+        sendEncoded(encoded);
+        postStatus();
+        break;
+      }
+      case "call":
+        await sendTurnIntent(command);
+        break;
+      case "get_projection":
+        await postCachedProjection(command.scope ?? current?.scope ?? "");
+        break;
+      case "cache_status":
+        postStatus();
+        break;
     }
-    case "call":
-      await sendTurnIntent(command);
-      break;
-    case "get_projection":
-      await postCachedProjection(command.scope ?? current?.scope ?? "");
-      break;
-    case "cache_status":
-      postStatus();
-      break;
+  } catch (err) {
+    failed = err;
+    throw err;
+  } finally {
+    postBrowserActivity({
+      phase: "command",
+      path: command.kind,
+      ms: metricElapsed(startedAt),
+      status: failed ? "error" : "ok",
+      ...(failed ? { error: "E_BROWSER_WORKER_COMMAND", error_detail: errorMessage(failed) } : {})
+    });
   }
 }
 
@@ -178,7 +248,7 @@ async function connectTo(next: { token: string; node: string; scope: string; act
     const previous = socket;
     socket = null;
     connecting = false;
-    connectReady?.settle();
+    connectReady?.settle("superseded");
     previous?.close(1000, "v2 browser scope changed");
     await putMeta("connected", false);
   }
@@ -199,6 +269,7 @@ async function connectTo(next: { token: string; node: string; scope: string; act
  * that local-execution boundary, later callers return immediately.
  */
 async function connect(): Promise<void> {
+  const connectStartedAt = metricNow();
   const target = current;
   if (!target) return;
   if (socket?.readyState === WebSocket.OPEN) return connectPromise ?? undefined;
@@ -211,14 +282,27 @@ async function connect(): Promise<void> {
     resolveReady = resolve;
   });
   connectPromise = promise;
+  const cacheStartedAt = metricNow();
   const cachedHead = target.scope ? await getMeta<unknown>(`head:${target.scope}`) : undefined;
   const executableSeedDigest = target.scope ? await cachedOpenExecutableSeedDigest(target.node, target.scope) : undefined;
+  postBrowserActivity({
+    phase: "connect_cache_probe",
+    path: "connect",
+    scope: target.scope,
+    node: target.node,
+    actor: target.actor,
+    ms: metricElapsed(cacheStartedAt),
+    status: "ok",
+    count: executableSeedDigest ? 1 : 0,
+    reason: executableSeedDigest ? "open_seed_digest" : "no_open_seed_digest"
+  });
   if (generation !== connectGeneration || current !== target) {
     if (connectPromise === promise) connectPromise = null;
     resolveReady();
     return promise;
   }
   const lastKnownHead: ShadowScopeHead | undefined = isShadowScopeHead(cachedHead) ? cachedHead : undefined;
+  const wsCreateStartedAt = metricNow();
   const ws = new WebSocket(v2BrowserWebSocketUrl({
     location,
     token: target.token,
@@ -227,6 +311,17 @@ async function connect(): Promise<void> {
     last_known_head: lastKnownHead,
     executable_seed_digest: executableSeedDigest
   }), "woo-v2.turn-network.json");
+  postBrowserActivity({
+    phase: "websocket_create",
+    path: "connect",
+    scope: target.scope,
+    node: target.node,
+    actor: target.actor,
+    ms: metricElapsed(wsCreateStartedAt),
+    status: "ok",
+    count: lastKnownHead ? 1 : 0,
+    executable_transfer_cache: executableSeedDigest ? "hit" : "miss"
+  });
   socket = ws;
   {
     // WebSocket open is not enough: the relay sends TransportHello before
@@ -234,13 +329,24 @@ async function connect(): Promise<void> {
     // display catch-up, executable seed state, and the scope execution ad have
     // all been installed, so the first durable turn can plan locally and repair
     // exact atoms instead of falling back to server-assisted intent planning.
-    const settle = () => {
+    const settle = (reason = "ready") => {
       const ready = connectReady;
       if (ready?.settle === settle) {
         workerScope.clearTimeout(ready.timer);
         connectReady = null;
       }
       if (connectPromise === promise) connectPromise = null;
+      postBrowserActivity({
+        phase: "connect_ready_wait",
+        path: "connect",
+        scope: target.scope,
+        node: target.node,
+        actor: target.actor,
+        ms: metricElapsed(connectStartedAt),
+        status: reason === "ready" || reason === "superseded" ? "ok" : "error",
+        reason,
+        count: (ready?.sawDisplayState ? 1 : 0) + (ready?.sawExecutableState ? 1 : 0) + (ready?.sawAd ? 1 : 0)
+      });
       resolveReady();
     };
     connectReady = {
@@ -248,13 +354,22 @@ async function connect(): Promise<void> {
       sawExecutableState: false,
       sawAd: false,
       settle,
-      timer: workerScope.setTimeout(settle, 5000)
+      timer: workerScope.setTimeout(() => settle("timeout"), 5000)
     };
     ws.addEventListener("open", () => {
       if (socket !== ws) return;
       connecting = false;
       reconnectDelayMs = 500;
       void putMeta("connected", true);
+      postBrowserActivity({
+        phase: "websocket_open",
+        path: "connect",
+        scope: target.scope,
+        node: target.node,
+        actor: target.actor,
+        ms: metricElapsed(connectStartedAt),
+        status: "ok"
+      });
       postStatus();
     });
     ws.addEventListener("message", (event) => {
@@ -277,7 +392,17 @@ async function connect(): Promise<void> {
       void putMeta("connected", false);
       postStatus();
       scheduleReconnect();
-      settle();
+      postBrowserActivity({
+        phase: "websocket_close",
+        path: "connect",
+        scope: target.scope,
+        node: target.node,
+        actor: target.actor,
+        ms: metricElapsed(connectStartedAt),
+        status: "error",
+        reason: "close"
+      });
+      settle("close");
     });
     ws.addEventListener("error", () => {
       if (socket !== ws) return;
@@ -285,60 +410,101 @@ async function connect(): Promise<void> {
       rejectPendingStateTransfers(new Error("v2 browser socket error"));
       void putMeta("connected", false);
       postStatus();
-      settle();
+      postBrowserActivity({
+        phase: "websocket_error",
+        path: "connect",
+        scope: target.scope,
+        node: target.node,
+        actor: target.actor,
+        ms: metricElapsed(connectStartedAt),
+        status: "error",
+        reason: "error"
+      });
+      settle("error");
     });
   }
   return promise;
 }
 
 async function receiveFrame(encoded: string): Promise<void> {
+  const frameStartedAt = metricNow();
+  const frameBytes = jsonBytes(encoded);
+  let envelopeType = "decode_pending";
+  let mutationCount = 0;
+  let failed: unknown;
   // Every frame is decoded through the transport-neutral codec before cache
   // mutation so the browser worker rejects the same malformed envelopes as the
   // relay and in-process tests.
-  const envelope = decodeEnvelope(encoded);
-  let installedExecutableState = false;
-  const receivedStateTransfer = envelope.type === "woo.state.transfer.shadow.v1";
-  const receivedExecutableStateTransfer = receivedStateTransfer && isExecutableStateTransfer(envelope.body);
-  const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
-  for (const mutation of v2BrowserCacheMutationsForEnvelope(envelope)) {
-    const applied = await applyCacheMutation(mutation);
-    if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
-    if (applied?.kind === "projection") postProjection(applied.scope, applied.head, applied.projection);
-    if (mutation.kind === "applied_frame") postAppliedFrame(mutation.frame, mutation.transcript);
-    if (mutation.kind === "object_page" || mutation.kind === "state_page") installedExecutableState = true;
+  try {
+    const decodeStartedAt = metricNow();
+    const envelope = decodeEnvelope(encoded);
+    envelopeType = envelope.type;
+    postBrowserActivity({
+      phase: "frame_decode",
+      path: envelopeType,
+      ms: metricElapsed(decodeStartedAt),
+      status: "ok",
+      bytes: frameBytes
+    });
+    let installedExecutableState = false;
+    const receivedStateTransfer = envelope.type === "woo.state.transfer.shadow.v1";
+    const receivedExecutableStateTransfer = receivedStateTransfer && isExecutableStateTransfer(envelope.body);
+    const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
+    const mutations = v2BrowserCacheMutationsForEnvelope(envelope);
+    mutationCount = mutations.length;
+    for (const mutation of mutations) {
+      const applied = await applyCacheMutation(mutation);
+      if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
+      if (applied?.kind === "projection") postProjection(applied.scope, applied.head, applied.projection);
+      if (mutation.kind === "applied_frame") postAppliedFrame(mutation.frame, mutation.transcript);
+      if (mutation.kind === "object_page" || mutation.kind === "state_page") installedExecutableState = true;
+    }
+    if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
+      const reply = envelope.body as ShadowTurnExecReply;
+      if (!(reply.ok === false && reply.reason === "missing_state")) await reconcileTentativeTurnReply(reply, envelope.reply_to);
+      const message = v2TurnResultMessageFromReply(reply, envelope.reply_to);
+      if (message) postMessage(message);
+    }
+    if (envelope.type === "woo.transport.error.v1" && envelope.reply_to) {
+      await invalidateTentativeTurn(envelope.reply_to, "transport_error");
+    }
+    if (envelope.type === "woo.live.event.shadow.v1") {
+      postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
+    }
+    if (envelope.type === "woo.state.transfer.shadow.v1" && envelope.reply_to) {
+      resolvePendingStateTransfer(envelope.reply_to);
+    }
+    if (installedExecutableState || receivedStateTransfer) await replayPending();
+    markConnectReady(receivedStateTransfer, receivedExecutableStateTransfer, receivedExecutionAd, envelope.type === "woo.transport.error.v1");
+    postMessage({ kind: "frame", envelope });
+    postStatus();
+  } catch (err) {
+    failed = err;
+    throw err;
+  } finally {
+    postBrowserActivity({
+      phase: "frame_process",
+      path: envelopeType,
+      ms: metricElapsed(frameStartedAt),
+      status: failed ? "error" : "ok",
+      count: mutationCount,
+      bytes: frameBytes,
+      ...(failed ? { error: "E_BROWSER_FRAME", error_detail: errorMessage(failed) } : {})
+    });
   }
-  if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
-    const reply = envelope.body as ShadowTurnExecReply;
-    if (!(reply.ok === false && reply.reason === "missing_state")) await reconcileTentativeTurnReply(reply, envelope.reply_to);
-    const message = v2TurnResultMessageFromReply(reply, envelope.reply_to);
-    if (message) postMessage(message);
-  }
-  if (envelope.type === "woo.transport.error.v1" && envelope.reply_to) {
-    await invalidateTentativeTurn(envelope.reply_to, "transport_error");
-  }
-  if (envelope.type === "woo.live.event.shadow.v1") {
-    postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
-  }
-  if (envelope.type === "woo.state.transfer.shadow.v1" && envelope.reply_to) {
-    resolvePendingStateTransfer(envelope.reply_to);
-  }
-  if (installedExecutableState || receivedStateTransfer) await replayPending();
-  markConnectReady(receivedStateTransfer, receivedExecutableStateTransfer, receivedExecutionAd, envelope.type === "woo.transport.error.v1");
-  postMessage({ kind: "frame", envelope });
-  postStatus();
 }
 
 function markConnectReady(receivedDisplayState: boolean, receivedExecutableState: boolean, receivedExecutionAd: boolean, receivedTransportError: boolean): void {
   const ready = connectReady;
   if (!ready) return;
   if (receivedTransportError) {
-    ready.settle();
+    ready.settle("transport_error");
     return;
   }
   if (receivedDisplayState) ready.sawDisplayState = true;
   if (receivedExecutableState) ready.sawExecutableState = true;
   if (receivedExecutionAd) ready.sawAd = true;
-  if (ready.sawDisplayState && ready.sawExecutableState && ready.sawAd) ready.settle();
+  if (ready.sawDisplayState && ready.sawExecutableState && ready.sawAd) ready.settle("ready");
 }
 
 function isExecutableStateTransfer(body: unknown): boolean {
@@ -371,75 +537,114 @@ function pendingMatchesCurrentSession(pending: PendingEnvelope): boolean {
 }
 
 async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }>): Promise<void> {
+  const startedAt = metricNow();
+  let failed: unknown;
+  let plannedLocally = false;
   if (!current || !current.actor) {
     postMessage({ kind: "error", error: "v2 browser call requires an authenticated actor" });
     return;
   }
-  const commandScope = command.scope || current.scope;
-  if (commandScope && current.scope !== commandScope) {
-    await connectTo({ ...current, scope: commandScope });
-  }
-  await connect();
-  if (!current || !current.actor) {
-    postMessage({ kind: "error", error: "v2 browser call lost authenticated actor while connecting" });
-    return;
-  }
-  if (await sendLocalTurnExec(command)) {
+  try {
+    const commandScope = command.scope || current.scope;
+    if (commandScope && current.scope !== commandScope) {
+      await connectTo({ ...current, scope: commandScope });
+    }
+    const connectWaitStartedAt = metricNow();
+    await connect();
+    postBrowserActivity({
+      phase: "turn_connect_wait",
+      path: command.verb,
+      route: command.route,
+      scope: command.scope || current?.scope,
+      ms: metricElapsed(connectWaitStartedAt),
+      status: "ok"
+    });
+    if (!current || !current.actor) {
+      postMessage({ kind: "error", error: "v2 browser call lost authenticated actor while connecting" });
+      return;
+    }
+    if (await sendLocalTurnExec(command)) {
+      plannedLocally = true;
+      postStatus();
+      return;
+    }
+    const body: ShadowTurnIntentRequest = {
+      kind: "woo.turn.intent.request.shadow.v1",
+      id: command.id,
+      route: command.route,
+      scope: command.scope || current.scope,
+      target: command.target,
+      verb: command.verb,
+      args: Array.isArray(command.args) ? command.args as WooValue[] : [],
+      persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
+    };
+    const delegationStartedAt = metricNow();
+    const scopeDelegation = selectV2DelegatedScopeExecutor({
+      records: await allExecutionAds(),
+      scope: body.scope
+    });
+    postBrowserActivity({
+      phase: "scope_delegation_select",
+      path: command.verb,
+      route: command.route,
+      scope: body.scope,
+      ms: metricElapsed(delegationStartedAt),
+      status: "ok",
+      count: scopeDelegation.ok ? 1 : 0
+    });
+    // Bare durable intent is not a browser fallback. When local execution cannot
+    // build a turn, the only durable escape hatch is a scope executor selected
+    // from the execution-ad cache; that keeps the edge on explicit delegation
+    // instead of drifting back to opaque server-side planning.
+    const fallbackPolicy = v2ServerAssistedIntentPolicy({
+      route: command.route,
+      persistence: body.persistence,
+      selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null
+    });
+    if (!fallbackPolicy.ok) {
+      postTurnUnavailable(command, fallbackPolicy.reason);
+      postStatus();
+      return;
+    }
+    if (fallbackPolicy.selected_ad) {
+      body.selected_ad = fallbackPolicy.selected_ad;
+      postMessage({ kind: "local_turn_delegated", ...turnDiagnostic(command, body.persistence), node: fallbackPolicy.selected_ad, reason: "scope_ad" });
+    }
+    const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
+      v: 2,
+      type: body.kind,
+      id: command.id,
+      from: current.node,
+      actor: current.actor,
+      ...(current.session ? { session: current.session } : {}),
+      auth: { mode: "session", token: current.token },
+      body
+    };
+    const encoded = encodeEnvelope(envelope);
+    await putPending({
+      id: envelope.id,
+      encoded,
+      created_at: Date.now(),
+      auth_token: current.token,
+      from: current.node
+    });
+    sendEncoded(encoded);
     postStatus();
-    return;
+  } catch (err) {
+    failed = err;
+    throw err;
+  } finally {
+    postBrowserActivity({
+      phase: "turn_intent",
+      path: command.verb,
+      route: command.route,
+      scope: command.scope || current?.scope,
+      ms: metricElapsed(startedAt),
+      status: failed ? "error" : "ok",
+      reason: plannedLocally ? "local_exec" : "delegated_or_server_intent",
+      ...(failed ? { error: "E_BROWSER_TURN_INTENT", error_detail: errorMessage(failed) } : {})
+    });
   }
-  const body: ShadowTurnIntentRequest = {
-    kind: "woo.turn.intent.request.shadow.v1",
-    id: command.id,
-    route: command.route,
-    scope: command.scope || current.scope,
-    target: command.target,
-    verb: command.verb,
-    args: Array.isArray(command.args) ? command.args as WooValue[] : [],
-    persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
-  };
-  const scopeDelegation = selectV2DelegatedScopeExecutor({
-    records: await allExecutionAds(),
-    scope: body.scope
-  });
-  // Bare durable intent is not a browser fallback. When local execution cannot
-  // build a turn, the only durable escape hatch is a scope executor selected
-  // from the execution-ad cache; that keeps the edge on explicit delegation
-  // instead of drifting back to opaque server-side planning.
-  const fallbackPolicy = v2ServerAssistedIntentPolicy({
-    route: command.route,
-    persistence: body.persistence,
-    selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null
-  });
-  if (!fallbackPolicy.ok) {
-    postTurnUnavailable(command, fallbackPolicy.reason);
-    postStatus();
-    return;
-  }
-  if (fallbackPolicy.selected_ad) {
-    body.selected_ad = fallbackPolicy.selected_ad;
-    postMessage({ kind: "local_turn_delegated", ...turnDiagnostic(command, body.persistence), node: fallbackPolicy.selected_ad, reason: "scope_ad" });
-  }
-  const envelope: ShadowEnvelope<ShadowTurnIntentRequest> = {
-    v: 2,
-    type: body.kind,
-    id: command.id,
-    from: current.node,
-    actor: current.actor,
-    ...(current.session ? { session: current.session } : {}),
-    auth: { mode: "session", token: current.token },
-    body
-  };
-  const encoded = encodeEnvelope(envelope);
-  await putPending({
-    id: envelope.id,
-    encoded,
-    created_at: Date.now(),
-    auth_token: current.token,
-    from: current.node
-  });
-  sendEncoded(encoded);
-  postStatus();
 }
 
 function postTurnUnavailable(command: Extract<V2WorkerCommand, { kind: "call" }>, reason: string): void {
@@ -497,8 +702,24 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     return true;
   }
   let local: V2BrowserLocalTurnResult;
+  let activePhase = "local_turn_execution_cache";
+  let activeStartedAt = metricNow();
   try {
+    const cacheStartedAt = activeStartedAt;
     const executionCache = await executionCacheForScope(scope);
+    postBrowserActivity({
+      phase: "local_turn_execution_cache",
+      path: command.verb,
+      route: command.route,
+      scope,
+      ms: metricElapsed(cacheStartedAt),
+      status: "ok",
+      records: executionCache.records.length,
+      count: executionCache.cached_objects.length + executionCache.cached_pages.length + executionCache.committed_transcripts.length
+    });
+    activePhase = "local_turn_plan";
+    activeStartedAt = metricNow();
+    const planStartedAt = metricNow();
     local = await planV2BrowserLocalTurn({
       node: current.node,
       actor: current.actor,
@@ -523,7 +744,17 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
         ...stats
       })
     });
-  } catch {
+    postBrowserActivity({
+      phase: "local_turn_plan",
+      path: command.verb,
+      route: command.route,
+      scope,
+      ms: metricElapsed(planStartedAt),
+      status: "ok",
+      reason: local.ok ? "ok" : local.reason,
+      count: local.ok ? local.observation_count : (local.missing_atoms?.length ?? 0)
+    });
+  } catch (err) {
     // Local planning genuinely throws (e.g. a pre-recording substrate check
     // such as presence/permission fires against a stale local serialized) on
     // the cold path between scope-open and the actor's enter commit. That's a
@@ -532,6 +763,17 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     // the page console — callers that grep for verb-thrown text mistake it
     // for a real transport error. The reason code is enough for diagnostics.
     postMessage({ kind: "local_turn_fallback", ...turnDiagnostic(command, persistence), reason: "local_planning_error" });
+    postBrowserActivity({
+      phase: activePhase,
+      path: command.verb,
+      route: command.route,
+      scope,
+      ms: metricElapsed(activeStartedAt),
+      status: "error",
+      reason: "local_planning_error",
+      error: "E_BROWSER_LOCAL_PLAN",
+      error_detail: errorMessage(err)
+    });
     return false;
   }
   if (!local.ok) {
@@ -594,6 +836,7 @@ async function repairLocalExecutableState(
   local: V2BrowserLocalTurnResult,
   command: Extract<V2WorkerCommand, { kind: "call" }>
 ): Promise<boolean> {
+  const startedAt = metricNow();
   const id = command.id;
   if (local.ok || local.reason !== "missing_state" || !current || !current.actor || !local.key) return false;
   const key = local.key;
@@ -639,14 +882,35 @@ async function repairLocalExecutableState(
   });
   try {
     await requestStateTransfer(envelope);
+    postBrowserActivity({
+      phase: "local_turn_repair",
+      path: command.verb,
+      route: command.route,
+      scope: key.scope,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      count: missingAtoms.length
+    });
     return true;
   } catch (err) {
     postMessage({ kind: "local_turn_repair_failed", ...turnDiagnostic(command), error: errorMessage(err) });
+    postBrowserActivity({
+      phase: "local_turn_repair",
+      path: command.verb,
+      route: command.route,
+      scope: key.scope,
+      ms: metricElapsed(startedAt),
+      status: "error",
+      count: missingAtoms.length,
+      error: "E_BROWSER_LOCAL_REPAIR",
+      error_detail: errorMessage(err)
+    });
     return false;
   }
 }
 
 async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest>): Promise<void> {
+  const startedAt = metricNow();
   const encoded = encodeEnvelope(envelope);
   const id = envelope.id;
   const pending = new Promise<void>((resolve, reject) => {
@@ -657,7 +921,30 @@ async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableSta
     pendingStateTransfers.set(id, { resolve, reject, timer });
   });
   sendEncoded(encoded);
-  await pending;
+  try {
+    await pending;
+    postBrowserActivity({
+      phase: "state_transfer_request",
+      path: envelope.body.mode,
+      scope: envelope.body.scope,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      bytes: jsonBytes(encoded),
+      count: envelope.body.atom_hashes?.length ?? envelope.body.missing_atoms?.length ?? 0
+    });
+  } catch (err) {
+    postBrowserActivity({
+      phase: "state_transfer_request",
+      path: envelope.body.mode,
+      scope: envelope.body.scope,
+      ms: metricElapsed(startedAt),
+      status: "error",
+      bytes: jsonBytes(encoded),
+      error: "E_BROWSER_STATE_TRANSFER",
+      error_detail: errorMessage(err)
+    });
+    throw err;
+  }
 }
 
 function resolvePendingStateTransfer(id: string): void {
@@ -735,7 +1022,27 @@ async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest):
 }
 
 function sendEncoded(encoded: string): void {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(encoded);
+  const startedAt = metricNow();
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(encoded);
+    postBrowserActivity({
+      phase: "websocket_send",
+      path: "frame",
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      bytes: jsonBytes(encoded),
+      count: 1
+    });
+    return;
+  }
+  postBrowserActivity({
+    phase: "websocket_send",
+    path: "frame",
+    ms: metricElapsed(startedAt),
+    status: "error",
+    bytes: jsonBytes(encoded),
+    reason: "socket_not_open"
+  });
 }
 
 function scheduleReconnect(): void {
@@ -768,6 +1075,7 @@ async function db(): Promise<IDBDatabase> {
   // projection/catch-up hydration. Raw frame history is deliberately omitted so
   // long-lived browser sessions do not accumulate an unbounded debug log.
   dbPromise ??= new Promise((resolve, reject) => {
+    const startedAt = metricNow();
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const database = request.result;
@@ -783,8 +1091,15 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(TENTATIVE_TURN_STORE)) database.createObjectStore(TENTATIVE_TURN_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(EXECUTION_CHECKPOINT_STORE)) database.createObjectStore(EXECUTION_CHECKPOINT_STORE, { keyPath: "scope" });
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("failed to open v2 browser cache"));
+    request.onsuccess = () => {
+      postBrowserActivity({ phase: "idb_open", path: "indexeddb", method: "open", ms: metricElapsed(startedAt), status: "ok", count: 1 });
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      const err = request.error ?? new Error("failed to open v2 browser cache");
+      postBrowserActivity({ phase: "idb_open", path: "indexeddb", method: "open", ms: metricElapsed(startedAt), status: "error", error: "E_BROWSER_IDB_OPEN", error_detail: errorMessage(err) });
+      reject(err);
+    };
   });
   return dbPromise;
 }
@@ -811,48 +1126,85 @@ async function allPending(): Promise<PendingEnvelope[]> {
 }
 
 async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<{ kind: "projection"; scope: string; head: ShadowScopeHead; projection: unknown } | void> {
-  switch (mutation.kind) {
-    case "meta":
-      await putMeta(mutation.key, mutation.value);
-      return;
-    case "pending_delete":
-      await deletePending(mutation.id);
-      return;
-    case "projection":
-      await putProjection(mutation.scope, mutation.head, mutation.projection);
-      if (mutation.reset_execution_overlay) await resetCommittedExecutionOverlay(mutation.scope);
-      return;
-    case "projection_patch": {
-      const row = await getProjection(mutation.scope);
-      const baseHead = isProjectionRow(row) && isShadowScopeHead(row.head) ? row.head : undefined;
-      const projection = applyShadowScopeProjectionPatch(isProjectionRow(row) ? row.projection : undefined, mutation.patch, baseHead);
-      await putProjection(mutation.scope, mutation.head, projection);
-      return { kind: "projection", scope: mutation.scope, head: mutation.head, projection };
-    }
-    case "applied_frame":
-      await putAppliedFrame(mutation.frame);
-      if (mutation.transcript) {
-        await putTranscript(mutation.transcript, mutation.frame.position.seq);
-        await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
+  const startedAt = metricNow();
+  let failed: unknown;
+  try {
+    switch (mutation.kind) {
+      case "meta":
+        await putMeta(mutation.key, mutation.value);
+        return;
+      case "pending_delete":
+        await deletePending(mutation.id);
+        return;
+      case "projection":
+        await putProjection(mutation.scope, mutation.head, mutation.projection);
+        if (mutation.reset_execution_overlay) await resetCommittedExecutionOverlay(mutation.scope);
+        return;
+      case "projection_patch": {
+        const row = await getProjection(mutation.scope);
+        const baseHead = isProjectionRow(row) && isShadowScopeHead(row.head) ? row.head : undefined;
+        const projection = applyShadowScopeProjectionPatch(isProjectionRow(row) ? row.projection : undefined, mutation.patch, baseHead);
+        await putProjection(mutation.scope, mutation.head, projection);
+        return { kind: "projection", scope: mutation.scope, head: mutation.head, projection };
       }
-      return;
-    case "transcript":
-      if (await transcriptCoveredByCheckpoint(mutation.transcript)) return;
-      await putTranscript(mutation.transcript);
-      return;
-    case "object_page":
-      await putObjectPage(mutation.hash, mutation.object);
-      return;
-    case "state_page":
-      await putStatePage(mutation.hash, mutation.ref, mutation.page);
-      return;
-    case "execution_ad":
-      await putExecutionAd(mutation.record);
-      return;
-    case "execution_transfer":
-      await putExecutionTransfer(mutation.record);
-      return;
+      case "applied_frame":
+        await putAppliedFrame(mutation.frame);
+        if (mutation.transcript) {
+          await putTranscript(mutation.transcript, mutation.frame.position.seq);
+          await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
+        }
+        return;
+      case "transcript":
+        if (await transcriptCoveredByCheckpoint(mutation.transcript)) return;
+        await putTranscript(mutation.transcript);
+        return;
+      case "object_page":
+        await putObjectPage(mutation.hash, mutation.object);
+        return;
+      case "state_page":
+        await putStatePage(mutation.hash, mutation.ref, mutation.page);
+        return;
+      case "execution_ad":
+        await putExecutionAd(mutation.record);
+        return;
+      case "execution_transfer":
+        await putExecutionTransfer(mutation.record);
+        return;
+    }
+  } catch (err) {
+    failed = err;
+    throw err;
+  } finally {
+    postBrowserActivity({
+      phase: "cache_mutation",
+      path: mutation.kind,
+      what: mutation.kind,
+      scope: mutationScope(mutation),
+      ms: metricElapsed(startedAt),
+      status: failed ? "error" : "ok",
+      count: 1,
+      bytes: mutationApproxBytes(mutation),
+      ...(failed ? { error: "E_BROWSER_CACHE_MUTATION", error_detail: errorMessage(failed) } : {})
+    });
   }
+}
+
+function mutationScope(mutation: V2BrowserCacheMutation): string | undefined {
+  if ("scope" in mutation && typeof mutation.scope === "string") return mutation.scope;
+  if (mutation.kind === "applied_frame") return mutation.frame.position.scope;
+  if (mutation.kind === "transcript") return mutation.transcript.scope;
+  if (mutation.kind === "execution_transfer") return mutation.record.scope;
+  if (mutation.kind === "execution_ad") return mutation.record.scope;
+  return current?.scope;
+}
+
+function mutationApproxBytes(mutation: V2BrowserCacheMutation): number | undefined {
+  if (mutation.kind === "object_page") return jsonBytes(mutation.object);
+  if (mutation.kind === "state_page") return jsonBytes(mutation.page);
+  if (mutation.kind === "projection") return jsonBytes(mutation.projection);
+  if (mutation.kind === "projection_patch") return jsonBytes(mutation.patch);
+  if (mutation.kind === "execution_transfer") return jsonBytes(mutation.record.transfer);
+  return undefined;
 }
 
 async function putProjection(scope: string, head: unknown, projection: unknown): Promise<void> {
@@ -1036,29 +1388,63 @@ async function executionCacheForScope(
   checkpoint?: V2BrowserExecutionCheckpoint;
   committed_transcripts: EffectTranscript[];
 }> {
-  const sourceRecords = records ?? await allExecutionTransfers();
-  const checkpoint = options.skip_checkpoint_build ? undefined : await getExecutionCheckpoint(scope);
-  const scopedRecords = sourceRecords.filter((record) => record.scope === scope);
-  const recordsToInstall = checkpoint
-    ? scopedRecords.filter((record) => record.received_at > checkpoint.transfer_high_watermark)
-    : scopedRecords;
-  const objectHashes = new Set<string>();
-  const pageHashes = new Set<string>();
-  for (const record of recordsToInstall) {
-    const transfer = record.transfer;
-    if (transfer.mode === "object_records") {
-      for (const page of transfer.object_pages) objectHashes.add(page.hash);
-    } else if (transfer.mode === "cell_pages") {
-      for (const page of transfer.page_refs) pageHashes.add(page.hash);
+  const startedAt = metricNow();
+  let scopedRecordCount = 0;
+  let objectHashCount = 0;
+  let pageHashCount = 0;
+  try {
+    const sourceRecords = records ?? await allExecutionTransfers();
+    const checkpoint = options.skip_checkpoint_build ? undefined : await getExecutionCheckpoint(scope);
+    const scopedRecords = sourceRecords.filter((record) => record.scope === scope);
+    scopedRecordCount = scopedRecords.length;
+    const recordsToInstall = checkpoint
+      ? scopedRecords.filter((record) => record.received_at > checkpoint.transfer_high_watermark)
+      : scopedRecords;
+    const objectHashes = new Set<string>();
+    const pageHashes = new Set<string>();
+    for (const record of recordsToInstall) {
+      const transfer = record.transfer;
+      if (transfer.mode === "object_records") {
+        for (const page of transfer.object_pages) objectHashes.add(page.hash);
+      } else if (transfer.mode === "cell_pages") {
+        for (const page of transfer.page_refs) pageHashes.add(page.hash);
+      }
     }
+    objectHashCount = objectHashes.size;
+    pageHashCount = pageHashes.size;
+    const cached_objects = await cachedObjectsByHash(objectHashes);
+    const cached_pages = await cachedStatePagesByHash(pageHashes);
+    const committed_transcripts = await committedTranscriptsForScope(scope, checkpoint?.through_seq ?? -1);
+    postBrowserActivity({
+      phase: "execution_cache_build",
+      path: options.skip_checkpoint_build ? "skip_checkpoint" : "with_checkpoint",
+      scope,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      records: scopedRecords.length,
+      count: cached_objects.length + cached_pages.length + committed_transcripts.length
+    });
+    return {
+      records: scopedRecords,
+      cached_objects,
+      cached_pages,
+      ...(checkpoint ? { checkpoint } : {}),
+      committed_transcripts
+    };
+  } catch (err) {
+    postBrowserActivity({
+      phase: "execution_cache_build",
+      path: options.skip_checkpoint_build ? "skip_checkpoint" : "with_checkpoint",
+      scope,
+      ms: metricElapsed(startedAt),
+      status: "error",
+      records: scopedRecordCount,
+      count: objectHashCount + pageHashCount,
+      error: "E_BROWSER_EXECUTION_CACHE",
+      error_detail: errorMessage(err)
+    });
+    throw err;
   }
-  return {
-    records: scopedRecords,
-    cached_objects: await cachedObjectsByHash(objectHashes),
-    cached_pages: await cachedStatePagesByHash(pageHashes),
-    ...(checkpoint ? { checkpoint } : {}),
-    committed_transcripts: await committedTranscriptsForScope(scope, checkpoint?.through_seq ?? -1)
-  };
 }
 
 async function cachedObjectsByHash(hashes: Iterable<string>): Promise<SerializedObject[]> {
@@ -1085,20 +1471,72 @@ async function cachedStatePageHashes(): Promise<string[]> {
 }
 
 async function cachedOpenExecutableSeedDigest(node: string, scope: string): Promise<string | undefined> {
-  const records = await allExecutionTransfers();
-  const cache = await executionCacheForScope(scope, records);
-  if (!canReconstructExecutionNode(node, scope, cache.records, cache.cached_objects, cache.cached_pages, cache.checkpoint)) {
+  const startedAt = metricNow();
+  let candidateCount = 0;
+  try {
+    const records = await allExecutionTransfers();
+    const cache = await executionCacheForScope(scope, records);
+    if (!canReconstructExecutionNode(node, scope, cache.records, cache.cached_objects, cache.cached_pages, cache.checkpoint)) {
+      postBrowserActivity({
+        phase: "open_seed_digest_probe",
+        path: "cache",
+        scope,
+        node,
+        ms: metricElapsed(startedAt),
+        status: "ok",
+        reason: "cannot_reconstruct",
+        records: cache.records.length
+      });
+      return undefined;
+    }
+    const candidates = cache.records
+      .filter((record) => record.scope === scope && record.transfer.mode === "cell_pages" && record.transfer.purpose === "open_executable_seed")
+      .slice()
+      .sort((a, b) => b.received_at - a.received_at || b.id.localeCompare(a.id));
+    candidateCount = candidates.length;
+    for (const record of candidates) {
+      const digest = shadowStateTransferCacheDigest(record.transfer);
+      if (digest) {
+        postBrowserActivity({
+          phase: "open_seed_digest_probe",
+          path: "cache",
+          scope,
+          node,
+          ms: metricElapsed(startedAt),
+          status: "ok",
+          reason: "hit",
+          records: candidateCount,
+          executable_transfer_cache: "hit"
+        });
+        return digest;
+      }
+    }
+    postBrowserActivity({
+      phase: "open_seed_digest_probe",
+      path: "cache",
+      scope,
+      node,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      reason: "miss",
+      records: candidateCount,
+      executable_transfer_cache: "miss"
+    });
     return undefined;
+  } catch (err) {
+    postBrowserActivity({
+      phase: "open_seed_digest_probe",
+      path: "cache",
+      scope,
+      node,
+      ms: metricElapsed(startedAt),
+      status: "error",
+      records: candidateCount,
+      error: "E_BROWSER_OPEN_SEED_DIGEST",
+      error_detail: errorMessage(err)
+    });
+    throw err;
   }
-  const candidates = cache.records
-    .filter((record) => record.scope === scope && record.transfer.mode === "cell_pages" && record.transfer.purpose === "open_executable_seed")
-    .slice()
-    .sort((a, b) => b.received_at - a.received_at || b.id.localeCompare(a.id));
-  for (const record of candidates) {
-    const digest = shadowStateTransferCacheDigest(record.transfer);
-    if (digest) return digest;
-  }
-  return undefined;
 }
 
 async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {
@@ -1202,11 +1640,38 @@ async function tx<T>(
   op: (store: IDBObjectStore) => IDBRequest<T>
 ): Promise<T> {
   const database = await db();
+  const startedAt = metricNow();
   return await new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (status: "ok" | "error", err?: unknown) => {
+      if (settled) return;
+      settled = true;
+      postBrowserActivity({
+        phase: "idb_tx",
+        path: "indexeddb",
+        method: mode,
+        what: storeName,
+        ms: metricElapsed(startedAt),
+        status,
+        count: 1,
+        ...(err ? { error: "E_BROWSER_IDB_TX", error_detail: errorMessage(err) } : {})
+      });
+    };
     const transaction = database.transaction(storeName, mode);
     const request = op(transaction.objectStore(storeName));
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error(`IndexedDB ${storeName} request failed`));
-    transaction.onerror = () => reject(transaction.error ?? new Error(`IndexedDB ${storeName} transaction failed`));
+    request.onsuccess = () => {
+      finish("ok");
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      const err = request.error ?? new Error(`IndexedDB ${storeName} request failed`);
+      finish("error", err);
+      reject(err);
+    };
+    transaction.onerror = () => {
+      const err = transaction.error ?? new Error(`IndexedDB ${storeName} transaction failed`);
+      finish("error", err);
+      reject(err);
+    };
   });
 }

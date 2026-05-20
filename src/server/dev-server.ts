@@ -75,11 +75,24 @@ const mcpGateway = new McpGateway(world, {
   }
 });
 type AttachedSocket = { sessionId: string; actor: string; socketId: string };
+type BrowserMetricSessionCounter = {
+  windowStart: number;
+  seen: number;
+  lastSeen: number;
+};
 const sockets = new Map<WebSocket, AttachedSocket>();
+const browserMetricSessionCounters = new Map<string, BrowserMetricSessionCounter>();
+let lastBrowserMetricCounterPrune = 0;
 let socketCounter = 1;
 const port = Number(process.env.PORT ?? 5173);
 const hmrPort = Number(process.env.VITE_HMR_PORT ?? port + 10_000);
 const MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024;
+const MAX_BROWSER_METRICS_BATCH = 200;
+const MAX_BROWSER_METRIC_STRING = 160;
+const BROWSER_METRICS_SESSION_BUDGET = 60;
+const BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE = 10;
+const BROWSER_METRICS_COUNTER_TTL_MS = 5 * 60_000;
+const METRIC_SAMPLE_WINDOW_MS = 1000;
 
 function emitDevMetric(event: MetricEvent): void {
   if (process.env.WOO_METRICS === "off") return;
@@ -108,6 +121,24 @@ const server = http.createServer(async (req, res) => {
         token: shadowBrowserSessionBearer(session),
         claims: shadowBrowserSessionClaimsValue(session, "local-dev", [session.actor])
       });
+    }
+    if (req.method === "POST" && url.pathname === "/api/browser-metrics") {
+      const session = requireRestSession(req);
+      const body = await readJson(req);
+      const rawMetrics = Array.isArray(body.metrics) ? body.metrics : [];
+      let accepted = 0;
+      let sampled = Math.max(0, rawMetrics.length - MAX_BROWSER_METRICS_BATCH);
+      for (const raw of rawMetrics.slice(0, MAX_BROWSER_METRICS_BATCH)) {
+        const event = browserActivityMetricFromPayload(raw, session);
+        if (!event) continue;
+        if (!acceptBrowserMetricForSession(session.id)) {
+          sampled += 1;
+          continue;
+        }
+        emitDevMetric(event);
+        accepted += 1;
+      }
+      return json(res, { ok: true, accepted, sampled });
     }
     const protocol = await handleRestProtocolRequest(nodeRestRequest(req, url.pathname ?? ""), {
       world,
@@ -272,7 +303,8 @@ v2wss.on("connection", (ws, req) => {
   void openShadowBrowserScope(browser, {
     preseed_catalog_pages: true,
     ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
-    ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
+    ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {}),
+    metric: emitDevMetric
   }).then((opened) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
@@ -807,6 +839,74 @@ function requireRestSession(req: http.IncomingMessage): Session {
   const match = Array.isArray(header) ? null : /^Session\s+(.+)$/i.exec(header.trim());
   if (!match) throw wooError("E_NOSESSION", "Authorization: Session <id> required");
   return world.auth(`session:${match[1]}`);
+}
+
+function acceptBrowserMetricForSession(sessionId: string): boolean {
+  const now = Date.now();
+  pruneBrowserMetricSessionCounters(now);
+  let counter = browserMetricSessionCounters.get(sessionId);
+  if (!counter || now - counter.windowStart >= METRIC_SAMPLE_WINDOW_MS) {
+    counter = { windowStart: now, seen: 0, lastSeen: now };
+    browserMetricSessionCounters.set(sessionId, counter);
+  }
+  counter.lastSeen = now;
+  counter.seen += 1;
+  if (counter.seen <= BROWSER_METRICS_SESSION_BUDGET) return true;
+  return (counter.seen - BROWSER_METRICS_SESSION_BUDGET) % BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE === 0;
+}
+
+function pruneBrowserMetricSessionCounters(now: number): void {
+  if (now - lastBrowserMetricCounterPrune < METRIC_SAMPLE_WINDOW_MS) return;
+  lastBrowserMetricCounterPrune = now;
+  for (const [sessionId, counter] of browserMetricSessionCounters) {
+    if (now - counter.lastSeen > BROWSER_METRICS_COUNTER_TTL_MS) {
+      browserMetricSessionCounters.delete(sessionId);
+    }
+  }
+}
+
+function browserActivityMetricFromPayload(raw: unknown, session: Session): MetricEvent | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const input = raw as Record<string, unknown>;
+  if (input.kind !== "browser_activity") return null;
+  const phase = boundedBrowserMetricString(input.phase);
+  if (!phase) return null;
+  const source = input.source === "main" ? "main" : "v2_browser_worker";
+  const status = input.status === "error" ? "error" : "ok";
+  return {
+    kind: "browser_activity",
+    source,
+    phase,
+    actor: session.actor,
+    ms: nonNegativeMetricNumber(input.ms) ?? 0,
+    status,
+    ...(boundedBrowserMetricString(input.scope) ? { scope: boundedBrowserMetricString(input.scope)! as ObjRef } : {}),
+    ...(boundedBrowserMetricString(input.node) ? { node: boundedBrowserMetricString(input.node)! } : {}),
+    ...(boundedBrowserMetricString(input.route) ? { route: boundedBrowserMetricString(input.route)! } : {}),
+    ...(boundedBrowserMetricString(input.method) ? { method: boundedBrowserMetricString(input.method)! } : {}),
+    ...(boundedBrowserMetricString(input.path) ? { path: boundedBrowserMetricString(input.path)! } : {}),
+    ...(boundedBrowserMetricString(input.what) ? { what: boundedBrowserMetricString(input.what)! } : {}),
+    ...(boundedBrowserMetricString(input.reason) ? { reason: boundedBrowserMetricString(input.reason)! } : {}),
+    ...(nonNegativeMetricNumber(input.count) !== undefined ? { count: nonNegativeMetricNumber(input.count)! } : {}),
+    ...(nonNegativeMetricNumber(input.bytes) !== undefined ? { bytes: nonNegativeMetricNumber(input.bytes)! } : {}),
+    ...(nonNegativeMetricNumber(input.records) !== undefined ? { records: nonNegativeMetricNumber(input.records)! } : {}),
+    ...(boundedBrowserMetricString(input.transfer_mode) ? { transfer_mode: boundedBrowserMetricString(input.transfer_mode)! } : {}),
+    ...(input.executable_transfer_cache === "hit" || input.executable_transfer_cache === "miss" ? { executable_transfer_cache: input.executable_transfer_cache } : {}),
+    ...(boundedBrowserMetricString(input.error) ? { error: boundedBrowserMetricString(input.error)! } : {}),
+    ...(boundedBrowserMetricString(input.error_detail) ? { error_detail: boundedBrowserMetricString(input.error_detail)! } : {})
+  };
+}
+
+function boundedBrowserMetricString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > MAX_BROWSER_METRIC_STRING ? trimmed.slice(0, MAX_BROWSER_METRIC_STRING) : trimmed;
+}
+
+function nonNegativeMetricNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.max(0, value);
 }
 
 async function readJson(req: http.IncomingMessage): Promise<Record<string, any>> {

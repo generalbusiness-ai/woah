@@ -525,7 +525,7 @@ hosts. This also matches the dashboard's primary pivot — "by component".
 
 #### Slot map (stable; the `/admin/stats` query layer hard-codes positions)
 
-The slot map is fixed-width: every data point fills all 17 blobs and 3
+The slot map is fixed-width: every data point fills all 18 blobs and 3
 doubles. Axes the event doesn't carry land as empty strings (blob) or 0
 (double). New axes get a NEW slot; existing slots are never reordered
 or repurposed.
@@ -535,10 +535,10 @@ or repurposed.
 | `blobs[0]`  | `kind`      | every event |
 | `blobs[1]`  | `scope`     | `v2_*`, `shadow_*`, `mcp_fanout`, `direct_call`, … |
 | `blobs[2]`  | `class`     | `do_constructor`, `do_handler` |
-| `blobs[3]`  | `route`     | `do_handler.route`, `cross_host_rpc.route`, `shadow_*_step.route` |
-| `blobs[4]`  | `method`    | `do_handler.method`, `mcp_request.method` |
-| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase` |
-| `blobs[6]`  | `what`      | `storage_direct_write.what` |
+| `blobs[3]`  | `route`     | `do_handler.route`, `cross_host_rpc.route`, `shadow_*_step.route`, browser turn route |
+| `blobs[4]`  | `method`    | `do_handler.method`, `mcp_request.method`, browser IndexedDB/WebSocket method |
+| `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase`, `v2_open_step.phase`, `browser_activity.phase` |
+| `blobs[6]`  | `what`      | `storage_direct_write.what`, browser cache/IndexedDB store |
 | `blobs[7]`  | `status`    | `"ok" \| "error" \| "timeout"` |
 | `blobs[8]`  | `error`     | error code (`E_*`) |
 | `blobs[9]`  | `target`    | `direct_call.target`, `dispatch_resolved.target`, falls back to `dangling_parent_ref.start` |
@@ -546,9 +546,10 @@ or repurposed.
 | `blobs[11]` | `tool`      | `mcp_request.tool` |
 | `blobs[12]` | `host`      | `cross_host_rpc.host`, `dispatch_resolved.host`, `host_schema_sync.host` |
 | `blobs[13]` | `actor`     | `mcp_tool_refresh_*.actor`, `dispatch_resolved.actor` |
-| `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating` |
-| `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `shadow_transcript_anomaly.reason` |
+| `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating`; browser frame/activity path |
+| `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `shadow_transcript_anomaly.reason`, browser fallback/cache reason |
 | `blobs[16]` | `error_detail` | bounded diagnostic detail for uncoded internal errors |
+| `blobs[17]` | `source`    | `browser_activity.source` (`main` or `v2_browser_worker`) |
 | `doubles[0]` | `ms`         | latency, when present |
 | `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
 | `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects`, `bytes`, or anomaly event count |
@@ -584,6 +585,28 @@ sampling rules above keep the storage-write hot kinds within the free
 `woo_v1_staging`) has its own quota.
 
 Startup storage instrumentation is emitted by the DO/repository wrapper before the `WooWorld` metrics hook exists. It covers repository schema migration, repository load/save, host-seed fetch (`host_seed_fetch`), Directory schema setup, Directory object-route registration (`directory_register_objects`), and Directory session-route registration (`directory_register_session`). Both Directory register phases include a `writes` count distinguishing diff-deduped no-ops (`writes: 0`) from actual row writes; downstream metric consumers can monitor that ratio to confirm dedup is healthy.
+
+Browser activity instrumentation is first-class because v2 open latency spans
+the browser cache, the network, the gateway, and CommitScopeDO. The browser
+worker posts `browser_activity` batches to `/api/browser-metrics`; the gateway
+authenticates the session, overwrites the actor with the session actor, and
+emits them under host key `browser`. Required activity coverage includes
+worker commands, WebSocket connect/readiness/send, frame decode/process, cache
+mutation kind, IndexedDB store/mode transactions, execution-cache rebuilds,
+local turn planning, state repair requests, main-thread projection apply, and
+render. These metrics are diagnostic only and must never add UI back-pressure:
+the client batches posts, bounds the pre-session queue, and the gateway applies
+a per-session one-second sampling window before writing browser metrics. A noisy
+tab is capped to one browser-metric POST per second and drops oldest queued
+diagnostics beyond the local hard cap.
+
+`v2_open_step` splits aggregate `/v2/open` wall time across both authority
+planes. CommitScopeDO phases cover request verification/read, relay lookup,
+session seeding, browser relay construction, shadow open, executable seed
+construction/digest/install, full-save, and response encoding. The gateway
+WebSocket phases cover authority payload construction, CommitScopeDO open RPC,
+and WebSocket frame encoding/sends for hello, display transfer, executable
+transfer, and ads.
 
 Cold-restart skip paths emit dedicated phases when the gateway recognizes that no work is needed:
 

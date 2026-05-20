@@ -278,6 +278,9 @@ describe("v2 CommitScopeDO cost budget", () => {
       const secondMetrics = metrics.slice(metricStart);
       const secondOpenMetric = lastMetric(secondMetrics, "v2_open");
       const secondSeedMetric = lastMetric(secondMetrics, "shadow_open_executable_seed_bytes");
+      const secondOpenStepPhases = Array.from(new Set(secondMetrics
+        .filter((metric) => metric.kind === "v2_open_step")
+        .map((metric) => String(metric.phase ?? ""))));
       expect(second.transfer).toMatchObject({
         mode: "delta",
         to: first.head,
@@ -316,6 +319,14 @@ describe("v2 CommitScopeDO cost budget", () => {
         preseeded_objects: 0,
         full_save: false
       });
+      expect(secondOpenStepPhases).toEqual(expect.arrayContaining([
+        "read_json",
+        "relay_for",
+        "open_shadow_scope",
+        "open_seed_cache_hit_build",
+        "full_save",
+        "response_encode"
+      ]));
       expect(metricNumber(secondOpenMetric, "executable_transfer_bytes")).toBeLessThan(
         metricNumber(firstOpenMetric, "executable_transfer_bytes") / 10
       );

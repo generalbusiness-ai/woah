@@ -37,6 +37,7 @@ const SLOT_ACTOR = 13;
 const SLOT_PATH = 14;
 const SLOT_REASON = 15;
 const SLOT_ERROR_DETAIL = 16;
+const SLOT_SOURCE = 17;
 
 const DBL_MS = 0;
 const DBL_SAMPLE_RATE = 1;
@@ -113,7 +114,7 @@ describe("metrics-sink", () => {
 
       // Empty axes still occupy their slot — fixed-width is what /admin/stats
       // SQL relies on.
-      expect(point.blobs).toHaveLength(17);
+      expect(point.blobs).toHaveLength(18);
       expect(point.blobs?.[SLOT_KIND]).toBe("do_handler");
       expect(point.blobs?.[SLOT_CLASS]).toBe("DirectoryDO");
       expect(point.blobs?.[SLOT_ROUTE]).toBe("/register-session");
@@ -341,6 +342,44 @@ describe("metrics-sink", () => {
       expect(calls[1]!.blobs?.[SLOT_ACTOR]).toBe("$wiz");
       expect(calls[2]!.blobs?.[SLOT_KIND]).toBe("v2_ws_close");
       expect(calls[2]!.blobs?.[SLOT_REASON]).toBe("close:1000");
+    });
+
+    it("packs browser activity and v2 open-step phases", () => {
+      const { binding, calls } = fakeAnalytics();
+      const browser: MetricEvent = {
+        kind: "browser_activity",
+        source: "v2_browser_worker",
+        phase: "idb_tx",
+        path: "indexeddb",
+        method: "readwrite",
+        what: "state_pages",
+        scope: "the_outliner",
+        node: "browser:test",
+        actor: "$wiz",
+        ms: 12,
+        status: "ok",
+        bytes: 4096
+      };
+      const openStep: MetricEvent = {
+        kind: "v2_open_step",
+        phase: "open_seed_full_build",
+        scope: "the_outliner",
+        node: "browser:test",
+        ms: 25,
+        status: "ok",
+        count: 42
+      };
+      writeMetricToAnalytics(browser, "browser", binding);
+      writeMetricToAnalytics(openStep, "the_outliner", binding);
+      expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("browser_activity");
+      expect(calls[0]!.blobs?.[SLOT_PHASE]).toBe("idb_tx");
+      expect(calls[0]!.blobs?.[SLOT_PATH]).toBe("indexeddb");
+      expect(calls[0]!.blobs?.[SLOT_WHAT]).toBe("state_pages");
+      expect(calls[0]!.blobs?.[SLOT_SOURCE]).toBe("v2_browser_worker");
+      expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(4096);
+      expect(calls[1]!.blobs?.[SLOT_KIND]).toBe("v2_open_step");
+      expect(calls[1]!.blobs?.[SLOT_PHASE]).toBe("open_seed_full_build");
+      expect(calls[1]!.doubles?.[DBL_COUNT]).toBe(42);
     });
 
     it("swallows AE write errors so a metric never breaks the worker", () => {

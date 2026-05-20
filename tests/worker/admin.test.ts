@@ -175,6 +175,15 @@ describe("/admin/series", () => {
     expect(sql).toContain("blob17 AS k");
   });
 
+  it("allows grouping by browser metric source", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+
+    const res = await call(baseEnv(), "/admin/series?groupBy=source", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    const sql = String(fetchSpy.mock.calls[0]![1]?.body);
+    expect(sql).toContain("blob18 AS k");
+  });
+
   it("returns 502 when the AE SQL API errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("oops", { status: 500 }));
     const res = await call(baseEnv(), "/admin/series", { headers: authHeaders });

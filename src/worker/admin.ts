@@ -97,7 +97,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 //
 // Query string:
 //   metric=count|sum_ms|p95_ms|sum_count    (default: count)
-//   groupBy=host_key|kind|scope|class|route|method|phase|what|status|error|target|verb|tool|host|actor|path|reason|error_detail
+//   groupBy=host_key|kind|scope|class|route|method|phase|what|status|error|target|verb|tool|host|actor|path|reason|error_detail|source
 //                                            (default: host_key)
 //   from=<unix-seconds-or-iso>              (default: now - 1h)
 //   to=<unix-seconds-or-iso>                (default: now)
@@ -107,7 +107,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 // Returns:
 //   { metric, groupBy, from, to, bucket, series: [ { key, points: [[unix, value], ...] } ] }
 //
-// AE SQL spec: index1 is host_key; blob1..blob16 follow the slot map in
+// AE SQL spec: index1 is host_key; blob1..blob18 follow the slot map in
 // metrics-sink.ts; double1..double3 are ms, sample_rate, count. The
 // `_sample_interval` column is AE's own adaptive-sampling multiplier;
 // `SUM(_sample_interval * doubleN)` reconstructs sums under both AE
@@ -131,7 +131,8 @@ const ALLOWED_GROUP_BY: Record<string, string> = {
   actor: "blob14",
   path: "blob15",
   reason: "blob16",
-  error_detail: "blob17"
+  error_detail: "blob17",
+  source: "blob18"
 };
 
 const BUCKET_SECONDS: Record<string, number> = {

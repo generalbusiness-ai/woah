@@ -63,6 +63,8 @@ describe("v2 browser worker integration", () => {
     socket.open();
     socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-1", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
     socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-1", opened.transfer.kind, opened.transfer)));
+    await waitForMessage(posted, (message) => isBrowserMetricPhase(message, "frame_process"));
+    await waitForMessage(posted, (message) => isBrowserMetricPhase(message, "idb_tx"));
 
     scope.dispatch({
       kind: "call",
@@ -770,6 +772,11 @@ function isLocalTurnCommitted(message: unknown, id: string): boolean {
 
 function isComposeViewFor(message: unknown, id: string): boolean {
   return isKind(message, "shadow_browser_compose_view") && (message as { id?: unknown }).id === id;
+}
+
+function isBrowserMetricPhase(message: unknown, phase: string): boolean {
+  return isKind(message, "browser_metric") &&
+    (message as { metric?: { phase?: unknown } }).metric?.phase === phase;
 }
 
 function isReadyStatus(message: unknown): boolean {

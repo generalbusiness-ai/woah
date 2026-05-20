@@ -128,26 +128,50 @@ export class CommitScopeDO {
         });
       }
       if (request.method === "POST" && url.pathname === "/v2/open") {
-        const startedAt = Date.now();
+        const startedAt = metricNow();
         let scope: ObjRef | undefined;
         let node: string | undefined;
         let fullSave = false;
         try {
+          let phaseStartedAt = metricNow();
           await verifyInternalRequest(this.env, request);
+          this.emitV2OpenStep("verify_internal", phaseStartedAt, { scope, node });
+          phaseStartedAt = metricNow();
           const input = await readJson<CommitScopeOpenRequest>(request);
+          this.emitV2OpenStep("read_json", phaseStartedAt, { scope: input.scope, node: input.node, bytes: requestContentLength(request) });
           scope = input.scope;
           node = input.node;
+          phaseStartedAt = metricNow();
           const relay = await this.relayFor(input);
+          this.emitV2OpenStep("relay_for", phaseStartedAt, { scope, node });
+          phaseStartedAt = metricNow();
           this.ensureSerializedSession(relay, input);
+          this.emitV2OpenStep("ensure_session", phaseStartedAt, { scope, node, count: input.sessions.length });
+          phaseStartedAt = metricNow();
           const browser = this.browserFor(relay, input);
+          this.emitV2OpenStep("browser_for", phaseStartedAt, { scope, node });
+          phaseStartedAt = metricNow();
           const opened = await openShadowBrowserScope(browser, {
             preseed_catalog_pages: true,
             last_known_head: input.last_known_head,
-            executable_seed_digest: input.executable_seed_digest
+            executable_seed_digest: input.executable_seed_digest,
+            metric: (event) => this.emitMetric(event)
           });
+          this.emitV2OpenStep("open_shadow_scope", phaseStartedAt, {
+            scope,
+            node,
+            transfer_mode: opened.transfer.mode,
+            executable_transfer_cache: opened.executable_transfer_cache,
+            bytes: opened.executable_transfer_bytes,
+            count: opened.preseeded_objects
+          });
+          phaseStartedAt = metricNow();
           const hello = shadowBrowserTransportHello(browser);
+          this.emitV2OpenStep("transport_hello", phaseStartedAt, { scope, node });
           // A cold relay seed must be durable before the open is reported.
+          phaseStartedAt = metricNow();
           fullSave = await this.saveFullIfNeeded(relay);
+          this.emitV2OpenStep("full_save", phaseStartedAt, { scope, node, full_save: fullSave, count: fullSave ? 1 : 0 });
           const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
           this.emitMetric({
             kind: "shadow_open_executable_seed_bytes",
@@ -171,7 +195,7 @@ export class CommitScopeDO {
             kind: "v2_open",
             scope,
             node,
-            ms: Date.now() - startedAt,
+            ms: metricElapsed(startedAt),
             status: "ok",
             transfer_mode: opened.transfer.mode,
             executable_transfer_cache: opened.executable_transfer_cache,
@@ -181,7 +205,7 @@ export class CommitScopeDO {
             preseeded_objects: opened.preseeded_objects,
             full_save: fullSave
           });
-          return jsonResponse({
+          const responseBody = {
             ok: true,
             relay: relay.node,
             hello,
@@ -189,9 +213,16 @@ export class CommitScopeDO {
             transfer: opened.transfer,
             executable_transfer: opened.executable_transfer,
             ads: opened.ads
-          } satisfies CommitScopeOpenResponse);
+          } satisfies CommitScopeOpenResponse;
+          phaseStartedAt = metricNow();
+          const encodedResponse = JSON.stringify(responseBody);
+          const response = new Response(encodedResponse, {
+            headers: { "content-type": "application/json; charset=utf-8" }
+          });
+          this.emitV2OpenStep("response_encode", phaseStartedAt, { scope, node, bytes: encodedResponse.length });
+          return response;
         } catch (err) {
-          this.emitMetric({ kind: "v2_open", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, ...metricErrorFields(err) });
+          this.emitMetric({ kind: "v2_open", scope, node, ms: metricElapsed(startedAt), status: "error", full_save: fullSave, ...metricErrorFields(err) });
           throw err;
         }
       }
@@ -565,6 +596,20 @@ export class CommitScopeDO {
     const hostKey = this.durableScopeKey("scope" in event ? event.scope : undefined);
     writeMetricToAnalytics(event, hostKey, this.env.METRICS);
     console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: hostKey }));
+  }
+
+  private emitV2OpenStep(
+    phase: string,
+    startedAt: number,
+    fields: Partial<Extract<MetricEvent, { kind: "v2_open_step" }>>
+  ): void {
+    this.emitMetric({
+      kind: "v2_open_step",
+      phase,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      ...fields
+    });
   }
 
   private durableScopeKey(scope?: ObjRef): string {
@@ -1080,4 +1125,20 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json; charset=utf-8" }
   });
+}
+
+function metricNow(): number {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+  return perf?.now ? perf.now() : Date.now();
+}
+
+function metricElapsed(startedAt: number): number {
+  return Math.max(0, Math.round((metricNow() - startedAt) * 1000) / 1000);
+}
+
+function requestContentLength(request: Request): number | undefined {
+  const raw = request.headers.get("content-length");
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }

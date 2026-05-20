@@ -314,6 +314,7 @@ export type ShadowBrowserOpenScopeOptions = {
   preseed_catalog_pages?: boolean;
   last_known_head?: ShadowCommitAccepted["position"];
   executable_seed_digest?: string;
+  metric?: (event: MetricEvent) => void;
 };
 
 type ShadowProjectionViewer = {
@@ -635,6 +636,7 @@ export async function openShadowBrowserScope(
   browser: ShadowBrowserNode,
   options: ShadowBrowserOpenScopeOptions = {}
 ): Promise<ShadowBrowserOpenScopeResult> {
+  const totalStartedAt = metricNow();
   validateShadowBrowserNodeAuth(browser);
   const serialized = browser.relay.commit_scope.serialized;
   const openSeedCacheKey = shadowBrowserOpenExecutableSeedCacheKey(browser.scope, browser.actor);
@@ -644,47 +646,123 @@ export async function openShadowBrowserScope(
     cachedOpenSeed.generation === browser.relay.serialized_generation &&
     options.executable_seed_digest === cachedOpenSeed.digest
   );
+  const preseedSelectStartedAt = metricNow();
   const preseed = options.preseed_catalog_pages === true && !cachedDigestMatches ? shadowBrowserCatalogObjects(serialized) : [];
+  emitV2OpenStep(options, browser, "preseed_catalog_select", preseedSelectStartedAt, {
+    count: preseed.length,
+    executable_transfer_cache: cachedDigestMatches ? "hit" : "miss"
+  });
   if (preseed.length > 0) {
+    const preseedInstallStartedAt = metricNow();
     installShadowCachedObjectRecords(browser.execution_node, preseed);
     cacheObjectPages(browser.cache, preseed);
+    emitV2OpenStep(options, browser, "preseed_catalog_install", preseedInstallStartedAt, { count: preseed.length });
   }
+  const subscribeStartedAt = metricNow();
   subscribeShadowBrowserNode(browser, browser.scope);
+  emitV2OpenStep(options, browser, "subscribe_scope", subscribeStartedAt, { count: 1 });
   // Scope open enters the state plane even for display-only projection data, so
   // every cache fill goes through the same recipient-bound verification path.
+  const catchupBuildStartedAt = metricNow();
   const transfer = buildShadowBrowserCatchupTransferForBrowser(browser, browser.scope, options.last_known_head);
+  emitV2OpenStep(options, browser, "catchup_transfer_build", catchupBuildStartedAt, {
+    transfer_mode: transfer.mode,
+    count: transfer.mode === "delta" ? transfer.applied.length : 1
+  });
+  const catchupApplyStartedAt = metricNow();
   applyShadowBrowserTransfer(browser, transfer);
+  emitV2OpenStep(options, browser, "catchup_transfer_apply", catchupApplyStartedAt, { transfer_mode: transfer.mode });
   let executableTransfer: ShadowStateTransfer;
   let executableSeedDigest: string | null = cachedOpenSeed?.generation === browser.relay.serialized_generation ? cachedOpenSeed.digest : null;
   if (cachedDigestMatches) {
+    const cacheHitStartedAt = metricNow();
     rememberShadowBrowserOpenExecutableSeedDigest(browser.relay, openSeedCacheKey, cachedOpenSeed!.digest);
     executableTransfer = buildShadowBrowserOpenExecutableSeedCacheHitTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+    emitV2OpenStep(options, browser, "open_seed_cache_hit_build", cacheHitStartedAt, { executable_transfer_cache: "hit" });
   } else {
+    const seedBuildStartedAt = metricNow();
     const fullExecutableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+    emitV2OpenStep(options, browser, "open_seed_full_build", seedBuildStartedAt, {
+      executable_transfer_cache: "miss",
+      count: fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.page_refs.length : 1
+    });
+    const digestStartedAt = metricNow();
     executableSeedDigest = shadowStateTransferCacheDigest(fullExecutableTransfer);
+    emitV2OpenStep(options, browser, "open_seed_digest", digestStartedAt, {
+      executable_transfer_cache: "miss",
+      count: executableSeedDigest ? 1 : 0
+    });
     if (executableSeedDigest) {
       rememberShadowBrowserOpenExecutableSeedDigest(browser.relay, openSeedCacheKey, executableSeedDigest);
     }
     // The execution node and browser cache are separate stores: the former runs
     // local turns, while the latter persists transfer pages through IndexedDB.
+    const installStartedAt = metricNow();
     installShadowStateTransfer(browser.execution_node, fullExecutableTransfer);
     cacheStatePages(browser.cache, fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.inline_pages : []);
+    emitV2OpenStep(options, browser, "open_seed_install", installStartedAt, {
+      executable_transfer_cache: "miss",
+      count: fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.inline_pages.length : 1
+    });
     executableTransfer = fullExecutableTransfer;
   }
+  const executableApplyStartedAt = metricNow();
   applyShadowBrowserTransfer(browser, executableTransfer);
+  emitV2OpenStep(options, browser, "open_seed_transfer_apply", executableApplyStartedAt, {
+    executable_transfer_cache: cachedDigestMatches ? "hit" : "miss"
+  });
+  const bytesStartedAt = metricNow();
+  const executableTransferBytes = shadowStateTransferJsonBytes(executableTransfer);
+  emitV2OpenStep(options, browser, "open_seed_json_bytes", bytesStartedAt, {
+    bytes: executableTransferBytes,
+    executable_transfer_cache: cachedDigestMatches ? "hit" : "miss"
+  });
+  const adsStartedAt = metricNow();
+  const ads = shadowBrowserScopeExecutionAds(browser.relay, browser.scope);
+  emitV2OpenStep(options, browser, "scope_execution_ads", adsStartedAt, { count: ads.length });
+  emitV2OpenStep(options, browser, "total", totalStartedAt, {
+    transfer_mode: transfer.mode,
+    executable_transfer_cache: cachedDigestMatches ? "hit" : "miss",
+    bytes: executableTransferBytes,
+    count: preseed.length
+  });
   return {
     projection: browser.cache.projections.get(browser.scope) ?? (transfer.mode === "projection" ? transfer.projection : null),
     transfer,
     executable_transfer: executableTransfer,
     executable_transfer_cache: cachedDigestMatches ? "hit" : "miss",
     ...(executableSeedDigest ? { executable_transfer_digest: executableSeedDigest } : {}),
-    executable_transfer_bytes: shadowStateTransferJsonBytes(executableTransfer),
+    executable_transfer_bytes: executableTransferBytes,
     executable_transfer_pages: executableTransfer.mode === "cell_pages" ? executableTransfer.page_refs.length : 0,
     executable_transfer_inline_pages: executableTransfer.mode === "cell_pages" ? executableTransfer.inline_pages.length : 0,
-    ads: shadowBrowserScopeExecutionAds(browser.relay, browser.scope),
+    ads,
     preseeded_objects: preseed.length,
     transfer_mode: transfer.mode
   };
+}
+
+function metricNow(): number {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+  return perf?.now ? perf.now() : Date.now();
+}
+
+function emitV2OpenStep(
+  options: ShadowBrowserOpenScopeOptions,
+  browser: ShadowBrowserNode,
+  phase: string,
+  startedAt: number,
+  fields: Partial<Extract<MetricEvent, { kind: "v2_open_step" }>> = {}
+): void {
+  options.metric?.({
+    kind: "v2_open_step",
+    phase,
+    scope: browser.scope,
+    node: browser.node,
+    ...(browser.actor ? { actor: browser.actor } : {}),
+    ms: Math.max(0, Math.round((metricNow() - startedAt) * 1000) / 1000),
+    status: "ok",
+    ...fields
+  });
 }
 
 function shadowStateTransferJsonBytes(transfer: ShadowStateTransfer): number {

@@ -64,7 +64,7 @@ export function analyticsSampleRate(event: MetricEvent): number {
 // hard-codes them. New axes get a NEW slot; the existing slot indices
 // must not be reordered or repurposed. See spec/reference/cloudflare.md
 // §R10.1 for the canonical schema and the per-`kind` field mapping.
-const BLOB_SLOTS = 17;
+const BLOB_SLOTS = 18;
 const DOUBLE_SLOTS = 3;
 
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
@@ -91,6 +91,12 @@ function primaryCount(event: MetricEvent): number {
       return typeof e.hosts === "number" ? e.hosts : 0;
     case "shadow_open_executable_seed_bytes":
       return typeof e.bytes === "number" ? e.bytes : 0;
+    case "v2_open_step":
+    case "browser_activity":
+      return typeof e.bytes === "number" ? e.bytes
+        : typeof e.count === "number" ? e.count
+          : typeof e.records === "number" ? e.records
+            : 0;
     case "shadow_transcript_anomaly":
       return 1;
     case "startup_storage":
@@ -117,8 +123,9 @@ function primaryCount(event: MetricEvent): number {
 //   blobs[2]    = class          DO class (PersistentObjectDO|DirectoryDO|CommitScopeDO)
 //   blobs[3]    = route          do_handler.route, cross_host_rpc.route
 //   blobs[4]    = method         do_handler.method, mcp_request.method
-//   blobs[5]    = phase          shadow_*_step.phase, startup_storage.phase, init.phase
-//   blobs[6]    = what           storage_direct_write.what
+//   blobs[5]    = phase          shadow_*_step.phase, startup_storage.phase, init.phase,
+//                                v2_open_step.phase, browser_activity.phase
+//   blobs[6]    = what           storage_direct_write.what, browser cache/IDB store
 //   blobs[7]    = status         "ok" | "error" | "timeout"
 //   blobs[8]    = error          error code (E_*, or wooError().code)
 //   blobs[9]    = target         direct_call.target, dispatch_resolved.target,
@@ -129,11 +136,14 @@ function primaryCount(event: MetricEvent): number {
 //   blobs[12]   = host           cross_host_rpc.host, dispatch_resolved.host,
 //                                host_schema_sync.host
 //   blobs[13]   = actor          mcp_tool_refresh_*.actor, dispatch_resolved.actor
-//   blobs[14]   = path           dispatch_resolved.path: "local"|"read"|"mutating"
+//   blobs[14]   = path           dispatch_resolved.path: "local"|"read"|"mutating",
+//                                browser frame/activity path
 //   blobs[15]   = reason         mcp_tool_refresh_*.reason, shadow_commit_rejected.reason,
 //                                rest_v2_in_process_fallback.reason,
-//                                shadow_transcript_anomaly.reason
+//                                shadow_transcript_anomaly.reason,
+//                                browser fallback/cache reason
 //   blobs[16]   = error_detail   bounded diagnostic detail for uncoded errors
+//   blobs[17]   = source         browser_activity.source ("main"|"v2_browser_worker")
 //   doubles[0]  = ms             latency (when present)
 //   doubles[1]  = sample_rate    1 (default) or the 1-in-N multiplier
 //   doubles[2]  = count          primary kind-specific count: rows |
@@ -180,6 +190,7 @@ export function writeMetricToAnalytics(
   blobs[14] = stringOrEmpty(e.path);
   blobs[15] = stringOrEmpty(e.reason);
   blobs[16] = stringOrEmpty(e.error_detail);
+  blobs[17] = stringOrEmpty(e.source);
 
   doubles[0] = ms;
   doubles[1] = rate;

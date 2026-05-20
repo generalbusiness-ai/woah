@@ -174,6 +174,12 @@ type V2FanoutDelivery = {
   localHostMaterialized: V2LocalHostMaterialization;
 };
 
+type BrowserMetricSessionCounter = {
+  windowStart: number;
+  seen: number;
+  lastSeen: number;
+};
+
 type V2SocketAttachment = {
   sessionId: string;
   actor: ObjRef;
@@ -193,6 +199,11 @@ const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+const MAX_BROWSER_METRICS_BATCH = 200;
+const MAX_BROWSER_METRIC_STRING = 160;
+const BROWSER_METRICS_SESSION_BUDGET = 60;
+const BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE = 10;
+const BROWSER_METRICS_COUNTER_TTL_MS = 5 * 60_000;
 const METRIC_SAMPLE_BUDGET = 10;
 const METRIC_SAMPLE_WINDOW_MS = 1000;
 // Read-only cross-host RPCs (room-snapshot, remote-get-prop, contents, etc.)
@@ -456,6 +467,10 @@ export class PersistentObjectDO {
         });
       }
 
+      if (worldGatewayHost && request.method === "POST" && pathname === "/api/browser-metrics") {
+        return await this.handleBrowserMetrics(world, request);
+      }
+
       if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/refresh-host-seeds") {
         const session = this.requireRestSession(world, request);
         if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
@@ -470,9 +485,15 @@ export class PersistentObjectDO {
         requireSession: () => this.requireRestSession(world, request),
         verifyTurnstile: (token, protocolRequest) => this.verifyTurnstile(token, protocolRequest),
         onAuthenticated: (session) => this.registerSessionRoute(session),
-        onSessionEnded: (session) => this.unregisterSessionRoute(session.id),
+        onSessionEnded: (session) => {
+          this.browserMetricSessionCounters.delete(session.id);
+          return this.unregisterSessionRoute(session.id);
+        },
         onSessionsEnded: async (sessions) => {
-          for (const session of sessions) await this.unregisterSessionRoute(session.id);
+          for (const session of sessions) {
+            this.browserMetricSessionCounters.delete(session.id);
+            await this.unregisterSessionRoute(session.id);
+          }
         },
         executeTurn: (input) => this.restV2Turn(world, input),
         installTap: async (actor, body) => {
@@ -759,6 +780,25 @@ export class PersistentObjectDO {
       world.recordMetric({ kind: "init", phase: "mcp_gateway", ms: Date.now() - initStart });
     }
     return this.mcpGateway;
+  }
+
+  private async handleBrowserMetrics(world: WooWorld, request: Request): Promise<Response> {
+    const session = this.requireRestSession(world, request);
+    const body = await readJsonBody(request);
+    const rawMetrics = Array.isArray(body.metrics) ? body.metrics : [];
+    let accepted = 0;
+    let sampled = Math.max(0, rawMetrics.length - MAX_BROWSER_METRICS_BATCH);
+    for (const raw of rawMetrics.slice(0, MAX_BROWSER_METRICS_BATCH)) {
+      const event = browserActivityMetricFromPayload(raw, session);
+      if (!event) continue;
+      if (!this.acceptBrowserMetricForSession(session.id)) {
+        sampled += 1;
+        continue;
+      }
+      this.emitMetric(event, "browser");
+      accepted += 1;
+    }
+    return jsonResponse({ ok: true, accepted, sampled });
   }
 
   private async verifyTurnstile(token: string, request: RestProtocolRequest): Promise<boolean> {
@@ -1856,6 +1896,31 @@ export class PersistentObjectDO {
     world.setChainOriginPrefix(localHost);
   }
 
+  private acceptBrowserMetricForSession(sessionId: string): boolean {
+    const now = Date.now();
+    this.pruneBrowserMetricSessionCounters(now);
+    let counter = this.browserMetricSessionCounters.get(sessionId);
+    if (!counter || now - counter.windowStart >= METRIC_SAMPLE_WINDOW_MS) {
+      counter = { windowStart: now, seen: 0, lastSeen: now };
+      this.browserMetricSessionCounters.set(sessionId, counter);
+    }
+    counter.lastSeen = now;
+    counter.seen += 1;
+    if (counter.seen <= BROWSER_METRICS_SESSION_BUDGET) return true;
+    if ((counter.seen - BROWSER_METRICS_SESSION_BUDGET) % BROWSER_METRICS_OVER_BUDGET_SAMPLE_RATE === 0) return true;
+    return false;
+  }
+
+  private pruneBrowserMetricSessionCounters(now: number): void {
+    if (now - this.lastBrowserMetricCounterPrune < METRIC_SAMPLE_WINDOW_MS) return;
+    this.lastBrowserMetricCounterPrune = now;
+    for (const [sessionId, counter] of this.browserMetricSessionCounters) {
+      if (now - counter.lastSeen > BROWSER_METRICS_COUNTER_TTL_MS) {
+        this.browserMetricSessionCounters.delete(sessionId);
+      }
+    }
+  }
+
   // Throttle log emission for high-rate metric kinds so a noisy gateway
   // doesn't blow up the log pipeline. `applied`, `direct_call`, and
   // `compose_look` already have natural 1-per-call bounds; `broadcast` and
@@ -1869,12 +1934,13 @@ export class PersistentObjectDO {
     // (see metrics-sink.ts) and we want a noisy `broadcast` burst to still
     // produce accurate counts in the dashboard.
     writeMetricToAnalytics(event, hostKey, this.env.METRICS);
-    if (event.kind === "broadcast" || event.kind === "cross_host_rpc" || event.kind === "storage_direct_write") {
-      const counter = this.metricSampleCounters[event.kind];
+    const sampleKind = event.kind === "browser_activity" ? "browser_metrics" : event.kind;
+    if (sampleKind === "broadcast" || sampleKind === "cross_host_rpc" || sampleKind === "storage_direct_write" || sampleKind === "browser_metrics") {
+      const counter = this.metricSampleCounters[sampleKind];
       const now = Date.now();
       if (now - counter.windowStart >= METRIC_SAMPLE_WINDOW_MS) {
         if (counter.suppressed > 0) {
-          console.log("woo.metric", JSON.stringify({ kind: `${event.kind}_log_sampled`, suppressed: counter.suppressed, ms_window: METRIC_SAMPLE_WINDOW_MS, ts: now, host_key: hostKey }));
+          console.log("woo.metric", JSON.stringify({ kind: `${sampleKind}_log_sampled`, suppressed: counter.suppressed, ms_window: METRIC_SAMPLE_WINDOW_MS, ts: now, host_key: hostKey }));
         }
         counter.windowStart = now;
         counter.emitted = 0;
@@ -1889,11 +1955,28 @@ export class PersistentObjectDO {
     console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now(), host_key: hostKey }));
   }
 
-  private metricSampleCounters: Record<"broadcast" | "cross_host_rpc" | "storage_direct_write", { windowStart: number; emitted: number; suppressed: number }> = {
+  private emitV2OpenStep(
+    phase: string,
+    startedAt: number,
+    fields: Partial<Extract<MetricEvent, { kind: "v2_open_step" }>>
+  ): void {
+    this.emitMetric({
+      kind: "v2_open_step",
+      phase,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      ...fields
+    }, this.durableHostKey());
+  }
+
+  private metricSampleCounters: Record<"broadcast" | "cross_host_rpc" | "storage_direct_write" | "browser_metrics", { windowStart: number; emitted: number; suppressed: number }> = {
     broadcast: { windowStart: 0, emitted: 0, suppressed: 0 },
     cross_host_rpc: { windowStart: 0, emitted: 0, suppressed: 0 },
-    storage_direct_write: { windowStart: 0, emitted: 0, suppressed: 0 }
+    storage_direct_write: { windowStart: 0, emitted: 0, suppressed: 0 },
+    browser_metrics: { windowStart: 0, emitted: 0, suppressed: 0 }
   };
+  private browserMetricSessionCounters = new Map<string, BrowserMetricSessionCounter>();
+  private lastBrowserMetricCounterPrune = 0;
 
   private serializedCallContext(ctx: CallContext): Record<string, unknown> {
     const session = ctx.session ? ctx.world.sessions.get(ctx.session) : undefined;
@@ -2622,6 +2705,7 @@ export class PersistentObjectDO {
 
   private async acceptV2TurnNetworkWebSocket(request: Request, world: WooWorld): Promise<Response> {
     const startedAt = Date.now();
+    const metricStartedAt = metricNow();
     // Public deployments rely on Cloudflare's TLS termination and route this as
     // wss://; plaintext ws:// is only acceptable for localhost development per
     // VTN19.
@@ -2676,7 +2760,10 @@ export class PersistentObjectDO {
     this.indexAddSocket(session.id, session.actor, server);
     try {
       const seedObjectIds = [commitScope, session.actor];
+      let phaseStartedAt = metricNow();
       const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds);
+      this.emitV2OpenStep("gateway_authority", phaseStartedAt, { scope: commitScope, node, actor: session.actor, count: seedObjectIds.length });
+      phaseStartedAt = metricNow();
       const opened = await this.v2CommitScopeOpen(world, commitScope, {
         scope: commitScope,
         node,
@@ -2687,8 +2774,10 @@ export class PersistentObjectDO {
         ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
         ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
       }, seedObjectIds);
+      this.emitV2OpenStep("gateway_commit_scope_open", phaseStartedAt, { scope: commitScope, node, actor: session.actor });
       const hello = opened.hello;
-      server.send(encodeEnvelope({
+      phaseStartedAt = metricNow();
+      const helloEnvelope = encodeEnvelope({
         v: 2,
         type: hello.kind,
         id: `${this.durableHostKey()}:hello:${Date.now()}`,
@@ -2698,9 +2787,12 @@ export class PersistentObjectDO {
         session: session.id,
         auth: { mode: "session", token },
         body: hello
-      } satisfies ShadowEnvelope<typeof hello>));
+      } satisfies ShadowEnvelope<typeof hello>);
+      server.send(helloEnvelope);
+      this.emitV2OpenStep("gateway_send_hello", phaseStartedAt, { scope: commitScope, node, actor: session.actor, bytes: helloEnvelope.length });
       const transfer = opened.transfer;
-      server.send(encodeEnvelope({
+      phaseStartedAt = metricNow();
+      const transferEnvelope = encodeEnvelope({
         v: 2,
         type: transfer.kind,
         id: `${this.durableHostKey()}:state:${crypto.randomUUID()}`,
@@ -2710,11 +2802,14 @@ export class PersistentObjectDO {
         session: session.id,
         auth: { mode: "session", token },
         body: transfer
-      } satisfies ShadowEnvelope<typeof transfer>));
+      } satisfies ShadowEnvelope<typeof transfer>);
+      server.send(transferEnvelope);
+      this.emitV2OpenStep("gateway_send_display_transfer", phaseStartedAt, { scope: commitScope, node, actor: session.actor, bytes: transferEnvelope.length });
       if ("to" in transfer) this.updateV2SocketStateHead(server, transfer.to);
       const executableTransfer = opened.executable_transfer;
       if (executableTransfer) {
-        server.send(encodeEnvelope({
+        phaseStartedAt = metricNow();
+        const executableEnvelope = encodeEnvelope({
           v: 2,
           type: executableTransfer.kind,
           id: `${this.durableHostKey()}:exec-state:${crypto.randomUUID()}`,
@@ -2724,10 +2819,14 @@ export class PersistentObjectDO {
           session: session.id,
           auth: { mode: "session", token },
           body: executableTransfer
-        } satisfies ShadowEnvelope<typeof executableTransfer>));
+        } satisfies ShadowEnvelope<typeof executableTransfer>);
+        server.send(executableEnvelope);
+        this.emitV2OpenStep("gateway_send_executable_transfer", phaseStartedAt, { scope: commitScope, node, actor: session.actor, bytes: executableEnvelope.length });
       }
+      phaseStartedAt = metricNow();
+      let adBytes = 0;
       for (const ad of opened.ads ?? []) {
-        server.send(encodeEnvelope({
+        const adEnvelope = encodeEnvelope({
           v: 2,
           type: ad.kind,
           id: `${this.durableHostKey()}:exec-ad:${crypto.randomUUID()}`,
@@ -2737,8 +2836,11 @@ export class PersistentObjectDO {
           session: session.id,
           auth: { mode: "anonymous_advisory" },
           body: ad
-        } satisfies ShadowEnvelope<typeof ad>));
+        } satisfies ShadowEnvelope<typeof ad>);
+        adBytes += adEnvelope.length;
+        server.send(adEnvelope);
       }
+      this.emitV2OpenStep("gateway_send_ads", phaseStartedAt, { scope: commitScope, node, actor: session.actor, bytes: adBytes, count: opened.ads?.length ?? 0 });
     } catch (err) {
       world.detachSocket(session.id, socketId);
       this.indexRemoveSocket(session.id, session.actor, server);
@@ -2763,7 +2865,7 @@ export class PersistentObjectDO {
       scope: commitScope,
       node,
       actor: session.actor,
-      ms: Date.now() - startedAt,
+      ms: metricElapsed(metricStartedAt),
       status: "ok"
     }, this.durableHostKey());
 
@@ -3812,6 +3914,60 @@ export class PersistentObjectDO {
 }
 
 // ---- module-scoped helpers ----
+
+function browserActivityMetricFromPayload(raw: unknown, session: Session): MetricEvent | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const input = raw as Record<string, unknown>;
+  if (input.kind !== "browser_activity") return null;
+  const phase = boundedString(input.phase);
+  if (!phase) return null;
+  const source = input.source === "main" ? "main" : "v2_browser_worker";
+  const status = input.status === "error" ? "error" : "ok";
+  const ms = nonNegativeNumber(input.ms) ?? 0;
+  return {
+    kind: "browser_activity",
+    source,
+    phase,
+    actor: session.actor,
+    ms,
+    status,
+    ...(boundedString(input.scope) ? { scope: boundedString(input.scope)! as ObjRef } : {}),
+    ...(boundedString(input.node) ? { node: boundedString(input.node)! } : {}),
+    ...(boundedString(input.route) ? { route: boundedString(input.route)! } : {}),
+    ...(boundedString(input.method) ? { method: boundedString(input.method)! } : {}),
+    ...(boundedString(input.path) ? { path: boundedString(input.path)! } : {}),
+    ...(boundedString(input.what) ? { what: boundedString(input.what)! } : {}),
+    ...(boundedString(input.reason) ? { reason: boundedString(input.reason)! } : {}),
+    ...(nonNegativeNumber(input.count) !== undefined ? { count: nonNegativeNumber(input.count)! } : {}),
+    ...(nonNegativeNumber(input.bytes) !== undefined ? { bytes: nonNegativeNumber(input.bytes)! } : {}),
+    ...(nonNegativeNumber(input.records) !== undefined ? { records: nonNegativeNumber(input.records)! } : {}),
+    ...(boundedString(input.transfer_mode) ? { transfer_mode: boundedString(input.transfer_mode)! } : {}),
+    ...(input.executable_transfer_cache === "hit" || input.executable_transfer_cache === "miss" ? { executable_transfer_cache: input.executable_transfer_cache } : {}),
+    ...(boundedString(input.error) ? { error: boundedString(input.error)! } : {}),
+    ...(boundedString(input.error_detail) ? { error_detail: boundedString(input.error_detail)! } : {})
+  };
+}
+
+function boundedString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > MAX_BROWSER_METRIC_STRING ? trimmed.slice(0, MAX_BROWSER_METRIC_STRING) : trimmed;
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.max(0, value);
+}
+
+function metricNow(): number {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+  return perf?.now ? perf.now() : Date.now();
+}
+
+function metricElapsed(startedAt: number): number {
+  return Math.max(0, Math.round((metricNow() - startedAt) * 1000) / 1000);
+}
 
 function chunkTombstones(records: TombstoneRecord[], chunkSize: number): TombstoneRecord[][] {
   if (records.length === 0) return [[]]; // always send at least one batch with final=true

@@ -35,6 +35,29 @@ type AuthMethod = "guest" | "apikey";
 type ToolTab = "dubspace" | "pinboard" | "tasks" | "outliner";
 type AppTab = "chat" | ToolTab | "tool" | "ide";
 
+type BrowserActivityMetricPayload = {
+  kind: "browser_activity";
+  source: "v2_browser_worker" | "main";
+  phase: string;
+  ms: number;
+  status: "ok" | "error";
+  scope?: string;
+  node?: string;
+  actor?: string;
+  route?: string;
+  method?: string;
+  path?: string;
+  what?: string;
+  reason?: string;
+  count?: number;
+  bytes?: number;
+  records?: number;
+  transfer_mode?: string;
+  executable_transfer_cache?: "hit" | "miss";
+  error?: string;
+  error_detail?: string;
+};
+
 class SessionExpiredError extends Error {
   constructor(message: string) {
     super(message);
@@ -355,6 +378,14 @@ let startupRoute: RouteLocation | null = parseLocationRoute(location.pathname, l
 let routeInitialized = false;
 let v2BrowserWorker: Worker | undefined;
 let v2BrowserWorkerScope = "";
+const browserMetricQueue: BrowserActivityMetricPayload[] = [];
+const browserMetricBatchLimit = 50;
+const browserMetricQueueLimit = browserMetricBatchLimit * 4;
+const browserMetricFlushDelayMs = 1000;
+const browserMetricMinFlushIntervalMs = 1000;
+let browserMetricFlushTimer: number | undefined;
+let browserMetricFlushInFlight = false;
+let browserMetricLastFlushAt = 0;
 let pendingNetworkRequests = 0;
 let networkWaitTimer: number | undefined;
 state.spaceChatHeights = loadSpaceChatHeights();
@@ -370,6 +401,9 @@ window.addEventListener("resize", () => {
 });
 window.addEventListener("popstate", () => {
   void applyLocationRoute("replace");
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushBrowserMetrics({ keepalive: true });
 });
 
 function beginNetworkWait() {
@@ -398,6 +432,64 @@ async function trackedFetch(input: RequestInfo | URL, init?: RequestInit): Promi
   } finally {
     endNetworkWait();
   }
+}
+
+function queueBrowserMetric(metric: unknown): void {
+  if (!isBrowserActivityMetricPayload(metric)) return;
+  browserMetricQueue.push(metric);
+  if (browserMetricQueue.length > browserMetricQueueLimit) {
+    browserMetricQueue.splice(0, browserMetricQueue.length - browserMetricQueueLimit);
+  }
+  if (!state.session) return;
+  if (browserMetricQueue.length >= browserMetricBatchLimit) {
+    scheduleBrowserMetricFlush(0);
+    return;
+  }
+  scheduleBrowserMetricFlush(browserMetricFlushDelayMs);
+}
+
+function scheduleBrowserMetricFlush(delayMs: number): void {
+  if (browserMetricFlushTimer !== undefined) return;
+  const sinceLastFlush = browserMetricLastFlushAt === 0 ? Number.POSITIVE_INFINITY : performance.now() - browserMetricLastFlushAt;
+  const waitMs = Math.max(0, delayMs, browserMetricMinFlushIntervalMs - sinceLastFlush);
+  browserMetricFlushTimer = window.setTimeout(() => {
+    browserMetricFlushTimer = undefined;
+    flushBrowserMetrics();
+  }, waitMs);
+}
+
+function flushBrowserMetrics(options: { keepalive?: boolean } = {}): void {
+  if (browserMetricFlushTimer !== undefined) {
+    window.clearTimeout(browserMetricFlushTimer);
+    browserMetricFlushTimer = undefined;
+  }
+  if (browserMetricFlushInFlight || browserMetricQueue.length === 0 || !state.session) return;
+  const metrics = browserMetricQueue.splice(0, browserMetricBatchLimit);
+  browserMetricFlushInFlight = true;
+  browserMetricLastFlushAt = performance.now();
+  void fetch("/api/browser-metrics", {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ metrics }),
+    keepalive: options.keepalive === true
+  }).catch(() => {
+    // Metrics are diagnostic only. Dropping a failed batch avoids creating
+    // back-pressure on the UI when the network is already unhealthy.
+  }).finally(() => {
+    browserMetricFlushInFlight = false;
+    if (browserMetricQueue.length > 0 && state.session) scheduleBrowserMetricFlush(0);
+  });
+}
+
+function isBrowserActivityMetricPayload(value: unknown): value is BrowserActivityMetricPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metric = value as Partial<BrowserActivityMetricPayload>;
+  return metric.kind === "browser_activity"
+    && (metric.source === "v2_browser_worker" || metric.source === "main")
+    && typeof metric.phase === "string"
+    && typeof metric.ms === "number"
+    && Number.isFinite(metric.ms)
+    && (metric.status === "ok" || metric.status === "error");
 }
 
 function trackV2TurnNetworkWait(id: string) {
@@ -452,12 +544,32 @@ function ensureV2BrowserWorker() {
   v2BrowserWorker = new Worker(new URL("./v2-browser-worker.ts", import.meta.url), { type: "module" });
   if (v2TestHooksEnabled) (window as unknown as { __wooV2BrowserWorker?: Worker }).__wooV2BrowserWorker = v2BrowserWorker;
   v2BrowserWorker.addEventListener("message", (event) => {
+    if (event.data?.kind === "browser_metric") queueBrowserMetric(event.data.metric);
     if (event.data?.kind === "status") console.debug("woo.v2", event.data.status);
     if (event.data?.kind === "projection") {
+      const startedAt = performance.now();
+      let failed: unknown;
       state.v2Projection = event.data as V2ProjectionMessage;
-      applyV2ProjectionMessage(state.v2Projection);
-      window.dispatchEvent(new CustomEvent("woo.v2.projection", { detail: state.v2Projection }));
-      console.debug("woo.v2.projection", state.v2Projection);
+      try {
+        applyV2ProjectionMessage(state.v2Projection);
+        window.dispatchEvent(new CustomEvent("woo.v2.projection", { detail: state.v2Projection }));
+        console.debug("woo.v2.projection", state.v2Projection);
+      } catch (err) {
+        failed = err;
+        throw err;
+      } finally {
+        queueBrowserMetric({
+          kind: "browser_activity",
+          source: "main",
+          phase: "projection_apply",
+          path: state.v2Projection.cached ? "cached" : "live",
+          scope: state.v2Projection.scope,
+          actor: state.actor,
+          ms: Math.max(0, performance.now() - startedAt),
+          status: failed ? "error" : "ok",
+          ...(failed ? { error: "E_BROWSER_PROJECTION_APPLY", error_detail: failed instanceof Error ? failed.message : String(failed) } : {})
+        });
+      }
     }
     if (event.data?.kind === "applied_frame") {
       const message = event.data as V2AppliedFrameMessage;
@@ -2430,55 +2542,78 @@ function pruneLiveControls() {
 }
 
 function render() {
-  if (state.authStatus !== "authenticated") {
-    renderLogin();
-    return;
-  }
-  const focus = captureRenderFocus();
-  const app = document.querySelector<HTMLDivElement>("#app")!;
-  // Tool components may own transient UI state in their custom element
-  // instance. Preserve the active frame root generically so a new tool catalog
-  // does not need another app-shell branch to keep drafts, panels, or hydrate
-  // guards alive across projection rerenders.
-  const activeToolSelector = activeToolElementSelector();
-  const preservedToolElement = activeToolSelector
-    ? app.querySelector<HTMLElement>(activeToolSelector)
-    : null;
-  if (preservedToolElement) preservedToolElement.remove();
-  app.innerHTML = `
-    <div class="shell ${state.observationsCollapsed ? "observations-collapsed" : ""}">
-      <aside class="nav">
-        <div class="brand">${escapeHtml(state.actor ? actorLabel(state.actor) : "connecting...")}</div>
-        <div class="actor">${escapeHtml(state.actor ?? "")}</div>
-        ${navButton("chat", "Chat")}
-        ${TOOL_TAB_DEFINITIONS.map((definition) => navButton(definition.tab, definition.label)).join("")}
-        ${state.tab === "tool" ? "<!-- Generic routed tools are URL-addressable for now; keep their nav item transient until tool discovery is designed. -->" : ""}
-        ${state.tab === "tool" ? navButton("tool", objectName(state.genericToolSubject) || "Tool") : ""}
-        ${navButton("ide", "Inspector")}
-        <a class="github-link" href="https://github.com/hughpyle/woo" target="_blank" rel="noopener noreferrer" aria-label="woo on GitHub" title="woo on GitHub">
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        </a>
-      </aside>
-      <main class="main">
-        ${isToolTab(state.tab) ? renderToolWorkspace(state.tab) : ""}
-        ${state.tab === "tool" ? renderGenericToolWorkspace(state.genericToolSubject) : ""}
-        ${state.tab === "chat" ? renderChat() : ""}
-        ${state.tab === "ide" ? renderIde() : ""}
-      </main>
-      ${renderObservationsPanel()}
-    </div>
-  `;
+  const startedAt = performance.now();
+  const renderPath = state.authStatus === "authenticated" ? state.tab : "login";
+  let failed: unknown;
+  try {
+    if (state.authStatus !== "authenticated") {
+      renderLogin();
+      return;
+    }
+    const focus = captureRenderFocus();
+    const app = document.querySelector<HTMLDivElement>("#app")!;
+    // Tool components may own transient UI state in their custom element
+    // instance. Preserve the active frame root generically so a new tool catalog
+    // does not need another app-shell branch to keep drafts, panels, or hydrate
+    // guards alive across projection rerenders.
+    const activeToolSelector = activeToolElementSelector();
+    const preservedToolElement = activeToolSelector
+      ? app.querySelector<HTMLElement>(activeToolSelector)
+      : null;
+    if (preservedToolElement) preservedToolElement.remove();
+    app.innerHTML = `
+      <div class="shell ${state.observationsCollapsed ? "observations-collapsed" : ""}">
+        <aside class="nav">
+          <div class="brand">${escapeHtml(state.actor ? actorLabel(state.actor) : "connecting...")}</div>
+          <div class="actor">${escapeHtml(state.actor ?? "")}</div>
+          ${navButton("chat", "Chat")}
+          ${TOOL_TAB_DEFINITIONS.map((definition) => navButton(definition.tab, definition.label)).join("")}
+          ${state.tab === "tool" ? "<!-- Generic routed tools are URL-addressable for now; keep their nav item transient until tool discovery is designed. -->" : ""}
+          ${state.tab === "tool" ? navButton("tool", objectName(state.genericToolSubject) || "Tool") : ""}
+          ${navButton("ide", "Inspector")}
+          <a class="github-link" href="https://github.com/hughpyle/woo" target="_blank" rel="noopener noreferrer" aria-label="woo on GitHub" title="woo on GitHub">
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          </a>
+        </aside>
+        <main class="main">
+          ${isToolTab(state.tab) ? renderToolWorkspace(state.tab) : ""}
+          ${state.tab === "tool" ? renderGenericToolWorkspace(state.genericToolSubject) : ""}
+          ${state.tab === "chat" ? renderChat() : ""}
+          ${state.tab === "ide" ? renderIde() : ""}
+        </main>
+        ${renderObservationsPanel()}
+      </div>
+    `;
 
-  if (preservedToolElement && activeToolSelector) {
-    const placeholder = app.querySelector<HTMLElement>(activeToolSelector);
-    if (placeholder) placeholder.replaceWith(preservedToolElement);
+    if (preservedToolElement && activeToolSelector) {
+      const placeholder = app.querySelector<HTMLElement>(activeToolSelector);
+      if (placeholder) placeholder.replaceWith(preservedToolElement);
+    }
+    bindCommon();
+    if (state.tab === "chat") mountChatComponent();
+    if (isToolTab(state.tab)) toolDefinition(state.tab)?.mount();
+    if (state.tab === "tool") mountGenericToolComponent();
+    if (state.tab === "ide") bindIde();
+    if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
+  } catch (err) {
+    failed = err;
+    throw err;
+  } finally {
+    if (state.session) {
+      queueBrowserMetric({
+        kind: "browser_activity",
+        source: "main",
+        phase: "render",
+        path: renderPath,
+        ms: Math.max(0, performance.now() - startedAt),
+        status: failed ? "error" : "ok",
+        scope: desiredV2BrowserScope(),
+        actor: state.actor,
+        count: (state.scopedProjection?.inventory?.length ?? 0) + Object.keys(state.scopedProjection?.overlays ?? {}).length,
+        ...(failed ? { error: "E_BROWSER_RENDER", error_detail: failed instanceof Error ? failed.message : String(failed) } : {})
+      });
+    }
   }
-  bindCommon();
-  if (state.tab === "chat") mountChatComponent();
-  if (isToolTab(state.tab)) toolDefinition(state.tab)?.mount();
-  if (state.tab === "tool") mountGenericToolComponent();
-  if (state.tab === "ide") bindIde();
-  if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
 }
 
 function renderLogin() {
