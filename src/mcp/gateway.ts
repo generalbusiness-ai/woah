@@ -20,6 +20,7 @@ import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
 import {
   createShadowBrowserRelayShim,
+  markShadowBrowserRelaySerializedChanged,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
@@ -277,7 +278,10 @@ export class McpGateway {
   private applyRemoteAccepted(scope: ObjRef, entry: RemoteAcceptedCommit): void {
     this.rememberRemoteAccepted(remoteAcceptedKey(entry.commit));
     const client = this.v2Scopes.get(scope);
-    if (client) applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
+    if (client) {
+      applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
+      markShadowBrowserRelaySerializedChanged(client.relay);
+    }
     this.world.applyCommittedShadowTranscript(entry.transcript);
     this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
     this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript);
@@ -475,7 +479,7 @@ export class McpGateway {
       authorityPayload: async (_submitScope, extraObjectIds) => {
         const payload = await this.v2AuthorityPayload(extraObjectIds);
         const client = this.v2Scopes.get(scope);
-        if (client) mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, payload.authority);
+        if (client) this.mergeV2AuthorityIntoScopeClient(client, payload.authority);
         return payload;
       },
       submitEnvelope: async (submitScope, body) => await hooks.envelope(submitScope, body),
@@ -561,7 +565,7 @@ export class McpGateway {
     }
     const pending = (async () => {
       const authority = seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor]);
-      mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, authority.authority);
+      this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
       const opened = await hooks.open(client.scope, {
         scope: client.scope,
         node: this.v2NodeFor(entry),
@@ -593,6 +597,15 @@ export class McpGateway {
     return { serialized, authority };
   }
 
+  private mergeV2AuthorityIntoScopeClient(client: V2ScopeClient, authority: SerializedAuthoritySlice): void {
+    // The gateway keeps one relay per scope and mutates its serialized snapshot
+    // with fresh session/actor authority. Relay-level cache generation must
+    // move with that snapshot or open executable seed digests can validate
+    // against pre-refresh pages.
+    mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, authority);
+    markShadowBrowserRelaySerializedChanged(client.relay);
+  }
+
   private acceptV2Commit(
     client: V2ScopeClient,
     reply: Extract<ShadowTurnExecReply, { ok: true }>,
@@ -601,6 +614,7 @@ export class McpGateway {
   ): void {
     if (!reply.commit || !reply.transcript) return;
     applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
+    markShadowBrowserRelaySerializedChanged(client.relay);
     this.world.applyCommittedShadowTranscript(reply.transcript, localHostMaterialized
       ? { skipObjectHost: { hostKey: localHostMaterialized.hostKey, gatewayHost: localHostMaterialized.gatewayHost === true } }
       : {});
@@ -621,6 +635,7 @@ export class McpGateway {
     for (const [scope, client] of this.v2Scopes) {
       if (scope === originScope) continue;
       applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
+      markShadowBrowserRelaySerializedChanged(client.relay);
     }
   }
 

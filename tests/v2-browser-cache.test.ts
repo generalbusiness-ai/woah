@@ -106,6 +106,24 @@ describe("v2 browser cache reducer", () => {
     ]);
   });
 
+  it("persists empty current-head deltas as head freshness markers", () => {
+    const head = { kind: "woo.scope_head.shadow.v1", scope: "the_dubspace", epoch: 1, seq: 4, hash: "h4" };
+    const envelope = envelopeFor("woo.state.transfer.shadow.v1", {
+      kind: "woo.state.transfer.shadow.v1",
+      mode: "delta",
+      scope: "the_dubspace",
+      to: head,
+      applied: [],
+      transcript_tail: [],
+      proof: { kind: "test" }
+    });
+
+    expect(v2BrowserCacheMutationsForEnvelope(envelope)).toEqual([
+      { kind: "meta", key: "head:the_dubspace", value: head },
+      { kind: "meta", key: "catchup_required", value: false }
+    ]);
+  });
+
   it("marks reset errors as requiring catch-up and clears pending replies on replies", () => {
     expect(v2BrowserCacheMutationsForEnvelope(envelopeFor("woo.transport.error.v1", {
       kind: "woo.transport.error.v1",

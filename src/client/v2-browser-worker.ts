@@ -3,7 +3,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
-import { applyShadowScopeProjectionPatch, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
+import { applyShadowScopeProjectionPatch, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import type { WooValue } from "../core/types";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
@@ -212,6 +212,7 @@ async function connect(): Promise<void> {
   });
   connectPromise = promise;
   const cachedHead = target.scope ? await getMeta<unknown>(`head:${target.scope}`) : undefined;
+  const executableSeedDigest = target.scope ? await cachedOpenExecutableSeedDigest(target.node, target.scope) : undefined;
   if (generation !== connectGeneration || current !== target) {
     if (connectPromise === promise) connectPromise = null;
     resolveReady();
@@ -223,7 +224,8 @@ async function connect(): Promise<void> {
     token: target.token,
     node: target.node,
     scope: target.scope,
-    last_known_head: lastKnownHead
+    last_known_head: lastKnownHead,
+    executable_seed_digest: executableSeedDigest
   }), "woo-v2.turn-network.json");
   socket = ws;
   {
@@ -1080,6 +1082,23 @@ async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowS
 async function cachedStatePageHashes(): Promise<string[]> {
   const keys = await tx<IDBValidKey[]>(STATE_PAGE_STORE, "readonly", (store) => store.getAllKeys());
   return keys.filter((key): key is string => typeof key === "string");
+}
+
+async function cachedOpenExecutableSeedDigest(node: string, scope: string): Promise<string | undefined> {
+  const records = await allExecutionTransfers();
+  const cache = await executionCacheForScope(scope, records);
+  if (!canReconstructExecutionNode(node, scope, cache.records, cache.cached_objects, cache.cached_pages, cache.checkpoint)) {
+    return undefined;
+  }
+  const candidates = cache.records
+    .filter((record) => record.scope === scope && record.transfer.mode === "cell_pages" && record.transfer.purpose === "open_executable_seed")
+    .slice()
+    .sort((a, b) => b.received_at - a.received_at || b.id.localeCompare(a.id));
+  for (const record of candidates) {
+    const digest = shadowStateTransferCacheDigest(record.transfer);
+    if (digest) return digest;
+  }
+  return undefined;
 }
 
 async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {

@@ -84,9 +84,15 @@ export type ShadowObjectRecordTransfer = {
   proof: ShadowStateProof;
 };
 
+export type ShadowCellPageTransferPurpose =
+  | "open_executable_seed"
+  | "open_executable_seed_cache_hit"
+  | "state_repair";
+
 export type ShadowCellPageTransfer = {
   kind: "woo.state.transfer.shadow.v1";
   mode: "cell_pages";
+  purpose?: ShadowCellPageTransferPurpose;
   scope: ObjRef;
   atom_hashes: string[];
   preimages?: string[];
@@ -399,6 +405,7 @@ export function buildShadowCellPageTransfer(input: {
   missing_atoms?: ShadowMissingAtom[];
   known_page_hashes?: Iterable<string>;
   session?: string | null;
+  purpose?: ShadowCellPageTransferPurpose;
 } & ShadowTransferSigning): ShadowCellPageTransfer {
   const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
   const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage));
@@ -414,13 +421,19 @@ export function buildShadowCellPageTransfer(input: {
   const transfer = {
     kind: "woo.state.transfer.shadow.v1",
     mode: "cell_pages",
+    ...(input.purpose ? { purpose: input.purpose } : {}),
     scope: input.key.scope,
     atom_hashes: granted.map((item) => item.hash),
     preimages: granted.map((item) => item.preimage),
     page_refs: pageRefs,
     inline_pages: inlinePages,
     ...shadowTransferWorldTail(input.serialized, input.key, input.session),
-    source_page_count: input.serialized.objects.reduce((sum, obj) => sum + shadowStatePagesForObject(obj).length, 0)
+    // Empty transfers are signed freshness/readiness markers. Counting every
+    // source page would rebuild page objects without granting executable
+    // material, which defeats the open-time cache-hit fast path.
+    source_page_count: selected.length === 0
+      ? 0
+      : input.serialized.objects.reduce((sum, obj) => sum + shadowStatePagesForObject(obj).length, 0)
   } satisfies Omit<ShadowCellPageTransfer, "proof">;
   return {
     ...transfer,
@@ -884,6 +897,7 @@ function shadowStateTransferRoot(
     : transfer.mode === "cell_pages"
       ? {
           ...base,
+          ...(transfer.purpose ? { purpose: transfer.purpose } : {}),
           page_refs: transfer.page_refs,
           inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
           sessions: transfer.sessions,
@@ -1062,6 +1076,7 @@ function objectClosureForPreimages(serialized: SerializedWorld, preimages: strin
 }
 
 function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[]): ShadowStatePage[] {
+  if (preimages.length === 0) return [];
   const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
   const catalogObjects = serialized.objects
     .filter((obj) => obj.id.startsWith("$"))

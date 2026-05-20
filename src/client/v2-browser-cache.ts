@@ -96,9 +96,8 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
     : transfer.projection
       ? { kind: "projection", scope: transfer.scope, head: transfer.to, projection: transfer.projection, ...(transfer.mode === "projection" ? { reset_execution_overlay: true } : {}) }
       : null;
-  if (!projectionMutation) return [];
   const common: V2BrowserCacheMutation[] = [
-    projectionMutation,
+    ...(projectionMutation ? [projectionMutation] : []),
     { kind: "meta", key: `head:${transfer.scope}`, value: transfer.to },
     { kind: "meta", key: "catchup_required", value: false }
   ];

@@ -5,7 +5,12 @@ import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
 import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
+import {
+  createShadowBrowserNode,
+  createShadowBrowserRelayShim,
+  openShadowBrowserScope,
+  shadowStateTransferCacheDigest
+} from "../src/core/shadow-browser-node";
 import { applyShadowTranscriptToCommittedState } from "../src/core/shadow-commit-scope";
 import type { MetricEvent, Observation, ObjRef, RemoteToolDescriptor, RemoteToolRequest, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
@@ -1236,7 +1241,7 @@ describe("McpHost", () => {
     expect(world.getProp("the_chatroom", "next_seq")).toBe(7);
   });
 
-  it("propagates accepted-frame writes to other cached scope snapshots", () => {
+  it("propagates accepted-frame writes to other cached scope snapshots", async () => {
     // Production bug: after `chatroom → southeast → deck`, then `deck → west →
     // chatroom`, the next actor verb routed to the chatroom scope reads stale
     // `actor.location=the_deck`. The gateway caches per-scope serialized
@@ -1273,6 +1278,21 @@ describe("McpHost", () => {
       objects.find((object) => object.id === id);
     expect(findActor(v2Scopes.get("scope_room_a")!.relay.commit_scope.serialized.objects, session.actor)?.location).toBe("scope_room_a");
     expect(findActor(v2Scopes.get("scope_room_b")!.relay.commit_scope.serialized.objects, session.actor)?.location).toBe("scope_room_a");
+    const roomARelay = v2Scopes.get("scope_room_a")!.relay;
+    const roomBRelay = v2Scopes.get("scope_room_b")!.relay;
+    const roomBBrowser = createShadowBrowserNode({
+      node: "mcp-cross-scope-room-b-browser",
+      scope: "scope_room_b",
+      actor: session.actor,
+      session: session.id,
+      relay: roomBRelay
+    });
+    const roomBOpen = await openShadowBrowserScope(roomBBrowser);
+    const staleRoomBDigest = shadowStateTransferCacheDigest(roomBOpen.executable_transfer);
+    expect(staleRoomBDigest).toBeTruthy();
+    expect(roomBRelay.open_executable_seed_cache.size).toBe(1);
+    const roomAGenerationBefore = roomARelay.serialized_generation;
+    const roomBGenerationBefore = roomBRelay.serialized_generation;
 
     // Simulate a commit in room A that moves the actor to room B. Production
     // would reach this through invokeV2 → CommitScopeDO → acceptV2Commit; the
@@ -1328,18 +1348,27 @@ describe("McpHost", () => {
 
     // The originating scope (room A) advanced head + applied writes — actor is
     // gone from its snapshot's room A contents and now at room B.
-    const roomASnapshot = v2Scopes.get("scope_room_a")!.relay.commit_scope.serialized;
+    const roomASnapshot = roomARelay.commit_scope.serialized;
     expect(findActor(roomASnapshot.objects, session.actor)?.location).toBe("scope_room_b");
-    expect(v2Scopes.get("scope_room_a")!.relay.commit_scope.head.seq).toBe(1);
+    expect(roomARelay.commit_scope.head.seq).toBe(1);
+    expect(roomARelay.serialized_generation).toBe(roomAGenerationBefore + 1);
 
     // The OTHER cached scope (room B) also reflects the actor's new location
     // — without this propagation, the next call dispatched to scope B would
     // read actor.location=room A and reject the verb as "not present here".
-    const roomBSnapshot = v2Scopes.get("scope_room_b")!.relay.commit_scope.serialized;
+    const roomBSnapshot = roomBRelay.commit_scope.serialized;
     expect(findActor(roomBSnapshot.objects, session.actor)?.location).toBe("scope_room_b");
     // Room B's head is NOT advanced by another scope's commit — only writes
     // mirror across.
-    expect(v2Scopes.get("scope_room_b")!.relay.commit_scope.head.seq).toBe(0);
+    expect(roomBRelay.commit_scope.head.seq).toBe(0);
+    expect(roomBRelay.serialized_generation).toBe(roomBGenerationBefore + 1);
+    expect(roomBRelay.open_executable_seed_cache.size).toBe(0);
+    const roomBReopen = await openShadowBrowserScope(roomBBrowser, {
+      executable_seed_digest: staleRoomBDigest ?? undefined
+    });
+    expect(roomBReopen.executable_transfer_cache).toBe("miss");
+    expect(roomBReopen.executable_transfer_inline_pages).toBeGreaterThan(0);
+    expect(roomBReopen.executable_transfer_digest).not.toBe(staleRoomBDigest);
 
     // The gateway's main world also reflects the actor's new location.
     expect(world.object(session.actor).location).toBe("scope_room_b");

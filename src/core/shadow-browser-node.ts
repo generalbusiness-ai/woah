@@ -39,6 +39,7 @@ export const MAX_SHADOW_IDEMPOTENCY_ENTRIES = 10_000;
 export const MAX_SHADOW_RECENT_REPLIES_ENTRIES = 10_000;
 export const MAX_SHADOW_ACCEPTED_TAIL = 1_000;
 export const MAX_SHADOW_TRANSCRIPT_TAIL = 1_000;
+export const MAX_SHADOW_OPEN_EXECUTABLE_SEED_CACHE = 128;
 const MAX_SHADOW_LIVE_EVENTS = 500;
 const MAX_SHADOW_BROWSER_TRANSFERS = 200;
 const MAX_SHADOW_BROWSER_CACHE_TAIL = 1_000;
@@ -214,6 +215,7 @@ export type ShadowBrowserRelayShim = {
   session_auth: Map<string, ShadowBrowserSessionClaims>;
   session_revs: Map<string, number>;
   serialized_generation: number;
+  open_executable_seed_cache: Map<string, { generation: number; digest: string }>;
   idempotency_window_ms: number;
   recently_seen: Map<string, number>;
   recent_replies: Map<string, ShadowEnvelope>;
@@ -291,6 +293,8 @@ export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
   executable_transfer: ShadowStateTransfer;
+  executable_transfer_cache: "hit" | "miss";
+  executable_transfer_digest?: string;
   executable_transfer_bytes: number;
   executable_transfer_pages: number;
   executable_transfer_inline_pages: number;
@@ -302,6 +306,7 @@ export type ShadowBrowserOpenScopeResult = {
 export type ShadowBrowserOpenScopeOptions = {
   preseed_catalog_pages?: boolean;
   last_known_head?: ShadowCommitAccepted["position"];
+  executable_seed_digest?: string;
 };
 
 type ShadowProjectionViewer = {
@@ -452,6 +457,7 @@ export function createShadowBrowserRelayShim(input: {
     session_auth: auth.session_auth,
     session_revs: auth.session_revs,
     serialized_generation: 0,
+    open_executable_seed_cache: new Map(),
     idempotency_window_ms: Math.max(input.idempotency_window_ms ?? MIN_SHADOW_IDEMPOTENCY_WINDOW_MS, MIN_SHADOW_IDEMPOTENCY_WINDOW_MS),
     recently_seen: new Map(),
     recent_replies: new Map(),
@@ -520,7 +526,17 @@ export function mergeShadowBrowserAuthoritySessionState(current: readonly Serial
 export function markShadowBrowserRelaySerializedChanged(relay: ShadowBrowserRelayShim): void {
   markShadowCommitScopeSerializedChanged(relay.commit_scope);
   relay.serialized_generation++;
+  relay.open_executable_seed_cache.clear();
   SHADOW_SERIALIZED_INDEX_CACHE.delete(relay.commit_scope.serialized);
+}
+
+function noteShadowBrowserRelayCommitAccepted(relay: ShadowBrowserRelayShim): void {
+  // Accepted commits replace commit_scope.serialized through the indexed commit
+  // scope, so the state index is already current. The browser-facing generation
+  // still must advance so open-time executable seed digests cannot validate
+  // against pre-commit pages.
+  relay.serialized_generation++;
+  relay.open_executable_seed_cache.clear();
 }
 
 export function createShadowBrowserNode(input: {
@@ -614,7 +630,14 @@ export async function openShadowBrowserScope(
 ): Promise<ShadowBrowserOpenScopeResult> {
   validateShadowBrowserNodeAuth(browser);
   const serialized = browser.relay.commit_scope.serialized;
-  const preseed = options.preseed_catalog_pages === true ? shadowBrowserCatalogObjects(serialized) : [];
+  const openSeedCacheKey = shadowBrowserOpenExecutableSeedCacheKey(browser.scope, browser.actor);
+  const cachedOpenSeed = browser.relay.open_executable_seed_cache.get(openSeedCacheKey);
+  const cachedDigestMatches = Boolean(
+    cachedOpenSeed &&
+    cachedOpenSeed.generation === browser.relay.serialized_generation &&
+    options.executable_seed_digest === cachedOpenSeed.digest
+  );
+  const preseed = options.preseed_catalog_pages === true && !cachedDigestMatches ? shadowBrowserCatalogObjects(serialized) : [];
   if (preseed.length > 0) {
     installShadowCachedObjectRecords(browser.execution_node, preseed);
     cacheObjectPages(browser.cache, preseed);
@@ -624,15 +647,30 @@ export async function openShadowBrowserScope(
   // every cache fill goes through the same recipient-bound verification path.
   const transfer = buildShadowBrowserCatchupTransfer(browser.relay, browser.scope, browser.node, options.last_known_head, shadowProjectionViewer(browser));
   applyShadowBrowserTransfer(browser, transfer);
-  const executableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor);
-  // The execution node and browser cache are separate stores: the former runs
-  // local turns, while the latter persists transfer pages through IndexedDB.
-  installShadowStateTransfer(browser.execution_node, executableTransfer);
+  let executableTransfer: ShadowStateTransfer;
+  let executableSeedDigest: string | null = cachedOpenSeed?.generation === browser.relay.serialized_generation ? cachedOpenSeed.digest : null;
+  if (cachedDigestMatches) {
+    rememberShadowBrowserOpenExecutableSeedDigest(browser.relay, openSeedCacheKey, cachedOpenSeed!.digest);
+    executableTransfer = buildShadowBrowserOpenExecutableSeedCacheHitTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+  } else {
+    const fullExecutableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+    executableSeedDigest = shadowStateTransferCacheDigest(fullExecutableTransfer);
+    if (executableSeedDigest) {
+      rememberShadowBrowserOpenExecutableSeedDigest(browser.relay, openSeedCacheKey, executableSeedDigest);
+    }
+    // The execution node and browser cache are separate stores: the former runs
+    // local turns, while the latter persists transfer pages through IndexedDB.
+    installShadowStateTransfer(browser.execution_node, fullExecutableTransfer);
+    cacheStatePages(browser.cache, fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.inline_pages : []);
+    executableTransfer = fullExecutableTransfer;
+  }
   applyShadowBrowserTransfer(browser, executableTransfer);
   return {
     projection: browser.cache.projections.get(browser.scope) ?? (transfer.mode === "projection" ? transfer.projection : null),
     transfer,
     executable_transfer: executableTransfer,
+    executable_transfer_cache: cachedDigestMatches ? "hit" : "miss",
+    ...(executableSeedDigest ? { executable_transfer_digest: executableSeedDigest } : {}),
     executable_transfer_bytes: shadowStateTransferJsonBytes(executableTransfer),
     executable_transfer_pages: executableTransfer.mode === "cell_pages" ? executableTransfer.page_refs.length : 0,
     executable_transfer_inline_pages: executableTransfer.mode === "cell_pages" ? executableTransfer.inline_pages.length : 0,
@@ -644,6 +682,74 @@ export async function openShadowBrowserScope(
 
 function shadowStateTransferJsonBytes(transfer: ShadowStateTransfer): number {
   return new TextEncoder().encode(JSON.stringify(transfer)).length;
+}
+
+function shadowBrowserOpenExecutableSeedCacheKey(scope: ObjRef, actor?: ObjRef): string {
+  return `${scope}\u0000${actor ?? ""}`;
+}
+
+function rememberShadowBrowserOpenExecutableSeedDigest(relay: ShadowBrowserRelayShim, key: string, digest: string): void {
+  // Map insertion order is the LRU list. The digest is only a cache validator,
+  // so evicting an old actor entry changes performance but never correctness.
+  relay.open_executable_seed_cache.delete(key);
+  relay.open_executable_seed_cache.set(key, {
+    generation: relay.serialized_generation,
+    digest
+  });
+  while (relay.open_executable_seed_cache.size > MAX_SHADOW_OPEN_EXECUTABLE_SEED_CACHE) {
+    const oldest = relay.open_executable_seed_cache.keys().next().value;
+    if (typeof oldest !== "string") break;
+    relay.open_executable_seed_cache.delete(oldest);
+  }
+}
+
+export function shadowStateTransferCacheDigest(transfer: ShadowStateTransfer): string | null {
+  if (transfer.mode === "closure") {
+    return hashSource(stableShadowJson({
+      kind: "woo.state_transfer_cache_digest.shadow.v1",
+      mode: transfer.mode,
+      scope: transfer.scope,
+      atom_hashes: transfer.atom_hashes,
+      preimages: transfer.preimages ?? [],
+      serialized_hash: hashSource(stableShadowJson(transfer.serialized as unknown as WooValue))
+    } as unknown as WooValue));
+  }
+  if (transfer.mode === "object_records") {
+    if (transfer.object_pages.length === 0) return null;
+    return hashSource(stableShadowJson({
+      kind: "woo.state_transfer_cache_digest.shadow.v1",
+      mode: transfer.mode,
+      scope: transfer.scope,
+      atom_hashes: transfer.atom_hashes,
+      preimages: transfer.preimages ?? [],
+      object_pages: transfer.object_pages.map(({ id, hash, bytes }) => ({ id, hash, bytes })),
+      sessions: transfer.sessions,
+      logs: transfer.logs,
+      snapshots: transfer.snapshots,
+      parkedTasks: transfer.parkedTasks,
+      tombstones: transfer.tombstones,
+      counters: transfer.counters,
+      source_object_count: transfer.source_object_count
+    } as unknown as WooValue));
+  }
+  if (transfer.page_refs.length === 0) return null;
+  return hashSource(stableShadowJson({
+    kind: "woo.state_transfer_cache_digest.shadow.v1",
+    mode: transfer.mode,
+    purpose: transfer.purpose ?? null,
+    scope: transfer.scope,
+    atom_hashes: transfer.atom_hashes,
+    preimages: transfer.preimages ?? [],
+    page_refs: transfer.page_refs.map(({ object, page, name, hash, bytes }) => ({ object, page, ...(name ? { name } : {}), hash, bytes })),
+    sessions: transfer.sessions,
+    logs: transfer.logs,
+    snapshots: transfer.snapshots,
+    parkedTasks: transfer.parkedTasks,
+    tombstones: transfer.tombstones,
+    counters: transfer.counters,
+    source_object_count: transfer.source_object_count,
+    source_page_count: transfer.source_page_count
+  } as unknown as WooValue));
 }
 
 export function buildShadowBrowserOpenExecutableSeedTransfer(
@@ -676,6 +782,36 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
   return buildShadowCellPageTransfer({
     serialized: shadowBrowserOpenExecutableSeedSerialized(relay.commit_scope.serialized, scope, actor),
     key,
+    purpose: "open_executable_seed",
+    recipient
+  });
+}
+
+function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  recipient: string,
+  actor?: ObjRef
+): ShadowStateTransfer {
+  const key: ShadowTurnKey = {
+    kind: "woo.turn_key.shadow.v1",
+    scope,
+    actor: actor ?? "",
+    target: scope,
+    verb: "__open_executable_seed_cache_hit__",
+    preimages: [],
+    atom_hashes: [],
+    read_preimages: [],
+    read_atom_hashes: [],
+    write_preimages: [],
+    write_atom_hashes: [],
+    accept_preimages: [],
+    accept_atom_hashes: []
+  };
+  return buildShadowCellPageTransfer({
+    serialized: relay.commit_scope.serialized,
+    key,
+    purpose: "open_executable_seed_cache_hit",
     recipient
   });
 }
@@ -833,20 +969,20 @@ function shadowBrowserOpenExecutableSeedSerialized(
     objectCounter: serialized.objectCounter,
     parkedTaskCounter: serialized.parkedTaskCounter,
     sessionCounter: serialized.sessionCounter,
+    // This is a read-only projection into the commit-scope snapshot. The cell
+    // page transfer builder clones the page/tail payloads it returns, so cloning
+    // every kept row here only duplicates work on the cold /v2/open path.
     objects: serialized.objects
       .filter((obj) => keep.has(obj.id))
-      .map((obj) => structuredClone(obj) as SerializedObject)
       .sort((a, b) => a.id.localeCompare(b.id)),
     sessions: serialized.sessions
       .filter((session) => session.actor === actor)
-      .map((session) => structuredClone(session) as SerializedSession)
       .sort((a, b) => a.id.localeCompare(b.id)),
     logs: serialized.logs
       .filter(([space]) => space === scope)
-      .map(([space, entries]) => [space, structuredClone(entries) as SerializedWorld["logs"][number][1]] as SerializedWorld["logs"][number]),
+      .sort(([a], [b]) => a.localeCompare(b)),
     snapshots: serialized.snapshots
-      .filter((snapshot) => snapshot.space_id === scope)
-      .map((snapshot) => structuredClone(snapshot)),
+      .filter((snapshot) => snapshot.space_id === scope),
     parkedTasks: [],
     tombstones: [...(serialized.tombstones ?? [])].sort()
   };
@@ -1103,7 +1239,10 @@ export async function executeShadowBrowserTurn(
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
   if (network.result.ok) {
     browser.cache.pending_turns.delete(id);
-    if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
+    if (network.result.commit) {
+      noteShadowBrowserRelayCommitAccepted(browser.relay);
+      publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
+    }
     else {
       browser.cache.transcript_tail.push(network.result.transcript);
       trimArrayHead(browser.cache.transcript_tail, MAX_SHADOW_BROWSER_CACHE_TAIL);
@@ -1203,6 +1342,25 @@ export function buildShadowBrowserDeltaTransferFromFrames(
   return { ...selectedTransfer, proof: signShadowBrowserStateTransfer(selectedTransfer, relay.state_signing, recipient) };
 }
 
+export function buildShadowBrowserCurrentTransfer(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  recipient: string
+): ShadowDeltaTransfer {
+  // Equal-head reconnects already hold the display projection in IndexedDB. A
+  // signed empty delta acknowledges freshness without rebuilding and resending
+  // a full projection body through the server-side browser shim.
+  const transfer = {
+    kind: "woo.state.transfer.shadow.v1",
+    mode: "delta",
+    scope,
+    to: structuredClone(relay.commit_scope.head) as ShadowCommitAccepted["position"],
+    applied: [],
+    transcript_tail: []
+  } satisfies Omit<ShadowDeltaTransfer, "proof">;
+  return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
+}
+
 export function buildShadowBrowserCatchupTransfer(
   relay: ShadowBrowserRelayShim,
   scope: ObjRef,
@@ -1210,6 +1368,15 @@ export function buildShadowBrowserCatchupTransfer(
   lastKnownHead?: ShadowCommitAccepted["position"],
   viewer?: ShadowProjectionViewer
 ): ShadowProjectionTransfer | ShadowDeltaTransfer {
+  if (
+    lastKnownHead &&
+    lastKnownHead.scope === scope &&
+    lastKnownHead.epoch === relay.commit_scope.head.epoch &&
+    lastKnownHead.seq === relay.commit_scope.head.seq &&
+    lastKnownHead.hash === relay.commit_scope.head.hash
+  ) {
+    return buildShadowBrowserCurrentTransfer(relay, scope, recipient);
+  }
   if (lastKnownHead && lastKnownHead.scope === scope && lastKnownHead.epoch === relay.commit_scope.head.epoch && lastKnownHead.seq < relay.commit_scope.head.seq) {
     const accepted = relay.accepted_frames
       .filter((frame) => frame.position.scope === scope && frame.position.seq > lastKnownHead.seq && frame.position.seq <= relay.commit_scope.head.seq)
@@ -1614,6 +1781,7 @@ async function executeShadowBrowserTurnExecRequest(
         network.result.reply.ads = [buildShadowTurnExecAdFromNode({ node: selectedExecutor, accepts: request.key, factor: 0.1 })];
       }
     }
+    if (network.result.commit) noteShadowBrowserRelayCommitAccepted(browser.relay);
     executor.committed_head_hash = browser.relay.commit_scope.head.hash;
     executor.serialized_generation = browser.relay.serialized_generation;
     if (network.result.commit) publishShadowBrowserAcceptedFrame(browser.relay, network.result.commit, network.result.transcript);
@@ -1645,6 +1813,7 @@ async function executeShadowBrowserAuthoritativeIntent(
   });
   if (result.ok) {
     const key = shadowTurnKeyFromTranscript(result.transcript);
+    if (result.commit) noteShadowBrowserRelayCommitAccepted(browser.relay);
     executor.committed_head_hash = browser.relay.commit_scope.head.hash;
     executor.serialized_generation = browser.relay.serialized_generation;
     if (result.reply) {
@@ -1740,7 +1909,9 @@ export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer:
       reconcileProjectionFallbackCache(browser, transfer);
       return;
     case "delta":
-      browser.cache.projections.set(transfer.scope, shadowProjectionForDeltaTransfer(browser.cache.projections.get(transfer.scope), transfer));
+      if (transfer.projection || transfer.projection_patch) {
+        browser.cache.projections.set(transfer.scope, shadowProjectionForDeltaTransfer(browser.cache.projections.get(transfer.scope), transfer));
+      }
       for (const transcript of transfer.transcript_tail) {
         if (!browser.cache.transcript_tail.some((item) => item.hash === transcript.hash)) {
           browser.cache.transcript_tail.push(structuredClone(transcript) as EffectTranscript);
@@ -1902,6 +2073,9 @@ function applyShadowProjectionListPatch(base: ScopedObjectSummary[], patch: Shad
 function shadowProjectionForDeltaTransfer(baseProjection: WooValue | undefined, transfer: ShadowDeltaTransfer): ShadowScopeProjection {
   if (transfer.projection) return structuredClone(transfer.projection) as ShadowScopeProjection;
   if (transfer.projection_patch) return applyShadowScopeProjectionPatch(baseProjection, transfer.projection_patch);
+  if (transfer.applied.length === 0 && transfer.transcript_tail.length === 0 && isShadowScopeProjection(baseProjection)) {
+    return structuredClone(baseProjection) as ShadowScopeProjection;
+  }
   throw new Error("shadow browser delta missing projection material");
 }
 
@@ -2341,7 +2515,12 @@ function verifyShadowBrowserStateTransfer(browser: ShadowBrowserNode, transfer: 
   if (transfer.mode !== "projection" && transfer.mode !== "delta") return;
   // Verification is intentionally before cache install: transcript bodies must
   // match their hashes, then the relay MAC must match a trusted authority.
-  if (transfer.mode === "delta" && Boolean(transfer.projection) === Boolean(transfer.projection_patch)) {
+  const noOpDelta = transfer.mode === "delta" &&
+    !transfer.projection &&
+    !transfer.projection_patch &&
+    transfer.applied.length === 0 &&
+    transfer.transcript_tail.length === 0;
+  if (transfer.mode === "delta" && !noOpDelta && Boolean(transfer.projection) === Boolean(transfer.projection_patch)) {
     throw new Error("shadow browser delta must carry exactly one projection material");
   }
   verifyShadowBrowserTranscriptHashes(transfer);

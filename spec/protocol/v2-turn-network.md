@@ -1017,16 +1017,20 @@ projection transfer for that scope, built and signed by the commit-scope/state
 authority. Recipients attached to other affected scopes receive live
 observations only; a state transfer for those scopes MUST be served by that
 scope's own state authority, never by the origin commit scope, because the
-transfer head and projection scope have to name the same scope. A delta transfer
-carries the accepted frame, a transcript tail, and exactly one display-state
-update: either a full refreshed projection or a projection patch against the
-receiver's previous projection head. Relays SHOULD send a projection patch for
-hot subscribed fan-out when they know the receiver's cached base projection, and
-MUST fall back to a full projection when the base is unknown, the patch would be
-larger than replacement, or the receiver reports a missing/mismatched base. The
-first patch shape updates scalar projection fields plus ordered object-summary
-lists. Patch base comparison MUST match scope, epoch, and sequence; when both
-sides have a non-empty head hash, it MUST match too.
+transfer head and projection scope have to name the same scope. A non-empty
+delta transfer carries the accepted frame, a transcript tail, and exactly one
+display-state update: either a full refreshed projection or a projection patch
+against the receiver's previous projection head. Relays SHOULD send a
+projection patch for hot subscribed fan-out when they know the receiver's cached
+base projection, and MUST fall back to a full projection when the base is
+unknown, the patch would be larger than replacement, or the receiver reports a
+missing/mismatched base. A relay MAY send an empty signed delta with no
+projection, no projection patch, no applied frames, and no transcript tail only
+when the receiver's `last_known_head` exactly matches the current scope head;
+this is a freshness marker for an already-cached projection, not replacement
+display state. The first patch shape updates scalar projection fields plus
+ordered object-summary lists. Patch base comparison MUST match scope, epoch, and
+sequence; when both sides have a non-empty head hash, it MUST match too.
 
 The projection body is `kind: "woo.scope_projection.v1"`. It is catalog-neutral
 display/cache state, not executable authority. It MUST name the `scope`, current
@@ -1520,7 +1524,10 @@ The endpoint validates the `woo-v2.turn-network.json` subprotocol, sends a v2
 envelope, decodes subsequent frames through the shared v2 envelope codec, and
 can return v2 execution replies. Reconnect opens may include the browser's
 cached `last_known_head` so `CommitScopeDO` can return a retained delta instead
-of a full projection when the tail is still available. The Worker gateway
+of a full projection when the tail is still available; they may also include
+`executable_seed_digest` so an unchanged open executable seed can be
+acknowledged with a compact signed marker instead of resending cached page
+bodies. The Worker gateway
 forwards authority-bearing v2 envelopes to `CommitScopeDO`, which persists the
 commit scope in row-shaped storage: one row per serialized object plus small
 rows for sessions, log entries, counters, accepted-frame tail, transcript tail,
@@ -2064,7 +2071,7 @@ permitted only for `localhost`, `127.0.0.1`, or `[::1]` development endpoints.
 The browser opens:
 
 ```text
-GET /v2/turn-network/ws?token=<session-token>&node=<browser-node-id>&scope=<scope-ref?>&last_known_head=<json-scope-head?>&resume=<resume-token?>
+GET /v2/turn-network/ws?token=<session-token>&node=<browser-node-id>&scope=<scope-ref?>&last_known_head=<json-scope-head?>&executable_seed_digest=<digest?>&resume=<resume-token?>
 Upgrade: websocket
 Sec-WebSocket-Protocol: woo-v2.turn-network.json
 ```
@@ -2078,10 +2085,30 @@ the socket is established, every envelope repeats the bearer token in
 single scope. When present, `last_known_head` is a JSON encoded `ScopeHead` for
 `scope`; the relay validates the shape, treats malformed or stale values as
 absent, and sends the state transfer that VTN9 would have returned for that
-cursor. Relays with retained contiguous history SHOULD send a delta transfer
-when it fits within the advertised message-size budget; otherwise they send a
-projection transfer. This shortcut does not replace explicit
+cursor. If `last_known_head` exactly equals the current scope head, the relay
+MAY send an empty signed delta freshness marker instead of rebuilding the full
+projection. Relays with retained contiguous history SHOULD send a non-empty
+delta transfer when it fits within the advertised message-size budget;
+otherwise they send a projection transfer. This shortcut does not replace explicit
 `Subscribe`/`CatchupRequest` for multi-scope clients.
+
+`executable_seed_digest` is an advisory cache validator for the open-time
+executable seed. The digest is computed from normalized executable
+state-transfer metadata: mode, scope, purpose, selected atoms/preimages, page
+or object refs without inline body bytes, session/log/snapshot/counter tail,
+and source counts; relay proof material and inline page bodies are excluded. A
+browser MUST send this digest only when it can reconstruct the opened scope's
+execution node from verified IndexedDB pages and/or a verified execution
+checkpoint. If the relay computes the same digest for the current open seed, it
+MAY send a compact signed executable state-transfer marker instead of resending
+the seed pages. The client-supplied digest is never authoritative: the relay
+MUST recompute the current digest from relay-owned serialized state and compare
+it against a generation-scoped server-side cache entry. Relays MUST invalidate
+or generation-advance that cache whenever their serialized seed state changes,
+and MUST bound retained digest entries. If the digest is absent, malformed, or
+stale, the relay sends the normal executable seed. This optimization is cache
+negotiation only; it does not weaken proof verification or authorize execution
+from unverified client state.
 
 The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
 reject the upgrade with HTTP 400. A server that accepts the WebSocket without
@@ -2116,10 +2143,18 @@ processing authority-bearing browser envelopes. This preserves hello-first
 transport semantics while ensuring browser caches install verified state before
 pending turns are replayed.
 
+For browser-local execution, the relay SHOULD then send either the open-time
+executable seed transfer or the compact executable-seed cache-hit marker
+described above. Both are ordinary signed executable state transfers. A browser
+that receives a cache-hit marker MUST use only its previously verified cached
+pages/checkpoint to reconstruct executable state; the marker is a readiness and
+freshness acknowledgement, not executable material by itself.
+
 If the relay emits an open-time `ExecCapabilityAd` for the scope, it SHOULD send
 that ad immediately after the initial state transfer. A browser that disables
 unselected durable intents MUST NOT release queued durable turns until the
-initial state transfer and that execution ad have both been installed.
+initial display state transfer, executable state transfer or cache-hit marker,
+and execution ad have all been installed.
 
 `TransportHello.actor` is the relay-validated actor from the session token. If
 it differs from the browser's cached actor, the browser MUST treat

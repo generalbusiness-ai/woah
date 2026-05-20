@@ -235,6 +235,7 @@ v2wss.on("connection", (ws, req) => {
   const node = url.searchParams.get("node") || `browser:dev:${socketCounter++}`;
   const requestedScope = url.searchParams.get("scope") as ObjRef | null;
   const lastKnownHead = parseShadowScopeHeadJson(url.searchParams.get("last_known_head"));
+  const executableSeedDigest = url.searchParams.get("executable_seed_digest") || undefined;
   let session: Session;
   try {
     if (!token) throw wooError("E_NOSESSION", "token query parameter is required");
@@ -269,7 +270,8 @@ v2wss.on("connection", (ws, req) => {
   // verified state-plane projection or catch-up delta for the requested scope.
   void openShadowBrowserScope(browser, {
     preseed_catalog_pages: true,
-    ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
+    ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
+    ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
   }).then((opened) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";

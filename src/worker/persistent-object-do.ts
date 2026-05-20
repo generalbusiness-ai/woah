@@ -2607,6 +2607,7 @@ export class PersistentObjectDO {
     const node = url.searchParams.get("node") || `browser:${crypto.randomUUID()}`;
     const scope = (url.searchParams.get("scope") || "") as ObjRef;
     const lastKnownHead = parseShadowScopeHeadJson(url.searchParams.get("last_known_head"));
+    const executableSeedDigest = url.searchParams.get("executable_seed_digest") || undefined;
     if (!token) {
       return this.rejectV2TurnNetworkWebSocket({ code: "E_NOSESSION", message: "token query parameter is required" }, 401, startedAt, scope, node);
     }
@@ -2653,7 +2654,8 @@ export class PersistentObjectDO {
         actor: session.actor,
         ...seeded.authority,
         serialized: seeded.serialized,
-        ...(lastKnownHead ? { last_known_head: lastKnownHead } : {})
+        ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
+        ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
       });
       const hello = opened.hello;
       server.send(encodeEnvelope({

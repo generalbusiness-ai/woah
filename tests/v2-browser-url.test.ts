@@ -17,12 +17,14 @@ describe("v2 browser websocket URL", () => {
       token: "guest:token",
       node: "browser:test",
       scope: "#room",
-      last_known_head: head
+      last_known_head: head,
+      executable_seed_digest: "seed-digest-1"
     }));
 
     expect(url.protocol).toBe("wss:");
     expect(url.pathname).toBe("/v2/turn-network/ws");
     expect(url.searchParams.get("scope")).toBe("#room");
+    expect(url.searchParams.get("executable_seed_digest")).toBe("seed-digest-1");
     expect(JSON.parse(url.searchParams.get("last_known_head") ?? "")).toEqual(head);
   });
 

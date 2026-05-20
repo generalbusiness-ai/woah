@@ -13,6 +13,7 @@ import {
   executeShadowBrowserTurn,
   handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
+  MAX_SHADOW_OPEN_EXECUTABLE_SEED_CACHE,
   markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
@@ -23,6 +24,7 @@ import {
   setShadowBrowserSessionToken,
   SHADOW_SCOPE_PROJECTION_PATCH_FIELDS,
   shadowLiveEventsForTranscript,
+  shadowStateTransferCacheDigest,
   shadowBrowserEnvelope,
   shadowBrowserSessionBearer,
   shadowBrowserTransportHello,
@@ -71,6 +73,113 @@ describe("shadow browser node shim", () => {
     expect(browser.cache.transcript_tail).toHaveLength(1);
     expect(browser.cache.transfers.length).toBeGreaterThanOrEqual(1);
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.44);
+  });
+
+  it("uses an executable seed digest to avoid resending cached open pages", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-open-seed-cache");
+    const opened = await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const digest = shadowStateTransferCacheDigest(opened.executable_transfer);
+    expect(digest).toBeTruthy();
+    expect(opened.executable_transfer_cache).toBe("miss");
+    expect(opened.executable_transfer_inline_pages).toBeGreaterThan(0);
+
+    const cached = await openShadowBrowserScope(browser, {
+      preseed_catalog_pages: true,
+      executable_seed_digest: digest ?? undefined
+    });
+
+    expect(cached.executable_transfer_cache).toBe("hit");
+    expect(cached.executable_transfer_pages).toBe(0);
+    expect(cached.executable_transfer_inline_pages).toBe(0);
+    expect(cached.executable_transfer_bytes).toBeLessThan(opened.executable_transfer_bytes / 10);
+
+    const turn = await executeShadowBrowserTurn(browser, {
+      id: "browser-open-seed-cache-wet",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.54]
+    });
+    expect(turn.result).toMatchObject({ ok: true });
+  });
+
+  it("bounds the relay executable seed digest cache by least-recent use", async () => {
+    const world = createWorld({ catalogs: false });
+    const sessions = Array.from(
+      { length: MAX_SHADOW_OPEN_EXECUTABLE_SEED_CACHE + 1 },
+      (_, index) => world.auth(`guest:browser-open-seed-lru-${index}`)
+    );
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay-open-seed-lru",
+      scope: "$system",
+      serialized: world.exportWorld()
+    });
+
+    for (const [index, session] of sessions.entries()) {
+      const browser = createShadowBrowserNode({
+        node: `browser-open-seed-lru-${index}`,
+        scope: "$system",
+        actor: session.actor,
+        session: session.id,
+        relay
+      });
+      const opened = await openShadowBrowserScope(browser);
+      expect(opened.executable_transfer_cache).toBe("miss");
+    }
+
+    const keys = Array.from(relay.open_executable_seed_cache.keys());
+    expect(keys).toHaveLength(MAX_SHADOW_OPEN_EXECUTABLE_SEED_CACHE);
+    expect(keys.some((key) => key.endsWith(`\u0000${sessions[0].actor}`))).toBe(false);
+    expect(keys.some((key) => key.endsWith(`\u0000${sessions.at(-1)!.actor}`))).toBe(true);
+  });
+
+  it("uses an empty display delta when the browser already has the current projection head", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-open-current-cache");
+    const opened = await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    expect(opened.transfer.mode).toBe("projection");
+
+    const current = await openShadowBrowserScope(browser, {
+      preseed_catalog_pages: true,
+      last_known_head: opened.transfer.to
+    });
+    expect(current.transfer).toMatchObject({
+      mode: "delta",
+      to: opened.transfer.to,
+      applied: [],
+      transcript_tail: []
+    });
+    expect("projection" in current.transfer).toBe(false);
+    expect("projection_patch" in current.transfer).toBe(false);
+    expect(current.projection).toEqual(opened.projection);
+
+    const wrongHash = await openShadowBrowserScope(browser, {
+      preseed_catalog_pages: true,
+      last_known_head: { ...opened.transfer.to, hash: "not-current" }
+    });
+    expect(wrongHash.transfer.mode).toBe("projection");
+  });
+
+  it("resends the open executable seed when the cached digest is stale", async () => {
+    const { browser } = await browserForScope("the_dubspace", "guest:browser-open-seed-stale");
+    const opened = await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+    const staleDigest = shadowStateTransferCacheDigest(opened.executable_transfer);
+    expect(staleDigest).toBeTruthy();
+
+    const turn = await executeShadowBrowserTurn(browser, {
+      id: "browser-open-seed-stale-wet",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.55]
+    });
+    expect(turn.result).toMatchObject({ ok: true });
+
+    const reopened = await openShadowBrowserScope(browser, {
+      preseed_catalog_pages: true,
+      executable_seed_digest: staleDigest ?? undefined
+    });
+
+    expect(reopened.executable_transfer_cache).toBe("miss");
+    expect(reopened.executable_transfer_inline_pages).toBeGreaterThan(0);
+    expect(reopened.executable_transfer_digest).not.toBe(staleDigest);
   });
 
   it("does not let live-persistence turns dirty the next durable dubspace turn", async () => {

@@ -8,7 +8,8 @@ import {
   createShadowBrowserRelayShim,
   openShadowBrowserScope,
   setShadowBrowserSessionToken,
-  shadowBrowserEnvelope
+  shadowBrowserEnvelope,
+  shadowStateTransferCacheDigest
 } from "../../src/core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
@@ -222,6 +223,101 @@ describe("v2 CommitScopeDO cost budget", () => {
         v2_commit_scope_session: world.exportWorld().sessions.length
       });
     } finally {
+      scopeState.close();
+    }
+  });
+
+  it("returns a compact executable seed marker when the open digest matches", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:cf-v2-open-seed-cache");
+    const scopeState = new FakeDurableObjectState("the_dubspace");
+    const commitScope = new CommitScopeDO(scopeState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = { WOO_INTERNAL_SECRET: "cf-test-secret" };
+    const metrics: Record<string, unknown>[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((label: unknown, payload: unknown) => {
+      if (label === "woo.metric" && typeof payload === "string") {
+        metrics.push(JSON.parse(payload) as Record<string, unknown>);
+      }
+    });
+
+    const open = async (node: string, executableSeedDigest?: string, lastKnownHead?: Record<string, any>): Promise<Record<string, any>> => {
+      const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_dubspace",
+          node,
+          token: "guest:cf-v2-open-seed-cache",
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          serialized: world.exportWorld(),
+          ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
+          ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
+        })
+      }));
+      const response = await commitScope.fetch(request);
+      expect(response.ok).toBe(true);
+      return await response.json() as Record<string, any>;
+    };
+
+    try {
+      const first = await open("browser:v2-open-seed-cache-a");
+      const digest = shadowStateTransferCacheDigest(first.executable_transfer);
+      const firstOpenMetric = lastMetric(metrics, "v2_open");
+      expect(digest).toBeTruthy();
+      expect(first.executable_transfer).toMatchObject({ mode: "cell_pages", purpose: "open_executable_seed" });
+      expect(first.executable_transfer.inline_pages.length).toBeGreaterThan(0);
+
+      const metricStart = metrics.length;
+      resetStateCostLog(scopeState);
+      const second = await open("browser:v2-open-seed-cache-b", digest ?? undefined, first.head);
+      const secondMetrics = metrics.slice(metricStart);
+      const secondOpenMetric = lastMetric(secondMetrics, "v2_open");
+      const secondSeedMetric = lastMetric(secondMetrics, "shadow_open_executable_seed_bytes");
+      expect(second.transfer).toMatchObject({
+        mode: "delta",
+        to: first.head,
+        applied: [],
+        transcript_tail: []
+      });
+      expect(second.executable_transfer).toMatchObject({
+        mode: "cell_pages",
+        purpose: "open_executable_seed_cache_hit",
+        page_refs: [],
+        inline_pages: []
+      });
+      expect(JSON.stringify(second.executable_transfer).length).toBeLessThan(
+        JSON.stringify(first.executable_transfer).length / 10
+      );
+      expect(JSON.stringify(second).length).toBeLessThan(JSON.stringify(first).length / 10);
+      // This is a regression guard for the work behind the compact response:
+      // cache-hit opens must not durable-write, catalog-preseed, or rebuild and
+      // resend the executable page closure. Raw wall-clock assertions are too
+      // noisy for CI, but these counters pin the expensive operations.
+      expect(rowWrites(scopeState)).toBe(0);
+      expect(secondSeedMetric).toMatchObject({
+        kind: "shadow_open_executable_seed_bytes",
+        bytes: metricNumber(secondOpenMetric, "executable_transfer_bytes"),
+        pages: 0,
+        inline_pages: 0,
+        status: "ok"
+      });
+      expect(secondOpenMetric).toMatchObject({
+        kind: "v2_open",
+        status: "ok",
+        transfer_mode: "delta",
+        executable_transfer_cache: "hit",
+        executable_transfer_pages: 0,
+        executable_transfer_inline_pages: 0,
+        preseeded_objects: 0,
+        full_save: false
+      });
+      expect(metricNumber(secondOpenMetric, "executable_transfer_bytes")).toBeLessThan(
+        metricNumber(firstOpenMetric, "executable_transfer_bytes") / 10
+      );
+    } finally {
+      logSpy.mockRestore();
       scopeState.close();
     }
   });
@@ -491,6 +587,18 @@ function rowWrites(state: FakeDurableObjectState): number {
   return state.storage.sql.execLog
     .filter((entry) => /^(INSERT|UPDATE|DELETE)\b/i.test(entry.query.trim()))
     .reduce((total, entry) => total + entry.changes, 0);
+}
+
+function lastMetric(metrics: Record<string, unknown>[], kind: string): Record<string, unknown> {
+  const metric = [...metrics].reverse().find((entry) => entry.kind === kind);
+  expect(metric).toBeTruthy();
+  return metric!;
+}
+
+function metricNumber(metric: Record<string, unknown>, field: string): number {
+  const value = metric[field];
+  expect(typeof value).toBe("number");
+  return value as number;
 }
 
 function writeRowsByTable(state: FakeDurableObjectState): Record<string, number> {

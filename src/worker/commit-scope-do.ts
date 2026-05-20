@@ -138,7 +138,8 @@ export class CommitScopeDO {
           const browser = this.browserFor(relay, input);
           const opened = await openShadowBrowserScope(browser, {
             preseed_catalog_pages: true,
-            last_known_head: input.last_known_head
+            last_known_head: input.last_known_head,
+            executable_seed_digest: input.executable_seed_digest
           });
           const hello = shadowBrowserTransportHello(browser);
           // A cold relay seed must be durable before the open is reported.
@@ -169,6 +170,11 @@ export class CommitScopeDO {
             ms: Date.now() - startedAt,
             status: "ok",
             transfer_mode: opened.transfer.mode,
+            executable_transfer_cache: opened.executable_transfer_cache,
+            executable_transfer_bytes: opened.executable_transfer_bytes,
+            executable_transfer_pages: opened.executable_transfer_pages,
+            executable_transfer_inline_pages: opened.executable_transfer_inline_pages,
+            preseeded_objects: opened.preseeded_objects,
             full_save: fullSave
           });
           return jsonResponse({
@@ -949,6 +955,7 @@ type CommitScopeBaseRequest = {
 type CommitScopeOpenRequest = CommitScopeBaseRequest & {
   serialized?: SerializedWorld;
   last_known_head?: ShadowScopeHead;
+  executable_seed_digest?: string;
 };
 
 type CommitScopeOpenResponse = {
