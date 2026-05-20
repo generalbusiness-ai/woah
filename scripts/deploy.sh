@@ -382,5 +382,25 @@ else
   fail "POST /mcp returned $RETRY_STATUS after $RETRY_ATTEMPTS attempts (expected 200; 405 means the SPA fallback intercepted — check wrangler.toml run_worker_first)"
 fi
 
+# Cross-actor smoke. The single-call MCP routing check above only verifies
+# that the worker is reachable; it does not exercise commit-scope open,
+# cross-host authority-slice RPCs, cross-room moves, or peer observation
+# fan-out — every one of which can regress while healthz + routing still
+# reply 200. That blind spot is what let prod deploy `555f9935` (the
+# authority-slice cell rewrite) ship with cold-open RPCs blowing past the
+# 5s HOST_READ_RPC_TIMEOUT ceiling. The walkthrough is the cheapest
+# real-world coverage we have; allow operators to skip it (env override or
+# --skip-smoke) for emergency redeploys.
+if [[ "${WOO_DEPLOY_SMOKE:-1}" == "0" || "${SKIP_SMOKE:-0}" == "1" ]]; then
+  warn "deploy smoke skipped (WOO_DEPLOY_SMOKE=0 or SKIP_SMOKE=1)"
+else
+  if WOO_SMOKE_BASE_URL="$WORKER_URL" npx --no-install tsx scripts/smoke-walkthrough.ts > /tmp/woo-deploy-smoke.log 2>&1; then
+    ok "smoke walkthrough: 9/9 cross-actor steps passed"
+  else
+    tail -20 /tmp/woo-deploy-smoke.log
+    fail "smoke walkthrough failed against $WORKER_URL (see /tmp/woo-deploy-smoke.log). Roll back with: npx wrangler rollback --version-id <previous>"
+  fi
+fi
+
 echo
 echo "${GREEN}${BOLD}deploy ok${NC} version=$version_id url=$WORKER_URL"

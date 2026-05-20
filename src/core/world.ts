@@ -6031,53 +6031,137 @@ export class WooWorld {
     const ids: ObjRef[] = [];
     const seen = new Set<ObjRef>();
     const contentsExpanded = new Set<ObjRef>();
-    const pushValueRefs = (value: WooValue): void => {
+    // Value-ref tracing surfaces runtime instances named directly or one
+    // wrapper level deep inside a property value. Examples that must work:
+    //   `exit.dest = "the_deck"`                          (direct string)
+    //   `the_chatroom.exits = { southeast: "exit_x" }`    (one-level map)
+    //   `the_actor.inventory = ["the_mug", "the_lamp"]`   (one-level array)
+    // We deliberately do NOT recurse without limit: deeply nested catalog
+    // tables (e.g. `the_dubspace.scenes_history = [{ drum: "$drum_loop", … }]`)
+    // would otherwise drag the entire reachable-instance graph into every
+    // slice. The wrapper (an array/map directly stored as the property
+    // value) is followed; references inside *that* wrapper's string/array/
+    // object children are walked once each, but we stop there. Anything
+    // deeper must be named explicitly via executor.ts §executorAuthorityObjectIds.
+    //
+    // When we surface a runtime ref through this walk, we mark its push with
+    // `traceValues: true` so the *target* gets one more hop of value-tracing
+    // (e.g. `the_chatroom.exits.southeast = exit_x` then `exit_x.dest =
+    // the_deck`). The cascade stops at the target's targets — `the_deck`'s
+    // own exits do not pull in their destinations.
+    const VALUE_TRACE_MAX_DEPTH = 2;
+    const pushValueRefs = (value: WooValue, depth = 0, propagate = true): void => {
       if (typeof value === "string") {
-        if (this.objects.has(value as ObjRef)) push(value as ObjRef);
+        if (this.objects.has(value as ObjRef)) push(value as ObjRef, propagate ? { traceValues: "leaf" } : {});
         return;
       }
+      if (depth >= VALUE_TRACE_MAX_DEPTH) return;
       if (Array.isArray(value)) {
-        for (const item of value) pushValueRefs(item);
+        for (const item of value) pushValueRefs(item, depth + 1, propagate);
         return;
       }
       if (value && typeof value === "object") {
-        for (const item of Object.values(value)) pushValueRefs(item);
+        for (const item of Object.values(value)) pushValueRefs(item, depth + 1, propagate);
       }
     };
-    const push = (id: ObjRef | null | undefined, includeContents = false): void => {
+    const push = (id: ObjRef | null | undefined, options: { includeContents?: boolean; traceValues?: "full" | "leaf" } = {}): void => {
       if (!id) return;
       const obj = this.objects.get(id);
       if (!obj) return;
       if (!seen.has(id)) {
         seen.add(id);
         ids.push(id);
+        // Dispatch dependencies for any reachable object: parent class chain,
+        // owner, verb/prop definers, feature classes. Verb resolution walks
+        // these chains and must find them in the slice.
         if (obj.parent) push(obj.parent);
         push(obj.owner);
-        for (const def of obj.propertyDefs.values()) {
-          push(def.owner);
-          pushValueRefs(def.defaultValue);
+        for (const def of obj.propertyDefs.values()) push(def.owner);
+        for (const verb of obj.verbs) {
+          push(verb.owner);
+          // Verb bodies dispatch on shared helper classes ($match, $utils,
+          // $string_utils, …) named by literal in the bytecode. We surface
+          // those refs precisely instead of falling back to a catalog-wide
+          // $-prefix sweep: a turn whose verbs call `take` pulls in `$match`
+          // and friends; a turn that does not, does not. Native verbs have
+          // no bytecode body to scan, so we just take the owner.
+          if (verb.kind !== "native") {
+            for (const literal of verb.bytecode?.literals ?? []) {
+              if (typeof literal === "string" && literal.startsWith("$")) push(literal as ObjRef);
+            }
+          }
         }
-        for (const [, value] of obj.properties) pushValueRefs(value);
-        for (const verb of obj.verbs) push(verb.owner);
         for (const feature of this.safeFeatureList(id)) push(feature);
+        // Property-value tracing decides whether we follow `obj.foo = x` and
+        // pull `x` into the slice too. We trace in two specific cases:
+        //
+        //  - Explicit roots and their one-hop expansion (room/actor/scope/
+        //    contents named by the caller): the verb will dispatch directly
+        //    on their property targets — `exit.dest = the_deck` must
+        //    surface `the_deck` so `:acceptable` can be invoked there.
+        //
+        //  - `$`-prefixed catalog/helper classes anywhere we reach them:
+        //    catalog code wires itself together by property
+        //    (`$system.help_dbs = ["$help"]`, `$match.kinds = […]`). The
+        //    graph between catalogs is small and stable, so following it is
+        //    cheap. Without this, a verb that goes `$system.help_dbs`
+        //    leaves `$help` unreachable from the slice.
+        //
+        // We do NOT trace values on transitive *non-`$`* objects (the_dubspace,
+        // exit objects, etc.): those are runtime instances whose property
+        // graph can sprawl to the entire reachable-room graph and explode
+        // the slice. If a turn needs deeper instance state, the caller must
+        // name it as an explicit root via executor.ts
+        // §executorAuthorityObjectIds, or the satellite raises E_OBJNF and
+        // the caller widens the retry's `objects` list.
+        // Two trace modes:
+        //   options.traceValues === "full": this is an explicit root; walk
+        //     the property graph one logical hop and recurse one more hop
+        //     into the surfaced targets (so `room.exits.southeast = exit`
+        //     then `exit.dest = the_deck` are both reached, but the_deck's
+        //     exits do not pull in another set of rooms).
+        //   options.traceValues === "leaf": this object was reached via a
+        //     full-trace one-hop expansion; surface its direct refs but do
+        //     not propagate trace further. Catalog ($-prefixed) classes
+        //     reached anywhere also leaf-trace — catalogs cross-reference
+        //     each other ($system.help_dbs → $help) and the connected graph
+        //     is small.
+        //   missing/false: no value tracing. The object's row is in the
+        //     slice; deeper dispatch reads the durable cache on the
+        //     satellite.
+        const mode = options.traceValues
+          ? options.traceValues
+          : id.startsWith("$")
+            ? "leaf"
+            : "off";
+        if (mode !== "off") {
+          for (const [, value] of obj.properties) pushValueRefs(value, 0, mode === "full");
+        }
       }
-      if (!includeContents || contentsExpanded.has(id)) return;
+      if (!options.includeContents || contentsExpanded.has(id)) return;
       contentsExpanded.add(id);
       for (const item of obj.contents) push(item);
     };
-    for (const id of extraObjectIds) push(id, true);
+    for (const id of extraObjectIds) push(id, { includeContents: true, traceValues: "full" });
     for (const session of sessions) {
-      push(session.actor, true);
-      if (session.activeScope) push(session.activeScope, true);
+      push(session.actor, { includeContents: true, traceValues: "full" });
+      if (session.activeScope) push(session.activeScope, { includeContents: true, traceValues: "full" });
       const actor = this.objects.get(session.actor);
-      if (actor?.location) push(actor.location, true);
+      if (actor?.location) push(actor.location, { includeContents: true, traceValues: "full" });
     }
-    // Catalog/helper objects are code dependencies rather than visible room
-    // contents. Partial authority seeds need them for bytecode call targets
-    // such as $match and $help even when the caller did not name those objects.
-    for (const id of this.objects.keys()) {
-      if (id.startsWith("$")) push(id);
-    }
+    // Catalog code (the $-prefixed class graph) is delivered separately. On
+    // first open a satellite has no durable snapshot, the open is rejected with
+    // E_SNAPSHOT_REQUIRED, and the gateway retries with the full serialized
+    // seed attached — see persistent-object-do.ts §v2CommitScopeOpen. After
+    // that the satellite holds the catalog durably, so per-envelope authority
+    // refreshes need only carry the rooted state that may have changed. The
+    // reachability walk above already covers catalog dependencies the turn
+    // actually touches: parent classes, owners, feature classes, contents, and
+    // refs threaded as explicit roots through executor.ts
+    // §executorAuthorityObjectIds. An unconditional `for (id of objects.keys)
+    // if (startsWith("$")) push(id)` sweep was removed (2026-05-20): on
+    // production it inflated the slice to ~3 MB / 1000 page-refs and pushed
+    // cold-open round-trips past the 5s HOST_READ_RPC_TIMEOUT ceiling.
     return buildSerializedAuthorityCellSlice({
       sessions,
       objects: this.exportObjects(ids),

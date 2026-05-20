@@ -893,7 +893,16 @@ rows, the session actors, the sessions' active rooms, and any explicit
 turn-scope/target rows the gateway knows are relevant, plus owner, class,
 feature, property-reference, and catalog/helper support cells needed to execute
 that working set. A CommitScopeDO MUST refresh these cells before planning an
-intent. When an authority slice is present, its `sessions[*].activeScope`
+intent. The slice contract is **reachability-bounded**, NOT catalog-wide: an
+implementation MUST NOT package every catalog/helper class on every refresh
+"to be safe". Catalog code is delivered durably via the first-open `serialized`
+seed (E_SNAPSHOT_REQUIRED retry path) and held on the satellite; per-envelope
+refresh carries only the rooted state that may have changed. Implementations
+that surface catalog helpers in the slice should do so by precise reachability
+(verb bytecode literal scan; one-hop property-value tracing from explicit
+roots; class-chain walk) rather than by name prefix or by enumerating the
+whole `objects` map — a catalog-wide sweep inflates the cross-host RPC body
+into multi-megabyte territory and trips read-timeout deadlines on cold opens. When an authority slice is present, its `sessions[*].activeScope`
 replaces any older per-scope value in the CommitScopeDO snapshot; otherwise a
 cross-scope move accepted in one scope can leave another scope planning against
 stale presence. `session_objects` is a compatibility request field for older
