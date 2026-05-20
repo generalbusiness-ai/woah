@@ -1,9 +1,8 @@
 import { compileVerb } from "./authoring";
-import { setPropBytecode, setValueBytecode } from "./fixtures";
 import { installLocalCatalogs } from "./local-catalogs";
 import type { ObjectRepository, SeedWorld, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
 import { hashSource } from "./source-hash";
-import type { MetricEvent, ObjRef, TinyBytecode, VerbDef, WooValue } from "./types";
+import type { MetricEvent, ObjRef, VerbDef, WooValue } from "./types";
 import { valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
@@ -344,6 +343,18 @@ const PLAYER_HELP_SOURCE = `verb :help(topic) rxd {
 
 const ROOT_DESCRIBE_SOURCE = `verb :describe() rxd {
   return describe_object(this);
+}`;
+
+const ROOT_SET_VALUE_SOURCE = `verb :set_value(value) r {
+  this.value = value;
+  observe({ type: "value_changed", source: this, value: value });
+  return value;
+}`;
+
+const ROOT_SET_PROP_SOURCE = `verb :set_prop(name, value) r {
+  this.(name) = value;
+  observe({ type: "property_changed", source: this, name: name, value: value });
+  return value;
 }`;
 
 const ROOT_TITLE_SOURCE = `verb :title() rxd {
@@ -1080,8 +1091,8 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$catalog_registry", "features_version", 0);
   seedProp(world, "$catalog_registry", "installed_catalogs", []);
 
-  bytecode(world, "$root", "set_value", setValueBytecode, "verb :set_value(value) r { ... }", { perms: "r" });
-  bytecode(world, "$root", "set_prop", setPropBytecode, "verb :set_prop(name, value) r { ... }", { perms: "r" });
+  sourceVerb(world, "$root", "set_value", ROOT_SET_VALUE_SOURCE, { perms: "r" });
+  sourceVerb(world, "$root", "set_prop", ROOT_SET_PROP_SOURCE, { perms: "r" });
   sourceVerb(world, "$root", "describe", ROOT_DESCRIBE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "title", ROOT_TITLE_SOURCE, { directCallable: true });
   sourceVerb(world, "$root", "look_self", ROOT_LOOK_SELF_SOURCE, { directCallable: true });
@@ -1282,39 +1293,6 @@ function reparentSeed(world: WooWorld, obj: ObjRef, parent: ObjRef): void {
   world.markObjectChanged(obj);
   if (oldParent && world.objects.has(oldParent)) world.markObjectChanged(oldParent);
   world.markObjectChanged(parent);
-}
-
-function bytecode(world: WooWorld, obj: ObjRef, name: string, bytecodeValue: TinyBytecode, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; perms?: string } = {}): void {
-  const existing = world.ownVerbExact(obj, name);
-  if (existing) {
-    const existingDirectCallable = existing.direct_callable === true;
-    const existingSkipPresenceCheck = existing.skip_presence_check === true;
-    const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existingDirectCallable || options.directCallable === true);
-    const next = {
-      ...existing,
-      perms: parsedPerms.perms,
-      direct_callable: parsedPerms.directCallable,
-      skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true
-    };
-    if (next.perms !== existing.perms || next.direct_callable !== existingDirectCallable || next.skip_presence_check !== existingSkipPresenceCheck) world.addVerb(obj, next);
-    return;
-  }
-  const parsedPerms = normalizeVerbPerms(options.perms ?? "rx", options.directCallable === true);
-  world.addVerb(obj, {
-    kind: "bytecode",
-    name,
-    aliases: [],
-    owner: "$wiz",
-    perms: parsedPerms.perms,
-    arg_spec: {},
-    source,
-    source_hash: hashSource(source),
-    bytecode: bytecodeValue,
-    version: bytecodeValue.version,
-    line_map: {},
-    direct_callable: parsedPerms.directCallable,
-    skip_presence_check: options.skipPresenceCheck === true
-  });
 }
 
 function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {

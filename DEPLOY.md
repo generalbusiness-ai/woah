@@ -54,13 +54,13 @@ For other local DB locations:
 WOO_DB=.woo/test.sqlite npm run dev
 ```
 
-For true in-memory world systems (no SQLite at all), use `InMemoryObjectRepository` directly in test runners or scripts:
+For ephemeral world systems (no on-disk file), pass `:memory:` to `LocalSQLiteRepository`:
 
 ```ts
 import { createWorld } from "./src/core/bootstrap";
-import { InMemoryObjectRepository } from "./src/core/repository";
+import { LocalSQLiteRepository } from "./src/server/sqlite-repository";
 
-const world = createWorld({ repository: new InMemoryObjectRepository() });
+const world = createWorld({ repository: new LocalSQLiteRepository(":memory:") });
 ```
 
 That mode resets when the process exits.

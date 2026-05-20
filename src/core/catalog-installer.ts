@@ -1,5 +1,4 @@
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
-import { fixtureByName } from "./fixtures";
 import { hashSource } from "./source-hash";
 import { wooError, type ErrorValue, type ObjRef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -47,7 +46,7 @@ type CatalogVerbDef = {
   skip_presence_check?: boolean;
   tool_exposed?: boolean;
   pure?: boolean;
-  implementation?: { kind: "native"; handler: string } | { kind: "fixture"; name: keyof typeof fixtureByName };
+  implementation?: { kind: "native"; handler: string };
 };
 
 type CatalogSchemaDef = {
@@ -1233,14 +1232,6 @@ function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, 
     // is the only signal — declaration *is* derivation here.
     const native_pure = def.pure === true ? true : undefined;
     return { ...base, kind: "native", native: def.implementation.handler, pure: native_pure, pure_declared: native_pure };
-  }
-
-  if (allowImplementationHints && def.implementation?.kind === "fixture") {
-    const bytecode = fixtureByName[def.implementation.name] as TinyBytecode | undefined;
-    if (!bytecode) throw wooError("E_CATALOG", `unknown fixture implementation: ${def.implementation.name}`);
-    const finalBytecode: TinyBytecode = { ...bytecode, version };
-    const pure = combineVerbPurity(analyzeBytecodePurity(finalBytecode), def.pure, `${obj}:${def.name}`);
-    return { ...base, kind: "bytecode", bytecode: finalBytecode, pure: pure || undefined, pure_declared: def.pure === true ? true : undefined };
   }
 
   return compileCatalogVerb(obj, def, owner, version);

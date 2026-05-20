@@ -8,8 +8,8 @@ manifests through `@local:<catalog>`; demo classes and instances are not seeded
 directly in bootstrap.
 
 The manifests carry DSL source as the catalog contract. Some verbs also carry a
-v0.5 `implementation` hint that points at a native handler or bytecode fixture
-while the DSL/runtime grows enough to express the full behavior directly.
+v0.5 `implementation` hint that points at a native handler while the DSL/runtime
+grows enough to express the full behavior directly.
 
 Each catalog owns its app-level design in `DESIGN.md`; platform-wide contracts
 stay under `spec/`. Roles (foundational utility vs demo application) are

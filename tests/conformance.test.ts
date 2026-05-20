@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { compileVerb, installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
-import { InMemoryObjectRepository } from "../src/core/repository";
 import { wooError } from "../src/core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
@@ -30,25 +29,10 @@ type Backend = {
   make: (options?: MakeOptions) => Harness;
 };
 
+// SQLite is the only conformance backend. `restart()` needs to reopen the
+// same store, so file-backed SQLite (not `:memory:`) is the right choice
+// here even when individual tests don't restart.
 const backends: Backend[] = [
-  {
-    name: "memory",
-    make: (options) => {
-      const catalogs = options?.catalogs;
-      const repo = new InMemoryObjectRepository();
-      let world = createWorld({ repository: repo, catalogs });
-      return {
-        get world() {
-          return world;
-        },
-        restart: () => {
-          world = createWorld({ repository: repo, catalogs });
-          return world;
-        },
-        cleanup: () => undefined
-      };
-    }
-  },
   {
     name: "sqlite",
     make: (options) => {

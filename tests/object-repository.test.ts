@@ -1,8 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { InMemoryObjectRepository, type ObjectRepository, type ParkedTaskRecord, type SerializedObject } from "../src/core/repository";
+import type { ObjectRepository, ParkedTaskRecord, SerializedObject } from "../src/core/repository";
 import type { ErrorValue, Message, VerbDef, WooValue } from "../src/core/types";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
@@ -11,24 +8,17 @@ type RepoHandle = {
   cleanup: () => void;
 };
 
+// SQLite is the only repository implementation tested here. None of these
+// cases restart, so `:memory:` keeps the cleanup loop trivial.
 const backends: { name: string; make: () => RepoHandle }[] = [
-  {
-    name: "in-memory",
-    make: () => {
-      const repo = new InMemoryObjectRepository();
-      return { repo, cleanup: () => undefined };
-    }
-  },
   {
     name: "sqlite",
     make: () => {
-      const dir = mkdtempSync(join(tmpdir(), "woo-object-repo-"));
-      const repo = new LocalSQLiteRepository(join(dir, "repo.sqlite"));
+      const repo = new LocalSQLiteRepository(":memory:");
       return {
         repo,
         cleanup: () => {
           repo.close();
-          rmSync(dir, { recursive: true, force: true });
         }
       };
     }

@@ -29,7 +29,7 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
 
 ### DP1.1 Local test and single-target systems
 
-- **In-memory mode** (tests). Run with `InMemoryObjectRepository` from [`src/core/repository.ts`](../../src/core/repository.ts); no disk persistence and reset on process exit.
+- **In-memory mode** (tests). Run with `LocalSQLiteRepository(":memory:")` from [`src/server/sqlite-repository.ts`](../../src/server/sqlite-repository.ts); no disk persistence and reset on process exit.
 - **Local SQLite mode** (single-node local system). Use `npm run dev` (default `WOO_DB=.woo/dev.sqlite`) or set `WOO_DB` for custom path/in-memory behavior.
 
 ---
