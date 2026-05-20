@@ -64,7 +64,7 @@ function memoizeTestOperation<T>(cache: Map<string, Promise<unknown>>, key: stri
   return promise;
 }
 
-export function bytecodeVerb(name: string, bytecode: TinyBytecode, owner = "$wiz", perms = "rxd"): VerbDef {
+export function bytecodeVerb(name: string, bytecode: TinyBytecode, owner = "$wiz", perms = "rxd"): Extract<VerbDef, { kind: "bytecode" }> {
   return {
     kind: "bytecode",
     name,
