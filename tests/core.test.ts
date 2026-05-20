@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld, scopeSerializedWorldToHost } from "../src/core/bootstrap";
 import { bundledCatalogAliases, installLocalCatalogs } from "../src/core/local-catalogs";
-import type { ParkedTaskRecord } from "../src/core/repository";
+import type { ParkedTaskRecord, SerializedWorld } from "../src/core/repository";
 import type { CallContext, WooWorld } from "../src/core/world";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 import {
@@ -1453,6 +1453,177 @@ describe("woo core", () => {
     // Idempotent: second pass with same seed produces no change.
     const second = mergeHostScopedSeedWithStatus(merged.world, seed, "the_pinboard");
     expect(second.changed).toBe(false);
+  });
+
+  it("isolates serialized input while importing worlds", () => {
+    const serialized = createWorld({ catalogs: false }).exportWorld();
+    const root = serialized.objects.find((obj) => obj.id === "$root");
+    expect(root).toBeTruthy();
+    if (!root) return;
+
+    const setNestedMarker = (value: WooValue, marker: string): void => {
+      ((value as Record<string, WooValue>).nested as Record<string, WooValue>).marker = marker;
+    };
+    const nestedMarker = (value: WooValue): WooValue => {
+      return ((value as Record<string, WooValue>).nested as Record<string, WooValue>).marker;
+    };
+
+    root.flags = { wizard: false, programmer: false, fertile: false };
+    const defaultDef = {
+      name: "isolation_default",
+      defaultValue: { nested: { marker: "before" } },
+      owner: "$wiz",
+      perms: "r",
+      version: 1
+    };
+    const propertyEntry: [string, WooValue] = ["isolation_value", { nested: { marker: "before" } }];
+    const verb = {
+      ...nativeVerb("isolate_import"),
+      aliases: ["iso"],
+      arg_spec: { command: { nested: { marker: "before" } } },
+      line_map: { nested: { marker: "before" } },
+      calls: [{ name: "look", this_call: true }]
+    };
+    const byteVerb = bytecodeVerb("isolate_bytecode", {
+      ops: [["PUSH", { nested: { marker: "before" } }]],
+      literals: [{ nested: { marker: "before" } }],
+      num_locals: 0,
+      max_stack: 1,
+      version: 1
+    });
+    const eventSchema: Record<string, WooValue> = { nested: { marker: "before" } };
+    const logEntry: SerializedWorld["logs"][number][1][number] = {
+      space: "$nowhere",
+      seq: 1,
+      ts: 1,
+      actor: "$wiz",
+      message: message("$wiz", "$root", "look", [{ nested: { marker: "before" } }]),
+      observations: [{ type: "isolation_event", source: "$root", payload: { nested: { marker: "before" } } }],
+      applied_ok: false,
+      error: { code: "E_TEST", message: "before", value: { nested: { marker: "before" } } }
+    };
+    const snapshot: SerializedWorld["snapshots"][number] = {
+      space_id: "$nowhere",
+      seq: 1,
+      ts: 1,
+      state: { nested: { marker: "before" } },
+      hash: "isolation"
+    };
+    const task: ParkedTaskRecord = {
+      id: "isolation_task",
+      parked_on: "$nowhere",
+      state: "suspended",
+      resume_at: null,
+      awaiting_player: null,
+      correlation_id: null,
+      serialized: { nested: { marker: "before" } },
+      created: 1,
+      origin: "$nowhere"
+    };
+    root.propertyDefs.push(defaultDef);
+    root.properties.push(propertyEntry);
+    root.propertyVersions.push(["isolation_value", 7]);
+    root.verbs.push(verb);
+    root.verbs.push(byteVerb);
+    root.eventSchemas.push(["isolation_event", eventSchema]);
+    serialized.logs.push(["$nowhere", [logEntry]]);
+    serialized.snapshots.push(snapshot);
+    serialized.parkedTasks.push(task);
+
+    const reloaded = createWorldFromSerialized(serialized, { persist: false });
+
+    root.flags.wizard = true;
+    setNestedMarker(defaultDef.defaultValue, "after-input");
+    setNestedMarker(propertyEntry[1], "after-input");
+    verb.aliases[0] = "after-input";
+    setNestedMarker(verb.arg_spec.command, "after-input");
+    setNestedMarker(verb.line_map, "after-input");
+    verb.calls[0].name = "after-input";
+    setNestedMarker(byteVerb.bytecode.ops[0][1], "after-input");
+    setNestedMarker(byteVerb.bytecode.literals[0], "after-input");
+    setNestedMarker(eventSchema, "after-input");
+    setNestedMarker(logEntry.message.args[0], "after-input");
+    setNestedMarker(logEntry.observations[0].payload, "after-input");
+    setNestedMarker(logEntry.error!.value!, "after-input");
+    setNestedMarker(snapshot.state, "after-input");
+    setNestedMarker(task.serialized, "after-input");
+
+    const exported = reloaded.exportWorld();
+    const importedRoot = exported.objects.find((obj) => obj.id === "$root");
+    const importedVerb = importedRoot?.verbs.find((item) => item.name === "isolate_import");
+    const importedByteVerb = importedRoot?.verbs.find((item) => item.name === "isolate_bytecode");
+    expect(importedRoot?.flags.wizard).toBe(false);
+    expect(nestedMarker(importedRoot!.propertyDefs.find((def) => def.name === "isolation_default")!.defaultValue)).toBe("before");
+    expect(nestedMarker(importedRoot!.properties.find(([name]) => name === "isolation_value")![1])).toBe("before");
+    expect(importedVerb?.aliases).toEqual(["iso"]);
+    expect(nestedMarker(importedVerb!.arg_spec.command)).toBe("before");
+    expect(nestedMarker(importedVerb!.line_map)).toBe("before");
+    expect(importedVerb?.calls).toEqual([{ name: "look", this_call: true }]);
+    expect(importedByteVerb?.kind).toBe("bytecode");
+    if (importedByteVerb?.kind !== "bytecode") return;
+    expect(nestedMarker(importedByteVerb.bytecode.ops[0][1])).toBe("before");
+    expect(nestedMarker(importedByteVerb.bytecode.literals[0])).toBe("before");
+    expect(nestedMarker(importedRoot!.eventSchemas.find(([name]) => name === "isolation_event")![1])).toBe("before");
+    expect(nestedMarker(exported.logs.find(([space]) => space === "$nowhere")![1][0].message.args[0])).toBe("before");
+    expect(nestedMarker(exported.logs.find(([space]) => space === "$nowhere")![1][0].observations[0].payload)).toBe("before");
+    expect(nestedMarker(exported.logs.find(([space]) => space === "$nowhere")![1][0].error!.value!)).toBe("before");
+    expect(nestedMarker(exported.snapshots.find((item) => item.hash === "isolation")!.state)).toBe("before");
+    expect(nestedMarker(exported.parkedTasks.find((item) => item.id === "isolation_task")!.serialized)).toBe("before");
+
+    const liveRoot = reloaded.object("$root");
+    const liveVerb = liveRoot.verbs.find((item) => item.name === "isolate_import");
+    const liveByteVerb = liveRoot.verbs.find((item) => item.name === "isolate_bytecode");
+    expect(liveVerb).toBeTruthy();
+    expect(liveByteVerb?.kind).toBe("bytecode");
+    if (!liveVerb || liveByteVerb?.kind !== "bytecode") return;
+    liveRoot.flags.programmer = true;
+    setNestedMarker(liveRoot.propertyDefs.get("isolation_default")!.defaultValue, "after-world");
+    setNestedMarker(liveRoot.properties.get("isolation_value")!, "after-world");
+    liveVerb.aliases[0] = "after-world";
+    setNestedMarker(liveVerb.arg_spec.command, "after-world");
+    setNestedMarker(liveVerb.line_map, "after-world");
+    liveVerb.calls![0].name = "after-world";
+    setNestedMarker(liveByteVerb.bytecode.ops[0][1], "after-world");
+    setNestedMarker(liveByteVerb.bytecode.literals[0], "after-world");
+    setNestedMarker(liveRoot.eventSchemas.get("isolation_event")!, "after-world");
+    const liveLog = reloaded.logs.get("$nowhere")![0];
+    setNestedMarker(liveLog.message.args[0], "after-world");
+    setNestedMarker(liveLog.observations[0].payload, "after-world");
+    setNestedMarker(liveLog.error!.value!, "after-world");
+    setNestedMarker(reloaded.snapshots.find((item) => item.hash === "isolation")!.state, "after-world");
+    setNestedMarker(reloaded.parkedTasks.get("isolation_task")!.serialized, "after-world");
+
+    expect(root.flags.programmer).toBe(false);
+    expect(nestedMarker(defaultDef.defaultValue)).toBe("after-input");
+    expect(nestedMarker(propertyEntry[1])).toBe("after-input");
+    expect(verb.aliases).toEqual(["after-input"]);
+    expect(nestedMarker(verb.arg_spec.command)).toBe("after-input");
+    expect(nestedMarker(verb.line_map)).toBe("after-input");
+    expect(verb.calls).toEqual([{ name: "after-input", this_call: true }]);
+    expect(nestedMarker(byteVerb.bytecode.ops[0][1])).toBe("after-input");
+    expect(nestedMarker(byteVerb.bytecode.literals[0])).toBe("after-input");
+    expect(nestedMarker(eventSchema)).toBe("after-input");
+    expect(nestedMarker(logEntry.message.args[0])).toBe("after-input");
+    expect(nestedMarker(logEntry.observations[0].payload)).toBe("after-input");
+    expect(nestedMarker(logEntry.error!.value!)).toBe("after-input");
+    expect(nestedMarker(snapshot.state)).toBe("after-input");
+    expect(nestedMarker(task.serialized)).toBe("after-input");
+  });
+
+  it("does not share cached boot snapshot cells across createWorld calls", () => {
+    const first = createWorld({ catalogs: false });
+    const firstRoot = first.object("$root");
+    const firstDescribe = firstRoot.verbs.find((verb) => verb.name === "describe");
+    expect(firstDescribe).toBeTruthy();
+    if (!firstDescribe) return;
+
+    firstRoot.flags.wizard = true;
+    firstDescribe.aliases.push("cache_poison");
+
+    const secondRoot = createWorld({ catalogs: false }).object("$root");
+    const secondDescribe = secondRoot.verbs.find((verb) => verb.name === "describe");
+    expect(secondRoot.flags.wizard).not.toBe(true);
+    expect(secondDescribe?.aliases).not.toContain("cache_poison");
   });
 
   it("normalizes legacy d permission shorthand while importing worlds", async () => {

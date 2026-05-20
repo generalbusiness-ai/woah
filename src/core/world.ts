@@ -6195,31 +6195,28 @@ export class WooWorld {
           owner: item.owner,
           location: item.location,
           anchor: item.anchor,
-          flags: item.flags ?? {},
+          flags: { ...(item.flags ?? {}) },
           created: item.created,
           modified: item.modified,
-          propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneValue(def.defaultValue) }])),
-          properties: new Map(item.properties.map(([name, value]) => [name, cloneValue(value)])),
+          propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
+          properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
           propertyVersions: new Map(item.propertyVersions),
-          verbs: item.verbs.map((verb, index) => {
-            const parsedPerms = normalizeVerbPerms(verb.perms, verb.direct_callable === true);
-            return { ...verb, perms: parsedPerms.perms, direct_callable: parsedPerms.directCallable, slot: index + 1 } as VerbDef;
-          }),
+          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
           children: new Set(item.children),
           contents: new Set(item.contents),
-          eventSchemas: new Map(item.eventSchemas)
+          eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
         });
       }
       for (const session of serialized.sessions) {
         this.sessions.set(session.id, this.hydrateSession(session, Date.now()));
       }
       for (const [space, entries] of serialized.logs) {
-        const hydrated = cloneValue(entries as unknown as WooValue) as unknown as SpaceLogEntry[];
+        const hydrated = cloneImportedPlainData(entries);
         this.logs.set(space, hydrated.map((entry) => ({ ...entry, observations: entry.observations ?? [] })));
       }
-      this.snapshots = serialized.snapshots ?? [];
+      this.snapshots = cloneImportedPlainData(serialized.snapshots ?? []);
       for (const task of serialized.parkedTasks ?? []) {
-        this.parkedTasks.set(task.id, cloneValue(task as unknown as WooValue) as unknown as ParkedTaskRecord);
+        this.parkedTasks.set(task.id, cloneImportedPlainData(task));
       }
       this.objectCounter = serialized.objectCounter ?? serialized.taskCounter ?? 1;
       this.parkedTaskCounter = serialized.parkedTaskCounter ?? 1;
@@ -10725,6 +10722,58 @@ function appendQuery(base: string, params: Record<string, string>): string {
 }
 
 const STORAGE_FLUSH_TOP_N = 5;
+
+type BytecodeVerbDef = Extract<VerbDef, { kind: "bytecode" }>;
+
+function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
+  // importWorld may hydrate directly from cached boot snapshots. Copy every
+  // mutable verb cell so callers can freely edit the live world without
+  // poisoning the serialized source reused by later cold boots.
+  const parsedPerms = normalizeVerbPerms(verb.perms, verb.direct_callable === true);
+  const common = {
+    aliases: [...verb.aliases],
+    arg_spec: cloneImportedRecord(verb.arg_spec),
+    line_map: cloneImportedRecord(verb.line_map),
+    ...(verb.calls !== undefined ? { calls: verb.calls.map((call) => ({ ...call })) } : {}),
+    perms: parsedPerms.perms,
+    direct_callable: parsedPerms.directCallable,
+    slot
+  };
+  if (verb.kind === "bytecode") {
+    return {
+      ...verb,
+      ...common,
+      bytecode: cloneImportedBytecode(verb.bytecode)
+    };
+  }
+  return {
+    ...verb,
+    ...common
+  };
+}
+
+function cloneImportedBytecode(bytecode: BytecodeVerbDef["bytecode"]): BytecodeVerbDef["bytecode"] {
+  return {
+    ...bytecode,
+    ops: bytecode.ops.map((op) => cloneImportedPlainData(op) as BytecodeVerbDef["bytecode"]["ops"][number]),
+    literals: cloneImportedPlainData(bytecode.literals)
+  };
+}
+
+function cloneImportedRecord(value: Record<string, WooValue>): Record<string, WooValue> {
+  return cloneImportedPlainData(value);
+}
+
+function cloneImportedPlainData<T>(value: T): T {
+  // Serialized worlds are JSON-shaped data. A narrow copier is much cheaper
+  // than structuredClone here and still gives importWorld the by-value
+  // isolation contract it needs for cached snapshots.
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => cloneImportedPlainData(item)) as T;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) out[key] = cloneImportedPlainData(entry);
+  return out as T;
+}
 
 function sortedMap<K extends string, V>(map: Map<K, V>): Map<K, V> {
   return new Map(Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b)));

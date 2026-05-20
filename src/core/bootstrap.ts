@@ -465,7 +465,7 @@ export function createWorld(options: { repository?: WorldRepository & Partial<Ob
   if (!options.repository) {
     const world = new WooWorld();
     if (options.metricsHook) world.setMetricsHook(options.metricsHook);
-    world.importWorld(cloneSerializedWorld(cachedBootSnapshot(options.catalogs)));
+    world.importWorld(cachedBootSnapshot(options.catalogs));
     world.enableIncrementalPersistence();
     return world;
   }
@@ -486,7 +486,7 @@ export function createWorld(options: { repository?: WorldRepository & Partial<Ob
     // boot snapshot as in-memory worlds. Reusing the cached snapshot avoids
     // recompiling/reinstalling bundled catalogs for every empty test or cold
     // repository while preserving the persisted first-save shape.
-    world.importWorld(cloneSerializedWorld(cachedBootSnapshot(options.catalogs)));
+    world.importWorld(cachedBootSnapshot(options.catalogs));
     world.persist();
   }
   world.enableIncrementalPersistence();
@@ -946,10 +946,6 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
 
   // Children/contents/modified explicitly NOT merged (HS2.2 skip-list).
   return changed;
-}
-
-function cloneSerializedWorld(value: SerializedWorld): SerializedWorld {
-  return cloneSerialized(value);
 }
 
 function cloneSerializedObject(value: SerializedObject): SerializedObject {
