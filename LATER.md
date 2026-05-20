@@ -7,6 +7,8 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+- consolidate DO shared paths
+
 - syntax for @-someone
 
 want to integrate this as a hermes plugin
