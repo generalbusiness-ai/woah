@@ -10,7 +10,8 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
-  buildShadowBrowserProjectionTransfer,
+  applyShadowBrowserTransfer,
+  buildShadowBrowserCatchupTransferForBrowser,
   buildShadowBrowserSessionAuth,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
@@ -25,9 +26,11 @@ import {
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
+  setShadowBrowserSessionToken,
   shadowLiveEventMatchesBrowser,
   shadowLiveEventsForTranscript,
   shadowBrowserTransportHello,
+  subscribeShadowBrowserNode,
   type ShadowBrowserEnvelopeReceipt,
   type ShadowBrowserRelayShim,
   type ShadowBrowserStateTransfer,
@@ -259,10 +262,9 @@ export class CommitScopeDO {
           }
           const relay = await this.relayFor(input);
           this.ensureSerializedSession(relay, input);
-          const transfer = buildShadowBrowserProjectionTransfer(relay, input.transfer_scope, input.node, {
-            actor: input.actor,
-            session: input.session
-          });
+          const browser = this.stateTransferBrowserFor(relay, input);
+          const transfer = buildShadowBrowserCatchupTransferForBrowser(browser, input.transfer_scope, input.last_known_head);
+          this.applyStateTransferToBrowserCache(browser, transfer);
           this.emitMetric({
             kind: "v2_state_transfer",
             scope: input.transfer_scope,
@@ -434,6 +436,28 @@ export class CommitScopeDO {
       relay,
       token: input.token
     });
+  }
+
+  private stateTransferBrowserFor(relay: ShadowBrowserRelayShim, input: CommitScopeStateTransferRequest) {
+    const existing = relay.browsers.get(input.node);
+    if (existing && existing.actor === input.actor && existing.session === input.session) {
+      setShadowBrowserSessionToken(existing, input.token);
+      return existing;
+    }
+    const browser = this.browserFor(relay, input);
+    subscribeShadowBrowserNode(browser, input.transfer_scope);
+    return browser;
+  }
+
+  private applyStateTransferToBrowserCache(browser: ReturnType<CommitScopeDO["browserFor"]>, transfer: ShadowBrowserStateTransfer): void {
+    if (transfer.mode !== "delta" || !transfer.projection_patch) {
+      applyShadowBrowserTransfer(browser, transfer);
+      return;
+    }
+    const currentSeq = shadowProjectionSeq(browser.cache.projections.get(transfer.scope));
+    if (currentSeq === transfer.projection_patch.base.seq || currentSeq !== transfer.to.seq) {
+      applyShadowBrowserTransfer(browser, transfer);
+    }
   }
 
   private fanoutEnvelopes(
@@ -974,6 +998,7 @@ type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {
 
 type CommitScopeStateTransferRequest = CommitScopeBaseRequest & {
   transfer_scope: ObjRef;
+  last_known_head?: ShadowScopeHead;
 };
 
 type CommitScopeEnvelopeResponse = {
@@ -999,6 +1024,12 @@ type CommitScopeMetaRow = {
   parked_task_counter?: number;
   session_counter?: number;
 };
+
+function shadowProjectionSeq(value: unknown): number | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const seq = (value as { seq?: unknown }).seq;
+  return typeof seq === "number" ? seq : null;
+}
 
 async function readJson<T>(request: Request): Promise<T> {
   return await request.json() as T;

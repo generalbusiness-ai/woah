@@ -24,8 +24,9 @@ import { installGitHubTap, updateGitHubTap } from "./github-taps";
 import { LocalSQLiteRepository } from "./sqlite-repository";
 import { McpGateway } from "../mcp/gateway";
 import {
+  applyShadowBrowserTransfer,
   buildShadowBrowserSessionAuth,
-  buildShadowBrowserDeltaTransfer,
+  buildShadowBrowserDeltaTransferForBrowser,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
@@ -663,10 +664,7 @@ function sendDevV2Fanout(
     if (origin.relay.subscriptions.get(body.commit.position.scope)?.has(browser.node) !== true) continue;
     const socket = v2SocketsByNode.get(browser.node);
     if (!socket || socket.readyState !== WebSocket.OPEN) continue;
-    const transfer = buildShadowBrowserDeltaTransfer(origin.relay, body.commit as ShadowCommitAccepted, body.transcript, browser.node, {
-      actor: browser.actor,
-      session: browser.session
-    });
+    const transfer = buildShadowBrowserDeltaTransferForBrowser(origin.relay, browser, body.commit as ShadowCommitAccepted, body.transcript);
     socket.send(encodeEnvelope({
       v: 2,
       type: transfer.kind,
@@ -678,6 +676,7 @@ function sendDevV2Fanout(
       auth: { mode: "session", token: browser.session_token ?? "" },
       body: transfer
     } satisfies ShadowEnvelope<typeof transfer>));
+    applyShadowBrowserTransfer(browser, transfer);
   }
 }
 

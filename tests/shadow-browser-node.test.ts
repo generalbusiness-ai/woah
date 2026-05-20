@@ -18,6 +18,7 @@ import {
   mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
+  publishShadowBrowserAcceptedFrame,
   publishShadowBrowserLiveEvent,
   purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
@@ -37,10 +38,10 @@ import {
 } from "../src/core/shadow-browser-node";
 import { hashSource } from "../src/core/source-hash";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
-import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
+import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import type { ShadowCommitAccepted, ShadowScopeHead } from "../src/core/shadow-commit-scope";
+import { submitShadowCommit, type ShadowCommitAccepted, type ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 
 describe("shadow browser node shim", () => {
@@ -203,7 +204,7 @@ describe("shadow browser node shim", () => {
 
     const live = await executeShadowBrowserTurn(browser, {
       id: "browser-dubspace-live-enter",
-      route: "direct",
+      route: "sequenced",
       target: "the_dubspace",
       verb: "enter",
       args: [],
@@ -799,6 +800,77 @@ describe("shadow browser node shim", () => {
       seq: 1
     });
     expect(worldFor(first).getProp("delay_1", "wet")).toBe(0.91);
+  });
+
+  it("fans out accepted-frame projection patches without rebuilding a full projection per subscriber", async () => {
+    const anchor = createWorld();
+    for (let index = 0; index < 32; index += 1) {
+      const id = `projection_fanout_item_${index}`;
+      anchor.createObject({ id, name: `Projection fan-out item ${index}`, parent: "$thing", owner: "$wiz", location: "the_dubspace" });
+      anchor.setProp(id, "description", `projection fan-out description ${index}`);
+    }
+    const sessions = await Promise.all(Array.from({ length: 4 }, async (_item, index) => {
+      const session = anchor.auth(`guest:browser-projection-fanout-${index}`);
+      await anchor.directCall(`browser-projection-fanout-enter-${index}`, session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+      return session;
+    }));
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-projection-fanout-relay",
+      scope: "the_dubspace",
+      serialized: anchor.exportWorld()
+    });
+    const browsers = sessions.map((session, index) => createShadowBrowserNode({
+      node: `browser-projection-fanout-${index}`,
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay
+    }));
+    for (const browser of browsers) await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-projection-fanout-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: sessions[0].id,
+      actor: sessions[0].actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.73]
+    };
+    const planned = await runShadowTurnCallTranscript(relay.commit_scope.serialized, call);
+    const accepted = submitShadowCommit(relay.commit_scope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: call.id,
+      scope: call.scope,
+      expected: relay.commit_scope.head,
+      transcript: planned.transcript
+    });
+    if (accepted.kind !== "woo.commit.accepted.shadow.v1") throw new Error(`expected accepted commit: ${accepted.errors.join(", ")}`);
+
+    const baseProjection = browsers[0].cache.projections.get("the_dubspace");
+    if (!baseProjection || typeof baseProjection !== "object" || Array.isArray(baseProjection) || !("objects" in baseProjection) || !Array.isArray(baseProjection.objects)) {
+      throw new Error("expected cached base projection");
+    }
+    const visibleObjects = baseProjection.objects.length;
+    const originalStructuredClone = globalThis.structuredClone;
+    const cloneSpy = vi.spyOn(globalThis, "structuredClone").mockImplementation((value) => originalStructuredClone(value));
+    try {
+      publishShadowBrowserAcceptedFrame(relay, accepted, planned.transcript);
+    } finally {
+      cloneSpy.mockRestore();
+    }
+
+    expect(cloneSpy.mock.calls.length).toBeLessThan(visibleObjects * browsers.length);
+    for (const browser of browsers) {
+      const delta = browser.cache.transfers.filter((transfer) => transfer.mode === "delta").at(-1);
+      expect(delta).toBeDefined();
+      if (!delta || delta.mode !== "delta") throw new Error("expected accepted-frame delta");
+      expect(delta.projection).toBeUndefined();
+      expect(delta.projection_patch?.objects.upsert.map((item) => item.id)).toEqual(["delay_1"]);
+      expect(browser.cache.projections.get("the_dubspace")).toMatchObject({ seq: 1 });
+    }
   });
 
   it("rejects tampered browser projection transfers", async () => {

@@ -702,9 +702,9 @@ export function transcriptTouchedObjectIds(transcript: EffectTranscript): Set<Ob
     if (create.location) ids.add(create.location);
   }
   for (const write of transcript.writes) {
-    if (write.cell.kind === "prop" || write.cell.kind === "location" || write.cell.kind === "contents" || write.cell.kind === "lifecycle") {
-      ids.add(write.cell.object);
-    }
+    // Projection summaries include object metadata and inherited definitions,
+    // so every written cell can change this object or a descendant summary.
+    ids.add(write.cell.object);
   }
   return ids;
 }

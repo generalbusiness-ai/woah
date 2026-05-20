@@ -704,7 +704,8 @@ export async function executeShadowTurnCallOrNeedState(
     }
   }
 
-  const commit = options.commitScope && request.persistence !== "live"
+  const livePersistence = request.persistence === "live";
+  const commit = options.commitScope && !livePersistence
     ? submitShadowCommit(options.commitScope, {
         kind: "woo.commit.submit.shadow.v1",
         id: request.id ?? request.call.id,
@@ -718,7 +719,13 @@ export async function executeShadowTurnCallOrNeedState(
     : null;
   const receipt = commit
     ? commit.receipt
-    : shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript);
+    : livePersistence
+      // Live persistence is not authority-bearing: it may run through the
+      // sequenced route to reuse catalog behavior, but its writes are discarded
+      // below. Validate transcript completeness, not durable read versions that
+      // include ephemeral sequencer bookkeeping from this same live turn.
+      ? shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript, [], { ok: true, errors: [] })
+      : shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript);
   if (!receipt.accepted) {
     node.world = undefined;
     const conflict = commit?.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
@@ -746,7 +753,6 @@ export async function executeShadowTurnCallOrNeedState(
     };
   }
 
-  const livePersistence = request.persistence === "live";
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
     ? options.commitScope?.serialized ?? requireSerializedAfter(run)
     : livePersistence

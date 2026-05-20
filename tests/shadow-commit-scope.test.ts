@@ -5,7 +5,8 @@ import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import {
   applyShadowTranscriptToCommittedState,
   applyShadowTranscriptToCommitScopeCache,
-  createShadowCommitScope
+  createShadowCommitScope,
+  transcriptTouchedObjectIds
 } from "../src/core/shadow-commit-scope";
 import type { MetricEvent } from "../src/core/types";
 
@@ -48,6 +49,30 @@ describe("shadow commit scope", () => {
       object: "room",
       id: "bad-remove"
     });
+  });
+
+  it("tracks every written cell's object as touched for projection dependency patches", () => {
+    const transcript: EffectTranscript = {
+      ...addChildTranscript(),
+      id: "all-write-kinds",
+      hash: "transcript:all-write-kinds",
+      creates: [],
+      writes: [
+        { cell: { kind: "prop", object: "prop_source", name: "name" }, value: "Prop Source", op: "set" },
+        { cell: { kind: "verb", object: "verb_source", name: "look" }, value: null, op: "set" },
+        { cell: { kind: "location", object: "moved_object" }, value: "room", op: "move" },
+        { cell: { kind: "contents", object: "container" }, value: ["moved_object"], op: "replace" },
+        { cell: { kind: "lifecycle", object: "created_object" }, value: true, op: "create" }
+      ]
+    };
+
+    expect([...transcriptTouchedObjectIds(transcript)].sort()).toEqual([
+      "container",
+      "created_object",
+      "moved_object",
+      "prop_source",
+      "verb_source"
+    ]);
   });
 });
 

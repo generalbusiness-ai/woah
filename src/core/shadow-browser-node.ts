@@ -1,5 +1,12 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
-import { createShadowCommitScope, markShadowCommitScopeSerializedChanged, type ShadowCommitAccepted, type ShadowCommitConflict, type ShadowCommitScope } from "./shadow-commit-scope";
+import {
+  createShadowCommitScope,
+  markShadowCommitScopeSerializedChanged,
+  transcriptTouchedObjectIds,
+  type ShadowCommitAccepted,
+  type ShadowCommitConflict,
+  type ShadowCommitScope
+} from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
   createShadowExecutionNode,
@@ -645,7 +652,7 @@ export async function openShadowBrowserScope(
   subscribeShadowBrowserNode(browser, browser.scope);
   // Scope open enters the state plane even for display-only projection data, so
   // every cache fill goes through the same recipient-bound verification path.
-  const transfer = buildShadowBrowserCatchupTransfer(browser.relay, browser.scope, browser.node, options.last_known_head, shadowProjectionViewer(browser));
+  const transfer = buildShadowBrowserCatchupTransferForBrowser(browser, browser.scope, options.last_known_head);
   applyShadowBrowserTransfer(browser, transfer);
   let executableTransfer: ShadowStateTransfer;
   let executableSeedDigest: string | null = cachedOpenSeed?.generation === browser.relay.serialized_generation ? cachedOpenSeed.digest : null;
@@ -1307,6 +1314,25 @@ export function buildShadowBrowserDeltaTransfer(
   return buildShadowBrowserDeltaTransferFromFrames(relay, [accepted], [transcript], recipient, viewer, baseProjection, baseHead);
 }
 
+export function buildShadowBrowserDeltaTransferForBrowser(
+  relay: ShadowBrowserRelayShim,
+  browser: ShadowBrowserNode,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): ShadowDeltaTransfer {
+  const baseProjection = browser.cache.projections.get(accepted.position.scope);
+  return buildShadowBrowserDeltaTransfer(
+    relay,
+    accepted,
+    transcript,
+    browser.node,
+    shadowProjectionViewer(browser),
+    isShadowScopeProjection(baseProjection) ? baseProjection : undefined,
+    shadowBrowserCachedProjectionHead(browser, accepted.position.scope) ??
+      shadowBrowserProjectionHead(baseProjection, accepted.position.scope, accepted.position.epoch)
+  );
+}
+
 export function buildShadowBrowserDeltaTransferFromFrames(
   relay: ShadowBrowserRelayShim,
   acceptedFrames: ShadowCommitAccepted[],
@@ -1329,7 +1355,6 @@ export function buildShadowBrowserDeltaTransferFromFrames(
     return transcript;
   });
   const to = structuredClone(ordered[ordered.length - 1].position) as ShadowCommitAccepted["position"];
-  const projection = shadowScopeProjection(relay.commit_scope.serialized, scope, to.seq, viewer);
   // Delta transfer carries the committed frame plus transcript tail needed by
   // browser caches to catch up without receiving executable closure state.
   const common = {
@@ -1340,6 +1365,24 @@ export function buildShadowBrowserDeltaTransferFromFrames(
     applied: ordered.map((frame) => structuredClone(frame) as ShadowCommitAccepted),
     transcript_tail: orderedTranscripts.map((transcript) => structuredClone(transcript) as EffectTranscript)
   } satisfies Omit<ShadowDeltaTransfer, "proof" | "projection" | "projection_patch">;
+  if (ordered.length === 1 && baseProjection && baseHead && baseProjection.scope === scope && baseHead.scope === scope) {
+    const projectionPatch = shadowScopeProjectionPatchFromTranscript(
+      relay.commit_scope.serialized,
+      ordered[0],
+      orderedTranscripts[0],
+      baseProjection,
+      baseHead,
+      viewer
+    );
+    if (projectionPatch) {
+      const patchTransfer = {
+        ...common,
+        projection_patch: projectionPatch
+      } satisfies Omit<ShadowDeltaTransfer, "proof">;
+      return { ...patchTransfer, proof: signShadowBrowserStateTransfer(patchTransfer, relay.state_signing, recipient) };
+    }
+  }
+  const projection = shadowScopeProjection(relay.commit_scope.serialized, scope, to.seq, viewer);
   const fullTransfer = {
     ...common,
     projection
@@ -1381,7 +1424,9 @@ export function buildShadowBrowserCatchupTransfer(
   scope: ObjRef,
   recipient: string,
   lastKnownHead?: ShadowCommitAccepted["position"],
-  viewer?: ShadowProjectionViewer
+  viewer?: ShadowProjectionViewer,
+  baseProjection?: ShadowScopeProjection,
+  baseHead?: ShadowCommitAccepted["position"]
 ): ShadowProjectionTransfer | ShadowDeltaTransfer {
   if (
     lastKnownHead &&
@@ -1401,7 +1446,7 @@ export function buildShadowBrowserCatchupTransfer(
     const transcriptByHash = new Map(relay.transcript_tail.map((item) => [item.hash, item] as const));
     const transcripts = accepted.map((frame) => transcriptByHash.get(frame.transcript_hash));
     if (hasContiguousTail && transcripts.every((item): item is EffectTranscript => Boolean(item))) {
-      const delta = buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient, viewer);
+      const delta = buildShadowBrowserDeltaTransferFromFrames(relay, accepted, transcripts, recipient, viewer, baseProjection, baseHead);
       // A retained tail can still be the wrong transfer choice when the browser
       // has been away for many chatty turns. Projection fallback is smaller for
       // display catch-up and preserves the one-frame WebSocket contract.
@@ -1409,6 +1454,24 @@ export function buildShadowBrowserCatchupTransfer(
     }
   }
   return buildShadowBrowserProjectionTransfer(relay, scope, recipient, viewer);
+}
+
+export function buildShadowBrowserCatchupTransferForBrowser(
+  browser: ShadowBrowserNode,
+  scope: ObjRef,
+  lastKnownHead?: ShadowCommitAccepted["position"]
+): ShadowProjectionTransfer | ShadowDeltaTransfer {
+  const requestedHead = lastKnownHead;
+  const cachedBase = requestedHead ? shadowBrowserCachedProjectionBase(browser, scope, requestedHead) : null;
+  return buildShadowBrowserCatchupTransfer(
+    browser.relay,
+    scope,
+    browser.node,
+    requestedHead,
+    shadowProjectionViewer(browser),
+    cachedBase?.projection,
+    cachedBase?.head
+  );
 }
 
 function shadowBrowserTransferBodyByteLength(
@@ -1439,16 +1502,7 @@ export function publishShadowBrowserAcceptedFrame(
     if (relay.subscriptions.get(accepted.position.scope)?.has(browser.node) !== true) continue;
     // The originator is often subscribed too; accepted-frame dedup below makes
     // that round trip harmless while preserving one relay fan-out path.
-    const baseProjection = browser.cache.projections.get(accepted.position.scope);
-    const transfer = buildShadowBrowserDeltaTransfer(
-      relay,
-      accepted,
-      transcript,
-      browser.node,
-      shadowProjectionViewer(browser),
-      isShadowScopeProjection(baseProjection) ? baseProjection : undefined,
-      shadowBrowserCachedProjectionHead(browser, accepted.position.scope) ?? shadowBrowserProjectionHead(baseProjection, accepted.position.scope, accepted.position.epoch)
-    );
+    const transfer = buildShadowBrowserDeltaTransferForBrowser(relay, browser, accepted, transcript);
     applyShadowBrowserTransfer(browser, transfer);
   }
 }
@@ -2032,14 +2086,82 @@ export function applyShadowScopeProjectionPatch(
   if (!isShadowScopeProjection(baseProjection)) throw new Error("shadow projection patch requires cached base projection");
   if (baseProjection.scope !== patch.scope || baseProjection.seq !== patch.base.seq) throw new Error("shadow projection patch base mismatch");
   if (baseHead && !shadowScopeHeadsCompatible(baseHead, patch.base)) throw new Error("shadow projection patch head mismatch");
-  const projection = structuredClone(baseProjection) as ShadowScopeProjection;
-  Object.assign(projection, structuredClone(patch.fields) as typeof patch.fields);
-  projection.kind = "woo.scope_projection.shadow.v1";
-  projection.scope = patch.scope;
-  projection.seq = patch.to.seq;
-  projection.objects = applyShadowProjectionListPatch(baseProjection.objects, patch.objects);
-  if (patch.inventory) projection.inventory = applyShadowProjectionListPatch(baseProjection.inventory ?? [], patch.inventory);
+  const projection = {
+    ...baseProjection,
+    ...(structuredClone(patch.fields) as typeof patch.fields),
+    kind: "woo.scope_projection.shadow.v1",
+    scope: patch.scope,
+    seq: patch.to.seq,
+    objects: applyShadowProjectionListPatch(baseProjection.objects, patch.objects)
+  } satisfies ShadowScopeProjection;
+  if (patch.inventory) {
+    projection.inventory = applyShadowProjectionListPatch(baseProjection.inventory ?? [], patch.inventory);
+  }
   return projection;
+}
+
+function shadowScopeProjectionPatchFromTranscript(
+  serialized: SerializedWorld,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript,
+  baseProjection: ShadowScopeProjection,
+  baseHead: ShadowCommitAccepted["position"],
+  viewer?: ShadowProjectionViewer
+): ShadowScopeProjectionPatch | null {
+  const scope = accepted.position.scope;
+  if (
+    baseHead.scope !== scope ||
+    baseHead.epoch !== accepted.position.epoch ||
+    baseHead.seq !== accepted.position.seq - 1 ||
+    baseProjection.seq !== baseHead.seq
+  ) {
+    return null;
+  }
+  const index = shadowSerializedIndex(serialized);
+  const scopeObj = index.objects.get(scope);
+  const actorObj = viewer?.actor ? index.objects.get(viewer.actor) : undefined;
+  const session = viewer?.session ? index.sessions.get(viewer.session) : undefined;
+  const changedObjects = transcriptTouchedObjectIds(transcript);
+  const fields: ShadowScopeProjectionPatch["fields"] = {};
+  setShadowProjectionPatchField(fields, baseProjection, "title", scopeObj?.name ?? scope);
+  setShadowProjectionPatchField(fields, baseProjection, "object_count", serialized.objects.length);
+  setShadowProjectionPatchField(fields, baseProjection, "contents", scopeObj?.contents ?? []);
+  setShadowProjectionPatchField(fields, baseProjection, "seq", accepted.position.seq);
+  setShadowProjectionPatchField(fields, baseProjection, "cursor", { spaces: { [scope]: { next_seq: accepted.position.seq + 1 } }, live: { resumable: false } });
+  if (viewer) {
+    setShadowProjectionPatchField(fields, baseProjection, "viewer", viewer);
+    setShadowProjectionPatchField(fields, baseProjection, "self", actorObj ? shadowSerializedObjectSummary(index, actorObj, viewer.actor) : null);
+    setShadowProjectionPatchField(fields, baseProjection, "session", viewer.session ? {
+      id: viewer.session,
+      actor: viewer.actor,
+      active_scope: session?.activeScope ?? null,
+      current_location: session?.activeScope ?? null,
+      all_locations: session?.activeScope ? [session.activeScope] : []
+    } : null);
+  }
+  setShadowProjectionPatchField(fields, baseProjection, "subject", scopeObj ? shadowSerializedObjectSummary(index, scopeObj, viewer?.actor) : null);
+  const objects = shadowProjectionListPatchFromRefs(index, baseProjection.objects, shadowProjectionRefs(index, scope, viewer), changedObjects, viewer?.actor);
+  const inventory = viewer
+    ? shadowProjectionListPatchFromRefs(index, baseProjection.inventory ?? [], actorObj?.contents ?? [], changedObjects, viewer.actor)
+    : null;
+  return {
+    kind: "woo.scope_projection_patch.shadow.v1",
+    scope,
+    base: structuredClone(baseHead) as ShadowCommitAccepted["position"],
+    to: structuredClone(accepted.position) as ShadowCommitAccepted["position"],
+    fields,
+    objects,
+    ...(inventory && shadowProjectionListPatchHasChanges(baseProjection.inventory ?? [], inventory) ? { inventory } : {})
+  };
+}
+
+function setShadowProjectionPatchField<K extends ShadowScopeProjectionPatchField>(
+  fields: ShadowScopeProjectionPatch["fields"],
+  baseProjection: ShadowScopeProjection,
+  field: K,
+  value: ShadowScopeProjection[K]
+): void {
+  if (!shadowValuesEqual(baseProjection[field], value)) fields[field] = structuredClone(value) as never;
 }
 
 function shadowScopeProjectionPatch(
@@ -2076,8 +2198,56 @@ function shadowProjectionListPatch(base: ScopedObjectSummary[], next: ScopedObje
   };
 }
 
+function shadowProjectionListPatchFromRefs(
+  index: ShadowSerializedIndex,
+  base: ScopedObjectSummary[],
+  nextRefs: ObjRef[],
+  changedObjects: ReadonlySet<ObjRef>,
+  actor?: ObjRef
+): ShadowProjectionListPatch {
+  const baseById = new Map(base.map((item) => [item.id, item] as const));
+  const nextIds = nextRefs.filter((id) => index.objects.has(id));
+  const nextById = new Set(nextIds);
+  const upsert: ScopedObjectSummary[] = [];
+  for (const id of nextIds) {
+    if (!baseById.has(id) || shadowProjectionSummaryMayHaveChanged(index, id, changedObjects)) {
+      const obj = index.objects.get(id);
+      if (obj) upsert.push(shadowSerializedObjectSummary(index, obj, actor));
+    }
+  }
+  return {
+    order: nextIds,
+    upsert,
+    remove: base.filter((item) => !nextById.has(item.id)).map((item) => item.id)
+  };
+}
+
+function shadowProjectionSummaryMayHaveChanged(
+  index: ShadowSerializedIndex,
+  objRef: ObjRef,
+  changedObjects: ReadonlySet<ObjRef>
+): boolean {
+  if (changedObjects.size === 0) return false;
+  let current = index.objects.get(objRef) ?? null;
+  const seen = new Set<ObjRef>();
+  while (current && !seen.has(current.id)) {
+    if (changedObjects.has(current.id)) return true;
+    seen.add(current.id);
+    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+  }
+  return false;
+}
+
+function shadowProjectionListPatchHasChanges(base: ScopedObjectSummary[], patch: ShadowProjectionListPatch): boolean {
+  if (patch.upsert.length > 0 || patch.remove.length > 0) return true;
+  if (base.length !== patch.order.length) return true;
+  return base.some((item, index) => item.id !== patch.order[index]);
+}
+
 function applyShadowProjectionListPatch(base: ScopedObjectSummary[], patch: ShadowProjectionListPatch): ScopedObjectSummary[] {
-  const byId = new Map(base.map((item) => [item.id, structuredClone(item) as ScopedObjectSummary] as const));
+  // Base summaries are shared by reference for unchanged rows; projection cache
+  // callers must treat summary entries as immutable.
+  const byId = new Map(base.map((item) => [item.id, item] as const));
   for (const id of patch.remove) byId.delete(id);
   for (const item of patch.upsert) byId.set(item.id, structuredClone(item) as ScopedObjectSummary);
   return patch.order
@@ -2102,6 +2272,27 @@ function shadowBrowserCachedProjectionHead(browser: ShadowBrowserNode, scope: Ob
     }
   }
   return undefined;
+}
+
+function shadowBrowserCachedProjectionBase(
+  browser: ShadowBrowserNode,
+  scope: ObjRef,
+  head: ShadowCommitAccepted["position"]
+): { projection: ShadowScopeProjection; head: ShadowCommitAccepted["position"] } | null {
+  const current = browser.cache.projections.get(scope);
+  const currentHead = shadowBrowserCachedProjectionHead(browser, scope) ??
+    shadowBrowserProjectionHead(current, scope, browser.relay.commit_scope.head.epoch);
+  if (currentHead && shadowScopeHeadsCompatible(currentHead, head) && isShadowScopeProjection(current)) {
+    return { projection: current, head: currentHead };
+  }
+  for (let index = browser.cache.transfers.length - 1; index >= 0; index -= 1) {
+    const transfer = browser.cache.transfers[index];
+    if ((transfer.mode !== "projection" && transfer.mode !== "delta") || transfer.scope !== scope) continue;
+    if (!shadowScopeHeadsCompatible(transfer.to, head)) continue;
+    if (transfer.mode === "projection") return { projection: transfer.projection, head: transfer.to };
+    if (transfer.projection) return { projection: transfer.projection, head: transfer.to };
+  }
+  return null;
 }
 
 function shadowBrowserProjectionHead(value: WooValue | undefined, scope: ObjRef, epoch: number): ShadowCommitAccepted["position"] | undefined {

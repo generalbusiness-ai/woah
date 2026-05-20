@@ -11,6 +11,7 @@ import {
 } from "../../src/core/shadow-browser-node";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
+import type { ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
 import type { CallContext, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
 import { CFObjectRepository } from "../../src/worker/cf-repository";
@@ -474,6 +475,123 @@ describe("v2 Worker fan-out helpers", () => {
         })
       }));
       await expect(target.fetch(request)).rejects.toThrow(/state transfer scope mismatch/);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("serves Worker state-transfer fan-out as a patch from the socket's last known head", async () => {
+    const secret = "cf-test-secret";
+    const state = new FakeDurableObjectState("the_dubspace");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+    try {
+      const world = createWorld();
+      const session = world.auth("guest:cf-state-patch");
+      await world.directCall("cf-state-patch-enter", session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+      const serialized = world.exportWorld();
+      const token = "token:cf-state-patch";
+      const node = "browser:cf-state-patch";
+      const openRequest = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_dubspace",
+          node,
+          token,
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          session_objects: world.exportObjects([session.actor]),
+          serialized
+        })
+      }));
+      const opened = await target.fetch(openRequest);
+      expect(opened.ok).toBe(true);
+      const openedPayload = await opened.json() as { head: ShadowScopeHead };
+
+      const localRelay = createShadowBrowserRelayShim({
+        node: "cf-state-patch-local-relay",
+        scope: "the_dubspace",
+        serialized
+      });
+      const localBrowser = createShadowBrowserNode({
+        node,
+        scope: "the_dubspace",
+        actor: session.actor,
+        session: session.id,
+        relay: localRelay
+      });
+      setShadowBrowserSessionToken(localBrowser, token);
+      const call: ShadowTurnCall = {
+        kind: "woo.turn_call.shadow.v1",
+        id: "cf-state-patch-wet",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.62]
+      };
+      const planned = await runShadowTurnCall(localRelay.commit_scope.serialized, call);
+      const turnRequest = {
+        kind: "woo.turn.exec.request.shadow.v1" as const,
+        id: call.id,
+        call,
+        key: shadowTurnKeyFromTranscript(planned.transcript),
+        expected: openedPayload.head,
+        persistence: "durable" as const
+      };
+      const envelope = encodeEnvelope(shadowBrowserEnvelope(localBrowser, turnRequest.kind, turnRequest, "cf-state-patch-envelope"));
+      const envelopeRequest = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/envelope", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_dubspace",
+          node,
+          token,
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          session_objects: world.exportObjects([session.actor]),
+          envelope
+        })
+      }));
+      const envelopeResponse = await target.fetch(envelopeRequest);
+      expect(envelopeResponse.ok).toBe(true);
+      await expect(envelopeResponse.json()).resolves.toMatchObject({
+        reply: expect.any(String),
+        head: expect.objectContaining({ seq: openedPayload.head.seq + 1 })
+      });
+
+      const transferRequest = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/state-transfer", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_dubspace",
+          transfer_scope: "the_dubspace",
+          node,
+          token,
+          session: session.id,
+          actor: session.actor,
+          sessions: world.exportSessions(),
+          session_objects: world.exportObjects([session.actor]),
+          last_known_head: openedPayload.head
+        })
+      }));
+      const transferResponse = await target.fetch(transferRequest);
+      expect(transferResponse.ok).toBe(true);
+      const transferPayload = await transferResponse.json() as Record<string, any>;
+      expect(transferPayload.transfer).toMatchObject({
+        mode: "delta",
+        scope: "the_dubspace",
+        projection_patch: {
+          base: { seq: openedPayload.head.seq },
+          to: { seq: openedPayload.head.seq + 1 }
+        }
+      });
+      expect(transferPayload.transfer.projection).toBeUndefined();
+      expect(transferPayload.transfer.projection_patch.objects.upsert.map((item: { id: string }) => item.id)).toEqual(["delay_1"]);
     } finally {
       state.close();
     }

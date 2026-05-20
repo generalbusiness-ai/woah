@@ -175,6 +175,7 @@ type V2SocketAttachment = {
   scope: ObjRef;
   token?: string;
   openedAt?: number;
+  stateHead?: ShadowScopeHead;
 };
 
 const WORLD_HOST = "world";
@@ -2681,6 +2682,7 @@ export class PersistentObjectDO {
         auth: { mode: "session", token },
         body: transfer
       } satisfies ShadowEnvelope<typeof transfer>));
+      if ("to" in transfer) this.updateV2SocketStateHead(server, transfer.to);
       const executableTransfer = opened.executable_transfer;
       if (executableTransfer) {
         server.send(encodeEnvelope({
@@ -3201,7 +3203,8 @@ export class PersistentObjectDO {
         token: att.token,
         session: att.sessionId,
         actor: att.actor,
-        transfer_scope: att.scope
+        transfer_scope: att.scope,
+        ...(att.stateHead ? { last_known_head: att.stateHead } : {})
       });
       ws.send(encodeEnvelope({
         v: 2,
@@ -3214,6 +3217,7 @@ export class PersistentObjectDO {
         auth: { mode: "session", token: att.token },
         body: transfer.transfer
       } satisfies ShadowEnvelope<typeof transfer.transfer>));
+      if ("to" in transfer.transfer) this.updateV2SocketStateHead(ws, transfer.transfer.to);
     } catch (err) {
       console.warn("woo.v2_browser_commit_fanout.state_transfer_failed", {
         node: att.node,
@@ -3413,6 +3417,7 @@ export class PersistentObjectDO {
   // ---- WS helpers ----
 
   private attachment(ws: WebSocket): V2SocketAttachment | null {
+    if (typeof ws.deserializeAttachment !== "function") return null;
     const raw = ws.deserializeAttachment();
     if (!raw || typeof raw !== "object") return null;
     const a = raw as Record<string, unknown>;
@@ -3425,8 +3430,29 @@ export class PersistentObjectDO {
       ...(typeof a.node === "string" ? { node: a.node } : {}),
       scope: (typeof a.scope === "string" ? a.scope : a.actor) as ObjRef,
       ...(typeof a.token === "string" ? { token: a.token } : {}),
-      ...(typeof a.openedAt === "number" ? { openedAt: a.openedAt } : {})
+      ...(typeof a.openedAt === "number" ? { openedAt: a.openedAt } : {}),
+      ...(this.isShadowScopeHeadRecord(a.stateHead) ? { stateHead: a.stateHead } : {})
     };
+  }
+
+  private isShadowScopeHeadRecord(value: unknown): value is ShadowScopeHead {
+    return Boolean(
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      (value as { kind?: unknown }).kind === "woo.scope_head.shadow.v1" &&
+      typeof (value as { scope?: unknown }).scope === "string" &&
+      typeof (value as { epoch?: unknown }).epoch === "number" &&
+      typeof (value as { seq?: unknown }).seq === "number" &&
+      typeof (value as { hash?: unknown }).hash === "string"
+    );
+  }
+
+  private updateV2SocketStateHead(ws: WebSocket, stateHead: ShadowScopeHead): void {
+    const att = this.attachment(ws);
+    if (!att) return;
+    if (typeof ws.serializeAttachment !== "function") return;
+    ws.serializeAttachment({ ...att, stateHead });
   }
 
   // Helper used at every cross-host verb-dispatch site to (a) probe verb
