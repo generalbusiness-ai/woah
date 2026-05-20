@@ -54,10 +54,10 @@ import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import {
-  encodeV2TurnGatewayIntentEnvelope,
-  v2TurnGatewayAuthorityObjectIds,
-  v2TurnGatewayAuthorityPayload
-} from "../core/v2-turn-gateway";
+  encodeExecutorIntentEnvelope,
+  executorAuthorityObjectIds,
+  executorAuthorityPayload
+} from "../core/executor";
 
 const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
 
@@ -461,7 +461,7 @@ function v2RelayForScope(scope: ObjRef): ShadowBrowserRelayShim {
 }
 
 function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds: Iterable<ObjRef> = []): void {
-  const { authority } = v2TurnGatewayAuthorityPayload(world, extraObjectIds);
+  const { authority } = executorAuthorityPayload(world, extraObjectIds);
   const auth = buildShadowBrowserSessionAuth({
     sessions: authority.sessions,
     scope: relay.commit_scope.scope,
@@ -543,7 +543,7 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
   const browser = v2ShadowBrowser(`node:dev:rest:${input.id ?? randomUUID()}`, token, input.session, input.scope);
   refreshDevV2RelaySessions(browser.relay, [input.scope, input.target, input.actor]);
   ensureDevV2SerializedSession(browser.relay, input.session);
-  const encoded = encodeV2TurnGatewayIntentEnvelope({
+  const encoded = encodeExecutorIntentEnvelope({
     node: browser.node,
     turn: {
       id: input.id,
@@ -610,7 +610,7 @@ async function handleV2ShadowFrame(
     const containerContents = world.objects.has(containerForContents)
       ? Array.from(world.object(containerForContents).contents)
       : [];
-    const explicitRows = v2TurnGatewayAuthorityObjectIds({
+    const explicitRows = executorAuthorityObjectIds({
       scope: callScope ?? browser.relay.commit_scope.scope,
       target: callTarget ?? undefined,
       actor: session.actor

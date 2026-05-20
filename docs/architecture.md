@@ -21,7 +21,7 @@ flowchart TD
     end
 
     subgraph Core["Substrate — src/core (catalog-agnostic)"]
-        Gateway["Turn gateway<br/>(v2-turn-gateway.ts)"]
+        Gateway["Executor / turn submission<br/>(executor.ts)"]
         World["World<br/>objects, audience, moves<br/>(world.ts)"]
         VM["Tiny VM + DSL compiler<br/>(tiny-vm.ts, dsl-compiler.ts)"]
         Builtins["Native primitives<br/>(generic builtins)"]

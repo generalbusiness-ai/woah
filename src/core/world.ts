@@ -213,7 +213,19 @@ export type DeferredHostEffect =
   | { kind: "space_subscriber"; space: ObjRef; actor: ObjRef; present: boolean; session?: string }
   | { kind: "move_object"; obj: ObjRef; target: ObjRef; suppress_mirror_host?: string | null };
 
-export type HostBridge = {
+// ExecutorContext: the environment an executor depends on while stepping a
+// verb. Per spec/semantics/distribution.md §DT1, the world (executor) needs
+// to read and write properties, look up object summaries, dispatch verbs,
+// and so on. Some of those operations cross hosts in a distributed
+// deployment; this interface is what the executor uses to reach across.
+//
+// The name was historically `HostBridge`, which read as "the world's bridge
+// to the host" — that framing presupposed objects had owning hosts whose
+// authority the executor needed to defer to. In the §DT1 model that
+// authority belongs to the scope sequencer, not to any host; placement is
+// a cache hint. The renamed `ExecutorContext` reflects that: this is the
+// executor's view of its environment, not a bridge to anyone's authority.
+export type ExecutorContext = {
   localHost: string;
   hostForObject(id: ObjRef, memo?: HostOperationMemo): string | null | Promise<string | null>;
   getPropChecked(progr: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue>;
@@ -474,7 +486,7 @@ export class WooWorld {
   private guestFreePool = new Set<ObjRef>();
   private objectRepository: ObjectRepository | null;
   private incrementalPersistenceEnabled = false;
-  private hostBridge: HostBridge | null;
+  private executorContext: ExecutorContext | null;
   // One host runs one behavior at a time. Awaited cross-host RPC must not let a
   // second local behavior mutate the same in-memory state mid-savepoint.
   private hostQueue: Promise<unknown> = Promise.resolve();
@@ -509,9 +521,9 @@ export class WooWorld {
   private currentTurnWriter: RecordedWriteAuthority | null = null;
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
 
-  constructor(private repository?: WooRepository, options: { hostBridge?: HostBridge | null; turnRecorder?: TurnRecorder | null } = {}) {
+  constructor(private repository?: WooRepository, options: { executorContext?: ExecutorContext | null; turnRecorder?: TurnRecorder | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
-    this.hostBridge = options.hostBridge ?? null;
+    this.executorContext = options.executorContext ?? null;
     this.turnRecorder = options.turnRecorder ?? null;
     this.registerNativeHandlers();
   }
@@ -699,8 +711,8 @@ export class WooWorld {
     this.persist();
   }
 
-  setHostBridge(bridge: HostBridge | null): void {
-    this.hostBridge = bridge;
+  setExecutorContext(bridge: ExecutorContext | null): void {
+    this.executorContext = bridge;
   }
 
   /** Identify chain ids originating on this host. The PO DO sets this to
@@ -747,8 +759,8 @@ export class WooWorld {
 
   // Read access for the MCP host (cross-host tool enumeration). Other callers
   // should use the typed APIs that wrap the bridge.
-  getHostBridge(): HostBridge | null {
-    return this.hostBridge;
+  getExecutorContext(): ExecutorContext | null {
+    return this.executorContext;
   }
 
   // Register or replace a native verb handler. Used by the MCP host to wire
@@ -765,8 +777,8 @@ export class WooWorld {
   }
 
   private async remoteHostForObject(objRef: ObjRef, memo?: HostOperationMemo): Promise<string | null> {
-    const host = await (this.hostBridge?.hostForObject(objRef, memo) ?? null);
-    if (!host || host === this.hostBridge?.localHost) return null;
+    const host = await (this.executorContext?.hostForObject(objRef, memo) ?? null);
+    if (!host || host === this.executorContext?.localHost) return null;
     return host;
   }
 
@@ -881,9 +893,9 @@ export class WooWorld {
   async isRecycledChecked(id: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
     if (this.tombstones.has(id)) return true;
     const remoteHost = await this.remoteHostForObject(id, memo);
-    if (remoteHost && this.hostBridge?.isRecycled) {
+    if (remoteHost && this.executorContext?.isRecycled) {
       try {
-        return await this.hostBridge.isRecycled(id, memo);
+        return await this.executorContext.isRecycled(id, memo);
       } catch {
         // Best-effort: if the remote host is unreachable, fall back to
         // the local answer (false). The caller can re-probe.
@@ -1405,10 +1417,10 @@ export class WooWorld {
 
   async getPropChecked(progr: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
     if (await this.remoteHostForObject(objRef, memo)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("get_prop", { progr, object: objRef, property: name });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      return await this.hostBridge.getPropChecked(progr, objRef, name, memo);
+      return await this.executorContext.getPropChecked(progr, objRef, name, memo);
     }
     if (!this.canReadProperty(progr, objRef, name)) {
       throw wooError("E_PERM", `${progr} cannot read ${objRef}.${name}`, { progr, obj: objRef, property: name });
@@ -1427,10 +1439,10 @@ export class WooWorld {
 
   async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue, memo?: HostOperationMemo): Promise<void> {
     if (await this.remoteHostForObject(objRef, memo)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("set_prop", { progr, object: objRef, property: name });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      await this.hostBridge.setPropChecked(progr, objRef, name, value, memo);
+      await this.executorContext.setPropChecked(progr, objRef, name, value, memo);
       return;
     }
     try {
@@ -3639,10 +3651,10 @@ export class WooWorld {
   async dispatch(ctx: CallContext, target: ObjRef, verbName: string, args: WooValue[], startAt?: ObjRef | null, maxChars?: number | null): Promise<WooValue> {
     let result: WooValue;
     if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("dispatch", { target, verb: verbName, start_at: startAt ?? null });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      result = await this.hostBridge.dispatch(ctx, target, verbName, args, startAt);
+      result = await this.executorContext.dispatch(ctx, target, verbName, args, startAt);
     } else {
       if (this.callDepth >= MAX_CALL_DEPTH) throw wooError("E_CALL_DEPTH", "maximum verb call depth exceeded");
       this.callDepth += 1;
@@ -3756,8 +3768,8 @@ export class WooWorld {
 
   async roomSnapshotForActor(actor: ObjRef, room: ObjRef, sessionId: string | null = null, memo: HostOperationMemo = createHostOperationMemo()): Promise<RoomSnapshot> {
     if (await this.remoteHostForObject(room, memo)) {
-      if (!this.hostBridge?.roomSnapshot) throw wooError("E_INTERNAL", "remote host bridge room snapshots unavailable");
-      return await this.hostBridge.roomSnapshot(actor, room, sessionId, memo);
+      if (!this.executorContext?.roomSnapshot) throw wooError("E_INTERNAL", "remote host bridge room snapshots unavailable");
+      return await this.executorContext.roomSnapshot(actor, room, sessionId, memo);
     }
 
     const roomSummary = await this.scopedObjectSummary(actor, room, memo);
@@ -3782,8 +3794,8 @@ export class WooWorld {
 
   async overlaySnapshotForActor(actor: ObjRef, subject: ObjRef, surface = "default", sessionId: string | null = null, memo: HostOperationMemo = createHostOperationMemo()): Promise<OverlaySnapshot> {
     if (await this.remoteHostForObject(subject, memo)) {
-      if (!this.hostBridge?.overlaySnapshot) throw wooError("E_INTERNAL", "remote host bridge overlay snapshots unavailable");
-      return await this.hostBridge.overlaySnapshot(actor, subject, surface, sessionId, memo);
+      if (!this.executorContext?.overlaySnapshot) throw wooError("E_INTERNAL", "remote host bridge overlay snapshots unavailable");
+      return await this.executorContext.overlaySnapshot(actor, subject, surface, sessionId, memo);
     }
 
     const room = await this.spaceLikeOrRemote(subject, memo)
@@ -3821,10 +3833,10 @@ export class WooWorld {
       remoteByHost.set(host, list);
     }
     if (remoteByHost.size === 0) return out;
-    if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge object summaries unavailable");
+    if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge object summaries unavailable");
     await Promise.all(Array.from(remoteByHost.values()).map(async (ids) => {
       try {
-        Object.assign(out, await this.hostBridge!.objectSummaries(actor, ids, memo));
+        Object.assign(out, await this.executorContext!.objectSummaries(actor, ids, memo));
       } catch (err) {
         if (!isReadAvailabilityError(err)) throw err;
       }
@@ -3834,8 +3846,8 @@ export class WooWorld {
 
   async scopedObjectSummary(actor: ObjRef, objRef: ObjRef, memo: HostOperationMemo = createHostOperationMemo()): Promise<ScopedObjectSummary> {
     if (await this.remoteHostForObject(objRef, memo)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge object summaries unavailable");
-      return await this.hostBridge.objectSummary(actor, objRef, memo);
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge object summaries unavailable");
+      return await this.executorContext.objectSummary(actor, objRef, memo);
     }
     return this.localScopedObjectSummary(actor, objRef);
   }
@@ -3852,8 +3864,8 @@ export class WooWorld {
   private async cursorNextSeq(space: ObjRef, memo: HostOperationMemo): Promise<WooValue | null> {
     try {
       if (await this.remoteHostForObject(space, memo)) {
-        if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-        return await this.hostBridge.getPropChecked("$wiz", space, "next_seq", memo);
+        if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+        return await this.executorContext.getPropChecked("$wiz", space, "next_seq", memo);
       }
       return this.getProp(space, "next_seq");
     } catch (err) {
@@ -5247,7 +5259,7 @@ export class WooWorld {
         await this.invokeContainerHookSwallow(ctx, oldLocation, "exitfunc", [objRef]);
       }
       this.mirrorRemoteMoveLocally(objRef, targetRef);
-      ctx.deferHostEffect({ kind: "move_object", obj: objRef, target: targetRef, suppress_mirror_host: this.hostBridge?.localHost ?? null });
+      ctx.deferHostEffect({ kind: "move_object", obj: objRef, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
       if (this.objects.has(targetRef) || await this.remoteHostForObject(targetRef, ctx.hostMemo)) {
         await this.invokeContainerHookSwallow(ctx, targetRef, "enterfunc", [objRef]);
       }
@@ -5309,7 +5321,7 @@ export class WooWorld {
       if (this.primarySessionForActor(actor)?.id === session.id) {
         if (ctx.deferHostEffect && await this.remoteHostForObject(actor, ctx.hostMemo)) {
           this.mirrorRemoteMoveLocally(actor, targetRef);
-          ctx.deferHostEffect({ kind: "move_object", obj: actor, target: targetRef, suppress_mirror_host: this.hostBridge?.localHost ?? null });
+          ctx.deferHostEffect({ kind: "move_object", obj: actor, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
         } else {
           await this.moveObjectChecked(actor, targetRef);
         }
@@ -5361,7 +5373,7 @@ export class WooWorld {
     if (ctx?.deferHostEffect && objRemote) {
       if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.object(targetRef);
       this.mirrorRemoteMoveLocally(objRef, targetRef);
-      ctx.deferHostEffect({ kind: "move_object", obj: objRef, target: targetRef, suppress_mirror_host: this.hostBridge?.localHost ?? null });
+      ctx.deferHostEffect({ kind: "move_object", obj: objRef, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
       return;
     }
     if (!await this.remoteHostForObject(targetRef, ctx?.hostMemo)) this.object(targetRef);
@@ -5370,10 +5382,10 @@ export class WooWorld {
 
   async moveObjectChecked(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {
     if (await this.remoteHostForObject(objRef)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("move", { object: objRef, target: targetRef });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      return await this.hostBridge.moveObject(objRef, targetRef, options);
+      return await this.executorContext.moveObject(objRef, targetRef, options);
     }
     return await this.moveObjectOwned(objRef, targetRef, options);
   }
@@ -5497,10 +5509,10 @@ export class WooWorld {
       });
       return obj.location;
     }
-    if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+    if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
     const effect = remoteBridgeUntrackedEffect("location", { object: objRef });
     this.recordUntrackedEffect(effect.name, effect.detail);
-    return await this.hostBridge.location(objRef, memo);
+    return await this.executorContext.location(objRef, memo);
   }
 
   async observeToSpace(ctx: CallContext, space: ObjRef, event: Observation): Promise<void> {
@@ -7487,10 +7499,10 @@ export class WooWorld {
     const remote = await this.remoteHostForObject(containerRef);
     if (remote) {
       if (options.suppressMirrorHost && remote === options.suppressMirrorHost) return;
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("mirror_contents", { container: containerRef, object: objRef, present });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      await this.hostBridge.mirrorContents(containerRef, objRef, present);
+      await this.executorContext.mirrorContents(containerRef, objRef, present);
       return;
     }
     if (this.objects.has(containerRef)) this.mirrorContents(containerRef, objRef, present);
@@ -7790,9 +7802,9 @@ export class WooWorld {
       }
       return sessions;
     }
-    if (audience && this.hostBridge && await this.remoteHostForObject(audience)) {
+    if (audience && this.executorContext && await this.remoteHostForObject(audience)) {
       try {
-        return await this.hostBridge.spaceAudienceSessions?.(audience, actors) ?? [];
+        return await this.executorContext.spaceAudienceSessions?.(audience, actors) ?? [];
       } catch {
         // Remote audience lookup is best-effort; over-broadcasting to every
         // session for these actors would violate session-location isolation.
@@ -7844,8 +7856,8 @@ export class WooWorld {
 
   private async remoteIsDescendantOfChecked(objRef: ObjRef, ancestorRef: ObjRef, memo?: HostOperationMemo): Promise<boolean> {
     if (await this.remoteHostForObject(objRef, memo)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      return await this.hostBridge.isDescendantOf(objRef, ancestorRef, memo);
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      return await this.executorContext.isDescendantOf(objRef, ancestorRef, memo);
     }
     this.object(objRef);
     return false;
@@ -7856,7 +7868,7 @@ export class WooWorld {
     const spaceRemote = await this.remoteHostForObject(space);
     const sessionId = this.presenceSessionId(actor, ctx);
     if (!actorRemote && !spaceRemote) return this.updatePresence(actor, space, present, sessionId);
-    if (!this.hostBridge && (actorRemote || spaceRemote)) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+    if (!this.executorContext && (actorRemote || spaceRemote)) throw wooError("E_INTERNAL", "remote host bridge unavailable");
     if (ctx?.deferHostEffect) {
       let changed = false;
       if (actorRemote) {
@@ -7893,16 +7905,16 @@ export class WooWorld {
       }
       return this.updateActorPresenceLocal(actor, space, present, sessionId);
     }
-    if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-    await this.hostBridge.setActorPresence(actor, space, present, sessionId);
+    if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+    await this.executorContext.setActorPresence(actor, space, present, sessionId);
     return true;
   }
 
   private async setSpaceSubscriberChecked(space: ObjRef, actor: ObjRef, present: boolean, sessionId: string = this.presenceSessionId(actor)): Promise<boolean> {
     const spaceRemote = await this.remoteHostForObject(space);
     if (!spaceRemote) return this.updateSpaceSubscriberLocal(space, actor, present, sessionId);
-    if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-    await this.hostBridge.setSpaceSubscriber(space, actor, present, sessionId);
+    if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+    await this.executorContext.setSpaceSubscriber(space, actor, present, sessionId);
     return true;
   }
 
@@ -9074,10 +9086,10 @@ export class WooWorld {
     memo?: HostOperationMemo
   ): Promise<Map<ObjRef, ObjRef[]>> {
     const out = new Map<ObjRef, ObjRef[]>();
-    if (remoteActors.length === 0 || !this.hostBridge) return out;
-    if (this.hostBridge.actorSessionLocationsBatch) {
+    if (remoteActors.length === 0 || !this.executorContext) return out;
+    if (this.executorContext.actorSessionLocationsBatch) {
       try {
-        return await this.hostBridge.actorSessionLocationsBatch(remoteActors, memo);
+        return await this.executorContext.actorSessionLocationsBatch(remoteActors, memo);
       } catch (err) {
         if (!isReadAvailabilityError(err)) throw err;
         return out;
@@ -9085,7 +9097,7 @@ export class WooWorld {
     }
     await Promise.all(remoteActors.map(async (actor) => {
       try {
-        const locations = await this.hostBridge?.actorSessionLocations?.(actor, memo) ?? [];
+        const locations = await this.executorContext?.actorSessionLocations?.(actor, memo) ?? [];
         out.set(actor, locations);
       } catch (err) {
         if (!isReadAvailabilityError(err)) throw err;
@@ -9165,10 +9177,10 @@ export class WooWorld {
 
   private async objectContents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]> {
     if (await this.remoteHostForObject(objRef, memo)) {
-      if (!this.hostBridge) throw wooError("E_INTERNAL", "remote host bridge unavailable");
+      if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("contents", { object: objRef });
       this.recordUntrackedEffect(effect.name, effect.detail);
-      return await this.hostBridge.contents(objRef, memo);
+      return await this.executorContext.contents(objRef, memo);
     }
     return this.contentsOf(objRef);
   }
@@ -9189,9 +9201,9 @@ export class WooWorld {
 
   private async objectSummaryForLook(ctx: CallContext, item: ObjRef): Promise<HostObjectSummary | null> {
     if (!await this.remoteHostForObject(item, ctx.hostMemo)) return null;
-    if (!this.hostBridge?.describeObject) return null;
+    if (!this.executorContext?.describeObject) return null;
     try {
-      return await this.hostBridge.describeObject(ctx.progr, ctx.actor, item, ctx.hostMemo);
+      return await this.executorContext.describeObject(ctx.progr, ctx.actor, item, ctx.hostMemo);
     } catch (err) {
       if (!isReadAvailabilityError(err)) throw err;
       return null;
@@ -9208,10 +9220,10 @@ export class WooWorld {
       remoteIds.push(item);
       remoteHosts.add(host);
     }
-    if (remoteIds.length === 0 || !this.hostBridge) return { summaries, remoteCount: 0, batchCount: 0 };
-    if (this.hostBridge.describeObjects) {
+    if (remoteIds.length === 0 || !this.executorContext) return { summaries, remoteCount: 0, batchCount: 0 };
+    if (this.executorContext.describeObjects) {
       try {
-        const batch = await this.hostBridge.describeObjects(ctx.progr, ctx.actor, remoteIds, ctx.hostMemo);
+        const batch = await this.executorContext.describeObjects(ctx.progr, ctx.actor, remoteIds, ctx.hostMemo);
         for (const id of remoteIds) {
           const summary = batch[id];
           if (summary) summaries.set(id, summary);
@@ -9291,9 +9303,9 @@ export class WooWorld {
     }
     if (typeof target !== "string") throw wooError("E_TYPE", "remote_describe expects an object or list of objects", target);
     if (!await this.remoteHostForObject(target, ctx.hostMemo)) return null;
-    if (!this.hostBridge?.describeObject) return null;
+    if (!this.executorContext?.describeObject) return null;
     try {
-      return await this.hostBridge.describeObject(ctx.progr, ctx.actor, target, ctx.hostMemo) as unknown as WooValue;
+      return await this.executorContext.describeObject(ctx.progr, ctx.actor, target, ctx.hostMemo) as unknown as WooValue;
     } catch (err) {
       if (!isReadAvailabilityError(err)) throw err;
       return null;
@@ -9555,9 +9567,9 @@ export class WooWorld {
 
   private async tryResolveVerbForCommand(ctx: CallContext, target: ObjRef, verb: string): Promise<CommandVerbSummary | null> {
     if (await this.remoteHostForObject(target, ctx.hostMemo)) {
-      if (!this.hostBridge?.resolveVerb) return null;
+      if (!this.executorContext?.resolveVerb) return null;
       try {
-        return await this.hostBridge.resolveVerb(target, verb, ctx.hostMemo);
+        return await this.executorContext.resolveVerb(target, verb, ctx.hostMemo);
       } catch (err) {
         const error = normalizeError(err);
         if (error.code !== "E_VERBNF" && !isReadAvailabilityError(error)) throw err;
@@ -9722,9 +9734,9 @@ export class WooWorld {
 
   private async commandVerbCandidates(ctx: CallContext, target: ObjRef, name: string): Promise<CommandVerbSummary[]> {
     if (await this.remoteHostForObject(target, ctx.hostMemo)) {
-      if (this.hostBridge?.commandVerbCandidates) {
+      if (this.executorContext?.commandVerbCandidates) {
         try {
-          return await this.hostBridge.commandVerbCandidates(target, name, ctx.hostMemo);
+          return await this.executorContext.commandVerbCandidates(target, name, ctx.hostMemo);
         } catch (err) {
           if (!isReadAvailabilityError(err)) throw err;
           return [];

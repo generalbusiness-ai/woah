@@ -1,5 +1,5 @@
 import { createWorld } from "../src/core/bootstrap";
-import type { CallContext, HostBridge, HostObjectSummary, HostOperationMemo, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
+import type { CallContext, ExecutorContext, HostObjectSummary, HostOperationMemo, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../src/core/types";
 
 export function message(actor: string, target: string, verb: string, args: unknown[] = []): Message {
@@ -80,7 +80,7 @@ export function bytecodeVerb(name: string, bytecode: TinyBytecode, owner = "$wiz
   };
 }
 
-export class LocalHostBridge implements HostBridge {
+export class LocalExecutorContext implements ExecutorContext {
   readonly getPropCalls = new Map<string, number>();
   readonly describeCalls = new Map<string, number>();
   readonly describeManyCalls: ObjRef[][] = [];

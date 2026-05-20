@@ -3,7 +3,7 @@ import { createWorld } from "../src/core/bootstrap";
 import { handleRestProtocolRequest, statusForError, type RestProtocolRequest } from "../src/core/protocol";
 import { publicAppliedFrame, wooError, type ObjRef, type Session, type WooValue } from "../src/core/types";
 import type { DeferredHostEffect, RoomSnapshot, WooWorld } from "../src/core/world";
-import { LocalHostBridge } from "./core-support";
+import { LocalExecutorContext } from "./core-support";
 
 function get(pathname: string, headers: Record<string, string> = {}): RestProtocolRequest {
   return {
@@ -384,9 +384,9 @@ describe("scoped client projection", () => {
       ["the_chatroom", "room-a"],
       ["the_deck", "room-b"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    roomA.setHostBridge(new LocalHostBridge("room-a", worlds, routes));
-    roomB.setHostBridge(new LocalHostBridge("room-b", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    roomA.setExecutorContext(new LocalExecutorContext("room-a", worlds, routes));
+    roomB.setExecutorContext(new LocalExecutorContext("room-b", worlds, routes));
     roomA.createObject({ id: actor, name: home.object(actor).name, parent: "$guest", owner: "$wiz" });
     home.sessions.get(session.id)!.activeScope = "the_chatroom";
     roomA.ensureSessionForActor(session.id, actor, session.tokenClass, session.expiresAt, "the_chatroom");
@@ -427,8 +427,8 @@ describe("scoped client projection", () => {
     const routes = new Map<ObjRef, string>([
       ["the_deck", "deck-host"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("deck-host", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("deck-host", worlds, routes));
 
     const body = await apiMe(home, session);
     expect(body.objects).toBeUndefined();
@@ -451,7 +451,7 @@ describe("scoped client projection", () => {
     const routes = new Map<ObjRef, string>([
       ["the_deck", "deck-host"]
     ]);
-    class FailingRoomBridge extends LocalHostBridge {
+    class FailingRoomBridge extends LocalExecutorContext {
       constructor(readonly code: string) {
         super("home", worlds, routes);
       }
@@ -460,15 +460,15 @@ describe("scoped client projection", () => {
       }
     }
 
-    home.setHostBridge(new FailingRoomBridge("E_TIMEOUT"));
-    remote.setHostBridge(new LocalHostBridge("deck-host", worlds, routes));
+    home.setExecutorContext(new FailingRoomBridge("E_TIMEOUT"));
+    remote.setExecutorContext(new LocalExecutorContext("deck-host", worlds, routes));
     const degraded = await apiMe(home, session);
     expect(degraded.here).toBeNull();
 
     remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$room", owner: "$wiz" });
     routes.set("remote_room", "deck-host");
     home.sessions.get(session.id)!.activeScope = "remote_room";
-    class FailingAncestryBridge extends LocalHostBridge {
+    class FailingAncestryBridge extends LocalExecutorContext {
       constructor(readonly code: string) {
         super("home", worlds, routes);
       }
@@ -477,11 +477,11 @@ describe("scoped client projection", () => {
       }
     }
 
-    home.setHostBridge(new FailingAncestryBridge("E_TIMEOUT"));
+    home.setExecutorContext(new FailingAncestryBridge("E_TIMEOUT"));
     const degradedBeforeRoomSnapshot = await apiMe(home, session);
     expect(degradedBeforeRoomSnapshot.here).toBeNull();
 
-    home.setHostBridge(new FailingRoomBridge("E_PERM"));
+    home.setExecutorContext(new FailingRoomBridge("E_PERM"));
     const denied = await handleRestProtocolRequest(get("/api/me"), {
       world: home,
       requireSession: () => session,
@@ -508,13 +508,13 @@ describe("scoped client projection", () => {
     const routes = new Map<ObjRef, string>([
       [remoteActor, "actor-host"]
     ]);
-    class SlowActorBridge extends LocalHostBridge {
+    class SlowActorBridge extends LocalExecutorContext {
       override async actorSessionLocations(): Promise<ObjRef[]> {
         throw wooError("E_TIMEOUT", "actor host unavailable");
       }
     }
-    roomHost.setHostBridge(new SlowActorBridge("room-host", worlds, routes));
-    actorHost.setHostBridge(new LocalHostBridge("actor-host", worlds, routes));
+    roomHost.setExecutorContext(new SlowActorBridge("room-host", worlds, routes));
+    actorHost.setExecutorContext(new LocalExecutorContext("actor-host", worlds, routes));
 
     const snapshot = await roomHost.roomSnapshotForActor("$wiz", "the_deck");
     expect(snapshot.roster.map((actor: { id: string }) => actor.id)).not.toContain(remoteActor);
@@ -550,11 +550,11 @@ describe("scoped client projection", () => {
       ["the_deck", "room-host"],
       [badge, "item-host"]
     ]);
-    const homeBridge = new LocalHostBridge("home", worlds, routes);
-    const roomBridge = new LocalHostBridge("room-host", worlds, routes);
-    home.setHostBridge(homeBridge);
-    roomHost.setHostBridge(roomBridge);
-    itemHost.setHostBridge(new LocalHostBridge("item-host", worlds, routes));
+    const homeBridge = new LocalExecutorContext("home", worlds, routes);
+    const roomBridge = new LocalExecutorContext("room-host", worlds, routes);
+    home.setExecutorContext(homeBridge);
+    roomHost.setExecutorContext(roomBridge);
+    itemHost.setExecutorContext(new LocalExecutorContext("item-host", worlds, routes));
 
     const body = await apiMe(home, session);
     expect(body.here.contents).toEqual(expect.arrayContaining([

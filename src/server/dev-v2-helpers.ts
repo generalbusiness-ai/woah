@@ -18,7 +18,7 @@
 //     runShadowTurnCallOnWorld without a transcript — the SPA still needs
 //     a reply_to-bearing answer to drain its pending-turn set).
 //
-// All three predate the v2-turn-gateway consolidation but remain because
+// All three predate the executor consolidation but remain because
 // the dev transport runs ingress in-process rather than through the
 // CommitScopeDO surface.
 

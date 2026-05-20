@@ -15,7 +15,7 @@ import {
 import type { ShadowTurnExecReply } from "../../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
-import { v2TurnGatewayAuthorityPayload } from "../../src/core/v2-turn-gateway";
+import { executorAuthorityPayload } from "../../src/core/executor";
 import type { WooWorld } from "../../src/core/world";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
@@ -198,7 +198,7 @@ describe("v2 CommitScopeDO cost budget", () => {
     const scopeState = new FakeDurableObjectState("#-1");
     const commitScope = new CommitScopeDO(scopeState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
     const env = { WOO_INTERNAL_SECRET: "cf-test-secret" };
-    const authority = v2TurnGatewayAuthorityPayload(world, ["#-1", session.actor]);
+    const authority = executorAuthorityPayload(world, ["#-1", session.actor]);
     const expectedObjects = serializedWorldFromAuthoritySlice(authority.authority).objects.length;
     const expectedSessions = authority.sessions.length;
     resetStateCostLog(scopeState);
@@ -244,7 +244,7 @@ describe("v2 CommitScopeDO cost budget", () => {
     });
 
     const open = async (node: string, executableSeedDigest?: string, lastKnownHead?: Record<string, any>): Promise<Record<string, any>> => {
-      const authority = v2TurnGatewayAuthorityPayload(world, ["the_dubspace", session.actor]);
+      const authority = executorAuthorityPayload(world, ["the_dubspace", session.actor]);
       const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -439,7 +439,7 @@ async function makeCostHarness(): Promise<CostHarness> {
     this.value = value;
     return this.value;
   }`, null).ok).toBe(true);
-  const initialAuthority = v2TurnGatewayAuthorityPayload(world, ["#-1", "cf_v2_cost_box", session.actor]);
+  const initialAuthority = executorAuthorityPayload(world, ["#-1", "cf_v2_cost_box", session.actor]);
 
   const relay = createShadowBrowserRelayShim({
     node: "node:commit-scope:#-1",
@@ -473,7 +473,7 @@ async function makeCostHarness(): Promise<CostHarness> {
     scopeState,
     commitScopeNamespace,
     openScope: async () => {
-      const authority = v2TurnGatewayAuthorityPayload(world, ["#-1", "cf_v2_cost_box", session.actor]);
+      const authority = executorAuthorityPayload(world, ["#-1", "cf_v2_cost_box", session.actor]);
       const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
         method: "POST",
         headers: { "content-type": "application/json" },

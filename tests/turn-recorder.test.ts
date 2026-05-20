@@ -10,7 +10,7 @@ import { shadowCommitReceipt } from "../src/core/turn-commit";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { comparableTurnEvents, replayRecordedTurn } from "../src/core/turn-replay";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
-import type { HostBridge } from "../src/core/world";
+import type { ExecutorContext } from "../src/core/world";
 import { message, nativeVerb } from "./core-support";
 
 describe("turn recorder", () => {
@@ -684,12 +684,12 @@ describe("turn recorder", () => {
       null
     );
     expect(installed.ok).toBe(true);
-    world.setHostBridge({
+    world.setExecutorContext({
       localHost: "local",
       hostForObject: (id: string) => id === "remote_box" ? "remote" : null,
       isDescendantOf: async () => false,
       dispatch: async () => 7
-    } as unknown as HostBridge);
+    } as unknown as ExecutorContext);
     const before = world.exportWorld();
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);

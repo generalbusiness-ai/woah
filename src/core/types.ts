@@ -34,7 +34,7 @@ export function sessionActiveScopeFromRecord(record: Record<string, unknown> | n
   return null;
 }
 
-// Tool descriptor returned by HostBridge.enumerateRemoteTools so the gateway
+// Tool descriptor returned by ExecutorContext.enumerateRemoteTools so the gateway
 // can surface verbs on objects that live on a different host. Mirrors the
 // gateway-side McpTool shape without name sanitization (the gateway dedupes
 // names across the merged set).
