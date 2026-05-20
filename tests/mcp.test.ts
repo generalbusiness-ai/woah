@@ -13,7 +13,7 @@ import {
 } from "../src/core/shadow-browser-node";
 import { applyShadowTranscriptToCommittedState } from "../src/core/shadow-commit-scope";
 import type { MetricEvent, Observation, ObjRef, RemoteToolDescriptor, RemoteToolRequest, VerbDef, WooValue } from "../src/core/types";
-import type { CallContext, HostBridge, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
+import type { CallContext, ExecutorContext, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 
 function bootstrapWorld() {
   return createWorld();
@@ -65,7 +65,7 @@ function nativeToolVerb(name: string, native: string): VerbDef {
   };
 }
 
-class RemoteToolBridge implements HostBridge {
+class RemoteToolBridge implements ExecutorContext {
   constructor(
     readonly localHost: string,
     private readonly worlds: Map<string, WooWorld>,
@@ -1466,14 +1466,14 @@ describe("McpHost", () => {
     world.setProp("$system", "guest_initial_room", null);
     const session = world.auth("guest:mcp-lazy-refresh");
     let remoteEnumerations = 0;
-    world.setHostBridge({
+    world.setExecutorContext({
       localHost: "home",
       hostForObject: (id: string) => id === "the_chatroom" ? "chat" : "home",
       enumerateRemoteTools: async () => {
         remoteEnumerations += 1;
         return [];
       }
-    } as unknown as HostBridge);
+    } as unknown as ExecutorContext);
     const host = new McpHost(world);
     host.bindSession(session.id, session.actor);
     await host.refreshToolList(session.id, session.actor);
@@ -1634,8 +1634,8 @@ describe("McpGateway", () => {
       ["remote_widget", "remote"]
     ]);
     const hosts = new Map<string, McpHost>([["remote", remoteHost]]);
-    home.setHostBridge(new RemoteToolBridge("home", worlds, routes, hosts));
-    remote.setHostBridge(new RemoteToolBridge("remote", worlds, routes, hosts));
+    home.setExecutorContext(new RemoteToolBridge("home", worlds, routes, hosts));
+    remote.setExecutorContext(new RemoteToolBridge("remote", worlds, routes, hosts));
 
     home.createObject({ id: "remote_gallery", name: "Remote Gallery", parent: "$space", owner: "$wiz" });
     home.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz" });
@@ -1731,8 +1731,8 @@ describe("McpGateway", () => {
       ["remote_widget", "remote"]
     ]);
     const hosts = new Map<string, McpHost>([["remote", remoteHost]]);
-    home.setHostBridge(new RemoteToolBridge("home", worlds, routes, hosts));
-    remote.setHostBridge(new RemoteToolBridge("remote", worlds, routes, hosts));
+    home.setExecutorContext(new RemoteToolBridge("home", worlds, routes, hosts));
+    remote.setExecutorContext(new RemoteToolBridge("remote", worlds, routes, hosts));
 
     remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
     remote.setProp("remote_room", "name", "Remote Room");
@@ -1776,8 +1776,8 @@ describe("McpGateway", () => {
     ]);
     const routes = new Map<ObjRef, string>([["remote_widget", "remote"]]);
     const hosts = new Map<string, McpHost>([["remote", remoteHost]]);
-    home.setHostBridge(new RemoteToolBridge("home", worlds, routes, hosts));
-    remote.setHostBridge(new RemoteToolBridge("remote", worlds, routes, hosts));
+    home.setExecutorContext(new RemoteToolBridge("home", worlds, routes, hosts));
+    remote.setExecutorContext(new RemoteToolBridge("remote", worlds, routes, hosts));
 
     home.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz" });
     remote.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz" });

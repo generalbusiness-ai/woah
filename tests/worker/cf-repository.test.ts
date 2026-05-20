@@ -13,7 +13,7 @@ import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-tu
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
 import type { ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
-import type { CallContext, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
+import type { CallContext, ExecutorContext, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
 import { CFObjectRepository } from "../../src/worker/cf-repository";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
@@ -863,7 +863,7 @@ function installFailureFixture(world: WooWorld): void {
   );
 }
 
-class FakeHostBridge implements HostBridge {
+class FakeExecutorContext implements ExecutorContext {
   constructor(
     readonly localHost: string,
     private readonly worlds: Map<string, WooWorld>,
@@ -1885,8 +1885,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         ["cf_remote_room", "room"],
         ["cf_home_widget", "home"]
       ]);
-      home.setHostBridge(new FakeHostBridge("home", worlds, routes));
-      roomHost.setHostBridge(new FakeHostBridge("room", worlds, routes));
+      home.setExecutorContext(new FakeExecutorContext("home", worlds, routes));
+      roomHost.setExecutorContext(new FakeExecutorContext("room", worlds, routes));
 
       roomHost.createObject({ id: "cf_remote_room", name: "Remote Room", parent: "$chatroom", owner: "$wiz" });
       roomHost.setProp("cf_remote_room", "subscribers", [actor]);
@@ -3059,13 +3059,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(horoscopeRoute).toMatchObject({ host: "the_deck" });
       gateway.routeCache.set("the_horoscope", "world");
       gateway.publishedRoutes.set("the_horoscope", "world");
-      const repairedHost = await (gatewayWorld as any).hostBridge.hostForObject("the_horoscope" as ObjRef);
+      const repairedHost = await (gatewayWorld as any).executorContext.hostForObject("the_horoscope" as ObjRef);
       expect(repairedHost).toBe("the_deck");
       expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
       expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
       gateway.routeCache.set("the_horoscope", "world");
       gateway.publishedRoutes.set("the_horoscope", "world");
-      const bridgeHost = await (gatewayWorld as any).hostBridge.hostForObject("the_horoscope" as ObjRef);
+      const bridgeHost = await (gatewayWorld as any).executorContext.hostForObject("the_horoscope" as ObjRef);
       expect(bridgeHost).toBe("the_deck");
       expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
       expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
@@ -3074,7 +3074,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       gateway.publishedRoutes.delete("the_horoscope");
       gateway.registerRoutes = async () => false;
       try {
-        const localHost = await (gatewayWorld as any).hostBridge.hostForObject("the_horoscope" as ObjRef);
+        const localHost = await (gatewayWorld as any).executorContext.hostForObject("the_horoscope" as ObjRef);
         expect(localHost).toBe("the_deck");
         expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
         expect(gateway.publishedRoutes.has("the_horoscope")).toBe(false);

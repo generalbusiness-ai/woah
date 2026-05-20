@@ -1060,7 +1060,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const obj = assertObj(builtinArgs[0]);
         const actorCheck = frame.ctx.world.isDescendantOfChecked(obj, "$actor", frame.ctx.hostMemo);
         if (isPromiseLike(actorCheck) ? await actorCheck : actorCheck) {
-          if (await frame.ctx.world.isRemoteObject(obj, frame.ctx.hostMemo)) return await frame.ctx.world.getHostBridge()?.actorSessionLocations?.(obj, frame.ctx.hostMemo) ?? [];
+          if (await frame.ctx.world.isRemoteObject(obj, frame.ctx.hostMemo)) return await frame.ctx.world.getExecutorContext()?.actorSessionLocations?.(obj, frame.ctx.hostMemo) ?? [];
           return frame.ctx.world.allLocationsForActor(obj);
         }
         const loc = await frame.ctx.world.objectLocationChecked(obj, frame.ctx.hostMemo);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { installVerbAs } from "../src/core/authoring";
-import { LocalHostBridge } from "./core-support";
+import { LocalExecutorContext } from "./core-support";
 import type { ObjRef } from "../src/core/types";
 import type { WooWorld } from "../src/core/world";
 
@@ -45,9 +45,9 @@ describe("isa", () => {
       ["remote_sub", "remote"],
       ["remote_grand", "remote"]
     ]);
-    const bridge = new LocalHostBridge("home", worlds, routes);
-    home.setHostBridge(bridge);
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    const bridge = new LocalExecutorContext("home", worlds, routes);
+    home.setExecutorContext(bridge);
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
     const auth = home.auth("guest:remote-isa-check");
     home.object(auth.actor).owner = auth.actor;
     home.object(auth.actor).flags.programmer = true;

@@ -74,12 +74,12 @@ import {
 import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
-  mergeV2TurnGatewayAuthority,
+  mergeExecutorAuthority,
   submitTurnIntent,
-  v2TurnGatewayAuthorityObjectIds,
-  v2TurnGatewayAuthorityPayload,
-  v2TurnGatewayEnvelopeId
-} from "../core/v2-turn-gateway";
+  executorAuthorityObjectIds,
+  executorAuthorityPayload,
+  executorEnvelopeId
+} from "../core/executor";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
@@ -89,7 +89,7 @@ import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./met
 
 // Re-import WooWorld type. Note `import type` must reach the world module
 // without dragging Node-only deps into the Worker bundle.
-import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, HostOperationMemo, MoveObjectResult, OverlaySnapshot, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../core/world";
+import type { CallContext, DeferredHostEffect, ExecutorContext, HostObjectSummary, HostOperationMemo, MoveObjectResult, OverlaySnapshot, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../core/world";
 
 export interface Env {
   WOO: DurableObjectNamespace;
@@ -837,7 +837,7 @@ export class PersistentObjectDO {
         : isMcpGatewayShardHost(hostKey)
           ? await this.createMcpGatewayShardWorld(hostKey, metricsHook)
         : await this.createHostScopedWorld(hostKey as ObjRef, metricsHook);
-      this.installHostBridge(world, hostKey);
+      this.installExecutorContext(world, hostKey);
       // Rehydrate live WebSocket attachments. After DO wake-from-hibernation,
       // state.getWebSockets() returns sockets whose serializeAttachment
       // payload survived hibernation; the in-memory world.sessions, however,
@@ -1395,7 +1395,7 @@ export class PersistentObjectDO {
     }
   }
 
-  private installHostBridge(world: WooWorld, localHost: string): void {
+  private installExecutorContext(world: WooWorld, localHost: string): void {
     const hostForObjectUncached = async (id: ObjRef): Promise<string | null> => {
       const resolved = await this.resolveObjectHostForWorld(world, id, "");
       return resolved || null;
@@ -1404,7 +1404,7 @@ export class PersistentObjectDO {
       if (!memo) return await hostForObjectUncached(id);
       return await memoizeHostOperation(memo.routes, id, () => hostForObjectUncached(id));
     };
-    const bridge: HostBridge = {
+    const bridge: ExecutorContext = {
       localHost,
       hostForObject,
       getPropChecked: async (progr, objRef, name, memo) => {
@@ -1891,7 +1891,7 @@ export class PersistentObjectDO {
         return responses.flat();
       }
     };
-    world.setHostBridge(bridge);
+    world.setExecutorContext(bridge);
     world.setMetricsHook((event) => this.emitMetric(event, localHost));
     world.setChainOriginPrefix(localHost);
   }
@@ -2898,7 +2898,7 @@ export class PersistentObjectDO {
     try {
       const authorityIds = v2SocketEnvelopeAuthorityObjectIds(encoded, att.scope, att.actor);
       const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
-        ...v2TurnGatewayAuthorityPayload(world, authorityIds),
+        ...executorAuthorityPayload(world, authorityIds),
         scope: att.scope,
         node: att.node,
         token: att.token,
@@ -2947,7 +2947,7 @@ export class PersistentObjectDO {
     scope: ObjRef,
     body: Record<string, unknown>,
     seedObjectIds: Iterable<ObjRef>,
-    seed?: { serialized: SerializedWorld; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }
+    seed?: { serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }
   ): Promise<CommitScopeOpenResponse> {
     try {
       return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", body);
@@ -2971,7 +2971,7 @@ export class PersistentObjectDO {
   ): Promise<RestV2RelayClient> {
     if (forceReopen) this.restV2Relays.delete(scope);
     let client = this.restV2Relays.get(scope);
-    const seedObjectIds = v2TurnGatewayAuthorityObjectIds({
+    const seedObjectIds = executorAuthorityObjectIds({
       scope: input.scope,
       target: input.target,
       actor: input.actor,
@@ -3004,20 +3004,20 @@ export class PersistentObjectDO {
       return client;
     }
     this.rememberRestV2Relay(scope, client);
-    mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, seeded.authority.authority, { clone: true });
+    mergeExecutorAuthority(client.relay.commit_scope.serialized, seeded.authority.authority, { clone: true });
     return client;
   }
 
-  private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }> {
+  private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
     const ids = Array.from(extraObjectIds);
     const authority = await this.v2GatewayAuthorityPayload(world, ids);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
   }
 
-  private async v2GatewayAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {
+  private async v2GatewayAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<ReturnType<typeof executorAuthorityPayload>> {
     const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
-    const local = v2TurnGatewayAuthorityPayload(world, ids);
+    const local = executorAuthorityPayload(world, ids);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const localHost = this.durableHostKey();
     const routesById = new Map(world.objectRoutes().map((route) => [route.id, route] as const));
@@ -3106,7 +3106,7 @@ export class PersistentObjectDO {
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => client.relay.commit_scope.serialized,
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
-      envelopeId: (id, attempt) => v2TurnGatewayEnvelopeId(id, attempt, () => crypto.randomUUID()),
+      envelopeId: (id, attempt) => executorEnvelopeId(id, attempt, () => crypto.randomUUID()),
       authorityPayload: async (_scope, extraObjectIds) => await this.v2GatewayAuthorityPayload(world, extraObjectIds),
       submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body),
       // Forward planning-phase verb metrics to the host world's metrics
@@ -3358,7 +3358,7 @@ export class PersistentObjectDO {
     if (!att.node || !att.token) return;
     try {
       const transfer = await this.v2CommitScopePost<CommitScopeStateTransferResponse>(commitScope, "/v2/state-transfer", {
-        ...v2TurnGatewayAuthorityPayload(world, [commitScope, att.scope, att.actor]),
+        ...executorAuthorityPayload(world, [commitScope, att.scope, att.actor]),
         scope: commitScope,
         node: att.node,
         token: att.token,
@@ -4077,7 +4077,7 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
   try {
     const envelope = decodeEnvelope(encoded);
     const body = envelope.body;
-    if (!isRecord(body)) return v2TurnGatewayAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
+    if (!isRecord(body)) return executorAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
     const call = isRecord(body.call) ? body.call : null;
     const scope = objRefFromUnknown(call?.scope) ?? objRefFromUnknown(body.scope) ?? fallbackScope;
     const target = objRefFromUnknown(call?.target) ?? objRefFromUnknown(body.target);
@@ -4092,9 +4092,9 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
       : isRecord(body.body)
       ? body.body as Record<string, WooValue>
       : undefined;
-    return v2TurnGatewayAuthorityObjectIds({ scope, target, actor, args, body: requestBody }, fallbackScope);
+    return executorAuthorityObjectIds({ scope, target, actor, args, body: requestBody }, fallbackScope);
   } catch {
-    return v2TurnGatewayAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
+    return executorAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
   }
 }
 

@@ -1,3 +1,28 @@
+// Executor protocol — the home of the "Execute" role described in
+// spec/semantics/distribution.md §DT1. Any node holding sufficient state to
+// step a verb is an executor; this module defines what executors do and how
+// they submit their results to a scope sequencer for ordering.
+//
+// The role has four operations:
+//
+//   currentHead() — the head the executor last played forward to.
+//   playTo(head)  — apply accepted frames up through `head`.
+//   execute(intent) — step the verb against current state; produce a
+//                     transcript proposal annotated with the head it ran
+//                     against.
+//   signEnvelope(envelope) — produce an envelope signed by this executor's
+//                            identity; the sequencer accepts proposals
+//                            from any registered signer regardless of
+//                            which executor produced them.
+//
+// `submitTurnIntent` below is the current submission glue that wraps
+// `execute` + `signEnvelope` and posts to the scope sequencer. The three
+// implementations (hosted DO, browser, MCP) reach `submitTurnIntent`
+// through their own adapters — see `src/worker/persistent-object-do.ts`,
+// `src/core/shadow-browser-node.ts`, and `src/mcp/gateway.ts`. They do
+// not yet share a single `Executor` class; this module is the role's
+// home and the place future symmetrization should live.
+
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import { mergeSerializedAuthoritySlice, type MergeSerializedAuthorityInput } from "./authority-slice";
 import {
@@ -14,14 +39,14 @@ import type { WooWorld } from "./world";
 
 export const V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED = "E_SNAPSHOT_REQUIRED";
 
-export type V2TurnGatewayAuthorityPayload = {
+export type ExecutorAuthorityPayload = {
   sessions: SerializedSession[];
   /** Legacy fallback for pre-authority callers. Authority-bearing payloads MUST leave this empty. */
   session_objects: SerializedObject[];
   authority: SerializedAuthoritySlice;
 };
 
-export type V2TurnGatewayCallInput = {
+export type ExecutorCallInput = {
   id?: string;
   route: ShadowTurnCall["route"];
   scope: ObjRef;
@@ -35,7 +60,7 @@ export type V2TurnGatewayCallInput = {
   token: string;
 };
 
-export type V2TurnGatewayEnvelopeBody = {
+export type ExecutorEnvelopeBody = {
   scope: ObjRef;
   node: string;
   token: string;
@@ -48,12 +73,12 @@ export type V2TurnGatewayEnvelopeBody = {
   envelope: string;
 };
 
-export type V2TurnGatewayEnvelopeResult = {
+export type ExecutorEnvelopeResult = {
   reply: string | null;
   head?: ShadowScopeHead;
 };
 
-export type SubmitTurnIntentResult<Client, Result extends V2TurnGatewayEnvelopeResult> =
+export type SubmitTurnIntentResult<Client, Result extends ExecutorEnvelopeResult> =
   | {
       kind: "local_frame";
       frame: AppliedFrame | DirectResultFrame | ErrorFrame;
@@ -72,8 +97,8 @@ export type SubmitTurnIntentResult<Client, Result extends V2TurnGatewayEnvelopeR
       planned?: ShadowTurnCallTranscriptRun;
     };
 
-export type SubmitTurnIntentOptions<Client, Result extends V2TurnGatewayEnvelopeResult> = {
-  input: V2TurnGatewayCallInput;
+export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
+  input: ExecutorCallInput;
   strategy: "intent" | "planned-exec";
   maxAttempts?: number;
   ensureClient(scope: ObjRef, attempt: number): Promise<Client>;
@@ -82,9 +107,9 @@ export type SubmitTurnIntentOptions<Client, Result extends V2TurnGatewayEnvelope
   clientSerialized?(client: Client): SerializedWorld;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
-  authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): V2TurnGatewayAuthorityPayload | Promise<V2TurnGatewayAuthorityPayload>;
-  submitEnvelope(scope: ObjRef, body: V2TurnGatewayEnvelopeBody): Promise<Result>;
-  authorityObjectIds?(input: V2TurnGatewayCallInput, commitScope: ObjRef): ObjRef[];
+  authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
+  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
+  authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
   // Forwarder for engine metric events recorded during planning-phase
   // verb execution (the ephemeral world built from clientSerialized).
@@ -94,10 +119,10 @@ export type SubmitTurnIntentOptions<Client, Result extends V2TurnGatewayEnvelope
   onMetric?: (event: MetricEvent) => void;
 };
 
-export function v2TurnGatewayAuthorityPayload(
+export function executorAuthorityPayload(
   world: WooWorld,
   extraObjectIds: Iterable<ObjRef> = []
-): V2TurnGatewayAuthorityPayload {
+): ExecutorAuthorityPayload {
   // Gateways must refresh bearer/session authority without exporting a full
   // world. Keep the payload shape identical for REST, MCP, WS, and Worker DO
   // callers so later cell-slice shrinking has one contract to change.
@@ -110,7 +135,7 @@ export function v2TurnGatewayAuthorityPayload(
   };
 }
 
-export function mergeV2TurnGatewayAuthority(
+export function mergeExecutorAuthority(
   serialized: { sessions: SerializedSession[]; objects: SerializedObject[] },
   authority: MergeSerializedAuthorityInput,
   options: { clone?: boolean } = {}
@@ -118,7 +143,7 @@ export function mergeV2TurnGatewayAuthority(
   mergeSerializedAuthoritySlice(serialized, authority, options);
 }
 
-export function v2TurnGatewayAuthorityObjectIds(
+export function executorAuthorityObjectIds(
   input: { scope: ObjRef; target?: ObjRef | null; actor: ObjRef; args?: readonly WooValue[]; body?: Record<string, WooValue> },
   commitScope: ObjRef = input.scope
 ): ObjRef[] {
@@ -151,13 +176,13 @@ export function v2TurnGatewayAuthorityObjectIds(
   return ids;
 }
 
-export function v2TurnGatewayReplyNeedsRepair(reply: ShadowTurnExecReply): boolean {
+export function executorReplyNeedsRepair(reply: ShadowTurnExecReply): boolean {
   if (reply.ok === true) return false;
   if (reply.reason === "missing_state") return true;
   return reply.reason === "commit_rejected" && reply.commit?.reason === "stale_head";
 }
 
-export function v2TurnGatewayEnvelopeId(
+export function executorEnvelopeId(
   turnId: string,
   attempt: number,
   repairId: () => string
@@ -168,7 +193,7 @@ export function v2TurnGatewayEnvelopeId(
   return attempt === 0 ? turnId : `${turnId}:repair:${repairId()}`;
 }
 
-export function buildV2TurnGatewayCall(input: V2TurnGatewayCallInput, id: string): ShadowTurnCall {
+export function buildExecutorCall(input: ExecutorCallInput, id: string): ShadowTurnCall {
   return {
     kind: "woo.turn_call.shadow.v1",
     id,
@@ -183,9 +208,9 @@ export function buildV2TurnGatewayCall(input: V2TurnGatewayCallInput, id: string
   };
 }
 
-export function encodeV2TurnGatewayIntentEnvelope(input: {
+export function encodeExecutorIntentEnvelope(input: {
   node: string;
-  turn: V2TurnGatewayCallInput;
+  turn: ExecutorCallInput;
   turnId?: string;
   envelopeId?: string;
 }): string {
@@ -206,9 +231,9 @@ export function encodeV2TurnGatewayIntentEnvelope(input: {
   }));
 }
 
-export function encodeV2TurnGatewayExecEnvelope(input: {
+export function encodeExecutorExecEnvelope(input: {
   node: string;
-  turn: V2TurnGatewayCallInput;
+  turn: ExecutorCallInput;
   turnId: string;
   envelopeId?: string;
   request: ShadowTurnExecRequest;
@@ -224,13 +249,13 @@ export function encodeV2TurnGatewayExecEnvelope(input: {
   }));
 }
 
-export function v2TurnGatewayEnvelopeBody(input: {
+export function executorEnvelopeBody(input: {
   scope: ObjRef;
   node: string;
-  turn: V2TurnGatewayCallInput;
-  authority: V2TurnGatewayAuthorityPayload;
+  turn: ExecutorCallInput;
+  authority: ExecutorAuthorityPayload;
   envelope: string;
-}): V2TurnGatewayEnvelopeBody {
+}): ExecutorEnvelopeBody {
   return {
     scope: input.scope,
     node: input.node,
@@ -244,36 +269,36 @@ export function v2TurnGatewayEnvelopeBody(input: {
   };
 }
 
-export function decodeV2TurnGatewayReply(encoded: string | null): ShadowEnvelope<ShadowTurnExecReply> | null {
+export function decodeExecutorReply(encoded: string | null): ShadowEnvelope<ShadowTurnExecReply> | null {
   return encoded ? decodeEnvelope<ShadowTurnExecReply>(encoded) : null;
 }
 
-export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvelopeResult>(
+export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeResult>(
   options: SubmitTurnIntentOptions<Client, Result>
 ): Promise<SubmitTurnIntentResult<Client, Result>> {
   const maxAttempts = options.maxAttempts ?? 1;
-  const shouldRetry = options.shouldRetry ?? v2TurnGatewayReplyNeedsRepair;
+  const shouldRetry = options.shouldRetry ?? executorReplyNeedsRepair;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (options.strategy === "intent") {
       const client = await options.ensureClient(options.input.scope, attempt);
       const turnId = options.input.id ?? options.nextTurnId(client, attempt);
-      const envelope = encodeV2TurnGatewayIntentEnvelope({
+      const envelope = encodeExecutorIntentEnvelope({
         node: options.clientNode(client),
         turn: options.input,
         turnId,
         envelopeId: options.envelopeId?.(turnId, attempt)
       });
       const authorityObjectIds = options.authorityObjectIds?.(options.input, options.input.scope)
-        ?? v2TurnGatewayAuthorityObjectIds(options.input);
+        ?? executorAuthorityObjectIds(options.input);
       const authority = await options.authorityPayload(options.input.scope, authorityObjectIds);
-      const result = await options.submitEnvelope(options.input.scope, v2TurnGatewayEnvelopeBody({
+      const result = await options.submitEnvelope(options.input.scope, executorEnvelopeBody({
         scope: options.input.scope,
         node: options.clientNode(client),
         turn: options.input,
         authority,
         envelope
       }));
-      const replyEnvelope = decodeV2TurnGatewayReply(result.reply);
+      const replyEnvelope = decodeExecutorReply(result.reply);
       if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) continue;
       return {
         kind: "submitted",
@@ -283,13 +308,13 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
         result,
         replyEnvelope,
         reply: replyEnvelope?.body ?? null,
-        call: buildV2TurnGatewayCall(options.input, turnId)
+        call: buildExecutorCall(options.input, turnId)
       };
     }
 
     const planningClient = await options.ensureClient(options.input.scope, attempt);
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
-    const call = buildV2TurnGatewayCall(options.input, turnId);
+    const call = buildExecutorCall(options.input, turnId);
     const serialized = options.clientSerialized?.(planningClient);
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     const planned = await runShadowTurnCallTranscript(serialized, call, { onMetric: options.onMetric });
@@ -315,7 +340,7 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
       },
       persistence: options.input.persistence
     };
-    const envelope = encodeV2TurnGatewayExecEnvelope({
+    const envelope = encodeExecutorExecEnvelope({
       node: options.clientNode(commitClient),
       turn: options.input,
       turnId,
@@ -323,16 +348,16 @@ export async function submitTurnIntent<Client, Result extends V2TurnGatewayEnvel
       request
     });
     const authorityObjectIds = options.authorityObjectIds?.(options.input, commitScope)
-      ?? v2TurnGatewayAuthorityObjectIds(options.input, commitScope);
+      ?? executorAuthorityObjectIds(options.input, commitScope);
     const authority = await options.authorityPayload(commitScope, authorityObjectIds);
-    const result = await options.submitEnvelope(commitScope, v2TurnGatewayEnvelopeBody({
+    const result = await options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
       turn: options.input,
       authority,
       envelope
     }));
-    const replyEnvelope = decodeV2TurnGatewayReply(result.reply);
+    const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) continue;
     return {
       kind: "submitted",

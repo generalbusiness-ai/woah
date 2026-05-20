@@ -8,14 +8,14 @@ import type { ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
 import {
-  mergeV2TurnGatewayAuthority,
+  mergeExecutorAuthority,
   submitTurnIntent,
-  v2TurnGatewayAuthorityPayload,
-  v2TurnGatewayEnvelopeId,
-  v2TurnGatewayAuthorityObjectIds,
-  v2TurnGatewayReplyNeedsRepair,
-  type V2TurnGatewayEnvelopeBody
-} from "../src/core/v2-turn-gateway";
+  executorAuthorityPayload,
+  executorEnvelopeId,
+  executorAuthorityObjectIds,
+  executorReplyNeedsRepair,
+  type ExecutorEnvelopeBody
+} from "../src/core/executor";
 import type { ObjRef } from "../src/core/types";
 
 describe("v2 turn gateway", () => {
@@ -26,10 +26,10 @@ describe("v2 turn gateway", () => {
 
     const serialized = world.exportWorld();
     serialized.objects = serialized.objects.filter((obj) => !["the_outline", "$outliner"].includes(obj.id));
-    const payload = v2TurnGatewayAuthorityPayload(world, ["the_chatroom", session.actor]);
+    const payload = executorAuthorityPayload(world, ["the_chatroom", session.actor]);
     expect(payload.authority.kind).toBe("woo.authority_slice.cells.shadow.v1");
     expect(payload.session_objects).toEqual([]);
-    mergeV2TurnGatewayAuthority(
+    mergeExecutorAuthority(
       serialized,
       payload.authority,
       { clone: true }
@@ -75,12 +75,12 @@ describe("v2 turn gateway", () => {
   });
 
   it("classifies only state-repair replies as retryable", () => {
-    expect(v2TurnGatewayReplyNeedsRepair({
+    expect(executorReplyNeedsRepair({
       kind: "woo.turn.exec.reply.shadow.v1",
       ok: false,
       reason: "missing_state"
     })).toBe(true);
-    expect(v2TurnGatewayReplyNeedsRepair({
+    expect(executorReplyNeedsRepair({
       kind: "woo.turn.exec.reply.shadow.v1",
       ok: false,
       reason: "commit_rejected",
@@ -94,7 +94,7 @@ describe("v2 turn gateway", () => {
         receipt: receipt(false)
       }
     })).toBe(true);
-    expect(v2TurnGatewayReplyNeedsRepair(okReply("turn"))).toBe(false);
+    expect(executorReplyNeedsRepair(okReply("turn"))).toBe(false);
   });
 
   it("merges versioned authority cells into serialized state without duplicating objects", () => {
@@ -114,7 +114,7 @@ describe("v2 turn gateway", () => {
       counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 },
       tombstones: ["$gone" as ObjRef]
     });
-    mergeV2TurnGatewayAuthority(serialized, authority);
+    mergeExecutorAuthority(serialized, authority);
 
     expect(serialized.sessions.map((session) => session.id)).toEqual(["new"]);
     expect(new Map(serialized.objects.map((object) => [object.id, object.name]))).toEqual(new Map([
@@ -129,7 +129,7 @@ describe("v2 turn gateway", () => {
     const world = createWorld();
     const session = world.auth("guest:v2-authority-no-session-object-echo");
     const actor = world.exportObjects([session.actor])[0];
-    const payload = v2TurnGatewayAuthorityPayload({
+    const payload = executorAuthorityPayload({
       exportSessions: () => [session],
       exportAuthoritySlice: (sessions: SerializedSession[]) => ({
         kind: "woo.authority_slice.shadow.v1",
@@ -144,7 +144,7 @@ describe("v2 turn gateway", () => {
   });
 
   it("includes argument and body strings in explicit authority roots", () => {
-    expect(v2TurnGatewayAuthorityObjectIds({
+    expect(executorAuthorityObjectIds({
       scope: "$room" as ObjRef,
       target: "$tool" as ObjRef,
       actor: "$actor" as ObjRef,
@@ -154,7 +154,7 @@ describe("v2 turn gateway", () => {
   });
 
   it("submits intent turns through one retry loop with refreshed authority", async () => {
-    const envelopes: V2TurnGatewayEnvelopeBody[] = [];
+    const envelopes: ExecutorEnvelopeBody[] = [];
     const attempts: number[] = [];
     const result = await submitTurnIntent({
       input: {
@@ -177,7 +177,7 @@ describe("v2 turn gateway", () => {
       },
       clientNode: (client) => client.node,
       nextTurnId: () => { throw new Error("explicit test turn id should be reused"); },
-      envelopeId: (turnId, attempt) => v2TurnGatewayEnvelopeId(turnId, attempt, () => "retry"),
+      envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => "retry"),
       authorityPayload: (_scope, extraObjectIds) => ({
         sessions: [],
         session_objects: [],
@@ -318,7 +318,7 @@ type PlannedGatewayClient = {
 
 type PlannedGatewaySubmission = {
   scope: ObjRef;
-  body: V2TurnGatewayEnvelopeBody;
+  body: ExecutorEnvelopeBody;
   envelope: ShadowEnvelope<ShadowTurnExecRequest>;
   request: ShadowTurnExecRequest;
 };
@@ -360,7 +360,7 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
             .map((id, index) => serializedObject(id, id, index))
         }
       }),
-      submitEnvelope: async (scope: ObjRef, body: V2TurnGatewayEnvelopeBody) => {
+      submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
         const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
         submissions.push({ scope, body, envelope, request: envelope.body });
         return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
@@ -400,7 +400,7 @@ function serializedObject(id: string, name: string, ts: number): SerializedObjec
   };
 }
 
-function authorityObjectIds(authority: V2TurnGatewayEnvelopeBody["authority"]): ObjRef[] {
+function authorityObjectIds(authority: ExecutorEnvelopeBody["authority"]): ObjRef[] {
   return Array.from(authoritySliceObjectIds(authority));
 }
 

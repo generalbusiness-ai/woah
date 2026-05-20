@@ -6,7 +6,7 @@ import { compileVerb, installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { wooError } from "../src/core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../src/core/types";
-import type { CallContext, DeferredHostEffect, HostBridge, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
+import type { CallContext, DeferredHostEffect, ExecutorContext, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
 type Harness = {
@@ -108,7 +108,7 @@ function bytecodeVerb(name: string, bytecode: TinyBytecode): VerbDef {
   };
 }
 
-class LocalHostBridge implements HostBridge {
+class LocalExecutorContext implements ExecutorContext {
   readonly contentsCalls = new Map<ObjRef, number>();
   actorSessionLocationsCalls = 0;
   actorSessionLocationsBatchCalls: Array<ObjRef[]> = [];
@@ -404,8 +404,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         ["remote", remote]
       ]);
       const routes = new Map<ObjRef, string>([["conf_remote_box", "remote"]]);
-      home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-      remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+      home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+      remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
       remote.createObject({ id: "conf_remote_box", name: "Remote Box", parent: "$thing", owner: "$wiz" });
       remote.defineProperty("conf_remote_box", {
@@ -502,9 +502,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         ["conf_room_a", "room-a"],
         ["conf_room_b", "room-b"]
       ]);
-      home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-      roomA.setHostBridge(new LocalHostBridge("room-a", worlds, routes));
-      roomB.setHostBridge(new LocalHostBridge("room-b", worlds, routes));
+      home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+      roomA.setExecutorContext(new LocalExecutorContext("room-a", worlds, routes));
+      roomB.setExecutorContext(new LocalExecutorContext("room-b", worlds, routes));
 
       roomA.createObject({ id: "conf_room_a", name: "Room A", parent: "$space", owner: "$wiz" });
       roomB.createObject({ id: "conf_room_b", name: "Room B", parent: "$space", owner: "$wiz" });
@@ -552,11 +552,11 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         ["the_deck", "room-b"],
         ["the_hot_tub", "room-b"]
       ]);
-      home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-      const roomABridge = new LocalHostBridge("room-a", worlds, routes);
-      const roomBBridge = new LocalHostBridge("room-b", worlds, routes);
-      roomA.setHostBridge(roomABridge);
-        roomB.setHostBridge(roomBBridge);
+      home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+      const roomABridge = new LocalExecutorContext("room-a", worlds, routes);
+      const roomBBridge = new LocalExecutorContext("room-b", worlds, routes);
+      roomA.setExecutorContext(roomABridge);
+        roomB.setExecutorContext(roomBBridge);
 
         roomA.createObject({ id: actor, name: actor, parent: "$guest", owner: "$wiz" });
         home.sessions.get(session.id)!.activeScope = "the_chatroom";
@@ -695,10 +695,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         [live3, "home"],
         ["conf_batch_room", "room"]
       ]);
-      const homeBridge = new LocalHostBridge("home", worlds, routes);
-      const roomBridge = new LocalHostBridge("room", worlds, routes);
-      home.setHostBridge(homeBridge);
-      roomHost.setHostBridge(roomBridge);
+      const homeBridge = new LocalExecutorContext("home", worlds, routes);
+      const roomBridge = new LocalExecutorContext("room", worlds, routes);
+      home.setExecutorContext(homeBridge);
+      roomHost.setExecutorContext(roomBridge);
 
       roomHost.createObject({ id: "conf_batch_room", name: "Batch Room", parent: "$chatroom", owner: "$wiz" });
       roomHost.setProp("conf_batch_room", "subscribers", [live1, live2, live3]);
@@ -736,10 +736,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         [live, "home"],
         ["conf_batch_fail_room", "room"]
       ]);
-      const homeBridge = new LocalHostBridge("home", worlds, routes);
-      const roomBridge = new LocalHostBridge("room", worlds, routes);
-      home.setHostBridge(homeBridge);
-      roomHost.setHostBridge(roomBridge);
+      const homeBridge = new LocalExecutorContext("home", worlds, routes);
+      const roomBridge = new LocalExecutorContext("room", worlds, routes);
+      home.setExecutorContext(homeBridge);
+      roomHost.setExecutorContext(roomBridge);
 
       roomHost.createObject({ id: "conf_batch_fail_room", name: "Batch-Fail Room", parent: "$chatroom", owner: "$wiz" });
       roomHost.setProp("conf_batch_fail_room", "subscribers", [live]);
@@ -782,8 +782,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         [watcher, "home"],
         ["conf_scrub_room", "room"]
       ]);
-      home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-      roomHost.setHostBridge(new LocalHostBridge("room", worlds, routes));
+      home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+      roomHost.setExecutorContext(new LocalExecutorContext("room", worlds, routes));
 
       roomHost.createObject({ id: "conf_scrub_room", name: "Scrub Room", parent: "$chatroom", owner: "$wiz" });
       roomHost.setProp("conf_scrub_room", "subscribers", [stale, watcher]);
@@ -926,8 +926,8 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         ["conf_remote_room", "room"],
         ["conf_home_widget", "home"]
       ]);
-      home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-      roomHost.setHostBridge(new LocalHostBridge("room", worlds, routes));
+      home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+      roomHost.setExecutorContext(new LocalExecutorContext("room", worlds, routes));
 
       roomHost.createObject({ id: "conf_remote_room", name: "Remote Room", parent: "$chatroom", owner: "$wiz" });
       roomHost.setProp("conf_remote_room", "subscribers", [actor]);

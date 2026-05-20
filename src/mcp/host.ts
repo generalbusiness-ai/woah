@@ -395,7 +395,7 @@ export class McpHost {
       }
     }
 
-    const bridge = this.world.getHostBridge();
+    const bridge = this.world.getExecutorContext();
     const addRemoteDescriptors = (descriptors: RemoteToolDescriptor[], filterToSelected: boolean): void => {
       for (const d of descriptors) {
         if (filterToSelected && !plan.selectedIds.has(d.object)) continue;
@@ -627,7 +627,7 @@ export class McpHost {
 
   async resolveReachableTool(actor: ObjRef, object: ObjRef, verbName: string): Promise<McpTool | null> {
     const locallyReachable = this.reachable(actor).some((entry) => entry.id === object);
-    const bridge = this.world.getHostBridge();
+    const bridge = this.world.getExecutorContext();
     if (locallyReachable && await this.world.isRemoteObject(object)) {
       if (!bridge?.enumerateRemoteTools) return null;
       const projection = this.usesObviousProjection(actor, object) ? "obvious" : "tools";

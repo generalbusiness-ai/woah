@@ -9,7 +9,7 @@ import {
   authedWorld,
   bytecodeVerb,
   callInDubspace,
-  LocalHostBridge,
+  LocalExecutorContext,
   message,
   nativeVerb
 } from "./core-support";
@@ -114,9 +114,9 @@ describe("woo core", () => {
       ["remote_builtin_lamp", "remote"],
       ["remote_builtin_mug", "remote"]
     ]);
-    const bridge = new LocalHostBridge("home", worlds, routes);
-    home.setHostBridge(bridge);
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    const bridge = new LocalExecutorContext("home", worlds, routes);
+    home.setExecutorContext(bridge);
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
     remote.createObject({ id: "remote_builtin_lamp", name: "Remote Builtin Lamp", parent: "$thing", owner: "$wiz" });
     remote.setProp("remote_builtin_lamp", "description", "A remote lamp summary.");
     remote.createObject({ id: "remote_builtin_mug", name: "Remote Builtin Mug", parent: "$thing", owner: "$wiz" });
@@ -249,8 +249,8 @@ describe("woo core", () => {
       ["remote", remote]
     ]);
     const routes = new Map<ObjRef, string>([["remote_box", "remote"]]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
     remote.createObject({ id: "remote_box", name: "Remote Box", parent: "$thing", owner: "$wiz" });
     remote.defineProperty("remote_box", {
@@ -355,8 +355,8 @@ describe("woo core", () => {
       // its local table and trips E_OBJNF.
       ["home_obj", "home"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
     home.setChainOriginPrefix("home");
     remote.setChainOriginPrefix("remote");
 
@@ -431,9 +431,9 @@ describe("woo core", () => {
       ["remote", remote]
     ]);
     const routes = new Map<ObjRef, string>([["remote_box", "remote"]]);
-    const bridge = new LocalHostBridge("home", worlds, routes);
-    home.setHostBridge(bridge);
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    const bridge = new LocalExecutorContext("home", worlds, routes);
+    home.setExecutorContext(bridge);
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
     remote.createObject({ id: "remote_box", name: "Remote Box", parent: "$thing", owner: "$wiz" });
     remote.defineProperty("remote_box", {
@@ -484,9 +484,9 @@ describe("woo core", () => {
     const routes = new Map<ObjRef, string>([
       ["remote_guest", "remote"]
     ]);
-    const bridge = new LocalHostBridge("home", worlds, routes);
-    home.setHostBridge(bridge);
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    const bridge = new LocalExecutorContext("home", worlds, routes);
+    home.setExecutorContext(bridge);
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
     remote.createObject({ id: "remote_guest", name: "Remote Guest", parent: "$player", owner: "$wiz" });
     remote.setProp("remote_guest", "name", "Remote Guest");
@@ -527,9 +527,9 @@ describe("woo core", () => {
       ["remote_lamp", "remote"],
       ["remote_mug", "remote"]
     ]);
-    const bridge = new LocalHostBridge("home", worlds, routes);
-    home.setHostBridge(bridge);
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    const bridge = new LocalExecutorContext("home", worlds, routes);
+    home.setExecutorContext(bridge);
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
     remote.createObject({ id: "remote_lamp", name: "Remote Lamp", parent: "$thing", owner: "$wiz" });
     remote.setProp("remote_lamp", "description", "A lamp hosted on a different object host.");
@@ -571,8 +571,8 @@ describe("woo core", () => {
     const routes = new Map<ObjRef, string>([
       ["remote_welcome_pin", "remote"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
     remote.createObject({ id: "remote_welcome_pin", name: "Remote Welcome Pin", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
     home.mirrorContents("the_chatroom", "remote_welcome_pin", true);
@@ -605,8 +605,8 @@ describe("woo core", () => {
     const routes = new Map<ObjRef, string>([
       ["remote_welcome_pin", "remote"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
 
     remote.createObject({ id: "remote_welcome_pin", name: "Remote Welcome Pin", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
     remote.setProp("remote_welcome_pin", "description", "A pin hosted somewhere else.");
@@ -655,8 +655,8 @@ describe("woo core", () => {
       ["the_deck", "chat"],
       ["the_pinboard", "pinboard"]
     ]);
-    chat.setHostBridge(new LocalHostBridge("chat", worlds, routes));
-    pinboard.setHostBridge(new LocalHostBridge("pinboard", worlds, routes));
+    chat.setExecutorContext(new LocalExecutorContext("chat", worlds, routes));
+    pinboard.setExecutorContext(new LocalExecutorContext("pinboard", worlds, routes));
 
     chat.setActorPresence(watcher.actor, "the_deck", true);
     chat.setSpaceSubscriber("the_deck", watcher.actor, true);
@@ -751,8 +751,8 @@ describe("woo core", () => {
       ["delay_1", "home"],
       ["remote_box", "remote"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
     remote.createObject({ id: "remote_box", name: "Remote Box", parent: "$thing", owner: "$wiz" });
     remote.defineProperty("remote_box", {
       name: "secret",
@@ -1930,8 +1930,8 @@ describe("woo core", () => {
       [actor, "home"],
       ["remote_room", "remote"]
     ]);
-    home.setHostBridge(new LocalHostBridge("home", worlds, routes));
-    remote.setHostBridge(new LocalHostBridge("remote", worlds, routes));
+    home.setExecutorContext(new LocalExecutorContext("home", worlds, routes));
+    remote.setExecutorContext(new LocalExecutorContext("remote", worlds, routes));
     home.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
     remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
     home.createObject({ id: "emitter", name: "Emitter", parent: "$thing", owner: "$wiz", location: "remote_room" });

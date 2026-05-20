@@ -29,10 +29,10 @@ import { applyAcceptedShadowFrame, applyShadowTranscriptToCommitScopeCache, type
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
-  mergeV2TurnGatewayAuthority,
+  mergeExecutorAuthority,
   submitTurnIntent,
-  v2TurnGatewayAuthorityPayload
-} from "../core/v2-turn-gateway";
+  executorAuthorityPayload
+} from "../core/executor";
 
 const MCP_TOKEN_HEADER = "mcp-token";
 const MCP_SESSION_HEADER = "mcp-session-id";
@@ -63,7 +63,7 @@ type SessionEntry = {
 export type McpV2ClientHooks = {
   open: (scope: ObjRef, body: McpV2OpenBody) => Promise<McpV2OpenResult>;
   envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
-  authorityPayload?: (extraObjectIds: ObjRef[]) => Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>>;
+  authorityPayload?: (extraObjectIds: ObjRef[]) => Promise<ReturnType<typeof executorAuthorityPayload>>;
 };
 
 export type McpV2OpenBody = {
@@ -569,7 +569,7 @@ export class McpGateway {
     entry: SessionEntry,
     client: V2ScopeClient,
     hooks: McpV2ClientHooks,
-    seeded?: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }
+    seeded?: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }
   ): Promise<void> {
     if (client.openedSessions.has(entry.woo.id)) return;
     const existing = client.openingSessions.get(entry.woo.id);
@@ -606,11 +606,11 @@ export class McpGateway {
     }
   }
 
-  private async v2AuthorityPayload(extraObjectIds: ObjRef[]): Promise<ReturnType<typeof v2TurnGatewayAuthorityPayload>> {
-    return await (this.options.v2?.authorityPayload?.(extraObjectIds) ?? Promise.resolve(v2TurnGatewayAuthorityPayload(this.world, extraObjectIds)));
+  private async v2AuthorityPayload(extraObjectIds: ObjRef[]): Promise<ReturnType<typeof executorAuthorityPayload>> {
+    return await (this.options.v2?.authorityPayload?.(extraObjectIds) ?? Promise.resolve(executorAuthorityPayload(this.world, extraObjectIds)));
   }
 
-  private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof v2TurnGatewayAuthorityPayload> }> {
+  private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
     const authority = await this.v2AuthorityPayload(extraObjectIds);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
@@ -621,7 +621,7 @@ export class McpGateway {
     // with fresh session/actor authority. Relay-level cache generation must
     // move with that snapshot or open executable seed digests can validate
     // against pre-refresh pages.
-    mergeV2TurnGatewayAuthority(client.relay.commit_scope.serialized, authority);
+    mergeExecutorAuthority(client.relay.commit_scope.serialized, authority);
     markShadowBrowserRelaySerializedChanged(client.relay);
   }
 

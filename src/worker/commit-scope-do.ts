@@ -50,7 +50,7 @@ import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
-import { V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED } from "../core/v2-turn-gateway";
+import { V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED } from "../core/executor";
 import {
   isShadowTurnExecReply,
   shadowReplyMetricKind,
