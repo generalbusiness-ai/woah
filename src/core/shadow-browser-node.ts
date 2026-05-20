@@ -1142,26 +1142,41 @@ export function publishShadowBrowserLiveEvent(
   event: ShadowLiveEvent,
   options: { except?: string | null } = {}
 ): void {
-  relay.live_events.push(structuredClone(event) as ShadowLiveEvent);
+  const cached = cloneImmutableShadowLiveEvent(event);
+  relay.live_events.push(cached);
   trimArrayHead(relay.live_events, MAX_SHADOW_LIVE_EVENTS);
   for (const browser of relay.browsers.values()) {
     if (options.except && browser.node === options.except) continue;
-    if (!shadowLiveEventMatchesBrowser(relay, browser, event)) continue;
-    receiveShadowBrowserLiveEvent(browser, event);
+    if (!shadowLiveEventMatchesBrowser(relay, browser, cached)) continue;
+    receiveShadowBrowserLiveEvent(browser, cached);
   }
 }
 
 function receiveShadowBrowserLiveEvent(browser: ShadowBrowserNode, event: ShadowLiveEvent): void {
-  const cloned = structuredClone(event) as ShadowLiveEvent;
   if (event.coalesce) {
     const index = browser.cache.live_events.findIndex((item) => item.coalesce === event.coalesce);
     if (index >= 0) {
-      browser.cache.live_events[index] = cloned;
+      browser.cache.live_events[index] = event;
       return;
     }
   }
-  browser.cache.live_events.push(cloned);
+  browser.cache.live_events.push(event);
   trimArrayHead(browser.cache.live_events, MAX_SHADOW_LIVE_EVENTS);
+}
+
+function cloneImmutableShadowLiveEvent(event: ShadowLiveEvent): ShadowLiveEvent {
+  // Live fan-out writes the same event into relay history and every matching
+  // browser cache. Clone once at the trust boundary, then freeze so accidental
+  // cache readers cannot mutate shared event cells.
+  return freezePlainShadowValue(structuredClone(event) as ShadowLiveEvent);
+}
+
+function freezePlainShadowValue<T>(value: T): T {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const entry of Object.values(value as Record<string, unknown>)) {
+    freezePlainShadowValue(entry);
+  }
+  return Object.freeze(value);
 }
 
 export function shadowLiveEventMatchesBrowser(

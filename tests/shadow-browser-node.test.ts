@@ -18,6 +18,7 @@ import {
   mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
+  publishShadowBrowserLiveEvent,
   purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -28,6 +29,7 @@ import {
   shadowBrowserEnvelope,
   shadowBrowserSessionBearer,
   shadowBrowserTransportHello,
+  subscribeShadowBrowserNode,
   unsubscribeShadowBrowserNode,
   type ShadowBrowserStateTransfer,
   type ShadowBrowserNode,
@@ -633,6 +635,70 @@ describe("shadow browser node shim", () => {
     });
     expect(first.cache.applied_frames).toHaveLength(0);
     expect(second.cache.applied_frames).toHaveLength(0);
+  });
+
+  it("shares one immutable live event clone across history and matching browser caches", () => {
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-live-shared-relay",
+      scope: "the_dubspace",
+      serialized: createWorld().exportWorld()
+    });
+    const first = createShadowBrowserNode({
+      node: "browser-live-shared-a",
+      scope: "the_dubspace",
+      actor: "guest_1",
+      relay
+    });
+    const second = createShadowBrowserNode({
+      node: "browser-live-shared-b",
+      scope: "the_dubspace",
+      actor: "guest_2",
+      relay
+    });
+    const third = createShadowBrowserNode({
+      node: "browser-live-shared-c",
+      scope: "the_dubspace",
+      actor: "guest_3",
+      relay
+    });
+    subscribeShadowBrowserNode(first);
+    subscribeShadowBrowserNode(second);
+    subscribeShadowBrowserNode(third);
+
+    const event: ShadowLiveEvent = {
+      kind: "woo.live.event.shadow.v1",
+      id: "browser-live-shared",
+      source: "delay_1",
+      actor: "guest_1",
+      scope: "the_dubspace",
+      observation: {
+        type: "control_preview",
+        source: "delay_1",
+        control: "wet",
+        value: 0.25,
+        nested: { marker: "before" }
+      }
+    };
+    const originalStructuredClone = globalThis.structuredClone;
+    const cloneSpy = vi.spyOn(globalThis, "structuredClone").mockImplementation((value) => originalStructuredClone(value));
+    try {
+      publishShadowBrowserLiveEvent(relay, event);
+      expect(cloneSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      cloneSpy.mockRestore();
+    }
+
+    const shared = relay.live_events[0];
+    expect(first.cache.live_events[0]).toBe(shared);
+    expect(second.cache.live_events[0]).toBe(shared);
+    expect(third.cache.live_events[0]).toBe(shared);
+    expect(shared).not.toBe(event);
+    expect(Object.isFrozen(shared)).toBe(true);
+    expect(Object.isFrozen(shared.observation)).toBe(true);
+    expect(Object.isFrozen((shared.observation as Record<string, WooValue>).nested)).toBe(true);
+
+    ((event.observation as Record<string, WooValue>).nested as Record<string, WooValue>).marker = "after-input";
+    expect(((shared.observation as Record<string, WooValue>).nested as Record<string, WooValue>).marker).toBe("before");
   });
 
   it("routes movement transcript live events to each observation source room", () => {
