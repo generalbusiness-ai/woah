@@ -44,8 +44,12 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import { materializeDevV2CommitLocally } from "./dev-v2-commit";
-import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting } from "./dev-v2-routing";
+import {
+  buildVerbThrewReplyEnvelope,
+  decodeTurnIntentForRecovery,
+  materializeDevV2CommitLocally,
+  resolveTurnEnvelopeRouting
+} from "./dev-v2-helpers";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";

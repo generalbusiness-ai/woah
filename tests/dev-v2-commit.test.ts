@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { createWorld } from "../src/core/bootstrap";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
-import { materializeDevV2CommitLocally } from "../src/server/dev-v2-commit";
+import { materializeDevV2CommitLocally } from "../src/server/dev-v2-helpers";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
 describe("dev v2 commit materialization", () => {

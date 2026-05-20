@@ -19,7 +19,7 @@ import {
   shadowBrowserSessionBearer
 } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
-import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting, resolveTurnEnvelopeScope } from "../src/server/dev-v2-routing";
+import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting, resolveTurnEnvelopeScope } from "../src/server/dev-v2-helpers";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import { v2TurnResultMessageFromReply } from "../src/client/v2-browser-messages";
 import type { ObjRef } from "../src/core/types";
