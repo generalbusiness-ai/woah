@@ -85,17 +85,18 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     return invokeDynamicToolWithArgs(tool, orderArgsForVerb(tool, params));
   };
 
-  const findReachableTool = async (object: ObjRef, verb: string): Promise<McpTool> => {
-    const tool = await host.resolveReachableTool(actor, object, verb);
-    // Diagnostic: capture the gateway's view of the actor at decision time
-    // so an E_VERBNF miss can be classified — stale client (object not the
-    // actor's current room), session/location desync (gateway has actor in
-    // a different room than the caller expects), or genuine tool absence.
-    // miss_reason discriminates "object not in reachable set" from
-    // "verb missing on a reachable object"; resolveReachableTool today
-    // returns null for both, so a finer breakdown will need to push the
-    // reason out of host.ts. For now we conservatively label as
-    // not_reachable and refine in a follow-up if the metric shows otherwise.
+  // Diagnostic: capture the gateway's view of the actor at resolution time
+  // so an E_VERBNF miss can be classified — stale client (object not the
+  // actor's current room), session/location desync (gateway has actor in
+  // a different room than the caller expects), or genuine tool absence.
+  // Called from every path that turns an MCP tool-name into a McpTool or
+  // E_VERBNF: the woo_call lookup (findReachableTool), the dynamic-name
+  // parser (resolveDynamicToolName), and the CallToolRequestSchema
+  // fall-through when toolsByName misses entirely. miss_reason
+  // discriminates "object not reachable" from "verb missing on a
+  // reachable object" only as far as the caller knows; resolveReachableTool
+  // returns null for both today, so we label miss as `not_reachable`.
+  const recordToolResolve = (object: ObjRef, verb: string, status: "hit" | "miss"): void => {
     const activeScope = options.world.activeScopeForSession(sessionId);
     const actorLocation = options.world.objects.get(actor)?.location ?? null;
     options.world.recordMetric({
@@ -106,9 +107,14 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
       verb,
       active_scope: activeScope,
       actor_location: actorLocation,
-      status: tool ? "hit" : "miss",
-      ...(tool ? {} : { miss_reason: "not_reachable" as const })
+      status,
+      ...(status === "miss" ? { miss_reason: "not_reachable" as const } : {})
     });
+  };
+
+  const findReachableTool = async (object: ObjRef, verb: string): Promise<McpTool> => {
+    const tool = await host.resolveReachableTool(actor, object, verb);
+    recordToolResolve(object, verb, tool ? "hit" : "miss");
     if (!tool) throw wooError("E_VERBNF", `reachable MCP tool not found: ${object}:${verb}`);
     return tool;
   };
@@ -248,14 +254,27 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     if (stableTool) return invokeForMcp(() => stableTool.invoke(params));
 
     let tool = toolsByName.get(request.params.name);
-    if (!tool) {
+    if (tool) {
+      // Listed-tool hit: the actor's published toolset already has this
+      // tool. Still record a resolve so we can correlate latency / track
+      // the cached tool-list against per-call activity.
+      recordToolResolve(tool.object, tool.verb, "hit");
+    } else {
       tool = (await resolveDynamicToolName(request.params.name)) ?? undefined;
     }
     if (!tool && !looksLikeDynamicToolName(request.params.name)) {
       await refreshTools();
       tool = toolsByName.get(request.params.name);
+      if (tool) recordToolResolve(tool.object, tool.verb, "hit");
     }
     if (!tool) {
+      // Final miss: the request did not parse as a dynamic name and a
+      // refresh didn't surface it. Log as a resolve miss against the raw
+      // request name so the gateway-side context (session, active_scope,
+      // actor_location) is captured — without this, an MCP "unknown tool"
+      // reply has no antecedent metric.
+      const parsed = parseDynamicToolName(request.params.name);
+      recordToolResolve(parsed?.object ?? (request.params.name as ObjRef), parsed?.verb ?? "(unknown)", "miss");
       return {
         content: [{ type: "text" as const, text: `unknown tool: ${request.params.name}` }],
         isError: true
@@ -264,17 +283,33 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     return invokeForMcp(() => invokeDynamicTool(tool, params));
   });
 
-  async function resolveDynamicToolName(name: string): Promise<McpTool | null> {
+  function parseDynamicToolName(name: string): { object: ObjRef; verb: string } | null {
     const marker = name.indexOf("__");
     if (marker <= 0) return null;
     const objectName = name.slice(0, marker);
     const verbName = name.slice(marker + 2);
     if (!verbName) return null;
-    const candidates = objectName.startsWith("$") ? [objectName] : [objectName, `$${objectName}`];
+    return { object: objectName as ObjRef, verb: verbName };
+  }
+
+  async function resolveDynamicToolName(name: string): Promise<McpTool | null> {
+    const parsed = parseDynamicToolName(name);
+    if (!parsed) return null;
+    const candidates = parsed.object.startsWith("$") ? [parsed.object] : [parsed.object, `$${parsed.object}` as ObjRef];
     for (const candidate of candidates) {
-      const tool = await host.resolveReachableTool(actor, candidate, verbName);
-      if (tool) return tool;
+      const tool = await host.resolveReachableTool(actor, candidate, parsed.verb);
+      if (tool) {
+        // Resolved against the candidate that hit — record the actual
+        // (object, verb) we found, not the requested one, so the metric
+        // matches the runtime dispatch.
+        recordToolResolve(tool.object, tool.verb, "hit");
+        return tool;
+      }
     }
+    // All candidates missed. Record once against the parsed (object, verb)
+    // so the antecedent is visible regardless of how many candidates were
+    // tried — the candidate list is implementation detail.
+    recordToolResolve(parsed.object, parsed.verb, "miss");
     return null;
   }
 

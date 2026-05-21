@@ -3516,27 +3516,40 @@ export class PersistentObjectDO {
     const scopedHosts = await this.mcpShardHostsForScopes(affectedScopes);
     const hosts = new Set(scopedHosts);
     const localHost = this.durableHostKey();
-    hosts.delete(localHost);
-    if (hosts.size === 0) return;
+    const localSuppressed = hosts.delete(localHost);
+    // Live fanout has no durable subscribers list (no commit, no fanout
+    // recipients) — peers receive the transcript only if Directory's
+    // scoped-presence lookup names their shard. We record the metric even
+    // when hosts.size === 0 so chat:say-style peer-not-seeing-observation
+    // cases ("the selector ran with zero remote shards") show up in logs
+    // the same way the durable commit path does.
     const body = {
       scope,
       origin_session: originSessionId,
       transcript: transcript as unknown as WooValue
     };
-    await Promise.all(Array.from(hosts, async (host) => {
-      try {
-        await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-live-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
-      } catch (err) {
-        console.warn("woo.mcp_live_fanout.failed", { host, scope, error: normalizeError(err) });
-      }
-    }));
+    if (hosts.size > 0) {
+      await Promise.all(Array.from(hosts, async (host) => {
+        try {
+          await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-live-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
+        } catch (err) {
+          console.warn("woo.mcp_live_fanout.failed", { host, scope, error: normalizeError(err) });
+        }
+      }));
+    }
     world.recordMetric({
       kind: "mcp_fanout",
       scope,
       shards: hosts.size,
       observations: transcript.observations.length,
       affected_scopes: affectedScopes.length,
-      scoped_shards: scopedHosts.length
+      scoped_shards: scopedHosts.length,
+      // Live fanout has no durable subscriber list — explicit subscriber
+      // shards are always zero. Keep the field set (0) for symmetry with
+      // the commit path so triage queries don't need to special-case live.
+      subscriber_shards: 0,
+      local_suppressed: localSuppressed,
+      origin_session: originSessionId
     });
   }
 
