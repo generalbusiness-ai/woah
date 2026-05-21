@@ -3600,33 +3600,44 @@ export class PersistentObjectDO {
     // appear in Directory's scoped query — a session can subscribe to a scope
     // without being located there — so we add their gateway shards here in
     // addition to the scoped-presence shards above.
+    const subscriberShardSet = new Set<string>();
     for (const item of fanout) {
       const sessionId = mcpSessionIdFromNode(item.node);
       if (!sessionId) continue;
-      hosts.add(mcpGatewayShardHost(this.env, sessionId));
+      const shard = mcpGatewayShardHost(this.env, sessionId);
+      hosts.add(shard);
+      subscriberShardSet.add(shard);
     }
-    hosts.delete(localHost);
-    if (hosts.size === 0) return;
+    const localSuppressed = hosts.delete(localHost);
+    // Metric fires regardless of hosts.size so triage can see that the
+    // selector ran with `shards: 0` (peer-not-seeing-observation cases often
+    // hinge on this — no remote shards selected and local delivery
+    // suppressed = no fanout at all).
     const body = {
       scope,
       origin_session: originSessionId,
       commit: commit as unknown as WooValue,
       transcript: transcript as unknown as WooValue
     };
-    await Promise.all(Array.from(hosts, async (host) => {
-      try {
-        await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
-      } catch (err) {
-        console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
-      }
-    }));
+    if (hosts.size > 0) {
+      await Promise.all(Array.from(hosts, async (host) => {
+        try {
+          await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
+        } catch (err) {
+          console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
+        }
+      }));
+    }
     world.recordMetric({
       kind: "mcp_fanout",
       scope,
       shards: hosts.size,
       observations: commit.observations.length,
       affected_scopes: affectedScopes.length,
-      scoped_shards: scopedHosts.length
+      scoped_shards: scopedHosts.length,
+      subscriber_shards: subscriberShardSet.size,
+      local_suppressed: localSuppressed,
+      origin_session: originSessionId
     });
   }
 

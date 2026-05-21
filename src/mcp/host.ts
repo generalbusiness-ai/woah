@@ -772,7 +772,7 @@ export class McpHost {
           await this.broadcasts.broadcastLiveEvents(result, sessionId);
         }
         const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (result as McpTranscriptBearing).transcript, refreshBaseline);
-        this.recordToolRefreshDecision(actor, "invoke", decision);
+        this.recordToolRefreshDecision(actor, "invoke", decision, sessionId);
         if (decision.refresh) {
           await this.refreshToolList(sessionId, actor);
         }
@@ -796,7 +796,7 @@ export class McpHost {
       await this.broadcasts.broadcastApplied(frame, sessionId);
     }
     const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (frame as McpTranscriptBearing).transcript, refreshBaseline);
-    this.recordToolRefreshDecision(actor, "invoke", decision);
+    this.recordToolRefreshDecision(actor, "invoke", decision, sessionId);
     if (decision.refresh) {
       await this.refreshToolList(sessionId, actor);
     }
@@ -898,13 +898,21 @@ export class McpHost {
     return { refresh: true, reason: "reachability_digest", transcript: decision.transcript };
   }
 
-  private recordToolRefreshDecision(actor: ObjRef, source: McpToolRefreshSource, decision: McpToolRefreshDecision): void {
+  private recordToolRefreshDecision(actor: ObjRef, source: McpToolRefreshSource, decision: McpToolRefreshDecision, sessionId?: string): void {
+    // session_id + active_scope let us tell which gateway shard made the
+    // decision and what it thought the actor's working scope was — the two
+    // pieces of context missing when a refresh metric lands without an
+    // obvious matching tools/call. active_scope is read from the session's
+    // recorded activeScope, with a fallback to the actor's location.
+    const activeScope = (sessionId ? this.world.activeScopeForSession(sessionId) : null) ?? this.world.objects.get(actor)?.location ?? null;
     this.world.recordMetric({
       kind: decision.refresh ? "mcp_tool_refresh_taken" : "mcp_tool_refresh_skipped",
       actor,
       source,
       reason: decision.reason,
-      transcript: decision.transcript
+      transcript: decision.transcript,
+      ...(sessionId ? { session_id: sessionId } : {}),
+      active_scope: activeScope
     });
   }
 

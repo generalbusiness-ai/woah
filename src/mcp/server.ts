@@ -87,6 +87,28 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
 
   const findReachableTool = async (object: ObjRef, verb: string): Promise<McpTool> => {
     const tool = await host.resolveReachableTool(actor, object, verb);
+    // Diagnostic: capture the gateway's view of the actor at decision time
+    // so an E_VERBNF miss can be classified — stale client (object not the
+    // actor's current room), session/location desync (gateway has actor in
+    // a different room than the caller expects), or genuine tool absence.
+    // miss_reason discriminates "object not in reachable set" from
+    // "verb missing on a reachable object"; resolveReachableTool today
+    // returns null for both, so a finer breakdown will need to push the
+    // reason out of host.ts. For now we conservatively label as
+    // not_reachable and refine in a follow-up if the metric shows otherwise.
+    const activeScope = options.world.activeScopeForSession(sessionId);
+    const actorLocation = options.world.objects.get(actor)?.location ?? null;
+    options.world.recordMetric({
+      kind: "mcp_tool_resolve",
+      actor,
+      session_id: sessionId,
+      object,
+      verb,
+      active_scope: activeScope,
+      actor_location: actorLocation,
+      status: tool ? "hit" : "miss",
+      ...(tool ? {} : { miss_reason: "not_reachable" as const })
+    });
     if (!tool) throw wooError("E_VERBNF", `reachable MCP tool not found: ${object}:${verb}`);
     return tool;
   };
