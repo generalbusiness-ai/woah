@@ -6526,6 +6526,16 @@ export class WooWorld {
       : null;
     this.bumpMutationVersion();
     this.hostSeedCache.clear();
+    // Collect every object id touched by this transcript so we can persist
+    // the changes at the end. Without this, MCP gateway shards updated
+    // session.activeScope and actor.location only in-memory; when the DO
+    // hibernated between calls and rehydrated, it loaded the pre-update
+    // values from durable storage and the gateway's view diverged from
+    // both the WORLD DO (authoritative) and the actor's owning host —
+    // producing the "actor at $nowhere / session.activeScope null"
+    // mid-test blank that broke cross-actor MCP smoke. See
+    // memory/divergent_session_state_race.md.
+    const touchedObjects = new Set<ObjRef>();
     let stepStartedAt = Date.now();
     for (const create of transcript.creates) {
       if (skippedHostPredicates?.createBelongsHere(create)) continue;
@@ -6533,6 +6543,9 @@ export class WooWorld {
       this.objects.set(create.object, this.objectFromSerializedCreate(serialized));
       if (serialized.parent) addSortedSetValue(this.objects.get(serialized.parent)?.children, serialized.id);
       if (serialized.location) addSortedSetValue(this.objects.get(serialized.location)?.contents, serialized.id);
+      touchedObjects.add(create.object);
+      if (serialized.parent) touchedObjects.add(serialized.parent);
+      if (serialized.location) touchedObjects.add(serialized.location);
     }
     profile?.("apply_creates", stepStartedAt);
 
@@ -6544,6 +6557,7 @@ export class WooWorld {
     for (const write of writes) {
       if (skippedHostPredicates?.belongsHere(write.cell.object)) continue;
       this.applyTranscriptWriteInPlace(write, objectTimestamp, transcript);
+      touchedObjects.add(write.cell.object);
     }
     profile?.("apply_writes", stepStartedAt);
 
@@ -6554,11 +6568,25 @@ export class WooWorld {
 
     stepStartedAt = Date.now();
     const sessionUpdate = transcriptSessionActiveScope(transcript);
+    let touchedSession: Session | null = null;
     if (sessionUpdate) {
       const session = this.sessions.get(sessionUpdate.session);
-      if (session?.actor === sessionUpdate.actor) session.activeScope = sessionUpdate.activeScope;
+      if (session?.actor === sessionUpdate.actor) {
+        session.activeScope = sessionUpdate.activeScope;
+        touchedSession = session;
+      }
     }
     profile?.("apply_session", stepStartedAt);
+
+    // Persist the in-memory changes through the active repository so the next
+    // cold-load (DO hibernate/rehydrate, worker restart) sees the updated
+    // session.activeScope and object cells. persistObject/persistSession
+    // no-op when there is no repository (in-memory tests) so this stays
+    // safe across runtime modes.
+    for (const id of touchedObjects) {
+      if (this.objects.has(id)) this.persistObject(id);
+    }
+    if (touchedSession) this.persistSession(touchedSession);
 
     stepStartedAt = Date.now();
     const logEntry = transcriptLogEntry(transcript);
