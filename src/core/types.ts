@@ -327,6 +327,12 @@ export type MetricEvent =
   // decision so cross_host_rpc latency stats stay clean and policy
   // changes are easy to grep for.
   | { kind: "authority_slice_omitted"; host: string; object_count: number }
+  // Fires from WooWorld.reapSession with the session+actor state at the
+  // moment of reap. Lets triage tell whether a gateway shard's
+  // `actor_loc=$nowhere active_scope=null` divergent state comes from a
+  // reap → resetGuestOnDisconnect (this metric will precede it) or from a
+  // separate code path that clears actor.location and session.activeScope.
+  | { kind: "session_reap"; session_id: string; actor: ObjRef; token_class: string; is_guest: boolean; active_scope: ObjRef | null; last_detach_ms_ago: number | null; expires_at_ms: number }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"

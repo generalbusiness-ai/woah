@@ -7448,6 +7448,20 @@ export class WooWorld {
     if (!session) return;
     const isGuest = this.inheritsFrom(session.actor, "$guest");
     const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
+    // Diagnostic: surface the exact reap moment + the state we're about to
+    // blow away. Triage cross-actor smoke needs to know whether the
+    // `actor_loc=$nowhere active_scope=null` pattern is caused by reap →
+    // resetGuestOnDisconnect or by some other code path.
+    this.recordMetric({
+      kind: "session_reap",
+      session_id: sessionId,
+      actor: session.actor,
+      token_class: session.tokenClass ?? "guest",
+      is_guest: isGuest,
+      active_scope: session.activeScope ?? null,
+      last_detach_ms_ago: session.lastDetachAt === null ? null : Math.max(0, Date.now() - session.lastDetachAt),
+      expires_at_ms: session.expiresAt
+    });
     session.attachedSockets.clear();
     this.killReadTasksFor(session.actor);
     this.removeSessionPresence(sessionId, session.actor);

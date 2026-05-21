@@ -2167,6 +2167,43 @@ export class PersistentObjectDO {
         return jsonResponse({ ok: true });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/debug/session") {
+        // Probe: dump the gateway shard's in-memory view of one session and
+        // its actor. Used to diagnose the actor_loc=$nowhere active_scope=null
+        // divergent state (see memory/divergent_session_state_race.md):
+        // calling this immediately after a failed E_VERBNF surfaces whether
+        // the cached actor row or the session row is the one out of sync.
+        const sessionId = String(body.session_id ?? "");
+        const actor = String(body.actor ?? "") as ObjRef;
+        const session = sessionId ? (world as unknown as { sessions: Map<string, { actor: ObjRef; activeScope: ObjRef | null; expiresAt: number; lastDetachAt: number | null; tokenClass?: string; attachedSockets: Set<string> }> }).sessions.get(sessionId) ?? null : null;
+        const actorObj = actor && world.objects.has(actor) ? world.object(actor) : null;
+        const sessionAlive = sessionId ? world.sessionAlive(sessionId) : null;
+        return jsonResponse({
+          host_key: hostKey,
+          session_id_known: !!session,
+          session: session ? {
+            actor: session.actor,
+            activeScope: session.activeScope,
+            expiresAt: session.expiresAt,
+            lastDetachAt: session.lastDetachAt,
+            tokenClass: session.tokenClass,
+            attachedSocketCount: session.attachedSockets.size
+          } : null,
+          session_alive: sessionAlive,
+          active_scope_for_session: world.activeScopeForSession(sessionId || null),
+          actor_known: !!actorObj,
+          actor: actorObj ? {
+            id: actor,
+            name: actorObj.name,
+            parent: actorObj.parent,
+            location: actorObj.location,
+            modified: actorObj.modified
+          } : null,
+          all_sessions_for_actor: actor ? world.allLocationsForActor(actor) : null,
+          now: Date.now()
+        });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/object-summary") {
         const readActor = String(body.read_actor ?? "") as ObjRef;
         const obj = String(body.obj ?? "") as ObjRef;
