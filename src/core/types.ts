@@ -313,6 +313,14 @@ export type MetricEvent =
   // Logged when a cross-host RPC fires (the `cross_host_rpc` end event only
   // logs on settle, so a wedged fetch leaves no trace at all).
   | { kind: "cross_host_rpc_start"; route: string; host: string; rpc_id?: string }
+  // Emitted by v2GatewayAuthorityPayload when a per-envelope refresh's
+  // /__internal/authority-slice fetch to a remote host timed out and we
+  // chose to omit that host's slice from the combined authority. The
+  // sender already records a `cross_host_rpc{status:"timeout", rpc_id}`
+  // for the underlying RPC; this distinct event captures the higher-level
+  // decision so cross_host_rpc latency stats stay clean and policy
+  // changes are easy to grep for.
+  | { kind: "authority_slice_omitted"; host: string; object_count: number }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"

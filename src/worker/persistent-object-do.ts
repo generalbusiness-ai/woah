@@ -3056,8 +3056,10 @@ export class PersistentObjectDO {
 
     const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
     const byHost = new Map<string, Set<ObjRef>>();
+    const remoteHostedIds = new Set<ObjRef>();
     for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;
+      remoteHostedIds.add(id);
       const list = byHost.get(host) ?? new Set<ObjRef>();
       list.add(id);
       byHost.set(host, list);
@@ -3090,19 +3092,26 @@ export class PersistentObjectDO {
         // fail loudly instead of persisting a partial seed.
         if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures) {
           this.world?.recordMetric({
-            kind: "cross_host_rpc",
-            route: "/__internal/authority-slice",
+            kind: "authority_slice_omitted",
             host,
-            ms: 0,
-            status: "error",
-            error: "authority_slice_omitted"
+            object_count: objects.size
           });
           return { host, response: null, error };
         }
         throw err;
       }
     }));
-    const slices: SerializedAuthoritySlice[] = [local.authority];
+    // `local.authority` was built across ALL requested ids — including those
+    // owned by remote hosts, for which the gateway holds a potentially
+    // stale copy. Strip those non-locally-hosted cells before combining,
+    // otherwise an omitted remote slice would leak the gateway's stale view
+    // through `combineSerializedAuthoritySlices → mergeSerializedAuthoritySlice`
+    // and the CommitScopeDO would never fall back to its durable snapshot.
+    // Only objects whose authoritative host is this gateway survive in the
+    // base local slice; fresh remote cells come exclusively from successful
+    // remote responses below.
+    const localOnlyAuthority = filterSerializedAuthoritySliceObjects(local.authority, (id) => !remoteHostedIds.has(id));
+    const slices: SerializedAuthoritySlice[] = [localOnlyAuthority];
     for (const { host, response } of remoteSlices) {
       if (!response) continue;
       const accepted = new Set<ObjRef>();
