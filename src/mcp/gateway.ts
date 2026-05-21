@@ -258,7 +258,22 @@ export class McpGateway {
   acceptRemoteV2Commit(scope: ObjRef, commit: ShadowCommitAccepted, transcript: EffectTranscript, originSessionId?: string | null): void {
     const commitScope = commit.position.scope;
     const key = remoteAcceptedKey(commit);
-    if (this.remoteAccepted.has(key)) return;
+    // Diagnostic: log every entry to acceptRemoteV2Commit so we can see whether
+    // a peer shard is even reaching this code path for the cross-actor smoke
+    // (Bug A — peer-not-seeing-observation). The previous metrics confirmed
+    // the sender's selector chose remote shards; this confirms the receiver.
+    const dedupedAlready = this.remoteAccepted.has(key);
+    this.world.recordMetric({
+      kind: "mcp_remote_commit_received",
+      scope,
+      commit_scope: commitScope,
+      seq: commit.position.seq,
+      origin_session: originSessionId ?? null,
+      observations: commit.observations.length,
+      queue_count: this.host.queueCount(),
+      dedup_skipped: dedupedAlready
+    });
+    if (dedupedAlready) return;
     const pending = this.remotePending.get(commitScope);
     if (pending?.has(commit.position.seq)) return;
 
@@ -283,7 +298,19 @@ export class McpGateway {
 
   acceptRemoteV2Live(scope: ObjRef, transcript: EffectTranscript, originSessionId?: string | null): void {
     const key = remoteLiveAcceptedKey(scope, transcript);
-    if (this.remoteAccepted.has(key)) return;
+    const dedupedAlready = this.remoteAccepted.has(key);
+    // Same shape as the commit-path metric above: log every live-event receipt
+    // on a peer shard so we can see whether the live-fanout path is reaching
+    // the receiver before the audience filter rejects.
+    this.world.recordMetric({
+      kind: "mcp_remote_live_received",
+      scope,
+      origin_session: originSessionId ?? null,
+      observations: transcript.observations.length,
+      queue_count: this.host.queueCount(),
+      dedup_skipped: dedupedAlready
+    });
+    if (dedupedAlready) return;
     this.rememberRemoteAccepted(key);
     this.host.routeLiveEvents(liveFrameFromTranscript(scope, transcript), originSessionId ?? null);
   }

@@ -333,6 +333,20 @@ export type MetricEvent =
   // reap → resetGuestOnDisconnect (this metric will precede it) or from a
   // separate code path that clears actor.location and session.activeScope.
   | { kind: "session_reap"; session_id: string; actor: ObjRef; token_class: string; is_guest: boolean; active_scope: ObjRef | null; last_detach_ms_ago: number | null; expires_at_ms: number }
+  // Fired on a peer MCP gateway shard when it receives a remote commit or
+  // live-event fanout (acceptRemoteV2Commit / acceptRemoteV2Live). Captures
+  // whether the receiving shard has any sessions bound (`queue_count`) and
+  // whether this commit was deduped against a prior receipt. Bug A
+  // (peer-not-seeing-observation) hinges on these two: if `queue_count` is
+  // 0 the shard has nobody to deliver to; if `dedup_skipped` is true the
+  // earlier path already handled it.
+  | { kind: "mcp_remote_commit_received"; scope: ObjRef; commit_scope: ObjRef; seq: number; origin_session: string | null; observations: number; queue_count: number; dedup_skipped: boolean }
+  | { kind: "mcp_remote_live_received"; scope: ObjRef; origin_session: string | null; observations: number; queue_count: number; dedup_skipped: boolean }
+  // Summary of one routeShadowAcceptedFrame pass. Distinguishes "scanned
+  // queues=N, delivered to M" from "scanned queues=0" (nobody to deliver
+  // to) and "scanned queues=N, delivered to 0" (audience filter rejected
+  // everyone).
+  | { kind: "mcp_observation_routed"; scope: ObjRef; observation_type: string; queues_scanned: number; deliveries: number; route: "live" | "accepted" }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"

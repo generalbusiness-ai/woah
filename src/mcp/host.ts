@@ -178,13 +178,25 @@ export class McpHost {
     for (let i = 0; i < observations.length; i++) {
       const observation = observations[i];
       const sessionAudience = result.observationSessionAudiences?.[i] ?? result.audienceSessions ?? null;
+      let queuesScanned = 0;
+      let deliveries = 0;
       if (sessionAudience) {
         const sessionSet = new Set(sessionAudience);
         for (const sessionId of sessionSet) {
+          queuesScanned += 1;
           if (originSessionId && sessionId === originSessionId) continue;
           if (!this.queues.has(sessionId)) continue;
           this.enqueueFor(sessionId, observation);
+          deliveries += 1;
         }
+        this.world.recordMetric({
+          kind: "mcp_observation_routed",
+          scope: typeof result.audience === "string" ? (result.audience as ObjRef) : ("?" as ObjRef),
+          observation_type: String(observation.type ?? ""),
+          queues_scanned: queuesScanned,
+          deliveries,
+          route: "live"
+        });
         continue;
       }
       const audience = result.observationAudiences?.[i] ?? result.audienceActors ?? null;
@@ -195,6 +207,7 @@ export class McpHost {
       if (directed.from) directedActors.add(directed.from);
       const sourceScope = typeof observation.source === "string" ? observation.source : null;
       for (const [sessionId, queue] of this.queues) {
+        queuesScanned += 1;
         if (originSessionId && sessionId === originSessionId) continue;
         const sessionLocation = this.world.activeScopeForSession(sessionId);
         const shouldDeliver = audienceSet
@@ -206,8 +219,19 @@ export class McpHost {
               sessionLocation === result.audience ||
               (sourceScope !== null && (this.actorSubscribes(queue.actor, sourceScope) || sessionLocation === sourceScope))
             );
-        if (shouldDeliver) this.enqueueFor(sessionId, observation);
+        if (shouldDeliver) {
+          this.enqueueFor(sessionId, observation);
+          deliveries += 1;
+        }
       }
+      this.world.recordMetric({
+        kind: "mcp_observation_routed",
+        scope: typeof result.audience === "string" ? (result.audience as ObjRef) : ("?" as ObjRef),
+        observation_type: String(observation.type ?? ""),
+        queues_scanned: queuesScanned,
+        deliveries,
+        route: "live"
+      });
     }
   }
 
@@ -231,7 +255,10 @@ export class McpHost {
       const directedActors = new Set<ObjRef>();
       if (directed.to) directedActors.add(directed.to);
       if (directed.from) directedActors.add(directed.from);
+      let queuesScanned = 0;
+      let deliveries = 0;
       for (const [sessionId, queue] of this.queues) {
+        queuesScanned += 1;
         if (originSessionId && sessionId === originSessionId) continue;
         const sessionLocation = this.world.activeScopeForSession(sessionId);
         const sourceScope = typeof observation.source === "string" ? observation.source : null;
@@ -242,9 +269,21 @@ export class McpHost {
             (sourceScope !== null && (this.actorSubscribes(queue.actor, sourceScope) || sessionLocation === sourceScope));
         if (shouldDeliver) {
           this.enqueueFor(sessionId, observation);
+          deliveries += 1;
           if (refreshDecisionForActor(queue.actor).refresh) refreshSessions.add(sessionId);
         }
       }
+      // Per-observation summary. Audience drops show as `queues_scanned > 0`
+      // but `deliveries === 0`. "Shard has nobody to deliver to" shows as
+      // `queues_scanned === 0`.
+      this.world.recordMetric({
+        kind: "mcp_observation_routed",
+        scope: frame.position.scope,
+        observation_type: String(observation.type ?? ""),
+        queues_scanned: queuesScanned,
+        deliveries,
+        route: "accepted"
+      });
     }
     for (const sessionId of refreshSessions) {
       const queue = this.queues.get(sessionId);
@@ -628,6 +667,12 @@ export class McpHost {
     }
     return true;
   }
+
+  /** Number of sessions currently bound to this MCP host (have an entry in
+   * `this.queues`). Used by acceptRemote* diagnostic metrics to distinguish
+   * "fanout reached a shard that hosts no MCP sessions" from "fanout reached
+   * the right shard but the audience filter rejected." */
+  queueCount(): number { return this.queues.size; }
 
   async markToolListSeen(sessionId: string, actor: ObjRef): Promise<void> {
     // The transport just handed this actor a concrete tools/list result.
