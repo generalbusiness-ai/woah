@@ -293,7 +293,19 @@ export class McpHost {
     add(actor, "self");
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
     const activeLocations = this.world.allLocationsForActor(actor);
-    const activeScope = actorObj?.location ?? activeLocations[0] ?? null;
+    // Session-driven activeScope wins over actorObj.location. The gateway
+    // shard's actor row is a cross-host cache that can fall through to
+    // $player.home's class default ("$nowhere") when the durable copy of
+    // the actor row hasn't been refreshed since the last move — the
+    // gateway is the session's host, not the actor's host, so its cached
+    // actor.location can lag without surfacing as null/undefined. Reading
+    // session.activeScope first makes the reachability check independent
+    // of that cache, fixing the actor_loc=$nowhere divergent state hit by
+    // the cross-actor smoke (memory/divergent_session_state_race.md).
+    // We still fall back to actorObj.location for code paths with no
+    // session (admin probes, postflight checks) and for actors whose
+    // session has detached.
+    const activeScope = activeLocations[0] ?? actorObj?.location ?? null;
     if (activeScope) add(activeScope, "location", false);
     if (activeScope && this.world.objects.has(activeScope) && this.descendsFrom(activeScope, "$space")) {
       for (const id of this.world.object(activeScope).contents) {
