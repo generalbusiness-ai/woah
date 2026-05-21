@@ -254,27 +254,39 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     if (stableTool) return invokeForMcp(() => stableTool.invoke(params));
 
     let tool = toolsByName.get(request.params.name);
+    // Track whether any resolve attempt below has already emitted an
+    // `mcp_tool_resolve` event for this call. The final fall-through
+    // records a miss only if no prior path did, so an invalid foo__bar
+    // counts as one miss (in resolveDynamicToolName), not two.
+    let resolveLogged = false;
     if (tool) {
       // Listed-tool hit: the actor's published toolset already has this
       // tool. Still record a resolve so we can correlate latency / track
       // the cached tool-list against per-call activity.
       recordToolResolve(tool.object, tool.verb, "hit");
+      resolveLogged = true;
     } else {
-      tool = (await resolveDynamicToolName(request.params.name)) ?? undefined;
+      const resolved = await resolveDynamicToolName(request.params.name);
+      tool = resolved.tool ?? undefined;
+      resolveLogged = resolved.logged;
     }
     if (!tool && !looksLikeDynamicToolName(request.params.name)) {
       await refreshTools();
       tool = toolsByName.get(request.params.name);
-      if (tool) recordToolResolve(tool.object, tool.verb, "hit");
+      if (tool) {
+        recordToolResolve(tool.object, tool.verb, "hit");
+        resolveLogged = true;
+      }
     }
     if (!tool) {
-      // Final miss: the request did not parse as a dynamic name and a
-      // refresh didn't surface it. Log as a resolve miss against the raw
-      // request name so the gateway-side context (session, active_scope,
-      // actor_location) is captured — without this, an MCP "unknown tool"
-      // reply has no antecedent metric.
-      const parsed = parseDynamicToolName(request.params.name);
-      recordToolResolve(parsed?.object ?? (request.params.name as ObjRef), parsed?.verb ?? "(unknown)", "miss");
+      // Final miss. Skip the metric when an upstream resolver already
+      // logged one — see resolveLogged comment above. If parsing rejected
+      // the name entirely (no `__` separator), no upstream miss fired and
+      // we record against the raw name so the gateway-side context
+      // (session, active_scope, actor_location) is captured.
+      if (!resolveLogged) {
+        recordToolResolve(request.params.name as ObjRef, "(unknown)", "miss");
+      }
       return {
         content: [{ type: "text" as const, text: `unknown tool: ${request.params.name}` }],
         isError: true
@@ -292,9 +304,15 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     return { object: objectName as ObjRef, verb: verbName };
   }
 
-  async function resolveDynamicToolName(name: string): Promise<McpTool | null> {
+  async function resolveDynamicToolName(name: string): Promise<{ tool: McpTool | null; logged: boolean }> {
+    // Returns `logged: true` when this function emitted an mcp_tool_resolve
+    // event (either hit-on-candidate or miss-on-parsed-name); the caller
+    // uses that flag to suppress duplicate misses from the final fall-
+    // through. Returns `logged: false` only when the name didn't parse
+    // as a dynamic name at all — there is nothing to record at this layer
+    // and the caller may still emit its own miss.
     const parsed = parseDynamicToolName(name);
-    if (!parsed) return null;
+    if (!parsed) return { tool: null, logged: false };
     const candidates = parsed.object.startsWith("$") ? [parsed.object] : [parsed.object, `$${parsed.object}` as ObjRef];
     for (const candidate of candidates) {
       const tool = await host.resolveReachableTool(actor, candidate, parsed.verb);
@@ -303,14 +321,14 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
         // (object, verb) we found, not the requested one, so the metric
         // matches the runtime dispatch.
         recordToolResolve(tool.object, tool.verb, "hit");
-        return tool;
+        return { tool, logged: true };
       }
     }
     // All candidates missed. Record once against the parsed (object, verb)
     // so the antecedent is visible regardless of how many candidates were
     // tried — the candidate list is implementation detail.
     recordToolResolve(parsed.object, parsed.verb, "miss");
-    return null;
+    return { tool: null, logged: true };
   }
 
   return { server, host, dispose };
