@@ -788,6 +788,25 @@ export class PersistentObjectDO {
         },
         broadcasts: {}
       });
+      // On cold-load (DO rehydrate after hibernation), McpHost.queues is empty.
+      // The runtime relies on bindSession to populate it, which only happens
+      // when a client sends a fresh /mcp request that goes through gateway
+      // session resume. Until that happens, peer-shard fanout to this shard
+      // for the actor's session is dropped (queues_scanned=0 in the
+      // mcp_observation_routed metric — see commit 9316122). Rebind every
+      // persisted session in world.sessions whose shard hash points at this
+      // gateway shard. The queue starts empty; observations land in it
+      // immediately; the next woo_wait drain returns them.
+      const localShard = this.durableHostKey();
+      let rebound = 0;
+      const reboundStart = Date.now();
+      for (const session of world.sessions.values()) {
+        if (mcpGatewayShardHost(this.env, session.id) === localShard) {
+          this.mcpGateway.host.bindSession(session.id, session.actor);
+          rebound += 1;
+        }
+      }
+      world.recordMetric({ kind: "mcp_gateway_rebind", host_key: localShard, sessions_rebound: rebound, ms: Date.now() - reboundStart });
       world.recordMetric({ kind: "init", phase: "mcp_gateway", ms: Date.now() - initStart });
     }
     return this.mcpGateway;

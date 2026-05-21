@@ -347,6 +347,11 @@ export type MetricEvent =
   // to) and "scanned queues=N, delivered to 0" (audience filter rejected
   // everyone).
   | { kind: "mcp_observation_routed"; scope: ObjRef; observation_type: string; queues_scanned: number; deliveries: number; route: "live" | "accepted" }
+  // Fired on each lazy McpGateway init, after persisted sessions belonging
+  // to this shard are re-bound into McpHost.queues. Lets us see whether the
+  // rebind on cold-load is actually finding sessions (sessions_rebound > 0)
+  // or whether the shard genuinely has nothing to bind (e.g., a fresh DO).
+  | { kind: "mcp_gateway_rebind"; host_key: string; sessions_rebound: number; ms: number }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"
