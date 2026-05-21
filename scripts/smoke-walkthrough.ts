@@ -162,7 +162,16 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     await bob.call("the_chatroom", "southeast", []);
     await drain(alice);
     await drain(bob);
-    await alice.call("the_deck", "enter", ["the_pinboard"]).catch(() => undefined);
+    // `the_deck:enter the_pinboard` is the cross-room-enter form; it can
+    // fail with scope_mismatch if the actor's session isn't routed for the
+    // sequenced enter (see memory: cross_scope_enter_route_sequenced).
+    // The `pinboard:enter` below is the canonical entry, so we tolerate
+    // this opportunistic warm-up failing but log it instead of swallowing.
+    try {
+      await alice.call("the_deck", "enter", ["the_pinboard"]);
+    } catch (err) {
+      console.warn(`alice deck:enter the_pinboard warm-up failed: ${(err as Error).message}`);
+    }
     await alice.call("the_pinboard", "enter", []);
     await bob.call("the_pinboard", "enter", []);
     await drain(alice);
@@ -183,10 +192,17 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // we assert the row shape on its result rather than calling :room_roster
   // (which is direct_callable but intentionally not tool_exposed).
   await step("outliner:enter result includes a roster row for alice", async () => {
-    await alice.call("the_pinboard", "leave", []).catch(() => undefined);
-    await bob.call("the_pinboard", "leave", []).catch(() => undefined);
-    await alice.call("the_deck", "west", []);
-    await bob.call("the_deck", "west", []);
+    // Only call leave if the actor is actually in the pinboard right now —
+    // see McpSession.leaveIfIn. If the upstream `pinboard:enter` failed,
+    // they're not in the pinboard, and calling leave from the wrong room
+    // (silently swallowed by the old .catch) masked a real E_VERBNF.
+    await alice.leaveIfIn("the_pinboard");
+    await bob.leaveIfIn("the_pinboard");
+    // Similarly: only walk west if we're actually on the deck. If we never
+    // made it onto the deck, we're (probably) still in the chatroom — skip
+    // the move so the smoke doesn't generate a stale E_VERBNF here.
+    if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", []);
+    if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", []);
     await drain(alice);
     await drain(bob);
     const aliceEnter = unwrap(await alice.callRaw("the_outline", "enter", []));
@@ -221,10 +237,15 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // in lock-step, then bob enters last so alice (already in) is the
   // one waiting on the `entered` observation.
   await step("tasks: cross-room `entered` reaches peer", async () => {
-    await alice.call("the_outline", "leave", []).catch(() => undefined);
-    await bob.call("the_outline", "leave", []).catch(() => undefined);
-    await alice.call("the_chatroom", "southeast", []);
-    await bob.call("the_chatroom", "southeast", []);
+    // Same guard pattern as outliner:enter — only leave if we're in the
+    // outline; only southeast if we're in the chatroom. Without these
+    // guards a transient failure in the previous step cascades into
+    // E_VERBNF on the wrong-room verb here, which masks the real cause.
+    await alice.leaveIfIn("the_outline");
+    await bob.leaveIfIn("the_outline");
+    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", []);
+    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", []);
+    if (alice.currentRoom !== "the_deck") throw new Error(`alice expected on the_deck before south; at=${alice.currentRoom}`);
     await alice.call("the_deck", "south", []);
     await drain(alice);
     await drain(bob);
@@ -318,6 +339,16 @@ async function waitFor(
 
 class McpSession {
   private nextId = 2;
+  // Tracked client-side from every move-style response that carries a `room`
+  // field in its structuredContent.result. The smoke walkthrough used to
+  // silently `.catch(() => undefined)` the leave verbs that close out one
+  // tool space before walking somewhere else; when the underlying enter had
+  // failed earlier (cold-start transient, slice timeout, etc.), the leave
+  // was a no-op, the *next* directional verb was issued from the wrong
+  // assumed room, and the server returned E_VERBNF — a false negative that
+  // masked the real failure. Track the last-known room so the smoke can
+  // gate its leaves on actually being there.
+  currentRoom: string | null = null;
 
   private constructor(
     readonly sessionId: string,
@@ -366,7 +397,30 @@ class McpSession {
   }
 
   async call(object: string, verb: string, verbArgs: unknown[]): Promise<unknown> {
-    return unwrap(await this.callRaw(object, verb, verbArgs));
+    const result = unwrap(await this.callRaw(object, verb, verbArgs));
+    // Move/enter/leave responses carry `room` in structuredContent.result.
+    // Update tracked room from every successful call so guarded helpers
+    // below can avoid calling leave/direction verbs from the wrong room.
+    if (isRecord(result) && typeof result.room === "string") this.currentRoom = result.room;
+    return result;
+  }
+
+  // Call `verb` on `space` only if our tracked location matches `space`.
+  // Used to close out a tool space (`pinboard:leave`, `outline:leave`) where
+  // an earlier `enter` may have failed; calling the leave verb from a room
+  // we never reached generates a confusing E_VERBNF that masks the real
+  // upstream failure. Returns true if the leave actually fired.
+  async leaveIfIn(space: string): Promise<boolean> {
+    if (this.currentRoom !== space) return false;
+    try {
+      await this.call(space, "leave", []);
+      return true;
+    } catch (err) {
+      // Surface (don't swallow) — a leave that fails despite our location
+      // tracking saying we're there is a real signal, not noise.
+      console.warn(`leave ${space} failed for ${this.label} at ${this.currentRoom}: ${(err as Error).message}`);
+      return false;
+    }
   }
 
   async callRaw(object: string, verb: string, verbArgs: unknown[]): Promise<any> {
