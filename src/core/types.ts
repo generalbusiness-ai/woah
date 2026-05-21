@@ -245,7 +245,7 @@ export type WooObject = {
 export type MetricEvent =
   | { kind: "broadcast"; audience_size: number; obs_count: number; ms: number; origin_session?: string }
   | { kind: "compose_look"; room: ObjRef; present_count: number; contents_count: number; remote_titles: number; remote_describe_batches: number; ms: number }
-  | { kind: "cross_host_rpc"; route: string; host: string; ms: number; status: "ok" | "error" | "timeout"; error?: string; queue_ms?: number }
+  | { kind: "cross_host_rpc"; route: string; host: string; ms: number; status: "ok" | "error" | "timeout"; error?: string; queue_ms?: number; rpc_id?: string }
   | { kind: "storage_flush"; objects: number; properties: number; sessions: number; deleted_sessions: number; tasks: number; deleted_tasks: number; counters: boolean; ms: number; rows?: number; top_properties?: Array<[string, number]>; top_objects?: Array<[ObjRef, number]> }
   // `rows` is a logical-operations estimate, not a measured SQL row count.
   // Single-row ops (`session`, `task`, `tombstone`, `snapshot`,
@@ -275,7 +275,7 @@ export type MetricEvent =
   | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean }
   | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean }
   | { kind: "do_constructor"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; ms: number }
-  | { kind: "do_handler"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; method: string; route: string; ms: number; status: "ok" | "error"; error?: string; error_detail?: string }
+  | { kind: "do_handler"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; method: string; route: string; ms: number; status: "ok" | "error"; error?: string; error_detail?: string; rpc_id?: string }
   | { kind: "shadow_apply_step"; phase: "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "total"; scope: ObjRef; route: string; ms: number; objects: number; creates: number; writes: number }
   | { kind: "shadow_gateway_apply_step"; phase: "capture_runtime" | "export_world" | "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "apply_serialized" | "import_world" | "restore_runtime" | "total"; scope: ObjRef; route: string; ms: number; objects: number; properties: number; sessions: number; logs: number; creates: number; writes: number }
   | { kind: "shadow_transcript_anomaly"; scope: ObjRef; route: string; reason: "contents_remove_without_move"; object: ObjRef; id?: string }
@@ -312,7 +312,7 @@ export type MetricEvent =
   | { kind: "host_task_long_running"; id: number; label: string; elapsed_ms: number }
   // Logged when a cross-host RPC fires (the `cross_host_rpc` end event only
   // logs on settle, so a wedged fetch leaves no trace at all).
-  | { kind: "cross_host_rpc_start"; route: string; host: string }
+  | { kind: "cross_host_rpc_start"; route: string; host: string; rpc_id?: string }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"

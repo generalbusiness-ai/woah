@@ -118,6 +118,11 @@ export class CommitScopeDO {
     let handlerStatus: "ok" | "error" = "ok";
     let handlerError: string | undefined;
     let handlerErrorDetail: string | undefined;
+    // Per-call correlation id stamped by the sender (see
+    // persistent-object-do.ts §forwardInternalRaw). Echoed on do_handler so
+    // a sender timeout can be matched against the receiver's actual handler
+    // runtime — distinguishing transit delay from satellite execution.
+    const rpcId = request.headers.get("x-woo-rpc-id") || undefined;
     try {
       if (request.method === "GET" && url.pathname === "/healthz") {
         return jsonResponse({
@@ -336,6 +341,7 @@ export class CommitScopeDO {
         route: url.pathname,
         ms: Date.now() - handlerStartedAt,
         status: handlerStatus,
+        ...(rpcId ? { rpc_id: rpcId } : {}),
         ...(handlerError ? { error: handlerError } : {}),
         ...(handlerErrorDetail ? { error_detail: handlerErrorDetail } : {})
       });

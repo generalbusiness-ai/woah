@@ -386,6 +386,10 @@ export class PersistentObjectDO {
     let handlerStatus: "ok" | "error" = "ok";
     let handlerError: string | undefined;
     let handlerErrorDetail: string | undefined;
+    // Per-call correlation id stamped by the sender (forwardInternalRaw).
+    // We echo it in `do_handler` so a sender-side timeout can be matched to
+    // the receiver's actual handler runtime without keeping the fetch alive.
+    const rpcId = request.headers.get("x-woo-rpc-id") || undefined;
     // Operator-bootstrap precondition check (cloudflare.md §R14.7).
     try {
       if (!this.env.WOO_INITIAL_WIZARD_TOKEN) {
@@ -560,6 +564,7 @@ export class PersistentObjectDO {
         route: pathname || "_pre_route",
         ms: Date.now() - handlerStartedAt,
         status: handlerStatus,
+        ...(rpcId ? { rpc_id: rpcId } : {}),
         ...(handlerError ? { error: handlerError } : {}),
         ...(handlerErrorDetail ? { error_detail: handlerErrorDetail } : {})
       }, hostKey);
@@ -773,7 +778,13 @@ export class PersistentObjectDO {
             const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, { localMcpLiveHandled: true });
             return { ...result, local_host_materialized: delivery.localHostMaterialized };
           },
-          authorityPayload: async (extraObjectIds) => await this.v2GatewayAuthorityPayload(world, extraObjectIds)
+          // tolerateRemoteFailures: this is the per-envelope refresh callback
+          // for an already-opened MCP session; the CommitScopeDO has a durable
+          // snapshot, so omitting a cold satellite's slice falls through to
+          // existing cells. The first-open seeding path does NOT pass this
+          // flag — see comment on v2GatewayAuthorityPayload.
+          authorityPayload: async (extraObjectIds) =>
+            await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true })
         },
         broadcasts: {}
       });
@@ -3015,7 +3026,18 @@ export class PersistentObjectDO {
     return { serialized, authority };
   }
 
-  private async v2GatewayAuthorityPayload(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<ReturnType<typeof executorAuthorityPayload>> {
+  private async v2GatewayAuthorityPayload(
+    world: WooWorld,
+    extraObjectIds: Iterable<ObjRef>,
+    options: { tolerateRemoteFailures?: boolean } = {}
+  ): Promise<ReturnType<typeof executorAuthorityPayload>> {
+    // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
+    // omit slices for cold/unreachable remote hosts and rely on the
+    // CommitScopeDO's existing durable snapshot. It must NOT be set on the
+    // first-open seeding path: a missing remote slice would let the
+    // satellite persist an incomplete seed (no recovery on subsequent
+    // warm opens). Open paths instead let the timeout propagate so the
+    // caller fails loudly and the client retries against a warm satellite.
     const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
     const local = executorAuthorityPayload(world, ids);
     const localObjectIds = authoritySliceObjectIds(local.authority);
@@ -3041,16 +3063,48 @@ export class PersistentObjectDO {
       byHost.set(host, list);
     }
 
-    const remoteSlices = await Promise.all(Array.from(byHost, async ([host, objects]) => ({
-      host,
-      response: await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
-        host,
-        "/__internal/authority-slice",
-        { objects: Array.from(objects) }
-      )
-    })));
+    // Remote authority-slice fetches can time out on cold satellites. When
+    // that happens we deliberately OMIT that host's fresh slice from the
+    // combined authority rather than substituting the gateway's local view
+    // of those objects: the gateway copy can be stale in ways stale_head
+    // does not fully repair (the authority merge overwrites cached cells;
+    // direct/live planning paths may not get a clean sequenced repair).
+    // The downstream CommitScopeDO uses its existing durable snapshot for
+    // anything not present in the combined slice; if cells it needs are
+    // genuinely missing, dispatch raises missing_state / E_OBJNF and the
+    // caller retries against what is now a warm satellite.
+    const remoteSlices = await Promise.all(Array.from(byHost, async ([host, objects]) => {
+      try {
+        const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+          host,
+          "/__internal/authority-slice",
+          { objects: Array.from(objects) }
+        );
+        return { host, response, error: null as { code: string } | null };
+      } catch (err) {
+        const error = normalizeError(err);
+        // Only swallow read-deadline timeouts (E_TIMEOUT) and only when the
+        // caller declared this is a refresh path (durable snapshot exists).
+        // Other errors (auth, signature, unreachable) always propagate;
+        // first-open seeding paths likewise propagate so cold-cold misses
+        // fail loudly instead of persisting a partial seed.
+        if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures) {
+          this.world?.recordMetric({
+            kind: "cross_host_rpc",
+            route: "/__internal/authority-slice",
+            host,
+            ms: 0,
+            status: "error",
+            error: "authority_slice_omitted"
+          });
+          return { host, response: null, error };
+        }
+        throw err;
+      }
+    }));
     const slices: SerializedAuthoritySlice[] = [local.authority];
     for (const { host, response } of remoteSlices) {
+      if (!response) continue;
       const accepted = new Set<ObjRef>();
       const responseObjectIds = Array.from(authoritySliceObjectIds(response.authority));
       const objectHosts = await Promise.all(responseObjectIds.map(
@@ -3107,7 +3161,11 @@ export class PersistentObjectDO {
       clientSerialized: (client) => client.relay.commit_scope.serialized,
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => executorEnvelopeId(id, attempt, () => crypto.randomUUID()),
-      authorityPayload: async (_scope, extraObjectIds) => await this.v2GatewayAuthorityPayload(world, extraObjectIds),
+      // Per-turn authority refresh against an already-opened relay; the
+      // CommitScopeDO has a durable snapshot so a cold satellite's slice
+      // can be safely omitted. See comment on v2GatewayAuthorityPayload.
+      authorityPayload: async (_scope, extraObjectIds) =>
+        await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true }),
       submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body),
       // Forward planning-phase verb metrics to the host world's metrics
       // hook so /admin/ footprint-by-verb sees v2 traffic.
@@ -3753,9 +3811,18 @@ export class PersistentObjectDO {
     // active (cold-load directory chatter, postflight probes, etc.) —
     // treated as a fresh chain at the receiver.
     const chainId = this.world?.currentTaskChainId() ?? null;
+    // Per-call correlation id, propagated to the receiver via header and
+    // back into both sides' metrics. The sender's `cross_host_rpc_start`,
+    // the receiver's `do_handler`, and the sender's `cross_host_rpc`
+    // (ok|timeout|error) all share the same `rpc_id`, so a timeout on the
+    // sender can be matched against the receiver's actual handler runtime —
+    // distinguishing transit latency from satellite execution time without
+    // keeping orphaned fetches alive past timeout.
+    const rpcId = crypto.randomUUID();
     const baseHeaders: Record<string, string> = {
       "content-type": "application/json; charset=utf-8",
-      "x-woo-host-key": host
+      "x-woo-host-key": host,
+      "x-woo-rpc-id": rpcId
     };
     if (chainId !== null) baseHeaders["x-woo-task-chain"] = chainId;
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
@@ -3766,7 +3833,7 @@ export class PersistentObjectDO {
     const startedAt = Date.now();
     // Logged here so a wedged fetch leaves a trace; the existing
     // `cross_host_rpc` end event only fires on settle.
-    this.world?.recordMetric({ kind: "cross_host_rpc_start", route: path, host });
+    this.world?.recordMetric({ kind: "cross_host_rpc_start", route: path, host, rpc_id: rpcId });
     // Every cross-host RPC gets a deadline. Read-only callers pick a tight
     // one (HOST_READ_RPC_TIMEOUT_MS via forwardInternalReadChecked); mutating
     // callers fall back to the much more generous HOST_WRITE_RPC_TIMEOUT_MS
@@ -3784,7 +3851,7 @@ export class PersistentObjectDO {
       observedQueueMs = queueMs;
       const parsed = await response.json() as T;
       const queueField = observedQueueMs > 0 ? { queue_ms: observedQueueMs } : {};
-      this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok", ...queueField });
+      this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "ok", rpc_id: rpcId, ...queueField });
       return parsed;
     } catch (err) {
       const queueField = observedQueueMs > 0 ? { queue_ms: observedQueueMs } : {};
@@ -3792,11 +3859,11 @@ export class PersistentObjectDO {
       // as before this refactor.
       const isAbortTimeout = controller.signal.aborted && (controller.signal.reason as { code?: string } | undefined)?.code === "E_TIMEOUT";
       if (isAbortTimeout) {
-        this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "timeout", ...queueField });
+        this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "timeout", rpc_id: rpcId, ...queueField });
         throw controller.signal.reason;
       }
       const error = normalizeError(err);
-      this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "error", error: error.code, ...queueField });
+      this.world?.recordMetric({ kind: "cross_host_rpc", route: path, host, ms: Date.now() - startedAt, status: "error", error: error.code, rpc_id: rpcId, ...queueField });
       throw err;
     } finally {
       clearTimeout(timeout);

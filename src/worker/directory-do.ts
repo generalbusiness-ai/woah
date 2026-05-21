@@ -64,6 +64,8 @@ export class DirectoryDO {
     let handlerStatus: "ok" | "error" = "ok";
     let handlerError: string | undefined;
     let handlerErrorDetail: string | undefined;
+    // See persistent-object-do.ts §forwardInternalRaw — sender stamps this.
+    const rpcId = request.headers.get("x-woo-rpc-id") || undefined;
     try {
       if (!this.schemaEnsured) {
         const schemaStartedAt = Date.now();
@@ -188,6 +190,7 @@ export class DirectoryDO {
         route: url.pathname,
         ms: Date.now() - handlerStartedAt,
         status: handlerStatus,
+        ...(rpcId ? { rpc_id: rpcId } : {}),
         ...(handlerError ? { error: handlerError } : {}),
         ...(handlerErrorDetail ? { error_detail: handlerErrorDetail } : {})
       });
