@@ -7440,7 +7440,22 @@ export class WooWorld {
     if (session.attachedSockets.size > 0) return false;
     if (now >= session.expiresAt) return true;
     if (session.lastDetachAt === null) return false;
-    return now >= session.lastDetachAt + this.sessionGrace(session.tokenClass);
+    // HTTP/MCP sessions never socket-attach, so `lastDetachAt` is the
+    // protocol's idea of "not currently connected" from the moment the DO
+    // rehydrates (persistedSessionFromRow stamps lastDetachAt = load time
+    // when the persisted value was null). Without a socket-attach signal to
+    // keep them alive, the grace clock advances across hibernation cycles
+    // and the session can be reaped while the client is still actively
+    // making requests — that produces the divergent state hit by
+    // cross-actor smoke (memory/divergent_session_state_race.md).
+    //
+    // Treat `lastInputAt` (bumped by touchSessionInput at the protocol
+    // edge) as an equivalent activity signal. `lastInputAt` is in-memory
+    // only, so after a DO rehydrate it's 0 and the lastDetachAt clock
+    // resumes — but the next request bumps lastInputAt and brings the
+    // session firmly back into the alive window for `grace` ms.
+    const lastActiveAt = Math.max(session.lastDetachAt, session.lastInputAt ?? 0);
+    return now >= lastActiveAt + this.sessionGrace(session.tokenClass);
   }
 
   private reapSession(sessionId: string): void {
