@@ -352,6 +352,15 @@ export type MetricEvent =
   // rebind on cold-load is actually finding sessions (sessions_rebound > 0)
   // or whether the shard genuinely has nothing to bind (e.g., a fresh DO).
   | { kind: "mcp_gateway_rebind"; host_key: string; sessions_rebound: number; ms: number }
+  // Fired from WooWorld.movetoActorChecked when an actor (with an active
+  // session) is moved through the session-aware path. Reports whether the
+  // primary-session guard fired the physical-move branch, which is the
+  // branch that produces the object_move transcript entry. Bug B
+  // (outline:leave server-vs-client divergence) hinges on this: a non-
+  // primary or remote-actor case updates session.activeScope but not
+  // actor.location, leaving the apply transcript without a move write so
+  // committed state diverges from the immediate reply.
+  | { kind: "moveto_actor"; actor: ObjRef; session_id: string; from: ObjRef | null; to: ObjRef; is_primary: boolean; primary_session_id: string | null; remote_actor_host: boolean; defer_host_effect: boolean }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"

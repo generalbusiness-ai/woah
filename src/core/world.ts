@@ -5318,8 +5318,26 @@ export class WooWorld {
       }
       session.activeScope = targetRef;
       this.persistSession(session);
-      if (this.primarySessionForActor(actor)?.id === session.id) {
-        if (ctx.deferHostEffect && await this.remoteHostForObject(actor, ctx.hostMemo)) {
+      const primary = this.primarySessionForActor(actor);
+      const isPrimary = primary?.id === session.id;
+      const remoteActorHost = await this.remoteHostForObject(actor, ctx.hostMemo);
+      // Diagnostic: capture whether the primary-session guard fires the
+      // physical-move branch. Bug B (outline:leave server vs client
+      // divergence) shows session.activeScope updating but actor.location
+      // staying at the_outline — that would happen if isPrimary=false here.
+      this.recordMetric({
+        kind: "moveto_actor",
+        actor,
+        session_id: session.id,
+        from: oldLocation ?? null,
+        to: targetRef,
+        is_primary: isPrimary,
+        primary_session_id: primary?.id ?? null,
+        remote_actor_host: Boolean(remoteActorHost),
+        defer_host_effect: Boolean(ctx.deferHostEffect)
+      });
+      if (isPrimary) {
+        if (ctx.deferHostEffect && remoteActorHost) {
           this.mirrorRemoteMoveLocally(actor, targetRef);
           ctx.deferHostEffect({ kind: "move_object", obj: actor, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
         } else {
