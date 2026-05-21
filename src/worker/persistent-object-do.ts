@@ -3056,13 +3056,32 @@ export class PersistentObjectDO {
 
     const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
     const byHost = new Map<string, Set<ObjRef>>();
-    const remoteHostedIds = new Set<ObjRef>();
     for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;
-      remoteHostedIds.add(id);
       const list = byHost.get(host) ?? new Set<ObjRef>();
       list.add(id);
       byHost.set(host, list);
+    }
+    // To make an omitted remote slice genuinely fall back to the CommitScopeDO's
+    // durable snapshot (rather than leaking stale gateway-local copies of that
+    // host's cells), we need to know which cells in `local.authority` belong to
+    // a host whose remote fetch we attempted-and-omitted. exportAuthoritySlice
+    // expands the request through parent chain, contents, value-refs, and verb
+    // bytecode literals, so `local.authority` carries far more than the
+    // explicit `ids`: requesting `the_chatroom` also pulls in
+    // exit_living_room_southeast, the_deck (via exit.dest), etc.
+    // We classify every object in `local.authority` by host, then drop only
+    // those whose host appears in `omittedHosts` (populated below from
+    // tolerated remote-fetch timeouts). Transitively-reachable cells for
+    // hosts we never asked stay in the slice — preserving the existing
+    // behavior of using the gateway's local view for second-degree cells.
+    const localAuthorityObjectIds = Array.from(authoritySliceObjectIds(local.authority));
+    const localAuthorityHosts = await Promise.all(localAuthorityObjectIds.map(
+      async (id) => [id, await resolveHost(id, WORLD_HOST)] as const
+    ));
+    const localObjectHostMap = new Map<ObjRef, string>();
+    for (const [id, host] of localAuthorityHosts) {
+      if (host) localObjectHostMap.set(id, host);
     }
 
     // Remote authority-slice fetches can time out on cold satellites. When
@@ -3075,6 +3094,7 @@ export class PersistentObjectDO {
     // anything not present in the combined slice; if cells it needs are
     // genuinely missing, dispatch raises missing_state / E_OBJNF and the
     // caller retries against what is now a warm satellite.
+    const omittedHosts = new Set<string>();
     const remoteSlices = await Promise.all(Array.from(byHost, async ([host, objects]) => {
       try {
         const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
@@ -3096,21 +3116,25 @@ export class PersistentObjectDO {
             host,
             object_count: objects.size
           });
+          omittedHosts.add(host);
           return { host, response: null, error };
         }
         throw err;
       }
     }));
-    // `local.authority` was built across ALL requested ids — including those
-    // owned by remote hosts, for which the gateway holds a potentially
-    // stale copy. Strip those non-locally-hosted cells before combining,
-    // otherwise an omitted remote slice would leak the gateway's stale view
-    // through `combineSerializedAuthoritySlices → mergeSerializedAuthoritySlice`
-    // and the CommitScopeDO would never fall back to its durable snapshot.
-    // Only objects whose authoritative host is this gateway survive in the
-    // base local slice; fresh remote cells come exclusively from successful
-    // remote responses below.
-    const localOnlyAuthority = filterSerializedAuthoritySliceObjects(local.authority, (id) => !remoteHostedIds.has(id));
+    // Strip the gateway's local cells for hosts we attempted-and-omitted.
+    // This is the precise version of the A1-safe invariant: an omitted
+    // host's cells genuinely fall back to the CommitScopeDO's durable
+    // snapshot. Hosts we never tried to fetch (transitive reachability —
+    // e.g. `the_chatroom`'s exit.dest reaching `the_deck` without
+    // `the_deck` itself being an explicit id) keep their gateway-local
+    // copy; that matches pre-change behavior for second-degree cells.
+    const localOnlyAuthority = omittedHosts.size === 0
+      ? local.authority
+      : filterSerializedAuthoritySliceObjects(local.authority, (id) => {
+          const host = localObjectHostMap.get(id);
+          return host === undefined || !omittedHosts.has(host);
+        });
     const slices: SerializedAuthoritySlice[] = [localOnlyAuthority];
     for (const { host, response } of remoteSlices) {
       if (!response) continue;
