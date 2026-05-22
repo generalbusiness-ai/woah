@@ -7183,7 +7183,12 @@ export class WooWorld {
   }
 
   private persistSession(session: Session): void {
-    this.bumpMutationVersion();
+    // Do NOT bump mutationCounter: sessions are explicitly excluded from
+    // host-seed deliveries (exportHostScopedWorld returns `sessions: []`),
+    // so persisting a session can never change any host's seed. Bumping
+    // here was the dominant cause of the 94% host_seed_cache miss rate
+    // measured before this change — every MCP request bumps lastInputAt
+    // and persists, invalidating every host's cache.
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7196,7 +7201,7 @@ export class WooWorld {
   }
 
   private deletePersistedSession(sessionId: string): void {
-    this.bumpMutationVersion();
+    // Same rationale as persistSession: sessions are not in host seeds.
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
