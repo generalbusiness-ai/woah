@@ -766,11 +766,29 @@ export class WooWorld {
    * turn events. The persist sites that invoke this are called during
    * turn execution; recording a phantom prop_read of `host_placement`
    * on every persisted object would pollute the transcript and break
-   * write-prior-version semantics. Read the property bag directly. */
+   * write-prior-version semantics. Walk the class chain manually for
+   * inherited defaults. */
   private hostKeyForObject(id: ObjRef): string {
+    // Read `host_placement` from own property, else walk class chain
+    // (parent links) for inherited propertyDef default. No turn-event
+    // side effects.
     const rawHostPlacement = (target: ObjRef): unknown => {
       const obj = this.objects.get(target);
-      return obj?.properties.get("host_placement") ?? obj?.propertyDefs.get("host_placement")?.defaultValue ?? null;
+      if (!obj) return null;
+      if (obj.properties.has("host_placement")) return obj.properties.get("host_placement");
+      if (obj.propertyDefs.has("host_placement")) return obj.propertyDefs.get("host_placement")!.defaultValue;
+      let cursor: ObjRef | null = obj.parent;
+      const seen = new Set<ObjRef>();
+      while (cursor && !seen.has(cursor)) {
+        seen.add(cursor);
+        const ancestor = this.objects.get(cursor);
+        if (!ancestor) break;
+        if (ancestor.propertyDefs.has("host_placement")) {
+          return ancestor.propertyDefs.get("host_placement")!.defaultValue;
+        }
+        cursor = ancestor.parent;
+      }
+      return null;
     };
     if (rawHostPlacement(id) === "self") return id;
     const obj = this.objects.get(id);
@@ -3926,9 +3944,14 @@ export class WooWorld {
   }
 
   objectRoutes(): Array<{ id: ObjRef; host: string; anchor: ObjRef | null }> {
+    // Use the same chain-walking lookup as hostKeyForObject so a class-
+    // level host_placement default (e.g., $block → "self") classifies every
+    // instance as self-hosted. The previous implementation only checked
+    // own propertyDefs/properties, so subclasses of a self-hosted class
+    // wouldn't inherit the placement.
     const selfHosted = new Set<ObjRef>();
     for (const id of this.objects.keys()) {
-      if (this.propOrNull(id, "host_placement") === "self") selfHosted.add(id);
+      if (this.hostKeyForObject(id) === id) selfHosted.add(id);
     }
     const hostFor = (id: ObjRef): string => {
       if (selfHosted.has(id)) return id;
