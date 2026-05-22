@@ -757,6 +757,42 @@ export class WooWorld {
     this.mutationCounter += 1;
   }
 
+  /** Walk the anchor chain to find which host's slice owns `id`.
+   * Mirrors objectRoutes()'s `hostFor` but is O(depth) rather than O(N).
+   * Used by the per-host hostSeedCache invalidation paths so a write to
+   * one host doesn't invalidate every host's cached seed.
+   *
+   * IMPORTANT: This must NOT call getProp / propOrNull — those record
+   * turn events. The persist sites that invoke this are called during
+   * turn execution; recording a phantom prop_read of `host_placement`
+   * on every persisted object would pollute the transcript and break
+   * write-prior-version semantics. Read the property bag directly. */
+  private hostKeyForObject(id: ObjRef): string {
+    const rawHostPlacement = (target: ObjRef): unknown => {
+      const obj = this.objects.get(target);
+      return obj?.properties.get("host_placement") ?? obj?.propertyDefs.get("host_placement")?.defaultValue ?? null;
+    };
+    if (rawHostPlacement(id) === "self") return id;
+    const obj = this.objects.get(id);
+    if (!obj) return DEFAULT_OBJECT_HOST;
+    let cursor: ObjRef | null = obj.anchor;
+    const seen = new Set<ObjRef>();
+    while (cursor && !seen.has(cursor)) {
+      if (rawHostPlacement(cursor) === "self") return cursor;
+      seen.add(cursor);
+      cursor = this.objects.has(cursor) ? this.object(cursor).anchor : null;
+    }
+    return DEFAULT_OBJECT_HOST;
+  }
+
+  /** Drop one host's cached seed without bumping the global cache version.
+   * Used by per-object persist paths that know which host's slice changed:
+   * the next host-seed request for `host` will rebuild, but other hosts'
+   * cached seeds remain valid. */
+  private invalidateHostSeed(host: string): void {
+    this.hostSeedCache.delete(host as ObjRef);
+  }
+
   // Read access for the MCP host (cross-host tool enumeration). Other callers
   // should use the typed APIs that wrap the bridge.
   getExecutorContext(): ExecutorContext | null {
@@ -6282,13 +6318,17 @@ export class WooWorld {
    */
   buildHostSeedForDeliveryWithDigest(host: ObjRef): { seed: SeedWorld; digest: string } {
     const startedAt = Date.now();
-    const version = this.mutationCounter;
+    // Cache is invalidated by explicit delete from invalidateHostSeed,
+    // not by version comparison. The `version` field is retained for
+    // compatibility but no longer gates cache hits — the only way an
+    // entry leaves the cache is a delete call from a persist site that
+    // affected this host's slice.
     const cached = this.hostSeedCache.get(host);
-    if (cached && cached.version === version) {
+    if (cached) {
       this.recordMetric({ kind: "host_seed_cache", host, status: "hit", ms: Date.now() - startedAt });
       return { seed: cached.seed, digest: cached.digest };
     }
-    const missReason: "version_changed" | "absent" = cached ? "version_changed" : "absent";
+    const missReason: "version_changed" | "absent" = "absent";
     const slice = this.exportHostScopedWorld(host);
     // The wire body keeps the insertion-order layout that the existing
     // mergeHostScopedSeed contract assumes: per-object arrays (verbs,
@@ -6319,7 +6359,11 @@ export class WooWorld {
     // transfer. The canonical form is gateway-internal, never
     // transmitted, so it doesn't perturb merge semantics.
     const digest = hashSource(canonicalJsonStringify(canonicalSeedForDigest(seed)));
-    this.hostSeedCache.set(host, { version, seed, digest });
+    // version is no longer consulted by the cache lookup (kept on the
+    // entry shape for backward compatibility — invalidation is purely
+    // by explicit delete). Capture the current mutationCounter as a
+    // diagnostic stamp.
+    this.hostSeedCache.set(host, { version: this.mutationCounter, seed, digest });
     this.recordMetric({ kind: "host_seed_cache", host, status: "miss", reason: missReason, ms: Date.now() - startedAt });
     return { seed, digest };
   }
@@ -6411,8 +6455,14 @@ export class WooWorld {
     const gatewayHost = options.gatewayHost === true;
     const { belongsHere, createBelongsHere } = this.transcriptHostPredicates(hostKey, gatewayHost);
 
-    this.bumpMutationVersion();
-    this.hostSeedCache.clear();
+    // Per-host invalidation: the apply scopes writes to hostKey via the
+    // predicates above. Inner persistObject/persistProperty calls inside
+    // the loop will invalidate hostKey's hostSeedCache as needed. Skip
+    // the explicit clear-all that was here before — it was the dominant
+    // cause of cache misses on WORLD when satellite write-throughs fanned
+    // back to WORLD.
+    this.mutationCounter += 1;
+    this.invalidateHostSeed(hostKey);
     let objects = 0;
     let properties = 0;
     let logs = 0;
@@ -6548,8 +6598,13 @@ export class WooWorld {
     const skippedHostPredicates = skipHost
       ? this.transcriptHostPredicates(skipHost.hostKey, skipHost.gatewayHost === true)
       : null;
-    this.bumpMutationVersion();
-    this.hostSeedCache.clear();
+    // Inner persistObject/persistProperty calls inside the apply loop
+    // will invalidate the per-host caches as their writes are persisted.
+    // The earlier full clear-all here was the cause of the cache-miss
+    // problem on WORLD: a satellite's write-through commit fans back to
+    // WORLD's acceptV2Commit → applyCommittedShadowTranscriptInPlace →
+    // clear() → next satellite's host-seed request rebuilds from scratch.
+    this.mutationCounter += 1;
     // Collect every object id touched by this transcript so we can persist
     // the changes at the end. Without this, MCP gateway shards updated
     // session.activeScope and actor.location only in-memory; when the DO
@@ -7094,7 +7149,13 @@ export class WooWorld {
   }
 
   private persistObject(objRef: ObjRef): void {
-    this.bumpMutationVersion();
+    this.mutationCounter += 1;
+    // Per-host cache invalidation: only the host whose slice contains
+    // objRef needs its cached host-seed dropped. Other hosts' caches
+    // stay valid. hostKeyForObject walks the anchor chain to find which
+    // host owns the slice; for $-classes and other DEFAULT_OBJECT_HOST
+    // objects this returns "world", so only WORLD's cache is dropped.
+    this.invalidateHostSeed(this.hostKeyForObject(objRef));
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7110,7 +7171,8 @@ export class WooWorld {
   }
 
   private deletePersistedObject(objRef: ObjRef): void {
-    this.bumpMutationVersion();
+    this.mutationCounter += 1;
+    this.invalidateHostSeed(this.hostKeyForObject(objRef));
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7130,7 +7192,11 @@ export class WooWorld {
    * non-zero, just like dirty objects.
    */
   private persistTombstone(objRef: ObjRef): void {
-    this.bumpMutationVersion();
+    this.mutationCounter += 1;
+    // Tombstones are in every host's seed (exportHostScopedWorld returns
+    // `tombstones: Array.from(this.tombstones).sort()`), so a tombstone
+    // write must invalidate every host's cached seed.
+    this.hostSeedCache.clear();
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7141,7 +7207,10 @@ export class WooWorld {
   }
 
   private persistProperty(objRef: ObjRef, name: string): void {
-    this.bumpMutationVersion();
+    this.mutationCounter += 1;
+    // Properties travel with their owning object's slice. Invalidate
+    // only that host's cache.
+    this.invalidateHostSeed(this.hostKeyForObject(objRef));
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7154,7 +7223,8 @@ export class WooWorld {
   }
 
   private deletePersistedProperty(objRef: ObjRef, name: string): void {
-    this.bumpMutationVersion();
+    this.mutationCounter += 1;
+    this.invalidateHostSeed(this.hostKeyForObject(objRef));
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
