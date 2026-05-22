@@ -478,26 +478,9 @@ export class WooWorld {
   // writes, deletes, accepted log rows). It may over-invalidate after rollback;
   // callers only depend on equality meaning "safe cache hit."
   private mutationCounter = 0;
-  /** Per-host mutation counter for hostSeedCache. Anything that mutates a
-   * specific host's slice bumps that host's counter; the host-seed cache
-   * is keyed by (host, that host's counter). Most mutations touch one
-   * host's slice (a verb writes to room objects on that room's host), so
-   * per-host counters dramatically reduce cache invalidation compared to
-   * a single global counter. Genuinely global changes (importWorld,
-   * tombstones, class-graph edits) bump every counter.
-   *
-   * Bumping discipline:
-   *   - applyCommittedShadowTranscriptToHost(hostKey, ...) → bump hostKey.
-   *   - applyCommittedShadowTranscriptInPlace(transcript) → bump every
-   *     host whose object appears in the transcript's creates/writes.
-   *   - importWorld → invalidate every entry by deleting them all.
-   *   - Direct ad-hoc writes (createObject, setProp, etc.) → bump every
-   *     host. Conservative because the host-seed reflects every object's
-   *     state and we can't always cheaply derive which host changed; the
-   *     hot transcript paths above avoid this. */
-  private hostSeedCacheVersionByHost: Map<ObjRef, number> = new Map();
   /** Per-host cache for buildHostSeedForDelivery. Keyed by host; valid
-   * while `version === hostSeedCacheVersionByHost.get(host)`. */
+   * while `version === mutationCounter`. Any mutation invalidates all
+   * entries (cheap: just a counter compare on lookup). */
   private hostSeedCache: Map<ObjRef, { version: number; seed: SeedWorld; digest: string }> = new Map();
   private callDepth = 0;
   private guestFreePool = new Set<ObjRef>();
@@ -772,27 +755,6 @@ export class WooWorld {
 
   private bumpMutationVersion(): void {
     this.mutationCounter += 1;
-    // Conservative: most callers of bumpMutationVersion are paths whose
-    // exact host impact isn't trivially known here (direct writes, generic
-    // persist hooks). Treat them as global. The hot transcript paths
-    // (applyCommittedShadowTranscriptToHost / inPlace) bypass this and
-    // call bumpHostSeedVersion(host) directly so they don't invalidate
-    // every host's cache.
-    this.bumpAllHostSeedVersions();
-  }
-
-  /** Bump the host-seed cache version for one specific host. Used by the
-   * transcript apply paths that know exactly which host's slice changed. */
-  private bumpHostSeedVersion(host: ObjRef): void {
-    this.hostSeedCacheVersionByHost.set(host, (this.hostSeedCacheVersionByHost.get(host) ?? 0) + 1);
-  }
-
-  /** Bump every known host's seed-cache version. Used by the global
-   * fallback path and by importWorld. */
-  private bumpAllHostSeedVersions(): void {
-    for (const host of this.hostSeedCacheVersionByHost.keys()) {
-      this.hostSeedCacheVersionByHost.set(host, (this.hostSeedCacheVersionByHost.get(host) ?? 0) + 1);
-    }
   }
 
   // Read access for the MCP host (cross-host tool enumeration). Other callers
@@ -6320,11 +6282,7 @@ export class WooWorld {
    */
   buildHostSeedForDeliveryWithDigest(host: ObjRef): { seed: SeedWorld; digest: string } {
     const startedAt = Date.now();
-    // Per-host version. Established lazily: hosts seen here all get a row
-    // in hostSeedCacheVersionByHost so future bumpAllHostSeedVersions()
-    // covers them. A missing entry defaults to 0 (first build).
-    const version = this.hostSeedCacheVersionByHost.get(host) ?? 0;
-    if (!this.hostSeedCacheVersionByHost.has(host)) this.hostSeedCacheVersionByHost.set(host, version);
+    const version = this.mutationCounter;
     const cached = this.hostSeedCache.get(host);
     if (cached && cached.version === version) {
       this.recordMetric({ kind: "host_seed_cache", host, status: "hit", ms: Date.now() - startedAt });
@@ -6453,15 +6411,8 @@ export class WooWorld {
     const gatewayHost = options.gatewayHost === true;
     const { belongsHere, createBelongsHere } = this.transcriptHostPredicates(hostKey, gatewayHost);
 
-    // Per-host invalidation: this apply mutates ONLY hostKey's slice
-    // (the predicates above scope writes to that host). Only hostKey's
-    // host-seed cache needs to be invalidated. Bumping the global
-    // mutationCounter via the old bumpMutationVersion() invalidated every
-    // host's cache — observed as ~94% miss rate during smoke. The new
-    // bumpHostSeedVersion + delete leaves other hosts' caches valid.
-    this.mutationCounter += 1;
-    this.bumpHostSeedVersion(hostKey);
-    this.hostSeedCache.delete(hostKey);
+    this.bumpMutationVersion();
+    this.hostSeedCache.clear();
     let objects = 0;
     let properties = 0;
     let logs = 0;
