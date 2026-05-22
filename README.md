@@ -15,6 +15,7 @@ We have built this sort of space before.  It's a good time to build it again.
 
 ## Woah
 
+[![SafeSkill NaN/100](https://img.shields.io/badge/SafeSkill-NaN%2F100_Blocked-red)](https://safeskill.dev/scan/generalbusiness-ai-woah)
 `Woah` is a virtual world made of programmable, shared, persistent objects.
 
 It operates a distributed virtual machine with strong consistency.
