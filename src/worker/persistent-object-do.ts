@@ -955,6 +955,32 @@ export class PersistentObjectDO {
   }
 
   private async createMcpGatewayShardWorld(hostKey: string, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
+    // KV fast path: WORLD publishes its full exportWorld to
+    // mcp-gateway-world-current → digest, mcp-gateway-world:${digest}
+    // → bytes on every snapshot request. The bytes are identical
+    // across all gateway shards (the handler doesn't shard on the
+    // body), so a single KV value serves every shard's cold-load
+    // and the edge cache benefits compound across shards.
+    if (this.env.HOST_SEED_KV) {
+      const kvStartedAt = Date.now();
+      try {
+        const pointer = await this.env.HOST_SEED_KV.get("mcp-gateway-world-current", "text");
+        if (pointer && pointer.length > 0) {
+          const raw = await this.env.HOST_SEED_KV.get(`mcp-gateway-world:${pointer}`, "text");
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (isSerializedWorld(parsed)) {
+              this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: parsed.objects.length, source: "kv" }, hostKey);
+              return createWorldFromSerialized(parsed, { repository: this.repo, metricsHook, persist: false });
+            }
+          }
+        }
+        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
+      } catch (err) {
+        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
+        // fall through to DO RPC
+      }
+    }
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/mcp-gateway-world`, {
@@ -970,7 +996,7 @@ export class PersistentObjectDO {
     if (!response.ok || !isSerializedWorld(body)) {
       throw wooError("E_STORAGE", `failed to load MCP gateway shard snapshot for ${hostKey}`, body as WooValue);
     }
-    this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - startedAt, status: "ok", objects: body.objects.length }, hostKey);
+    this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - startedAt, status: "ok", objects: body.objects.length, source: "do" }, hostKey);
     return createWorldFromSerialized(body, { repository: this.repo, metricsHook, persist: false });
   }
 
@@ -1067,21 +1093,20 @@ export class PersistentObjectDO {
         seedMergeChanged = true;
       }
     }
-    if (seedMergeChanged && freshSeedSource === "do") world.persistFullSnapshot();
-    // KV-sourced seeds are NOT persisted: they're a cold-load
-    // accelerator only. If a KV value happens to be stale, the
-    // in-memory world for this DO instance carries that staleness
-    // until the next apply-v2-commit fanout corrects it, but local
-    // SQL stays clean and the next cold-load can recover. The v1 KV
-    // cache (commit 71e41a5) skipped this guard and corrupted
-    // satellite SQL when a stale KV value got persisted — recovery
-    // required force-rebuild routes. See
-    // notes/2026-05-22-decomposed-kv-seed-cache.md.
-    // Same rationale for the seed digest: only record it when the
-    // bytes came from the authoritative DO RPC path, so a cold-load
-    // never trusts a digest that pointed at a KV-cached seed of
-    // unknown freshness.
-    if (freshSeedDigest && freshSeed && freshSeedSource === "do") {
+    // With content-addressed KV keys (Lever B), a successful KV read
+    // returns bytes whose digest matches the requested pointer — the
+    // bytes are self-consistent and either current or a frozen past
+    // version. Persisting them to local SQL is safe: stale-but-
+    // consistent state is exactly what the next apply-v2-commit
+    // fanout corrects, and the cold-load no longer pays the merge
+    // cost on every wake. The v1 KV poisoning required a non-
+    // content-addressed key (deploy N+1 read deploy N's bytes under
+    // the same key); Lever B's bytes:${host}:${digest} key shape
+    // means a deploy that changes verb shape produces a new digest
+    // and a new key, so old bytes are unreachable through the
+    // pointer.
+    if (seedMergeChanged) world.persistFullSnapshot();
+    if (freshSeedDigest && freshSeed) {
       this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, freshSeedDigest);
     }
     this.scrubStaleSubscribersOnce(world);
@@ -2123,7 +2148,34 @@ export class PersistentObjectDO {
 
       if (request.method === "POST" && pathname === "/__internal/mcp-gateway-world") {
         if (hostKey !== WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "MCP gateway snapshots are served only by the world host");
-        return jsonResponse(world.exportWorld());
+        const exported = world.exportWorld();
+        // KV publish (Lever B extension): the MCP gateway snapshot is
+        // identical across all gateway shards (the handler ignores the
+        // body.shard hint), so a single KV value serves every shard's
+        // cold-load. Content-addressed by hash of the serialized world
+        // so a new commit produces a new key automatically. Pointer
+        // moves last. Read path is in createMcpGatewayShardWorld.
+        //
+        // Measurement before this commit (Lever B host-seed only):
+        //   mcp_gateway_snapshot_fetch avg 1183ms, max 6647ms
+        // Expected after: KV reads ~50-200ms when fresh, falls through
+        // to DO RPC on miss (e.g., right after a content change before
+        // the waitUntil write lands).
+        if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
+          const body = JSON.stringify(exported);
+          const digest = hashSource(body);
+          const bytesKey = `mcp-gateway-world:${digest}`;
+          const pointerKey = "mcp-gateway-world-current";
+          this.state.waitUntil((async () => {
+            try {
+              await this.env.HOST_SEED_KV!.put(bytesKey, body, { expirationTtl: 7 * 24 * 3600 });
+              await this.env.HOST_SEED_KV!.put(pointerKey, digest);
+            } catch (err) {
+              console.warn("woo.mcp_gateway_world_kv_put.failed", { digest, error: normalizeError(err) });
+            }
+          })());
+        }
+        return jsonResponse(exported);
       }
 
       if (request.method === "POST" && pathname === "/__internal/mcp-commit-fanout") {
