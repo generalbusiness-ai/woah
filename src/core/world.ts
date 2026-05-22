@@ -10801,34 +10801,9 @@ function nextScopedObjectCounter(ids: Iterable<ObjRef>): number {
 // (bootstrap.ts:normalizeVerbForCompare). See buildHostSeedForDelivery for the
 // full rationale and the degradation contract for non-bundled-catalog verbs.
 function stripAuthoringMetadataFromObject(obj: SerializedObject): SerializedObject {
-  // Wire-format strip for host-seed delivery. Removes verb authoring/
-  // execution metadata that the receiver can rebuild from `source` —
-  // dramatically reduces seed size (verb.bytecode was the dominant
-  // payload at ~67% of bytes for typical satellite seeds). The
-  // receiver's importWorld path (cloneImportedVerb) recompiles
-  // bytecode from source on import when it's missing, transparently.
-  //
-  // Native verbs have no compilable source; their bytecode is the
-  // native binding name, kept as-is (zero size impact).
-  //
-  // Local SQL persistence keeps the full bytecode and line_map — this
-  // strip applies only to outbound wire delivery via buildHostSeed*.
   const stripped: SerializedObject = {
     ...obj,
-    verbs: obj.verbs.map((verb) => {
-      if (verb.kind !== "bytecode") return { ...verb, line_map: {} };
-      // Source-only delivery: drop bytecode and line_map. The receiver
-      // recompiles from source. source_hash stays on the wire so the
-      // recompile's result can be verified against the publisher's
-      // expectation.
-      const { bytecode: _bytecode, line_map: _line_map, ...rest } = verb;
-      // The cloneImportedVerb compile fallback expects a placeholder
-      // shape it can detect. Mark with kind=bytecode but bytecode={}
-      // (empty TinyBytecode shape) so the type system still sees a
-      // BytecodeVerbDef, but the runtime check picks it up as "needs
-      // compile."
-      return { ...rest, line_map: {}, bytecode: { ops: [], literals: [], num_locals: 0, max_stack: 0, version: 0 } } as VerbDef;
-    })
+    verbs: obj.verbs.map((verb) => ({ ...verb, line_map: {} }))
   };
   if (obj.parent === "$account") {
     const sensitive = new Set(["password_hash", "password_salt", "oauth_identities"]);
@@ -11050,28 +11025,10 @@ function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
     slot
   };
   if (verb.kind === "bytecode") {
-    // Source-only host-seed delivery (see stripAuthoringMetadataFromObject)
-    // sends an empty bytecode placeholder. Detect that shape and recompile
-    // from `source` here. A normal hydration path (local SQL, cached
-    // snapshot) supplies real bytecode; the recompile branch never fires.
-    const needsRecompile = !verb.bytecode || !Array.isArray(verb.bytecode.ops) || verb.bytecode.ops.length === 0;
-    let bytecode = verb.bytecode;
-    if (needsRecompile && typeof verb.source === "string" && verb.source.length > 0) {
-      const compiled = compileVerb(verb.source);
-      if (compiled.ok && compiled.bytecode) {
-        bytecode = compiled.bytecode;
-      } else {
-        // Refuse to import a verb we can't make runnable. The merge
-        // path treats this as an error rather than silently leaving an
-        // empty-ops verb that would later trip the VM. (E_COMPILE)
-        const messages = compiled.diagnostics.map((d) => d.message).join("; ");
-        throw wooError("E_COMPILE", `host-seed delivered source-only verb ${verb.name} but recompile failed: ${messages || "no diagnostic"}`, { verb: verb.name });
-      }
-    }
     return {
       ...verb,
       ...common,
-      bytecode: cloneImportedBytecode(bytecode)
+      bytecode: cloneImportedBytecode(verb.bytecode)
     };
   }
   return {
