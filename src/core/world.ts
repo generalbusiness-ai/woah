@@ -6281,9 +6281,14 @@ export class WooWorld {
    * fine: line_map doesn't drive merge changes anyway.
    */
   buildHostSeedForDeliveryWithDigest(host: ObjRef): { seed: SeedWorld; digest: string } {
+    const startedAt = Date.now();
     const version = this.mutationCounter;
     const cached = this.hostSeedCache.get(host);
-    if (cached && cached.version === version) return { seed: cached.seed, digest: cached.digest };
+    if (cached && cached.version === version) {
+      this.recordMetric({ kind: "host_seed_cache", host, status: "hit", ms: Date.now() - startedAt });
+      return { seed: cached.seed, digest: cached.digest };
+    }
+    const missReason: "version_changed" | "absent" = cached ? "version_changed" : "absent";
     const slice = this.exportHostScopedWorld(host);
     // The wire body keeps the insertion-order layout that the existing
     // mergeHostScopedSeed contract assumes: per-object arrays (verbs,
@@ -6315,6 +6320,7 @@ export class WooWorld {
     // transmitted, so it doesn't perturb merge semantics.
     const digest = hashSource(canonicalJsonStringify(canonicalSeedForDigest(seed)));
     this.hostSeedCache.set(host, { version, seed, digest });
+    this.recordMetric({ kind: "host_seed_cache", host, status: "miss", reason: missReason, ms: Date.now() - startedAt });
     return { seed, digest };
   }
 

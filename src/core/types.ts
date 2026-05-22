@@ -361,6 +361,14 @@ export type MetricEvent =
   // actor.location, leaving the apply transcript without a move write so
   // committed state diverges from the immediate reply.
   | { kind: "moveto_actor"; actor: ObjRef; session_id: string; from: ObjRef | null; to: ObjRef; is_primary: boolean; primary_session_id: string | null; remote_actor_host: boolean; defer_host_effect: boolean }
+  // Fired from buildHostSeedForDeliveryWithDigest on every host-seed request
+  // so we can measure WORLD's cache effectiveness before/after per-host
+  // invalidation changes. A hit is a Map lookup; a miss runs
+  // exportHostScopedWorld + canonicalJsonStringify + hashSource over the
+  // full host slice. reason: "version_changed" means mutationCounter moved;
+  // "absent" means the entry was never built or was explicitly deleted.
+  // ms reports the compute cost on a miss.
+  | { kind: "host_seed_cache"; host: ObjRef; status: "hit" | "miss"; reason?: "version_changed" | "absent"; ms: number }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"
