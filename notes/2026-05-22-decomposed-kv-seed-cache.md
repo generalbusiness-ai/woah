@@ -180,7 +180,29 @@ lazy-compile design.
 ## Status
 
 - Recovery: ✅ live (force-rebuild routes deployed `23dc0c44`)
-- Step 1: ✅ live (per-host invalidation, ~45% cache hit)
-- Lever A (source-only seeds): ⛔ reverted (regression on cold-load)
-- v1 KV: ⛔ disabled (write path active but unused, awaiting v2)
-- Lever B (decomposed KV with content-addressed keys): pending
+- Step 1: ✅ live (per-host invalidation, ~45% in-DO hit rate)
+- Lever A (source-only seeds): ⛔ reverted (cold-load regression)
+- v1 KV: replaced by Lever B
+- Lever B (content-addressed KV, both seed paths): ✅ live (commit
+  `03fa936`, deploy `9a9e95c0`)
+- Next: horoscope polling off WORLD — see
+  `notes/2026-05-22-horoscope-blocking-world.md`
+
+## Lever B measured impact (deploy `9a9e95c0`)
+
+| Metric | Before (Step 1 v2 only) | After Lever B |
+|---|---|---|
+| `mcp_gateway_snapshot_fetch` avg | 1183 ms | 98 ms |
+| `mcp_gateway_snapshot_fetch` max | 6647 ms | 351 ms |
+| `host_seed_fetch` avg | ~500 ms | 138 ms |
+| `host_seed_fetch` max | ~3 s | 358 ms |
+| KV serve rate | 0% | 100% |
+
+Both seed-delivery paths are ~10x faster and no longer the smoke
+bottleneck. Cold satellite cold-load now consults KV first, falls
+back to DO RPC on miss/error. KV-sourced merges persist to local
+SQL (content-addressed keys ⇒ no stale-poisoning risk).
+
+Smoke pass rate didn't fully recover because the remaining MCP POST
+timeouts come from horoscope polling blocking WORLD's single-
+threaded execution. Resolving that is the next milestone.
