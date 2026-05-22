@@ -3425,6 +3425,18 @@ export class PersistentObjectDO {
       this.emitRestV2InProcessFallback(input, "no_commit_scope");
       return await this.restV2TurnInProcess(world, input);
     }
+    // Live verbs (persistence: "live") declare themselves read-only: they
+    // produce a result and observations but no durable commit. Running
+    // them through submitTurnIntent → CommitScopeDO costs a cross-DO
+    // round-trip + relay-open for no consistency benefit; the gateway's
+    // local world snapshot already has the verb's read surface. Skip
+    // the round-trip and execute in-process. Bypasses the bottleneck
+    // documented in notes/2026-05-22-horoscope-blocking-world.md where
+    // the_horoscope's next_pending polling repeatedly opened a v2 relay
+    // against an idle CommitScopeDO, blocking WORLD for 9-26s per call.
+    if (input.persistence === "live") {
+      return await this.restV2TurnInProcess(world, input);
+    }
     const token = shadowBrowserSessionBearer(input.session);
     const submitted = await submitTurnIntent<RestV2RelayClient, CommitScopeEnvelopeResponse>({
       input: {
@@ -3440,7 +3452,10 @@ export class PersistentObjectDO {
         persistence: input.persistence,
         token
       },
-      strategy: input.persistence === "live" ? "intent" : "planned-exec",
+      // Live verbs took the "intent" strategy until commit (TBD). They now
+      // bypass this code path entirely via the early return above, so the
+      // remaining branch is durable → planned-exec.
+      strategy: "planned-exec",
       maxAttempts: 2,
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
