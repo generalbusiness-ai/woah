@@ -75,6 +75,16 @@ class_name = "DirectoryDO"
 name = "COMMIT_SCOPE"
 class_name = "CommitScopeDO"
 
+# KV-fronted host-seed cache. WORLD writes (host, digest, seed_bytes)
+# tuples on every host-seed build; cold satellites read from KV via a
+# Worker route before falling back to WORLD's DO. Per-region cached at
+# the edge, eventual-consistency on writes — fine for host-seed delivery
+# because seeds are coupled to the digest the satellite already stores.
+# See notes/2026-05-21-host-seed-kv.md (forthcoming).
+[[kv_namespaces]]
+binding = "HOST_SEED_KV"
+id = "450f0affacf44f8ca3ae03add832eeb8"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersistentObjectDO"]

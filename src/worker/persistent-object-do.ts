@@ -122,6 +122,11 @@ export interface Env {
   // staging hits `woo_v1_staging` and prod hits `woo_v1_prod`; defaults
   // to `woo_v1_prod` for unset envs to fail safely toward production.
   WOO_AE_DATASET?: string;
+  // KV-fronted host-seed cache. Populated by WORLD on every host-seed
+  // build (via waitUntil so the build itself isn't blocked) and read by
+  // satellite cold-loads before they fall back to WORLD's DO. See
+  // wrangler.toml [[kv_namespaces]] binding HOST_SEED_KV.
+  HOST_SEED_KV?: KVNamespace;
 }
 
 type CommitScopeOpenResponse = {
@@ -1223,6 +1228,31 @@ export class PersistentObjectDO {
   }
 
   private async fetchHostSeed(hostKey: ObjRef): Promise<{ seed: SeedWorld; digest: string | null }> {
+    // KV fast path: try the HOST_SEED_KV binding first. If WORLD has
+    // published a seed for this host (every successful build does), we
+    // get it from the edge in ~50ms instead of round-tripping to WORLD
+    // (which itself may be hibernated, costing 1–3s of cold-load before
+    // it can answer). Falls through to the DO RPC path below on KV miss
+    // or any KV error.
+    if (this.env.HOST_SEED_KV) {
+      const kvStartedAt = Date.now();
+      try {
+        const raw = await this.env.HOST_SEED_KV.get(`seed:${hostKey}`, "text");
+        if (raw) {
+          const parsed = JSON.parse(raw) as { digest?: string | null; seed?: unknown };
+          if (isSeedWorld(parsed.seed)) {
+            this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: parsed.seed.objects.length, source: "kv" }, hostKey);
+            return { seed: parsed.seed, digest: typeof parsed.digest === "string" && parsed.digest.length > 0 ? parsed.digest : null };
+          }
+        }
+        // Record an explicit KV miss so we can see how often the fast
+        // path doesn't fire vs the slow DO RPC path actually serving.
+        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
+      } catch (err) {
+        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
+        // Fall through to the DO RPC path on any KV failure.
+      }
+    }
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     try {
@@ -1239,7 +1269,7 @@ export class PersistentObjectDO {
       if (!response.ok) {
         throw wooError("E_STORAGE", `failed to load host seed for ${hostKey}`, body as WooValue);
       }
-      this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "ok", objects: Array.isArray((body as { objects?: unknown }).objects) ? ((body as { objects: unknown[] }).objects.length) : undefined }, hostKey);
+      this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "ok", objects: Array.isArray((body as { objects?: unknown }).objects) ? ((body as { objects: unknown[] }).objects.length) : undefined, source: "do" }, hostKey);
       if (!isSeedWorld(body)) throw wooError("E_STORAGE", `host-seed response missing SeedWorld.objectHosts (spec §HS1)`, hostKey);
       // The digest header lets the receiver persist the gateway's
       // content fingerprint so its next cold-load can short-circuit
@@ -2094,6 +2124,27 @@ export class PersistentObjectDO {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
         const built = world.buildHostSeedForDeliveryWithDigest(host);
+        // KV publish: write the (host, digest, seed) tuple to the
+        // HOST_SEED_KV binding so cold satellites can read it from the
+        // edge instead of round-tripping to WORLD. Fire-and-forget via
+        // waitUntil so the build's own response isn't blocked on the
+        // KV write. Value shape: { digest, seed }. Satellites read by
+        // host name and compare digest against their stored digest
+        // before deciding to use the seed bytes. See wrangler.toml
+        // HOST_SEED_KV binding; populated on every host-seed build
+        // here, never invalidated explicitly (writes overwrite by key
+        // and the digest carries the freshness signal). Cache TTL is
+        // intentionally absent — stale data is bounded by the next
+        // apply-v2-commit fanout to the satellite, which is the same
+        // signal that keeps the in-DO hostSeedCache fresh.
+        if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
+          const payload = JSON.stringify({ digest: built.digest, seed: built.seed });
+          this.state.waitUntil(
+            this.env.HOST_SEED_KV.put(`seed:${host}`, payload).catch((err) => {
+              console.warn("woo.host_seed_kv_put.failed", { host, error: normalizeError(err) });
+            })
+          );
+        }
         return jsonResponse(built.seed, 200, { "x-woo-seed-digest": built.digest });
       }
 
