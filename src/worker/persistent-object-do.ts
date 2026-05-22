@@ -1228,31 +1228,20 @@ export class PersistentObjectDO {
   }
 
   private async fetchHostSeed(hostKey: ObjRef): Promise<{ seed: SeedWorld; digest: string | null }> {
-    // KV fast path: try the HOST_SEED_KV binding first. If WORLD has
-    // published a seed for this host (every successful build does), we
-    // get it from the edge in ~50ms instead of round-tripping to WORLD
-    // (which itself may be hibernated, costing 1–3s of cold-load before
-    // it can answer). Falls through to the DO RPC path below on KV miss
-    // or any KV error.
-    if (this.env.HOST_SEED_KV) {
-      const kvStartedAt = Date.now();
-      try {
-        const raw = await this.env.HOST_SEED_KV.get(`seed:${hostKey}`, "text");
-        if (raw) {
-          const parsed = JSON.parse(raw) as { digest?: string | null; seed?: unknown };
-          if (isSeedWorld(parsed.seed)) {
-            this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: parsed.seed.objects.length, source: "kv" }, hostKey);
-            return { seed: parsed.seed, digest: typeof parsed.digest === "string" && parsed.digest.length > 0 ? parsed.digest : null };
-          }
-        }
-        // Record an explicit KV miss so we can see how often the fast
-        // path doesn't fire vs the slow DO RPC path actually serving.
-        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
-      } catch (err) {
-        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
-        // Fall through to the DO RPC path on any KV failure.
-      }
-    }
+    // KV READ PATH TEMPORARILY DISABLED — see KV WRITE path below for
+    // context. The KV value is keyed by `seed:${host}` with no version
+    // discriminator; a deploy that changes class definitions (verb
+    // metadata, properties, etc.) leaves stale bytes in KV. On the
+    // next satellite cold-load, the stale seed merges over the
+    // satellite's local SQL data and downstream verb dispatch fails
+    // with E_PERM / "fresh turn produced no recording" against the
+    // wrong shape. Re-enable once the key includes a deploy
+    // discriminator (worker version or schema hash) so a new deploy
+    // automatically falls through to DO RPC and re-publishes.
+    //
+    // The WRITE path stays on so KV remains populated for the future
+    // read path. WORLD's host-seed handler still publishes on every
+    // build via state.waitUntil.
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     try {
