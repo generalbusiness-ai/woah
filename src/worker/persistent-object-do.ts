@@ -488,6 +488,39 @@ export class PersistentObjectDO {
         return jsonResponse(await this.refreshRemoteHostSeeds(world, { hosts }));
       }
 
+      if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/force-rebuild-host") {
+        // Wizard-authorized force-rebuild of a target satellite. Wipes
+        // the target DO's local SQL via /__internal/force-rebuild, so
+        // its next request triggers a clean cold-load from WORLD. Used
+        // to recover from a stale-seed-poisoning incident where
+        // refresh-host-seeds can't push the fix because the satellite's
+        // seed exceeds the 1MB request body limit.
+        const session = this.requireRestSession(world, request);
+        if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
+        const body = await readJsonBody(request);
+        const targets = Array.isArray(body.hosts) ? body.hosts.filter((item): item is string => typeof item === "string") : [];
+        if (targets.length === 0) throw wooError("E_INVARG", "force-rebuild-host requires hosts: string[]");
+        const results: Array<Record<string, unknown>> = [];
+        for (const target of targets) {
+          if (target === WORLD_HOST) {
+            results.push({ host: target, ok: false, error: "cannot force-rebuild WORLD" });
+            continue;
+          }
+          try {
+            const result = await this.forwardInternalChecked<{ ok: true; host: string; ms: number }>(
+              target,
+              "/__internal/force-rebuild",
+              {},
+              { timeoutMs: 30_000 }
+            );
+            results.push(result);
+          } catch (err) {
+            results.push({ host: target, ok: false, error: normalizeError(err) });
+          }
+        }
+        return jsonResponse({ ok: results.every((r) => r.ok !== false), results });
+      }
+
       const protocol = await handleRestProtocolRequest(workerRestRequest(request, pathname), {
         world,
         authenticateToken: (token) => this.authenticateToken(world, token),
@@ -2152,6 +2185,31 @@ export class PersistentObjectDO {
         if (!isSeedWorld(body.seed)) throw wooError("E_INVARG", "apply-host-seed requires a SeedWorld with objectHosts (spec §HS1)");
         const digest = typeof body.digest === "string" && body.digest.length > 0 ? body.digest : null;
         return jsonResponse(this.applyHostSeed(world, host, body.seed, digest));
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/force-rebuild") {
+        // Recovery path for a satellite whose local SQL got poisoned (e.g.,
+        // by a bad host-seed merge from a stale KV value). Wipes the DO's
+        // entire SQL storage and drops the in-memory world; the next /mcp
+        // or other handler request triggers a normal cold-load that pulls
+        // a fresh seed from WORLD via /__internal/host-seed (response body,
+        // no 1MB limit) and writes it through to clean SQL. WORLD itself
+        // can't be wiped this way; refuse there.
+        if (hostKey === WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "force-rebuild is for object hosts and gateway shards, not WORLD");
+        const wipeStart = Date.now();
+        try {
+          await this.state.storage.deleteAll();
+        } catch (err) {
+          console.warn("woo.force_rebuild.deleteAll_failed", { host: hostKey, error: normalizeError(err) });
+          throw err;
+        }
+        this.world = null;
+        this.routesRegistered = false;
+        this.publishedRoutes.clear();
+        this.routeCache.clear();
+        this.crossHostPropCache.clear();
+        this.mcpGateway = null;
+        return jsonResponse({ ok: true, host: hostKey, ms: Date.now() - wipeStart });
       }
 
       if (request.method === "POST" && pathname === "/__internal/broadcast-applied") {
