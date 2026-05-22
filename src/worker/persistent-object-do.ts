@@ -1024,6 +1024,11 @@ export class PersistentObjectDO {
     // full fetch would be pure overhead until one of those lands.
     let freshSeed: SeedWorld | null = null;
     let freshSeedDigest: string | null = null;
+    // Track whether the fresh seed came from KV (cache) or DO RPC
+    // (authoritative). Only DO-sourced seeds are allowed to drive
+    // persistFullSnapshot — see the v1 KV stale-data poisoning
+    // incident on 2026-05-22 (notes/2026-05-22-decomposed-kv-seed-cache.md).
+    let freshSeedSource: "kv" | "do" = "do";
     try {
       // Use the gateway's seed verbatim — re-scoping via
       // nonEmptyHostScopedWorld would import-then-re-export, which
@@ -1035,6 +1040,7 @@ export class PersistentObjectDO {
       const fetched = await this.fetchHostSeed(hostKey);
       freshSeed = fetched.seed.objects.length > 0 ? fetched.seed : null;
       freshSeedDigest = fetched.digest;
+      freshSeedSource = fetched.source;
     } catch (err) {
       if (!scoped) throw err;
       console.warn("woo.cluster_seed_refresh_failed", { host: hostKey, error: normalizeError(err) });
@@ -1061,13 +1067,21 @@ export class PersistentObjectDO {
         seedMergeChanged = true;
       }
     }
-    if (seedMergeChanged) world.persistFullSnapshot();
-    // Record the digest only when the gateway supplied one AND we
-    // actually pulled the matching body — if we skipped the transfer
-    // the stored digest is already correct, and an unannotated
-    // response means rolling-deploy mixed versions where the next
-    // probe will simply miss.
-    if (freshSeedDigest && freshSeed) {
+    if (seedMergeChanged && freshSeedSource === "do") world.persistFullSnapshot();
+    // KV-sourced seeds are NOT persisted: they're a cold-load
+    // accelerator only. If a KV value happens to be stale, the
+    // in-memory world for this DO instance carries that staleness
+    // until the next apply-v2-commit fanout corrects it, but local
+    // SQL stays clean and the next cold-load can recover. The v1 KV
+    // cache (commit 71e41a5) skipped this guard and corrupted
+    // satellite SQL when a stale KV value got persisted — recovery
+    // required force-rebuild routes. See
+    // notes/2026-05-22-decomposed-kv-seed-cache.md.
+    // Same rationale for the seed digest: only record it when the
+    // bytes came from the authoritative DO RPC path, so a cold-load
+    // never trusts a digest that pointed at a KV-cached seed of
+    // unknown freshness.
+    if (freshSeedDigest && freshSeed && freshSeedSource === "do") {
       this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, freshSeedDigest);
     }
     this.scrubStaleSubscribersOnce(world);
@@ -1260,21 +1274,37 @@ export class PersistentObjectDO {
     }));
   }
 
-  private async fetchHostSeed(hostKey: ObjRef): Promise<{ seed: SeedWorld; digest: string | null }> {
-    // KV READ PATH TEMPORARILY DISABLED — see KV WRITE path below for
-    // context. The KV value is keyed by `seed:${host}` with no version
-    // discriminator; a deploy that changes class definitions (verb
-    // metadata, properties, etc.) leaves stale bytes in KV. On the
-    // next satellite cold-load, the stale seed merges over the
-    // satellite's local SQL data and downstream verb dispatch fails
-    // with E_PERM / "fresh turn produced no recording" against the
-    // wrong shape. Re-enable once the key includes a deploy
-    // discriminator (worker version or schema hash) so a new deploy
-    // automatically falls through to DO RPC and re-publishes.
-    //
-    // The WRITE path stays on so KV remains populated for the future
-    // read path. WORLD's host-seed handler still publishes on every
-    // build via state.waitUntil.
+  private async fetchHostSeed(hostKey: ObjRef): Promise<{ seed: SeedWorld; digest: string | null; source: "kv" | "do" }> {
+    // KV READ PATH (Lever B, content-addressed).
+    // Sequence:
+    //   1. Read seed-current:${host} → digest (cheap, ~10ms)
+    //   2. Read seed:${host}:${digest} → bytes (cheap, ~10-50ms)
+    //   3. Return seed + digest; caller's merge logic handles staleness
+    // On any miss/error, fall through to the DO RPC path below. The
+    // content-addressed key prevents the v1 stale-data poisoning: a
+    // satellite that reads an older pointer gets older bytes, but the
+    // bytes are self-consistent (digest matches), and the receiver's
+    // mergeHostScopedSeedWithStatus is robust to slight version skew.
+    if (this.env.HOST_SEED_KV) {
+      const kvStartedAt = Date.now();
+      try {
+        const pointer = await this.env.HOST_SEED_KV.get(`seed-current:${hostKey}`, "text");
+        if (pointer && pointer.length > 0) {
+          const raw = await this.env.HOST_SEED_KV.get(`seed:${hostKey}:${pointer}`, "text");
+          if (raw) {
+            const parsed = JSON.parse(raw) as { digest?: string | null; seed?: unknown };
+            if (isSeedWorld(parsed.seed) && parsed.digest === pointer) {
+              this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: parsed.seed.objects.length, source: "kv" }, hostKey);
+              return { seed: parsed.seed, digest: pointer, source: "kv" };
+            }
+          }
+        }
+        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
+      } catch (err) {
+        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
+        // Fall through to DO RPC.
+      }
+    }
     const startedAt = Date.now();
     const id = this.env.WOO.idFromName(WORLD_HOST);
     try {
@@ -1299,7 +1329,7 @@ export class PersistentObjectDO {
       // (rolling deploys) omit the header — treat that as "no digest
       // known," which falls back to the full fetch every time.
       const digest = response.headers.get("x-woo-seed-digest");
-      return { seed: body, digest: digest && digest.length > 0 ? digest : null };
+      return { seed: body, digest: digest && digest.length > 0 ? digest : null, source: "do" };
     } catch (err) {
       this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - startedAt, status: "error", ...metricErrorFields(err) }, hostKey);
       throw err;
@@ -2146,26 +2176,44 @@ export class PersistentObjectDO {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
         const built = world.buildHostSeedForDeliveryWithDigest(host);
-        // KV publish: write the (host, digest, seed) tuple to the
-        // HOST_SEED_KV binding so cold satellites can read it from the
-        // edge instead of round-tripping to WORLD. Fire-and-forget via
-        // waitUntil so the build's own response isn't blocked on the
-        // KV write. Value shape: { digest, seed }. Satellites read by
-        // host name and compare digest against their stored digest
-        // before deciding to use the seed bytes. See wrangler.toml
-        // HOST_SEED_KV binding; populated on every host-seed build
-        // here, never invalidated explicitly (writes overwrite by key
-        // and the digest carries the freshness signal). Cache TTL is
-        // intentionally absent — stale data is bounded by the next
-        // apply-v2-commit fanout to the satellite, which is the same
-        // signal that keeps the in-DO hostSeedCache fresh.
-        if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
+        // KV publish (Lever B): content-addressed write.
+        //   seed:${host}:${digest} -> { digest, seed }  (the bytes)
+        //   seed-current:${host}   -> digest             (the pointer)
+        // The bytes key is immutable per content; new content = new key.
+        // The pointer moves atomically (last write wins). Stale bytes
+        // stay in KV until TTL but are unreferenced. Satellite reads
+        // pointer first, then bytes; if either is missing, falls
+        // through to DO RPC.
+        //
+        // The version-discriminator design (deploy-version in key,
+        // tried in commit 71e41a5) caused the stale-poisoning incident
+        // when the receiver also persisted the merged seed to local
+        // SQL. Content-addressing fixes that because a stale value's
+        // key isn't reachable from the (newer) pointer.
+        if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function" && built.digest) {
+          const bytesKey = `seed:${host}:${built.digest}`;
+          const pointerKey = `seed-current:${host}`;
           const payload = JSON.stringify({ digest: built.digest, seed: built.seed });
-          this.state.waitUntil(
-            this.env.HOST_SEED_KV.put(`seed:${host}`, payload).catch((err) => {
-              console.warn("woo.host_seed_kv_put.failed", { host, error: normalizeError(err) });
-            })
-          );
+          this.state.waitUntil((async () => {
+            try {
+              // Write bytes first; then move the pointer. This order
+              // means a satellite that reads `seed-current` after the
+              // write finds bytes available. If we wrote the pointer
+              // first and crashed, a satellite would read the pointer
+              // and miss the bytes — falls through to DO RPC, no
+              // correctness loss but a missed cache hit.
+              await this.env.HOST_SEED_KV!.put(bytesKey, payload, {
+                // TTL keeps stale-content keys from growing unboundedly.
+                // The bytes are immutable so a long TTL is safe;
+                // anything still pointed at by current must be fresh
+                // enough to be valid.
+                expirationTtl: 7 * 24 * 3600
+              });
+              await this.env.HOST_SEED_KV!.put(pointerKey, built.digest);
+            } catch (err) {
+              console.warn("woo.host_seed_kv_put.failed", { host, digest: built.digest, error: normalizeError(err) });
+            }
+          })());
         }
         return jsonResponse(built.seed, 200, { "x-woo-seed-digest": built.digest });
       }

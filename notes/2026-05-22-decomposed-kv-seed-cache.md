@@ -138,10 +138,49 @@ manage `hostSeedCache` invalidation per Step 1.
   WORLD-as-bottleneck under apply-v2-commit load. Independent of
   Step 3b.
 
+## Lever A regression (2026-05-22)
+
+Attempted Lever A (commit `610f863`, reverted at `f6d13ff`). Smoke
+collapsed from 6–7/9 to 0–3/9. Root cause: on the first cold-load
+after a wipe, the satellite has an empty SQL slice, so the merged
+world IS the (placeholder-bytecode) seed. cloneImportedVerb then
+recompiles every verb synchronously during importWorld. With ~70
+verbs per satellite slice and ~50 ms per DSL compile, that's ~3.5 s
+of synchronous CPU on the cold-load path — pushes past the 20 s
+smoke wall.
+
+Subsequent cold-loads should have been fast (local SQL has full
+bytecode from `persistFullSnapshot`), but the regression was visible
+across 4 consecutive smokes. Hypothesis: the first cold-load hard-
+fail leaves the satellite in a degraded state (request queues,
+unhealthy mark, etc.) that cascades.
+
+Conclusion: source-only seeds are not viable without a lazy-compile
+or persistent-compile-cache strategy. Defer Lever A; pursue Lever B
+on its own.
+
+### Lever B without Lever A
+
+Lever B's wins are independent of size:
+- Edge-cached KV reads avoid waking WORLD on satellite cold-load.
+- Content-addressed keys prevent stale-data poisoning across deploys.
+- Decomposition lets each class be cached separately by every
+  satellite that uses it.
+
+The size concern that drove Lever A (`apply-host-seed` 1 MB
+subrequest-body limit) doesn't apply to KV: KV value limit is 25 MB,
+KV writes go via `env.HOST_SEED_KV.put` which bypasses subrequest
+constraints. So we can keep verb.bytecode in the wire format and
+still get the KV distribution benefits.
+
+If size becomes the actual bottleneck later (e.g., 1 MB satellite
+boots that take >500 ms over the wire), revisit Lever A with a
+lazy-compile design.
+
 ## Status
 
 - Recovery: ✅ live (force-rebuild routes deployed `23dc0c44`)
 - Step 1: ✅ live (per-host invalidation, ~45% cache hit)
+- Lever A (source-only seeds): ⛔ reverted (regression on cold-load)
 - v1 KV: ⛔ disabled (write path active but unused, awaiting v2)
-- Lever A (source-only seeds): pending
-- Lever B (decomposed KV): pending
+- Lever B (decomposed KV with content-addressed keys): pending
