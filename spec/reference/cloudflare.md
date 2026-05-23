@@ -676,15 +676,34 @@ The Worker is a thin router. Business logic lives in DOs.
 
 ```
 GET  /                                  → static asset (index.html)
-GET  /api/objects/<id>                  → DO RPC (describe)
-GET  /api/objects/<id>/properties/<n>   → DO RPC (getProp)
-POST /api/objects/<id>/calls/<verb>     → gateway v2 executor + CommitScopeDO
-GET  /api/objects/<id>/log              → DO RPC (readLog)
+GET  /api/objects/<id>                  → DO RPC (describe), routed to <id>'s host
+GET  /api/objects/<id>/properties/<n>   → DO RPC (getProp), routed to <id>'s host
+POST /api/objects/<id>/calls/<verb>     → DO RPC (v2 executor), routed to <id>'s host (Directory-resolved; falls back to gateway). Durable verbs commit through CommitScopeDO from the originating host; live verbs run in-process on the receiving host without CommitScopeDO.
+GET  /api/objects/<id>/log              → DO RPC (readLog), routed to <id>'s host
 GET  /api/objects/<id>/stream           → 410 E_GONE (retired)
-POST /api/auth                          → Sessions handler (mints/resumes session)
+POST /api/auth                          → Sessions handler (mints/resumes session) — gateway host
 GET  /v2/turn-network/ws                → v2 WS upgrade → gateway host
 POST /mcp                               → first request on gateway host; established sessions route to MCP gateway shard
 ```
+
+`/api/objects/<id>/calls/<verb>` was previously forced to the `world`
+gateway host on the rationale that v2 REST calls run against a gateway
+snapshot. That constraint was relaxed in the block-self-hosting work
+(see `notes/2026-05-22-horoscope-blocking-world.md` and
+`notes/2026-05-22-decomposed-kv-seed-cache.md`). Two architectural
+shifts keep routed-call execution safe:
+
+- Live verbs (declared `arg_spec.command.persistence: "live"`) bypass
+  CommitScopeDO and execute in-process against the receiving DO's
+  local world. No round-trip and no consistency loss because the verb
+  reads only its host's own slice.
+- Durable verbs still go through CommitScopeDO. CommitScopeDO is the
+  authority for ordering; the submitting host's snapshot is a planner
+  input that CommitScopeDO validates before accept. The originating
+  host's `writeThroughV2CommitToObjectHosts.localApplied` branch
+  applies the transcript to its own SQL when it owns the touched
+  objects; non-local touched objects still receive
+  `/__internal/apply-v2-commit` fanout.
 
 MCP streamable-HTTP traffic is deliberately not pinned to the singleton
 `world` gateway after initialization. The first request has no MCP session id
