@@ -2659,11 +2659,20 @@ describe("CFObjectRepository production-shape coverage", () => {
   // The test forced apply-v2-commit to fail to verify that path.
   //
   // Post-refactor: the call lands directly on the_chatroom. The
-  // write is local SQL inside writeThroughV2CommitToObjectHosts'
-  // localApplied branch — there is no apply-v2-commit fanout to
-  // intercept. The analogous failure surface is "local SQL write
-  // raises mid-commit" which is exercised by the CFObjectRepository
-  // direct write-error tests earlier in this file.
+  // write to the_weather is local SQL inside
+  // writeThroughV2CommitToObjectHosts' localApplied branch — there
+  // is no apply-v2-commit fanout to intercept for in-host writes.
+  //
+  // The remote-touched-host apply failure surface still exists in
+  // code: writeThroughV2CommitToObjectHosts (persistent-object-do.ts)
+  // still fans /__internal/apply-v2-commit to non-local touched
+  // hosts, and a failure there still throws E_RETRY back up the
+  // REST path. Reproducing it in this test fixture requires a verb
+  // whose transcript touches a host other than the originating one
+  // (e.g., a chat verb that writes to both the room and the actor
+  // when the actor's row is on a different DO). That test belongs
+  // here once a cross-host fixture is wired up; tracked in #46
+  // follow-ups.
 
   it("sends REST v2 relay snapshots only when CommitScopeDO asks for a seed", async () => {
     const directoryState = new FakeDurableObjectState("directory");

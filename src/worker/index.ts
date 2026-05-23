@@ -1,8 +1,10 @@
 // Worker entry — splits routing between Durable Objects and Workers Assets.
 //
-// Global API, /healthz, /v2/turn-network/ws      -> world/gateway DO.
-// Object REST calls                             → world/gateway DO v2 executor.
-// Object REST reads                             → Directory-resolved host DO.
+// Global API, /healthz, /v2/turn-network/ws      → world/gateway DO.
+// Object REST calls and reads                    → Directory-resolved host DO
+//                                                  (calls/Y formerly forced
+//                                                  to world; see /api/objects
+//                                                  block below for rationale).
 // Everything else                                → env.ASSETS.fetch (the bundled SPA from ./dist).
 
 import type { Env } from "./persistent-object-do";
@@ -74,13 +76,23 @@ export default {
       // Block subjects (the_horoscope, the_weather, ...) anchored to
       // a self-hosted room now execute on that room's DO instead of
       // pinning WORLD's host queue.
-      const host = await resolveHostForObjectRoute(env, request, objectRoute);
-      const routed = await withDirectorySession(env, request);
-      const response = await forwardToHost(env, host, routed);
-      if (host !== WORLD_HOST && request.method === "POST" && objectRoute.rest[0] === "calls") {
-        await broadcastRoutedCall(env, request, response.clone(), host);
+      try {
+        const host = await resolveHostForObjectRoute(env, request, objectRoute);
+        const routed = await withDirectorySession(env, request);
+        const response = await forwardToHost(env, host, routed);
+        if (host !== WORLD_HOST && request.method === "POST" && objectRoute.rest[0] === "calls") {
+          await broadcastRoutedCall(env, request, response.clone(), host);
+        }
+        return response;
+      } catch (err) {
+        // Routing-stage errors (e.g. E_RATE from the body peek in
+        // resolveHostForObjectRoute) must surface as a normalized
+        // JSON error response, not as a Worker exception. Once the
+        // request reaches a DO, core/protocol.ts handles normalization
+        // — but the routing peek runs before that boundary, so the
+        // top-level fetch is the last chance to translate.
+        return errorResponseFor(err);
       }
-      return response;
     }
 
     if (isApiPath(url.pathname)) {
@@ -418,3 +430,29 @@ function errorMessage(err: unknown): string {
     return String(err);
   }
 }
+
+/** Map a thrown WooError (or other) into the public REST error envelope.
+ * Used at the Worker entry's routing boundary; once a request reaches a
+ * DO, core/protocol.ts normalizes errors there. Status map mirrors the
+ * REST protocol: rate-limit/quota -> 429, internal -> 500, perms -> 403,
+ * not-found -> 404, default -> 500. */
+function errorResponseFor(err: unknown): Response {
+  const error = err && typeof err === "object" && "code" in err
+    ? err as { code: string; message?: string; value?: unknown }
+    : { code: "E_INTERNAL", message: errorMessage(err) };
+  const status = (() => {
+    switch (error.code) {
+      case "E_RATE": return 429;
+      case "E_PERM": return 403;
+      case "E_OBJNF":
+      case "E_VERBNF":
+      case "E_PROPNF": return 404;
+      case "E_RETRY": return 503;
+      case "E_INVARG": return 400;
+      case "E_NOSESSION": return 401;
+      default: return 500;
+    }
+  })();
+  return jsonResponse({ error }, status);
+}
+
