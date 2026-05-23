@@ -3,11 +3,16 @@ main = "src/index.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
-# Drain the queue every minute. The block's :order verb optionally emits a
-# directed `text` wakeup; that path can land later as a websocket-attached
-# variant. For the demo, one-minute polling is fine.
+# Drain the queue every 15 minutes. Each plug tick wakes WORLD via
+# /api/objects/the_horoscope/calls/next_pending and pinned its host
+# queue for 19-26 s of v2-relay setup (see
+# notes/2026-05-22-horoscope-blocking-world.md). Minute-cadence polling
+# was using ~30% of WORLD's wall time on overhead alone for a queue
+# that's empty most of the time. 15-minute polling is plenty for a
+# demo block; the :order verb can still emit a directed `text` wakeup
+# for synchronous response.
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/15 * * * *"]
 
 # Workers AI binding. Free-tier daily-neuron quota covers the demo easily.
 [ai]
