@@ -397,6 +397,29 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
             actual: actualParent
           });
         }
+        const expectedAnchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, records) : null;
+        const actualAnchor = world.object(hook.as).anchor;
+        if (actualAnchor !== expectedAnchor) {
+          issues.push({
+            severity: "warning",
+            kind: "seed_anchor_drift",
+            object: hook.as,
+            message: `${hook.as} anchor differs from seed hook`,
+            expected: expectedAnchor,
+            actual: actualAnchor
+          });
+        }
+        if (world.propOrNull(expectedParent, "instances_self_host") === true && world.propOrNull(hook.as, "host_placement") !== "self") {
+          issues.push({
+            severity: "warning",
+            kind: "seed_host_placement_drift",
+            object: hook.as,
+            property: "host_placement",
+            message: `${hook.as} is missing self-host placement for ${expectedParent}`,
+            expected: "self",
+            actual: world.propOrNull(hook.as, "host_placement")
+          });
+        }
       } catch (err) {
         issues.push(catalogStatusErrorIssue("unresolved_seed_parent", hook.as, err));
       }
@@ -503,7 +526,9 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
       const parent = resolveObjectRef(world, hook.class, localObjects, localSeeds, existing);
       const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
       const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;
+      assertCatalogSeedPlacement(world, id, parent, anchor);
       world.createObject({ id, name: hook.name ?? id, parent, owner: actor, anchor, location });
+      applyCatalogSeedHostPlacement(world, id, parent);
       localSeeds.set(hook.as, id);
       setDescriptionIfEmpty(world, id, catalogDescription(hook.description, hook.name ?? id, manifest.name));
       setNameIfMissing(world, id, hook.name ?? id);
@@ -777,7 +802,13 @@ export function verifyCatalogSchemaPlan(world: WooWorld, manifest: CatalogManife
     if (issue.verb && issue.object) return plannedVerbs.has(`${issue.object}:${issue.verb}`);
     if (issue.property && issue.object) return plannedProperties.has(`${issue.object}.${issue.property}`);
     if (issue.kind === "missing_object" || issue.kind === "parent_drift") return issue.object ? plannedObjects.has(issue.object) : false;
-    if (issue.kind === "missing_seed" || issue.kind === "seed_parent_drift" || issue.kind === "seed_property_drift") return issue.object ? plannedObjects.has(issue.object) : false;
+    if (
+      issue.kind === "missing_seed" ||
+      issue.kind === "seed_parent_drift" ||
+      issue.kind === "seed_anchor_drift" ||
+      issue.kind === "seed_host_placement_drift" ||
+      issue.kind === "seed_property_drift"
+    ) return issue.object ? plannedObjects.has(issue.object) : false;
     if (issue.kind === "feature_drift") return issue.object ? plannedObjects.has(issue.object) : false;
     if (issue.kind === "missing_schema" && issue.object && typeof issue.expected === "string") return plannedSchemas.has(`${issue.object}:${issue.expected}`);
     return issue.object ? plannedObjects.has(issue.object) : false;
@@ -914,7 +945,9 @@ function applyCatalogSchemaPlanStep(
         const parent = resolveObjectRef(world, step.hook.class, context.localObjects, context.localSeeds, context.existing);
         const anchor = step.hook.anchor ? resolveObjectRef(world, step.hook.anchor, context.localObjects, context.localSeeds, context.existing) : null;
         const location = step.hook.location ? resolveObjectRef(world, step.hook.location, context.localObjects, context.localSeeds, context.existing) : null;
+        assertCatalogSeedPlacement(world, step.object, parent, anchor);
         world.createObject({ id: step.object, name: step.hook.name ?? step.object, parent, owner: context.actor, anchor, location });
+        applyCatalogSeedHostPlacement(world, step.object, parent);
       }
       reconcileSeedObject(world, step.object, step.hook, manifest, context.actor, context.localObjects, context.localSeeds, context.existing, context.rehomeNowhereSeedObjects);
       return;
@@ -1009,6 +1042,7 @@ function reconcileSeedObject(
   const parent = resolveObjectRef(world, hook.class, localObjects, localSeeds, existing);
   const anchor = hook.anchor ? resolveObjectRef(world, hook.anchor, localObjects, localSeeds, existing) : null;
   const location = hook.location ? resolveObjectRef(world, hook.location, localObjects, localSeeds, existing) : null;
+  assertCatalogSeedPlacement(world, id, parent, anchor);
   const changedObjects = new Set<ObjRef>();
   const markChanged = (objRef: ObjRef | null | undefined): void => {
     if (objRef && world.objects.has(objRef)) changedObjects.add(objRef);
@@ -1067,7 +1101,22 @@ function reconcileSeedObject(
       markChanged(obj.location);
     }
   }
+  applyCatalogSeedHostPlacement(world, id, parent);
   for (const objRef of changedObjects) world.markObjectChanged(objRef);
+}
+
+function assertCatalogSeedPlacement(world: WooWorld, id: ObjRef, parent: ObjRef, anchor: ObjRef | null): void {
+  if (anchor === null || world.propOrNull(parent, "instances_self_host") !== true) return;
+  throw wooError("E_INVARG", "cannot anchor a self-hosted seed instance", { object: id, parent, anchor });
+}
+
+function applyCatalogSeedHostPlacement(world: WooWorld, id: ObjRef, parent: ObjRef): void {
+  // Catalog seeds bypass WooWorld.createRuntimeObject, so the installer must
+  // perform the same create-time projection from class metadata to the
+  // instance-owned routing marker.
+  if (world.propOrNull(parent, "instances_self_host") === true && world.propOrNull(id, "host_placement") !== "self") {
+    world.setProp(id, "host_placement", "self");
+  }
 }
 
 function populateSeedExitAliasMaps(world: WooWorld, manifest: CatalogManifest, localSeeds: Map<string, ObjRef>): void {

@@ -3983,11 +3983,18 @@ describe("local catalogs", () => {
       const world = createWorld({ catalogs: false });
       // the_weather / the_horoscope seeds live in demoworld now.
       installLocalCatalogs(world, ["demoworld"]);
-      // Weather panel: anchored in the chatroom, default config matches manifest seed.
+      // Weather panel: located in the chatroom, default config matches manifest seed.
       expect(world.objects.has("the_weather")).toBe(true);
       expect(world.object("the_weather").parent).toBe("$weather_block");
       expect(world.object("the_weather").location).toBe("the_chatroom");
-      expect(world.object("the_weather").anchor).toBe("the_chatroom");
+      // $block declares instances_self_host: true, which forbids
+      // non-null anchors at create time (spec/semantics/objects.md
+      // §4.1). The instance lives at location=the_chatroom but
+      // routes to its own DO via host_placement="self" set at
+      // create-instance time by the catalog installer.
+      expect(world.object("the_weather").anchor).toBe(null);
+      expect(world.getProp("the_weather", "host_placement")).toBe("self");
+      expect(world.objectRoutes().find((route) => route.id === "the_weather")).toMatchObject({ host: "the_weather", anchor: null });
       expect(world.getProp("the_weather", "place")).toBe("Mountain View CA");
       expect(world.getProp("the_weather", "timezone")).toBe("America/Los_Angeles");
       expect(world.getProp("the_weather", "units")).toBe("imperial");
@@ -4024,12 +4031,15 @@ describe("local catalogs", () => {
           text: "The weather panel shows that the temperature in Mountain View CA was 72°F at May 6, 2026, 9:01 AM PDT."
         });
       }
-      // Horoscope machine: anchored on the deck, default rate limit + persona.
+      // Horoscope machine: located on the deck, default rate limit + persona.
       expect(world.objects.has("the_horoscope")).toBe(true);
       expect(world.object("$horoscope_block").flags.fertile).toBe(true);
       expect(world.object("the_horoscope").parent).toBe("$horoscope_block");
       expect(world.object("the_horoscope").location).toBe("the_deck");
-      expect(world.object("the_horoscope").anchor).toBe("the_deck");
+      // Same as the_weather: $block.instances_self_host forbids anchor.
+      expect(world.object("the_horoscope").anchor).toBe(null);
+      expect(world.getProp("the_horoscope", "host_placement")).toBe("self");
+      expect(world.objectRoutes().find((route) => route.id === "the_horoscope")).toMatchObject({ host: "the_horoscope", anchor: null });
       expect(world.getProp("the_horoscope", "rate_limit_seconds")).toBe(60);
       expect(world.getProp("the_horoscope", "system_prompt")).toMatch(/fortune-teller/i);
       const horoscopeLook = await world.directCall("blocks-horoscope-look", "$wiz", "the_horoscope", "look_self", []);
@@ -4046,6 +4056,40 @@ describe("local catalogs", () => {
       if (orderPlan.op === "result") {
         expect(orderPlan.result).toMatchObject({ ok: true, target: "the_horoscope", verb: "order", args: ["scorpio"] });
       }
+    });
+
+    it("repairs existing block seeds to the self-host projection", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["demoworld"]);
+
+      world.object("the_weather").anchor = "the_chatroom";
+      world.object("the_chatroom").contents.add("the_weather");
+      world.setProp("the_weather", "host_placement", null);
+
+      installLocalCatalogs(world, []);
+
+      expect(world.object("the_weather").anchor).toBe(null);
+      expect(world.getProp("the_weather", "host_placement")).toBe("self");
+      expect(world.objectRoutes().find((route) => route.id === "the_weather")).toMatchObject({ host: "the_weather", anchor: null });
+    });
+
+    it("rejects catalog seed anchors on self-hosting classes", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["block"]);
+
+      expect(() => installCatalogManifest(world, {
+        name: "bad-block-seed",
+        version: "0.1.0",
+        spec_version: "v1",
+        license: "MIT",
+        seed_hooks: [{
+          kind: "create_instance",
+          class: "$block",
+          as: "bad_seed_block",
+          anchor: "$nowhere",
+          location: "$nowhere"
+        }]
+      } as unknown as RuntimeCatalogManifest, { tap: "@local", alias: "bad-block-seed", actor: "$wiz" })).toThrow(/cannot anchor a self-hosted seed instance/);
     });
 
     it("$horoscope_block inherits the dispenser surface end-to-end", async () => {

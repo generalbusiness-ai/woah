@@ -212,9 +212,21 @@ async function registerAuthResponse(env: Env, response: Response): Promise<void>
       current_location: sessionActiveScope(body),
       apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null
     });
-    await directoryPost(env, "/register-objects", {
-      routes: [{ id: body.actor, host: WORLD_HOST, anchor: null }]
-    });
+    // Auth-time actor route registration. Previously hard-coded
+    // host=WORLD_HOST regardless of where the actor actually lives —
+    // for apikey-bound block actors (the_horoscope, the_weather)
+    // that overwrote the block's self-host route on every cold plug
+    // auth. Skip the write if Directory already has a non-WORLD route
+    // for this actor (its actual host has registered it on cold-load).
+    // Default to WORLD only when no route exists yet (newly-minted
+    // guest actors). See review finding "P1: Plug cold auth can
+    // overwrite the new self-host route back to world."
+    const existing = await resolveDirectoryObject(env, body.actor, WORLD_HOST);
+    if (existing.host === WORLD_HOST) {
+      await directoryPost(env, "/register-objects", {
+        routes: [{ id: body.actor, host: WORLD_HOST, anchor: null }]
+      });
+    }
   } catch {
     // Auth succeeded; Directory registration is best-effort for this response.
     // Subsequent object routes without a Directory session will fail closed on

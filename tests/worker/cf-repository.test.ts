@@ -3189,9 +3189,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(gateway).toBeTruthy();
       const gatewayWorld = await gateway.getWorld("world") as WooWorld;
       const horoscopeRoute = gatewayWorld.objectRoutes().find((route) => route.id === "the_horoscope");
-      // Post-block-self-hosting: $block has host_placement: "self" so
-      // every block instance hosts on its own DO. the_horoscope's route
-      // is the_horoscope itself rather than its anchor the_deck.
+      // Post-block-self-hosting: $block declares instances_self_host, so
+      // each block instance receives host_placement: "self" at seed/create
+      // time and routes to its own DO.
       expect(horoscopeRoute).toMatchObject({ host: "the_horoscope" });
       gateway.routeCache.set("the_horoscope", "world");
       gateway.publishedRoutes.set("the_horoscope", "world");

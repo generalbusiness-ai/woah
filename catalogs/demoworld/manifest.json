@@ -906,7 +906,6 @@
       "as": "the_weather",
       "name": "Weather panel",
       "description": "A small weather panel on the wall by the door. It hums faintly. The current temperature, today's forecast, and recent history glow in soft monochrome.",
-      "anchor": "the_chatroom",
       "location": "the_chatroom",
       "properties": {
         "aliases": ["weather", "panel", "thermometer"],
@@ -921,7 +920,6 @@
       "as": "the_horoscope",
       "name": "Horoscope machine",
       "description": "A small wooden cabinet with a brass crank and a paper-tape slot, set against the deck railing. Drop a sign or topic in and it produces a slip of paper for you. The machine hums when an order is in flight.",
-      "anchor": "the_deck",
       "location": "the_deck",
       "properties": {
         "aliases": ["horoscope", "machine", "cabinet"],

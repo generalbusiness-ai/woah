@@ -2798,7 +2798,16 @@ export class PersistentObjectDO {
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
-      await this.registerRoutes([{ id: session.actor, host: WORLD_HOST, anchor: null }]);
+      // Register the actor's object route at the actor's actual host,
+      // not blindly at WORLD. For newly-minted guests on WORLD this
+      // resolves to WORLD (unchanged), but for apikey-bound actors
+      // that ARE objects with their own host (e.g. self-hosted blocks
+      // like the_horoscope), the previous hard-coded WORLD_HOST
+      // overwrote the correct self-host route on every plug auth —
+      // see review finding "P1: Plug cold auth can overwrite the new
+      // self-host route back to world."
+      const actorRoute = this.world?.objectRoutes().find((route) => route.id === session.actor);
+      await this.registerRoutes([{ id: session.actor, host: actorRoute?.host ?? WORLD_HOST, anchor: actorRoute?.anchor ?? null }]);
     } catch {
       // Directory registration accelerates cross-DO routing. The local auth
       // result remains authoritative for this host; routed object calls fail

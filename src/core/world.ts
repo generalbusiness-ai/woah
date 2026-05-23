@@ -3944,11 +3944,11 @@ export class WooWorld {
   }
 
   objectRoutes(): Array<{ id: ObjRef; host: string; anchor: ObjRef | null }> {
-    // Use the same chain-walking lookup as hostKeyForObject so a class-
-    // level host_placement default (e.g., $block → "self") classifies every
-    // instance as self-hosted. The previous implementation only checked
-    // own propertyDefs/properties, so subclasses of a self-hosted class
-    // wouldn't inherit the placement.
+    // Use the same lookup as hostKeyForObject so legacy class-level
+    // host_placement defaults, explicit instance properties, and anchored
+    // routes classify consistently. New self-hosting classes use
+    // instances_self_host at create time, which stamps host_placement on
+    // each instance rather than routing class objects themselves.
     const selfHosted = new Set<ObjRef>();
     for (const id of this.objects.keys()) {
       if (this.hostKeyForObject(id) === id) selfHosted.add(id);
@@ -5255,6 +5255,17 @@ export class WooWorld {
       if (typeof options.name === "string") this.setProp(id, "name", options.name);
       if (typeof options.description === "string") this.setProp(id, "description", options.description);
       if (Array.isArray(options.aliases) && options.aliases.length > 0) this.setProp(id, "aliases", options.aliases);
+      // When the resolved class declares `instances_self_host: true`,
+      // the routing layer expects the new instance to carry
+      // `host_placement: "self"` so its own DO becomes the host root.
+      // Without this, the class-level signal is the only marker — and
+      // walking class defaults from objectRoutes() would also treat the
+      // class itself as self-hosted (which it isn't; classes live on
+      // WORLD). Setting host_placement on the instance is the spec's
+      // per-instance representation (§4.2 routing precedence: rule 1).
+      if (this.propOrNull(parent, "instances_self_host") === true) {
+        this.setProp(id, "host_placement", "self");
+      }
       this.persistCounters();
       return id;
     });
@@ -5806,6 +5817,10 @@ export class WooWorld {
       name: options.name,
       flags: { fertile: options.fertile }
     });
+    // See createRuntimeObject for rationale.
+    if (this.propOrNull(parent, "instances_self_host") === true) {
+      this.setProp(id, "host_placement", "self");
+    }
     this.persistCounters();
     return id;
   }
