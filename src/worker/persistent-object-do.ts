@@ -43,10 +43,10 @@ import {
   type RestProtocolHost,
   type RestProtocolRequest
 } from "../core/protocol";
-import type { ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, WooValue } from "../core/types";
+import type { ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, TinyBytecode, VerbDef, WooValue } from "../core/types";
 import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SeedWorld, SerializedAuthoritySlice, SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
@@ -204,6 +204,8 @@ const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+const HOST_SEED_KV_KIND = "woo.host_seed.kv.bytecode_free.v1";
+const MCP_GATEWAY_WORLD_KV_KIND = "woo.mcp_gateway_world.kv.bytecode_free.v1";
 const MAX_BROWSER_METRICS_BATCH = 200;
 const MAX_BROWSER_METRIC_STRING = 160;
 const BROWSER_METRICS_SESSION_BUDGET = 60;
@@ -955,26 +957,45 @@ export class PersistentObjectDO {
   }
 
   private async createMcpGatewayShardWorld(hostKey: string, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
-    // KV fast path: WORLD publishes its full exportWorld to
+    // KV fast path: WORLD publishes a bytecode-free exportWorld to
     // mcp-gateway-world-current → digest, mcp-gateway-world:${digest}
-    // → bytes on every snapshot request. The bytes are identical
-    // across all gateway shards (the handler doesn't shard on the
-    // body), so a single KV value serves every shard's cold-load
-    // and the edge cache benefits compound across shards.
+    // on every snapshot request. The reader restores exact bytecode
+    // from local/catalog reservoirs by hash; if any verb cannot be
+    // restored it falls through to WORLD's authoritative full snapshot.
+    // The bytes are otherwise identical across all gateway shards
+    // (the handler doesn't shard on the body), so a single KV value
+    // serves every shard's cold-load and the edge cache benefits
+    // compound across shards.
     if (this.env.HOST_SEED_KV) {
       const kvStartedAt = Date.now();
       try {
+        let missReason: HostSeedKvRestoreMissReason | null = null;
         const pointer = await this.env.HOST_SEED_KV.get("mcp-gateway-world-current", "text");
         if (pointer && pointer.length > 0) {
           const raw = await this.env.HOST_SEED_KV.get(`mcp-gateway-world:${pointer}`, "text");
           if (raw) {
-            const parsed = JSON.parse(raw);
-            if (isSerializedWorld(parsed)) {
-              this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: parsed.objects.length, source: "kv" }, hostKey);
-              return createWorldFromSerialized(parsed, { repository: this.repo, metricsHook, persist: false });
+            try {
+              const parsed = JSON.parse(raw) as unknown;
+              const restored = restoreMcpGatewayWorldKvPayload(parsed, pointer, this.repo.load(), this.env, (event) => this.emitMetric(event, hostKey));
+              if (restored.ok) {
+                this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: restored.value.objects.length, source: "kv" }, hostKey);
+                return createWorldFromSerialized(restored.value, { repository: this.repo, metricsHook, persist: false });
+              }
+              missReason = restored.reason;
+            } catch (err) {
+              if (err instanceof SyntaxError) {
+                missReason = "invalid_payload";
+              } else {
+                throw err;
+              }
             }
+          } else {
+            missReason = "no_entry";
           }
+        } else {
+          missReason = "no_pointer";
         }
+        this.emitMetric({ kind: "host_seed_kv_restore_miss", cache: "mcp_gateway_world", host: hostKey, reason: missReason ?? "invalid_payload", ms: Date.now() - kvStartedAt }, hostKey);
         this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
       } catch (err) {
         this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
@@ -1063,7 +1084,7 @@ export class PersistentObjectDO {
       // spec/protocol/host-seeds.md §HS1, objectHosts is the only
       // routing input the merge needs and must come from the
       // gateway's batched directory view).
-      const fetched = await this.fetchHostSeed(hostKey);
+      const fetched = await this.fetchHostSeed(hostKey, scoped);
       freshSeed = fetched.seed.objects.length > 0 ? fetched.seed : null;
       freshSeedDigest = fetched.digest;
       freshSeedSource = fetched.source;
@@ -1299,7 +1320,7 @@ export class PersistentObjectDO {
     }));
   }
 
-  private async fetchHostSeed(hostKey: ObjRef): Promise<{ seed: SeedWorld; digest: string | null; source: "kv" | "do" }> {
+  private async fetchHostSeed(hostKey: ObjRef, localSeedSource: SerializedWorld | null): Promise<{ seed: SeedWorld; digest: string | null; source: "kv" | "do" }> {
     // KV READ PATH (Lever B, content-addressed).
     // Sequence:
     //   1. Read seed-current:${host} → digest (cheap, ~10ms)
@@ -1313,17 +1334,33 @@ export class PersistentObjectDO {
     if (this.env.HOST_SEED_KV) {
       const kvStartedAt = Date.now();
       try {
+        let missReason: HostSeedKvRestoreMissReason | null = null;
         const pointer = await this.env.HOST_SEED_KV.get(`seed-current:${hostKey}`, "text");
         if (pointer && pointer.length > 0) {
           const raw = await this.env.HOST_SEED_KV.get(`seed:${hostKey}:${pointer}`, "text");
           if (raw) {
-            const parsed = JSON.parse(raw) as { digest?: string | null; seed?: unknown };
-            if (isSeedWorld(parsed.seed) && parsed.digest === pointer) {
-              this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: parsed.seed.objects.length, source: "kv" }, hostKey);
-              return { seed: parsed.seed, digest: pointer, source: "kv" };
+            try {
+              const parsed = JSON.parse(raw) as unknown;
+              const seed = restoreHostSeedKvPayload(parsed, pointer, localSeedSource, this.env, (event) => this.emitMetric(event, hostKey));
+              if (seed.ok) {
+                this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: seed.value.objects.length, source: "kv" }, hostKey);
+                return { seed: seed.value, digest: pointer, source: "kv" };
+              }
+              missReason = seed.reason;
+            } catch (err) {
+              if (err instanceof SyntaxError) {
+                missReason = "invalid_payload";
+              } else {
+                throw err;
+              }
             }
+          } else {
+            missReason = "no_entry";
           }
+        } else {
+          missReason = "no_pointer";
         }
+        this.emitMetric({ kind: "host_seed_kv_restore_miss", cache: "host_seed", host: hostKey, reason: missReason ?? "invalid_payload", ms: Date.now() - kvStartedAt }, hostKey);
         this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
       } catch (err) {
         this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
@@ -2152,9 +2189,13 @@ export class PersistentObjectDO {
         // KV publish (Lever B extension): the MCP gateway snapshot is
         // identical across all gateway shards (the handler ignores the
         // body.shard hint), so a single KV value serves every shard's
-        // cold-load. Content-addressed by hash of the serialized world
-        // so a new commit produces a new key automatically. Pointer
-        // moves last. Read path is in createMcpGatewayShardWorld.
+        // cold-load. The KV payload strips verb.bytecode and stores
+        // per-verb hashes; shard cold-load restores matching bytecode
+        // from local/catalog reservoirs or falls through to this full
+        // DO response. Content-addressed by hash of the full serialized
+        // world so a new commit or bytecode change produces a new key
+        // automatically. Pointer moves last. Read path is in
+        // createMcpGatewayShardWorld.
         //
         // Measurement before this commit (Lever B host-seed only):
         //   mcp_gateway_snapshot_fetch avg 1183ms, max 6647ms
@@ -2162,13 +2203,14 @@ export class PersistentObjectDO {
         // to DO RPC on miss (e.g., right after a content change before
         // the waitUntil write lands).
         if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
-          const body = JSON.stringify(exported);
-          const digest = hashSource(body);
+          const fullBody = JSON.stringify(exported);
+          const digest = hashSource(fullBody);
           const bytesKey = `mcp-gateway-world:${digest}`;
           const pointerKey = "mcp-gateway-world-current";
+          const payload = JSON.stringify(bytecodeFreeMcpGatewayWorldKvPayload(exported, digest));
           this.state.waitUntil((async () => {
             try {
-              await this.env.HOST_SEED_KV!.put(bytesKey, body, { expirationTtl: 7 * 24 * 3600 });
+              await this.env.HOST_SEED_KV!.put(bytesKey, payload, { expirationTtl: 7 * 24 * 3600 });
               await this.env.HOST_SEED_KV!.put(pointerKey, digest);
             } catch (err) {
               console.warn("woo.mcp_gateway_world_kv_put.failed", { digest, error: normalizeError(err) });
@@ -2228,14 +2270,17 @@ export class PersistentObjectDO {
         const host = String(body.host ?? "") as ObjRef;
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
         const built = world.buildHostSeedForDeliveryWithDigest(host);
-        // KV publish (Lever B): content-addressed write.
-        //   seed:${host}:${digest} -> { digest, seed }  (the bytes)
+        // KV publish (Lever B): content-addressed bytecode-free write.
+        //   seed:${host}:${digest} -> { digest, seed, bytecode_hashes }
         //   seed-current:${host}   -> digest             (the pointer)
         // The bytes key is immutable per content; new content = new key.
-        // The pointer moves atomically (last write wins). Stale bytes
-        // stay in KV until TTL but are unreferenced. Satellite reads
-        // pointer first, then bytes; if either is missing, falls
-        // through to DO RPC.
+        // The seed omits verb.bytecode (the dominant KV storage cost);
+        // satellites restore exact bytecode by hash from local SQL or
+        // bundled catalogs. If a verb is new, edited, or compiled by a
+        // different runtime and no matching local bytecode exists, the
+        // cache is treated as a miss and the satellite falls through to
+        // DO RPC. The pointer moves atomically (last write wins). Stale
+        // bytes stay in KV until TTL but are unreferenced.
         //
         // The version-discriminator design (deploy-version in key,
         // tried in commit 71e41a5) caused the stale-poisoning incident
@@ -2245,7 +2290,7 @@ export class PersistentObjectDO {
         if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function" && built.digest) {
           const bytesKey = `seed:${host}:${built.digest}`;
           const pointerKey = `seed-current:${host}`;
-          const payload = JSON.stringify({ digest: built.digest, seed: built.seed });
+          const payload = JSON.stringify(bytecodeFreeHostSeedKvPayload(built.seed, built.digest));
           this.state.waitUntil((async () => {
             try {
               // Write bytes first; then move the pointer. This order
@@ -4396,6 +4441,264 @@ function jsonResponse(body: unknown, status = 200, headers: Record<string, strin
     status,
     headers: { "content-type": "application/json; charset=utf-8", ...headers }
   });
+}
+
+type BytecodeHashEntry = { object: ObjRef; verb: string; hash: string };
+type BytecodeReservoirEntry = { hash: string; bytecode: TinyBytecode };
+type BytecodeReservoir = Map<ObjRef, Map<string, BytecodeReservoirEntry>>;
+type HostSeedKvRestoreMissReason = Extract<MetricEvent, { kind: "host_seed_kv_restore_miss" }>["reason"];
+type KvRestoreResult<T> = { ok: true; value: T } | { ok: false; reason: HostSeedKvRestoreMissReason };
+type ReservoirLookupResult = { ok: true; bytecode: TinyBytecode } | { ok: false; reason: "hash_mismatch" | "reservoir_miss" };
+
+// Module scope here is per Worker isolate, not global across Cloudflare.
+// Each isolate rebuilds this reservoir at most once per auto-install catalog
+// config, which keeps repeated bytecode-free KV restores from reinstalling
+// bundled catalogs while making the one-time build cost observable.
+const localCatalogReservoirs = new Map<string, BytecodeReservoir>();
+
+function bytecodeFreeHostSeedKvPayload(seed: SeedWorld, digest: string): Record<string, unknown> {
+  const stripped = stripBytecodeForKv(seed);
+  return {
+    kind: HOST_SEED_KV_KIND,
+    digest,
+    seed: stripped.world,
+    bytecode_hashes: stripped.bytecodeHashes
+  };
+}
+
+function bytecodeFreeMcpGatewayWorldKvPayload(world: SerializedWorld, digest: string): Record<string, unknown> {
+  const stripped = stripBytecodeForKv(world);
+  return {
+    kind: MCP_GATEWAY_WORLD_KV_KIND,
+    digest,
+    world: stripped.world,
+    bytecode_hashes: stripped.bytecodeHashes
+  };
+}
+
+function restoreHostSeedKvPayload(
+  value: unknown,
+  expectedDigest: string,
+  localSeedSource: SerializedWorld | null,
+  env: Env,
+  emitMetric?: (event: MetricEvent) => void
+): KvRestoreResult<SeedWorld> {
+  if (!isPlainRecord(value)) return { ok: false, reason: "invalid_payload" };
+  if (value.kind === HOST_SEED_KV_KIND) {
+    if (value.digest !== expectedDigest) return { ok: false, reason: "digest_mismatch" };
+    if (!isSeedWorld(value.seed)) return { ok: false, reason: "invalid_payload" };
+    if (!isBytecodeHashEntries(value.bytecode_hashes)) return { ok: false, reason: "invalid_bytecode_hashes" };
+    const restored = restoreBytecodeFreeWorld(value.seed, value.bytecode_hashes, localSeedSource, env, emitMetric);
+    return restored.ok && !isSeedWorld(restored.value) ? { ok: false, reason: "invalid_payload" } : restored;
+  }
+  if (value.digest !== expectedDigest) return { ok: false, reason: "digest_mismatch" };
+  if (isSeedWorld(value.seed)) {
+    return serializedWorldHasCompleteBytecode(value.seed)
+      ? { ok: true, value: value.seed }
+      : { ok: false, reason: "incomplete_legacy_bytecode" };
+  }
+  return { ok: false, reason: "invalid_payload" };
+}
+
+function restoreMcpGatewayWorldKvPayload(
+  value: unknown,
+  expectedDigest: string,
+  localSeedSource: SerializedWorld | null,
+  env: Env,
+  emitMetric?: (event: MetricEvent) => void
+): KvRestoreResult<SerializedWorld> {
+  if (isSerializedWorld(value)) {
+    return serializedWorldHasCompleteBytecode(value)
+      ? { ok: true, value }
+      : { ok: false, reason: "incomplete_legacy_bytecode" };
+  }
+  if (!isPlainRecord(value)) return { ok: false, reason: "invalid_payload" };
+  if (value.kind !== MCP_GATEWAY_WORLD_KV_KIND) return { ok: false, reason: "invalid_payload" };
+  if (value.digest !== expectedDigest) return { ok: false, reason: "digest_mismatch" };
+  if (!isSerializedWorld(value.world)) return { ok: false, reason: "invalid_payload" };
+  if (!isBytecodeHashEntries(value.bytecode_hashes)) return { ok: false, reason: "invalid_bytecode_hashes" };
+  return restoreBytecodeFreeWorld(value.world, value.bytecode_hashes, localSeedSource, env, emitMetric);
+}
+
+function stripBytecodeForKv<T extends SerializedWorld>(world: T): { world: T; bytecodeHashes: BytecodeHashEntry[] } {
+  const bytecodeHashes: BytecodeHashEntry[] = [];
+  const objects = world.objects.map((obj) => {
+    const verbs = obj.verbs.map((verb) => {
+      if (verb.kind !== "bytecode") return { ...verb, line_map: {} };
+      bytecodeHashes.push({ object: obj.id, verb: verb.name, hash: hashTinyBytecode(verb.bytecode) });
+      const { bytecode: _bytecode, ...withoutBytecode } = verb;
+      return { ...withoutBytecode, line_map: {} } as unknown as VerbDef;
+    });
+    return { ...obj, verbs };
+  });
+  return { world: { ...world, objects } as T, bytecodeHashes };
+}
+
+function restoreBytecodeFreeWorld<T extends SerializedWorld>(
+  world: T,
+  bytecodeHashes: BytecodeHashEntry[],
+  localSeedSource: SerializedWorld | null,
+  env: Env,
+  emitMetric?: (event: MetricEvent) => void
+): KvRestoreResult<T> {
+  const localReservoir = bytecodeReservoirFromSerializedWorld(localSeedSource);
+  const localOnly = restoreBytecodeFreeWorldFromReservoirs(world, bytecodeHashes, [localReservoir]);
+  if (localOnly.ok) return localOnly;
+  if (localOnly.reason !== "reservoir_miss" && localOnly.reason !== "hash_mismatch") return localOnly;
+  const withCatalog = restoreBytecodeFreeWorldFromReservoirs(world, bytecodeHashes, [localReservoir, localCatalogBytecodeReservoir(env, emitMetric)]);
+  if (withCatalog.ok) return withCatalog;
+  return localOnly.reason === "hash_mismatch" && withCatalog.reason === "reservoir_miss" ? localOnly : withCatalog;
+}
+
+function restoreBytecodeFreeWorldFromReservoirs<T extends SerializedWorld>(
+  world: T,
+  bytecodeHashes: BytecodeHashEntry[],
+  reservoirs: readonly BytecodeReservoir[]
+): KvRestoreResult<T> {
+  const expectedHashes = new Map(bytecodeHashes.map((entry) => [bytecodeHashKey(entry.object, entry.verb), entry.hash]));
+  if (expectedHashes.size !== bytecodeHashes.length) return { ok: false, reason: "duplicate_bytecode_hash" };
+  const objects: SerializedObject[] = [];
+  for (const obj of world.objects) {
+    const verbs: VerbDef[] = [];
+    for (const verb of obj.verbs) {
+      const raw = verb as unknown as Record<string, unknown>;
+      const line_map = isPlainRecord(raw.line_map) ? structuredClone(raw.line_map) as Record<string, WooValue> : {};
+      if (raw.kind !== "bytecode") {
+        verbs.push({ ...verb, line_map } as VerbDef);
+        continue;
+      }
+      const name = typeof raw.name === "string" ? raw.name : "";
+      const expected = expectedHashes.get(bytecodeHashKey(obj.id, name));
+      if (!expected) return { ok: false, reason: "missing_bytecode_hash" };
+      if (isTinyBytecode(raw.bytecode)) {
+        if (hashTinyBytecode(raw.bytecode) !== expected) return { ok: false, reason: "inline_hash_mismatch" };
+        verbs.push({ ...verb, line_map, bytecode: structuredClone(raw.bytecode) } as VerbDef);
+        continue;
+      }
+      const lookup = findReservoirBytecode(reservoirs, obj.id, name, expected);
+      if (!lookup.ok) return { ok: false, reason: lookup.reason };
+      verbs.push({ ...verb, line_map, bytecode: structuredClone(lookup.bytecode) } as VerbDef);
+    }
+    objects.push({ ...obj, verbs });
+  }
+  return { ok: true, value: { ...world, objects } as T };
+}
+
+function bytecodeReservoirFromSerializedWorld(world: SerializedWorld | null): BytecodeReservoir {
+  const reservoir: BytecodeReservoir = new Map();
+  if (!world) return reservoir;
+  for (const obj of world.objects) {
+    for (const verb of obj.verbs) {
+      if (verb.kind !== "bytecode" || !isTinyBytecode((verb as unknown as Record<string, unknown>).bytecode)) continue;
+      let objectVerbs = reservoir.get(obj.id);
+      if (!objectVerbs) {
+        objectVerbs = new Map();
+        reservoir.set(obj.id, objectVerbs);
+      }
+      objectVerbs.set(verb.name, { hash: hashTinyBytecode(verb.bytecode), bytecode: verb.bytecode });
+    }
+  }
+  return reservoir;
+}
+
+function localCatalogBytecodeReservoir(env: Env, emitMetric?: (event: MetricEvent) => void): BytecodeReservoir {
+  const key = env.WOO_AUTO_INSTALL_CATALOGS ?? "<default>";
+  const cached = localCatalogReservoirs.get(key);
+  if (cached) return cached;
+  const startedAt = Date.now();
+  try {
+    const world = createWorld({ catalogs: parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS) });
+    const reservoir = bytecodeReservoirFromSerializedWorld(world.exportWorld());
+    localCatalogReservoirs.set(key, reservoir);
+    emitMetric?.({
+      kind: "kv_catalog_reservoir_build",
+      catalog_key: key,
+      ms: Date.now() - startedAt,
+      status: "ok",
+      objects: world.objects.size,
+      verbs: bytecodeReservoirVerbCount(reservoir)
+    });
+    return reservoir;
+  } catch (err) {
+    emitMetric?.({ kind: "kv_catalog_reservoir_build", catalog_key: key, ms: Date.now() - startedAt, status: "error", ...metricErrorFields(err) });
+    throw err;
+  }
+}
+
+function findReservoirBytecode(
+  reservoirs: readonly BytecodeReservoir[],
+  object: ObjRef,
+  verb: string,
+  expectedHash: string
+): ReservoirLookupResult {
+  let foundDifferentHash = false;
+  for (const reservoir of reservoirs) {
+    const entry = reservoir.get(object)?.get(verb);
+    if (!entry) continue;
+    if (entry.hash === expectedHash) return { ok: true, bytecode: entry.bytecode };
+    foundDifferentHash = true;
+  }
+  return { ok: false, reason: foundDifferentHash ? "hash_mismatch" : "reservoir_miss" };
+}
+
+function bytecodeReservoirVerbCount(reservoir: BytecodeReservoir): number {
+  let count = 0;
+  for (const verbs of reservoir.values()) count += verbs.size;
+  return count;
+}
+
+function serializedWorldHasCompleteBytecode(world: SerializedWorld): boolean {
+  for (const obj of world.objects) {
+    for (const verb of obj.verbs) {
+      const raw = verb as unknown as Record<string, unknown>;
+      if (raw.kind === "bytecode" && !isTinyBytecode(raw.bytecode)) return false;
+    }
+  }
+  return true;
+}
+
+function isBytecodeHashEntries(value: unknown): value is BytecodeHashEntry[] {
+  return Array.isArray(value) && value.every((entry) =>
+    isPlainRecord(entry) &&
+    typeof entry.object === "string" &&
+    typeof entry.verb === "string" &&
+    typeof entry.hash === "string" &&
+    entry.hash.length > 0
+  );
+}
+
+function isTinyBytecode(value: unknown): value is TinyBytecode {
+  if (!isPlainRecord(value)) return false;
+  return Array.isArray(value.ops) &&
+    Array.isArray(value.literals) &&
+    Number.isInteger(value.num_locals) &&
+    Number.isInteger(value.max_stack) &&
+    Number.isInteger(value.version);
+}
+
+function hashTinyBytecode(bytecode: TinyBytecode): string {
+  return hashSource(canonicalKvJsonStringify(bytecode));
+}
+
+function bytecodeHashKey(object: ObjRef, verb: string): string {
+  return `${object}\u0000${verb}`;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function canonicalKvJsonStringify(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(canonicalKvJsonStringify).join(",") + "]";
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return "{" + Object.keys(record).sort().map((key) => JSON.stringify(key) + ":" + canonicalKvJsonStringify(record[key])).join(",") + "}";
+  }
+  return "null";
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown>> {

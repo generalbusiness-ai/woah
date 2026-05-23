@@ -1,208 +1,202 @@
 # Decomposed KV Seed Cache (Step 3b)
 
-Design doc for the planned successor to the monolithic-per-host KV cache
-that was rolled back on 2026-05-22 after stale-key poisoning corrupted
-the_chatroom and the_outline satellites. Captured as a checkpoint before
-implementation begins.
+Status and decision note for the Cloudflare host-seed KV cache. This
+started as the planned successor to the monolithic per-host cache that
+was rolled back on 2026-05-22 after stale-key poisoning corrupted
+the_chatroom and the_outline. It is now updated to reflect the actual
+implemented path.
 
 ## Why the v1 design failed
 
 The v1 KV cache (commit `71e41a5`, rolled back at `45d9e83`) wrote one
-KV value per host: `seed:${host}` → `{ digest, seed }`. Key was not
-versioned. When deploy N+1 changed verb metadata, the satellite cold-
-load picked up the deploy-N bytes from KV, merged them over local SQL,
-and persisted the corrupted merge. Two compounding bugs:
+KV value per host: `seed:${host}` -> `{ digest, seed }`. The key was
+not versioned. When deploy N+1 changed verb metadata, a satellite
+cold-load picked up deploy-N bytes from KV, merged them over local SQL,
+and persisted the corrupted merge.
 
-1. **No deploy discriminator on the key.** Same key across deploys.
-2. **`persistFullSnapshot` on every `seedMergeChanged === true`.** Any
-   merge — including ones from stale KV — got written to local SQL.
+Two issues compounded:
 
-Recovery required `/api/admin/force-rebuild-host` on the two
-poisoned satellites (commit `b75aaa8`).
+1. **No content discriminator on the key.** The same key survived
+   across deploys and content changes.
+2. **Durable persistence after any merge.** `persistFullSnapshot` ran
+   after `seedMergeChanged === true`, including merges sourced from
+   stale KV.
 
-Two further observations from the incident:
+Recovery required `/api/admin/force-rebuild-host` on the two poisoned
+satellites (commit `b75aaa8`).
 
-- the_chatroom and the_outline have seeds larger than the 1MB Worker
-  subrequest body limit. `refresh-host-seeds` (which pushes the seed
-  to the satellite) can't reach them. The pull path
-  (`/__internal/host-seed`) works because Worker response bodies
-  aren't subject to the same limit.
-- A satellite seed today is dominated by `verb.bytecode` and
-  `verb.line_map`. Earlier breakdown: 996KB for the_deck, verbs 67%
-  of bytes. Multiple satellite seeds carry the same $-class verbs
-  (e.g., `$weather` appears in both the_chatroom and the_outline).
+Two observations from the incident still matter:
 
-## Goals for v2
+- Some satellite seeds exceeded the 1 MB Worker subrequest body limit
+  on the push path (`refresh-host-seeds`). The pull path
+  (`/__internal/host-seed`) works because Worker response bodies are
+  not subject to the same limit.
+- Seed bytes are dominated by `verb.bytecode` and `verb.line_map`.
+  Earlier breakdown: 996 KB for the_deck, with verbs at 67% of bytes.
+  Multiple satellite seeds carry identical bundled class verbs.
+
+## Goals
 
 1. **Cold-load latency under 500 ms** when KV has hot entries.
-2. **No satellite size limits.** Each KV value <100KB.
-3. **Stale KV cannot poison local SQL.**
-4. **Cache hits survive across deploys** when content didn't change.
-5. **No deploy-version coupling required** in the key.
+2. **Stale KV cannot poison local SQL.**
+3. **Cache hits survive across deploys** when content is unchanged.
+4. **No deploy-version coupling** in KV keys.
+5. **Reduced KV serialization/storage cost** by removing bytecode from
+   cache bytes.
 
-## Approach
+The original "<100 KB per KV value" target belongs to the deferred
+class-decomposed design. It is no longer the active acceptance gate for
+this step because measured whole-seed KV reads are already below the
+cold-load latency target.
 
-Two orthogonal levers:
+## Current Implementation
 
-### Lever A — source-only seeds
+The live Lever B shape is content-addressed whole-seed KV:
 
-Strip `verb.bytecode` and `verb.line_map` from delivered seeds. Wire
-format carries `verb.source` (the DSL string) only. Receiver
-recompiles via the existing DSL compiler at load time. Native verbs
-have no source — encode as a tiny `{ native: name }` shape and keep
-the native registry on the receiver.
+| Key | Value |
+|---|---|
+| `seed-current:${host}` | digest pointer |
+| `seed:${host}:${digest}` | bytecode-free host seed payload |
+| `mcp-gateway-world-current` | digest pointer |
+| `mcp-gateway-world:${digest}` | bytecode-free gateway snapshot payload |
 
-Cost: ~10 ms per catalog install on the receiver (DSL compile is
-cheap; bootstrap measurements show ~250 ms for 59 catalog objects
-which includes a lot of object/property work, not just verb
-compile).
+The digest is computed from the full authoritative serialized world or
+seed, including bytecode. Bytecode changes therefore move the pointer
+even though the cached payload omits bytecode.
 
-Win: ~85% reduction in seed bytes. the_chatroom drops well under
-the 1MB limit; the_deck drops from ~1MB to ~150KB.
+Authoritative DO responses still carry executable `verb.bytecode`. KV
+is a cache encoding only:
 
-### Lever B — class-decomposed KV
+- KV payloads use explicit version kinds:
+  `woo.host_seed.kv.bytecode_free.v1` and
+  `woo.mcp_gateway_world.kv.bytecode_free.v1`.
+- KV payloads strip `verb.bytecode`, clear `line_map`, and carry
+  per-verb bytecode hashes.
+- Cold readers restore exact bytecode from trusted reservoirs:
+  local SQL first, then bundled catalogs compiled by the same runtime.
+- If any bytecode body is missing or hash-mismatched, the KV entry is a
+  miss and the reader falls back to the signed authoritative DO
+  response.
 
-Replace the monolithic `seed:${host}` value with three layers:
-
-| Key | Value | Updated by | Read by |
-|---|---|---|---|
-| `class:${classId}:${classDigest}` | one class's serialized form (source-only verbs, propertyDefs, eventSchemas, ancestry chain) | catalog install/upgrade on WORLD | every cold satellite that needs that class |
-| `host-objects:${host}:${objectsDigest}` | non-class objects owned by host | host's writes | that host's cold-load |
-| `host-manifest:${host}` | `{ classes_used: { id, digest }[], objects_digest, schema_version }` | gateway after any host write or class change | cold satellite as first probe |
-
-A satellite cold-loading `the_chatroom` does:
-
-1. **Read `host-manifest:the_chatroom`** (one tiny KV read).
-2. **Parallel-read** every `class:${id}:${digest}` and `host-objects:the_chatroom:${digest}` listed in the manifest. Each is small; CF KV reads at edge are <50 ms typical.
-3. **Assemble** the world from the pieces.
-4. **Recompile** verbs from source (lever A).
-5. **Hand off** to the existing world materializer.
-
-The digest in each class/host-objects key means stale values are
-unreachable — a new digest is a new key. No deploy versioning
-needed; content-addressing handles it.
-
-### Why this together
-
-- Each KV read is small and edge-cacheable.
-- Shared classes (`$weather`, `$room`, `$thing`) read from a single
-  KV value across many satellites; the read is hot at the edge.
-- Class changes only invalidate the affected class entry; host
-  changes only invalidate that host's `host-objects`. Cross-deploy
-  no-op changes naturally hit the same digest.
-- No persistFullSnapshot from KV (see safety below) so even if
-  some inconsistency slips through, local SQL is unaffected.
+This keeps cold-loads fast when the cache is valid without reintroducing
+the Lever A regression.
 
 ## Safety
 
-KV remains a cold-load accelerator, not durable state. The cold-load
-flow:
+The safety boundary is now content addressing plus bytecode hash
+verification, not provisional non-persistence.
 
-```
-in-memory world ← assemble(KV reads) [used for the current request]
-local SQL       ← persistFullSnapshot ONLY when seed came from DO
-                  (authoritative) AND the merge ran clean
-```
+KV-sourced merges may persist to local SQL because the bytes are
+self-consistent under a content-addressed key. A stale value may remain
+in KV until TTL, but it is unreachable after the pointer moves. A
+mismatched or incomplete bytecode-free payload is never imported; it is
+treated as a cache miss.
 
-Concretely: when `fetchHostSeed`'s KV read assembles a world, mark
-it `provisional: true`. Skip `persistFullSnapshot` until a future
-authoritative refresh confirms (e.g., a fanned-out
-`apply-v2-commit` that touches the host, or an explicit refresh).
+Two metrics are specifically for drift detection:
 
-This way: a poisoned KV value affects one DO instance until next
-hibernation; never enters durable storage. The dominant cost — first
-cold-load — is still accelerated; the persistence is bounded behind
-a known-good signal.
+- `host_seed_kv_restore_miss` distinguishes ordinary cache absence
+  (`no_pointer`, `no_entry`) from restore drift (`hash_mismatch`,
+  `inline_hash_mismatch`, `reservoir_miss`, etc.).
+- `kv_catalog_reservoir_build` records the one-time per-isolate cost of
+  building the bundled-catalog bytecode reservoir.
 
-## Migration path
+The module-global reservoir cache is Worker-isolate-local. It is not
+shared across Cloudflare isolates.
 
-1. Land Lever A (source-only seeds) first. No KV changes; just
-   reduces the host_seed_fetch body size to under 1MB everywhere.
-   Removes the immediate `the_chatroom` / `the_outline` push limit.
-2. Land Lever B with the three new KV key shapes. Keep the v1
-   `seed:${host}` key writes for backward compatibility during the
-   rollout; read v2 first, fall back to v1, fall back to DO RPC.
-3. Verify v2 hit rate and cold-start cost. Drop v1 write/read once
-   verified.
+## Deferred Alternatives
 
-Step 2 needs WORLD to compute manifests on catalog install/upgrade
-and on commit fanout — that's the same hook points that already
-manage `hostSeedCache` invalidation per Step 1.
+### Lever A: Source-Only Seeds
 
-## What this doesn't fix
+Attempted in commit `610f863`, reverted at `f6d13ff`. Smoke collapsed
+from 6-7/9 to 0-3/9.
 
-- WORLD's cold-load itself. WORLD still reads its full SQL on
-  rehydrate. The lift here is for SATELLITES being faster when
-  WORLD is awake.
-- Step 2 (actors off WORLD). That's still the structural fix for
-  WORLD-as-bottleneck under apply-v2-commit load. Independent of
-  Step 3b.
+Root cause: on first cold-load after a wipe, the satellite has an empty
+SQL slice, so the merged world is the placeholder-bytecode seed.
+`cloneImportedVerb` then recompiles every verb synchronously during
+`importWorld`. With roughly 70 verbs per satellite slice and about
+50 ms per DSL compile, that puts seconds of CPU on the cold-load path
+and pushes the 20 s smoke wall.
 
-## Lever A regression (2026-05-22)
+Decision: source-only seeds are not viable without a lazy-compile or
+persistent compile-cache strategy. Missing bytecode on the cold path
+must fall back to WORLD's authoritative response, not synchronously
+recompile seed source.
 
-Attempted Lever A (commit `610f863`, reverted at `f6d13ff`). Smoke
-collapsed from 6–7/9 to 0–3/9. Root cause: on the first cold-load
-after a wipe, the satellite has an empty SQL slice, so the merged
-world IS the (placeholder-bytecode) seed. cloneImportedVerb then
-recompiles every verb synchronously during importWorld. With ~70
-verbs per satellite slice and ~50 ms per DSL compile, that's ~3.5 s
-of synchronous CPU on the cold-load path — pushes past the 20 s
-smoke wall.
+### Class-Decomposed KV
 
-Subsequent cold-loads should have been fast (local SQL has full
-bytecode from `persistFullSnapshot`), but the regression was visible
-across 4 consecutive smokes. Hypothesis: the first cold-load hard-
-fail leaves the satellite in a degraded state (request queues,
-unhealthy mark, etc.) that cascades.
+The original class-decomposed plan split host seeds into:
 
-Conclusion: source-only seeds are not viable without a lazy-compile
-or persistent-compile-cache strategy. Defer Lever A; pursue Lever B
-on its own.
+| Key | Value |
+|---|---|
+| `class:${classId}:${classDigest}` | one class's serialized form |
+| `host-objects:${host}:${objectsDigest}` | non-class objects owned by host |
+| `host-manifest:${host}` | class digests and host object digest |
 
-### Lever B without Lever A
+This remains a plausible future storage optimization because shared
+classes (`$room`, `$thing`, `$weather`, etc.) would be edge-cached once
+and reused by many hosts. It is not the immediate next step: measured
+seed fetches are already under the latency target, and implementing this
+now would add complexity before the next bottleneck is proven to be KV
+value size or KV read time.
 
-Lever B's wins are independent of size:
-- Edge-cached KV reads avoid waking WORLD on satellite cold-load.
-- Content-addressed keys prevent stale-data poisoning across deploys.
-- Decomposition lets each class be cached separately by every
-  satellite that uses it.
+### Canonical JSON Consolidation
 
-The size concern that drove Lever A (`apply-host-seed` 1 MB
-subrequest-body limit) doesn't apply to KV: KV value limit is 25 MB,
-KV writes go via `env.HOST_SEED_KV.put` which bypasses subrequest
-constraints. So we can keep verb.bytecode in the wire format and
-still get the KV distribution benefits.
+The bytecode hash path currently has a local canonical JSON helper.
+Consolidate it with the existing canonical JSON logic in `world.ts` and
+the bootstrap digest path before this area grows another variant.
 
-If size becomes the actual bottleneck later (e.g., 1 MB satellite
-boots that take >500 ms over the wire), revisit Lever A with a
-lazy-compile design.
+## Measured Impact
 
-## Status
+From deploy `9a9e95c0` before the bytecode-free cache encoding:
 
-- Recovery: ✅ live (force-rebuild routes deployed `23dc0c44`)
-- Step 1: ✅ live (per-host invalidation, ~45% in-DO hit rate)
-- Lever A (source-only seeds): ⛔ reverted (cold-load regression)
-- v1 KV: replaced by Lever B
-- Lever B (content-addressed KV, both seed paths): ✅ live (commit
-  `03fa936`, deploy `9a9e95c0`)
-- Next: horoscope polling off WORLD — see
-  `notes/2026-05-22-horoscope-blocking-world.md`
-
-## Lever B measured impact (deploy `9a9e95c0`)
-
-| Metric | Before (Step 1 v2 only) | After Lever B |
-|---|---|---|
+| Metric | Before Step 1 v2 only | After content-addressed Lever B |
+|---|---:|---:|
 | `mcp_gateway_snapshot_fetch` avg | 1183 ms | 98 ms |
 | `mcp_gateway_snapshot_fetch` max | 6647 ms | 351 ms |
 | `host_seed_fetch` avg | ~500 ms | 138 ms |
 | `host_seed_fetch` max | ~3 s | 358 ms |
 | KV serve rate | 0% | 100% |
 
-Both seed-delivery paths are ~10x faster and no longer the smoke
-bottleneck. Cold satellite cold-load now consults KV first, falls
-back to DO RPC on miss/error. KV-sourced merges persist to local
-SQL (content-addressed keys ⇒ no stale-poisoning risk).
+The seed-delivery paths were no longer the smoke bottleneck after
+content-addressed KV. Bytecode-free KV should reduce KV bytes and
+serialization/storage cost further while preserving the same fallback
+semantics.
 
-Smoke pass rate didn't fully recover because the remaining MCP POST
-timeouts come from horoscope polling blocking WORLD's single-
-threaded execution. Resolving that is the next milestone.
+## Current Status
+
+- Recovery: live (force-rebuild routes deployed at `23dc0c44`).
+- Step 1: live (per-host invalidation, about 45% in-DO hit rate).
+- Content-addressed Lever B: live for both seed paths.
+- Bytecode-free KV payloads: implemented in branch
+  `decomposed-kv-seed-cache`; authoritative DO responses still carry
+  bytecode and remain the fallback for fresh, edited, or non-bundled
+  verbs.
+- Block self-hosting: implemented on `main` in `2e52f05`; `$block`
+  instances such as `the_horoscope` route to their own DO in current
+  code. Production still needs smoke/tail confirmation if that commit
+  has not been deployed.
+
+## Immediate Next Steps
+
+1. Review and merge the bytecode-free KV branch.
+2. Deploy the current main+branch state when approved, then run
+   `scripts/smoke-with-tail.sh`.
+3. Confirm the_horoscope no longer appears as
+   `host_key:"world"` for `/api/objects/the_horoscope/calls/*`.
+   Expected post-block-self-hosting shape: those calls route to
+   `host_key:"the_horoscope"`.
+4. Sort remaining `world` `do_handler` events by `ms` from the smoke
+   tail. The next implementation priority should be the largest
+   measured WORLD blocker, not another KV redesign.
+5. If the next blocker is actor/session/fanin shaped, resume Step 2:
+   move actors and their hot commit paths off WORLD.
+
+## What This Does Not Fix
+
+- WORLD's own cold-load. WORLD still reads its full SQL on rehydrate.
+- WORLD as a coordination point for actor/session/fanin paths. KV helps
+  satellites avoid waking WORLD for seed reads; it does not remove every
+  request path that legitimately touches WORLD.
+- The 1 MB push limit for explicit `refresh-host-seeds` of large hosts.
+  The pull path remains the production cold-load path; revisit class
+  decomposition if push refresh becomes operationally important.

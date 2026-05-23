@@ -26,6 +26,177 @@ import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 // contention they legitimately exceed Vitest's default 30s per-test timeout.
 vi.setConfig({ testTimeout: 120_000 });
 
+class FakeKVNamespace {
+  readonly values = new Map<string, string>();
+
+  async get(key: string, _type?: "text"): Promise<string | null> {
+    return this.values.get(key) ?? null;
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    this.values.set(key, value);
+  }
+}
+
+class WaitUntilDurableObjectState extends FakeDurableObjectState {
+  readonly waitUntilPromises: Promise<unknown>[] = [];
+
+  waitUntil(promise: Promise<unknown>): void {
+    this.waitUntilPromises.push(Promise.resolve(promise));
+  }
+
+  async drainWaitUntil(): Promise<void> {
+    await Promise.all(this.waitUntilPromises.splice(0));
+  }
+}
+
+function hasJsonKey(value: unknown, key: string): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((item) => hasJsonKey(item, key));
+  return Object.entries(value).some(([name, child]) => name === key || hasJsonKey(child, key));
+}
+
+function metricEvents(logSpy: { mock: { calls: unknown[][] } }, kind: string): Array<Record<string, unknown>> {
+  const events: Array<Record<string, unknown>> = [];
+  for (const call of logSpy.mock.calls) {
+    if (call[0] !== "woo.metric" || typeof call[1] !== "string") continue;
+    const parsed = JSON.parse(call[1]) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { kind?: unknown }).kind === kind) {
+      events.push(parsed as Record<string, unknown>);
+    }
+  }
+  return events;
+}
+
+function firstBytecodeVerb(world: WooWorld): VerbDef | null {
+  for (const obj of world.objects.values()) {
+    for (const verb of obj.verbs) {
+      if (verb.kind === "bytecode") return verb;
+    }
+  }
+  return null;
+}
+
+function injectMismatchedInlineBytecode(world: unknown, hashes: Array<Record<string, unknown>>): void {
+  const first = hashes[0];
+  if (!first || typeof first.object !== "string" || typeof first.verb !== "string") {
+    throw new Error("expected at least one bytecode hash");
+  }
+  if (!world || typeof world !== "object" || Array.isArray(world)) throw new Error("expected serialized world");
+  const objects = (world as { objects?: unknown }).objects;
+  if (!Array.isArray(objects)) throw new Error("expected serialized objects");
+  const mismatched: TinyBytecode = { ops: [], literals: [], num_locals: 0, max_stack: 0, version: 999 };
+  for (const obj of objects) {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
+    if ((obj as { id?: unknown }).id !== first.object) continue;
+    const verbs = (obj as { verbs?: unknown }).verbs;
+    if (!Array.isArray(verbs)) break;
+    for (const verb of verbs) {
+      if (!verb || typeof verb !== "object" || Array.isArray(verb)) continue;
+      if ((verb as { name?: unknown }).name === first.verb) {
+        (verb as Record<string, unknown>).bytecode = mismatched;
+        return;
+      }
+    }
+  }
+  throw new Error("failed to inject mismatched bytecode");
+}
+
+function createHostSeedKvHarness() {
+  const kv = new FakeKVNamespace();
+  const directoryState = new FakeDurableObjectState("directory");
+  const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+  const wooStates = new Map<string, WaitUntilDurableObjectState>();
+  const wooObjects = new Map<string, PersistentObjectDO>();
+  const hostSeedFetches: string[] = [];
+  const mcpGatewayWorldFetches: string[] = [];
+  let env: Env;
+  const wooNamespace = new FakeDurableObjectNamespace((name) => {
+    let object = wooObjects.get(name);
+    if (!object) {
+      const state = new WaitUntilDurableObjectState(name);
+      wooStates.set(name, state);
+      object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+      wooObjects.set(name, object);
+    }
+    return {
+      fetch: async (request: Request): Promise<Response> => {
+        if (name === "world" && new URL(request.url).pathname === "/__internal/host-seed") {
+          const body = await request.clone().json().catch(() => ({})) as Record<string, unknown>;
+          hostSeedFetches.push(String(body.host ?? ""));
+        }
+        if (name === "world" && new URL(request.url).pathname === "/__internal/mcp-gateway-world") {
+          const body = await request.clone().json().catch(() => ({})) as Record<string, unknown>;
+          mcpGatewayWorldFetches.push(String(body.shard ?? ""));
+        }
+        return await object!.fetch(request);
+      }
+    };
+  });
+  env = {
+    WOO_INITIAL_WIZARD_TOKEN: "cf-kv-seed-token",
+    WOO_INTERNAL_SECRET: "cf-test-secret",
+    WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,note,blocks-demo",
+    DIRECTORY: new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    }),
+    WOO: wooNamespace,
+    HOST_SEED_KV: kv as unknown as KVNamespace
+  } as unknown as Env;
+
+  const drain = async (name: string): Promise<void> => {
+    await wooStates.get(name)?.drainWaitUntil();
+  };
+
+  const publishHostSeed = async (host: string): Promise<{ pointer: string; bytesKey: string; payload: Record<string, unknown> }> => {
+    const request = await signInternalRequest(env, new Request("https://woo.internal/__internal/host-seed", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-woo-host-key": "world"
+      },
+      body: JSON.stringify({ host })
+    }));
+    const response = await wooNamespace.get({ name: "world" }).fetch(request);
+    if (!response.ok) throw new Error(`host seed publish failed: ${response.status} ${await response.text()}`);
+    await drain("world");
+    const pointer = await kv.get(`seed-current:${host}`, "text");
+    expect(pointer).toBeTruthy();
+    const bytesKey = `seed:${host}:${pointer}`;
+    const raw = await kv.get(bytesKey, "text");
+    expect(raw).toBeTruthy();
+    return { pointer: pointer!, bytesKey, payload: JSON.parse(raw!) as Record<string, unknown> };
+  };
+
+  const publishMcpGatewayWorld = async (shard: string): Promise<{ pointer: string; bytesKey: string; payload: Record<string, unknown> }> => {
+    const request = await signInternalRequest(env, new Request("https://woo.internal/__internal/mcp-gateway-world", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-woo-host-key": "world"
+      },
+      body: JSON.stringify({ shard })
+    }));
+    const response = await wooNamespace.get({ name: "world" }).fetch(request);
+    if (!response.ok) throw new Error(`mcp gateway snapshot publish failed: ${response.status} ${await response.text()}`);
+    await drain("world");
+    const pointer = await kv.get("mcp-gateway-world-current", "text");
+    expect(pointer).toBeTruthy();
+    const bytesKey = `mcp-gateway-world:${pointer}`;
+    const raw = await kv.get(bytesKey, "text");
+    expect(raw).toBeTruthy();
+    return { pointer: pointer!, bytesKey, payload: JSON.parse(raw!) as Record<string, unknown> };
+  };
+
+  const close = (): void => {
+    directoryState.close();
+    for (const state of wooStates.values()) state.close();
+  };
+
+  return { env, kv, wooNamespace, wooObjects, hostSeedFetches, mcpGatewayWorldFetches, drain, publishHostSeed, publishMcpGatewayWorld, close };
+}
+
 describe("v2 Worker fan-out helpers", () => {
   it("preserves multiple envelopes for the same recipient node", () => {
     const grouped = v2FanoutEnvelopesByNode([
@@ -3284,6 +3455,115 @@ describe("CFObjectRepository production-shape coverage", () => {
       logSpy.mockRestore();
       directoryState.close();
       for (const state of wooStates.values()) state.close();
+    }
+  });
+
+  it("stores host-seed KV entries without bytecode and restores bytecode on satellite cold-load", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { payload } = await harness.publishHostSeed("the_chatroom");
+      expect(payload).toMatchObject({
+        kind: "woo.host_seed.kv.bytecode_free.v1",
+        digest: expect.any(String),
+        seed: expect.any(Object),
+        bytecode_hashes: expect.any(Array)
+      });
+      expect(payload.bytecode_hashes as unknown[]).not.toHaveLength(0);
+      expect(hasJsonKey(payload.seed, "bytecode")).toBe(false);
+      expect(hasJsonKey(payload.seed, "line_map")).toBe(true);
+
+      harness.hostSeedFetches.length = 0;
+      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+      expect(healthz.ok).toBe(true);
+      expect(harness.hostSeedFetches).toEqual([]);
+      const chatroomWorld = await (harness.wooObjects.get("the_chatroom") as any).getWorld("the_chatroom") as WooWorld;
+      const verb = firstBytecodeVerb(chatroomWorld);
+      expect(verb?.kind).toBe("bytecode");
+      if (verb?.kind === "bytecode") expect(verb.bytecode.ops.length).toBeGreaterThan(0);
+      expect(metricEvents(logSpy, "kv_catalog_reservoir_build")).toEqual([
+        expect.objectContaining({ status: "ok", verbs: expect.any(Number) })
+      ]);
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("falls back to the authoritative host seed when stripped KV bytecode hashes cannot be restored", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { bytesKey, payload } = await harness.publishHostSeed("the_chatroom");
+      const hashes = payload.bytecode_hashes as Array<Record<string, unknown>>;
+      expect(hashes.length).toBeGreaterThan(0);
+      hashes[0].hash = "not-the-bytecode-hash";
+      await harness.kv.put(bytesKey, JSON.stringify(payload));
+
+      harness.hostSeedFetches.length = 0;
+      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+      expect(healthz.ok).toBe(true);
+      expect(harness.hostSeedFetches).toContain("the_chatroom");
+      expect(metricEvents(logSpy, "host_seed_kv_restore_miss")).toContainEqual(
+        expect.objectContaining({ cache: "host_seed", host: "the_chatroom", reason: "hash_mismatch" })
+      );
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("rejects inline bytecode in a bytecode-free host-seed KV payload when the hash does not match", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { bytesKey, payload } = await harness.publishHostSeed("the_chatroom");
+      injectMismatchedInlineBytecode(payload.seed, payload.bytecode_hashes as Array<Record<string, unknown>>);
+      await harness.kv.put(bytesKey, JSON.stringify(payload));
+
+      harness.hostSeedFetches.length = 0;
+      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+      expect(healthz.ok).toBe(true);
+      expect(harness.hostSeedFetches).toContain("the_chatroom");
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("stores MCP gateway snapshot KV entries without bytecode and restores from the local catalog reservoir", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { payload } = await harness.publishMcpGatewayWorld("mcp-gateway-0");
+      expect(payload).toMatchObject({
+        kind: "woo.mcp_gateway_world.kv.bytecode_free.v1",
+        digest: expect.any(String),
+        world: expect.any(Object),
+        bytecode_hashes: expect.any(Array)
+      });
+      expect(payload.bytecode_hashes as unknown[]).not.toHaveLength(0);
+      expect(hasJsonKey(payload.world, "bytecode")).toBe(false);
+
+      harness.mcpGatewayWorldFetches.length = 0;
+      const healthz = await harness.wooNamespace.get({ name: "mcp-gateway-0" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "mcp-gateway-0" }
+      })));
+      expect(healthz.ok).toBe(true);
+      expect(harness.mcpGatewayWorldFetches).toEqual([]);
+      const shardWorld = await (harness.wooObjects.get("mcp-gateway-0") as any).getWorld("mcp-gateway-0") as WooWorld;
+      const verb = firstBytecodeVerb(shardWorld);
+      expect(verb?.kind).toBe("bytecode");
+      if (verb?.kind === "bytecode") expect(verb.bytecode.ops.length).toBeGreaterThan(0);
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
     }
   });
 

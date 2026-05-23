@@ -3,6 +3,27 @@
 Discovered while measuring Lever B's KV-fronted seed cache on prod
 deploy `9a9e95c0` (commit `03fa936`).
 
+## Status update (2026-05-23)
+
+The smallest fix described below has landed in code: commit `2e52f05`
+made `$block` instances self-hosted by default, and current Worker tests
+assert that `the_horoscope` routes to host `the_horoscope` rather than
+`world`.
+
+Treat this note as a historical diagnosis until production smoke/tail
+confirms the deployed route shape. Confirmation criteria:
+
+- no `do_handler` events on `host_key:"world"` for
+  `/api/objects/the_horoscope/calls/*`;
+- corresponding horoscope calls appear on `host_key:"the_horoscope"`;
+- `scripts/smoke-with-tail.sh` no longer reports horoscope routes as
+  the largest WORLD handlers.
+
+If horoscope still appears under WORLD after deploy, the next action is
+route repair or deploy verification, not a new cache change. Once
+horoscope is gone from WORLD, sort remaining `world` `do_handler`
+latencies and fix the next measured blocker.
+
 ## What the metrics show
 
 A single smoke run captured 25 `do_handler` events with `ms > 2000`,
