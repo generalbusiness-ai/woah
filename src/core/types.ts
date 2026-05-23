@@ -369,6 +369,14 @@ export type MetricEvent =
   // "absent" means the entry was never built or was explicitly deleted.
   // ms reports the compute cost on a miss.
   | { kind: "host_seed_cache"; host: ObjRef; status: "hit" | "miss"; reason?: "version_changed" | "absent"; ms: number }
+  // Distinguishes KV cache absence from bytecode-restore drift. A no_pointer
+  // or no_entry is normal during rollout/TTL churn; hash_mismatch means the
+  // local/catalog bytecode reservoir no longer matches WORLD's authoritative
+  // bytecode hash and the reader fell back to the signed DO response.
+  | { kind: "host_seed_kv_restore_miss"; cache: "host_seed" | "mcp_gateway_world"; host: string; reason: "no_pointer" | "no_entry" | "invalid_payload" | "digest_mismatch" | "invalid_bytecode_hashes" | "duplicate_bytecode_hash" | "missing_bytecode_hash" | "inline_hash_mismatch" | "hash_mismatch" | "reservoir_miss" | "incomplete_legacy_bytecode"; ms: number }
+  // One-time per Worker isolate and auto-install catalog configuration when a
+  // bytecode-free KV entry cannot be restored from local SQL alone.
+  | { kind: "kv_catalog_reservoir_build"; catalog_key: string; ms: number; status: "ok" | "error"; objects?: number; verbs?: number; error?: string; error_detail?: string }
   // Emitted on every verb dispatch from the worker's host bridge, so each
   // dispatch leaves a trace of (a) where it routed and (b) which path it
   // took. `path` is "local" when the destination is the same host, "read"

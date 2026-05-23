@@ -101,6 +101,8 @@ function primaryCount(event: MetricEvent): number {
       return 1;
     case "startup_storage":
       return typeof e.objects === "number" ? e.objects : (typeof e.routes === "number" ? e.routes : 0);
+    case "kv_catalog_reservoir_build":
+      return typeof e.verbs === "number" ? e.verbs : 0;
     case "shadow_apply_step":
     case "shadow_gateway_apply_step":
       return typeof e.objects === "number" ? e.objects : 0;

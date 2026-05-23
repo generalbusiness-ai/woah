@@ -76,6 +76,24 @@ for future probes. The merge protocol itself does not depend on the
 digest; it is metadata for cold-load wire-savings strategies layered
 on top.
 
+### HS1.3 KV accelerator encoding
+
+The authoritative `/__internal/host-seed` response carries executable
+`verb.bytecode`. Reference-layer KV accelerators MAY store a
+bytecode-free encoding of the same seed to reduce serialization and KV
+storage cost, but such an encoding is only a cache representation, not
+a new seed contract.
+
+A bytecode-free cache entry MUST carry a digest for the full
+authoritative seed and per-verb bytecode hashes. A receiver may use the
+entry only after restoring every missing bytecode body from a trusted
+local reservoir (for example its stored SQL slice or the bundled
+catalogs compiled by the same runtime) and verifying the restored
+bytecode hash. If any bytecode body is missing or mismatched, the cache
+entry is a miss and the receiver MUST fetch the authoritative seed.
+Receivers MUST NOT recompile arbitrary seed source synchronously on the
+cold-load path as the fallback for a missing bytecode body.
+
 ---
 
 ## HS2. Per-subject merge

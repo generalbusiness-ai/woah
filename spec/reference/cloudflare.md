@@ -475,6 +475,17 @@ the gateway's `$system.applied_migrations` ledger may be copied into a
 host seed, but it does not prove the host's local instance data was
 converted.
 
+When `HOST_SEED_KV` is configured, the Worker writes a content-addressed
+cache entry for host seeds and MCP gateway snapshots. The KV bytes omit
+`verb.bytecode` and include per-verb bytecode hashes; cold readers
+restore exact bytecode from local SQL or bundled-catalog reservoirs
+before using the cache. A missing or mismatched hash is a cache miss and
+falls back to the signed DO response, which still carries full
+bytecode. The cold reader emits `kv_catalog_reservoir_build` when it
+has to build the per-isolate bundled-catalog reservoir and
+`host_seed_kv_restore_miss` when a KV entry is absent or cannot be
+restored.
+
 A wizard may ask the gateway to refresh live object hosts with
 `POST /api/admin/refresh-host-seeds`. The gateway exports each requested
 host-scoped seed and sends it to the owning DO. The receiving host merges that
