@@ -3009,27 +3009,30 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(gateway).toBeTruthy();
       const gatewayWorld = await gateway.getWorld("world") as WooWorld;
       const horoscopeRoute = gatewayWorld.objectRoutes().find((route) => route.id === "the_horoscope");
-      expect(horoscopeRoute).toMatchObject({ host: "the_deck" });
+      // Post-block-self-hosting: $block has host_placement: "self" so
+      // every block instance hosts on its own DO. the_horoscope's route
+      // is the_horoscope itself rather than its anchor the_deck.
+      expect(horoscopeRoute).toMatchObject({ host: "the_horoscope" });
       gateway.routeCache.set("the_horoscope", "world");
       gateway.publishedRoutes.set("the_horoscope", "world");
       const repairedHost = await (gatewayWorld as any).executorContext.hostForObject("the_horoscope" as ObjRef);
-      expect(repairedHost).toBe("the_deck");
-      expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
-      expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
+      expect(repairedHost).toBe("the_horoscope");
+      expect(gateway.routeCache.get("the_horoscope")).toBe("the_horoscope");
+      expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_horoscope");
       gateway.routeCache.set("the_horoscope", "world");
       gateway.publishedRoutes.set("the_horoscope", "world");
       const bridgeHost = await (gatewayWorld as any).executorContext.hostForObject("the_horoscope" as ObjRef);
-      expect(bridgeHost).toBe("the_deck");
-      expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
-      expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_deck");
+      expect(bridgeHost).toBe("the_horoscope");
+      expect(gateway.routeCache.get("the_horoscope")).toBe("the_horoscope");
+      expect(gateway.publishedRoutes.get("the_horoscope")).toBe("the_horoscope");
       const originalRegisterRoutes = gateway.registerRoutes.bind(gateway);
       gateway.routeCache.delete("the_horoscope");
       gateway.publishedRoutes.delete("the_horoscope");
       gateway.registerRoutes = async () => false;
       try {
         const localHost = await (gatewayWorld as any).executorContext.hostForObject("the_horoscope" as ObjRef);
-        expect(localHost).toBe("the_deck");
-        expect(gateway.routeCache.get("the_horoscope")).toBe("the_deck");
+        expect(localHost).toBe("the_horoscope");
+        expect(gateway.routeCache.get("the_horoscope")).toBe("the_horoscope");
         expect(gateway.publishedRoutes.has("the_horoscope")).toBe(false);
       } finally {
         gateway.registerRoutes = originalRegisterRoutes;

@@ -15,7 +15,8 @@
         { "name": "last_error", "type": "any", "default": null, "perms": "r" },
         { "name": "summary_props", "type": "list<str>", "default": [], "perms": "r" },
         { "name": "writable_owner", "type": "list<str>", "default": [], "perms": "r" },
-        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error"], "perms": "r" }
+        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error"], "perms": "r" },
+        { "name": "host_placement", "type": "str", "default": "self", "perms": "r" }
       ],
       "verbs": [
         {
