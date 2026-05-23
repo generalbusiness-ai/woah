@@ -57,12 +57,24 @@ export default {
 
     const objectRoute = parseObjectRoute(url.pathname);
     if (objectRoute) {
-      // v2 REST calls execute from the gateway snapshot and commit through
-      // CommitScopeDO. Routing calls to the target host would reintroduce v1's
-      // stale per-host cache problem for cross-host inventory and movement.
-      const host = objectRoute.rest[0] === "calls"
-        ? WORLD_HOST
-        : await resolveHostForObjectRoute(env, request, objectRoute);
+      // Route /api/objects/X/calls/Y to X's host when Directory knows
+      // one; otherwise fall back to WORLD. Previously /calls/ was
+      // forced to WORLD on the rationale that v2 REST calls run from
+      // a gateway snapshot and commit through CommitScopeDO. Two
+      // architectural shifts make satellite-side execution safe:
+      //   - Live verbs (commit 6153d8a) bypass CommitScopeDO entirely
+      //     and execute in-process against the receiving DO's world.
+      //   - Durable verbs still go through CommitScopeDO regardless of
+      //     which DO submits the envelope — CommitScopeDO is the
+      //     authority for ordering; the submitting host's snapshot is
+      //     just a planner input, validated by CommitScopeDO before
+      //     accept. The originating host's writeThroughV2CommitToObjectHosts
+      //     applies the transcript locally for the touched objects it
+      //     owns, then fans apply-v2-commit to other touched hosts.
+      // Block subjects (the_horoscope, the_weather, ...) anchored to
+      // a self-hosted room now execute on that room's DO instead of
+      // pinning WORLD's host queue.
+      const host = await resolveHostForObjectRoute(env, request, objectRoute);
       const routed = await withDirectorySession(env, request);
       const response = await forwardToHost(env, host, routed);
       if (host !== WORLD_HOST && request.method === "POST" && objectRoute.rest[0] === "calls") {

@@ -2542,8 +2542,18 @@ describe("CFObjectRepository production-shape coverage", () => {
     const wooNamespace = new FakeDurableObjectNamespace((name) => {
       let object = wooObjects.get(name);
       if (!object) {
-        const state = new FakeDurableObjectState(name);
-        wooStates.set(name, state);
+        // Reuse the existing FakeDurableObjectState if any. The cold-host
+        // simulation below works by deleting the DO instance from
+        // wooObjects (mimicking a DO going cold); the SQL-backed state
+        // in wooStates must survive that so the next DO instance loads
+        // the persisted data. Previously this branch always created a
+        // fresh state, which silently dropped persistence between
+        // cold-restart simulations.
+        let state = wooStates.get(name);
+        if (!state) {
+          state = new FakeDurableObjectState(name);
+          wooStates.set(name, state);
+        }
         object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
         wooObjects.set(name, object);
       }
@@ -2613,23 +2623,19 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(readDaily.status, JSON.stringify(readDaily.body)).toBe(200);
       expect(readDaily.body.value).toEqual([{ day: "today" }]);
 
-      const lastApply = applyBodies.at(-1);
-      expect(lastApply).toBeTruthy();
-      for (let i = 0; i < 2; i += 1) {
-        const request = await signInternalRequest(env, new Request("https://woo.internal/__internal/apply-v2-commit", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "x-woo-host-key": "the_chatroom"
-          },
-          body: JSON.stringify(lastApply)
-        }));
-        const response = await env.WOO.get(env.WOO.idFromName("the_chatroom")).fetch(request);
-        expect(response.ok, await response.clone().text()).toBe(true);
-      }
-      const readAfterReplay = await get("/api/objects/the_weather/properties/current", session);
-      expect(readAfterReplay.status, JSON.stringify(readAfterReplay.body)).toBe(200);
-      expect(readAfterReplay.body.value).toEqual({ temperature: 72 });
+      // Architectural note: pre-refactor (the WORLD-centric routing for
+      // /api/objects/X/calls/Y) the REST call landed on WORLD, which
+      // fanned the write to the_chatroom via apply-v2-commit. The
+      // applyBodies capture + replay block here exercised that
+      // write-through path.
+      //
+      // Post-refactor (worker/index.ts: route /calls/ to X's host's
+      // DO), the call lands directly on the_chatroom and writes apply
+      // to local SQL inside writeThroughV2CommitToObjectHosts'
+      // localApplied branch. There is no apply-v2-commit fanout to
+      // the_chatroom because the_chatroom IS the originating host.
+      // applyBodies stays empty by design — the cold-host check below
+      // is the durability assertion that remains meaningful.
 
       // Simulate a cold object-host DO: the value must be in the host's
       // repository, not just the warm gateway's in-memory v2 cache.
@@ -2644,73 +2650,20 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
-  it("returns a retryable error when accepted v2 REST writes cannot reach the object host", async () => {
-    const directoryState = new FakeDurableObjectState("directory");
-    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
-    const wooStates = new Map<string, FakeDurableObjectState>();
-    const wooObjects = new Map<string, PersistentObjectDO>();
-    let env: Env;
-    const wooNamespace = new FakeDurableObjectNamespace((name) => {
-      let object = wooObjects.get(name);
-      if (!object) {
-        const state = new FakeDurableObjectState(name);
-        wooStates.set(name, state);
-        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
-        wooObjects.set(name, object);
-      }
-      return {
-        fetch: async (request: Request): Promise<Response> => {
-          if (name === "the_chatroom" && new URL(request.url).pathname === "/__internal/apply-v2-commit") {
-            return new Response(JSON.stringify({ error: { code: "E_STORAGE", message: "forced host apply failure" } }), {
-              status: 500,
-              headers: { "content-type": "application/json" }
-            });
-          }
-          return await object.fetch(request);
-        }
-      };
-    });
-    env = {
-      WOO_INITIAL_WIZARD_TOKEN: "cf-weather-write-through-fail-token",
-      WOO_INTERNAL_SECRET: "cf-test-secret",
-      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,block,weather,blocks-demo",
-      DIRECTORY: new FakeDurableObjectNamespace((name) => {
-        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-        return directory;
-      }),
-      WOO: wooNamespace,
-      COMMIT_SCOPE: fakeCommitScopeNamespace()
-    } as unknown as Env;
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, any> }> {
-      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(session ? { authorization: `Session ${session}` } : {})
-        },
-        body: JSON.stringify(body)
-      }), env, {});
-      return { status: response.status, body: await response.json() as Record<string, any> };
-    }
-
-    try {
-      const auth = await post("/api/auth", { token: "wizard:cf-weather-write-through-fail-token" });
-      expect(auth.status).toBe(200);
-      const session = String(auth.body.session);
-
-      const failed = await post("/api/objects/the_weather/calls/set_property", { args: ["last_error", "probe"] }, session);
-      expect(failed.status, JSON.stringify(failed.body)).toBe(503);
-      expect(failed.body.error).toMatchObject({ code: "E_RETRY" });
-    } finally {
-      warnSpy.mockRestore();
-      logSpy.mockRestore();
-      directoryState.close();
-      for (const state of wooStates.values()) state.close();
-    }
-  });
+  // Retired with the call-routing refactor (worker/index.ts: route
+  // /api/objects/X/calls/Y to X's host's DO instead of WORLD).
+  //
+  // Pre-refactor: REST writes to the_weather landed on WORLD, which
+  // fanned to the_chatroom via apply-v2-commit. If the_chatroom
+  // rejected the apply, the originating WORLD returned 503 E_RETRY.
+  // The test forced apply-v2-commit to fail to verify that path.
+  //
+  // Post-refactor: the call lands directly on the_chatroom. The
+  // write is local SQL inside writeThroughV2CommitToObjectHosts'
+  // localApplied branch — there is no apply-v2-commit fanout to
+  // intercept. The analogous failure surface is "local SQL write
+  // raises mid-commit" which is exercised by the CFObjectRepository
+  // direct write-error tests earlier in this file.
 
   it("sends REST v2 relay snapshots only when CommitScopeDO asks for a seed", async () => {
     const directoryState = new FakeDurableObjectState("directory");
