@@ -38,7 +38,7 @@ const raw = argPath
 const events = parseTailEvents(raw);
 const metrics = collectMetrics(events);
 
-report(metrics);
+report(metrics, events);
 
 // --- parsing ---------------------------------------------------------------
 
@@ -57,10 +57,7 @@ function parseTailEvents(text) {
     } else {
       buf.push(line);
     }
-    for (const ch of line) {
-      if (ch === "{") depth += 1;
-      else if (ch === "}") depth -= 1;
-    }
+    depth += braceDeltaOutsideStrings(line);
     if (buf.length > 0 && depth === 0) {
       try {
         out.push(JSON.parse(buf.join("\n")));
@@ -71,6 +68,30 @@ function parseTailEvents(text) {
     }
   }
   return out;
+}
+
+function braceDeltaOutsideStrings(line) {
+  let delta = 0;
+  let inString = false;
+  let escaped = false;
+  for (const ch of line) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") delta += 1;
+    else if (ch === "}") delta -= 1;
+  }
+  return delta;
 }
 
 function collectMetrics(events) {
@@ -132,13 +153,14 @@ function section(title) {
 
 // --- aggregations ----------------------------------------------------------
 
-function report(metrics) {
+function report(metrics, events) {
   if (metrics.length === 0) {
     console.log("(no woo.metric events found in tail log)");
-    return;
   }
   console.log(`# analyze-smoke-tail: ${metrics.length} woo.metric events`);
 
+  reportInvocationWallTime(events);
+  if (metrics.length === 0) return;
   reportPerHost(metrics);
   reportColdStart(metrics);
   reportSeedDelivery(metrics);
@@ -147,6 +169,51 @@ function report(metrics) {
   reportObservationRouting(metrics);
   reportSlowHandlers(metrics);
   reportErrors(metrics);
+}
+
+function reportInvocationWallTime(events) {
+  section("Cloudflare invocation wall/cpu");
+  const byRoute = new Map();
+  for (const event of events) {
+    const hasWall = typeof event.wallTime === "number";
+    const hasCpu = typeof event.cpuTime === "number";
+    if (!hasWall && !hasCpu) continue;
+    const route = eventRoute(event);
+    const entrypoint = event.entrypoint || (event.executionModel === "stateless" ? "Worker" : "?");
+    const key = `${entrypoint} ${route}`;
+    const bucket = byRoute.get(key) || { wall: [], cpu: [], errors: 0, statuses: new Map() };
+    if (hasWall) bucket.wall.push(event.wallTime);
+    if (hasCpu) bucket.cpu.push(event.cpuTime);
+    const status = event.event?.response?.status;
+    if (typeof status === "number") bucket.statuses.set(status, (bucket.statuses.get(status) || 0) + 1);
+    if (event.outcome && event.outcome !== "ok") bucket.errors += 1;
+    byRoute.set(key, bucket);
+  }
+
+  console.log(`  ${pad("entry route", 62)} ${pad("count", 6)} ${pad("err", 4)} ${pad("wall_p95", 8)} ${pad("wall_max", 8)} ${pad("cpu_p95", 7)} ${pad("status", 12)}`);
+  const rows = Array.from(byRoute.entries())
+    .map(([key, bucket]) => ({
+      key,
+      wall: summarize(bucket.wall),
+      cpu: summarize(bucket.cpu),
+      errors: bucket.errors,
+      statuses: Array.from(bucket.statuses.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([s, n]) => `${s}:${n}`).join(" ")
+    }))
+    .sort((a, b) => b.wall.sum - a.wall.sum);
+  for (const row of rows.slice(0, 30)) {
+    console.log(`  ${pad(row.key, 62)} ${num(row.wall.count)} ${num(row.errors, 4)} ${num(row.wall.p95, 8)} ${num(row.wall.max, 8)} ${num(row.cpu.p95, 7)} ${pad(row.statuses, 12)}`);
+  }
+}
+
+function eventRoute(event) {
+  const method = event.event?.request?.method || "?";
+  const rawUrl = event.event?.request?.url;
+  if (typeof rawUrl !== "string") return `${method} ?`;
+  try {
+    return `${method} ${new URL(rawUrl).pathname}`;
+  } catch {
+    return `${method} ${rawUrl}`;
+  }
 }
 
 function reportPerHost(metrics) {
@@ -159,7 +226,7 @@ function reportPerHost(metrics) {
     const h = m.host_key || "?";
     const bucket = byHost.get(h) || { ms: [], errors: 0, routes: new Map() };
     bucket.ms.push(m.ms || 0);
-    if (m.status === "error") bucket.errors += 1;
+    if (metricFailed(m)) bucket.errors += 1;
     const r = m.route || "?";
     bucket.routes.set(r, (bucket.routes.get(r) || 0) + 1);
     byHost.set(h, bucket);
@@ -236,7 +303,7 @@ function reportCrossHostRpc(metrics) {
     const key = `${m.route || "?"}→${m.host || "?"}`;
     const bucket = byRoute.get(key) || { ms: [], errors: 0 };
     bucket.ms.push(m.ms || 0);
-    if (m.status === "error") bucket.errors += 1;
+    if (metricFailed(m)) bucket.errors += 1;
     byRoute.set(key, bucket);
   }
   console.log(`  ${pad("route → host", 60)} ${pad("count", 6)} ${pad("err", 4)} ${pad("mean", 6)} ${pad("p95", 6)} ${pad("max", 6)}`);
@@ -260,7 +327,7 @@ function reportVerbDispatch(metrics) {
     const bucket = byVerb.get(key) || { ms: [], errors: 0, observations: 0 };
     bucket.ms.push(m.ms || 0);
     bucket.observations += m.observations || 0;
-    if (m.status === "error") bucket.errors += 1;
+    if (metricFailed(m)) bucket.errors += 1;
     byVerb.set(key, bucket);
   }
   console.log(`  ${pad("target:verb/kind", 55)} ${pad("count", 6)} ${pad("err", 4)} ${pad("obs", 5)} ${pad("mean", 6)} ${pad("p95", 6)} ${pad("max", 6)}`);
@@ -312,8 +379,8 @@ function reportErrors(metrics) {
   section("Errors");
   const byCode = new Map();
   for (const m of metrics) {
-    if (m.status !== "error") continue;
-    const code = m.error || "(unspecified)";
+    if (!metricFailed(m)) continue;
+    const code = m.error || (m.status === "timeout" ? "timeout" : "(unspecified)");
     const where = `${m.kind || "?"}/${m.route || m.phase || ""}`;
     const key = `${code} ${where}`;
     byCode.set(key, (byCode.get(key) || 0) + 1);
@@ -325,4 +392,8 @@ function reportErrors(metrics) {
   for (const [k, n] of Array.from(byCode.entries()).sort((a, b) => b[1] - a[1])) {
     console.log(`  ${num(n, 4)}  ${k}`);
   }
+}
+
+function metricFailed(metric) {
+  return metric.status === "error" || metric.status === "timeout";
 }
