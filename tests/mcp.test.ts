@@ -839,6 +839,75 @@ describe("McpHost", () => {
     ]));
   });
 
+  it("saves an active remote manifest after a move when the gateway actor row is stale", async () => {
+    const home = bootstrapWorld();
+    const remote = bootstrapWorld();
+    const remoteHost = new McpHost(remote);
+    const worlds = new Map<string, WooWorld>([
+      ["home", home],
+      ["remote", remote]
+    ]);
+    const routes = new Map<ObjRef, string>([["remote_room", "remote"]]);
+    const hosts = new Map<string, McpHost>([["remote", remoteHost]]);
+    home.setExecutorContext(new RemoteToolBridge("home", worlds, routes, hosts));
+    remote.setExecutorContext(new RemoteToolBridge("remote", worlds, routes, hosts));
+
+    remote.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
+    remote.addVerb("remote_room", nativeToolVerb("west", "remote_west"));
+    remote.registerNativeHandler("remote_west", () => "west");
+
+    const session = home.auth("guest:mcp-post-move-manifest");
+    home.object(session.actor).location = "$nowhere";
+    session.activeScope = "$nowhere";
+    const transcript = mcpTestTranscript({
+      id: "mcp-post-move-manifest",
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "probe", args: [] },
+      moves: [{ object: session.actor, from: "$nowhere", to: "remote_room" }],
+      writes: [{ cell: { kind: "location", object: session.actor }, value: "remote_room", op: "move" }],
+      hash: "mcp-post-move-manifest"
+    });
+    let saved: SessionToolManifest | null = null;
+    const host = new McpHost(home, {
+      direct: async () => {
+        // Reproduce the production split-brain shape: session routing updates
+        // from projection rows, but the gateway-local actor object still reads
+        // as $nowhere until a later authority refresh.
+        session.activeScope = "remote_room";
+        home.object(session.actor).location = "$nowhere";
+        return attachTranscriptForTest(
+          { op: "result" as const, result: true, observations: [], audience: null },
+          transcript
+        );
+      }
+    }, {
+      staleFallback: true,
+      loadSessionManifest: () => saved,
+      saveSessionManifest: (manifest) => { saved = manifest; }
+    });
+    host.bindSession(session.id, session.actor);
+    const tool: McpTool = {
+      name: `${session.actor}__probe`,
+      object: session.actor,
+      verb: "probe",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      persistence: "durable",
+      enclosingSpace: null
+    };
+
+    await host.invokeTool(session.actor, session.id, tool, []);
+
+    const savedManifest = saved as SessionToolManifest | null;
+    if (!savedManifest) throw new Error("expected a saved session manifest");
+    expect(savedManifest.active_scope).toBe("remote_room");
+    expect(savedManifest.tools.map((candidate) => `${candidate.object}:${candidate.verb}`)).toContain("remote_room:west");
+    const here = await host.listTools(session.actor, { scope: "here", sessionId: session.id });
+    expect(here.tools.map((candidate) => `${candidate.object}:${candidate.verb}`)).toContain("remote_room:west");
+  });
+
   it("refreshes post-call tools when the v2 transcript writes verb shape", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-refresh-verb-shape");
@@ -2214,7 +2283,14 @@ describe("McpGateway", () => {
     }
     remote.registerNativeHandler("remote_ping", () => "pong");
 
-    const gateway = new McpGateway(home, { toolManifests: { staleFallback: true } });
+    let savedManifest: SessionToolManifest | null = null;
+    const gateway = new McpGateway(home, {
+      toolManifests: {
+        staleFallback: true,
+        saveSessionManifest: (manifest) => { savedManifest = manifest; },
+        loadSessionManifest: () => savedManifest
+      }
+    });
     const init = await gateway.handle(jsonRpcRequest("http://t/mcp", {
       jsonrpc: "2.0",
       id: 1,
@@ -2230,7 +2306,7 @@ describe("McpGateway", () => {
     const wooSession = Array.from(home.sessions.values())[0];
     const actor = wooSession?.actor;
     expect(actor).toBeTruthy();
-    home.object(actor!).location = "remote_gallery";
+    home.object(actor!).location = "$nowhere";
     wooSession!.activeScope = "remote_gallery";
     home.object("remote_gallery").contents.add(actor!);
     remote.setSpaceSubscriber("remote_gallery", actor!, true, wooSession!.id);
@@ -2252,6 +2328,8 @@ describe("McpGateway", () => {
     const hereBody = await hereList.json() as { result: { isError?: boolean; structuredContent?: { result?: { tools?: Array<{ name: string }> } } } };
     expect(hereBody.result.isError).not.toBe(true);
     expect(hereBody.result.structuredContent?.result?.tools?.some((tool) => tool.name === "remote_widget__ping")).toBe(true);
+    const manifestAfterHere = savedManifest as SessionToolManifest | null;
+    expect(manifestAfterHere?.tools.some((tool) => tool.object === "remote_widget" && tool.verb === "ping")).toBe(true);
 
     homeBridge.failEnumerate = true;
     const call = await gateway.handle(jsonRpcRequest("http://t/mcp", {
@@ -2264,6 +2342,8 @@ describe("McpGateway", () => {
     const callBody = await call.json() as { result: { isError?: boolean; structuredContent?: { result?: unknown } } };
     expect(callBody.result.isError).not.toBe(true);
     expect(callBody.result.structuredContent?.result).toBe("pong");
+    const staleManifest = savedManifest as SessionToolManifest | null;
+    expect(staleManifest).toMatchObject({ stale: true, stale_reason: "owner_timeout" });
 
     const focused = await gateway.handle(jsonRpcRequest("http://t/mcp", {
       jsonrpc: "2.0",
@@ -2306,6 +2386,7 @@ describe("McpGateway", () => {
 
     const session = home.auth("guest:mcp-remote-location");
     home.object(session.actor).location = "remote_room";
+    session.activeScope = "remote_room";
 
     const host = new McpHost(home);
     host.bindSession(session.id, session.actor);

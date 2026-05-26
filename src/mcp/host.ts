@@ -444,7 +444,7 @@ export class McpHost {
   }
 
   private async enumerateToolsForScope(actor: ObjRef, scope: McpToolScope, object: ObjRef | undefined, query: string | undefined, sessionId?: string): Promise<McpTool[]> {
-    const plan = await this.toolScopePlan(actor, scope, object);
+    const plan = await this.toolScopePlan(actor, scope, object, sessionId);
     const tools: McpTool[] = [];
     const usedNames = new Set<string>();
     const seenObjectVerb = new Set<string>();
@@ -499,7 +499,8 @@ export class McpHost {
   private async toolScopePlan(
     actor: ObjRef,
     scope: McpToolScope,
-    object: ObjRef | undefined
+    object: ObjRef | undefined,
+    sessionId?: string
   ): Promise<{ selectedIds: Set<ObjRef>; obviousOnlyIds: Set<ObjRef>; remoteRequests: RemoteToolRequest[] }> {
     const selectedIds = new Set<ObjRef>();
     const obviousOnlyIds = new Set<ObjRef>();
@@ -507,7 +508,8 @@ export class McpHost {
     const remoteExpandCandidates = new Map<ObjRef, RemoteToolProjection>();
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
     const activeLocations = this.world.allLocationsForActor(actor);
-    const activeScope = actorObj?.location ?? activeLocations[0] ?? null;
+    const sessionScope = sessionId ? this.world.activeScopeForSession(sessionId) : null;
+    const activeScope = sessionScope ?? activeLocations[0] ?? actorObj?.location ?? null;
     const focus = this.focusListOf(actor);
     const reachable = this.reachable(actor);
     const reachableOrigins = new Map(reachable.map((entry) => [entry.id, entry.origin]));
@@ -674,9 +676,11 @@ export class McpHost {
     };
   }
 
-  private async collectRemoteScopeIds(actor: ObjRef): Promise<ObjRef[]> {
+  private async collectRemoteScopeIds(actor: ObjRef, sessionId?: string): Promise<ObjRef[]> {
     const candidates = new Set<ObjRef>();
     const actorObj = this.world.objects.has(actor) ? this.world.object(actor) : null;
+    const sessionScope = sessionId ? this.world.activeScopeForSession(sessionId) : null;
+    if (sessionScope) candidates.add(sessionScope);
     if (actorObj?.location) candidates.add(actorObj.location);
     for (const id of this.world.allLocationsForActor(actor)) candidates.add(id);
     for (const id of this.focusListOf(actor)) candidates.add(id);
@@ -717,6 +721,20 @@ export class McpHost {
     return true;
   }
 
+  async refreshSessionToolManifest(sessionId: string, actor: ObjRef): Promise<boolean> {
+    const changed = await this.refreshToolList(sessionId, actor);
+    if (this.manifestHooks.staleFallback !== true && !this.manifestHooks.saveSessionManifest) return changed;
+    try {
+      const page = await this.listTools(actor, { scope: "active", limit: 64, sessionId });
+      await this.markToolListSeen(sessionId, actor, page.tools);
+    } catch {
+      // A post-call descriptor refresh is an availability cache update, not
+      // part of the committed action. Keep the action successful even if a
+      // descriptor owner or manifest write is temporarily unavailable.
+    }
+    return changed;
+  }
+
   /** Number of sessions currently bound to this MCP host (have an entry in
    * `this.queues`). Used by acceptRemote* diagnostic metrics to distinguish
    * "fanout reached a shard that hosts no MCP sessions" from "fanout reached
@@ -731,17 +749,29 @@ export class McpHost {
     this.toolListSnapshot.set(sessionId, await this.toolListDigest(actor));
     if (tools.length > 0) {
       const now = Date.now();
+      const nextTools = tools.map((tool) => tool.descriptor ?? descriptorFromTool(tool));
+      const cached = this.sessionToolManifests.get(sessionId);
+      const activeScope = this.world.activeScopeForSession(sessionId) ?? actor;
+      const loaded = cached ?? await this.manifestHooks.loadSessionManifest?.(sessionId) ?? null;
+      const merged = new Map<string, RemoteToolDescriptor>();
+      if (loaded && loaded.expires_at_ms > now && loaded.active_scope === activeScope) {
+        for (const descriptor of loaded.tools) merged.set(remoteToolDescriptorKey(descriptor), descriptor);
+      }
+      for (const descriptor of nextTools) merged.set(remoteToolDescriptorKey(descriptor), descriptor);
+      const mergedTools = Array.from(merged.values());
+      const staleReason = mergedTools.find((descriptor) => descriptor.stale)?.stale_reason;
       const manifest: SessionToolManifest = {
         kind: "woo.session_tool_manifest.v1",
         session_id: sessionId,
         actor,
-        active_scope: this.world.activeScopeForSession(sessionId) ?? actor,
-        tools: tools.map((tool) => tool.descriptor ?? descriptorFromTool(tool)),
+        active_scope: activeScope,
+        tools: mergedTools,
         source_surfaces: [],
         last_apply_seq: 0,
         last_apply_hash: "",
         updated_at_ms: now,
-        expires_at_ms: now + 5 * 60_000
+        expires_at_ms: now + 5 * 60_000,
+        ...(staleReason ? { stale: true, stale_reason: staleReason } : {})
       };
       this.sessionToolManifests.set(sessionId, manifest);
       await this.manifestHooks.saveSessionManifest?.(manifest);
@@ -781,7 +811,7 @@ export class McpHost {
       }, new Set());
     }
     if (!bridge?.enumerateRemoteTools) return null;
-    const remoteScopeIds = await this.collectRemoteScopeIds(actor);
+    const remoteScopeIds = await this.collectRemoteScopeIds(actor, sessionId);
     if (remoteScopeIds.length === 0) return null;
     let descriptors: RemoteToolDescriptor[] = [];
     let remoteFailed = false;
@@ -806,10 +836,13 @@ export class McpHost {
   private async sessionManifestDescriptors(sessionId: string, staleReason?: ProjectionFreshness["stale_reason"]): Promise<RemoteToolDescriptor[]> {
     if (this.manifestHooks.staleFallback !== true) return [];
     const now = Date.now();
+    const activeScope = this.world.activeScopeForSession(sessionId) ?? null;
+    const manifestIsCurrent = (manifest: SessionToolManifest): boolean =>
+      activeScope !== null && manifest.active_scope === activeScope;
     const cached = this.sessionToolManifests.get(sessionId);
-    if (cached && cached.expires_at_ms > now) return (await this.markSessionManifestStale(cached, staleReason)).tools;
+    if (cached && cached.expires_at_ms > now && manifestIsCurrent(cached)) return (await this.markSessionManifestStale(cached, staleReason)).tools;
     const loaded = await this.manifestHooks.loadSessionManifest?.(sessionId) ?? null;
-    if (!loaded || loaded.expires_at_ms <= now) return [];
+    if (!loaded || loaded.expires_at_ms <= now || !manifestIsCurrent(loaded)) return [];
     const manifest = await this.markSessionManifestStale(loaded, staleReason);
     this.sessionToolManifests.set(sessionId, manifest);
     return manifest.tools;
@@ -997,7 +1030,7 @@ export class McpHost {
         const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (result as McpTranscriptBearing).transcript, refreshBaseline);
         this.recordToolRefreshDecision(actor, "invoke", decision, sessionId);
         if (decision.refresh) {
-          await this.refreshToolList(sessionId, actor);
+          await this.refreshSessionToolManifest(sessionId, actor);
         }
         return { result: result.result, observations: this.filterCallerObservations(sessionId, result.observations, result.observationSessionAudiences) };
       } finally {
@@ -1021,7 +1054,7 @@ export class McpHost {
     const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (frame as McpTranscriptBearing).transcript, refreshBaseline);
     this.recordToolRefreshDecision(actor, "invoke", decision, sessionId);
     if (decision.refresh) {
-      await this.refreshToolList(sessionId, actor);
+      await this.refreshSessionToolManifest(sessionId, actor);
     }
     const errObs = frame.observations.find((o) => o.type === "$error");
     return {
@@ -1285,6 +1318,10 @@ function descriptorFromTool(tool: McpTool): RemoteToolDescriptor {
     source: "",
     enclosingSpace: tool.enclosingSpace
   };
+}
+
+function remoteToolDescriptorKey(descriptor: RemoteToolDescriptor): string {
+  return `${descriptor.object}${OBJECT_VERB_SEP}${descriptor.verb}`;
 }
 
 function jsonSchemaForHint(hint: string): Record<string, unknown> {

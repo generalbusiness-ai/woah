@@ -170,7 +170,9 @@ Containment cycles and re-entrant rooms (a room as the contents of another room 
 
 Reachability spans hosts. When a selected scope entry resolves to a remote $space (per [hosts.md §3](hosts.md#3-hosts-and-execution-model)) the gateway first consults same-host projection cache rows and the session's last tool manifest, then refreshes from the owning host when needed. Scopes that expand space contents (`here`, `space`, `all`) include per-instance verbs on dynamically-created objects (a `$task` minted at runtime on a registry's host, a `$cockatoo` cloned into a chat room). The bounded `active` scope asks the same host but filters the response back to the selected objects, so a registry containing hundreds of tasks does not become hundreds of MCP tools by default. The same rule applies to `woo_call(object, verb, args?)`: targeted resolution must search the remote contribution for the actor's reachable spaces/focus set, not only the gateway's local object ids. The remote host is responsible for applying the actor's read-permission filter before returning its contribution; the gateway trusts that filter (same-deployment trust, [hosts.md §3.3](hosts.md#33-trust-model-across-hosts)).
 
-Tool listing is monotonic within a live MCP session up to manifest expiry. Once
+Tool listing is monotonic within a live MCP session up to manifest expiry.
+Protocol `tools/list` and `woo_list_reachable_tools` are both concrete listing
+surfaces that record returned dynamic descriptors in the session manifest. Once
 the gateway has returned a descriptor in a session's `SessionToolManifest`, an
 owner timeout or cache miss may mark that descriptor stale but MUST NOT make it
 disappear from `woo_call` resolution in the same session. A descriptor is
