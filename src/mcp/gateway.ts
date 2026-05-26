@@ -350,28 +350,20 @@ export class McpGateway {
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
     if (entry.commit.projection_delta) {
-      // Worker gateways persist accepted fanout into their SQL projection
-      // cache before calling this method. In that mode the MCP gateway only
-      // routes observations; updating its WooWorld would reintroduce the
-      // mirror-world maintenance path the projection cache replaces.
-      if (this.options.externalProjectionFanout === true) {
-        this.world.recordMetric({
-          kind: "gateway_projection_apply",
-          scope: entry.commit.position.scope,
-          rows: projectionWrites.length,
-          projection_bytes: entry.commit.projection_delta?.projection_bytes ?? 0,
-          source: "fanout"
-        });
-      } else {
-        this.world.applyProjectionWrites(projectionWrites, { persist: false, transcript: entry.transcript });
-        this.world.recordMetric({
-          kind: "gateway_projection_apply",
-          scope: entry.commit.position.scope,
-          rows: projectionWrites.length,
-          projection_bytes: entry.commit.projection_delta?.projection_bytes ?? 0,
-          source: "fanout"
-        });
-      }
+      // Worker gateways persist accepted fanout into SQL before calling this
+      // method, but MCP delivery still uses the in-memory WooWorld as its
+      // routing cache (session.activeScope, subscribers, reachable objects).
+      // Apply the row-body-complete projection writes without persistence so
+      // routing sees the accepted state while durable projection ownership
+      // stays in the SQL cache and no transcript replay is reintroduced.
+      this.world.applyProjectionWrites(projectionWrites, { persist: false, transcript: entry.transcript });
+      this.world.recordMetric({
+        kind: "gateway_projection_apply",
+        scope: entry.commit.position.scope,
+        rows: projectionWrites.length,
+        projection_bytes: entry.commit.projection_delta?.projection_bytes ?? 0,
+        source: "fanout"
+      });
     } else {
       this.world.applyCommittedShadowTranscript(entry.transcript);
     }

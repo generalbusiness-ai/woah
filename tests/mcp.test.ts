@@ -1138,7 +1138,7 @@ describe("McpHost", () => {
     });
   });
 
-  it("does not update the gateway WooWorld mirror for projection-cache fanout", () => {
+  it("applies projection-cache fanout to the volatile gateway routing cache", () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-v2-external-projection-fanout");
     const metrics: MetricEvent[] = [];
@@ -1198,12 +1198,93 @@ describe("McpHost", () => {
 
     gateway.acceptRemoteV2Commit("the_chatroom", commit, transcript);
 
-    expect(world.propOrNull(session.actor, "fanout_probe")).toBeNull();
+    expect(world.propOrNull(session.actor, "fanout_probe")).toBe("remote");
     expect(metrics).toContainEqual(expect.objectContaining({
       kind: "gateway_projection_apply",
       source: "fanout",
       rows: 1,
       projection_bytes: 100
+    }));
+    expect(metrics.some((event) => event.kind === "shadow_gateway_apply_step")).toBe(false);
+  });
+
+  it("routes projection-cache fanout after applying session active-scope rows", async () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const alice = world.auth("guest:mcp-v2-fanout-routing-alice");
+    const bob = world.auth("guest:mcp-v2-fanout-routing-bob");
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const gateway = new McpGateway(world, { externalProjectionFanout: true });
+    gateway.bindActorSession(bob.id, bob.actor);
+    expect(world.activeScopeForSession(bob.id)).toBe("$nowhere");
+
+    const bobSessionRow = structuredClone(world.exportSessions().find((row) => row.id === bob.id)!);
+    bobSessionRow.activeScope = "the_chatroom";
+    const write: ProjectionWrite = {
+      table: "sessions",
+      key: bob.id,
+      op: "upsert",
+      row: bobSessionRow,
+      bytes: 100
+    };
+    const observation: Observation = { type: "entered", source: "the_chatroom", actor: alice.actor, room: "the_chatroom", text: "Alice entered.", ts: 1 };
+    const transcript = mcpTestTranscript({
+      id: "mcp-v2-fanout-routing-cache",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 2,
+      session: alice.id,
+      call: { actor: alice.actor, target: "the_chatroom", verb: "enter", args: [] },
+      writes: [],
+      observations: [observation],
+      hash: "mcp-v2-fanout-routing-cache"
+    });
+    const commit: ShadowCommitAccepted = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-fanout-routing-cache",
+      position: {
+        kind: "woo.scope_head.shadow.v1",
+        scope: "the_chatroom",
+        epoch: 1,
+        seq: 2,
+        hash: "h2"
+      },
+      transcript_hash: transcript.hash,
+      post_state_hash: "post",
+      observations: [observation],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: transcript.id,
+        route: transcript.route,
+        scope: transcript.scope,
+        seq: transcript.seq,
+        transcript_hash: transcript.hash,
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      },
+      projection_delta: {
+        sessions: [{ key: bob.id, op: "upsert", bytes: write.bytes }],
+        projection_bytes: write.bytes
+      },
+      projection_writes: [write]
+    };
+
+    gateway.acceptRemoteV2Commit("the_chatroom", commit, transcript, alice.id);
+
+    expect(world.activeScopeForSession(bob.id)).toBe("the_chatroom");
+    const drain = await (gateway.host as unknown as { drainWait(sessionId: string, args: WooValue[]): Promise<{ observations: Observation[] }> }).drainWait(bob.id, [0, 10]);
+    expect(drain.observations).toEqual([
+      expect.objectContaining({ type: "entered", actor: alice.actor, room: "the_chatroom" })
+    ]);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "mcp_observation_routed",
+      route: "accepted",
+      observation_type: "entered",
+      queues_scanned: 1,
+      deliveries: 1
     }));
     expect(metrics.some((event) => event.kind === "shadow_gateway_apply_step")).toBe(false);
   });

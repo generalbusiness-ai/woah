@@ -800,11 +800,15 @@ CommitScope fanout recipients and shards with sessions in scopes touched by
 transcript moves, creates, contents writes, or presence-list writes. Remote
 shards consume `commit.projection_writes` into their gateway projection cache
 when present and expand `commit.projection_delta.tool_surface_sources` against
-their local tool-surface reverse index to evict stale descriptor cache rows. If
-projection writes are absent, shards fall back to the legacy transcript/snapshot
-apply path for materialized rows, but may still consume marker-only
-tool-surface invalidations. This keeps co-present MCP sessions observable across
-shard boundaries without making any shard authoritative for durable world state.
+their local tool-surface reverse index to evict stale descriptor cache rows.
+They must also apply those row-body-complete projection writes to their
+in-memory routing cache without persistence before queue fanout, because MCP
+delivery predicates read session active scopes, subscriber rows, and local
+reachability from that volatile `WooWorld`. If projection writes are absent,
+shards fall back to the legacy transcript/snapshot apply path for materialized
+rows, but may still consume marker-only tool-surface invalidations. This keeps
+co-present MCP sessions observable across shard boundaries without making any
+shard authoritative for durable world state.
 
 `/v2/open` supports an opt-in checkpoint/tail protocol by request body
 negotiation: `open_protocol: "checkpoint_tail.v1"`, `known_head`, and bounded
