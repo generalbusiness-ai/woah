@@ -2184,7 +2184,15 @@ describe("McpGateway", () => {
       ["remote_widget", "remote"]
     ]);
     const hosts = new Map<string, McpHost>([["remote", remoteHost]]);
-    home.setExecutorContext(new RemoteToolBridge("home", worlds, routes, hosts));
+    class FlakyRemoteToolBridge extends RemoteToolBridge {
+      failEnumerate = false;
+      override async enumerateRemoteTools(actor: ObjRef, requests: RemoteToolRequest[]): Promise<RemoteToolDescriptor[]> {
+        if (this.failEnumerate) throw new Error("owner timeout");
+        return await super.enumerateRemoteTools(actor, requests);
+      }
+    }
+    const homeBridge = new FlakyRemoteToolBridge("home", worlds, routes, hosts);
+    home.setExecutorContext(homeBridge);
     remote.setExecutorContext(new RemoteToolBridge("remote", worlds, routes, hosts));
 
     home.createObject({ id: "remote_gallery", name: "Remote Gallery", parent: "$space", owner: "$wiz" });
@@ -2206,7 +2214,7 @@ describe("McpGateway", () => {
     }
     remote.registerNativeHandler("remote_ping", () => "pong");
 
-    const gateway = new McpGateway(home);
+    const gateway = new McpGateway(home, { toolManifests: { staleFallback: true } });
     const init = await gateway.handle(jsonRpcRequest("http://t/mcp", {
       jsonrpc: "2.0",
       id: 1,
@@ -2245,6 +2253,7 @@ describe("McpGateway", () => {
     expect(hereBody.result.isError).not.toBe(true);
     expect(hereBody.result.structuredContent?.result?.tools?.some((tool) => tool.name === "remote_widget__ping")).toBe(true);
 
+    homeBridge.failEnumerate = true;
     const call = await gateway.handle(jsonRpcRequest("http://t/mcp", {
       jsonrpc: "2.0",
       id: 3,

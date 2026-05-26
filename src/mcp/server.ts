@@ -137,6 +137,11 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
       invoke: async (params) => {
         const includeSchema = booleanParam(params, "include_schema", false);
         const page = await host.listTools(actor, { ...toolListOptionsFromParams(params), sessionId });
+        // Stable discovery is the path used by smoke tests and MCP clients that
+        // avoid dynamic tools/list. Persist it into the same session manifest
+        // so a descriptor returned once remains callable through transient
+        // owner-refresh failures.
+        await host.markToolListSeen(sessionId, actor, page.tools);
         return {
           result: {
             scope: page.scope,
@@ -188,7 +193,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
         // is not a global lookup escape hatch for readable substrate objects.
         // Use the tool surface rather than local reachability so remote active-
         // scope contents exposed by `woo_list_reachable_tools` are accepted.
-        const reachable = (await host.enumerateTools(actor, { scope: "all" })).some((tool) => tool.object === target);
+        const reachable = (await host.enumerateTools(actor, { scope: "all", sessionId })).some((tool) => tool.object === target);
         if (!reachable) {
           if (!options.world.objects.has(target)) throw wooError("E_OBJNF", `focus target not found: ${target}`, target);
           throw wooError("E_PERM", `focus target is not reachable: ${target}`, target);
