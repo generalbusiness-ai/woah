@@ -128,7 +128,7 @@ function handleLandingHost(request: Request, env: Env, url: URL): Response | Pro
   if (isLandingPageRequest(request, url)) {
     if (!env.ASSETS) return missingAssetsResponse();
     const assetUrl = new URL(request.url);
-    assetUrl.pathname = "/landing.html";
+    assetUrl.pathname = "/landing";
     assetUrl.search = "";
     return env.ASSETS.fetch(new Request(assetUrl, request));
   }
@@ -144,7 +144,10 @@ function handleLandingHost(request: Request, env: Env, url: URL): Response | Pro
 }
 
 function isLandingPageRequest(request: Request, url: URL): boolean {
-  return (request.method === "GET" || request.method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html");
+  return (
+    (request.method === "GET" || request.method === "HEAD") &&
+    (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/landing" || url.pathname === "/landing.html")
+  );
 }
 
 function isLandingAssetPath(pathname: string): boolean {

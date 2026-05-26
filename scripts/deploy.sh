@@ -177,12 +177,17 @@ ok "wrangler: $(echo "$wrangler_version" | tail -1) (project-local)"
 if [[ $DRY_RUN -eq 1 ]]; then
   warn "dry-run: skipping cf token + secret-list checks"
 else
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -f "$HOME/.config/generalbusiness/cloudflare_woo.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$HOME/.config/generalbusiness/cloudflare_woo.env"
+    export CLOUDFLARE_API_TOKEN
+  fi
   if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -f "$HOME/.config/cloudflare/woo.token" ]]; then
     CLOUDFLARE_API_TOKEN=$(cat "$HOME/.config/cloudflare/woo.token")
     export CLOUDFLARE_API_TOKEN
   fi
   [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] \
-    || fail "CLOUDFLARE_API_TOKEN unset and ~/.config/cloudflare/woo.token missing"
+    || fail "CLOUDFLARE_API_TOKEN unset and neither ~/.config/generalbusiness/cloudflare_woo.env nor ~/.config/cloudflare/woo.token exists"
   ok "cf token present"
 
   secret_list=$("${WRANGLER[@]}" secret list 2>&1) \

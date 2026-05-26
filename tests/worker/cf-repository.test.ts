@@ -804,7 +804,11 @@ describe("v2 Worker fan-out helpers", () => {
 
     const landing = await worker.fetch(new Request("https://woah.generalbusiness.ai/"), env, {});
     expect(landing.status).toBe(200);
-    await expect(landing.text()).resolves.toBe("asset:/landing.html");
+    await expect(landing.text()).resolves.toBe("asset:/landing");
+
+    const landingPretty = await worker.fetch(new Request("https://woah.generalbusiness.ai/landing"), env, {});
+    expect(landingPretty.status).toBe(200);
+    await expect(landingPretty.text()).resolves.toBe("asset:/landing");
 
     const icon = await worker.fetch(new Request("https://woah.generalbusiness.ai/icons/favicon.svg"), env, {});
     expect(icon.status).toBe(200);
