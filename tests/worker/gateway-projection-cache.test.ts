@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { authoritySliceObjectIds } from "../../src/core/authority-slice";
 import { createWorld } from "../../src/core/bootstrap";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
 import type { ProjectionDeltaSummary, ProjectionWrite, SessionToolManifest } from "../../src/core/projection-delta";
+import type { SerializedAuthoritySlice } from "../../src/core/repository";
 import { encodeEnvelope } from "../../src/core/shadow-envelope";
-import type { ObjRef, RemoteToolDescriptor, RemoteToolRequest } from "../../src/core/types";
+import { wooError, type ObjRef, type RemoteToolDescriptor, type RemoteToolRequest } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
@@ -672,5 +674,30 @@ describe("gateway projection cache", () => {
     }), "fanout");
 
     expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toEqual([]);
+  });
+
+  it("preserves explicit actor authority when tolerated owner refresh times out", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const world = createWorld();
+    const session = world.auth("guest:authority-actor-preserve");
+    const actorParent = world.object(session.actor).parent;
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: { tolerateRemoteFailures?: boolean }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      forwardInternalReadChecked: () => Promise<never>;
+    };
+    po.forwardInternalReadChecked = async () => {
+      throw wooError("E_TIMEOUT", "owner refresh timeout");
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", session.actor], { tolerateRemoteFailures: true });
+    const ids = authoritySliceObjectIds(payload.authority);
+
+    expect(ids.has(session.actor)).toBe(true);
+    if (actorParent) expect(ids.has(actorParent)).toBe(true);
+    expect(ids.has("the_chatroom")).toBe(false);
   });
 });

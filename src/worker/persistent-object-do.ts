@@ -4137,6 +4137,7 @@ export class PersistentObjectDO {
     // genuinely missing, dispatch raises missing_state / E_OBJNF and the
     // caller retries against what is now a warm satellite.
     const omittedHosts = new Set<string>();
+    const localActorAuthorityIds = localActorAuthorityPreserveIds(world, ids);
     const remoteSlices = await Promise.all(Array.from(byHost, async ([host, objects]) => {
       try {
         const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
@@ -4165,15 +4166,15 @@ export class PersistentObjectDO {
       }
     }));
     // Strip the gateway's local cells for hosts we attempted-and-omitted.
-    // This is the precise version of the A1-safe invariant: an omitted
-    // host's cells genuinely fall back to the CommitScopeDO's durable
-    // snapshot. Hosts we never tried to fetch (transitive reachability —
-    // e.g. `the_chatroom`'s exit.dest reaching `the_deck` without
-    // `the_deck` itself being an explicit id) keep their gateway-local
-    // copy; that matches pre-change behavior for second-degree cells.
+    // The one deliberate exception is the explicit actor authority root: a
+    // new MCP/REST actor may not exist in the CommitScopeDO snapshot yet, so
+    // omitting its local row turns a timeout fallback into "actor not found".
+    // Keep that actor's class chain for type/permission checks, but continue
+    // stripping stale local target/scope cells for omitted hosts.
     const localOnlyAuthority = omittedHosts.size === 0
       ? local.authority
       : filterSerializedAuthoritySliceObjects(local.authority, (id) => {
+          if (localActorAuthorityIds.has(id)) return true;
           const host = localObjectHostMap.get(id);
           return host === undefined || !omittedHosts.has(host);
         });
@@ -5743,6 +5744,21 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
   } catch {
     return executorAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
   }
+}
+
+function localActorAuthorityPreserveIds(world: WooWorld, explicitIds: readonly ObjRef[]): Set<ObjRef> {
+  const preserve = new Set<ObjRef>();
+  for (const id of explicitIds) {
+    if (!world.objects.has(id) || !world.isDescendantOf(id, "$actor")) continue;
+    let cursor: ObjRef | null = id;
+    const seen = new Set<ObjRef>();
+    while (cursor && world.objects.has(cursor) && !seen.has(cursor)) {
+      seen.add(cursor);
+      preserve.add(cursor);
+      cursor = world.object(cursor).parent;
+    }
+  }
+  return preserve;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

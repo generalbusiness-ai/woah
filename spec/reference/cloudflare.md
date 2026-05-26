@@ -752,6 +752,13 @@ cells. The DO refreshes those cells before planning or serving recipient-bound
 transfer state so cross-scope movement accepted by one CommitScopeDO is visible
 to the next scope without a full-world transfer.
 
+Per-envelope authority refresh may omit a timed-out remote host only as a
+stale-snapshot fallback. It must still include the submitting actor's local
+authority row and actor-class ancestry when those rows are explicit request
+roots; a new session actor might not be present in the target CommitScopeDO
+snapshot yet, and omitting it turns a read timeout into a false
+`permission_denied: actor not found` rejection.
+
 Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to indexed commit-scope state, marks any legacy `SerializedWorld`
 cache dirty, and the storage transaction upserts only projection rows named by
