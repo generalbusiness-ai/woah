@@ -2244,9 +2244,12 @@ type CheckpointTailOpenEnvelope = {
   scope: ObjRef;
   head: ScopeHead;
   transfer: OpenTransfer;
-  viewer?: { actor: ObjRef; session?: string | null };
+  viewer: { actor: ObjRef; session?: string | null };
 };
 ```
+
+`viewer` is required because checkpoint projection install applies
+recipient-scoped visibility filters before exposing rows to the browser.
 
 The gateway streams continuation chunks as additional checkpoint/tail envelopes
 on the same WebSocket before considering open complete. The browser installs

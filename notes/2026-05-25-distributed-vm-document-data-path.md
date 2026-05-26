@@ -487,7 +487,9 @@ may be marked stale and refreshed asynchronously; it is removed only when an
 accepted projection delta says the object or verb is gone, the active scope
 changes, or the manifest expires. This directly addresses the observed
 `E_VERBNF` smoke failures where reachable tools disappeared during a cold
-descriptor refresh.
+descriptor refresh. Manifest expiry is the explicit monotonicity budget: after
+`expires_at_ms`, stale fallback returns no saved descriptors until a fresh owner
+refresh or tool listing writes a new manifest.
 
 `ExecutionCapsule` is the one-turn VM sufficiency transfer. It is not a
 checkpoint and not a descriptor cache. It contains the minimum authority cells
@@ -1125,6 +1127,9 @@ Backward compatibility:
 - Legacy `SerializedWorld` export remains for diagnostics and fallback while
   the flag is off.
 - A receiver that cannot parse `checkpoint_tail.v1` must not receive it.
+- Browser checkpoint/tail envelopes must carry a `viewer` because browser
+  install applies recipient-scoped visibility filters before exposing
+  projection rows.
 - A receiver that gets `E_CHECKPOINT_TOO_OLD` or an expired continuation retries
   with no `known_head` and receives a fresh checkpoint.
 

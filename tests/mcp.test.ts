@@ -1738,6 +1738,10 @@ describe("McpHost", () => {
     const fallbackList = await rehydrated.listTools(session.actor, { scope: "focus", sessionId: session.id });
     expect(fallbackList.tools.some((tool) => tool.object === "remote_widget" && tool.verb === "ping")).toBe(true);
     expect(saved[0]).toMatchObject({ stale: true, stale_reason: "owner_timeout" });
+    expect(saved[0].tools.find((tool) => tool.object === "remote_widget" && tool.verb === "ping")).toMatchObject({
+      stale: true,
+      stale_reason: "owner_timeout"
+    });
     await expect(rehydrated.resolveReachableTool(session.actor, "remote_widget", "ping", session.id)).resolves.toMatchObject({
       object: "remote_widget",
       verb: "ping"
@@ -1791,7 +1795,13 @@ describe("McpHost", () => {
 
     const fallbackList = await rehydrated.listTools(session.actor, { scope: "space", object: "remote_room", sessionId: session.id });
     expect(fallbackList.tools.some((tool) => tool.object === "remote_child" && tool.verb === "ping")).toBe(true);
-    expect(saved).toMatchObject({ stale: true, stale_reason: "owner_timeout" });
+    const staleManifest = saved as SessionToolManifest | null;
+    expect(staleManifest).toMatchObject({ stale: true, stale_reason: "owner_timeout" });
+    if (!staleManifest) throw new Error("expected stale manifest");
+    expect(staleManifest.tools.find((tool) => tool.object === "remote_child" && tool.verb === "ping")).toMatchObject({
+      stale: true,
+      stale_reason: "owner_timeout"
+    });
   });
 
   it("records method-resolution source rows for remote tool-surface invalidation", () => {

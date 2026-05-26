@@ -47,6 +47,8 @@ export type RemoteToolDescriptor = {
   source: string;
   enclosingSpace: ObjRef | null;
   source_rows?: Array<{ table: "objects"; authority_scope: ObjRef; key: ObjRef }>;
+  stale?: boolean;
+  stale_reason?: "owner_timeout" | "retention_gap" | "cache_miss" | "disabled";
 };
 
 export type RemoteToolProjection = "tools" | "obvious";

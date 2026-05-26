@@ -117,7 +117,7 @@ export type CheckpointTailOpenTransfer = {
   scope: ObjRef;
   head: ShadowScopeHead;
   transfer: OpenTransfer;
-  viewer?: { actor: ObjRef; session?: string | null };
+  viewer: { actor: ObjRef; session?: string | null };
 };
 
 export type ProjectionPage =

@@ -306,6 +306,9 @@ async function connect(): Promise<void> {
     resolveReady();
     return promise;
   }
+  // Row count is only a local hint that a cached head has corresponding
+  // projection material. The relay still validates last_known_head and can
+  // ignore it, so a stale IndexedDB meta row cannot authorize catch-up.
   const hasProjectionRows = target.scope ? await projectionRowCountForScope(target.scope) > 0 : false;
   const lastKnownHead: ShadowScopeHead | undefined = isShadowScopeHead(cachedHead) && hasProjectionRows ? cachedHead : undefined;
   const wsCreateStartedAt = metricNow();
@@ -1315,6 +1318,8 @@ async function clearProjectionRows(scope: string): Promise<void> {
 async function installCheckpointTailProjection(
   transfer: CheckpointTailOpenTransfer
 ): Promise<{ scope: string; head: ShadowScopeHead; projection: unknown } | null> {
+  const viewer = (transfer as { viewer?: CheckpointTailOpenTransfer["viewer"] }).viewer;
+  if (!viewer?.actor) throw new Error("checkpoint/tail transfer missing viewer");
   if (transfer.transfer.kind === "checkpoint") {
     const checkpoint = transfer.transfer.checkpoint;
     const exportKey = `checkpoint_export:${checkpoint.scope}`;
@@ -1356,6 +1361,10 @@ async function installCheckpointTailProjection(
           break;
       }
     }
+    // checkpoint_export is a tiny continuation validator, not a freshness
+    // lease. It is overwritten by the next export for this scope; the server
+    // pins continuation freshness by export id/head/hash and rejects stale
+    // continuation tokens.
     await putMeta(exportKey, exportState);
     if (transfer.transfer.continuation) {
       await putMeta("catchup_required", true);
@@ -1366,7 +1375,7 @@ async function installCheckpointTailProjection(
     return {
       scope: checkpoint.scope,
       head: checkpoint.head,
-      projection: await projectionFromStoredRows(checkpoint.scope, checkpoint.head, transfer.viewer)
+      projection: await projectionFromStoredRows(checkpoint.scope, checkpoint.head, viewer)
     };
   }
 
@@ -1378,7 +1387,7 @@ async function installCheckpointTailProjection(
   return {
     scope: transfer.scope,
     head: transfer.transfer.to,
-    projection: await projectionFromStoredRows(transfer.scope, transfer.transfer.to, transfer.viewer)
+    projection: await projectionFromStoredRows(transfer.scope, transfer.transfer.to, viewer)
   };
 }
 
@@ -1426,7 +1435,7 @@ async function applyProjectionWriteToBrowserRows(scope: string, write: Projectio
 async function projectionFromStoredRows(
   scope: string,
   head: ShadowScopeHead,
-  viewer?: CheckpointTailOpenTransfer["viewer"]
+  viewer: CheckpointTailOpenTransfer["viewer"]
 ): Promise<unknown> {
   const rows = await projectionRowsForScope(scope);
   const logsBySpace = new Map<ObjRef, SpaceLogEntry[]>();
@@ -1451,7 +1460,7 @@ async function projectionFromStoredRows(
   return shadowScopeProjectionFromSerialized(serialized, scope as ObjRef, head, transferViewer(viewer));
 }
 
-function transferViewer(viewer?: CheckpointTailOpenTransfer["viewer"]): { actor: ObjRef; session?: string | null } | undefined {
+function transferViewer(viewer: CheckpointTailOpenTransfer["viewer"]): { actor: ObjRef; session?: string | null } {
   return viewer;
 }
 

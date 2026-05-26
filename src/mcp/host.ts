@@ -630,7 +630,17 @@ export class McpHost {
 
   private assembleTool(
     object: ObjRef,
-    spec: { verb: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct: boolean; source: string; enclosingSpace: ObjRef | null; source_rows?: RemoteToolDescriptor["source_rows"] },
+    spec: {
+      verb: string;
+      aliases: string[];
+      arg_spec: Record<string, WooValue>;
+      direct: boolean;
+      source: string;
+      enclosingSpace: ObjRef | null;
+      source_rows?: RemoteToolDescriptor["source_rows"];
+      stale?: RemoteToolDescriptor["stale"];
+      stale_reason?: RemoteToolDescriptor["stale_reason"];
+    },
     usedNames: Set<string>
   ): McpTool {
     const baseName = sanitizeId(object) + "__" + spec.verb;
@@ -658,7 +668,8 @@ export class McpHost {
         direct: spec.direct,
         source: spec.source,
         enclosingSpace: spec.enclosingSpace,
-        ...(spec.source_rows ? { source_rows: spec.source_rows } : {})
+        ...(spec.source_rows ? { source_rows: spec.source_rows } : {}),
+        ...(spec.stale ? { stale: true, stale_reason: spec.stale_reason } : {})
       }
     };
   }
@@ -811,6 +822,7 @@ export class McpHost {
     if (!staleReason) return manifest;
     const stale: SessionToolManifest = {
       ...manifest,
+      tools: manifest.tools.map((tool) => ({ ...tool, stale: true, stale_reason: staleReason })),
       stale: true,
       stale_reason: staleReason,
       updated_at_ms: Date.now()

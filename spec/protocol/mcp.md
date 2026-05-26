@@ -176,10 +176,13 @@ owner timeout or cache miss may mark that descriptor stale but MUST NOT make it
 disappear from `woo_call` resolution in the same session. A descriptor is
 removed only when an accepted projection delta removes the object or verb, the
 session's active scope changes in a way that makes it unreachable, or the
-manifest expires. Persisted manifests record `stale:true` and `stale_reason`
-when they are served because owner refresh failed or returned no descriptors;
-that marker is freshness metadata, not a not-found result. Remote descriptor
-refreshes should also include tool-surface `source_rows` when available so the
+manifest expires. Expiry is the time bound on manifest monotonicity; after
+`expires_at_ms`, fallback returns no saved descriptors until an owner refresh or
+tool listing records a new manifest. Persisted manifests and the descriptors
+served from them record `stale:true` and `stale_reason` when they are served
+because owner refresh failed or returned no descriptors; that marker is
+freshness metadata, not a not-found result. Remote descriptor refreshes should
+also include tool-surface `source_rows` when available so the
 gateway can invalidate inherited and feature-provided verbs from accepted
 projection updates without reopening executable state. Descriptor reads may use
 stale projection rows; auth, permission checks, and VM execution may not.

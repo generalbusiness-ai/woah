@@ -104,6 +104,9 @@ into an unbounded invalidation index.
 After a descriptor has been returned to a session, same-host cache misses and
 owner refresh timeouts may make it stale but not absent. Removal requires an
 authoritative projection update, active-scope change, or manifest expiry.
+Manifest expiry is the explicit time bound on this monotonicity: after
+`expires_at_ms`, stale fallback returns no saved descriptors until a fresh
+owner refresh or tool listing records a new manifest.
 
 Serving a manifest because owner refresh failed is controlled by the same-host
 stale-fallback rollout flag. With that flag disabled, a saved manifest may be
