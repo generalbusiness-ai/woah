@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
-import { applyAcceptedShadowFrame } from "../../src/core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, serializedFor } from "../../src/core/shadow-commit-scope";
 import { createWorld } from "../../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../../src/core/shadow-envelope";
 import {
@@ -115,6 +115,69 @@ describe("v2 CommitScopeDO cost budget", () => {
       expect(commitScopeNamespace.fetchCallCount).toBe(1);
       expect(writeRowsByTable(directScopeState!)).toMatchObject({
         v2_commit_scope_meta: 1,
+        v2_commit_scope_accepted_frame: 1,
+        v2_commit_scope_transcript_tail: 1,
+        v2_commit_scope_seen: 1,
+        v2_commit_scope_reply: 1
+      });
+    } finally {
+      directoryState.close();
+      gatewayState.close();
+      for (const state of commitStates.values()) state.close();
+    }
+  });
+
+  it("uses execution capsules to skip MCP executable open for a new session on a durable scope", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const commitStates = new Map<string, FakeDurableObjectState>();
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const commitScopeNamespace = new FakeDurableObjectNamespace((name) => {
+      let state = commitStates.get(name);
+      if (!state) {
+        state = new FakeDurableObjectState(name);
+        commitStates.set(name, state);
+      }
+      return new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    });
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-mcp-capsule-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      WOO_V2_EXECUTION_CAPSULE: "1",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected DirectoryDO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: commitScopeNamespace
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const firstSession = await initializeMcp(gateway, "guest:cf-v2-mcp-capsule-a", 11);
+      await mcp(gateway, firstSession, 12, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "guest_1", verb: "set_description", args: ["capsule bootstrap"] }
+      });
+      const directScopeState = commitStates.get("#-1");
+      expect(directScopeState).toBeTruthy();
+
+      const secondSession = await initializeMcp(gateway, "guest:cf-v2-mcp-capsule-b", 13);
+      resetStateCostLog(directScopeState!);
+      commitScopeNamespace.fetchCallCount = 0;
+
+      const result = await mcp(gateway, secondSession, 14, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "guest_2", verb: "set_description", args: ["capsule without executable open"] }
+      });
+      expect(result.result).toMatchObject({ isError: false });
+      expect(commitScopeNamespace.fetchCallCount).toBe(1);
+      expect(writeRowsByTable(directScopeState!)).toEqual({
+        v2_commit_scope_meta: 1,
+        v2_commit_scope_object: 1,
         v2_commit_scope_accepted_frame: 1,
         v2_commit_scope_transcript_tail: 1,
         v2_commit_scope_seen: 1,
@@ -337,13 +400,31 @@ describe("v2 CommitScopeDO cost budget", () => {
   });
 
   it("performs exactly zero durable writes on duplicate envelope replay", async () => {
+    const metrics: Record<string, unknown>[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((label: unknown, payload: unknown) => {
+      if (label === "woo.metric" && typeof payload === "string") {
+        metrics.push(JSON.parse(payload) as Record<string, unknown>);
+      }
+    });
     const harness = await makeCostHarness();
     try {
       await harness.openScope();
       const envelope = await harness.envelope(1);
       await harness.internals.webSocketV2TurnNetworkMessage(harness.world, harness.ws as unknown as WebSocket, envelope);
+      const firstReplayMetric = lastMetric(metrics, "commit_reply_replay");
+      expect(firstReplayMetric).toMatchObject({
+        kind: "commit_reply_replay",
+        scope: "#-1",
+        node: "browser:v2-cost",
+        route: "/v2/envelope",
+        mode: "fresh",
+        status: "ok",
+        reply: "accepted"
+      });
+      expect(metricNumber(firstReplayMetric, "bytes")).toBeGreaterThan(0);
       const writesBeforeReplay = rowWrites(harness.scopeState);
       const gatewayWritesBeforeReplay = rowWrites(harness.gatewayState);
+      const metricStart = metrics.length;
 
       await harness.internals.webSocketV2TurnNetworkMessage(harness.world, harness.ws as unknown as WebSocket, envelope);
 
@@ -352,8 +433,20 @@ describe("v2 CommitScopeDO cost budget", () => {
       // fresh turn, even though the side effect is correctly deduped.
       expect(rowWrites(harness.scopeState)).toBe(writesBeforeReplay);
       expect(rowWrites(harness.gatewayState)).toBe(gatewayWritesBeforeReplay);
+      const duplicateReplayMetric = lastMetric(metrics.slice(metricStart), "commit_reply_replay");
+      expect(duplicateReplayMetric).toMatchObject({
+        kind: "commit_reply_replay",
+        scope: "#-1",
+        node: "browser:v2-cost",
+        route: "/v2/envelope",
+        mode: "cached_sql",
+        status: "ok",
+        reply: "accepted"
+      });
+      expect(metricNumber(duplicateReplayMetric, "bytes")).toBe(metricNumber(firstReplayMetric, "bytes"));
     } finally {
       harness.cleanup();
+      logSpy.mockRestore();
     }
   });
 
@@ -517,7 +610,7 @@ async function makeCostHarness(): Promise<CostHarness> {
       verb: "set_value",
       args: [67]
     };
-    const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+    const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
     const request = {
       kind: "woo.turn.exec.request.shadow.v1" as const,
       id: call.id,

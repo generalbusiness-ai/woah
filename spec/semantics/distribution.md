@@ -23,6 +23,12 @@ Execution is **symmetric** across all node kinds. A hosted Durable Object, a bro
 
 Execution is **speculative**. The transcript is a proposal until a sequencer accepts it (§DT3).
 
+Execution sufficiency may be held as an already-open local VM view or as a
+one-turn `ExecutionCapsule` supplied with the submission. The capsule is not
+holder catch-up state: it authorizes neither projection reads nor durable cache
+repair, and a sequencer without an existing durable snapshot must reject it and
+require an explicit seed/checkpoint bootstrap.
+
 ### Sequence
 
 For each **scope** — that is, for each [`$space`](space.md) instance — exactly one node is the **scope sequencer** at any time. The sequencer accepts envelope submissions, decides the total order in which transcripts apply, and emits accepted frames to subscribers.
@@ -40,6 +46,22 @@ Any node may hold a cache of cell versions for objects it cares about. State hol
 State holders include hosted PersistentObjectDOs (durable replicas, `host_placement` directs which objects are likely to be held where), browsers (volatile replicas of the open scope), and MCP shards (per-session replicas).
 
 `host_placement`, `instances_self_host`, and similar object properties are **cache hints**, not authority claims. A node holding an object's cells at a given version may serve reads; "the host" is the node most likely to have those cells warm, not the node that owns them.
+
+State holders catch up from **accepted frames plus projection rows**. The
+sequencer's accepted frame is the ordered fact: position, receipt, transcript
+hash/body reference, and observations derived from the transcript. Projection
+rows (`SerializedObject`, `SerializedSession`, log rows, snapshots, parked
+tasks, counters, tombstones, and tool-surface rows) are materialized cache rows
+at a head. A holder receiving a row-body-complete accepted frame applies the
+included projection writes directly. If the retained accepted-frame tail is not
+enough, the holder installs a bounded checkpoint of projection pages at one
+head and then resumes tail catch-up. A holder must not rediscover changed rows
+by scanning a full exported world after every accepted frame.
+
+`SerializedWorld` is therefore a boundary export format, not a hot-path
+invariant. Implementations may keep a lazy cached `SerializedWorld` for legacy
+diagnostics, fallback export, checkpoint construction, or VM execution views,
+but normal accepted-frame application is defined over indexed/projection state.
 
 ---
 

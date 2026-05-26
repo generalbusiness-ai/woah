@@ -558,7 +558,7 @@ or repurposed.
 | `blobs[12]` | `host`      | `cross_host_rpc.host`, `dispatch_resolved.host`, `host_schema_sync.host` |
 | `blobs[13]` | `actor`     | `mcp_tool_refresh_*.actor`, `dispatch_resolved.actor` |
 | `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating`; browser frame/activity path |
-| `blobs[15]` | `reason`    | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `shadow_transcript_anomaly.reason`, browser fallback/cache reason |
+| `blobs[15]` | `reason` / `mode` | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `commit_reply_replay.mode`, `shadow_transcript_anomaly.reason`, browser fallback/cache reason |
 | `blobs[16]` | `error_detail` | bounded diagnostic detail for uncoded internal errors |
 | `blobs[17]` | `source`    | `browser_activity.source` (`main` or `v2_browser_worker`) |
 | `doubles[0]` | `ms`         | latency, when present |
@@ -614,10 +614,11 @@ diagnostics beyond the local hard cap.
 `v2_open_step` splits aggregate `/v2/open` wall time across both authority
 planes. CommitScopeDO phases cover request verification/read, relay lookup,
 session seeding, browser relay construction, shadow open, executable seed
-construction/digest/install, full-save, and response encoding. The gateway
+construction/digest/install, full-save, checkpoint/tail packaging, checkpoint
+continuation stale, checkpoint pending, asynchronous checkpoint build, and response encoding. The gateway
 WebSocket phases cover authority payload construction, CommitScopeDO open RPC,
-and WebSocket frame encoding/sends for hello, display transfer, executable
-transfer, and ads.
+and WebSocket frame encoding/sends for hello, legacy display transfer,
+checkpoint/tail transfer chunks, executable transfer, and ads.
 
 Cold-restart skip paths emit dedicated phases when the gateway recognizes that no work is needed:
 
@@ -752,17 +753,23 @@ transfer state so cross-scope movement accepted by one CommitScopeDO is visible
 to the next scope without a full-world transfer.
 
 Accepted v2 commits do not rewrite the full world. The commit applies the
-transcript to the in-memory relay, then the storage transaction upserts only
-object rows named by transcript creates/writes plus any changed session active
-scope and sequenced log row. This keeps steady-state commit storage cost
-proportional to the turn delta, not to the scope's world size. Cold opens still
-write O(authority-seed-size) rows once for a new or migrated scope.
+transcript to indexed commit-scope state, marks any legacy `SerializedWorld`
+cache dirty, and the storage transaction upserts only projection rows named by
+the `ApplyResult`: touched objects, sessions, logs, counters, snapshots,
+parked tasks, tombstones, and tool surfaces. The normal accepted path MUST NOT
+materialize a full `SerializedWorld`; that export is reserved for explicit
+legacy/export/checkpoint/execution boundaries. This keeps steady-state commit
+storage cost proportional to the turn delta, not to the scope's world size.
+Cold opens still write O(authority-seed-size) rows once for a new or migrated
+scope.
 
 After `CommitScopeDO` accepts a v2 commit, the origin `PersistentObjectDO` must
-synchronously materialize the accepted transcript into every routed object host
-whose rows were touched by the transcript. The signed internal
-`POST /__internal/apply-v2-commit` endpoint applies only the receiver's
-host-owned slice and persists only changed object/property/log/session rows.
+synchronously materialize the accepted transcript or row-body-complete
+projection writes into every routed object host whose rows were touched by the
+commit. The signed internal `POST /__internal/apply-v2-commit` endpoint prefers
+the `projection_writes` field when present; otherwise it falls back to applying
+the transcript to the receiver's host-owned slice. In either mode it persists
+only changed object/property/log/session rows.
 The origin must complete this write-through before returning a clean applied
 REST/MCP/WS result; if any object host rejects or times out, the caller receives
 a retryable error rather than an applied frame whose public object reads would
@@ -784,10 +791,56 @@ transcript}`. `commit` is a `woo.commit.accepted.shadow.v1`; `transcript` is
 the matching `woo.effect_transcript.shadow.v1`. Affected shards include
 CommitScope fanout recipients and shards with sessions in scopes touched by
 transcript moves, creates, contents writes, or presence-list writes. Remote
-shards apply the accepted transcript to their non-persistent snapshot and route
-the accepted observations into their own MCP wait queues. This keeps co-present
-MCP sessions observable across shard boundaries without making any shard
-authoritative for durable world state.
+shards consume `commit.projection_writes` into their gateway projection cache
+when present and expand `commit.projection_delta.tool_surface_sources` against
+their local tool-surface reverse index to evict stale descriptor cache rows. If
+projection writes are absent, shards fall back to the legacy transcript/snapshot
+apply path for materialized rows, but may still consume marker-only
+tool-surface invalidations. This keeps co-present MCP sessions observable across
+shard boundaries without making any shard authoritative for durable world state.
+
+`/v2/open` supports an opt-in checkpoint/tail protocol by request body
+negotiation: `open_protocol: "checkpoint_tail.v1"`, `known_head`, and bounded
+transfer budgets. If the known head is covered by the retained tail and every
+retained frame has projection row bodies, `CommitScopeDO` returns frame
+transfers, split by continuation when the encoded transfer would exceed the
+byte budget. Otherwise it returns projection checkpoint pages and the retained
+frame tail as cache seed, also split by continuation when needed. Continuations
+are pinned to the retained export id/head/hash; a stale continuation returns
+`E_CHECKPOINT_CONTINUATION_STALE`. Legacy `/v2/open` responses remain the
+default while checkpoint/tail negotiation is off. `WOO_V2_CHECKPOINT_TAIL_OPEN`
+enables the CommitScopeDO body-field protocol for trusted callers. Browser
+WebSocket opens are narrower: because the first checkpoint pages are
+authority-shaped, the gateway MUST NOT send them to browser holders unless a
+browser-safe projection profile is active and a separate browser rollout gate is
+enabled. Until then, browser opens use the legacy display transfer even when
+CommitScopeDO can serve checkpoint/tail to server-side callers.
+
+`WOO_GATEWAY_PROJECTION_CACHE` enables the gateway's durable projection-row SQL
+cache for accepted fanout. `WOO_TOOL_SURFACE_PROJECTION_ROWS` is a narrower
+rollback flag for persisting and serving `ToolSurfaceProjectionRow` descriptor
+rows from that cache. `WOO_V2_SAME_HOST_STALE_FALLBACK` is a narrower rollback
+flag for serving cached tool surfaces or a session's last
+`SessionToolManifest` when owner descriptor refresh times out. Both narrower
+flags require `WOO_GATEWAY_PROJECTION_CACHE`; disabling either leaves ordinary
+authority and execution paths unchanged. `WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS`
+caps reverse-index rows per gateway scope, defaulting to 10,000 rows.
+`WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS` caps reverse-index rows per
+gateway shard, defaulting to 40,000 rows. When either cap is hit, the gateway
+stores the descriptor row as stale, marks the active scope saturated, and avoids
+adding source-index entries, so descriptor reads fall back to the session
+manifest or an owner refresh instead of relying on an unbounded invalidation
+index.
+
+`WOO_V2_EXECUTION_CAPSULE` controls a separate MCP/REST execution-open
+optimization. When enabled, a gateway that already has a local execution view
+for a durable scope may submit the next `/v2/envelope` with
+`execution_capsule.kind == "woo.execution_capsule.v1"` instead of first calling
+legacy executable `/v2/open`. If the matching `CommitScopeDO` has no durable
+snapshot, it returns `E_SNAPSHOT_REQUIRED`; rollout callers then perform the
+legacy seed bootstrap and retry without the capsule. This flag does not change
+checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
+class migration.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent
 through signed `POST /__internal/mcp-live-fanout` with `{scope,

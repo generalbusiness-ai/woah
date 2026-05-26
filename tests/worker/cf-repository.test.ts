@@ -11,7 +11,7 @@ import {
 } from "../../src/core/shadow-browser-node";
 import { runShadowTurnCall, type ShadowTurnCall } from "../../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../../src/core/turn-key";
-import type { ShadowScopeHead } from "../../src/core/shadow-commit-scope";
+import { serializedFor, type ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import type { Message, ObjRef, TinyBytecode, VerbDef, WooValue } from "../../src/core/types";
 import type { CallContext, ExecutorContext, HostObjectSummary, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../../src/core/world";
 import { CFObjectRepository } from "../../src/worker/cf-repository";
@@ -704,7 +704,7 @@ describe("v2 Worker fan-out helpers", () => {
         verb: "set_control",
         args: ["delay_1", "wet", 0.62]
       };
-      const planned = await runShadowTurnCall(localRelay.commit_scope.serialized, call);
+      const planned = await runShadowTurnCall(serializedFor(localRelay.commit_scope), call);
       const turnRequest = {
         kind: "woo.turn.exec.request.shadow.v1" as const,
         id: call.id,
@@ -1492,6 +1492,151 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("does not negotiate authority-shaped checkpoint/tail transfers on the browser WebSocket path", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const gatewayState = new FakeDurableObjectState("world");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const sent: string[] = [];
+    const openBodies: Array<Record<string, unknown>> = [];
+    class FakeServerWebSocket {
+      attachment: unknown;
+      readonly sent = sent;
+
+      serializeAttachment(value: unknown): void {
+        this.attachment = value;
+      }
+
+      send(data: string): void {
+        this.sent.push(data);
+      }
+
+      close(): void {}
+    }
+    class FakeWebSocketPair {
+      readonly 0 = {} as WebSocket;
+      readonly 1 = new FakeServerWebSocket() as unknown as WebSocket;
+    }
+    class CloudflareUpgradeResponse {
+      readonly body: BodyInit | null;
+      readonly headers: Headers;
+      readonly status: number;
+      readonly statusText: string;
+      readonly webSocket?: WebSocket;
+
+      constructor(body: BodyInit | null = null, init: (ResponseInit & { webSocket?: WebSocket }) = {}) {
+        this.body = body;
+        this.headers = new Headers(init.headers);
+        this.status = init.status ?? 200;
+        this.statusText = init.statusText ?? "";
+        this.webSocket = init.webSocket;
+      }
+
+      get ok(): boolean {
+        return this.status >= 200 && this.status < 300;
+      }
+
+      async text(): Promise<string> {
+        if (typeof this.body === "string") return this.body;
+        if (this.body == null) return "";
+        if (this.body instanceof ArrayBuffer) return new TextDecoder().decode(this.body);
+        return String(this.body);
+      }
+
+      async json(): Promise<unknown> {
+        return JSON.parse(await this.text());
+      }
+    }
+    const previousPair = (globalThis as unknown as { WebSocketPair?: unknown }).WebSocketPair;
+    const previousResponse = globalThis.Response;
+    vi.stubGlobal("WebSocketPair", FakeWebSocketPair);
+    vi.stubGlobal("Response", CloudflareUpgradeResponse);
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-v2-checkpoint-tail-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      WOO_V2_CHECKPOINT_TAIL_OPEN: "1",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`unexpected Woo DO ${name}`);
+      }),
+      COMMIT_SCOPE: new FakeDurableObjectNamespace(() => ({
+        fetch: async (request: Request): Promise<Response> => {
+          const body = await request.json() as Record<string, unknown>;
+          openBodies.push(body);
+          const scope = String(body.scope);
+          const actor = String(body.actor);
+          const session = String(body.session);
+          const head = { kind: "woo.scope_head.shadow.v1", scope, epoch: 1, seq: 0, hash: "checkpoint-tail-head" };
+          if (body.open_protocol === "checkpoint_tail.v1") throw new Error("browser open must not request authority-shaped checkpoint/tail pages");
+          return new Response(JSON.stringify({
+            ok: true,
+            relay: `node:commit-scope:${scope}`,
+            hello: {
+              kind: "woo.transport.hello.v1",
+              relay: `node:commit-scope:${scope}`,
+              session,
+              actor,
+              server_time: 1,
+              max_message_bytes: 1024 * 1024,
+              idempotency_window_ms: 300_000,
+              planes: ["execution", "commit", "state", "live"],
+              features: ["shadow-envelope"]
+            },
+            head,
+            transfer: {
+              kind: "woo.state.transfer.shadow.v1",
+              mode: "projection",
+              scope,
+              from: head,
+              to: head,
+              projection: { kind: "woo.scope_projection.shadow.v1", scope, subject: { id: scope } }
+            },
+            ads: []
+          }), { status: 200, headers: { "content-type": "application/json" } }) as Response;
+        }
+      }))
+    } as unknown as Env;
+    const gateway = new PersistentObjectDO(gatewayState as unknown as DurableObjectState, env);
+
+    try {
+      const response = await gateway.fetch(new Request("https://woo.test/v2/turn-network/ws?token=wizard:cf-v2-checkpoint-tail-token&node=browser:checkpoint-tail-ws", {
+        headers: {
+          upgrade: "websocket",
+          "sec-websocket-protocol": "woo-v2.turn-network.json"
+        }
+      }));
+
+      expect(response.status).toBe(101);
+      expect(openBodies).toHaveLength(1);
+      expect(openBodies[0]).not.toHaveProperty("open_protocol");
+      expect(sent).toHaveLength(2);
+      expect(decodeEnvelope(sent[0])).toMatchObject({
+        type: "woo.transport.hello.v1",
+        to: "browser:checkpoint-tail-ws"
+      });
+      expect(decodeEnvelope(sent[1])).toMatchObject({
+        type: "woo.state.transfer.shadow.v1",
+        to: "browser:checkpoint-tail-ws",
+        body: {
+          kind: "woo.state.transfer.shadow.v1",
+          mode: "projection"
+        }
+      });
+    } finally {
+      if (previousPair === undefined) {
+        Reflect.deleteProperty(globalThis as unknown as { WebSocketPair?: unknown }, "WebSocketPair");
+      } else {
+        vi.stubGlobal("WebSocketPair", previousPair);
+      }
+      vi.stubGlobal("Response", previousResponse);
+      directoryState.close();
+      gatewayState.close();
+    }
+  });
+
   it("handles v2 turn requests through the Worker WebSocket message path", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
@@ -1614,7 +1759,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         verb: "set_value",
         args: [67]
       };
-      const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+      const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
       const request = {
         kind: "woo.turn.exec.request.shadow.v1" as const,
         id: call.id,
@@ -1816,7 +1961,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         verb: "southeast",
         args: []
       };
-      const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+      const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
       const request = {
         kind: "woo.turn.exec.request.shadow.v1" as const,
         id: call.id,
@@ -2910,6 +3055,89 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(chatEnvelopes).toHaveLength(2);
       expect(chatEnvelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toBe(true);
       expect(chatEnvelopes.every((post) => Array.isArray(post.body.session_objects) && post.body.session_objects.length === 0)).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+    }
+  });
+
+  it("uses execution capsules to skip REST executable open after gateway rehydrate", async () => {
+    const directoryState = new FakeDurableObjectState("directory");
+    const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const wooStates = new Map<string, FakeDurableObjectState>();
+    const wooObjects = new Map<string, PersistentObjectDO>();
+    const commitPosts: Array<{ scope: string; path: string; body: Record<string, unknown> }> = [];
+    let env: Env;
+    const wooNamespace = new FakeDurableObjectNamespace((name) => {
+      let object = wooObjects.get(name);
+      if (!object) {
+        let state = wooStates.get(name);
+        if (!state) {
+          state = new FakeDurableObjectState(name);
+          wooStates.set(name, state);
+        }
+        object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+        wooObjects.set(name, object);
+      }
+      return object;
+    });
+    env = {
+      WOO_INITIAL_WIZARD_TOKEN: "cf-command-token",
+      WOO_INTERNAL_SECRET: "cf-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
+      WOO_V2_EXECUTION_CAPSULE: "1",
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+        return directory;
+      }),
+      WOO: wooNamespace,
+      COMMIT_SCOPE: fakeCommitScopeNamespace("cf-test-secret", (scope, path, body) => {
+        if (path !== "/v2/open" && path !== "/v2/envelope") return;
+        if (!body || typeof body !== "object" || Array.isArray(body)) return;
+        commitPosts.push({ scope, path, body: body as Record<string, unknown> });
+      })
+    } as unknown as Env;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    async function post(path: string, body: Record<string, unknown>, session?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+      const response = await worker.fetch(new Request(`https://woo.test${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(session ? { authorization: `Session ${session}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), env, {});
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    }
+
+    try {
+      const auth = await post("/api/auth", { token: "guest:cf-rest-capsule" });
+      expect(auth.status).toBe(200);
+      const session = String(auth.body.session);
+
+      const firstEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
+      expect(firstEnter.status, JSON.stringify(firstEnter.body)).toBe(200);
+      const firstChatOpens = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/open");
+      const firstChatEnvelopes = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/envelope");
+      expect(firstChatOpens).toHaveLength(1);
+      expect(firstChatOpens[0].body).toHaveProperty("serialized");
+      expect(firstChatEnvelopes).toHaveLength(2);
+      expect(firstChatEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
+      expect(firstChatEnvelopes[1].body).not.toHaveProperty("execution_capsule");
+
+      wooObjects.delete("world");
+      commitPosts.length = 0;
+
+      const secondEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
+      expect(secondEnter.status, JSON.stringify(secondEnter.body)).toBe(200);
+      const secondChatOpens = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/open");
+      const secondChatEnvelopes = commitPosts.filter((post) => post.scope === "the_chatroom" && post.path === "/v2/envelope");
+      expect(secondChatOpens).toHaveLength(0);
+      expect(secondChatEnvelopes).toHaveLength(1);
+      expect(secondChatEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
+      expect(secondChatEnvelopes[0].body).not.toHaveProperty("serialized");
     } finally {
       logSpy.mockRestore();
       directoryState.close();

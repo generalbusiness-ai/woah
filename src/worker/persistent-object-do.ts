@@ -63,7 +63,7 @@ import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, serializedFor, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import { isShadowCommitAccepted, isShadowTurnExecReply } from "../core/v2-reply-predicates";
 import {
   affectedBrowserFanoutScopes,
@@ -74,16 +74,29 @@ import {
 import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
+  buildExecutionCapsule,
   mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityObjectIds,
   executorAuthorityPayload,
-  executorEnvelopeId
+  executorEnvelopeId,
+  type ExecutorEnvelopeBody
 } from "../core/executor";
 import { CFObjectRepository } from "./cf-repository";
 import { McpGateway, type McpV2EnvelopeResult, type McpV2OpenResult } from "../mcp/gateway";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { hashSource } from "../core/source-hash";
+import { stableShadowJson } from "../core/shadow-cell-version";
+import {
+  projectionDeltaMissingWrites,
+  summarizeProjectionWrites,
+  type CheckpointTailOpenTransfer,
+  type OpenTransfer,
+  type ProjectionDeltaSummary,
+  type ProjectionWrite,
+  type SessionToolManifest,
+  type ToolSurfaceProjectionRow
+} from "../core/projection-delta";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
@@ -104,6 +117,14 @@ export interface Env {
   WOO_HOST_WRITE_TIMEOUT_MS?: string;
   WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
   WOO_MCP_GATEWAY_SHARDS?: string;
+  WOO_GATEWAY_PROJECTION_CACHE?: string;
+  WOO_V2_SAME_HOST_STALE_FALLBACK?: string;
+  WOO_TOOL_SURFACE_PROJECTION_ROWS?: string;
+  WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS?: string;
+  WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS?: string;
+  WOO_V2_CHECKPOINT_TAIL_OPEN?: string;
+  WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN?: string;
+  WOO_V2_EXECUTION_CAPSULE?: string;
   // Workers Analytics Engine binding. The metrics-sink module writes every
   // `MetricEvent` here (modulo sampling) so /admin/stats can query historical
   // counts and latencies without depending on tail-time consumption.
@@ -129,7 +150,7 @@ export interface Env {
   HOST_SEED_KV?: KVNamespace;
 }
 
-type CommitScopeOpenResponse = {
+type CommitScopeLegacyOpenResponse = {
   ok: true;
   relay: string;
   head?: ShadowScopeHead;
@@ -148,6 +169,17 @@ type CommitScopeOpenResponse = {
   executable_transfer?: ShadowBrowserStateTransfer;
   ads?: ShadowCapabilityAd[];
 };
+
+type CommitScopeCheckpointTailOpenResponse = {
+  ok: true;
+  open_protocol: "checkpoint_tail.v1";
+  relay: string;
+  head: ShadowScopeHead;
+  hello: CommitScopeLegacyOpenResponse["hello"];
+  transfer: OpenTransfer;
+};
+
+type CommitScopeOpenResponse = CommitScopeLegacyOpenResponse | CommitScopeCheckpointTailOpenResponse;
 
 type CommitScopeEnvelopeResponse = {
   ok: true;
@@ -200,6 +232,8 @@ type V2SocketAttachment = {
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
+const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
+const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
@@ -286,6 +320,16 @@ function isCommitScopeSnapshotRequiredError(err: unknown): boolean {
   const error = normalizeError(err);
   if (error.code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED) return true;
   return commitScopeErrorFromPayload(error.value)?.code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED;
+}
+
+function isCommitScopeCheckpointPendingError(err: unknown): boolean {
+  const error = normalizeError(err);
+  if (error.code === "E_CHECKPOINT_PENDING") return true;
+  return commitScopeErrorFromPayload(error.value)?.code === "E_CHECKPOINT_PENDING";
+}
+
+function isCheckpointTailOpenResponse(response: CommitScopeOpenResponse): response is CommitScopeCheckpointTailOpenResponse {
+  return (response as { open_protocol?: unknown }).open_protocol === "checkpoint_tail.v1";
 }
 
 // Internal RPC routes that are pure reads of world state and therefore safe
@@ -381,9 +425,554 @@ export class PersistentObjectDO {
     this.state = state;
     this.env = env;
     this.repo = new CFObjectRepository(state, (event) => this.emitMetric(event, this.durableHostKey()));
+    this.migrateGatewayProjectionCache();
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: constructorMs, ts: Date.now(), host_key: this.durableHostKey() }));
     writeConstructorMetricToAnalytics("PersistentObjectDO", constructorMs, this.durableHostKey(), this.env.METRICS);
+  }
+
+  private migrateGatewayProjectionCache(): void {
+    // Projection-cache tables are idempotent existing-DO SQL migrations. They
+    // are created on every host because PersistentObjectDO uses one class for
+    // world, gateway shards, and object hosts; only gateway shards write them
+    // when WOO_GATEWAY_PROJECTION_CACHE is enabled.
+    const sql = this.state.storage.sql;
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_projection_scope (
+      scope TEXT PRIMARY KEY,
+      head_seq INTEGER NOT NULL,
+      head_hash TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      stale INTEGER NOT NULL DEFAULT 0,
+      stale_reason TEXT
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_projection_object (
+      id TEXT NOT NULL,
+      authority_scope TEXT NOT NULL,
+      body TEXT NOT NULL,
+      last_apply_seq INTEGER NOT NULL,
+      last_apply_hash TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      stale INTEGER NOT NULL DEFAULT 0,
+      stale_reason TEXT,
+      PRIMARY KEY(authority_scope, id)
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_scope_member (
+      scope TEXT NOT NULL,
+      id TEXT NOT NULL,
+      authority_scope TEXT NOT NULL,
+      role TEXT NOT NULL,
+      last_apply_seq INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(scope, id, role)
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_projection_session (
+      session_id TEXT PRIMARY KEY,
+      scope TEXT,
+      actor TEXT NOT NULL,
+      body TEXT NOT NULL,
+      last_apply_seq INTEGER NOT NULL,
+      last_apply_hash TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      stale INTEGER NOT NULL DEFAULT 0,
+      stale_reason TEXT
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_tool_surface (
+      scope TEXT NOT NULL,
+      object TEXT NOT NULL,
+      object_authority_scope TEXT NOT NULL,
+      body TEXT NOT NULL,
+      last_apply_seq INTEGER NOT NULL,
+      last_apply_hash TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      stale INTEGER NOT NULL DEFAULT 0,
+      stale_reason TEXT,
+      PRIMARY KEY(scope, object)
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_session_tool_manifest (
+      session_id TEXT PRIMARY KEY,
+      actor TEXT NOT NULL,
+      active_scope TEXT NOT NULL,
+      body TEXT NOT NULL,
+      last_apply_seq INTEGER NOT NULL,
+      last_apply_hash TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      expires_at_ms INTEGER NOT NULL,
+      stale INTEGER NOT NULL DEFAULT 0,
+      stale_reason TEXT
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_tool_surface_source (
+      scope TEXT NOT NULL,
+      source_table TEXT NOT NULL,
+      source_authority_scope TEXT NOT NULL,
+      source_key TEXT NOT NULL,
+      object TEXT NOT NULL,
+      PRIMARY KEY(scope, source_table, source_authority_scope, source_key, object)
+    )`);
+    // A saturated scope is read as a cache miss so MCP can fall back to the
+    // session manifest or owner refresh instead of serving a partial tool list.
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_tool_surface_scope (
+      scope TEXT PRIMARY KEY,
+      saturated INTEGER NOT NULL DEFAULT 0,
+      saturated_reason TEXT,
+      updated_at_ms INTEGER NOT NULL
+    )`);
+  }
+
+  private gatewayProjectionCacheEnabled(): boolean {
+    return envFlag(this.env.WOO_GATEWAY_PROJECTION_CACHE);
+  }
+
+  private sameHostStaleFallbackEnabled(): boolean {
+    return this.gatewayProjectionCacheEnabled() && envFlag(this.env.WOO_V2_SAME_HOST_STALE_FALLBACK);
+  }
+
+  private toolSurfaceProjectionRowsEnabled(): boolean {
+    return this.gatewayProjectionCacheEnabled() && envFlag(this.env.WOO_TOOL_SURFACE_PROJECTION_ROWS);
+  }
+
+  private toolSurfaceSourceIndexMaxScopeRows(): number {
+    return nonNegativeIntegerEnv(
+      this.env.WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS,
+      DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS
+    );
+  }
+
+  private toolSurfaceSourceIndexMaxShardRows(): number {
+    return nonNegativeIntegerEnv(
+      this.env.WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS,
+      DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS
+    );
+  }
+
+  private checkpointTailOpenEnabled(): boolean {
+    return envFlag(this.env.WOO_V2_CHECKPOINT_TAIL_OPEN);
+  }
+
+  private browserCheckpointTailOpenEnabled(): boolean {
+    // The current checkpoint/tail pages are authority-shaped. Browser holders
+    // must not negotiate them until the BrowserProfile projection described in
+    // notes/2026-05-25-browser-holder-node.md lands.
+    return this.checkpointTailOpenEnabled() && envFlag(this.env.WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN);
+  }
+
+  private withCheckpointTailOpen(body: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...body,
+      open_protocol: "checkpoint_tail.v1",
+      known_head: body.known_head ?? body.last_known_head ?? null
+    };
+  }
+
+  private withoutCheckpointTailOpen(body: Record<string, unknown>): Record<string, unknown> {
+    const { open_protocol, known_head, transfer_budget_bytes, max_tail_frames, continuation, ...legacy } = body;
+    void open_protocol;
+    void known_head;
+    void transfer_budget_bytes;
+    void max_tail_frames;
+    void continuation;
+    return legacy;
+  }
+
+  private loadGatewaySessionToolManifest(sessionId: string): SessionToolManifest | null {
+    if (!this.sameHostStaleFallbackEnabled()) return null;
+    const row = firstSqlRow<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM gateway_session_tool_manifest WHERE session_id = ? AND expires_at_ms > ?",
+      sessionId,
+      Date.now()
+    ));
+    if (!row) return null;
+    const parsed = JSON.parse(row.body) as unknown;
+    return isSessionToolManifest(parsed) ? parsed : null;
+  }
+
+  private saveGatewaySessionToolManifest(manifest: SessionToolManifest): void {
+    if (!this.gatewayProjectionCacheEnabled()) return;
+    const body = stableShadowJson(manifest as unknown as WooValue);
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO gateway_session_tool_manifest(
+        session_id, actor, active_scope, body, last_apply_seq, last_apply_hash, updated_at_ms, expires_at_ms, stale, stale_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      manifest.session_id,
+      manifest.actor,
+      manifest.active_scope,
+      body,
+      manifest.last_apply_seq,
+      manifest.last_apply_hash,
+      manifest.updated_at_ms,
+      manifest.expires_at_ms,
+      manifest.stale ? 1 : 0,
+      manifest.stale_reason ?? null
+    );
+  }
+
+  private applyGatewayProjectionWrites(
+    position: ShadowScopeHead,
+    writes: readonly ProjectionWrite[],
+    source: "rest" | "mcp" | "fanout",
+    delta?: ProjectionDeltaSummary
+  ): { rows: number; bytes: number } {
+    this.requireProjectionWritesComplete(position.scope, delta, writes, `gateway_projection:${source}`);
+    if (!this.gatewayProjectionCacheEnabled()) return { rows: 0, bytes: 0 };
+    // The gateway cache stores accepted projection rows durably so a hibernated
+    // MCP shard can answer descriptor reads without reconstructing an
+    // executable WooWorld mirror first. Auth and execution still use the
+    // authoritative paths, not these stale-tolerant rows.
+    const sql = this.state.storage.sql;
+    const now = Date.now();
+    let rows = 0;
+    let bytes = 0;
+    const authorityScope = position.scope;
+    this.state.storage.transactionSync(() => {
+      sql.exec(
+        "INSERT OR REPLACE INTO gateway_projection_scope(scope, head_seq, head_hash, updated_at_ms, stale, stale_reason) VALUES (?, ?, ?, ?, 0, NULL)",
+        authorityScope,
+        position.seq,
+        position.hash,
+        now
+      );
+      rows += 1;
+      if (this.toolSurfaceProjectionRowsEnabled()) {
+        for (const marker of delta?.tool_surface_sources ?? []) {
+          if (marker.key.table === "objects") {
+            this.invalidateGatewayToolSurfacesForObject(marker.key.authority_scope, marker.key.key);
+          }
+        }
+      }
+      for (const write of writes) {
+        bytes += write.bytes;
+        switch (write.table) {
+          case "objects":
+            if (this.toolSurfaceProjectionRowsEnabled()) this.invalidateGatewayToolSurfacesForObject(authorityScope, write.key);
+            if (write.op === "delete") {
+              sql.exec("DELETE FROM gateway_projection_object WHERE authority_scope = ? AND id = ?", authorityScope, write.key);
+              sql.exec("DELETE FROM gateway_scope_member WHERE authority_scope = ? AND id = ?", authorityScope, write.key);
+            } else {
+              sql.exec(
+                `INSERT OR REPLACE INTO gateway_projection_object(
+                  id, authority_scope, body, last_apply_seq, last_apply_hash, updated_at_ms, stale, stale_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)`,
+                write.key,
+                authorityScope,
+                stableShadowJson(write.row as unknown as WooValue),
+                position.seq,
+                position.hash,
+                now
+              );
+              sql.exec(
+                "INSERT OR REPLACE INTO gateway_scope_member(scope, id, authority_scope, role, last_apply_seq, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+                authorityScope,
+                write.key,
+                authorityScope,
+                "projection",
+                position.seq,
+                now
+              );
+            }
+            rows += 1;
+            break;
+          case "sessions":
+            if (write.op === "delete") {
+              sql.exec("DELETE FROM gateway_projection_session WHERE session_id = ?", write.key);
+            } else {
+              sql.exec(
+                `INSERT OR REPLACE INTO gateway_projection_session(
+                  session_id, scope, actor, body, last_apply_seq, last_apply_hash, updated_at_ms, stale, stale_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
+                write.key,
+                write.row.activeScope ?? write.row.currentLocation ?? null,
+                write.row.actor,
+                stableShadowJson(write.row as unknown as WooValue),
+                position.seq,
+                position.hash,
+                now
+              );
+            }
+            rows += 1;
+            break;
+          case "tool_surfaces":
+            if (!this.toolSurfaceProjectionRowsEnabled()) break;
+            if (write.op === "delete") {
+              this.deleteGatewayToolSurface(write.key.scope, write.key.object);
+            } else {
+              this.upsertGatewayToolSurface(write.row, authorityScope, position, now);
+            }
+            rows += 1;
+            break;
+          default:
+            break;
+        }
+      }
+    });
+    this.emitMetric({
+      kind: "gateway_projection_cache_write",
+      scope: authorityScope,
+      rows,
+      bytes,
+      projection_bytes: bytes,
+      gateway_projection_rows_written: rows,
+      gateway_projection_bytes: bytes,
+      source
+    }, this.durableHostKey());
+    return { rows, bytes };
+  }
+
+  private requireProjectionWritesComplete(
+    scope: ObjRef,
+    delta: ProjectionDeltaSummary | undefined,
+    writes: readonly ProjectionWrite[],
+    source: string
+  ): void {
+    if (!delta) return;
+    const missing = projectionDeltaMissingWrites(delta, writes);
+    if (missing.length === 0) return;
+    throw wooError("E_PROJECTION_INCOMPLETE", "projection_delta upserts/deletes are missing row-body-complete projection_writes", {
+      scope,
+      source,
+      missing
+    });
+  }
+
+  private invalidateGatewayToolSurfacesForObject(authorityScope: ObjRef, object: ObjRef): void {
+    const rows = sqlRows<{ scope: string; object: string }>(this.state.storage.sql.exec(
+      `SELECT scope, object FROM gateway_tool_surface_source
+       WHERE source_table = 'objects' AND source_authority_scope = ? AND source_key = ?`,
+      authorityScope,
+      object
+    ));
+    for (const row of rows) this.deleteGatewayToolSurface(row.scope as ObjRef, row.object as ObjRef);
+  }
+
+  private deleteGatewayToolSurface(scope: ObjRef, object: ObjRef): void {
+    this.state.storage.sql.exec("DELETE FROM gateway_tool_surface WHERE scope = ? AND object = ?", scope, object);
+    this.state.storage.sql.exec("DELETE FROM gateway_tool_surface_source WHERE scope = ? AND object = ?", scope, object);
+    this.refreshGatewayToolSurfaceScopeSaturation(scope, Date.now());
+  }
+
+  private upsertGatewayToolSurface(row: ToolSurfaceProjectionRow, objectAuthorityScope: ObjRef, head: ShadowScopeHead, now = Date.now()): void {
+    const sourceRows = coalesceToolSurfaceSourceRows(row.source_rows);
+    const maxScopeRows = this.toolSurfaceSourceIndexMaxScopeRows();
+    const maxShardRows = this.toolSurfaceSourceIndexMaxShardRows();
+    const retainedScopeRows = firstSqlRow<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS n FROM gateway_tool_surface_source WHERE scope = ? AND object <> ?",
+      row.scope,
+      row.object
+    ))?.n ?? 0;
+    const retainedShardRows = firstSqlRow<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS n FROM gateway_tool_surface_source WHERE scope <> ? OR object <> ?",
+      row.scope,
+      row.object
+    ))?.n ?? 0;
+    const disabledCurrentObject = firstSqlRow<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS n FROM gateway_tool_surface WHERE scope = ? AND object = ? AND stale = 1 AND stale_reason = 'disabled'",
+      row.scope,
+      row.object
+    ))?.n ?? 0;
+    const scopeCapHit = retainedScopeRows + sourceRows.length > maxScopeRows;
+    const shardCapHit = retainedShardRows + sourceRows.length > maxShardRows;
+    const scopeBlocked = this.gatewayToolSurfaceScopeSaturated(row.scope) && disabledCurrentObject === 0;
+    const saturated = scopeBlocked || scopeCapHit || shardCapHit;
+    const saturationReason = scopeBlocked || (scopeCapHit && !shardCapHit) ? "scope" : scopeCapHit && shardCapHit ? "scope_and_shard" : "shard";
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO gateway_tool_surface(
+        scope, object, object_authority_scope, body, last_apply_seq, last_apply_hash, updated_at_ms, stale, stale_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      row.scope,
+      row.object,
+      objectAuthorityScope,
+      stableShadowJson({ ...row, source_rows: sourceRows } as unknown as WooValue),
+      head.seq,
+      head.hash,
+      now,
+      saturated ? 1 : 0,
+      saturated ? "disabled" : null
+    );
+    this.state.storage.sql.exec("DELETE FROM gateway_tool_surface_source WHERE scope = ? AND object = ?", row.scope, row.object);
+    if (saturated) {
+      this.markGatewayToolSurfaceScopeSaturated(row.scope, saturationReason, now);
+      this.emitMetric({
+        kind: "gateway_tool_surface_source_rows",
+        scope: row.scope,
+        object: row.object,
+        rows: sourceRows.length,
+        scope_rows: retainedScopeRows,
+        shard_rows: retainedShardRows,
+        cap: maxScopeRows,
+        shard_cap: maxShardRows,
+        saturated: true,
+        saturation_reason: saturationReason
+      }, this.durableHostKey());
+      return;
+    }
+    for (const sourceRow of sourceRows) {
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO gateway_tool_surface_source(
+          scope, source_table, source_authority_scope, source_key, object
+        ) VALUES (?, ?, ?, ?, ?)`,
+        row.scope,
+        sourceRow.table,
+        sourceRow.authority_scope,
+        sourceRow.key,
+        row.object
+      );
+    }
+    this.emitMetric({
+      kind: "gateway_tool_surface_source_rows",
+      scope: row.scope,
+      object: row.object,
+      rows: sourceRows.length,
+      scope_rows: retainedScopeRows + sourceRows.length,
+      shard_rows: retainedShardRows + sourceRows.length,
+      cap: maxScopeRows,
+      shard_cap: maxShardRows,
+      saturated: false
+    }, this.durableHostKey());
+    this.refreshGatewayToolSurfaceScopeSaturation(row.scope, now);
+  }
+
+  private readGatewayToolSurfaceDescriptors(requests: readonly RemoteToolRequest[]): RemoteToolDescriptor[] {
+    if (!this.toolSurfaceProjectionRowsEnabled()) return [];
+    const out: RemoteToolDescriptor[] = [];
+    const seen = new Set<string>();
+    const append = (row: ToolSurfaceProjectionRow): void => {
+      for (const verb of row.verbs) {
+        const key = `${row.object}\u0000${verb.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          object: row.object,
+          verb: verb.name,
+          aliases: verb.aliases ?? [],
+          arg_spec: verb.arg_spec ?? {},
+          direct: verb.direct === true,
+          source: verb.source ?? "",
+          enclosingSpace: verb.enclosingSpace ?? row.scope,
+          source_rows: row.source_rows
+        });
+      }
+    };
+    for (const request of requests) {
+      if (this.gatewayToolSurfaceScopeSaturated(request.id)) continue;
+      const rows = request.expandContents
+        ? sqlRows<{ body: string }>(this.state.storage.sql.exec(
+            "SELECT body FROM gateway_tool_surface WHERE scope = ? AND stale = 0 ORDER BY object",
+            request.id
+          ))
+        : sqlRows<{ body: string }>(this.state.storage.sql.exec(
+            "SELECT body FROM gateway_tool_surface WHERE scope = ? AND object = ? AND stale = 0",
+            request.id,
+            request.id
+          ));
+      for (const raw of rows) {
+        const parsed = JSON.parse(raw.body) as unknown;
+        if (isToolSurfaceProjectionRow(parsed)) append(parsed);
+      }
+    }
+    return out;
+  }
+
+  private gatewayToolSurfaceScopeSaturated(scope: ObjRef): boolean {
+    const row = firstSqlRow<{ saturated: number }>(this.state.storage.sql.exec(
+      "SELECT saturated FROM gateway_tool_surface_scope WHERE scope = ?",
+      scope
+    ));
+    return row?.saturated === 1;
+  }
+
+  private markGatewayToolSurfaceScopeSaturated(scope: ObjRef, reason: "scope" | "shard" | "scope_and_shard", now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR IGNORE INTO gateway_tool_surface_scope(scope, saturated, saturated_reason, updated_at_ms) VALUES (?, 1, ?, ?)",
+      scope,
+      reason,
+      now
+    );
+    this.state.storage.sql.exec(
+      "UPDATE gateway_tool_surface_scope SET saturated = 1, saturated_reason = ?, updated_at_ms = ? WHERE scope = ?",
+      reason,
+      now,
+      scope
+    );
+  }
+
+  private refreshGatewayToolSurfaceScopeSaturation(scope: ObjRef, now: number): void {
+    if (!this.gatewayToolSurfaceScopeSaturated(scope)) return;
+    // Recovery requires all disabled descriptor rows to be replaced or deleted;
+    // otherwise descriptor reads would see only a prefix of the active scope.
+    const disabledRows = firstSqlRow<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS n FROM gateway_tool_surface WHERE scope = ? AND stale = 1 AND stale_reason = 'disabled'",
+      scope
+    ))?.n ?? 0;
+    const scopeRows = firstSqlRow<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS n FROM gateway_tool_surface_source WHERE scope = ?",
+      scope
+    ))?.n ?? 0;
+    const shardRows = firstSqlRow<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS n FROM gateway_tool_surface_source"
+    ))?.n ?? 0;
+    if (disabledRows > 0 || scopeRows > this.toolSurfaceSourceIndexMaxScopeRows() || shardRows > this.toolSurfaceSourceIndexMaxShardRows()) return;
+    this.state.storage.sql.exec(
+      "UPDATE gateway_tool_surface_scope SET saturated = 0, saturated_reason = NULL, updated_at_ms = ? WHERE scope = ?",
+      now,
+      scope
+    );
+  }
+
+  private storeGatewayToolSurfacesFromDescriptors(scope: ObjRef, authorityScope: ObjRef, descriptors: readonly RemoteToolDescriptor[]): void {
+    if (!this.toolSurfaceProjectionRowsEnabled() || descriptors.length === 0) return;
+    const byObject = new Map<ObjRef, RemoteToolDescriptor[]>();
+    for (const descriptor of descriptors) {
+      const list = byObject.get(descriptor.object) ?? [];
+      list.push(descriptor);
+      byObject.set(descriptor.object, list);
+    }
+    const now = Date.now();
+    const head: ShadowScopeHead = {
+      kind: "woo.scope_head.shadow.v1",
+      scope,
+      epoch: 1,
+      seq: 0,
+      hash: ""
+    };
+    this.state.storage.transactionSync(() => {
+      for (const [object, objectDescriptors] of byObject) {
+        const sourceRows = coalesceToolSurfaceSourceRows(
+          objectDescriptors.flatMap((descriptor) => descriptor.source_rows && descriptor.source_rows.length > 0
+            ? descriptor.source_rows.map((row) => ({ ...row, authority_scope: authorityScope }))
+            : [{ table: "objects" as const, authority_scope: authorityScope, key: object }])
+        );
+        this.upsertGatewayToolSurface({
+          kind: "woo.tool_surface_projection.v1",
+          scope,
+          object,
+          head,
+          verbs: objectDescriptors.map((descriptor) => ({
+            name: descriptor.verb,
+            owner: object,
+            perms: "x",
+            aliases: descriptor.aliases,
+            arg_spec: descriptor.arg_spec,
+            direct: descriptor.direct,
+            source: descriptor.source,
+            enclosingSpace: descriptor.enclosingSpace
+          })),
+          source_rows: sourceRows
+        }, authorityScope, head, now);
+      }
+    });
+  }
+
+  private storeGatewayToolSurfacesForRequests(requests: readonly RemoteToolRequest[], descriptors: readonly RemoteToolDescriptor[]): void {
+    for (const request of requests) {
+      this.storeGatewayToolSurfacesFromDescriptors(
+        request.id,
+        request.id,
+        descriptors.filter((descriptor) => this.remoteToolDescriptorMatchesRequest(descriptor, request))
+      );
+    }
+  }
+
+  private remoteToolDescriptorMatchesRequest(descriptor: RemoteToolDescriptor, request: RemoteToolRequest): boolean {
+    if (descriptor.object === request.id) return true;
+    return request.expandContents === true && descriptor.enclosingSpace === request.id;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -807,6 +1396,7 @@ export class PersistentObjectDO {
       const initStart = Date.now();
       this.mcpGateway = new McpGateway(world, {
         serverName: "woo",
+        externalProjectionFanout: this.gatewayProjectionCacheEnabled(),
         v2: {
           open: async (scope, body): Promise<McpV2OpenResult> => {
             world.touchSessionInput(body.session);
@@ -816,6 +1406,7 @@ export class PersistentObjectDO {
             world.touchSessionInput(body.session);
             const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
             const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, { localMcpLiveHandled: true });
+            this.applyGatewayProjectionCacheFromReply(result.reply, "mcp");
             return { ...result, local_host_materialized: delivery.localHostMaterialized };
           },
           // tolerateRemoteFailures: this is the per-envelope refresh callback
@@ -824,7 +1415,13 @@ export class PersistentObjectDO {
           // existing cells. The first-open seeding path does NOT pass this
           // flag — see comment on v2GatewayAuthorityPayload.
           authorityPayload: async (extraObjectIds) =>
-            await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true })
+            await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true }),
+          executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
+        },
+        toolManifests: {
+          staleFallback: this.sameHostStaleFallbackEnabled(),
+          loadSessionManifest: (sessionId) => this.loadGatewaySessionToolManifest(sessionId),
+          saveSessionManifest: (manifest) => this.saveGatewaySessionToolManifest(manifest)
         },
         broadcasts: {}
       });
@@ -2034,6 +2631,7 @@ export class PersistentObjectDO {
       },
       enumerateRemoteTools: async (actor, requests) => {
         // Group ids by owning host, RPC each, merge.
+        const staleFallback = this.sameHostStaleFallbackEnabled();
         const byHost = new Map<string, RemoteToolRequest[]>();
         for (const request of requests) {
           const id = request.id;
@@ -2046,9 +2644,21 @@ export class PersistentObjectDO {
         if (byHost.size === 0) return [];
         const responses = await Promise.all(
           Array.from(byHost, async ([host, hostRequests]) => {
+            const cached = staleFallback ? this.readGatewayToolSurfaceDescriptors(hostRequests) : [];
+            if (cached.length > 0) {
+              this.emitMetric({
+                kind: "same_host_fallback",
+                route: "/__internal/enumerate-tools",
+                host,
+                rows: cached.length,
+                reason: "cache_hit"
+              }, localHost);
+              return cached;
+            }
             try {
               const response = await this.forwardInternalReadChecked<{ tools: RemoteToolDescriptor[] }>(host, "/__internal/enumerate-tools", { actor, requests: hostRequests });
               const tools = response.tools ?? [];
+              this.storeGatewayToolSurfacesForRequests(hostRequests, tools);
               // Returned descriptors include runtime-minted objects (tasks
               // created on the cluster) that the directory may not know about
               // yet. Record the responding host as their route so a follow-up
@@ -2058,6 +2668,17 @@ export class PersistentObjectDO {
               }
               return tools;
             } catch {
+              if (cached.length > 0) {
+                this.emitMetric({
+                  kind: "same_host_fallback",
+                  route: "/__internal/enumerate-tools",
+                  host,
+                  rows: cached.length,
+                  reason: "owner_timeout"
+                }, localHost);
+                return cached;
+              }
+              if (staleFallback) throw new Error(`remote tool descriptor refresh failed: ${host}`);
               return [] as RemoteToolDescriptor[];
             }
           })
@@ -2228,6 +2849,7 @@ export class PersistentObjectDO {
           throw wooError("E_INVARG", "mcp-commit-fanout requires transcript");
         }
         const originSession = typeof body.origin_session === "string" ? body.origin_session : null;
+        this.applyGatewayProjectionWrites(body.commit.position, body.commit.projection_writes ?? [], "fanout", body.commit.projection_delta);
         this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession);
         return jsonResponse({ ok: true });
       }
@@ -2253,6 +2875,13 @@ export class PersistentObjectDO {
         const commit = body.commit as ShadowCommitAccepted;
         const transcript = body.transcript as EffectTranscript;
         if (commit.position.scope !== scope || transcript.scope !== scope) throw wooError("E_INVARG", "apply-v2-commit scope mismatch");
+        const projectionWrites = Array.isArray(body.projection_writes)
+          ? body.projection_writes as ProjectionWrite[]
+          : commit.projection_writes ?? [];
+        if (projectionWrites.length > 0 || commit.projection_delta) {
+          this.requireProjectionWritesComplete(scope, commit.projection_delta, projectionWrites, "host_apply");
+          return jsonResponse(world.applyProjectionWrites(projectionWrites, { transcript }));
+        }
         // Satellite write-through: apply to the local host slice. The
         // ShadowApplyTarget abstraction supplies only `applyTranscript`
         // here — the originating gateway already did session/api-key
@@ -3083,7 +3712,7 @@ export class PersistentObjectDO {
       const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds);
       this.emitV2OpenStep("gateway_authority", phaseStartedAt, { scope: commitScope, node, actor: session.actor, count: seedObjectIds.length });
       phaseStartedAt = metricNow();
-      const opened = await this.v2CommitScopeOpen(world, commitScope, {
+      const openBody = {
         scope: commitScope,
         node,
         token,
@@ -3092,7 +3721,13 @@ export class PersistentObjectDO {
         ...authority,
         ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
         ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
-      }, seedObjectIds);
+      };
+      const opened = await this.v2CommitScopeOpen(
+        world,
+        commitScope,
+        this.browserCheckpointTailOpenEnabled() ? this.withCheckpointTailOpen(openBody) : openBody,
+        seedObjectIds
+      );
       this.emitV2OpenStep("gateway_commit_scope_open", phaseStartedAt, { scope: commitScope, node, actor: session.actor });
       const hello = opened.hello;
       phaseStartedAt = metricNow();
@@ -3109,6 +3744,18 @@ export class PersistentObjectDO {
       } satisfies ShadowEnvelope<typeof hello>);
       server.send(helloEnvelope);
       this.emitV2OpenStep("gateway_send_hello", phaseStartedAt, { scope: commitScope, node, actor: session.actor, bytes: helloEnvelope.length });
+      if (isCheckpointTailOpenResponse(opened)) {
+        await this.sendCheckpointTailOpenTransfer(server, opened, {
+          token,
+          node,
+          actor: session.actor,
+          sessionId: session.id,
+          scope: commitScope,
+          openBody: this.withCheckpointTailOpen(openBody)
+        });
+        this.updateV2SocketStateHead(server, opened.head);
+        this.emitV2OpenStep("gateway_send_ads", metricNow(), { scope: commitScope, node, actor: session.actor, bytes: 0, count: 0 });
+      } else {
       const transfer = opened.transfer;
       phaseStartedAt = metricNow();
       const transferEnvelope = encodeEnvelope({
@@ -3160,6 +3807,7 @@ export class PersistentObjectDO {
         server.send(adEnvelope);
       }
       this.emitV2OpenStep("gateway_send_ads", phaseStartedAt, { scope: commitScope, node, actor: session.actor, bytes: adBytes, count: opened.ads?.length ?? 0 });
+      }
     } catch (err) {
       world.detachSocket(session.id, socketId);
       this.indexRemoveSocket(session.id, session.actor, server);
@@ -3261,6 +3909,53 @@ export class PersistentObjectDO {
     return payload as T;
   }
 
+  private async sendCheckpointTailOpenTransfer(
+    server: WebSocket,
+    opened: CommitScopeCheckpointTailOpenResponse,
+    input: { token: string; node: string; actor: ObjRef; sessionId: string; scope: ObjRef; openBody: Record<string, unknown> }
+  ): Promise<void> {
+    let current = opened;
+    for (let chunk = 0; chunk < 256; chunk += 1) {
+      const phaseStartedAt = metricNow();
+      const body: CheckpointTailOpenTransfer = {
+        kind: "woo.open.checkpoint_tail.v1",
+        scope: input.scope,
+        head: current.head,
+        transfer: current.transfer,
+        viewer: { actor: input.actor, session: input.sessionId }
+      };
+      const envelope = encodeEnvelope({
+        v: 2,
+        type: body.kind,
+        id: `${this.durableHostKey()}:checkpoint-tail:${crypto.randomUUID()}`,
+        from: current.relay,
+        to: input.node,
+        actor: input.actor,
+        session: input.sessionId,
+        auth: { mode: "session", token: input.token },
+        body
+      } satisfies ShadowEnvelope<CheckpointTailOpenTransfer>);
+      server.send(envelope);
+      this.emitV2OpenStep("gateway_send_checkpoint_tail_transfer", phaseStartedAt, {
+        scope: input.scope,
+        node: input.node,
+        actor: input.actor,
+        bytes: envelope.length,
+        transfer_mode: current.transfer.kind,
+        count: current.transfer.kind === "frames" ? current.transfer.frames.length : current.transfer.checkpoint.pages.length,
+        ...(current.transfer.continuation ? { continuation: true } : {})
+      });
+      const continuation = current.transfer.continuation;
+      if (!continuation) return;
+      current = await this.v2CommitScopePost<CommitScopeCheckpointTailOpenResponse>(input.scope, "/v2/open", {
+        ...input.openBody,
+        open_protocol: "checkpoint_tail.v1",
+        continuation
+      });
+    }
+    throw wooError("E_CHECKPOINT_CONTINUATION_LOOP", "checkpoint/tail continuation did not terminate within the gateway safety cap");
+  }
+
   private async v2CommitScopeOpen(
     world: WooWorld,
     scope: ObjRef,
@@ -3271,6 +3966,9 @@ export class PersistentObjectDO {
     try {
       return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", body);
     } catch (err) {
+      if (Object.prototype.hasOwnProperty.call(body, "open_protocol") && isCommitScopeCheckpointPendingError(err)) {
+        return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", this.withoutCheckpointTailOpen(body));
+      }
       if (!isCommitScopeSnapshotRequiredError(err) || Object.prototype.hasOwnProperty.call(body, "serialized")) throw err;
       const seeded = seed ?? await this.v2GatewayState(world, seedObjectIds);
       return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", {
@@ -3310,6 +4008,10 @@ export class PersistentObjectDO {
         openedAt: Date.now(),
         nextTurn: 0
       };
+      if (this.restExecutionCapsuleEnabled() && !forceReopen) {
+        this.rememberRestV2Relay(scope, client);
+        return client;
+      }
       const opened = await this.v2CommitScopeOpen(world, scope, {
         ...seeded.authority,
         scope,
@@ -3323,8 +4025,33 @@ export class PersistentObjectDO {
       return client;
     }
     this.rememberRestV2Relay(scope, client);
-    mergeExecutorAuthority(client.relay.commit_scope.serialized, seeded.authority.authority, { clone: true });
+    mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "rest_authority_merge", metric: (event) => world.recordMetric(event) }), seeded.authority.authority, { clone: true });
     return client;
+  }
+
+  private restExecutionCapsuleEnabled(): boolean {
+    return envFlag(this.env.WOO_V2_EXECUTION_CAPSULE);
+  }
+
+  private withRestExecutionCapsule(
+    client: RestV2RelayClient | undefined,
+    body: ExecutorEnvelopeBody,
+    target: ObjRef,
+    verb: string
+  ): ExecutorEnvelopeBody {
+    if (!this.restExecutionCapsuleEnabled() || !client) return body;
+    return {
+      ...body,
+      execution_capsule: buildExecutionCapsule({
+        scope: body.scope,
+        head: client.relay.commit_scope.head,
+        actor: body.actor,
+        session: body.session,
+        target,
+        verb,
+        authority: body.authority
+      })
+    };
   }
 
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
@@ -3514,7 +4241,7 @@ export class PersistentObjectDO {
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
       clientHead: (client) => client.relay.commit_scope.head,
-      clientSerialized: (client) => client.relay.commit_scope.serialized,
+      clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "rest_turn_plan", metric: (event) => world.recordMetric(event) }),
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => executorEnvelopeId(id, attempt, () => crypto.randomUUID()),
       // Per-turn authority refresh against an already-opened relay; the
@@ -3522,7 +4249,38 @@ export class PersistentObjectDO {
       // can be safely omitted. See comment on v2GatewayAuthorityPayload.
       authorityPayload: async (_scope, extraObjectIds) =>
         await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true }),
-      submitEnvelope: async (scope, body) => await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body),
+      submitEnvelope: async (scope, body) => {
+        const client = this.restV2Relays.get(scope);
+        const capsuleBody = this.withRestExecutionCapsule(client, body, input.target, input.verb);
+        try {
+          return await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", capsuleBody);
+        } catch (err) {
+          if (!this.restExecutionCapsuleEnabled() || !isCommitScopeSnapshotRequiredError(err)) throw err;
+          if (!client) throw err;
+          const seedObjectIds = executorAuthorityObjectIds({
+            scope: input.scope,
+            target: input.target,
+            actor: input.actor,
+            args: input.args,
+            body: input.body
+          }, scope);
+          const seeded = await this.v2GatewayState(world, seedObjectIds);
+          const opened = await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", {
+            ...seeded.authority,
+            scope,
+            node: client.node,
+            token,
+            session: input.session.id,
+            actor: input.actor,
+            serialized: seeded.serialized
+          });
+          if (opened.head) client.relay.commit_scope.head = opened.head;
+          mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "rest_capsule_open_seed", metric: (event) => world.recordMetric(event) }), seeded.authority.authority, { clone: true });
+          const { execution_capsule, ...legacyBody } = capsuleBody;
+          void execution_capsule;
+          return await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", legacyBody);
+        }
+      },
       // Forward planning-phase verb metrics to the host world's metrics
       // hook so /admin/ footprint-by-verb sees v2 traffic.
       onMetric: (event) => world.recordMetric(event)
@@ -3616,11 +4374,45 @@ export class PersistentObjectDO {
       ? reply.body.transcript.call.scope as ObjRef
       : null;
     if (callScope && callScope !== reply.body.commit.position.scope) this.restV2Relays.delete(callScope);
+    const projectionWrites = reply.body.commit.projection_writes ?? [];
+    const projectionDelta = reply.body.commit.projection_delta;
+    if (projectionDelta) {
+      const revokedBefore = projectionWrites.length ? this.revokedApiKeyIds(world) : null;
+      this.applyGatewayProjectionWrites(reply.body.commit.position, projectionWrites, "rest", projectionDelta);
+      if (projectionWrites.length) {
+        world.applyProjectionWrites(projectionWrites, { persist: false, transcript: reply.body.transcript });
+      }
+      if (revokedBefore) await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
+      const session = world.sessions.get(sessionId);
+      if (session) {
+        this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
+        await this.registerSessionRoute(session);
+      }
+      world.recordMetric({
+        kind: "gateway_projection_apply",
+        scope: reply.body.commit.position.scope,
+        rows: projectionWrites.length,
+        projection_bytes: projectionDelta?.projection_bytes ?? 0,
+        source: "rest"
+      });
+      return;
+    }
     await runShadowApply(
       reply.body.transcript,
       this.buildGatewayApplyTarget(world, { skipObjectHost: localHostMaterialized }),
       { sessionId, result: reply.body.outcome.result ?? reply.body.transcript.result }
     );
+  }
+
+  private applyGatewayProjectionCacheFromReply(replyText: string | null, source: "rest" | "mcp" | "fanout"): void {
+    if (!replyText) return;
+    const reply = decodeEnvelope<ShadowTurnExecReply | ShadowStateTransfer>(replyText);
+    if (!isShadowTurnExecReply(reply.body)) return;
+    if (reply.body.ok !== true || !reply.body.commit) return;
+    const projectionWrites = reply.body.commit.projection_writes ?? [];
+    const projectionDelta = reply.body.commit.projection_delta;
+    if (!projectionWrites.length && !projectionDelta) return;
+    this.applyGatewayProjectionWrites(reply.body.commit.position, projectionWrites, source, projectionDelta);
   }
 
   private mirrorResultRoomToSession(world: WooWorld, session: Session, result: unknown): void {
@@ -3883,6 +4675,9 @@ export class PersistentObjectDO {
     transcript: EffectTranscript
   ): Promise<V2LocalHostMaterialization> {
     const startedAt = Date.now();
+    if (commit.projection_delta) {
+      return await this.writeThroughProjectionWritesToObjectHosts(world, scope, commit, transcript, startedAt);
+    }
     const touched = transcriptTouchedObjectIds(transcript);
     touched.add(scope);
     const localHost = this.durableHostKey();
@@ -3911,6 +4706,91 @@ export class PersistentObjectDO {
       console.warn("woo.v2_host_apply_fanout.failed", { scope, error });
       throw wooError("E_RETRY", `v2 commit accepted but object-host write-through failed: ${error.message}`, { scope, error });
     }
+  }
+
+  private async writeThroughProjectionWritesToObjectHosts(
+    world: WooWorld,
+    scope: ObjRef,
+    commit: ShadowCommitAccepted,
+    transcript: EffectTranscript,
+    startedAt: number
+  ): Promise<V2LocalHostMaterialization> {
+    const localHost = this.durableHostKey();
+    const projectionWrites = commit.projection_writes ?? [];
+    this.requireProjectionWritesComplete(scope, commit.projection_delta, projectionWrites, "host_write_through");
+    const byHost = await this.projectionWritesByHost(world, scope, projectionWrites, localHost);
+    const localWrites = byHost.get(localHost) ?? [];
+    let localApplied = false;
+    if (localWrites.length > 0) {
+      world.applyProjectionWrites(localWrites, { transcript });
+      byHost.delete(localHost);
+      localApplied = true;
+    }
+    try {
+      await Promise.all(Array.from(byHost, ([host, projectionWrites]) => this.forwardInternalChecked<{ ok: true }>(host, "/__internal/apply-v2-commit", {
+        scope,
+        commit: {
+          ...commit,
+          projection_delta: summarizeProjectionWrites(projectionWrites),
+          projection_writes: projectionWrites
+        } as unknown as WooValue,
+        transcript: transcript as unknown as WooValue,
+        projection_writes: projectionWrites as unknown as WooValue
+      }, { timeoutMs: this.hostWriteRpcTimeoutMs() })));
+      const remoteRows = Array.from(byHost.values()).reduce((sum, rows) => sum + rows.length, 0);
+      world.recordMetric({
+        kind: "v2_host_apply_fanout",
+        scope,
+        hosts: byHost.size + (localApplied ? 1 : 0),
+        touched: remoteRows + localWrites.length,
+        ms: Date.now() - startedAt,
+        status: "ok"
+      });
+      return localApplied ? { hostKey: localHost, gatewayHost: localHost === WORLD_HOST } : null;
+    } catch (err) {
+      const error = normalizeError(err);
+      world.recordMetric({ kind: "v2_host_apply_fanout", scope, hosts: byHost.size, touched: commit.projection_writes?.length ?? 0, ms: Date.now() - startedAt, status: "error", error: error.code });
+      console.warn("woo.v2_host_apply_fanout.failed", { scope, error });
+      throw wooError("E_RETRY", `v2 commit accepted but object-host projection write-through failed: ${error.message}`, { scope, error });
+    }
+  }
+
+  private async projectionWritesByHost(
+    world: WooWorld,
+    scope: ObjRef,
+    writes: readonly ProjectionWrite[],
+    fallbackHost: string
+  ): Promise<Map<string, ProjectionWrite[]>> {
+    const byHost = new Map<string, ProjectionWrite[]>();
+    const add = async (hostKey: string, write: ProjectionWrite): Promise<void> => {
+      if (!hostKey) return;
+      const list = byHost.get(hostKey) ?? [];
+      list.push(write);
+      byHost.set(hostKey, list);
+    };
+    for (const write of writes) {
+      switch (write.table) {
+        case "objects":
+        case "tombstones":
+          await add(await this.resolveObjectHostForWorld(world, write.key, fallbackHost), write);
+          break;
+        case "logs":
+        case "snapshots":
+          await add(await this.resolveObjectHostForWorld(world, write.key.space, fallbackHost), write);
+          break;
+        case "parked_tasks":
+          await add(write.op === "upsert"
+            ? await this.resolveObjectHostForWorld(world, write.row.parked_on, fallbackHost)
+            : await this.resolveObjectHostForWorld(world, scope, fallbackHost), write);
+          break;
+        case "sessions":
+        case "counters":
+        case "tool_surfaces":
+          await add(fallbackHost, write);
+          break;
+      }
+    }
+    return byHost;
   }
 
   private async deliverMcpCommitFanout(
@@ -4442,6 +5322,61 @@ function workerRestRequest(request: Request, pathname: string): RestProtocolRequ
     header: (name) => request.headers.get(name),
     readJson: () => readJsonBody(request)
   };
+}
+
+function sqlRows<T>(cursor: unknown): T[] {
+  if (cursor && typeof cursor === "object" && "toArray" in cursor && typeof cursor.toArray === "function") {
+    return cursor.toArray() as T[];
+  }
+  return Array.from(cursor as Iterable<T>);
+}
+
+function firstSqlRow<T>(cursor: unknown): T | null {
+  return sqlRows<T>(cursor)[0] ?? null;
+}
+
+function envFlag(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
+function nonNegativeIntegerEnv(value: string | undefined, fallback: number): number {
+  const raw = Number(value ?? fallback);
+  return Number.isInteger(raw) && raw >= 0 ? raw : fallback;
+}
+
+function isSessionToolManifest(value: unknown): value is SessionToolManifest {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as { kind?: unknown }).kind === "woo.session_tool_manifest.v1" &&
+    typeof (value as { session_id?: unknown }).session_id === "string" &&
+    typeof (value as { actor?: unknown }).actor === "string" &&
+    typeof (value as { active_scope?: unknown }).active_scope === "string" &&
+    Array.isArray((value as { tools?: unknown }).tools)
+  );
+}
+
+function isToolSurfaceProjectionRow(value: unknown): value is ToolSurfaceProjectionRow {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as { kind?: unknown }).kind === "woo.tool_surface_projection.v1" &&
+    typeof (value as { scope?: unknown }).scope === "string" &&
+    typeof (value as { object?: unknown }).object === "string" &&
+    Array.isArray((value as { verbs?: unknown }).verbs)
+  );
+}
+
+function coalesceToolSurfaceSourceRows(rows: ToolSurfaceProjectionRow["source_rows"]): ToolSurfaceProjectionRow["source_rows"] {
+  const byKey = new Map<string, ToolSurfaceProjectionRow["source_rows"][number]>();
+  for (const row of rows) {
+    byKey.set(`${row.table}\u0000${row.authority_scope}\u0000${row.key}`, row);
+  }
+  return Array.from(byKey.values()).sort((left, right) =>
+    `${left.table}\u0000${left.authority_scope}\u0000${left.key}`.localeCompare(`${right.table}\u0000${right.authority_scope}\u0000${right.key}`)
+  );
 }
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {

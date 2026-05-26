@@ -248,6 +248,27 @@ describe("metrics-sink", () => {
       expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("no_reachability_change");
     });
 
+    it("populates mode for commit_reply_replay on the reason axis", () => {
+      const { binding, calls } = fakeAnalytics();
+      const event: MetricEvent = {
+        kind: "commit_reply_replay",
+        scope: "#-1",
+        node: "browser:v2-cost",
+        route: "/v2/envelope",
+        mode: "cached_sql",
+        status: "ok",
+        reply: "accepted",
+        bytes: 512,
+        ms: 1
+      };
+      writeMetricToAnalytics(event, "#-1", binding);
+      expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("commit_reply_replay");
+      expect(calls[0]!.blobs?.[SLOT_SCOPE]).toBe("#-1");
+      expect(calls[0]!.blobs?.[SLOT_ROUTE]).toBe("/v2/envelope");
+      expect(calls[0]!.blobs?.[SLOT_STATUS]).toBe("ok");
+      expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("cached_sql");
+    });
+
     it("falls back to start when no target is present (dangling_parent_ref)", () => {
       const { binding, calls } = fakeAnalytics();
       const event: MetricEvent = { kind: "dangling_parent_ref", start: "obj_a", missing: "obj_b", tombstoned: false };

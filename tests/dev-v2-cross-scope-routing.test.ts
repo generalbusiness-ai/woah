@@ -13,6 +13,7 @@ import {
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   handleShadowBrowserTurnExecEnvelope,
+  markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserAuthoritySessionState,
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserEnvelope,
@@ -22,7 +23,17 @@ import { encodeEnvelope } from "../src/core/shadow-envelope";
 import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting, resolveTurnEnvelopeScope } from "../src/server/dev-v2-helpers";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import { v2TurnResultMessageFromReply } from "../src/client/v2-browser-messages";
+import { serializedFor } from "../src/core/shadow-commit-scope";
 import type { ObjRef } from "../src/core/types";
+
+function refreshRelaySessions(
+  relay: ReturnType<typeof createShadowBrowserRelayShim>,
+  sessions: Parameters<typeof mergeShadowBrowserAuthoritySessionState>[1]
+): void {
+  const snapshot = serializedFor(relay.commit_scope);
+  snapshot.sessions = mergeShadowBrowserAuthoritySessionState(snapshot.sessions, sessions);
+  markShadowBrowserRelaySerializedChanged(relay);
+}
 
 describe("dev v2 cross-scope WS routing", () => {
   it("routes a chat-style 'enter <space>' intent to the target's scope, not the chatroom scope", async () => {
@@ -85,10 +96,7 @@ describe("dev v2 cross-scope WS routing", () => {
     });
     relay.session_auth = sessionAuth.session_auth;
     relay.session_revs = sessionAuth.session_revs;
-    relay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
-      relay.commit_scope.serialized.sessions,
-      sessions
-    );
+    refreshRelaySessions(relay, sessions);
     const browser = createShadowBrowserClient({
       node: "browser-cross-scope-dispatch",
       scope: targetScope,
@@ -145,10 +153,7 @@ describe("dev v2 cross-scope WS routing", () => {
     });
     relay.session_auth = sessionAuth.session_auth;
     relay.session_revs = sessionAuth.session_revs;
-    relay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
-      relay.commit_scope.serialized.sessions,
-      sessions
-    );
+    refreshRelaySessions(relay, sessions);
     const browser = createShadowBrowserClient({
       node: "browser-cross-scope-regression",
       scope: chatroomScope,
@@ -208,10 +213,7 @@ describe("dev v2 cross-scope WS routing", () => {
     });
     relay.session_auth = sessionAuth.session_auth;
     relay.session_revs = sessionAuth.session_revs;
-    relay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
-      relay.commit_scope.serialized.sessions,
-      sessions
-    );
+    refreshRelaySessions(relay, sessions);
     const browser = createShadowBrowserClient({
       node: "browser-outliner-add",
       scope: targetScope,
@@ -275,10 +277,7 @@ describe("dev v2 cross-scope WS routing", () => {
     });
     relay.session_auth = sessionAuth.session_auth;
     relay.session_revs = sessionAuth.session_revs;
-    relay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
-      relay.commit_scope.serialized.sessions,
-      sessions
-    );
+    refreshRelaySessions(relay, sessions);
     const browser = createShadowBrowserClient({
       node: "browser-outliner-no-presence",
       scope: targetScope,
@@ -402,10 +401,7 @@ describe("dev v2 cross-scope WS routing", () => {
     });
     chatroomRelay.session_auth = chatroomAuth.session_auth;
     chatroomRelay.session_revs = chatroomAuth.session_revs;
-    chatroomRelay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
-      chatroomRelay.commit_scope.serialized.sessions,
-      sessions
-    );
+    refreshRelaySessions(chatroomRelay, sessions);
     const chatroomBrowser = createShadowBrowserClient({
       node: "browser-enter-dubspace-routing-e2e",
       scope: "the_chatroom" as ObjRef,
@@ -451,10 +447,7 @@ describe("dev v2 cross-scope WS routing", () => {
     });
     dubspaceRelay.session_auth = dubspaceAuth.session_auth;
     dubspaceRelay.session_revs = dubspaceAuth.session_revs;
-    dubspaceRelay.commit_scope.serialized.sessions = mergeShadowBrowserAuthoritySessionState(
-      dubspaceRelay.commit_scope.serialized.sessions,
-      sessions
-    );
+    refreshRelaySessions(dubspaceRelay, sessions);
     const dubspaceBrowser = createShadowBrowserClient({
       node: "browser-enter-dubspace-routing-e2e",
       scope: "the_dubspace" as ObjRef,

@@ -14,24 +14,27 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
 import { serializedWorldFromAuthoritySlice } from "../core/authority-slice";
-import type { AppliedFrame, DirectResultFrame, ErrorFrame, ErrorValue, Message, ObjRef, Session, WooValue } from "../core/types";
+import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice } from "../core/repository";
+import { projectionDeltaMissingWrites } from "../core/projection-delta";
 import { createMcpServer } from "./server";
-import { McpHost, type McpBroadcastHooks, type McpDispatchHooks } from "./host";
+import { McpHost, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
 import {
   createShadowBrowserRelayShim,
   markShadowBrowserRelaySerializedChanged,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, applyShadowTranscriptToCommitScopeCache, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import { applyAcceptedShadowFrame, applyShadowTranscriptToCommitScopeCache, serializedFor, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
+  buildExecutionCapsule,
   mergeExecutorAuthority,
   submitTurnIntent,
-  executorAuthorityPayload
+  executorAuthorityPayload,
+  type ExecutionCapsule
 } from "../core/executor";
 
 const MCP_TOKEN_HEADER = "mcp-token";
@@ -52,6 +55,21 @@ function isV2CommitScopeSnapshotRequiredError(err: unknown): boolean {
   return (nested as { code?: unknown }).code === V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED;
 }
 
+function assertProjectionWritesComplete(
+  delta: NonNullable<ShadowCommitAccepted["projection_delta"]>,
+  writes: readonly NonNullable<ShadowCommitAccepted["projection_writes"]>[number][],
+  scope: ObjRef,
+  source: "fanout" | "mcp"
+): void {
+  const missing = projectionDeltaMissingWrites(delta, writes);
+  if (missing.length === 0) return;
+  throw wooError("E_PROJECTION_INCOMPLETE", "projection_delta upserts/deletes are missing row-body-complete projection_writes", {
+    scope,
+    source,
+    missing
+  });
+}
+
 type SessionEntry = {
   woo: Session;
   v2Token: string;
@@ -64,6 +82,7 @@ export type McpV2ClientHooks = {
   open: (scope: ObjRef, body: McpV2OpenBody) => Promise<McpV2OpenResult>;
   envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
   authorityPayload?: (extraObjectIds: ObjRef[]) => Promise<ReturnType<typeof executorAuthorityPayload>>;
+  executionCapsuleOpen?: boolean;
 };
 
 export type McpV2OpenBody = {
@@ -72,6 +91,7 @@ export type McpV2OpenBody = {
   token: string;
   session: string;
   actor: ObjRef;
+  known_head?: ShadowScopeHead | null;
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
   authority?: SerializedAuthoritySlice;
@@ -93,6 +113,7 @@ export type McpV2EnvelopeBody = {
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
   authority?: SerializedAuthoritySlice;
+  execution_capsule?: ExecutionCapsule;
   envelope: string;
 };
 
@@ -125,6 +146,8 @@ export type McpGatewayOptions = {
   serverVersion?: string;
   broadcasts?: McpBroadcastHooks;
   dispatch?: McpDispatchHooks;
+  toolManifests?: McpToolManifestHooks;
+  externalProjectionFanout?: boolean;
   v2?: McpV2ClientHooks;
 };
 
@@ -145,7 +168,7 @@ export class McpGateway {
       call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) =>
         await this.invokeV2Call(sessionId, actor, space, message)
     } satisfies McpDispatchHooks : options.dispatch;
-    this.host = new McpHost(world, dispatch);
+    this.host = new McpHost(world, dispatch, options.toolManifests);
     if (options.broadcasts) this.host.setBroadcastHooks(options.broadcasts);
   }
 
@@ -316,13 +339,42 @@ export class McpGateway {
   }
 
   private applyRemoteAccepted(scope: ObjRef, entry: RemoteAcceptedCommit): void {
+    const projectionWrites = entry.commit.projection_writes ?? [];
+    if (entry.commit.projection_delta) {
+      assertProjectionWritesComplete(entry.commit.projection_delta, projectionWrites, entry.commit.position.scope, "fanout");
+    }
     this.rememberRemoteAccepted(remoteAcceptedKey(entry.commit));
     const client = this.v2Scopes.get(scope);
     if (client) {
       applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
-    this.world.applyCommittedShadowTranscript(entry.transcript);
+    if (entry.commit.projection_delta) {
+      // Worker gateways persist accepted fanout into their SQL projection
+      // cache before calling this method. In that mode the MCP gateway only
+      // routes observations; updating its WooWorld would reintroduce the
+      // mirror-world maintenance path the projection cache replaces.
+      if (this.options.externalProjectionFanout === true) {
+        this.world.recordMetric({
+          kind: "gateway_projection_apply",
+          scope: entry.commit.position.scope,
+          rows: projectionWrites.length,
+          projection_bytes: entry.commit.projection_delta?.projection_bytes ?? 0,
+          source: "fanout"
+        });
+      } else {
+        this.world.applyProjectionWrites(projectionWrites, { persist: false, transcript: entry.transcript });
+        this.world.recordMetric({
+          kind: "gateway_projection_apply",
+          scope: entry.commit.position.scope,
+          rows: projectionWrites.length,
+          projection_bytes: entry.commit.projection_delta?.projection_bytes ?? 0,
+          source: "fanout"
+        });
+      }
+    } else {
+      this.world.applyCommittedShadowTranscript(entry.transcript);
+    }
     this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
     this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript);
   }
@@ -522,7 +574,28 @@ export class McpGateway {
         if (client) this.mergeV2AuthorityIntoScopeClient(client, payload.authority);
         return payload;
       },
-      submitEnvelope: async (submitScope, body) => await hooks.envelope(submitScope, body),
+      submitEnvelope: async (submitScope, body) => {
+        const envelopeBody = this.withExecutionCapsule(
+          hooks,
+          this.v2Scopes.get(submitScope)?.relay.commit_scope.head ?? null,
+          body as McpV2EnvelopeBody,
+          target,
+          verb
+        );
+        try {
+          return await hooks.envelope(submitScope, envelopeBody);
+        } catch (err) {
+          if (!hooks.executionCapsuleOpen || !isV2CommitScopeSnapshotRequiredError(err)) throw err;
+          const client = this.v2Scopes.get(submitScope);
+          if (!client) throw err;
+          client.openedSessions.delete(entry.woo.id);
+          const seeded = await this.v2SerializedWorld([submitScope, entry.woo.actor]);
+          await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded, { forceLegacyOpen: true });
+          const { execution_capsule, ...legacyBody } = envelopeBody;
+          void execution_capsule;
+          return await hooks.envelope(submitScope, legacyBody);
+        }
+      },
       // Forward planning-phase verb metrics to the gateway world's metrics
       // hook so direct_call/applied/dispatch_resolved/broadcast events land
       // in AE and drive the /admin/ footprint-by-verb view.
@@ -596,23 +669,29 @@ export class McpGateway {
     entry: SessionEntry,
     client: V2ScopeClient,
     hooks: McpV2ClientHooks,
-    seeded?: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }
+    seeded?: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> },
+    options: { forceLegacyOpen?: boolean } = {}
   ): Promise<void> {
-    if (client.openedSessions.has(entry.woo.id)) return;
+    if (!options.forceLegacyOpen && client.openedSessions.has(entry.woo.id)) return;
     const existing = client.openingSessions.get(entry.woo.id);
-    if (existing) {
+    if (!options.forceLegacyOpen && existing) {
       await existing;
       return;
     }
     const pending = (async () => {
       const authority = seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor]);
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
+      if (hooks.executionCapsuleOpen && !options.forceLegacyOpen) {
+        client.openedSessions.add(entry.woo.id);
+        return;
+      }
       const openBody: McpV2OpenBody = {
         scope: client.scope,
         node: this.v2NodeFor(entry),
         token: entry.v2Token,
         session: entry.woo.id,
         actor: entry.woo.actor,
+        known_head: client.relay.commit_scope.head,
         ...authority
       };
       let opened: McpV2OpenResult;
@@ -633,6 +712,28 @@ export class McpGateway {
     }
   }
 
+  private withExecutionCapsule(
+    hooks: McpV2ClientHooks,
+    head: ShadowScopeHead | null,
+    body: McpV2EnvelopeBody,
+    target: ObjRef,
+    verb: string
+  ): McpV2EnvelopeBody {
+    if (!hooks.executionCapsuleOpen || !body.authority || !head) return body;
+    return {
+      ...body,
+      execution_capsule: buildExecutionCapsule({
+        scope: body.scope,
+        head,
+        actor: body.actor,
+        session: body.session,
+        target,
+        verb,
+        authority: body.authority
+      })
+    };
+  }
+
   private async v2AuthorityPayload(extraObjectIds: ObjRef[]): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (this.options.v2?.authorityPayload?.(extraObjectIds) ?? Promise.resolve(executorAuthorityPayload(this.world, extraObjectIds)));
   }
@@ -648,7 +749,7 @@ export class McpGateway {
     // with fresh session/actor authority. Relay-level cache generation must
     // move with that snapshot or open executable seed digests can validate
     // against pre-refresh pages.
-    mergeExecutorAuthority(client.relay.commit_scope.serialized, authority);
+    mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" }), authority);
     markShadowBrowserRelaySerializedChanged(client.relay);
   }
 
@@ -661,9 +762,22 @@ export class McpGateway {
     if (!reply.commit || !reply.transcript) return;
     applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
     markShadowBrowserRelaySerializedChanged(client.relay);
-    this.world.applyCommittedShadowTranscript(reply.transcript, localHostMaterialized
-      ? { skipObjectHost: { hostKey: localHostMaterialized.hostKey, gatewayHost: localHostMaterialized.gatewayHost === true } }
-      : {});
+    const projectionWrites = reply.commit.projection_writes ?? [];
+    if (reply.commit.projection_delta) {
+      assertProjectionWritesComplete(reply.commit.projection_delta, projectionWrites, reply.commit.position.scope, "mcp");
+      this.world.applyProjectionWrites(projectionWrites, { persist: false, transcript: reply.transcript });
+      this.world.recordMetric({
+        kind: "gateway_projection_apply",
+        scope: reply.commit.position.scope,
+        rows: projectionWrites.length,
+        projection_bytes: reply.commit.projection_delta?.projection_bytes ?? 0,
+        source: "mcp"
+      });
+    } else {
+      this.world.applyCommittedShadowTranscript(reply.transcript, localHostMaterialized
+        ? { skipObjectHost: { hostKey: localHostMaterialized.hostKey, gatewayHost: localHostMaterialized.gatewayHost === true } }
+        : {});
+    }
     this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.transcript);
     this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript);
   }

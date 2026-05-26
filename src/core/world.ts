@@ -45,6 +45,7 @@ import {
   transcriptLogEntry,
   transcriptSessionActiveScope
 } from "./shadow-commit-scope";
+import type { ProjectionWrite } from "./projection-delta";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -70,6 +71,11 @@ type ShadowGatewayApplyOptions = {
     hostKey: string;
     gatewayHost?: boolean;
   };
+};
+
+type ProjectionApplyOptions = {
+  persist?: boolean;
+  transcript?: EffectTranscript;
 };
 
 export type ShadowHostApplyResult = {
@@ -6460,6 +6466,146 @@ export class WooWorld {
     });
   }
 
+  applyProjectionWrites(writes: readonly ProjectionWrite[], options: ProjectionApplyOptions = {}): ShadowHostApplyResult {
+    const persist = options.persist !== false;
+    const result: ShadowHostApplyResult = {
+      ok: true,
+      host: "projection",
+      objects: 0,
+      properties: 0,
+      logs: 0,
+      sessions: 0,
+      creates: 0,
+      writes: writes.length
+    };
+    for (const write of writes) {
+      switch (write.table) {
+        case "objects":
+          if (write.op === "delete") {
+            this.objects.delete(write.key);
+            if (persist) this.deletePersistedObject(write.key);
+            else this.invalidateProjectionObjectCache(write.key);
+          } else {
+            const existing = this.objects.get(write.key);
+            const object = this.objectFromSerializedRow(write.row);
+            if (existing && options.transcript) this.mergeScopedProjectionObject(object, existing, write.key, options.transcript);
+            this.objects.set(write.key, object);
+            if (persist) this.persistProjectionObjectWrite(write.key, options.transcript, existing === undefined);
+            else this.invalidateProjectionObjectCache(write.key);
+          }
+          result.objects += 1;
+          break;
+        case "sessions":
+          if (write.op === "delete") {
+            this.sessions.delete(write.key);
+            if (persist) this.deletePersistedSession(write.key);
+          } else {
+            const session = this.hydrateSession(write.row, Date.now());
+            this.sessions.set(write.key, session);
+            if (persist) this.persistSession(session);
+          }
+          result.sessions += 1;
+          break;
+        case "logs":
+          if (write.op === "delete") {
+            const entries = this.logs.get(write.key.space) ?? [];
+            this.logs.set(write.key.space, entries.filter((entry) => entry.seq !== write.key.seq));
+          } else {
+            const entries = this.logs.get(write.key.space) ?? [];
+            const row = cloneValue(write.row as unknown as WooValue) as unknown as SpaceLogEntry;
+            mergeTranscriptLogEntry(entries, row);
+            this.logs.set(write.key.space, entries);
+            if (persist) this.activeObjectRepository()?.saveCommittedLogEntry(write.key.space, row);
+          }
+          result.logs += 1;
+          break;
+        case "snapshots":
+          this.snapshots = write.op === "delete"
+            ? this.snapshots.filter((row) => row.space_id !== write.key.space || row.seq !== write.key.seq)
+            : upsertProjectionRow(this.snapshots, (row) => row.space_id === write.key.space && row.seq === write.key.seq, cloneValue(write.row as unknown as WooValue) as unknown as SpaceSnapshotRecord);
+          if (persist && write.op === "upsert") this.activeObjectRepository()?.saveSpaceSnapshot(write.row);
+          break;
+        case "parked_tasks":
+          if (write.op === "delete") {
+            this.parkedTasks.delete(write.key);
+            if (persist) this.deletePersistedTask(write.key);
+          } else {
+            const task = cloneValue(write.row as unknown as WooValue) as unknown as ParkedTaskRecord;
+            this.parkedTasks.set(write.key, task);
+            if (persist) this.persistTask(task);
+          }
+          break;
+        case "counters":
+          if (write.key === "objectCounter") this.objectCounter = write.value;
+          if (write.key === "sessionCounter") this.sessionCounter = write.value;
+          if (write.key === "parkedTaskCounter") this.parkedTaskCounter = write.value;
+          if (persist) this.persistCounters();
+          break;
+        case "tombstones":
+          if (write.op === "delete") {
+            this.tombstones.delete(write.key);
+          } else {
+            this.tombstones.add(write.key);
+            if (persist) this.persistTombstone(write.key);
+          }
+          break;
+        case "tool_surfaces":
+          break;
+      }
+    }
+    return result;
+  }
+
+  private mergeScopedProjectionObject(target: WooObject, existing: WooObject, id: ObjRef, transcript: EffectTranscript): void {
+    // Projection rows are complete for the scope that accepted the frame, not
+    // necessarily complete for an object host's durable read model. Preserve
+    // out-of-scope containment and apply the accepted transcript's exact
+    // containment deltas onto the local full row.
+    let contents = Array.from(existing.contents);
+    let sawContentsWrite = false;
+    for (const write of finalWritesByCell(transcript)) {
+      if (write.cell.kind !== "contents" || write.cell.object !== id) continue;
+      sawContentsWrite = true;
+      contents = applyTranscriptContentsWriteRefs(contents, write, transcript, (event) => this.recordMetric(event));
+    }
+    target.contents = new Set(sawContentsWrite ? contents : Array.from(existing.contents));
+
+    const children = new Set(existing.children);
+    for (const create of transcript.creates) {
+      if (create.parent === id) children.add(create.object);
+    }
+    target.children = children;
+  }
+
+  private persistProjectionObjectWrite(id: ObjRef, transcript: EffectTranscript | undefined, created: boolean): void {
+    if (!transcript) {
+      this.persistObject(id);
+      return;
+    }
+    let wholeObjectDirty = created;
+    const dirtyProps = new Set<string>();
+    for (const create of transcript.creates) {
+      if (create.object === id || create.parent === id || create.location === id) wholeObjectDirty = true;
+    }
+    for (const write of finalWritesByCell(transcript)) {
+      if (write.cell.object !== id) continue;
+      if (write.cell.kind === "prop") {
+        if (write.op === "remove") wholeObjectDirty = true;
+        else dirtyProps.add(write.cell.name);
+      } else {
+        wholeObjectDirty = true;
+      }
+    }
+    if (wholeObjectDirty) this.persistObject(id);
+    for (const name of dirtyProps) this.persistProperty(id, name);
+    if (!wholeObjectDirty && dirtyProps.size === 0) this.invalidateProjectionObjectCache(id);
+  }
+
+  private invalidateProjectionObjectCache(id: ObjRef): void {
+    this.mutationCounter += 1;
+    this.invalidateHostSeed(this.hostKeyForObject(id));
+  }
+
   applyCommittedShadowTranscript(transcript: EffectTranscript, options: ShadowGatewayApplyOptions = {}): void {
     // CommitScopeDO is the authority for v2 shadow commits. The gateway keeps
     // this WooWorld as a routing/tool-list cache. Apply the same transcript
@@ -6737,6 +6883,27 @@ export class WooWorld {
       children: new Set(),
       contents: new Set(),
       eventSchemas: new Map()
+    };
+  }
+
+  private objectFromSerializedRow(item: SerializedObject): WooObject {
+    return {
+      id: item.id,
+      name: item.name,
+      parent: item.parent,
+      owner: item.owner,
+      location: item.location,
+      anchor: item.anchor,
+      flags: { ...(item.flags ?? {}) },
+      created: item.created,
+      modified: item.modified,
+      propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
+      properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
+      propertyVersions: new Map(item.propertyVersions),
+      verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+      children: new Set(item.children),
+      contents: new Set(item.contents),
+      eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
     };
   }
 
@@ -7499,23 +7666,33 @@ export class WooWorld {
   }
 
   reapExpiredSessions(now = Date.now()): string[] {
+    const startedAt = Date.now();
     const reaped: string[] = [];
+    let inspected = 0;
+    let guestReaped = 0;
+    let credentialReaped = 0;
+    const noteReaped = (session: Session): void => {
+      inspected += 1;
+      if (!this.sessionExpired(session, now)) return;
+      if (session.tokenClass === "guest") guestReaped += 1;
+      else credentialReaped += 1;
+      this.reapSession(session.id);
+      reaped.push(session.id);
+    };
     if (this.activeObjectRepository()) {
       for (const session of Array.from(this.sessions.values())) {
-        if (!this.sessionExpired(session, now)) continue;
-        this.reapSession(session.id);
-        reaped.push(session.id);
+        noteReaped(session);
       }
+      if (reaped.length > 0) this.recordMetric({ kind: "session_reap", inspected, reaped: reaped.length, guest_reaped: guestReaped, credential_reaped: credentialReaped, ms: Date.now() - startedAt });
       return reaped;
     }
     this.withPersistencePaused(() => {
       for (const session of Array.from(this.sessions.values())) {
-        if (!this.sessionExpired(session, now)) continue;
-        this.reapSession(session.id);
-        reaped.push(session.id);
+        noteReaped(session);
       }
     });
     if (reaped.length > 0) this.persist(true);
+    if (reaped.length > 0) this.recordMetric({ kind: "session_reap", inspected, reaped: reaped.length, guest_reaped: guestReaped, credential_reaped: credentialReaped, ms: Date.now() - startedAt });
     return reaped;
   }
 
@@ -7600,20 +7777,6 @@ export class WooWorld {
     if (!session) return;
     const isGuest = this.inheritsFrom(session.actor, "$guest");
     const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
-    // Diagnostic: surface the exact reap moment + the state we're about to
-    // blow away. Triage cross-actor smoke needs to know whether the
-    // `actor_loc=$nowhere active_scope=null` pattern is caused by reap →
-    // resetGuestOnDisconnect or by some other code path.
-    this.recordMetric({
-      kind: "session_reap",
-      session_id: sessionId,
-      actor: session.actor,
-      token_class: session.tokenClass ?? "guest",
-      is_guest: isGuest,
-      active_scope: session.activeScope ?? null,
-      last_detach_ms_ago: session.lastDetachAt === null ? null : Math.max(0, Date.now() - session.lastDetachAt),
-      expires_at_ms: session.expiresAt
-    });
     session.attachedSockets.clear();
     this.killReadTasksFor(session.actor);
     this.removeSessionPresence(sessionId, session.actor);
@@ -11096,6 +11259,14 @@ function cloneImportedPlainData<T>(value: T): T {
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) out[key] = cloneImportedPlainData(entry);
   return out as T;
+}
+
+function upsertProjectionRow<T>(rows: T[], predicate: (row: T) => boolean, value: T): T[] {
+  const next = rows.slice();
+  const index = next.findIndex(predicate);
+  if (index >= 0) next[index] = value;
+  else next.push(value);
+  return next;
 }
 
 function sortedMap<K extends string, V>(map: Map<K, V>): Map<K, V> {

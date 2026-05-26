@@ -66,6 +66,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 
 - [core.md](spec/semantics/core.md) — woah core: objects, messages, spaces, actors, observations
 - [distribution.md](spec/semantics/distribution.md) — Execute/Sequence/Hold roles; turn scope vs object host; sequencer keyed by scope ObjRef; cell version is freshness; no node owns objects (DT1–DT8, **draft**)
+- [projection-cache.md](spec/semantics/projection-cache.md) — accepted-frame projection rows, row-body-complete fanout, tool-surface rows, and session tool manifests (PC1–PC4, **draft**)
 - [values.md](spec/semantics/values.md) — value contract, equality, canonical serialization (V1–V11)
 - [objects.md](spec/semantics/objects.md) — object model, identity, verb dispatch, properties (§4, §5, §9, §10)
 - [sequenced-log.md](spec/semantics/sequenced-log.md) — `$sequenced_log` primitive: atomic seq allocation, durable append-only log (SL1–SL10)

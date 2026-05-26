@@ -89,6 +89,8 @@ function primaryCount(event: MetricEvent): number {
       return typeof e.fanout === "number" ? e.fanout : 0;
     case "v2_host_apply_fanout":
       return typeof e.hosts === "number" ? e.hosts : 0;
+    case "gateway_tool_surface_source_rows":
+      return typeof e.rows === "number" ? e.rows : 0;
     case "shadow_open_executable_seed_bytes":
       return typeof e.bytes === "number" ? e.bytes : 0;
     case "v2_open_step":
@@ -140,8 +142,9 @@ function primaryCount(event: MetricEvent): number {
 //   blobs[13]   = actor          mcp_tool_refresh_*.actor, dispatch_resolved.actor
 //   blobs[14]   = path           dispatch_resolved.path: "local"|"read"|"mutating",
 //                                browser frame/activity path
-//   blobs[15]   = reason         mcp_tool_refresh_*.reason, shadow_commit_rejected.reason,
+//   blobs[15]   = reason/mode    mcp_tool_refresh_*.reason, shadow_commit_rejected.reason,
 //                                rest_v2_in_process_fallback.reason,
+//                                commit_reply_replay.mode,
 //                                shadow_transcript_anomaly.reason,
 //                                browser fallback/cache reason
 //   blobs[16]   = error_detail   bounded diagnostic detail for uncoded errors
@@ -190,7 +193,7 @@ export function writeMetricToAnalytics(
   blobs[12] = stringOrEmpty(e.host);
   blobs[13] = stringOrEmpty(e.actor);
   blobs[14] = stringOrEmpty(e.path);
-  blobs[15] = stringOrEmpty(e.reason);
+  blobs[15] = stringOrEmpty(e.reason ?? e.mode);
   blobs[16] = stringOrEmpty(e.error_detail);
   blobs[17] = stringOrEmpty(e.source);
 

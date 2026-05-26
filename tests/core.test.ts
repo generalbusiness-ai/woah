@@ -2008,6 +2008,29 @@ describe("woo core", () => {
     expect(world.sessions.has(session.id)).toBe(true);
   });
 
+  it("emits one session_reap metric only for sweeps that reap sessions", () => {
+    const metrics: MetricEvent[] = [];
+    const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+    const first = world.auth("guest:reap-metric-a");
+    const second = world.auth("guest:reap-metric-b");
+
+    expect(world.reapExpiredSessions(Date.now())).toEqual([]);
+    expect(metrics.filter((event) => event.kind === "session_reap")).toEqual([]);
+
+    first.expiresAt = 1;
+    second.expiresAt = 1;
+    expect(world.reapExpiredSessions(2).sort()).toEqual([first.id, second.id].sort());
+    const reaps = metrics.filter((event) => event.kind === "session_reap");
+    expect(reaps).toHaveLength(1);
+    expect(reaps[0]).toMatchObject({
+      kind: "session_reap",
+      inspected: 2,
+      reaped: 2,
+      guest_reaped: 2,
+      credential_reaped: 0
+    });
+  });
+
   it("keeps a long-attached session resumable for the detach grace window", async () => {
     const world = createWorld();
     const session = world.auth("guest:long-attached");

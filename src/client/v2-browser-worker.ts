@@ -1,11 +1,12 @@
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { EffectTranscript } from "../core/effect-transcript";
-import type { SerializedObject } from "../core/repository";
+import type { ParkedTaskRecord, SerializedObject, SerializedSession, SerializedWorld, SpaceSnapshotRecord } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
-import { applyShadowScopeProjectionPatch, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
+import { applyShadowScopeProjectionPatch, shadowScopeProjectionFromSerialized, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
-import type { WooValue } from "../core/types";
+import type { ObjRef, SpaceLogEntry, WooValue } from "../core/types";
+import type { CheckpointTailOpenTransfer, ProjectionWrite, ToolSurfaceProjectionRow } from "../core/projection-delta";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
@@ -57,6 +58,7 @@ type V2CacheStatus = {
   connected: boolean;
   pending: number;
   projections: number;
+  projection_rows: number;
   applied_frames: number;
   transcript_tail: number;
   object_pages: number;
@@ -95,10 +97,11 @@ type BrowserActivityMetric = {
 };
 
 const DB_NAME = "woo-v2-browser";
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 const META_STORE = "meta";
 const PENDING_STORE = "pending";
 const PROJECTION_STORE = "projections";
+const PROJECTION_ROW_STORE = "projection_rows";
 const APPLIED_STORE = "applied_frames";
 const TRANSCRIPT_STORE = "transcript_tail";
 const OBJECT_PAGE_STORE = "object_pages";
@@ -303,7 +306,8 @@ async function connect(): Promise<void> {
     resolveReady();
     return promise;
   }
-  const lastKnownHead: ShadowScopeHead | undefined = isShadowScopeHead(cachedHead) ? cachedHead : undefined;
+  const hasProjectionRows = target.scope ? await projectionRowCountForScope(target.scope) > 0 : false;
+  const lastKnownHead: ShadowScopeHead | undefined = isShadowScopeHead(cachedHead) && hasProjectionRows ? cachedHead : undefined;
   const wsCreateStartedAt = metricNow();
   const ws = new WebSocket(v2BrowserWebSocketUrl({
     location,
@@ -450,6 +454,8 @@ async function receiveFrame(encoded: string): Promise<void> {
     });
     let installedExecutableState = false;
     const receivedStateTransfer = envelope.type === "woo.state.transfer.shadow.v1";
+    const receivedCheckpointTail = envelope.type === "woo.open.checkpoint_tail.v1";
+    const receivedCompleteCheckpointTail = receivedCheckpointTail && checkpointTailOpenTransferIsComplete(envelope.body);
     const receivedExecutableStateTransfer = receivedStateTransfer && isExecutableStateTransfer(envelope.body);
     const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
     const mutations = v2BrowserCacheMutationsForEnvelope(envelope);
@@ -476,8 +482,13 @@ async function receiveFrame(encoded: string): Promise<void> {
     if (envelope.type === "woo.state.transfer.shadow.v1" && envelope.reply_to) {
       resolvePendingStateTransfer(envelope.reply_to);
     }
-    if (installedExecutableState || receivedStateTransfer) await replayPending();
-    markConnectReady(receivedStateTransfer, receivedExecutableStateTransfer, receivedExecutionAd, envelope.type === "woo.transport.error.v1");
+    if (installedExecutableState || receivedStateTransfer || receivedCompleteCheckpointTail) await replayPending();
+    markConnectReady(
+      receivedStateTransfer || receivedCompleteCheckpointTail,
+      receivedExecutableStateTransfer || receivedCompleteCheckpointTail,
+      receivedExecutionAd || receivedCompleteCheckpointTail,
+      envelope.type === "woo.transport.error.v1"
+    );
     postMessage({ kind: "frame", envelope });
     postStatus();
   } catch (err) {
@@ -513,6 +524,13 @@ function isExecutableStateTransfer(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   const mode = (body as { mode?: unknown }).mode;
   return mode === "closure" || mode === "object_records" || mode === "cell_pages";
+}
+
+function checkpointTailOpenTransferIsComplete(body: unknown): boolean {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  const transfer = (body as { transfer?: unknown }).transfer;
+  if (!transfer || typeof transfer !== "object" || Array.isArray(transfer)) return false;
+  return !("continuation" in transfer);
 }
 
 async function replayPending(): Promise<void> {
@@ -1084,6 +1102,7 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(META_STORE)) database.createObjectStore(META_STORE);
       if (!database.objectStoreNames.contains(PENDING_STORE)) database.createObjectStore(PENDING_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(PROJECTION_STORE)) database.createObjectStore(PROJECTION_STORE, { keyPath: "scope" });
+      if (!database.objectStoreNames.contains(PROJECTION_ROW_STORE)) database.createObjectStore(PROJECTION_ROW_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(APPLIED_STORE)) database.createObjectStore(APPLIED_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(TRANSCRIPT_STORE)) database.createObjectStore(TRANSCRIPT_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(OBJECT_PAGE_STORE)) database.createObjectStore(OBJECT_PAGE_STORE, { keyPath: "hash" });
@@ -1159,7 +1178,7 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
           await putTranscript(mutation.transcript, mutation.frame.position.seq);
           await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
         }
-        if (mutation.transcript && rememberAppliedFramePost(mutation.frame)) return { kind: "applied_frame", frame: mutation.frame, transcript: mutation.transcript };
+        if (rememberAppliedFramePost(mutation.frame)) return { kind: "applied_frame", frame: mutation.frame, transcript: mutation.transcript };
         return;
       }
       case "transcript":
@@ -1175,6 +1194,12 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
       case "state_pages":
         await putStatePages(mutation.pages);
         return;
+      case "checkpoint_tail": {
+        const installed = await installCheckpointTailProjection(mutation.transfer);
+        if (!installed) return;
+        await putProjection(installed.scope, installed.head, installed.projection);
+        return { kind: "projection", scope: installed.scope, head: installed.head, projection: installed.projection };
+      }
       case "execution_ad":
         await putExecutionAd(mutation.record);
         return;
@@ -1204,6 +1229,7 @@ function mutationScope(mutation: V2BrowserCacheMutation): string | undefined {
   if ("scope" in mutation && typeof mutation.scope === "string") return mutation.scope;
   if (mutation.kind === "applied_frame") return mutation.frame.position.scope;
   if (mutation.kind === "transcript") return mutation.transcript.scope;
+  if (mutation.kind === "checkpoint_tail") return mutation.transfer.scope;
   if (mutation.kind === "execution_transfer") return mutation.record.scope;
   if (mutation.kind === "execution_ad") return mutation.record.scope;
   return current?.scope;
@@ -1215,12 +1241,16 @@ function mutationApproxBytes(mutation: V2BrowserCacheMutation): number | undefin
   if (mutation.kind === "state_pages") return mutation.pages.reduce((total, page) => total + jsonBytes(page.page), 0);
   if (mutation.kind === "projection") return jsonBytes(mutation.projection);
   if (mutation.kind === "projection_patch") return jsonBytes(mutation.patch);
+  if (mutation.kind === "checkpoint_tail") return jsonBytes(mutation.transfer.transfer);
   if (mutation.kind === "execution_transfer") return jsonBytes(mutation.record.transfer);
   return undefined;
 }
 
 function mutationCount(mutation: V2BrowserCacheMutation): number {
   if (mutation.kind === "state_pages") return mutation.pages.length;
+  if (mutation.kind === "checkpoint_tail") {
+    return mutation.transfer.transfer.kind === "frames" ? mutation.transfer.transfer.frames.length : mutation.transfer.transfer.checkpoint.pages.length;
+  }
   return 1;
 }
 
@@ -1235,6 +1265,194 @@ async function getProjection(scope: string): Promise<unknown | undefined> {
 
 function isProjectionRow(value: unknown): value is { scope: string; head: unknown; projection: unknown } {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) && typeof (value as { scope?: unknown }).scope === "string" && "projection" in value);
+}
+
+type ProjectionRowRecord =
+  | { id: string; scope: string; table: "objects"; key: ObjRef; row: SerializedObject }
+  | { id: string; scope: string; table: "sessions"; key: string; row: SerializedSession }
+  | { id: string; scope: string; table: "logs"; key: string; space: ObjRef; row: SpaceLogEntry }
+  | { id: string; scope: string; table: "snapshots"; key: string; space: ObjRef; row: SpaceSnapshotRecord }
+  | { id: string; scope: string; table: "parked_tasks"; key: string; row: ParkedTaskRecord }
+  | { id: string; scope: string; table: "tombstones"; key: ObjRef; row: { id: ObjRef } }
+  | { id: string; scope: string; table: "tool_surfaces"; key: string; row: ToolSurfaceProjectionRow };
+
+type ProjectionRowRecordInput =
+  | { scope: string; table: "objects"; key: ObjRef; row: SerializedObject }
+  | { scope: string; table: "sessions"; key: string; row: SerializedSession }
+  | { scope: string; table: "logs"; key: string; space: ObjRef; row: SpaceLogEntry }
+  | { scope: string; table: "snapshots"; key: string; space: ObjRef; row: SpaceSnapshotRecord }
+  | { scope: string; table: "parked_tasks"; key: string; row: ParkedTaskRecord }
+  | { scope: string; table: "tombstones"; key: ObjRef; row: { id: ObjRef } }
+  | { scope: string; table: "tool_surfaces"; key: string; row: ToolSurfaceProjectionRow };
+
+function projectionRowId(scope: string, table: ProjectionRowRecord["table"], key: string): string {
+  return `${scope}\u0000${table}\u0000${key}`;
+}
+
+async function projectionRowsForScope(scope: string): Promise<ProjectionRowRecord[]> {
+  const rows = await tx<ProjectionRowRecord[]>(PROJECTION_ROW_STORE, "readonly", (store) => store.getAll());
+  return rows.filter((row) => row.scope === scope);
+}
+
+async function projectionRowCountForScope(scope: string): Promise<number> {
+  return (await projectionRowsForScope(scope)).length;
+}
+
+async function putProjectionRow(row: ProjectionRowRecordInput): Promise<void> {
+  await tx(PROJECTION_ROW_STORE, "readwrite", (store) => store.put({ ...row, id: projectionRowId(row.scope, row.table, row.key) }));
+}
+
+async function deleteProjectionRow(scope: string, table: ProjectionRowRecord["table"], key: string): Promise<void> {
+  await tx(PROJECTION_ROW_STORE, "readwrite", (store) => store.delete(projectionRowId(scope, table, key)));
+}
+
+async function clearProjectionRows(scope: string): Promise<void> {
+  for (const row of await projectionRowsForScope(scope)) {
+    await tx(PROJECTION_ROW_STORE, "readwrite", (store) => store.delete(row.id));
+  }
+}
+
+async function installCheckpointTailProjection(
+  transfer: CheckpointTailOpenTransfer
+): Promise<{ scope: string; head: ShadowScopeHead; projection: unknown } | null> {
+  if (transfer.transfer.kind === "checkpoint") {
+    const checkpoint = transfer.transfer.checkpoint;
+    const exportKey = `checkpoint_export:${checkpoint.scope}`;
+    const exportState = {
+      checkpoint_hash: checkpoint.checkpoint_hash,
+      head: checkpoint.head
+    };
+    const prior = await getMeta<typeof exportState>(exportKey);
+    const beginsExport = checkpoint.pages.some((page) => page.page === "000001");
+    if (beginsExport || !prior || prior.checkpoint_hash !== checkpoint.checkpoint_hash) {
+      await clearProjectionRows(checkpoint.scope);
+    }
+    for (const page of checkpoint.pages) {
+      switch (page.table) {
+        case "objects":
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "objects", key: row.id, row });
+          break;
+        case "sessions":
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "sessions", key: row.id, row });
+          break;
+        case "logs":
+          for (const item of page.rows) {
+            await putProjectionRow({ scope: checkpoint.scope, table: "logs", key: `${item.space}:${item.entry.seq}`, space: item.space, row: item.entry });
+          }
+          break;
+        case "snapshots":
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "snapshots", key: `${row.space_id}:${row.seq}`, space: row.space_id, row });
+          break;
+        case "parked_tasks":
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "parked_tasks", key: row.id, row });
+          break;
+        case "tombstones":
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "tombstones", key: row.id, row });
+          break;
+        case "tool_surfaces":
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "tool_surfaces", key: `${row.scope}:${row.object}`, row });
+          break;
+        default:
+          break;
+      }
+    }
+    await putMeta(exportKey, exportState);
+    if (transfer.transfer.continuation) {
+      await putMeta("catchup_required", true);
+      return null;
+    }
+    await putMeta(`head:${checkpoint.scope}`, checkpoint.head);
+    await putMeta("catchup_required", false);
+    return {
+      scope: checkpoint.scope,
+      head: checkpoint.head,
+      projection: await projectionFromStoredRows(checkpoint.scope, checkpoint.head, transfer.viewer)
+    };
+  }
+
+  for (const frame of transfer.transfer.frames) {
+    for (const write of frame.projection_writes) await applyProjectionWriteToBrowserRows(transfer.scope, write);
+  }
+  await putMeta(`head:${transfer.scope}`, transfer.transfer.to);
+  await putMeta("catchup_required", false);
+  return {
+    scope: transfer.scope,
+    head: transfer.transfer.to,
+    projection: await projectionFromStoredRows(transfer.scope, transfer.transfer.to, transfer.viewer)
+  };
+}
+
+async function applyProjectionWriteToBrowserRows(scope: string, write: ProjectionWrite): Promise<void> {
+  switch (write.table) {
+    case "objects":
+      if (write.op === "delete") await deleteProjectionRow(scope, "objects", write.key);
+      else await putProjectionRow({ scope, table: "objects", key: write.key, row: write.row });
+      return;
+    case "sessions":
+      if (write.op === "delete") await deleteProjectionRow(scope, "sessions", write.key);
+      else await putProjectionRow({ scope, table: "sessions", key: write.key, row: write.row });
+      return;
+    case "logs": {
+      const key = `${write.key.space}:${write.key.seq}`;
+      if (write.op === "delete") await deleteProjectionRow(scope, "logs", key);
+      else await putProjectionRow({ scope, table: "logs", key, space: write.key.space, row: write.row });
+      return;
+    }
+    case "snapshots": {
+      const key = `${write.key.space}:${write.key.seq}`;
+      if (write.op === "delete") await deleteProjectionRow(scope, "snapshots", key);
+      else await putProjectionRow({ scope, table: "snapshots", key, space: write.key.space, row: write.row });
+      return;
+    }
+    case "parked_tasks":
+      if (write.op === "delete") await deleteProjectionRow(scope, "parked_tasks", write.key);
+      else await putProjectionRow({ scope, table: "parked_tasks", key: write.key, row: write.row });
+      return;
+    case "tombstones":
+      if (write.op === "delete") await deleteProjectionRow(scope, "tombstones", write.key);
+      else await putProjectionRow({ scope, table: "tombstones", key: write.key, row: write.row });
+      return;
+    case "tool_surfaces": {
+      const key = `${write.key.scope}:${write.key.object}`;
+      if (write.op === "delete") await deleteProjectionRow(scope, "tool_surfaces", key);
+      else await putProjectionRow({ scope, table: "tool_surfaces", key, row: write.row });
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+async function projectionFromStoredRows(
+  scope: string,
+  head: ShadowScopeHead,
+  viewer?: CheckpointTailOpenTransfer["viewer"]
+): Promise<unknown> {
+  const rows = await projectionRowsForScope(scope);
+  const logsBySpace = new Map<ObjRef, SpaceLogEntry[]>();
+  for (const row of rows) {
+    if (row.table !== "logs") continue;
+    const entries = logsBySpace.get(row.space) ?? [];
+    entries.push(row.row);
+    logsBySpace.set(row.space, entries);
+  }
+  const serialized: SerializedWorld = {
+    version: 1,
+    objectCounter: 0,
+    parkedTaskCounter: 0,
+    sessionCounter: 0,
+    objects: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "objects" }> => row.table === "objects").map((row) => row.row),
+    sessions: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "sessions" }> => row.table === "sessions").map((row) => row.row),
+    logs: Array.from(logsBySpace, ([space, entries]) => [space, entries.sort((a, b) => a.seq - b.seq)] as [ObjRef, SpaceLogEntry[]]),
+    snapshots: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "snapshots" }> => row.table === "snapshots").map((row) => row.row),
+    parkedTasks: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "parked_tasks" }> => row.table === "parked_tasks").map((row) => row.row),
+    tombstones: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "tombstones" }> => row.table === "tombstones").map((row) => row.row.id)
+  };
+  return shadowScopeProjectionFromSerialized(serialized, scope as ObjRef, head, transferViewer(viewer));
+}
+
+function transferViewer(viewer?: CheckpointTailOpenTransfer["viewer"]): { actor: ObjRef; session?: string | null } | undefined {
+  return viewer;
 }
 
 async function postCachedProjection(scope: string): Promise<void> {
@@ -1605,6 +1823,7 @@ async function status(): Promise<V2CacheStatus> {
     connected: socket?.readyState === WebSocket.OPEN,
     pending: (await allPending()).length,
     projections: await countStore(PROJECTION_STORE),
+    projection_rows: await countStore(PROJECTION_ROW_STORE),
     applied_frames: await countStore(APPLIED_STORE),
     transcript_tail: await countStore(TRANSCRIPT_STORE),
     object_pages: await countStore(OBJECT_PAGE_STORE),

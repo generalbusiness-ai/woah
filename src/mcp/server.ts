@@ -71,7 +71,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
 
   const toolsByName = new Map<string, McpTool>();
   const refreshTools = async (): Promise<McpTool[]> => {
-    const { tools } = await host.listTools(actor, { scope: "active", limit: 64 });
+    const { tools } = await host.listTools(actor, { scope: "active", limit: 64, sessionId });
     toolsByName.clear();
     for (const tool of tools) toolsByName.set(tool.name, tool);
     return tools;
@@ -113,7 +113,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
   };
 
   const findReachableTool = async (object: ObjRef, verb: string): Promise<McpTool> => {
-    const tool = await host.resolveReachableTool(actor, object, verb);
+    const tool = await host.resolveReachableTool(actor, object, verb, sessionId);
     recordToolResolve(object, verb, tool ? "hit" : "miss");
     if (!tool) throw wooError("E_VERBNF", `reachable MCP tool not found: ${object}:${verb}`);
     return tool;
@@ -136,7 +136,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
       },
       invoke: async (params) => {
         const includeSchema = booleanParam(params, "include_schema", false);
-        const page = await host.listTools(actor, toolListOptionsFromParams(params));
+        const page = await host.listTools(actor, { ...toolListOptionsFromParams(params), sessionId });
         return {
           result: {
             scope: page.scope,
@@ -231,7 +231,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools = await refreshTools();
-    await host.markToolListSeen(sessionId, actor);
+    await host.markToolListSeen(sessionId, actor, tools);
     return {
       tools: [
         ...Array.from(stableTools.values(), (tool) => ({
@@ -315,7 +315,7 @@ export function createMcpServer(options: McpServerOptions): McpServerInstance {
     if (!parsed) return { tool: null, logged: false };
     const candidates = parsed.object.startsWith("$") ? [parsed.object] : [parsed.object, `$${parsed.object}` as ObjRef];
     for (const candidate of candidates) {
-      const tool = await host.resolveReachableTool(actor, candidate, parsed.verb);
+      const tool = await host.resolveReachableTool(actor, candidate, parsed.verb, sessionId);
       if (tool) {
         // Resolved against the candidate that hit — record the actual
         // (object, verb) we found, not the requested one, so the metric

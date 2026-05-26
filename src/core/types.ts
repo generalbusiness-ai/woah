@@ -46,6 +46,7 @@ export type RemoteToolDescriptor = {
   direct: boolean;
   source: string;
   enclosingSpace: ObjRef | null;
+  source_rows?: Array<{ table: "objects"; authority_scope: ObjRef; key: ObjRef }>;
 };
 
 export type RemoteToolProjection = "tools" | "obvious";
@@ -282,14 +283,21 @@ export type MetricEvent =
   | { kind: "mcp_tool_resolve"; actor: ObjRef; session_id: string; object: ObjRef; verb: string; active_scope: ObjRef | null; actor_location: ObjRef | null; status: "hit" | "miss"; miss_reason?: "not_reachable" | "verb_not_exposed" | "remote_lookup_unavailable" }
   | { kind: "do_constructor"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; ms: number }
   | { kind: "do_handler"; class: "PersistentObjectDO" | "DirectoryDO" | "CommitScopeDO"; method: string; route: string; ms: number; status: "ok" | "error"; error?: string; error_detail?: string; rpc_id?: string }
-  | { kind: "shadow_apply_step"; phase: "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "total"; scope: ObjRef; route: string; ms: number; objects: number; creates: number; writes: number }
+  | { kind: "shadow_apply_step"; phase: "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "total"; scope: ObjRef; route: string; ms: number; objects: number; creates: number; writes: number; projection_bytes?: number }
+  | { kind: "serialized_world_materialized"; scope: ObjRef; seq: number; reason: string; ms: number; objects: number; sessions: number; logs: number }
   | { kind: "shadow_gateway_apply_step"; phase: "capture_runtime" | "export_world" | "clone_world" | "index_objects" | "collect_writes" | "apply_creates" | "apply_writes" | "apply_session" | "sort_objects" | "apply_log" | "counters" | "apply_serialized" | "import_world" | "restore_runtime" | "total"; scope: ObjRef; route: string; ms: number; objects: number; properties: number; sessions: number; logs: number; creates: number; writes: number }
   | { kind: "shadow_transcript_anomaly"; scope: ObjRef; route: string; reason: "contents_remove_without_move"; object: ObjRef; id?: string }
   | { kind: "shadow_open_executable_seed_bytes"; scope: ObjRef; node: string; bytes: number; pages: number; inline_pages: number; status: "ok" | "warn" }
   | { kind: "v2_open_step"; phase: string; scope?: ObjRef; node?: string; actor?: ObjRef; route?: string; method?: string; path?: string; what?: string; reason?: string; ms: number; status: "ok" | "error"; count?: number; bytes?: number; transfer_mode?: string; executable_transfer_cache?: "hit" | "miss"; full_save?: boolean; error?: string; error_detail?: string }
   | { kind: "v2_open"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; transfer_mode?: string; executable_transfer_cache?: "hit" | "miss"; executable_transfer_bytes?: number; executable_transfer_pages?: number; executable_transfer_inline_pages?: number; preseeded_objects?: number; full_save?: boolean; error?: string; error_detail?: string }
   | { kind: "v2_state_transfer"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; transfer_mode?: string; full_save?: boolean; error?: string; error_detail?: string }
-  | { kind: "v2_envelope"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; fresh?: boolean; reply?: "none" | "accepted" | "live" | "missing_state" | "commit_rejected"; fanout?: number; full_save?: boolean; error?: string; error_detail?: string }
+  | { kind: "v2_envelope"; scope?: ObjRef; node?: string; ms: number; status: "ok" | "error"; fresh?: boolean; reply?: "none" | "accepted" | "live" | "missing_state" | "commit_rejected"; fanout?: number; full_save?: boolean; projection_bytes?: number; tail_rows_written?: number; tail_bytes_retained?: number; error?: string; error_detail?: string }
+  | { kind: "commit_reply_replay"; scope?: ObjRef; node?: string; route: "/v2/envelope"; mode: "fresh" | "cached_sql" | "cached_kv" | "miss_after_hibernate"; status: "ok" | "miss"; reply?: "none" | "accepted" | "live" | "missing_state" | "commit_rejected"; bytes?: number; ms: number }
+  | { kind: "authority_tail"; scope: ObjRef; ms: number; tail_rows_written: number; tail_rows_pruned: number; tail_bytes_retained: number; accepted_frames_retained: number; transcript_tail_retained: number }
+  | { kind: "gateway_projection_apply"; scope: ObjRef; rows: number; projection_bytes: number; source: "rest" | "mcp" | "fanout" }
+  | { kind: "gateway_projection_cache_write"; scope: ObjRef; rows: number; bytes: number; projection_bytes: number; gateway_projection_rows_written: number; gateway_projection_bytes: number; source: "rest" | "mcp" | "fanout" }
+  | { kind: "gateway_tool_surface_source_rows"; scope: ObjRef; object: ObjRef; rows: number; scope_rows: number; shard_rows: number; cap: number; shard_cap: number; saturated: boolean; saturation_reason?: "scope" | "shard" | "scope_and_shard" }
+  | { kind: "same_host_fallback"; route: "/__internal/enumerate-tools"; host: string; rows: number; reason: "owner_timeout" | "cache_hit" }
   | { kind: "v2_ws_reject"; scope?: ObjRef; node?: string; ms: number; status: "error"; error: string; error_detail?: string }
   | { kind: "v2_ws_open"; scope: ObjRef; node: string; actor: ObjRef; ms: number; status: "ok" }
   | { kind: "v2_ws_close"; scope?: ObjRef; node?: string; actor?: ObjRef; code: number; clean: boolean; reason?: string; ms: number; status: "ok" }
@@ -327,12 +335,10 @@ export type MetricEvent =
   // decision so cross_host_rpc latency stats stay clean and policy
   // changes are easy to grep for.
   | { kind: "authority_slice_omitted"; host: string; object_count: number }
-  // Fires from WooWorld.reapSession with the session+actor state at the
-  // moment of reap. Lets triage tell whether a gateway shard's
-  // `actor_loc=$nowhere active_scope=null` divergent state comes from a
-  // reap → resetGuestOnDisconnect (this metric will precede it) or from a
-  // separate code path that clears actor.location and session.activeScope.
-  | { kind: "session_reap"; session_id: string; actor: ObjRef; token_class: string; is_guest: boolean; active_scope: ObjRef | null; last_detach_ms_ago: number | null; expires_at_ms: number }
+  // Fires once per reapExpiredSessions sweep only when at least one session is
+  // actually reaped. This keeps background sweep noise out of data-path tails
+  // while preserving enough volume information for retention debugging.
+  | { kind: "session_reap"; inspected: number; reaped: number; ms: number; guest_reaped: number; credential_reaped: number }
   // Fired on a peer MCP gateway shard when it receives a remote commit or
   // live-event fanout (acceptRemoteV2Commit / acceptRemoteV2Live). Captures
   // whether the receiving shard has any sessions bound (`queue_count`) and

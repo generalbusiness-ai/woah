@@ -39,6 +39,7 @@ import {
 import {
   shadowCommitScopeObject,
   shadowCommitScopeSession,
+  serializedFor,
   transcriptLogEntry,
   transcriptSessionActiveScope,
   transcriptTouchedObjectIds,
@@ -47,10 +48,12 @@ import {
 } from "../core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { stableShadowJson } from "../core/shadow-cell-version";
+import { hashSource } from "../core/source-hash";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
-import { V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED } from "../core/executor";
+import type { AcceptedFrameTransfer, OpenContinuation, OpenTransfer, ProjectionPage, ProjectionWrite, ScopeCheckpoint } from "../core/projection-delta";
+import { V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, type ExecutionCapsule } from "../core/executor";
 import {
   isShadowTurnExecReply,
   shadowReplyMetricKind,
@@ -61,6 +64,55 @@ import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
 
 const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
+const SHADOW_TAIL_RETENTION_BYTES = 16 * 1024 * 1024;
+const SHADOW_TAIL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const CHECKPOINT_TRANSFER_DEFAULT_BYTES = 512 * 1024;
+const CHECKPOINT_TRANSFER_MAX_BYTES = 1024 * 1024;
+const CHECKPOINT_PAGE_TARGET_BYTES = 512 * 1024;
+const CHECKPOINT_CONTINUATION_TTL_MS = 5 * 60 * 1000;
+const JSON_BYTES = new TextEncoder();
+
+type PersistedCheckpointPageRef = {
+  kind: "woo.projection_page_ref.v1";
+  page_index: number;
+  table: ProjectionPage["table"];
+  page: string;
+  hash: string;
+  bytes: number;
+};
+
+type PersistedCheckpointFrameRef = {
+  seq: number;
+  hash: string;
+  bytes: number;
+};
+
+type PersistedScopeCheckpointManifest = {
+  kind: "woo.scope_checkpoint_manifest.v1";
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  checkpoint_hash: string;
+  pages: PersistedCheckpointPageRef[];
+  frame_tail: PersistedCheckpointFrameRef[];
+};
+
+type LoadedScopeCheckpoint =
+  | {
+      storage: "manifest";
+      scope: ObjRef;
+      head: ShadowScopeHead;
+      checkpoint_hash: string;
+      page_refs: PersistedCheckpointPageRef[];
+      frame_refs: PersistedCheckpointFrameRef[];
+    }
+  | {
+      storage: "legacy";
+      scope: ObjRef;
+      head: ShadowScopeHead;
+      checkpoint_hash: string;
+      pages: ProjectionPage[];
+      frame_tail: ShadowCommitAccepted[];
+    };
 
 export class CommitScopeDO {
   private relay: ShadowBrowserRelayShim | null = null;
@@ -68,6 +120,7 @@ export class CommitScopeDO {
   private needsFullSave = false;
   private relayInitPromise: Promise<ShadowBrowserRelayShim> | null = null;
   private fullSavePromise: Promise<void> | null = null;
+  private checkpointBuildPromise: Promise<void> | null = null;
 
   constructor(
     private readonly state: CommitScopeDurableState,
@@ -106,6 +159,15 @@ export class CommitScopeDO {
     );
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_reply (idempotency_key TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_checkpoint (scope TEXT PRIMARY KEY, head_seq INTEGER NOT NULL, head_hash TEXT NOT NULL, head TEXT NOT NULL, checkpoint_hash TEXT NOT NULL, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_checkpoint_page (scope TEXT NOT NULL, checkpoint_hash TEXT NOT NULL, page_index INTEGER NOT NULL, table_name TEXT NOT NULL, page TEXT NOT NULL, page_hash TEXT NOT NULL, body TEXT NOT NULL, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(scope, checkpoint_hash, page_index))"
+    );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_checkpoint_frame (scope TEXT NOT NULL, checkpoint_hash TEXT NOT NULL, seq INTEGER NOT NULL, position_hash TEXT NOT NULL, body TEXT NOT NULL, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(scope, checkpoint_hash, seq))"
     );
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "CommitScopeDO", ms: constructorMs, ts: Date.now(), host_key: this.durableScopeKey() }));
@@ -147,8 +209,58 @@ export class CommitScopeDO {
           scope = input.scope;
           node = input.node;
           phaseStartedAt = metricNow();
-          const relay = await this.relayFor(input);
+          const relay = await this.relayFor(input, { mergeSerializedAuth: input.open_protocol !== "checkpoint_tail.v1" });
           this.emitV2OpenStep("relay_for", phaseStartedAt, { scope, node });
+          if (input.open_protocol === "checkpoint_tail.v1") {
+            phaseStartedAt = metricNow();
+            const responseBody = this.checkpointTailOpenResponse(relay, input);
+            if (!responseBody) {
+              const continuationRequested = input.continuation !== undefined;
+              const errorCode = continuationRequested ? "E_CHECKPOINT_CONTINUATION_STALE" : "E_CHECKPOINT_PENDING";
+              this.emitV2OpenStep(continuationRequested ? "checkpoint_tail_continuation_stale" : "checkpoint_tail_pending", phaseStartedAt, {
+                scope,
+                node,
+                transfer_mode: continuationRequested ? "checkpoint_tail:continuation_stale" : "checkpoint_tail:pending",
+                bytes: 0
+              });
+              this.emitMetric({
+                kind: "v2_open",
+                scope,
+                node,
+                ms: metricElapsed(startedAt),
+                status: "error",
+                transfer_mode: continuationRequested ? "checkpoint_tail:continuation_stale" : "checkpoint_tail:pending",
+                full_save: false,
+                error: errorCode
+              });
+              return jsonResponse({
+                error: continuationRequested
+                  ? wooError("E_CHECKPOINT_CONTINUATION_STALE", "checkpoint/tail continuation is expired or no longer matches the retained export")
+                  : wooError("E_CHECKPOINT_PENDING", "checkpoint/tail open has no complete checkpoint yet; retry or use legacy open during rollout")
+              }, continuationRequested ? 409 : 425);
+            }
+            this.emitV2OpenStep("checkpoint_tail_packaging", phaseStartedAt, {
+              scope,
+              node,
+              transfer_mode: responseBody.transfer.kind,
+              bytes: jsonByteLength(responseBody.transfer)
+            });
+            this.emitMetric({
+              kind: "v2_open",
+              scope,
+              node,
+              ms: metricElapsed(startedAt),
+              status: "ok",
+              transfer_mode: `checkpoint_tail:${responseBody.transfer.kind}`,
+              executable_transfer_cache: "hit",
+              executable_transfer_bytes: 0,
+              executable_transfer_pages: 0,
+              executable_transfer_inline_pages: 0,
+              preseeded_objects: 0,
+              full_save: false
+            });
+            return jsonResponse(responseBody);
+          }
           phaseStartedAt = metricNow();
           this.ensureSerializedSession(relay, input);
           this.emitV2OpenStep("ensure_session", phaseStartedAt, { scope, node, count: input.sessions.length });
@@ -177,6 +289,7 @@ export class CommitScopeDO {
           phaseStartedAt = metricNow();
           fullSave = await this.saveFullIfNeeded(relay);
           this.emitV2OpenStep("full_save", phaseStartedAt, { scope, node, full_save: fullSave, count: fullSave ? 1 : 0 });
+          if (fullSave) this.scheduleCheckpointBuild(relay, "legacy_open_full_save");
           const seedStatus = opened.executable_transfer_bytes > SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES ? "warn" : "ok";
           this.emitMetric({
             kind: "shadow_open_executable_seed_bytes",
@@ -236,6 +349,7 @@ export class CommitScopeDO {
         let scope: ObjRef | undefined;
         let node: string | undefined;
         let fullSave = false;
+        let tailStats: CommitScopeTailStats | null = null;
         try {
           await verifyInternalRequest(this.env, request);
           const input = await readJson<CommitScopeEnvelopeRequest>(request);
@@ -244,6 +358,7 @@ export class CommitScopeDO {
           const relay = await this.relayFor(input);
           this.ensureSerializedSession(relay, input);
           const browser = this.browserFor(relay, input);
+          const replayStartedAt = metricNow();
           const receipt = receiveShadowBrowserEnvelopeReceipt(browser, input.envelope);
           const turnReply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, {
             profile: (event) => this.emitMetric(event),
@@ -259,8 +374,15 @@ export class CommitScopeDO {
           // includes the accepted turn state; otherwise persist only the delta.
           fullSave = await this.saveFullIfNeeded(relay);
           if (!fullSave) {
-            await this.saveEnvelopeDelta(relay, receipt, reply);
+            tailStats = await this.saveEnvelopeDelta(relay, receipt, reply);
           }
+          this.emitCommitReplyReplayMetric({
+            scope,
+            node,
+            receipt,
+            reply,
+            startedAt: replayStartedAt
+          });
           const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
           this.emitMetric({
             kind: "v2_envelope",
@@ -271,7 +393,12 @@ export class CommitScopeDO {
             fresh: receipt.fresh,
             reply: shadowReplyMetricKind(reply),
             fanout: fanout.length,
-            full_save: fullSave
+            full_save: fullSave,
+            ...(tailStats ? {
+              tail_rows_written: tailStats.rowsWritten,
+              tail_bytes_retained: tailStats.bytesRetained,
+              projection_bytes: tailStats.projectionBytes
+            } : {})
           });
           this.emitShadowCommitMetric(reply, node, fanout.length);
           return jsonResponse({
@@ -348,7 +475,10 @@ export class CommitScopeDO {
     }
   }
 
-  private async relayFor(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
+  private async relayFor(
+    input: CommitScopeBaseRequest & { serialized?: SerializedWorld },
+    options: { mergeSerializedAuth?: boolean } = {}
+  ): Promise<ShadowBrowserRelayShim> {
     if (!this.relay) {
       if (!this.relayInitPromise) {
         const pending = this.initializeRelay(input);
@@ -366,7 +496,8 @@ export class CommitScopeDO {
     if (this.relay.commit_scope.scope !== input.scope) {
       throw wooError("E_PROTOCOL", `commit scope mismatch: have=${this.relay.commit_scope.scope} want=${input.scope}`);
     }
-    this.refreshSessionAuth(this.relay, input);
+    this.validateExecutionCapsule(input, this.relay.commit_scope.head);
+    this.refreshSessionAuth(this.relay, input, { mergeSerialized: options.mergeSerializedAuth !== false });
     return this.relay;
   }
 
@@ -379,6 +510,9 @@ export class CommitScopeDO {
         this.relay = loaded;
         return loaded;
       }
+    }
+    if (input.execution_capsule) {
+      throw wooError(V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, `commit scope ${input.scope} has no durable snapshot for execution capsule; retry with legacy open bootstrap`);
     }
     const serialized = input.serialized ?? (input.authority ? serializedWorldFromAuthoritySlice(input.authority) : null);
     if (!serialized) {
@@ -394,7 +528,22 @@ export class CommitScopeDO {
     return relay;
   }
 
-  private refreshSessionAuth(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
+  private validateExecutionCapsule(input: CommitScopeBaseRequest, currentHead: ShadowScopeHead): void {
+    const capsule = input.execution_capsule;
+    if (!capsule) return;
+    if (capsule.kind !== "woo.execution_capsule.v1") throw wooError("E_PROTOCOL", "invalid execution capsule kind");
+    if (capsule.scope !== input.scope) throw wooError("E_PROTOCOL", "execution capsule scope mismatch");
+    if (capsule.actor !== input.actor || capsule.session !== input.session) throw wooError("E_PROTOCOL", "execution capsule session mismatch");
+    if (capsule.head.scope !== input.scope) throw wooError("E_PROTOCOL", "execution capsule head scope mismatch");
+    if (capsule.head.epoch !== currentHead.epoch) throw wooError("E_PROTOCOL", "execution capsule epoch mismatch");
+    if (capsule.expires_at_ms <= Date.now()) throw wooError("E_STALE", "execution capsule expired");
+  }
+
+  private refreshSessionAuth(
+    relay: ShadowBrowserRelayShim,
+    input: CommitScopeBaseRequest,
+    options: { mergeSerialized?: boolean } = {}
+  ): void {
     // Sessions can be refreshed by the gateway between messages. Auth maps are
     // always rebuilt from the live session export; when the request carries an
     // authority slice, its session/object rows also refresh the planning
@@ -409,15 +558,18 @@ export class CommitScopeDO {
     });
     relay.session_auth = auth.session_auth;
     relay.session_revs = auth.session_revs;
+    if (options.mergeSerialized === false) return;
     if (authority) {
-      if (mergeSerializedAuthoritySlice(relay.commit_scope.serialized, authority, { clone: true })) {
+      const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_authority_merge", metric: (event) => this.emitMetric(event) });
+      if (mergeSerializedAuthoritySlice(serialized, authority, { clone: true })) {
         markShadowBrowserRelaySerializedChanged(relay);
       }
       return;
     }
-    const mergedSessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, sessionRows);
-    if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(relay.commit_scope.serialized.sessions as unknown as WooValue)) {
-      relay.commit_scope.serialized.sessions = mergedSessions;
+    const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_session_merge", metric: (event) => this.emitMetric(event) });
+    const mergedSessions = mergeShadowBrowserSessionState(serialized.sessions, sessionRows);
+    if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(serialized.sessions as unknown as WooValue)) {
+      serialized.sessions = mergedSessions;
       markShadowBrowserRelaySerializedChanged(relay);
     }
     this.refreshSerializedObjects(relay, input.session_objects ?? []);
@@ -431,14 +583,15 @@ export class CommitScopeDO {
     const current = (input.authority?.sessions ?? input.sessions).find((session) => session.id === input.session && session.actor === input.actor);
     if (!current) return;
     const serialized = structuredClone(current) as SerializedSession;
-    const index = relay.commit_scope.serialized.sessions.findIndex((session) => session.id === serialized.id);
+    const world = serializedFor(relay.commit_scope, { reason: "commit_scope_ensure_session", metric: (event) => this.emitMetric(event) });
+    const index = world.sessions.findIndex((session) => session.id === serialized.id);
     if (index < 0) {
-      relay.commit_scope.serialized.sessions.push(serialized);
-      relay.commit_scope.serialized.sessions.sort((a, b) => a.id.localeCompare(b.id));
+      world.sessions.push(serialized);
+      world.sessions.sort((a, b) => a.id.localeCompare(b.id));
       markShadowBrowserRelaySerializedChanged(relay);
       return;
     }
-    const existing = relay.commit_scope.serialized.sessions[index];
+    const existing = world.sessions[index];
     const next = input.authority
       ? serialized
       : {
@@ -446,24 +599,25 @@ export class CommitScopeDO {
         activeScope: existing.actor === serialized.actor && existing.activeScope !== undefined
           ? existing.activeScope
           : serialized.activeScope
-      };
+    };
     if (stableShadowJson(next as unknown as WooValue) !== stableShadowJson(existing as unknown as WooValue)) {
-      relay.commit_scope.serialized.sessions[index] = next;
+      world.sessions[index] = next;
       markShadowBrowserRelaySerializedChanged(relay);
     }
   }
 
   private refreshSerializedObjects(relay: ShadowBrowserRelayShim, objects: SerializedObject[]): void {
     if (objects.length === 0) return;
-    const byId = new Map(relay.commit_scope.serialized.objects.map((obj, index) => [obj.id, index] as const));
+    const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_object_refresh", metric: (event) => this.emitMetric(event) });
+    const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
     for (const obj of objects) {
       const clone = structuredClone(obj) as SerializedObject;
       const index = byId.get(clone.id);
       if (index === undefined) {
-        byId.set(clone.id, relay.commit_scope.serialized.objects.length);
-        relay.commit_scope.serialized.objects.push(clone);
+        byId.set(clone.id, serialized.objects.length);
+        serialized.objects.push(clone);
       } else {
-        relay.commit_scope.serialized.objects[index] = clone;
+        serialized.objects[index] = clone;
       }
     }
     markShadowBrowserRelaySerializedChanged(relay);
@@ -500,6 +654,470 @@ export class CommitScopeDO {
     if (currentSeq === transfer.projection_patch.base.seq || currentSeq !== transfer.to.seq) {
       applyShadowBrowserTransfer(browser, transfer);
     }
+  }
+
+  private checkpointTailOpenResponse(
+    relay: ShadowBrowserRelayShim,
+    input: CommitScopeOpenRequest
+  ): CommitScopeOpenCheckpointTailResponse | null {
+    const budget = boundedPositiveInteger(input.transfer_budget_bytes, CHECKPOINT_TRANSFER_DEFAULT_BYTES, CHECKPOINT_TRANSFER_MAX_BYTES);
+    const maxTailFrames = boundedPositiveInteger(input.max_tail_frames, 200, 200);
+    const transfer = input.continuation !== undefined
+      ? this.openContinuationTransfer(relay.commit_scope.scope, input.continuation, budget)
+      : this.openInitialCheckpointTailTransfer(relay, input, maxTailFrames, budget);
+    if (!transfer) {
+      if (input.continuation !== undefined) return null;
+      this.scheduleCheckpointBuild(relay, "checkpoint_tail_pending");
+      return null;
+    }
+    const browser = this.browserFor(relay, input);
+    subscribeShadowBrowserNode(browser, input.scope);
+    return {
+      ok: true,
+      open_protocol: "checkpoint_tail.v1",
+      relay: relay.node,
+      hello: shadowBrowserTransportHello(browser),
+      head: relay.commit_scope.head,
+      transfer
+    };
+  }
+
+  private openInitialCheckpointTailTransfer(
+    relay: ShadowBrowserRelayShim,
+    input: CommitScopeOpenRequest,
+    maxTailFrames: number,
+    budget: number
+  ): OpenTransfer | null {
+    const knownHead = input.known_head ?? input.last_known_head ?? null;
+    const frameTransfer = knownHead
+      ? this.openFrameTransfer(relay.commit_scope.scope, knownHead, relay.commit_scope.head, maxTailFrames, budget)
+      : null;
+    if (frameTransfer) return frameTransfer;
+    return this.loadScopeCheckpointTransfer(relay.commit_scope.scope, relay.commit_scope.head, budget);
+  }
+
+  private loadCompleteScopeCheckpoint(scope: ObjRef, head: ShadowScopeHead): LoadedScopeCheckpoint | null {
+    const row = sqlRows<{ body: string; head_hash: string; head_seq: number }>(this.state.storage.sql.exec(
+      "SELECT body, head_hash, head_seq FROM v2_commit_scope_checkpoint WHERE scope = ? LIMIT 1",
+      scope
+    ))[0] ?? null;
+    if (!row) return null;
+    if (Number(row.head_seq) !== head.seq || row.head_hash !== head.hash) return null;
+    const parsed = JSON.parse(row.body) as unknown;
+    const manifest = persistedScopeCheckpointManifestFromUnknown(parsed);
+    if (manifest) {
+      if (manifest.scope !== scope || !shadowScopeHeadsEqual(manifest.head, head)) return null;
+      return {
+        storage: "manifest",
+        scope: manifest.scope,
+        head: manifest.head,
+        checkpoint_hash: manifest.checkpoint_hash,
+        page_refs: manifest.pages,
+        frame_refs: manifest.frame_tail
+      };
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const legacyRecord = parsed as Record<string, unknown>;
+    const legacyHead = shadowScopeHeadFromUnknown(legacyRecord.head);
+    if (legacyRecord.kind !== "woo.scope_checkpoint.v1" || legacyRecord.scope !== scope || !legacyHead || !shadowScopeHeadsEqual(legacyHead, head) || !Array.isArray(legacyRecord.pages) || !Array.isArray(legacyRecord.frame_tail)) return null;
+    const legacy = legacyRecord as unknown as ScopeCheckpoint;
+    return {
+      storage: "legacy",
+      scope: legacy.scope,
+      head: legacy.head,
+      checkpoint_hash: legacy.checkpoint_hash,
+      pages: legacy.pages,
+      frame_tail: legacy.frame_tail
+    };
+  }
+
+  private loadScopeCheckpointTransfer(scope: ObjRef, head: ShadowScopeHead, budget: number): OpenTransfer | null {
+    const checkpoint = this.loadCompleteScopeCheckpoint(scope, head);
+    return checkpoint ? this.packageCheckpointTransfer(checkpoint, 0, budget) : null;
+  }
+
+  private openFrameTransfer(
+    scope: ObjRef,
+    knownHead: ShadowScopeHead,
+    currentHead: ShadowScopeHead,
+    maxTailFrames: number,
+    budget: number
+  ): OpenTransfer | null {
+    if (knownHead.scope !== scope || knownHead.epoch !== currentHead.epoch) return null;
+    if (knownHead.seq === currentHead.seq && knownHead.hash === currentHead.hash) {
+      return { kind: "frames", from: knownHead, to: currentHead, frames: [] };
+    }
+    if (knownHead.seq >= currentHead.seq || currentHead.seq - knownHead.seq > maxTailFrames) return null;
+    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq > ? AND seq <= ? ORDER BY seq",
+      scope,
+      knownHead.seq,
+      currentHead.seq
+    ));
+    if (rows.length !== currentHead.seq - knownHead.seq) return null;
+    const frames = rows.map((row) => JSON.parse(row.body) as ShadowCommitAccepted);
+    for (const frame of frames) {
+      if (!frame.projection_writes || frame.projection_writes.some((write) => write.op === "upsert" && !("row" in write) && !("value" in write))) {
+        return null;
+      }
+    }
+    const transfers = frames.map((frame) => ({
+      frame: acceptedFrameForTransfer(frame),
+      projection_writes: structuredClone(frame.projection_writes ?? []) as ProjectionWrite[]
+    } satisfies AcceptedFrameTransfer));
+    return this.packageFrameTransfer(scope, knownHead, currentHead, transfers, 0, budget);
+  }
+
+  private openContinuationTransfer(scope: ObjRef, continuation: unknown, budget: number): OpenTransfer | null {
+    const decoded = decodeOpenContinuation(continuation);
+    if (!decoded || decoded.scope !== scope || decoded.expires_at_ms <= Date.now()) return null;
+    if (decoded.mode === "checkpoint") {
+      const checkpoint = this.loadCompleteScopeCheckpoint(scope, decoded.head);
+      if (!checkpoint) return null;
+      if (checkpoint.checkpoint_hash !== decoded.checkpoint_hash) return null;
+      return this.packageCheckpointTransfer(checkpoint, decoded.next_page, budget);
+    }
+    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq >= ? AND seq <= ? ORDER BY seq",
+      scope,
+      decoded.next_seq,
+      decoded.head.seq
+    ));
+    const frames = rows.map((row) => JSON.parse(row.body) as ShadowCommitAccepted);
+    if (frames.length !== decoded.head.seq - decoded.next_seq + 1) return null;
+    if (frames.length === 0) return { kind: "frames", from: decoded.after_head, to: decoded.after_head, frames: [] };
+    if (frames[frames.length - 1]?.position.hash !== decoded.head.hash) return null;
+    const transfers = frames.map((frame) => ({
+      frame: acceptedFrameForTransfer(frame),
+      projection_writes: structuredClone(frame.projection_writes ?? []) as ProjectionWrite[]
+    } satisfies AcceptedFrameTransfer));
+    return this.packageFrameTransfer(scope, decoded.after_head, decoded.head, transfers, 0, budget);
+  }
+
+  private packageFrameTransfer(
+    scope: ObjRef,
+    from: ShadowScopeHead,
+    finalHead: ShadowScopeHead,
+    frames: AcceptedFrameTransfer[],
+    startIndex: number,
+    budget: number
+  ): OpenTransfer | null {
+    const selected: AcceptedFrameTransfer[] = [];
+    for (let index = startIndex; index < frames.length; index += 1) {
+      const candidate = [...selected, frames[index]!];
+      const candidateTo = candidate[candidate.length - 1]!.frame.position;
+      const transfer = {
+        kind: "frames",
+        from,
+        to: candidateTo,
+        frames: candidate,
+        ...(index + 1 < frames.length ? {
+          continuation: frameContinuation(scope, candidateTo, finalHead, frames[index + 1]!.frame.position.seq)
+        } : {})
+      } satisfies OpenTransfer;
+      if (selected.length > 0 && jsonByteLength(transfer) > budget) break;
+      selected.push(frames[index]!);
+      if (jsonByteLength(transfer) > budget) break;
+    }
+    if (selected.length === 0) return { kind: "frames", from, to: from, frames: [] };
+    const nextIndex = startIndex + selected.length;
+    const to = selected[selected.length - 1]!.frame.position;
+    return {
+      kind: "frames",
+      from,
+      to,
+      frames: selected,
+      ...(nextIndex < frames.length ? {
+        continuation: frameContinuation(scope, to, finalHead, frames[nextIndex]!.frame.position.seq)
+      } : {})
+    };
+  }
+
+  private packageCheckpointTransfer(checkpoint: LoadedScopeCheckpoint, startPage: number, budget: number): OpenTransfer | null {
+    const pageCount = this.checkpointPageCount(checkpoint);
+    if (startPage < 0 || startPage > pageCount) return null;
+    const selected: ProjectionPage[] = [];
+    for (let index = startPage; index < pageCount; index += 1) {
+      const page = this.checkpointPageAt(checkpoint, index);
+      if (!page) return null;
+      const candidate = [...selected, page];
+      const partial = this.partialCheckpoint(checkpoint, candidate, index + 1 < pageCount);
+      if (!partial) return null;
+      const transfer = {
+        kind: "checkpoint",
+        checkpoint: partial,
+        ...(index + 1 < pageCount ? {
+          continuation: checkpointContinuation(checkpoint, index + 1)
+        } : {})
+      } satisfies OpenTransfer;
+      if (selected.length > 0 && jsonByteLength(transfer) > budget) break;
+      selected.push(page);
+      if (jsonByteLength(transfer) > budget) break;
+    }
+    const nextPage = startPage + selected.length;
+    const partial = this.partialCheckpoint(checkpoint, selected, nextPage < pageCount);
+    if (!partial) return null;
+    return {
+      kind: "checkpoint",
+      checkpoint: partial,
+      ...(nextPage < pageCount ? {
+        continuation: checkpointContinuation(checkpoint, nextPage)
+      } : {})
+    };
+  }
+
+  private checkpointPageCount(checkpoint: LoadedScopeCheckpoint): number {
+    return checkpoint.storage === "legacy" ? checkpoint.pages.length : checkpoint.page_refs.length;
+  }
+
+  private checkpointPageAt(checkpoint: LoadedScopeCheckpoint, index: number): ProjectionPage | null {
+    if (checkpoint.storage === "legacy") return checkpoint.pages[index] ?? null;
+    const expected = checkpoint.page_refs[index];
+    if (!expected) return null;
+    const row = sqlRows<{ table_name: string; page: string; page_hash: string; body: string }>(this.state.storage.sql.exec(
+      "SELECT table_name, page, page_hash, body FROM v2_commit_scope_checkpoint_page WHERE scope = ? AND checkpoint_hash = ? AND page_index = ? LIMIT 1",
+      checkpoint.scope,
+      checkpoint.checkpoint_hash,
+      index
+    ))[0] ?? null;
+    if (!row) return null;
+    if (row.table_name !== expected.table || row.page !== expected.page || row.page_hash !== expected.hash) return null;
+    const page = JSON.parse(row.body) as ProjectionPage;
+    if (page.kind !== "woo.projection_page.v1" || page.table !== expected.table || page.page !== expected.page || page.hash !== expected.hash) return null;
+    return page;
+  }
+
+  private checkpointFrameTail(checkpoint: LoadedScopeCheckpoint): ShadowCommitAccepted[] | null {
+    if (checkpoint.storage === "legacy") return checkpoint.frame_tail;
+    const rows = sqlRows<{ seq: number; position_hash: string; body: string }>(this.state.storage.sql.exec(
+      "SELECT seq, position_hash, body FROM v2_commit_scope_checkpoint_frame WHERE scope = ? AND checkpoint_hash = ? ORDER BY seq",
+      checkpoint.scope,
+      checkpoint.checkpoint_hash
+    ));
+    if (rows.length !== checkpoint.frame_refs.length) return null;
+    const frames: ShadowCommitAccepted[] = [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      const expected = checkpoint.frame_refs[index]!;
+      if (Number(row.seq) !== expected.seq || row.position_hash !== expected.hash) return null;
+      const frame = JSON.parse(row.body) as ShadowCommitAccepted;
+      if (frame.position.seq !== expected.seq || frame.position.hash !== expected.hash) return null;
+      frames.push(frame);
+    }
+    return frames;
+  }
+
+  private partialCheckpoint(checkpoint: LoadedScopeCheckpoint, pages: ProjectionPage[], hasMorePages: boolean): ScopeCheckpoint | null {
+    const frameTail = hasMorePages ? [] : this.checkpointFrameTail(checkpoint);
+    if (!frameTail) return null;
+    return {
+      kind: "woo.scope_checkpoint.v1",
+      scope: checkpoint.scope,
+      head: checkpoint.head,
+      checkpoint_hash: checkpoint.checkpoint_hash,
+      pages,
+      // The retained frame tail seeds future catch-up after the checkpoint is
+      // fully installed. Sending it only with the final page batch keeps
+      // continuation chunks bounded and prevents receivers from replaying
+      // historical observations while projection pages are incomplete.
+      frame_tail: frameTail
+    };
+  }
+
+  private buildScopeCheckpoint(scope: ObjRef, head: ShadowScopeHead): ScopeCheckpoint {
+    const pages: ProjectionPage[] = [
+      ...this.objectProjectionPages(),
+      ...this.sessionProjectionPages(),
+      ...this.logProjectionPages(),
+      ...this.snapshotProjectionPages(),
+      ...this.parkedTaskProjectionPages(),
+      ...this.tombstoneProjectionPages()
+    ];
+    const frameTail = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_accepted_frame WHERE scope = ? ORDER BY seq",
+      scope
+    )).map((row) => acceptedFrameForTransfer(JSON.parse(row.body) as ShadowCommitAccepted));
+    const checkpointMaterial = {
+      kind: "woo.scope_checkpoint_material.v1",
+      scope,
+      head,
+      pages: pages.map((page, index) => checkpointPageRef(page, index)),
+      frame_tail: frameTail.map((frame) => frame.position)
+    };
+    return {
+      kind: "woo.scope_checkpoint.v1",
+      scope,
+      head,
+      checkpoint_hash: hashSource(stableShadowJson(checkpointMaterial as unknown as WooValue)),
+      pages,
+      frame_tail: frameTail
+    };
+  }
+
+  private scheduleCheckpointBuild(relay: ShadowBrowserRelayShim, reason: string): boolean {
+    const waitUntil = (this.state as { waitUntil?: (promise: Promise<unknown>) => void }).waitUntil;
+    if (typeof waitUntil !== "function") return false;
+    if (!this.checkpointBuildPromise) {
+      const scope = relay.commit_scope.scope;
+      const startedAt = metricNow();
+      const task = new Promise<void>((resolve) => setTimeout(resolve, 0)).then(async () => {
+        if (this.needsFullSave) await this.saveFullIfNeeded(relay);
+        this.persistScopeCheckpoint(scope, reason);
+      });
+      this.checkpointBuildPromise = task
+        .catch((err) => {
+          this.emitMetric({
+            kind: "v2_open_step",
+            phase: "checkpoint_build",
+            scope,
+            reason,
+            ms: metricElapsed(startedAt),
+            status: "error",
+            ...metricErrorFields(err)
+          });
+        })
+        .finally(() => {
+          this.checkpointBuildPromise = null;
+        });
+    }
+    waitUntil.call(this.state, this.checkpointBuildPromise);
+    return true;
+  }
+
+  private persistScopeCheckpoint(scope: ObjRef, reason: string): void {
+    const startedAt = metricNow();
+    const head = this.loadPersistedHead(scope);
+    if (!head) return;
+    const checkpoint = this.buildScopeCheckpoint(scope, head);
+    const pageRows = checkpoint.pages.map((page, index) => {
+      const body = JSON.stringify(page);
+      return { page, ref: checkpointPageRef(page, index, body), body };
+    });
+    const frameRows = checkpoint.frame_tail.map((frame) => {
+      const body = JSON.stringify(frame);
+      return { frame, ref: checkpointFrameRef(frame, body), body };
+    });
+    const manifest: PersistedScopeCheckpointManifest = {
+      kind: "woo.scope_checkpoint_manifest.v1",
+      scope,
+      head,
+      checkpoint_hash: checkpoint.checkpoint_hash,
+      pages: pageRows.map((row) => row.ref),
+      frame_tail: frameRows.map((row) => row.ref)
+    };
+    const body = JSON.stringify(manifest);
+    const now = Date.now();
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        "DELETE FROM v2_commit_scope_checkpoint_page WHERE scope = ? AND checkpoint_hash <> ?",
+        scope,
+        checkpoint.checkpoint_hash
+      );
+      this.state.storage.sql.exec(
+        "DELETE FROM v2_commit_scope_checkpoint_frame WHERE scope = ? AND checkpoint_hash <> ?",
+        scope,
+        checkpoint.checkpoint_hash
+      );
+      for (const { page, ref, body: pageBody } of pageRows) {
+        this.state.storage.sql.exec(
+          "INSERT OR REPLACE INTO v2_commit_scope_checkpoint_page(scope, checkpoint_hash, page_index, table_name, page, page_hash, body, bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          scope,
+          checkpoint.checkpoint_hash,
+          ref.page_index,
+          page.table,
+          page.page,
+          page.hash,
+          pageBody,
+          ref.bytes,
+          now
+        );
+      }
+      for (const { frame, ref, body: frameBody } of frameRows) {
+        this.state.storage.sql.exec(
+          "INSERT OR REPLACE INTO v2_commit_scope_checkpoint_frame(scope, checkpoint_hash, seq, position_hash, body, bytes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          scope,
+          checkpoint.checkpoint_hash,
+          frame.position.seq,
+          frame.position.hash,
+          frameBody,
+          ref.bytes,
+          now
+        );
+      }
+      this.state.storage.sql.exec(
+        "INSERT OR REPLACE INTO v2_commit_scope_checkpoint(scope, head_seq, head_hash, head, checkpoint_hash, body, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        scope,
+        head.seq,
+        head.hash,
+        JSON.stringify(head),
+        checkpoint.checkpoint_hash,
+        body,
+        now
+      );
+    });
+    const bytes = JSON_BYTES.encode(body).byteLength
+      + pageRows.reduce((sum, row) => sum + row.ref.bytes, 0)
+      + frameRows.reduce((sum, row) => sum + row.ref.bytes, 0);
+    this.emitMetric({
+      kind: "v2_open_step",
+      phase: "checkpoint_build",
+      scope,
+      reason,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      count: checkpoint.pages.length,
+      bytes
+    });
+  }
+
+  private loadPersistedHead(scope: ObjRef): ShadowScopeHead | null {
+    const row = sqlRows<{ head: string }>(this.state.storage.sql.exec(
+      "SELECT head FROM v2_commit_scope_meta WHERE id = 'current' AND scope = ? LIMIT 1",
+      scope
+    ))[0] ?? null;
+    return row ? JSON.parse(row.head) as ShadowScopeHead : null;
+  }
+
+  private objectProjectionPages(): ProjectionPage[] {
+    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_object ORDER BY id"
+    )).map((row) => JSON.parse(row.body) as SerializedObject);
+    return projectionPages("objects", rows);
+  }
+
+  private sessionProjectionPages(): ProjectionPage[] {
+    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_session ORDER BY id"
+    )).map((row) => JSON.parse(row.body) as SerializedSession);
+    return projectionPages("sessions", rows);
+  }
+
+  private logProjectionPages(): ProjectionPage[] {
+    const rows = sqlRows<{ space: string; body: string }>(this.state.storage.sql.exec(
+      "SELECT space, body FROM v2_commit_scope_log ORDER BY space, seq"
+    )).map((row) => ({ space: row.space as ObjRef, entry: JSON.parse(row.body) as SerializedWorld["logs"][number][1][number] }));
+    return projectionPages("logs", rows);
+  }
+
+  private snapshotProjectionPages(): ProjectionPage[] {
+    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_snapshot ORDER BY space, seq"
+    )).map((row) => JSON.parse(row.body) as SerializedWorld["snapshots"][number]);
+    return projectionPages("snapshots", rows);
+  }
+
+  private parkedTaskProjectionPages(): ProjectionPage[] {
+    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_task ORDER BY id"
+    )).map((row) => JSON.parse(row.body) as SerializedWorld["parkedTasks"][number]);
+    return projectionPages("parked_tasks", rows);
+  }
+
+  private tombstoneProjectionPages(): ProjectionPage[] {
+    const rows = sqlRows<{ id: string }>(this.state.storage.sql.exec(
+      "SELECT id FROM v2_commit_scope_tombstone ORDER BY id"
+    )).map((row) => ({ id: row.id as ObjRef }));
+    return projectionPages("tombstones", rows);
   }
 
   private fanoutEnvelopes(
@@ -596,6 +1214,35 @@ export class CommitScopeDO {
         // shape mismatch.
       }
     }
+  }
+
+  private emitCommitReplyReplayMetric(input: {
+    scope?: ObjRef;
+    node?: string;
+    receipt: ShadowBrowserEnvelopeReceipt;
+    reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null;
+    startedAt: number;
+  }): void {
+    // This metric is intentionally separate from v2_envelope: the design
+    // decision about durable reply rows needs a replay hit/miss numerator that
+    // does not require decoding turn outcomes from the general request stream.
+    const rowBacked = !input.receipt.fresh && this.replyRowExists(input.receipt.idempotency_key);
+    const mode: Extract<MetricEvent, { kind: "commit_reply_replay" }>["mode"] = input.receipt.fresh
+      ? "fresh"
+      : input.reply || rowBacked
+        ? "cached_sql"
+        : "miss_after_hibernate";
+    this.emitMetric({
+      kind: "commit_reply_replay",
+      scope: input.scope,
+      node: input.node,
+      route: "/v2/envelope",
+      mode,
+      status: mode === "miss_after_hibernate" ? "miss" : "ok",
+      reply: shadowReplyMetricKind(input.reply),
+      bytes: input.reply ? jsonByteLength(input.reply) : 0,
+      ms: metricElapsed(input.startedAt)
+    });
   }
 
   private emitMetric(event: MetricEvent): void {
@@ -722,9 +1369,11 @@ export class CommitScopeDO {
     const now = Date.now();
     this.state.storage.transactionSync(() => {
       this.saveMeta(relay, now);
-      this.saveWorldRows(relay.commit_scope.serialized, now);
-      this.saveAcceptedFrames(relay, now);
-      this.saveTranscriptTail(relay, now);
+      this.saveWorldRows(serializedFor(relay.commit_scope, { reason: "save_full", metric: (event) => this.emitMetric(event) }), now);
+      this.appendAcceptedFrames(relay, now);
+      this.appendTranscriptTail(relay, now);
+      this.pruneAcceptedFramesByHorizon(relay, now);
+      this.pruneTranscriptTailByHorizon(relay, now);
       this.saveSeenKeys(relay);
       this.saveRecentReplies(relay, now);
     });
@@ -734,16 +1383,17 @@ export class CommitScopeDO {
     relay: ShadowBrowserRelayShim,
     receipt: ShadowBrowserEnvelopeReceipt,
     reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null
-  ): Promise<void> {
+  ): Promise<CommitScopeTailStats | null> {
     // Replayed envelopes authenticate and return the cached reply, but they do
     // not mutate relay state. Skipping storage here makes retry idempotency
     // side-effect-free as well as turn-execution-free.
-    if (!receipt.fresh) return;
+    if (!receipt.fresh) return null;
     const seenAt = relay.recently_seen.get(receipt.idempotency_key);
-    if (seenAt === undefined) return;
+    if (seenAt === undefined) return null;
     const now = Date.now();
     const body = reply?.body;
     const willSaveMeta = isShadowTurnExecReply(body) && body.ok === true && Boolean(body.commit) && Boolean(body.transcript);
+    const tailStats: { value: CommitScopeTailStats | null } = { value: null };
     this.state.storage.transactionSync(() => {
       this.saveSeenKey(receipt.idempotency_key, seenAt);
       this.pruneSeenAndReplies(relay, now);
@@ -752,28 +1402,53 @@ export class CommitScopeDO {
         this.pruneRecentReplies();
       }
       if (willSaveMeta && body && isShadowTurnExecReply(body) && body.ok === true && body.commit && body.transcript) {
+        const tailStartedAt = Date.now();
         this.saveMeta(relay, now);
-        this.saveTranscriptDelta(relay, body.transcript, now);
-        this.saveAcceptedFrame(body.commit, now);
-        this.saveTranscript(body.transcript, now);
-        this.pruneAcceptedFrames(relay);
-        this.pruneTranscriptTail(relay);
+        this.saveTranscriptDelta(relay, body.transcript, now, body.commit.projection_writes ?? []);
+        const frameWritten = this.saveAcceptedFrame(body.commit, now);
+        const transcriptWritten = this.saveTranscript(body.transcript, now);
+        const framePruned = this.pruneAcceptedFramesByHorizon(relay, now);
+        const transcriptPruned = this.pruneTranscriptTailByHorizon(relay, now);
+        const retained = this.tailRetentionStats(relay.commit_scope.scope);
+        tailStats.value = {
+          rowsWritten: frameWritten + transcriptWritten,
+          rowsPruned: framePruned + transcriptPruned,
+          bytesRetained: retained.bytes,
+          acceptedFramesRetained: retained.acceptedFrames,
+          transcriptTailRetained: retained.transcripts,
+          projectionBytes: body.commit.projection_delta?.projection_bytes ?? 0,
+          ms: Date.now() - tailStartedAt
+        };
       }
     });
+    if (tailStats.value) {
+      this.emitMetric({
+        kind: "authority_tail",
+        scope: relay.commit_scope.scope,
+        ms: tailStats.value.ms,
+        tail_rows_written: tailStats.value.rowsWritten,
+        tail_rows_pruned: tailStats.value.rowsPruned,
+        tail_bytes_retained: tailStats.value.bytesRetained,
+        accepted_frames_retained: tailStats.value.acceptedFramesRetained,
+        transcript_tail_retained: tailStats.value.transcriptTailRetained
+      });
+      this.scheduleCheckpointBuild(relay, "accepted_commit");
+    }
+    return tailStats.value;
   }
 
   private saveMeta(relay: ShadowBrowserRelayShim, now: number): void {
-    const serialized = relay.commit_scope.serialized;
+    const scopeState = relay.commit_scope.state;
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       relay.commit_scope.scope,
       relay.node,
       JSON.stringify(relay.commit_scope.head),
       relay.idempotency_window_ms,
-      serialized.version,
-      serialized.objectCounter,
-      serialized.parkedTaskCounter,
-      serialized.sessionCounter,
+      scopeState.version,
+      scopeState.objectCounter,
+      scopeState.parkedTaskCounter,
+      scopeState.sessionCounter,
       now
     );
   }
@@ -816,7 +1491,11 @@ export class CommitScopeDO {
     }
   }
 
-  private saveTranscriptDelta(relay: ShadowBrowserRelayShim, transcript: EffectTranscript, now: number): void {
+  private saveTranscriptDelta(relay: ShadowBrowserRelayShim, transcript: EffectTranscript, now: number, projectionWrites: readonly ProjectionWrite[] = []): void {
+    if (projectionWrites.length > 0) {
+      this.saveProjectionWrites(projectionWrites, now);
+      return;
+    }
     for (const id of transcriptTouchedObjectIds(transcript)) {
       const obj = shadowCommitScopeObject(relay.commit_scope, id);
       if (obj) this.saveObjectRow(obj, now);
@@ -828,6 +1507,74 @@ export class CommitScopeDO {
     }
     const log = transcriptLogEntry(transcript);
     if (log) this.saveLogRow(log.space, log, now);
+  }
+
+  private saveProjectionWrites(writes: readonly ProjectionWrite[], now: number): void {
+    for (const write of writes) {
+      switch (write.table) {
+        case "objects":
+          if (write.op === "delete") {
+            this.state.storage.sql.exec("DELETE FROM v2_commit_scope_object WHERE id = ?", write.key);
+          } else {
+            this.saveObjectRow(write.row, now);
+          }
+          break;
+        case "sessions":
+          if (write.op === "delete") {
+            this.state.storage.sql.exec("DELETE FROM v2_commit_scope_session WHERE id = ?", write.key);
+          } else {
+            this.saveSessionRow(write.row, now);
+          }
+          break;
+        case "logs":
+          if (write.op === "delete") {
+            this.state.storage.sql.exec("DELETE FROM v2_commit_scope_log WHERE space = ? AND seq = ?", write.key.space, write.key.seq);
+          } else {
+            this.saveLogRow(write.key.space, write.row, now);
+          }
+          break;
+        case "snapshots":
+          if (write.op === "delete") {
+            this.state.storage.sql.exec("DELETE FROM v2_commit_scope_snapshot WHERE space = ? AND seq = ?", write.key.space, write.key.seq);
+          } else {
+            this.state.storage.sql.exec(
+              "INSERT OR REPLACE INTO v2_commit_scope_snapshot(space, seq, body, updated_at) VALUES (?, ?, ?, ?)",
+              write.key.space,
+              write.key.seq,
+              JSON.stringify(write.row),
+              now
+            );
+          }
+          break;
+        case "parked_tasks":
+          if (write.op === "delete") {
+            this.state.storage.sql.exec("DELETE FROM v2_commit_scope_task WHERE id = ?", write.key);
+          } else {
+            this.state.storage.sql.exec(
+              "INSERT OR REPLACE INTO v2_commit_scope_task(id, body, updated_at) VALUES (?, ?, ?)",
+              write.key,
+              JSON.stringify(write.row),
+              now
+            );
+          }
+          break;
+        case "tombstones":
+          if (write.op === "delete") {
+            this.state.storage.sql.exec("DELETE FROM v2_commit_scope_tombstone WHERE id = ?", write.key);
+          } else {
+            this.state.storage.sql.exec("INSERT OR REPLACE INTO v2_commit_scope_tombstone(id, updated_at) VALUES (?, ?)", write.key, now);
+          }
+          break;
+        case "counters":
+          // saveMeta writes counters from the already-applied commit-scope
+          // state at the start of this transaction.
+          break;
+        case "tool_surfaces":
+          // Tool-surface rows live in the gateway projection cache, not in
+          // CommitScopeDO's authority row store.
+          break;
+      }
+    }
   }
 
   private saveObjectRow(obj: SerializedObject, now: number): void {
@@ -858,30 +1605,18 @@ export class CommitScopeDO {
     );
   }
 
-  private saveAcceptedFrames(relay: ShadowBrowserRelayShim, now: number): void {
-    const live = new Set<string>();
+  private appendAcceptedFrames(relay: ShadowBrowserRelayShim, now: number): number {
+    let written = 0;
     for (const frame of relay.accepted_frames) {
-      live.add(`${frame.position.scope}\u0000${frame.position.seq}`);
-      this.state.storage.sql.exec(
-        "INSERT OR REPLACE INTO v2_commit_scope_accepted_frame(scope, seq, id, position_hash, body, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        frame.position.scope,
-        frame.position.seq,
-        frame.id ?? "",
-        frame.position.hash,
-        JSON.stringify(frame),
-        now
-      );
+      written += this.saveAcceptedFrame(frame, now);
     }
-    for (const row of sqlRows<{ scope: string; seq: number }>(this.state.storage.sql.exec("SELECT scope, seq FROM v2_commit_scope_accepted_frame"))) {
-      if (!live.has(`${row.scope}\u0000${row.seq}`)) {
-        this.state.storage.sql.exec("DELETE FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq = ?", row.scope, row.seq);
-      }
-    }
+    return written;
   }
 
-  private saveAcceptedFrame(frame: ShadowCommitAccepted, now: number): void {
+  private saveAcceptedFrame(frame: ShadowCommitAccepted, now: number): number {
+    if (this.acceptedFrameExists(frame.position.scope, frame.position.seq)) return 0;
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO v2_commit_scope_accepted_frame(scope, seq, id, position_hash, body, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO v2_commit_scope_accepted_frame(scope, seq, id, position_hash, body, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
       frame.position.scope,
       frame.position.seq,
       frame.id ?? "",
@@ -889,55 +1624,139 @@ export class CommitScopeDO {
       JSON.stringify(frame),
       now
     );
+    return 1;
   }
 
-  private pruneAcceptedFrames(relay: ShadowBrowserRelayShim): void {
-    const oldestKeptSeq = relay.commit_scope.head.seq - MAX_SHADOW_ACCEPTED_TAIL + 1;
-    if (oldestKeptSeq <= 1) return;
-    this.state.storage.sql.exec(
-      "DELETE FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq < ?",
-      relay.commit_scope.scope,
-      oldestKeptSeq
-    );
+  private pruneAcceptedFramesByHorizon(relay: ShadowBrowserRelayShim, now: number): number {
+    return this.pruneTailTableByHorizon({
+      table: "v2_commit_scope_accepted_frame",
+      scope: relay.commit_scope.scope,
+      maxRows: MAX_SHADOW_ACCEPTED_TAIL,
+      maxBytes: SHADOW_TAIL_RETENTION_BYTES,
+      minUpdatedAt: now - SHADOW_TAIL_RETENTION_MS
+    });
   }
 
-  private saveTranscriptTail(relay: ShadowBrowserRelayShim, now: number): void {
-    const live = new Set<string>();
+  private appendTranscriptTail(relay: ShadowBrowserRelayShim, now: number): number {
+    let written = 0;
     for (const transcript of relay.transcript_tail) {
-      live.add(transcript.hash);
-      this.state.storage.sql.exec(
-        "INSERT OR REPLACE INTO v2_commit_scope_transcript_tail(scope, seq, hash, body, updated_at) VALUES (?, ?, ?, ?, ?)",
-        transcript.scope,
-        transcript.seq,
-        transcript.hash,
-        JSON.stringify(transcript),
-        now
-      );
+      written += this.saveTranscript(transcript, now);
     }
-    for (const row of sqlRows<{ hash: string }>(this.state.storage.sql.exec("SELECT hash FROM v2_commit_scope_transcript_tail"))) {
-      if (!live.has(row.hash)) this.state.storage.sql.exec("DELETE FROM v2_commit_scope_transcript_tail WHERE hash = ?", row.hash);
-    }
+    return written;
   }
 
-  private saveTranscript(transcript: EffectTranscript, now: number): void {
+  private saveTranscript(transcript: EffectTranscript, now: number): number {
+    if (this.transcriptExists(transcript.hash)) return 0;
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO v2_commit_scope_transcript_tail(scope, seq, hash, body, updated_at) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO v2_commit_scope_transcript_tail(scope, seq, hash, body, updated_at) VALUES (?, ?, ?, ?, ?)",
       transcript.scope,
       transcript.seq,
       transcript.hash,
       JSON.stringify(transcript),
       now
     );
+    return 1;
   }
 
-  private pruneTranscriptTail(relay: ShadowBrowserRelayShim): void {
-    const oldestKeptSeq = relay.commit_scope.head.seq - MAX_SHADOW_TRANSCRIPT_TAIL + 1;
-    if (oldestKeptSeq <= 1) return;
-    this.state.storage.sql.exec(
-      "DELETE FROM v2_commit_scope_transcript_tail WHERE scope = ? AND seq < ?",
-      relay.commit_scope.scope,
-      oldestKeptSeq
-    );
+  private pruneTranscriptTailByHorizon(relay: ShadowBrowserRelayShim, now: number): number {
+    return this.pruneTailTableByHorizon({
+      table: "v2_commit_scope_transcript_tail",
+      scope: relay.commit_scope.scope,
+      maxRows: MAX_SHADOW_TRANSCRIPT_TAIL,
+      maxBytes: SHADOW_TAIL_RETENTION_BYTES,
+      minUpdatedAt: now - SHADOW_TAIL_RETENTION_MS
+    });
+  }
+
+  private acceptedFrameExists(scope: ObjRef, seq: number): boolean {
+    return sqlRows<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT 1 AS n FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq = ? LIMIT 1",
+      scope,
+      seq
+    )).length > 0;
+  }
+
+  private transcriptExists(hash: string): boolean {
+    return sqlRows<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT 1 AS n FROM v2_commit_scope_transcript_tail WHERE hash = ? LIMIT 1",
+      hash
+    )).length > 0;
+  }
+
+  private replyRowExists(idempotencyKey: string): boolean {
+    return sqlRows<{ n: number }>(this.state.storage.sql.exec(
+      "SELECT 1 AS n FROM v2_commit_scope_reply WHERE idempotency_key = ? LIMIT 1",
+      storageKey(idempotencyKey)
+    )).length > 0;
+  }
+
+  private pruneTailTableByHorizon(input: {
+    table: "v2_commit_scope_accepted_frame" | "v2_commit_scope_transcript_tail";
+    scope: ObjRef;
+    maxRows: number;
+    maxBytes: number;
+    minUpdatedAt: number;
+  }): number {
+    const checkpointHeadSeq = this.completeCheckpointHeadSeq(input.scope);
+    if (checkpointHeadSeq === null) return 0;
+    const rows = sqlRows<{ seq: number; hash?: string; body: string; updated_at: number }>(this.state.storage.sql.exec(
+      `SELECT seq, ${input.table === "v2_commit_scope_transcript_tail" ? "hash" : "'' AS hash"}, body, updated_at FROM ${input.table} WHERE scope = ? ORDER BY seq DESC`,
+      input.scope
+    ));
+    let kept = 0;
+    let keptBytes = 0;
+    const deleteRows: Array<{ seq: number; hash?: string }> = [];
+    for (const row of rows) {
+      const rowBytes = JSON_BYTES.encode(row.body).byteLength;
+      const withinCount = kept < input.maxRows;
+      const withinBytes = keptBytes + rowBytes <= input.maxBytes;
+      const withinAge = Number(row.updated_at) >= input.minUpdatedAt;
+      if (withinCount && withinBytes && withinAge) {
+        kept += 1;
+        keptBytes += rowBytes;
+      } else if (row.seq <= checkpointHeadSeq) {
+        deleteRows.push(row);
+      } else {
+        // Retention budgets are soft until a complete checkpoint covers the
+        // row. A lagging holder must always be able to recover from either a
+        // retained tail frame or a checkpoint that covers the pruned prefix.
+        kept += 1;
+        keptBytes += rowBytes;
+      }
+    }
+    for (const row of deleteRows) {
+      if (input.table === "v2_commit_scope_transcript_tail") {
+        this.state.storage.sql.exec("DELETE FROM v2_commit_scope_transcript_tail WHERE hash = ?", row.hash ?? "");
+      } else {
+        this.state.storage.sql.exec("DELETE FROM v2_commit_scope_accepted_frame WHERE scope = ? AND seq = ?", input.scope, row.seq);
+      }
+    }
+    return deleteRows.length;
+  }
+
+  private completeCheckpointHeadSeq(scope: ObjRef): number | null {
+    const rows = sqlRows<{ head_seq: number }>(this.state.storage.sql.exec(
+      "SELECT head_seq FROM v2_commit_scope_checkpoint WHERE scope = ? LIMIT 1",
+      scope
+    ));
+    if (rows.length === 0) return null;
+    const seq = Number(rows[0]!.head_seq);
+    return Number.isFinite(seq) ? seq : null;
+  }
+
+  private tailRetentionStats(scope: ObjRef): { bytes: number; acceptedFrames: number; transcripts: number } {
+    const frameRows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_accepted_frame WHERE scope = ?",
+      scope
+    ));
+    const transcriptRows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_transcript_tail WHERE scope = ?",
+      scope
+    ));
+    let bytes = 0;
+    for (const row of frameRows) bytes += JSON_BYTES.encode(row.body).byteLength;
+    for (const row of transcriptRows) bytes += JSON_BYTES.encode(row.body).byteLength;
+    return { bytes, acceptedFrames: frameRows.length, transcripts: transcriptRows.length };
   }
 
   private saveSeenKeys(relay: ShadowBrowserRelayShim): void {
@@ -1012,6 +1831,7 @@ export class CommitScopeDO {
 
 type CommitScopeDurableState = {
   id: unknown;
+  waitUntil?: (promise: Promise<unknown>) => void;
   storage: {
     sql: {
       exec(query: string, ...params: unknown[]): unknown;
@@ -1029,12 +1849,18 @@ type CommitScopeBaseRequest = {
   sessions: SerializedSession[];
   session_objects?: SerializedObject[];
   authority?: SerializedAuthoritySlice;
+  execution_capsule?: ExecutionCapsule;
   session_revs?: Record<string, number>;
 };
 
 type CommitScopeOpenRequest = CommitScopeBaseRequest & {
   serialized?: SerializedWorld;
   last_known_head?: ShadowScopeHead;
+  open_protocol?: "checkpoint_tail.v1";
+  known_head?: ShadowScopeHead | null;
+  transfer_budget_bytes?: number;
+  max_tail_frames?: number;
+  continuation?: OpenContinuation | { token: string } | string;
   executable_seed_digest?: string;
 };
 
@@ -1046,6 +1872,15 @@ type CommitScopeOpenResponse = {
   transfer: ShadowBrowserStateTransfer;
   executable_transfer: ShadowBrowserStateTransfer;
   ads: ShadowCapabilityAd[];
+};
+
+type CommitScopeOpenCheckpointTailResponse = {
+  ok: true;
+  open_protocol: "checkpoint_tail.v1";
+  relay: string;
+  hello: ShadowTransportHello;
+  head: ShadowScopeHead;
+  transfer: OpenTransfer;
 };
 
 type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {
@@ -1068,6 +1903,16 @@ type CommitScopeStateTransferResponse = {
   ok: true;
   relay: string;
   transfer: ShadowBrowserStateTransfer;
+};
+
+type CommitScopeTailStats = {
+  rowsWritten: number;
+  rowsPruned: number;
+  bytesRetained: number;
+  acceptedFramesRetained: number;
+  transcriptTailRetained: number;
+  projectionBytes: number;
+  ms: number;
 };
 
 type CommitScopeMetaRow = {
@@ -1140,6 +1985,299 @@ function metricNow(): number {
 
 function metricElapsed(startedAt: number): number {
   return Math.max(0, Math.round((metricNow() - startedAt) * 1000) / 1000);
+}
+
+function boundedPositiveInteger(value: unknown, fallback: number, max: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? Math.min(value, max)
+    : fallback;
+}
+
+function jsonByteLength(value: unknown): number {
+  return JSON_BYTES.encode(JSON.stringify(value)).byteLength;
+}
+
+type DecodedOpenContinuation =
+  | {
+      mode: "checkpoint";
+      scope: ObjRef;
+      export_id: string;
+      head: ShadowScopeHead;
+      checkpoint_hash: string;
+      next_page: number;
+      expires_at_ms: number;
+    }
+  | {
+      mode: "frames";
+      scope: ObjRef;
+      export_id: string;
+      after_head: ShadowScopeHead;
+      head: ShadowScopeHead;
+      next_seq: number;
+      expires_at_ms: number;
+    };
+
+function checkpointContinuation(checkpoint: LoadedScopeCheckpoint, nextPage: number): OpenContinuation {
+  const expiresAt = Date.now() + CHECKPOINT_CONTINUATION_TTL_MS;
+  const exportId = `checkpoint:${checkpoint.scope}:${checkpoint.head.epoch}:${checkpoint.head.seq}:${checkpoint.checkpoint_hash}`;
+  const material: DecodedOpenContinuation = {
+    mode: "checkpoint",
+    scope: checkpoint.scope,
+    export_id: exportId,
+    head: checkpoint.head,
+    checkpoint_hash: checkpoint.checkpoint_hash,
+    next_page: nextPage,
+    expires_at_ms: expiresAt
+  };
+  return {
+    token: encodeContinuationMaterial(material),
+    export_id: exportId,
+    head: checkpoint.head,
+    checkpoint_hash: checkpoint.checkpoint_hash,
+    expires_at_ms: expiresAt
+  };
+}
+
+function persistedScopeCheckpointManifestFromUnknown(value: unknown): PersistedScopeCheckpointManifest | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "woo.scope_checkpoint_manifest.v1") return null;
+  if (typeof record.scope !== "string" || typeof record.checkpoint_hash !== "string") return null;
+  const head = shadowScopeHeadFromUnknown(record.head);
+  if (!head) return null;
+  if (!Array.isArray(record.pages) || !Array.isArray(record.frame_tail)) return null;
+  const pages: PersistedCheckpointPageRef[] = [];
+  for (const item of record.pages) {
+    const page = checkpointPageRefFromUnknown(item);
+    if (!page) return null;
+    pages.push(page);
+  }
+  const frameTail: PersistedCheckpointFrameRef[] = [];
+  for (const item of record.frame_tail) {
+    const frame = checkpointFrameRefFromUnknown(item);
+    if (!frame) return null;
+    frameTail.push(frame);
+  }
+  return {
+    kind: "woo.scope_checkpoint_manifest.v1",
+    scope: record.scope as ObjRef,
+    head,
+    checkpoint_hash: record.checkpoint_hash,
+    pages,
+    frame_tail: frameTail
+  };
+}
+
+function checkpointPageRefFromUnknown(value: unknown): PersistedCheckpointPageRef | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "woo.projection_page_ref.v1") return null;
+  if (typeof record.page_index !== "number" || !Number.isInteger(record.page_index) || record.page_index < 0) return null;
+  if (record.table !== "objects" && record.table !== "sessions" && record.table !== "logs" && record.table !== "snapshots" && record.table !== "parked_tasks" && record.table !== "tombstones" && record.table !== "tool_surfaces") return null;
+  if (typeof record.page !== "string" || typeof record.hash !== "string") return null;
+  if (typeof record.bytes !== "number" || !Number.isFinite(record.bytes) || record.bytes < 0) return null;
+  return {
+    kind: "woo.projection_page_ref.v1",
+    page_index: record.page_index,
+    table: record.table,
+    page: record.page,
+    hash: record.hash,
+    bytes: record.bytes
+  };
+}
+
+function checkpointFrameRefFromUnknown(value: unknown): PersistedCheckpointFrameRef | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.seq !== "number" || !Number.isInteger(record.seq) || record.seq < 0) return null;
+  if (typeof record.hash !== "string") return null;
+  if (typeof record.bytes !== "number" || !Number.isFinite(record.bytes) || record.bytes < 0) return null;
+  return {
+    seq: record.seq,
+    hash: record.hash,
+    bytes: record.bytes
+  };
+}
+
+function checkpointPageRef(page: ProjectionPage, pageIndex: number, body = JSON.stringify(page)): PersistedCheckpointPageRef {
+  return {
+    kind: "woo.projection_page_ref.v1",
+    page_index: pageIndex,
+    table: page.table,
+    page: page.page,
+    hash: page.hash,
+    bytes: JSON_BYTES.encode(body).byteLength
+  };
+}
+
+function checkpointFrameRef(frame: ShadowCommitAccepted, body = JSON.stringify(frame)): PersistedCheckpointFrameRef {
+  return {
+    seq: frame.position.seq,
+    hash: frame.position.hash,
+    bytes: JSON_BYTES.encode(body).byteLength
+  };
+}
+
+function frameContinuation(scope: ObjRef, afterHead: ShadowScopeHead, finalHead: ShadowScopeHead, nextSeq: number): OpenContinuation {
+  const expiresAt = Date.now() + CHECKPOINT_CONTINUATION_TTL_MS;
+  const exportId = `frames:${scope}:${finalHead.epoch}:${finalHead.seq}:${finalHead.hash}`;
+  const material: DecodedOpenContinuation = {
+    mode: "frames",
+    scope,
+    export_id: exportId,
+    after_head: afterHead,
+    head: finalHead,
+    next_seq: nextSeq,
+    expires_at_ms: expiresAt
+  };
+  return {
+    token: encodeContinuationMaterial(material),
+    export_id: exportId,
+    head: finalHead,
+    expires_at_ms: expiresAt
+  };
+}
+
+function encodeContinuationMaterial(material: DecodedOpenContinuation): string {
+  return storageKey(stableShadowJson({
+    kind: "woo.open_checkpoint_tail.continuation.v1",
+    ...material
+  } as unknown as WooValue));
+}
+
+function decodeOpenContinuation(value: unknown): DecodedOpenContinuation | null {
+  const token = continuationToken(value);
+  if (!token) return null;
+  try {
+    const parsed = JSON.parse(decodeStorageKey(token)) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.kind !== "woo.open_checkpoint_tail.continuation.v1") return null;
+    const mode = record.mode;
+    const scope = typeof record.scope === "string" ? record.scope as ObjRef : null;
+    const exportId = typeof record.export_id === "string" ? record.export_id : null;
+    const head = shadowScopeHeadFromUnknown(record.head);
+    const expiresAt = typeof record.expires_at_ms === "number" ? record.expires_at_ms : null;
+    if (!scope || !exportId || !head || expiresAt === null) return null;
+    if (!continuationPublicFieldsMatch(value, exportId, head, expiresAt, typeof record.checkpoint_hash === "string" ? record.checkpoint_hash : undefined)) return null;
+    if (mode === "checkpoint") {
+      const checkpointHash = typeof record.checkpoint_hash === "string" ? record.checkpoint_hash : null;
+      const nextPage = typeof record.next_page === "number" && Number.isInteger(record.next_page) ? record.next_page : null;
+      if (!checkpointHash || nextPage === null) return null;
+      return {
+        mode,
+        scope,
+        export_id: exportId,
+        head,
+        checkpoint_hash: checkpointHash,
+        next_page: nextPage,
+        expires_at_ms: expiresAt
+      };
+    }
+    if (mode === "frames") {
+      const afterHead = shadowScopeHeadFromUnknown(record.after_head);
+      const nextSeq = typeof record.next_seq === "number" && Number.isInteger(record.next_seq) ? record.next_seq : null;
+      if (!afterHead || nextSeq === null) return null;
+      return {
+        mode,
+        scope,
+        export_id: exportId,
+        after_head: afterHead,
+        head,
+        next_seq: nextSeq,
+        expires_at_ms: expiresAt
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function continuationToken(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const token = (value as { token?: unknown }).token;
+  return typeof token === "string" && token.trim() ? token : null;
+}
+
+function continuationPublicFieldsMatch(
+  value: unknown,
+  exportId: string,
+  head: ShadowScopeHead,
+  expiresAt: number,
+  checkpointHash?: string
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return true;
+  const record = value as Record<string, unknown>;
+  if (typeof record.export_id === "string" && record.export_id !== exportId) return false;
+  if (typeof record.expires_at_ms === "number" && record.expires_at_ms !== expiresAt) return false;
+  if (typeof record.checkpoint_hash === "string" && record.checkpoint_hash !== checkpointHash) return false;
+  const publicHead = shadowScopeHeadFromUnknown(record.head);
+  if (publicHead && !shadowScopeHeadsEqual(publicHead, head)) return false;
+  return true;
+}
+
+function shadowScopeHeadFromUnknown(value: unknown): ShadowScopeHead | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "woo.scope_head.shadow.v1") return null;
+  if (typeof record.scope !== "string") return null;
+  if (typeof record.epoch !== "number" || !Number.isInteger(record.epoch)) return null;
+  if (typeof record.seq !== "number" || !Number.isInteger(record.seq)) return null;
+  if (typeof record.hash !== "string") return null;
+  return {
+    kind: "woo.scope_head.shadow.v1",
+    scope: record.scope as ObjRef,
+    epoch: record.epoch,
+    seq: record.seq,
+    hash: record.hash
+  };
+}
+
+function shadowScopeHeadsEqual(left: ShadowScopeHead, right: ShadowScopeHead): boolean {
+  return left.scope === right.scope && left.epoch === right.epoch && left.seq === right.seq && left.hash === right.hash;
+}
+
+function acceptedFrameForTransfer(frame: ShadowCommitAccepted): ShadowCommitAccepted {
+  const copy = structuredClone(frame) as ShadowCommitAccepted;
+  delete copy.projection_writes;
+  return copy;
+}
+
+function projectionPages(table: "objects", rows: SerializedObject[]): Extract<ProjectionPage, { table: "objects" }>[];
+function projectionPages(table: "sessions", rows: SerializedSession[]): Extract<ProjectionPage, { table: "sessions" }>[];
+function projectionPages(table: "logs", rows: Array<{ space: ObjRef; entry: SerializedWorld["logs"][number][1][number] }>): Extract<ProjectionPage, { table: "logs" }>[];
+function projectionPages(table: "snapshots", rows: SerializedWorld["snapshots"]): Extract<ProjectionPage, { table: "snapshots" }>[];
+function projectionPages(table: "parked_tasks", rows: SerializedWorld["parkedTasks"]): Extract<ProjectionPage, { table: "parked_tasks" }>[];
+function projectionPages(table: "tombstones", rows: Array<{ id: ObjRef }>): Extract<ProjectionPage, { table: "tombstones" }>[];
+function projectionPages(table: ProjectionPage["table"], rows: unknown[]): ProjectionPage[] {
+  const pages: ProjectionPage[] = [];
+  let current: unknown[] = [];
+  let currentBytes = 0;
+  const flush = (): void => {
+    if (current.length === 0) return;
+    const page = String(pages.length + 1).padStart(6, "0");
+    const material = { kind: "woo.projection_page_material.v1", table, page, rows: current };
+    pages.push({
+      kind: "woo.projection_page.v1",
+      table,
+      page,
+      hash: hashSource(stableShadowJson(material as unknown as WooValue)),
+      rows: current
+    } as ProjectionPage);
+    current = [];
+    currentBytes = 0;
+  };
+  for (const row of rows) {
+    const rowBytes = jsonByteLength(row);
+    if (current.length > 0 && currentBytes + rowBytes > CHECKPOINT_PAGE_TARGET_BYTES) flush();
+    current.push(row);
+    currentBytes += rowBytes;
+    if (rowBytes > CHECKPOINT_PAGE_TARGET_BYTES) flush();
+  }
+  flush();
+  return pages;
 }
 
 function requestContentLength(request: Request): number | undefined {

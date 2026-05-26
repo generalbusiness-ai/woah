@@ -7,6 +7,7 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { SerializedObject } from "../core/repository";
 import type { WooValue } from "../core/types";
+import type { CheckpointTailOpenTransfer } from "../core/projection-delta";
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
 import { v2ExecutionAdRecord } from "./v2-browser-delegation";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
@@ -22,6 +23,7 @@ export type V2BrowserCacheMutation =
   | { kind: "object_page"; hash: string; object: SerializedObject }
   | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage }
   | { kind: "state_pages"; scope: string; pages: Array<{ hash: string; ref: string; page: ShadowStatePage }> }
+  | { kind: "checkpoint_tail"; transfer: CheckpointTailOpenTransfer }
   | { kind: "execution_ad"; record: V2ExecutionAdRecord }
   | { kind: "execution_transfer"; record: V2ExecutableTransferRecord };
 
@@ -38,6 +40,15 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
   }
   if (envelope.type === "woo.state.transfer.shadow.v1") {
     return stateTransferMutations(envelope.body as ShadowBrowserStateTransfer);
+  }
+  if (envelope.type === "woo.open.checkpoint_tail.v1") {
+    const transfer = envelope.body as CheckpointTailOpenTransfer;
+    return [
+      { kind: "checkpoint_tail", transfer },
+      ...(transfer.transfer.kind === "frames"
+        ? transfer.transfer.frames.map((frame) => ({ kind: "applied_frame" as const, frame: frame.frame }))
+        : [])
+    ];
   }
   if (envelope.type === "woo.exec_capability_ad.shadow.v1") {
     return [{ kind: "execution_ad", record: v2ExecutionAdRecord(envelope.body as ShadowCapabilityAd) }];

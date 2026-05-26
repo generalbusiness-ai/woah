@@ -3,7 +3,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { capabilityAdProbablyCoversTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
-import { createShadowCommitScope, submitShadowCommit } from "../src/core/shadow-commit-scope";
+import { createShadowCommitScope, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
   buildShadowClosureTransfer,
@@ -20,6 +20,7 @@ import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } f
 import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
+import type { MetricEvent } from "../src/core/types";
 
 describe("shadow turn execution", () => {
   it("refuses missing state, installs a closure transfer, and retries the whole turn", async () => {
@@ -246,8 +247,8 @@ describe("shadow turn execution", () => {
     });
     if (!routed.result.ok) throw new Error(`commit-scope execution failed: ${routed.result.reason}`);
     expect(commitScope.head.seq).toBe(1);
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
-    expect(commitScope.serialized.objects.length).toBe(serializedBefore.objects.length);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
+    expect(serializedFor(commitScope).objects.length).toBe(serializedBefore.objects.length);
 
     const staleCall: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -280,7 +281,7 @@ describe("shadow turn execution", () => {
       commit: { kind: "woo.commit.conflict.shadow.v1", reason: "stale_head" },
       reply: { kind: "woo.turn.exec.reply.shadow.v1", ok: false, reason: "commit_rejected" }
     });
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("delay_1", "wet")).toBe(0.58);
     expect(createWorldFromSerialized(staleNode.serialized!, { persist: false }).getProp("delay_1", "wet")).not.toBe(0.59);
   });
 
@@ -332,7 +333,7 @@ describe("shadow turn execution", () => {
     expect(postStateExports).toBe(0);
     expect(result.transcript.hash).toBe(planned.transcript.hash);
     expect(result.receipt).toMatchObject({ accepted: true, transcript_hash: planned.transcript.hash });
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.62);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("delay_1", "wet")).toBe(0.62);
     expect(createWorldFromSerialized(result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.62);
   });
 
@@ -418,7 +419,7 @@ describe("shadow turn execution", () => {
     if (rejected.ok || rejected.reason !== "commit_rejected") throw new Error("expected stale transcript-only commit rejection");
     expect(postStateExports).toBe(0);
     expect(rejected.transcript.hash).toBe(stalePlan.transcript.hash);
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.64);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("delay_1", "wet")).toBe(0.64);
     expect(createWorldFromSerialized(staleNode.serialized!, { persist: false }).getProp("delay_1", "wet")).not.toBe(0.65);
   });
 
@@ -435,7 +436,7 @@ describe("shadow turn execution", () => {
     const acceptedNode = createShadowExecutionNode({
       node: "authoritative-accepted",
       scope: "the_dubspace",
-      serialized: commitScope.serialized,
+      serialized: serializedFor(commitScope),
       authoritative_state: true
     });
     const acceptedCall: ShadowTurnCall = {
@@ -487,7 +488,7 @@ describe("shadow turn execution", () => {
       commit: { kind: "woo.commit.conflict.shadow.v1", reason: "stale_head" }
     });
     expect(staleNode.world).toBeUndefined();
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("delay_1", "wet")).toBe(0.71);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("delay_1", "wet")).toBe(0.71);
   });
 
   it("refreshes authoritative executor caches only for moved objects and containers", async () => {
@@ -500,7 +501,7 @@ describe("shadow turn execution", () => {
     const node = createShadowExecutionNode({
       node: "authoritative-move",
       scope: "the_chatroom",
-      serialized: commitScope.serialized,
+      serialized: serializedFor(commitScope),
       authoritative_state: true
     });
     expect(node.page_hashes.size).toBe(0);
@@ -527,7 +528,7 @@ describe("shadow turn execution", () => {
     if (!result.ok) throw new Error("expected authoritative move to commit");
     const moved = result.transcript.moves[0]?.object;
     if (!moved) throw new Error("expected take to record a move");
-    const byId = new Map(commitScope.serialized.objects.map((obj) => [obj.id, obj] as const));
+    const byId = new Map(serializedFor(commitScope).objects.map((obj) => [obj.id, obj] as const));
     const actorObj = byId.get(actor);
     const roomObj = byId.get("the_chatroom");
     const mugObj = byId.get(moved);
@@ -579,7 +580,7 @@ describe("shadow turn execution", () => {
       transcript: wetRun.transcript
     });
     expect(wetAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("merge_box", "wet")).toBe(0.44);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("merge_box", "wet")).toBe(0.44);
 
     const feedbackCall: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -603,7 +604,7 @@ describe("shadow turn execution", () => {
     });
 
     expect(feedbackAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
-    const committed = createWorldFromSerialized(commitScope.serialized, { persist: false });
+    const committed = createWorldFromSerialized(serializedFor(commitScope), { persist: false });
     expect(committed.getProp("merge_box", "wet")).toBe(0.44);
     expect(committed.getProp("merge_box", "feedback")).toBe(0.37);
   });
@@ -639,13 +640,15 @@ describe("shadow turn execution", () => {
     const run = await runShadowTurnCallTranscript(serializedBefore, call);
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: run.transcript.scope, serialized: serializedBefore });
     const steps: Array<{ phase: string; objects: number }> = [];
+    const metrics: MetricEvent[] = [];
     const accepted = submitShadowCommit(commitScope, {
       kind: "woo.commit.submit.shadow.v1",
       id: "shadow-indexed-commit-wet",
       scope: run.transcript.scope,
       expected: structuredClone(commitScope.head),
       transcript: run.transcript,
-      profile: (event) => steps.push({ phase: event.phase, objects: event.objects })
+      profile: (event) => steps.push({ phase: event.phase, objects: event.objects }),
+      metric: (event) => metrics.push(event)
     });
 
     expect(accepted.kind).toBe("woo.commit.accepted.shadow.v1");
@@ -664,7 +667,12 @@ describe("shadow turn execution", () => {
     expect(commitScope.state.snapshots).not.toBe(serializedBefore.snapshots);
     expect(commitScope.state.parkedTasks).not.toBe(serializedBefore.parkedTasks);
     expect(commitScope.state.tombstones).not.toBe(serializedBefore.tombstones);
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("indexed_box", "wet")).toBe(0.41);
+    expect(metrics.filter((event) => event.kind === "serialized_world_materialized")).toEqual([]);
+    const materialized = serializedFor(commitScope, { reason: "test_boundary", metric: (event) => metrics.push(event) });
+    expect(createWorldFromSerialized(materialized, { persist: false }).getProp("indexed_box", "wet")).toBe(0.41);
+    expect(metrics.filter((event) => event.kind === "serialized_world_materialized")).toHaveLength(1);
+    serializedFor(commitScope, { reason: "test_boundary", metric: (event) => metrics.push(event) });
+    expect(metrics.filter((event) => event.kind === "serialized_world_materialized")).toHaveLength(1);
   });
 
   it("deduplicates submissions by intent id and transcript hash", async () => {
@@ -700,13 +708,13 @@ describe("shadow turn execution", () => {
       transcript: firstRun.transcript
     });
     expect(firstAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("submit_box", "value")).toBe(1);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("submit_box", "value")).toBe(1);
 
     const replayedCall: ShadowTurnCall = {
       ...firstCall,
       args: [2]
     };
-    const replayedRun = await runShadowTurnCall(commitScope.serialized, replayedCall);
+    const replayedRun = await runShadowTurnCall(serializedFor(commitScope), replayedCall);
     expect(replayedRun.transcript.hash).not.toBe(firstRun.transcript.hash);
     const replayedAccepted = submitShadowCommit(commitScope, {
       kind: "woo.commit.submit.shadow.v1",
@@ -717,7 +725,7 @@ describe("shadow turn execution", () => {
     });
 
     expect(replayedAccepted.kind).toBe("woo.commit.accepted.shadow.v1");
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("submit_box", "value")).toBe(2);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("submit_box", "value")).toBe(2);
     const duplicate = submitShadowCommit(commitScope, {
       kind: "woo.commit.submit.shadow.v1",
       id: "same-user-action",
@@ -797,7 +805,7 @@ describe("shadow turn execution", () => {
     if (rejected.kind !== "woo.commit.conflict.shadow.v1") throw new Error("expected tampered write to be rejected");
     expect(rejected.reason).toBe("permission_denied");
     expect(rejected.errors).toContain("permission_denied: no recorded authority can write admin_box.value");
-    expect(createWorldFromSerialized(commitScope.serialized, { persist: false }).getProp("admin_box", "value")).toBe(0);
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("admin_box", "value")).toBe(0);
   });
 
   it("uses cached state pages so a second real dubspace turn transfers only newly missing pages", async () => {

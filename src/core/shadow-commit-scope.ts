@@ -18,6 +18,15 @@ import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, shadowCommitReceiptFromTouchedStateHashes, type ShadowCommitReceipt } from "./turn-commit";
 import type { RecordedWriteAuthority } from "./turn-recorder";
 import type { MetricEvent, ObjRef, WooValue } from "./types";
+import {
+  coalesceProjectionWrites,
+  projectionDeltaWithToolSurfaceSourceMarkers,
+  projectionRowBytes,
+  summarizeProjectionWrites,
+  type ApplyResult,
+  type ProjectionDeltaSummary,
+  type ProjectionWrite
+} from "./projection-delta";
 
 export type ShadowScopeHead = {
   kind: "woo.scope_head.shadow.v1";
@@ -47,6 +56,8 @@ export type ShadowCommitAccepted = {
   post_state_hash: string;
   observations: EffectTranscript["observations"];
   receipt: ShadowCommitReceipt;
+  projection_delta?: ProjectionDeltaSummary;
+  projection_writes?: ProjectionWrite[];
 };
 
 export type ShadowCommitAcceptedWire = ShadowCommitAccepted;
@@ -79,6 +90,7 @@ export type ShadowCommitScope = {
   epoch: number;
   head: ShadowScopeHead;
   serialized: SerializedWorld;
+  serializedDirty: boolean;
   state: ShadowCommitScopeState;
   submissions: Map<string, ShadowCommitResult>;
 };
@@ -108,6 +120,12 @@ type ShadowCommitScopeSerializedRefs = {
   tombstones?: ObjRef[];
 };
 
+export type ShadowIndexedApplyResult = {
+  state: ShadowCommitScopeState;
+  projection_delta: ProjectionDeltaSummary;
+  projection_writes: ProjectionWrite[];
+};
+
 export type ShadowTranscriptApplyOptions = {
   objectTimestamp?: number;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
@@ -129,6 +147,7 @@ export function createShadowCommitScope(input: {
     epoch,
     head: shadowScopeHeadForSerialized(input.scope, epoch, serialized),
     serialized,
+    serializedDirty: false,
     state: createShadowCommitScopeState(serialized),
     submissions: new Map()
   };
@@ -194,8 +213,8 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   const stateBefore = ensureShadowCommitScopeState(scope);
   const beforeReader = createCommitScopeStateCellReader(stateBefore);
   const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
-  const mergedState = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile, metric: submit.metric });
-  const afterReader = createCommitScopeStateCellReader(mergedState);
+  const applied = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile, metric: submit.metric });
+  const afterReader = createCommitScopeStateCellReader(applied.state);
   const extraErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
   extraErrors.push(...validateShadowPostState(afterReader, submit.transcript));
   extraErrors.push(...validateShadowWriteAuthorityIndex(serializedAuthorityIndexFromState(stateBefore), submit.transcript));
@@ -229,7 +248,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     return conflict;
   }
 
-  scope.serialized = commitShadowCommitScopeState(scope, mergedState);
+  commitShadowCommitScopeState(scope, applied.state);
   // Shadow commit scopes sequence accepted transcripts independently of the
   // legacy durable space log. The serialized state is still in the hash, but
   // browser catch-up needs every accepted v2 commit to advance the head.
@@ -242,7 +261,9 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     transcript_hash: submit.transcript.hash,
     post_state_hash: receipt.post_state_hash,
     observations: submit.transcript.observations,
-    receipt
+    receipt,
+    projection_delta: applied.projection_delta,
+    projection_writes: applied.projection_writes
   };
   if (submissionCacheKey) scope.submissions.set(submissionCacheKey, accepted);
   return accepted;
@@ -256,7 +277,11 @@ export function applyAcceptedShadowFrame(
   // Consumers that receive an accepted frame from the commit authority already
   // have the validation result. Update their local cache from the transcript
   // and authority head without running the expensive authority checks again.
-  applyShadowTranscriptToCommitScopeCache(scope, transcript);
+  if (accepted.projection_writes?.length) {
+    applyProjectionWritesToCommitScopeCache(scope, accepted.projection_writes);
+  } else {
+    applyShadowTranscriptToCommitScopeCache(scope, transcript);
+  }
   scope.head = structuredClone(accepted.position) as ShadowScopeHead;
   if (accepted.id) scope.submissions.set(`${accepted.id}:${accepted.transcript_hash}`, structuredClone(accepted) as ShadowCommitAccepted);
 }
@@ -275,12 +300,44 @@ export function applyShadowTranscriptToCommitScopeCache(
   transcript: EffectTranscript,
   options: ShadowTranscriptApplyOptions = {}
 ): void {
-  const state = applyShadowTranscriptToIndexedState(ensureShadowCommitScopeState(scope), transcript, options);
-  scope.serialized = commitShadowCommitScopeState(scope, state);
+  const result = applyShadowTranscriptToIndexedState(ensureShadowCommitScopeState(scope), transcript, options);
+  commitShadowCommitScopeState(scope, result.state);
 }
 
 export function markShadowCommitScopeSerializedChanged(scope: ShadowCommitScope): void {
   scope.state = createShadowCommitScopeState(scope.serialized);
+  scope.serializedDirty = false;
+}
+
+export function isShadowCommitScopeSerializedDirty(scope: ShadowCommitScope): boolean {
+  return scope.serializedDirty;
+}
+
+export function shadowCommitScopeSerializedRef(scope: ShadowCommitScope): SerializedWorld {
+  return scope.serialized;
+}
+
+export function serializedFor(
+  scope: ShadowCommitScope,
+  options: { reason?: string; metric?: (event: MetricEvent) => void } = {}
+): SerializedWorld {
+  if (!scope.serializedDirty && stateMatchesSerializedRefs(scope.state, scope.serialized)) return scope.serialized;
+  const startedAt = Date.now();
+  const serialized = serializedWorldFromCommitScopeState(scope.state);
+  scope.serialized = serialized;
+  scope.serializedDirty = false;
+  scope.state.serializedRefs = serializedRefs(serialized);
+  options.metric?.({
+    kind: "serialized_world_materialized",
+    scope: scope.scope,
+    seq: scope.head.seq,
+    reason: options.reason ?? "unspecified",
+    ms: Date.now() - startedAt,
+    objects: serialized.objects.length,
+    sessions: serialized.sessions.length,
+    logs: serialized.logs.reduce((count, [, entries]) => count + entries.length, 0)
+  });
+  return serialized;
 }
 
 export function shadowCommitScopeObject(scope: ShadowCommitScope, id: ObjRef): SerializedObject | undefined {
@@ -304,7 +361,7 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   if (!submit.transcript.complete) {
     errors.push("incomplete_transcript");
   }
-  const checked = validation ?? validateTranscriptAgainstSerializedWorld(scope.serialized, submit.transcript);
+  const checked = validation ?? validateTranscriptAgainstSerializedWorld(serializedFor(scope, { reason: "legacy_validation" }), submit.transcript);
   for (const error of checked.errors) errors.push(error);
   return errors;
 }
@@ -434,10 +491,11 @@ function createShadowCommitScopeState(serialized: SerializedWorld): ShadowCommit
 }
 
 function ensureShadowCommitScopeState(scope: ShadowCommitScope): ShadowCommitScopeState {
-  // Older transport/cache boundaries still mutate `scope.serialized` directly.
-  // Rebuild the indexed view whenever those callers replace a top-level row
-  // array; in-place row edits must call markShadowCommitScopeSerializedChanged.
-  if (!stateMatchesSerializedRefs(scope.state, scope.serialized)) {
+  // Legacy import/cache boundaries may replace the serialized export through
+  // commit-scope helpers. Rebuild the indexed view whenever a top-level row
+  // array changed; in-place legacy row edits must call
+  // markShadowCommitScopeSerializedChanged.
+  if (!scope.serializedDirty && !stateMatchesSerializedRefs(scope.state, scope.serialized)) {
     scope.state = createShadowCommitScopeState(scope.serialized);
   }
   return scope.state;
@@ -481,11 +539,11 @@ function createCommitScopeStateCellReader(state: ShadowCommitScopeState): Transc
   return createTranscriptCellReaderFromObjectMap(serializedShellFromCommitScopeState(state), state.objectsById);
 }
 
-function applyShadowTranscriptToIndexedState(
+export function applyShadowTranscriptToIndexedState(
   current: ShadowCommitScopeState,
   transcript: EffectTranscript,
   options: ShadowTranscriptApplyOptions = {}
-): ShadowCommitScopeState {
+): ShadowIndexedApplyResult {
   const totalStartedAt = Date.now();
   const profile = (phase: (MetricEvent & { kind: "shadow_apply_step" })["phase"], startedAt: number) => {
     options.profile?.({
@@ -501,6 +559,7 @@ function applyShadowTranscriptToIndexedState(
   };
   const next = cloneShadowCommitScopeState(current);
   const mutableObjects = new Set<ObjRef>();
+  const touchedObjectIds = new Set<ObjRef>();
   const mutableObject = (id: ObjRef): SerializedObject | null => {
     const existing = next.objectsById.get(id);
     if (!existing) return null;
@@ -508,6 +567,7 @@ function applyShadowTranscriptToIndexedState(
     const clone = structuredClone(existing) as SerializedObject;
     next.objectsById.set(id, clone);
     mutableObjects.add(id);
+    touchedObjectIds.add(id);
     return clone;
   };
 
@@ -520,6 +580,7 @@ function applyShadowTranscriptToIndexedState(
     const created = serializedObjectFromCreate(create, options.objectTimestamp);
     next.objectsById.set(create.object, created);
     mutableObjects.add(create.object);
+    touchedObjectIds.add(create.object);
     if (created.parent) addUniqueObjectRef(mutableObject(created.parent)?.children, created.id);
     if (created.location) addUniqueObjectRef(mutableObject(created.location)?.contents, created.id);
   }
@@ -543,6 +604,189 @@ function applyShadowTranscriptToIndexedState(
   next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
   profile("counters", stepStartedAt);
   profile("total", totalStartedAt);
+  const projectionWrites = projectionWritesForIndexedApply(current, next, transcript, touchedObjectIds);
+  return {
+    state: next,
+    projection_delta: projectionDeltaWithToolSurfaceSourceMarkers(summarizeProjectionWrites(projectionWrites), transcript.scope),
+    projection_writes: projectionWrites
+  };
+}
+
+function projectionWritesForIndexedApply(
+  current: ShadowCommitScopeState,
+  next: ShadowCommitScopeState,
+  transcript: EffectTranscript,
+  touchedObjectIds: Set<ObjRef>
+): ProjectionWrite[] {
+  const writes: ProjectionWrite[] = [];
+  for (const id of Array.from(touchedObjectIds).sort()) {
+    const row = next.objectsById.get(id);
+    if (row) {
+      const clone = structuredClone(row) as SerializedObject;
+      writes.push({ table: "objects", key: id, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
+    } else if (current.objectsById.has(id)) {
+      writes.push({ table: "objects", key: id, op: "delete", bytes: 0 });
+    }
+  }
+
+  const sessionUpdate = transcriptSessionActiveScope(transcript);
+  if (sessionUpdate) {
+    const row = next.sessionsById.get(sessionUpdate.session);
+    if (row) {
+      const clone = structuredClone(row) as SerializedWorld["sessions"][number];
+      writes.push({ table: "sessions", key: row.id, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
+    } else if (current.sessionsById.has(sessionUpdate.session)) {
+      writes.push({ table: "sessions", key: sessionUpdate.session, op: "delete", bytes: 0 });
+    }
+  }
+
+  const log = transcriptLogEntry(transcript);
+  if (log) {
+    const clone = structuredClone(log) as SerializedWorld["logs"][number][1][number];
+    writes.push({ table: "logs", key: { space: log.space, seq: log.seq }, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
+  }
+
+  if (next.objectCounter !== current.objectCounter) {
+    writes.push({ table: "counters", key: "objectCounter", op: "upsert", value: next.objectCounter, bytes: projectionRowBytes({ key: "objectCounter", value: next.objectCounter }) });
+  }
+  if (next.sessionCounter !== current.sessionCounter) {
+    writes.push({ table: "counters", key: "sessionCounter", op: "upsert", value: next.sessionCounter, bytes: projectionRowBytes({ key: "sessionCounter", value: next.sessionCounter }) });
+  }
+  if (next.parkedTaskCounter !== current.parkedTaskCounter) {
+    writes.push({ table: "counters", key: "parkedTaskCounter", op: "upsert", value: next.parkedTaskCounter, bytes: projectionRowBytes({ key: "parkedTaskCounter", value: next.parkedTaskCounter }) });
+  }
+
+  appendSnapshotProjectionWrites(writes, current.snapshots, next.snapshots);
+  appendParkedTaskProjectionWrites(writes, current.parkedTasks, next.parkedTasks);
+  appendTombstoneProjectionWrites(writes, current.tombstones ?? [], next.tombstones ?? []);
+
+  return coalesceProjectionWrites(writes);
+}
+
+function appendSnapshotProjectionWrites(
+  writes: ProjectionWrite[],
+  currentRows: SerializedWorld["snapshots"],
+  nextRows: SerializedWorld["snapshots"]
+): void {
+  const current = new Map(currentRows.map((row) => [snapshotProjectionKey(row), row]));
+  const next = new Map(nextRows.map((row) => [snapshotProjectionKey(row), row]));
+  for (const key of Array.from(new Set([...current.keys(), ...next.keys()])).sort()) {
+    const before = current.get(key);
+    const after = next.get(key);
+    if (!after) {
+      const parsed = parseSnapshotProjectionKey(key);
+      writes.push({ table: "snapshots", key: parsed, op: "delete", bytes: 0 });
+      continue;
+    }
+    if (!before || stableShadowJson(before as unknown as WooValue) !== stableShadowJson(after as unknown as WooValue)) {
+      const clone = structuredClone(after) as SerializedWorld["snapshots"][number];
+      writes.push({ table: "snapshots", key: { space: clone.space_id, seq: clone.seq }, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
+    }
+  }
+}
+
+function appendParkedTaskProjectionWrites(
+  writes: ProjectionWrite[],
+  currentRows: SerializedWorld["parkedTasks"],
+  nextRows: SerializedWorld["parkedTasks"]
+): void {
+  const current = new Map(currentRows.map((row) => [row.id, row]));
+  const next = new Map(nextRows.map((row) => [row.id, row]));
+  for (const key of Array.from(new Set([...current.keys(), ...next.keys()])).sort()) {
+    const before = current.get(key);
+    const after = next.get(key);
+    if (!after) {
+      writes.push({ table: "parked_tasks", key, op: "delete", bytes: 0 });
+      continue;
+    }
+    if (!before || stableShadowJson(before as unknown as WooValue) !== stableShadowJson(after as unknown as WooValue)) {
+      const clone = structuredClone(after) as SerializedWorld["parkedTasks"][number];
+      writes.push({ table: "parked_tasks", key, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
+    }
+  }
+}
+
+function appendTombstoneProjectionWrites(
+  writes: ProjectionWrite[],
+  currentRows: readonly ObjRef[],
+  nextRows: readonly ObjRef[]
+): void {
+  const current = new Set(currentRows);
+  const next = new Set(nextRows);
+  for (const id of Array.from(new Set([...current, ...next])).sort()) {
+    if (next.has(id) && !current.has(id)) {
+      writes.push({ table: "tombstones", key: id, op: "upsert", row: { id }, bytes: projectionRowBytes({ id }) });
+    } else if (current.has(id) && !next.has(id)) {
+      writes.push({ table: "tombstones", key: id, op: "delete", bytes: 0 });
+    }
+  }
+}
+
+function snapshotProjectionKey(row: SerializedWorld["snapshots"][number]): string {
+  return `${row.space_id}\u0000${row.seq}`;
+}
+
+function parseSnapshotProjectionKey(key: string): { space: ObjRef; seq: number } {
+  const [space, rawSeq] = key.split("\u0000");
+  return { space: space as ObjRef, seq: Number(rawSeq) };
+}
+
+function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, writes: ProjectionWrite[]): void {
+  const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
+  for (const write of coalesceProjectionWrites(writes)) {
+    switch (write.table) {
+      case "objects":
+        if (write.op === "delete") next.objectsById.delete(write.key);
+        else next.objectsById.set(write.key, structuredClone(write.row) as SerializedObject);
+        break;
+      case "sessions":
+        if (write.op === "delete") next.sessionsById.delete(write.key);
+        else next.sessionsById.set(write.key, structuredClone(write.row) as SerializedWorld["sessions"][number]);
+        break;
+      case "logs": {
+        const entries = (next.logsByScope.get(write.key.space) ?? []).slice();
+        if (write.op === "delete") {
+          next.logsByScope.set(write.key.space, entries.filter((entry) => entry.seq !== write.key.seq));
+        } else {
+          mergeTranscriptLogEntry(entries, structuredClone(write.row) as SerializedWorld["logs"][number][1][number]);
+          next.logsByScope.set(write.key.space, entries);
+        }
+        break;
+      }
+      case "snapshots":
+        next.snapshots = write.op === "delete"
+          ? next.snapshots.filter((row) => row.space_id !== write.key.space || row.seq !== write.key.seq)
+          : upsertBy(next.snapshots, (row) => row.space_id === write.key.space && row.seq === write.key.seq, structuredClone(write.row) as SerializedWorld["snapshots"][number]);
+        break;
+      case "parked_tasks":
+        next.parkedTasks = write.op === "delete"
+          ? next.parkedTasks.filter((row) => row.id !== write.key)
+          : upsertBy(next.parkedTasks, (row) => row.id === write.key, structuredClone(write.row) as SerializedWorld["parkedTasks"][number]);
+        break;
+      case "counters":
+        if (write.key === "objectCounter") next.objectCounter = write.value;
+        if (write.key === "sessionCounter") next.sessionCounter = write.value;
+        if (write.key === "parkedTaskCounter") next.parkedTaskCounter = write.value;
+        break;
+      case "tombstones": {
+        const tombstones = new Set(next.tombstones ?? []);
+        if (write.op === "delete") tombstones.delete(write.key);
+        else tombstones.add(write.key);
+        next.tombstones = Array.from(tombstones).sort();
+        break;
+      }
+      case "tool_surfaces":
+        break;
+    }
+  }
+  commitShadowCommitScopeState(scope, next);
+}
+
+function upsertBy<T>(rows: T[], predicate: (row: T) => boolean, value: T): T[] {
+  const next = rows.slice();
+  const index = next.findIndex(predicate);
+  if (index >= 0) next[index] = value;
+  else next.push(value);
   return next;
 }
 
@@ -566,11 +810,9 @@ function applyTranscriptLogToState(state: ShadowCommitScopeState, transcript: Ef
   state.logsByScope.set(transcript.scope, entries);
 }
 
-function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState): SerializedWorld {
-  const serialized = serializedWorldFromCommitScopeState(state);
-  state.serializedRefs = serializedRefs(serialized);
+function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState): void {
   scope.state = state;
-  return serialized;
+  scope.serializedDirty = true;
 }
 
 function serializedWorldFromCommitScopeState(state: ShadowCommitScopeState): SerializedWorld {
@@ -603,89 +845,6 @@ function serializedShellFromCommitScopeState(state: ShadowCommitScopeState): Ser
   };
 }
 
-export function applyShadowTranscriptToCommittedState(
-  current: SerializedWorld,
-  transcript: EffectTranscript,
-  options: ShadowTranscriptApplyOptions = {}
-): SerializedWorld {
-  const totalStartedAt = Date.now();
-  const profile = (phase: (MetricEvent & { kind: "shadow_apply_step" })["phase"], startedAt: number) => {
-    options.profile?.({
-      kind: "shadow_apply_step",
-      phase,
-      scope: transcript.scope,
-      route: transcript.route,
-      ms: Date.now() - startedAt,
-      objects: current.objects.length,
-      creates: transcript.creates.length,
-      writes: transcript.writes.length
-    });
-  };
-  let stepStartedAt = Date.now();
-  const next: SerializedWorld = {
-    ...current,
-    objects: current.objects.slice()
-  };
-  profile("clone_world", stepStartedAt);
-  stepStartedAt = Date.now();
-  const currentObjects = new Map<ObjRef, SerializedObject>(next.objects.map((obj) => [obj.id, obj]));
-  const objectIndexes = new Map<ObjRef, number>(next.objects.map((obj, index) => [obj.id, index]));
-  const mutableObjects = new Set<ObjRef>();
-  let objectsNeedSort = false;
-  const mutableObject = (id: ObjRef): SerializedObject | null => {
-    const existing = currentObjects.get(id);
-    if (!existing) return null;
-    if (mutableObjects.has(id)) return existing;
-    const clone = structuredClone(existing) as SerializedObject;
-    currentObjects.set(id, clone);
-    mutableObjects.add(id);
-    const index = objectIndexes.get(id);
-    if (index !== undefined) next.objects[index] = clone;
-    return clone;
-  };
-  profile("index_objects", stepStartedAt);
-
-  // The commit scope constructs authoritative post-state from the transcript.
-  // Executor post-world snapshots are intentionally not trusted across this
-  // boundary; they are diagnostics/cache-fill only.
-  stepStartedAt = Date.now();
-  for (const create of transcript.creates) {
-    if (currentObjects.has(create.object)) continue;
-    const created = serializedObjectFromCreate(create, options.objectTimestamp);
-    currentObjects.set(create.object, created);
-    objectIndexes.set(create.object, next.objects.length);
-    mutableObjects.add(create.object);
-    next.objects.push(created);
-    objectsNeedSort = true;
-    if (created.parent) addUniqueObjectRef(mutableObject(created.parent)?.children, created.id);
-    if (created.location) addUniqueObjectRef(mutableObject(created.location)?.contents, created.id);
-  }
-  profile("apply_creates", stepStartedAt);
-  stepStartedAt = Date.now();
-  const writes = finalWritesByCell(transcript);
-  profile("collect_writes", stepStartedAt);
-  stepStartedAt = Date.now();
-  for (const write of writes) {
-    const target = mutableObject(write.cell.object);
-    if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
-  }
-  profile("apply_writes", stepStartedAt);
-  stepStartedAt = Date.now();
-  next.sessions = applyTranscriptSessionLocation(current.sessions, transcript);
-  profile("apply_session", stepStartedAt);
-  stepStartedAt = Date.now();
-  if (objectsNeedSort) next.objects.sort((a, b) => a.id.localeCompare(b.id));
-  profile("sort_objects", stepStartedAt);
-  stepStartedAt = Date.now();
-  next.logs = applyTranscriptLog(current.logs, transcript);
-  profile("apply_log", stepStartedAt);
-  stepStartedAt = Date.now();
-  next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
-  profile("counters", stepStartedAt);
-  profile("total", totalStartedAt);
-  return next;
-}
-
 export function transcriptSessionActiveScope(transcript: EffectTranscript): { session: string; actor: ObjRef; activeScope: ObjRef } | null {
   if (!transcript.session) return null;
   const actorMove = lastMoveForObject(transcript, transcript.call.actor);
@@ -707,20 +866,6 @@ export function transcriptTouchedObjectIds(transcript: EffectTranscript): Set<Ob
     ids.add(write.cell.object);
   }
   return ids;
-}
-
-function applyTranscriptSessionLocation(sessions: SerializedWorld["sessions"], transcript: EffectTranscript): SerializedWorld["sessions"] {
-  const update = transcriptSessionActiveScope(transcript);
-  if (!update) return sessions;
-  for (let index = 0; index < sessions.length; index += 1) {
-    const session = sessions[index];
-    if (session.id === update.session && session.actor === update.actor) {
-      const next = sessions.slice();
-      next[index] = { ...session, activeScope: update.activeScope };
-      return next;
-    }
-  }
-  return sessions;
 }
 
 function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: number | undefined): SerializedObject {
@@ -767,23 +912,6 @@ export function transcriptLogEntry(transcript: EffectTranscript): SerializedWorl
     applied_ok: transcript.error === undefined,
     ...(transcript.error ? { error: structuredClone(transcript.error) } : {})
   };
-}
-
-function applyTranscriptLog(logEntries: SerializedWorld["logs"], transcript: EffectTranscript): SerializedWorld["logs"] {
-  const entry = transcriptLogEntry(transcript);
-  if (!entry) return logEntries;
-  const next = logEntries.slice();
-  const index = next.findIndex(([space]) => space === transcript.scope);
-  const entries = index >= 0
-    ? structuredClone(next[index][1]) as SerializedWorld["logs"][number][1]
-    : [];
-  mergeTranscriptLogEntry(entries, entry);
-  if (index >= 0) {
-    next[index] = [transcript.scope, entries];
-    return next;
-  }
-  next.push([transcript.scope, entries]);
-  return next.sort(([a], [b]) => a.localeCompare(b));
 }
 
 export function mergeTranscriptLogEntry(entries: SpaceLogEntryLike[], entry: SpaceLogEntryLike): void {

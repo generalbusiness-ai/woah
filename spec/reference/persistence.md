@@ -407,7 +407,7 @@ CREATE TABLE v2_commit_scope_accepted_frame (
   seq           INTEGER NOT NULL,
   id            TEXT NOT NULL,
   position_hash TEXT NOT NULL,
-  body          TEXT NOT NULL, -- JSON ShadowCommitAccepted
+  body          TEXT NOT NULL, -- JSON ShadowCommitAccepted, including projection_writes when available
   updated_at    INTEGER NOT NULL,
   PRIMARY KEY(scope, seq)
 );
@@ -430,6 +430,40 @@ CREATE TABLE v2_commit_scope_reply (
   body            TEXT NOT NULL, -- JSON reply envelope
   updated_at      INTEGER NOT NULL
 );
+
+CREATE TABLE v2_commit_scope_checkpoint (
+  scope           TEXT PRIMARY KEY,
+  head_seq        INTEGER NOT NULL,
+  head_hash       TEXT NOT NULL,
+  head            TEXT NOT NULL, -- JSON ShadowScopeHead
+  checkpoint_hash TEXT NOT NULL,
+  body            TEXT NOT NULL, -- JSON ScopeCheckpointManifest
+  updated_at      INTEGER NOT NULL
+);
+
+CREATE TABLE v2_commit_scope_checkpoint_page (
+  scope           TEXT NOT NULL,
+  checkpoint_hash TEXT NOT NULL,
+  page_index      INTEGER NOT NULL,
+  table_name      TEXT NOT NULL,
+  page            TEXT NOT NULL,
+  page_hash       TEXT NOT NULL,
+  body            TEXT NOT NULL, -- JSON ProjectionPage
+  bytes           INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY(scope, checkpoint_hash, page_index)
+);
+
+CREATE TABLE v2_commit_scope_checkpoint_frame (
+  scope           TEXT NOT NULL,
+  checkpoint_hash TEXT NOT NULL,
+  seq             INTEGER NOT NULL,
+  position_hash   TEXT NOT NULL,
+  body            TEXT NOT NULL, -- JSON ShadowCommitAccepted without projection_writes
+  bytes           INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY(scope, checkpoint_hash, seq)
+);
 ```
 
 The `serialized` column remains nullable/empty so old scopes whose current row
@@ -438,6 +472,147 @@ materialize row state from `woo.authority_slice.cells.shadow.v1` page values
 rather than from a whole-world request snapshot. After the first successful
 legacy open, implementations SHOULD rewrite the scope into the row tables and
 clear `serialized`; new commits MUST NOT store the full world in that column.
+
+Accepted-frame and transcript tails are append/prune surfaces. `saveFull` or
+checkpoint construction MUST NOT rewrite retained tail rows. A new accepted
+frame is inserted by `(scope, seq)` and a transcript-tail row is inserted by
+transcript hash; pruning deletes only rows outside the configured retention
+horizon after a complete checkpoint covers the prefix being pruned.
+
+Checkpoint rows are maintained outside `/v2/open` packaging. If no complete
+manifest for the current head exists, checkpoint/tail open schedules
+maintenance and returns `E_CHECKPOINT_PENDING`; it does not scan the
+object/session/log tables to build a checkpoint inside the open request. The
+persisted manifest is small and contains page/frame references only; each
+`ProjectionPage` and retained frame tail entry is stored in its own row keyed by
+`(scope, checkpoint_hash, page_index)` or `(scope, checkpoint_hash, seq)`.
+`/v2/open` packages byte-bounded page chunks from those retained rows and
+returns an `OpenContinuation` pinned to the checkpoint hash/head/export id until
+all pages have been sent. A single projection row larger than the page target is
+emitted as its own page; rows approaching the SQL value limit are
+non-conforming and must be split before storage.
+
+`ShadowCommitAccepted.body` SHOULD include `projection_delta` and
+row-body-complete `projection_writes` for every touched projection upsert or
+delete. A retained frame without row bodies may remain for legacy compatibility,
+but checkpoint/tail open MUST NOT use it as a normal tail catch-up frame. Frame
+transfers carry those row bodies in `AcceptedFrameTransfer.projection_writes`;
+the nested accepted frame SHOULD omit the duplicate `projection_writes` field so
+the transfer does not pay for the same rows twice.
+`projection_delta.tool_surface_sources` is not a persisted row body surface: it
+contains `bytes: 0` invalidation markers for source rows that can stale cached
+tool surfaces, and those markers need not appear in `projection_writes`.
+
+### 14.5 Gateway projection cache schema
+
+MCP gateway shards use their `PersistentObjectDO` SQLite database as a durable
+projection cache. These rows are cache state, not execution authority. They
+survive hibernation so descriptor reads and accepted fanout do not require
+rebuilding an executable `WooWorld` mirror before serving a session.
+
+```sql
+CREATE TABLE gateway_projection_scope (
+  scope          TEXT PRIMARY KEY,
+  head_seq       INTEGER NOT NULL,
+  head_hash      TEXT NOT NULL,
+  updated_at_ms  INTEGER NOT NULL,
+  stale          INTEGER NOT NULL DEFAULT 0,
+  stale_reason   TEXT
+);
+
+CREATE TABLE gateway_projection_object (
+  id              TEXT NOT NULL,
+  authority_scope TEXT NOT NULL,
+  body            TEXT NOT NULL, -- JSON SerializedObject
+  last_apply_seq  INTEGER NOT NULL,
+  last_apply_hash TEXT NOT NULL,
+  updated_at_ms   INTEGER NOT NULL,
+  stale           INTEGER NOT NULL DEFAULT 0,
+  stale_reason    TEXT,
+  PRIMARY KEY(authority_scope, id)
+);
+
+CREATE TABLE gateway_scope_member (
+  scope          TEXT NOT NULL,
+  id             TEXT NOT NULL,
+  authority_scope TEXT NOT NULL,
+  role           TEXT NOT NULL,
+  last_apply_seq INTEGER NOT NULL,
+  updated_at_ms  INTEGER NOT NULL,
+  PRIMARY KEY(scope, id, role)
+);
+
+CREATE TABLE gateway_projection_session (
+  session_id      TEXT PRIMARY KEY,
+  scope           TEXT,
+  actor           TEXT NOT NULL,
+  body            TEXT NOT NULL, -- JSON SerializedSession
+  last_apply_seq  INTEGER NOT NULL,
+  last_apply_hash TEXT NOT NULL,
+  updated_at_ms   INTEGER NOT NULL,
+  stale           INTEGER NOT NULL DEFAULT 0,
+  stale_reason    TEXT
+);
+
+CREATE TABLE gateway_tool_surface (
+  scope                  TEXT NOT NULL,
+  object                 TEXT NOT NULL,
+  object_authority_scope TEXT NOT NULL,
+  body                   TEXT NOT NULL, -- JSON ToolSurfaceProjectionRow
+  last_apply_seq         INTEGER NOT NULL,
+  last_apply_hash        TEXT NOT NULL,
+  updated_at_ms          INTEGER NOT NULL,
+  stale                  INTEGER NOT NULL DEFAULT 0,
+  stale_reason           TEXT,
+  PRIMARY KEY(scope, object)
+);
+
+CREATE TABLE gateway_session_tool_manifest (
+  session_id      TEXT PRIMARY KEY,
+  actor           TEXT NOT NULL,
+  active_scope    TEXT NOT NULL,
+  body            TEXT NOT NULL, -- JSON SessionToolManifest
+  last_apply_seq  INTEGER NOT NULL,
+  last_apply_hash TEXT NOT NULL,
+  updated_at_ms   INTEGER NOT NULL,
+  expires_at_ms   INTEGER NOT NULL,
+  stale           INTEGER NOT NULL DEFAULT 0,
+  stale_reason    TEXT
+);
+
+CREATE TABLE gateway_tool_surface_source (
+  scope                  TEXT NOT NULL,
+  source_table           TEXT NOT NULL,
+  source_authority_scope TEXT NOT NULL,
+  source_key             TEXT NOT NULL,
+  object                 TEXT NOT NULL,
+  PRIMARY KEY(scope, source_table, source_authority_scope, source_key, object)
+);
+
+CREATE TABLE gateway_tool_surface_scope (
+  scope            TEXT PRIMARY KEY,
+  saturated        INTEGER NOT NULL DEFAULT 0,
+  saturated_reason TEXT,
+  updated_at_ms    INTEGER NOT NULL
+);
+```
+
+When an accepted fanout carries projection writes or
+`projection_delta.tool_surface_sources`, a gateway shard upserts or deletes the
+named cache rows, updates `gateway_projection_scope`, and invalidates any
+tool-surface rows whose source index names a changed object row. Descriptor reads
+may use bounded-stale projection rows or a session's last manifest, but auth,
+permissions, and VM execution reads must continue to use authoritative paths.
+
+The tool-surface source index is capped per gateway scope and per gateway shard.
+If persisting a surface's source rows would exceed either configured cap, the
+gateway stores that `gateway_tool_surface` row with `stale=1` and
+`stale_reason='disabled'`, marks the scope saturated in
+`gateway_tool_surface_scope`, and does not add `gateway_tool_surface_source`
+entries for it. Descriptor reads ignore saturated scopes and use the session
+manifest or owner refresh path instead. The scope can leave saturation only
+after disabled surfaces have been replaced or deleted and its persisted source
+rows fit under both caps.
 
 ---
 

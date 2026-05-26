@@ -33,6 +33,11 @@ const CLASSIFICATION = {
     signal: "host and object_count",
     endState: "Tail/checkpoint transfer should make omission policy explicit and rare."
   },
+  authority_tail: {
+    bucket: "authority_append",
+    signal: "tail_rows_written, tail_rows_pruned, tail_bytes_retained",
+    endState: "Accepted-frame and transcript tails append new rows and prune by bounded horizon; no retained-tail rewrite."
+  },
   browser_activity: {
     bucket: "browser_projection",
     signal: "phase, path, bytes, count, status",
@@ -173,6 +178,21 @@ const CLASSIFICATION = {
     signal: "object, verb, status",
     endState: "Resolve from actor, session, object, and tool-surface projection rows."
   },
+  gateway_projection_apply: {
+    bucket: "fanout_apply",
+    signal: "rows, projection_bytes, source",
+    endState: "Gateway consumes row-body-complete projection writes instead of running compatibility transcript apply."
+  },
+  gateway_projection_cache_write: {
+    bucket: "fanout_apply",
+    signal: "gateway_projection_rows_written, gateway_projection_bytes, source",
+    endState: "Gateway projection SQL rows replace gateway mirror-world maintenance for accepted fanout."
+  },
+  gateway_tool_surface_source_rows: {
+    bucket: "tool_projection",
+    signal: "scope, object, rows, scope_rows, shard_rows, cap, shard_cap, saturated",
+    endState: "Tool-surface reverse-index growth is measured and capped; saturated scopes fall back to session manifests or owner refresh."
+  },
   moveto_actor: {
     bucket: "vm_effect",
     signal: "actor, from, to",
@@ -185,8 +205,18 @@ const CLASSIFICATION = {
   },
   session_reap: {
     bucket: "background_session",
-    signal: "session and expiry fields",
+    signal: "inspected, reaped, guest_reaped, credential_reaped",
     endState: "Emit one metric per reap sweep only when reaped>0, with inspected/reaped counts; not per inspected session."
+  },
+  serialized_world_materialized: {
+    bucket: "compat_transform",
+    signal: "reason, scope, seq, objects, sessions, logs, ms",
+    endState: "Only explicit legacy/export/checkpoint/execution boundaries materialize SerializedWorld; normal accepted commit does not."
+  },
+  same_host_fallback: {
+    bucket: "tool_projection",
+    signal: "route, host, rows, reason",
+    endState: "Hot descriptor reads return bounded same-host projection data when an owner refresh is unavailable."
   },
   shadow_apply_step: {
     bucket: "commit_apply",
@@ -383,6 +413,8 @@ function reportFile(label, metrics) {
   reportKnownBytes(metrics);
   reportRows(metrics);
   reportTransformSurfaces(metrics);
+  reportSuccessCostSummary(metrics);
+  reportToolSurfaceSourceRows(metrics);
   reportRpc(metrics);
   reportVerbTraces(metrics);
   reportMetricVolume(metrics);
@@ -446,6 +478,64 @@ function reportTransformSurfaces(metrics) {
   for (const [key, rows] of [...groupBy(applyTotals, (m) => `commit|${m.scope || "?"}`)]) {
     const [, scope] = key.split("|");
     console.log(`| commit apply | ${scope} | ${rows.length} | ${sum(rows, "objects")} |  | ${sum(rows, "writes")} | ${sum(rows, "creates")} |`);
+  }
+}
+
+function reportSuccessCostSummary(metrics) {
+  const v2Envelopes = metrics.filter((m) => m.kind === "v2_envelope");
+  const authorityTail = metrics.filter((m) => m.kind === "authority_tail");
+  const gatewayProjection = metrics.filter((m) => m.kind === "gateway_projection_apply" || m.kind === "gateway_projection_cache_write");
+  const fanoutProjection = gatewayProjection.filter((m) => m.source === "fanout");
+  const hostFanout = metrics.filter((m) => m.kind === "v2_host_apply_fanout");
+  const checkpointTransfers = metrics.filter((m) =>
+    (m.kind === "v2_open_step" || m.kind === "browser_activity") &&
+    typeof m.transfer_mode === "string" &&
+    m.transfer_mode.startsWith("checkpoint_tail")
+  );
+  const checkpointBuild = metrics.filter((m) => m.kind === "v2_open_step" && m.phase === "checkpoint_build");
+  const checkpointPackaging = metrics.filter((m) => m.kind === "v2_open_step" && m.phase === "checkpoint_tail_packaging");
+  const ownerRefresh = metrics.filter((m) => m.kind === "cross_host_rpc" && m.route === "/__internal/enumerate-tools");
+  const roundTrips = metrics.filter((m) => m.kind === "cross_host_rpc");
+  const sameHostFallbacks = metrics.filter((m) => m.kind === "same_host_fallback");
+
+  const tailRowsWritten = sum(authorityTail, "tail_rows_written") + sum(v2Envelopes, "tail_rows_written");
+  const tailBytesRetained = Math.max(max(authorityTail, "tail_bytes_retained"), max(v2Envelopes, "tail_bytes_retained"));
+
+  section("Success-criteria cost summary");
+  console.log("| field | value | evidence metrics |");
+  console.log("|---|---:|---|");
+  console.log(`| frame bytes | ${sumFlexible(metrics, ["frame_bytes", "accepted_frame_bytes"])} | frame_bytes/accepted_frame_bytes when emitted |`);
+  console.log(`| projection rows touched | ${sum(gatewayProjection, "rows") + sum(hostFanout, "touched")} | gateway_projection_* rows + v2_host_apply_fanout.touched |`);
+  console.log(`| projection bytes | ${sumProjectionBytes(metrics)} | projection_bytes/gateway_projection_bytes/body_bytes/row_bytes |`);
+  console.log(`| fanout rows touched | ${sum(fanoutProjection, "rows") + sum(hostFanout, "touched")} | fanout gateway projection rows + host write-through touched |`);
+  console.log(`| checkpoint transfer bytes | ${sum(checkpointTransfers, "bytes")} | checkpoint_tail transfer v2_open_step/browser_activity bytes |`);
+  console.log(`| tail rows written | ${tailRowsWritten} | authority_tail + v2_envelope tail_rows_written |`);
+  console.log(`| tail bytes retained | ${tailBytesRetained} | max authority_tail/v2_envelope tail_bytes_retained |`);
+  console.log(`| checkpoint build ms | ${sum(checkpointBuild, "ms")} | v2_open_step phase=checkpoint_build |`);
+  console.log(`| checkpoint packaging ms | ${sum(checkpointPackaging, "ms")} | v2_open_step phase=checkpoint_tail_packaging |`);
+  console.log(`| same-host fallback count | ${sameHostFallbacks.length} | same_host_fallback events |`);
+  console.log(`| remote owner refresh count | ${ownerRefresh.length} | cross_host_rpc route=/__internal/enumerate-tools |`);
+  console.log(`| cross-host round trips | ${roundTrips.length} | cross_host_rpc events |`);
+}
+
+function reportToolSurfaceSourceRows(metrics) {
+  const sourceRows = metrics.filter((m) => m.kind === "gateway_tool_surface_source_rows");
+  section("Tool-surface reverse-index sizing");
+  console.log(`gateway_tool_surface_source_rows events: ${sourceRows.length}`);
+  if (sourceRows.length === 0) {
+    console.log("No tool-surface reverse-index metrics were observed.");
+    return;
+  }
+  console.log(`source rows requested: ${sum(sourceRows, "rows")}`);
+  console.log(`cap-hit events: ${sourceRows.filter((m) => m.saturated === true).length}`);
+  console.log("");
+  console.log("| scope | events | objects | source rows requested | max scope rows | scope cap | max shard rows | shard cap | cap hits | saturation reasons |");
+  console.log("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+  for (const [scope, rows] of [...groupBy(sourceRows, (m) => m.scope || "?")]
+    .sort((a, b) => max(b[1], "scope_rows") - max(a[1], "scope_rows") || a[0].localeCompare(b[0]))) {
+    const objects = new Set(rows.map((m) => m.object || "?")).size;
+    const reasons = [...new Set(rows.filter((m) => m.saturated === true).map((m) => m.saturation_reason || "unknown"))].join(",") || "";
+    console.log(`| ${scope} | ${rows.length} | ${objects} | ${sum(rows, "rows")} | ${max(rows, "scope_rows")} | ${max(rows, "cap")} | ${max(rows, "shard_rows")} | ${max(rows, "shard_cap")} | ${rows.filter((m) => m.saturated === true).length} | ${reasons} |`);
   }
 }
 
@@ -539,9 +629,15 @@ function sumProjectionBytes(rows) {
   return rows.reduce((acc, row) => acc + projectionBytes(row), 0);
 }
 
+function sumFlexible(rows, fields) {
+  return rows.reduce((acc, row) => acc + Math.max(...fields.map((field) => number(row[field]))), 0);
+}
+
 function projectionBytes(row) {
   const explicit = number(row.projection_bytes);
   if (explicit) return explicit;
+  const gateway = number(row.gateway_projection_bytes);
+  if (gateway) return gateway;
   const body = number(row.body_bytes);
   if (body) return body;
   return number(row.row_bytes);

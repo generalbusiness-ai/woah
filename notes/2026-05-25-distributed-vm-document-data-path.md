@@ -830,6 +830,13 @@ is removed: a vitest and a smoke-tail invariant that pass with the flag off and
 fail if the flag-on path leaks through. A rollback flag that leaves partial
 state active is a failed step, even if the forward path works.
 
+Landing note, 2026-05-26: Steps 0-3 were explicitly approved to ship
+unflagged on this branch. Those steps are structural hot-path refactors whose
+old code paths were cleanly excised: metric hygiene, lazy `SerializedWorld`,
+single `ApplyResult` applier, and append-only tail persistence. Their rollback
+surface is therefore the branch/deploy rollback rather than per-step env flags.
+Steps 4+ keep the narrower rollback flags named below.
+
 Freshness is also explicit. Every projection cache row carries:
 
 ```ts
@@ -1083,8 +1090,11 @@ Negotiation and cutover:
 - A caller opts in with `open_protocol:"checkpoint_tail.v1"`. If absent,
   `CommitScopeDO` returns the current legacy `/v2/open` response.
 - The rollout flag `WOO_V2_CHECKPOINT_TAIL_OPEN` controls whether the gateway
-  sends the new field. A per-client or per-scope allow-list may sit behind that
-  flag; the server contract is body-field negotiation.
+  permits the server-side body-field protocol. Browser WebSocket negotiation is
+  gated separately and remains off in this landing because these checkpoint
+  pages are authority-shaped; browser holders need the BrowserProfile
+  projection rows from `notes/2026-05-25-browser-holder-node.md` before they can
+  safely receive checkpoint/tail pages.
 - A frames response is returned only if `known_head` is within retained tail,
   the missing tail is at most 200 frames, every returned frame includes its
   `projection_writes`, and encoded response size is within
@@ -1102,6 +1112,11 @@ Negotiation and cutover:
   `export_id`, `head`, and optional `checkpoint_hash` pin snapshot identity; if
   that export is unavailable, the server returns `E_CHECKPOINT_CONTINUATION_STALE`
   and the receiver retries without `known_head`.
+- Persist the checkpoint export as a small manifest row plus separate
+  `v2_commit_scope_checkpoint_page` and `v2_commit_scope_checkpoint_frame` rows.
+  Do not store all pages and `frame_tail` in one SQL value; continuation
+  packaging must read only the requested page rows and the frame tail only on
+  the final chunk.
 
 Backward compatibility:
 
@@ -1158,10 +1173,10 @@ outside the first milestone.
 
 | Step | Rollback flag | Spec files | Migration |
 |---:|---|---|---|
-| 0 | `WOO_V2_METRIC_HYGIENE` | `spec/operations/observability.md` | No Cloudflare DO class migration. |
-| 1 | `WOO_V2_LAZY_SERIALIZED_WORLD` | `spec/semantics/distribution.md`; `spec/protocol/v2-turn-network.md`; `spec/reference/persistence.md` | No Cloudflare DO class migration; no SQL migration. |
-| 2 | `WOO_V2_APPLY_RESULT` | `spec/semantics/distribution.md`; `spec/protocol/v2-turn-network.md` | No Cloudflare DO class migration; no SQL migration. |
-| 3 | `WOO_V2_APPEND_ONLY_TAIL` | `spec/reference/persistence.md`; `spec/protocol/v2-turn-network.md`; `spec/reference/cloudflare.md` | No Cloudflare DO class migration; idempotent meta/high-water SQL if needed. |
+| 0 | none; explicitly approved unflagged 2026-05-26 | `spec/operations/observability.md` | No Cloudflare DO class migration. |
+| 1 | none; explicitly approved unflagged 2026-05-26 | `spec/semantics/distribution.md`; `spec/protocol/v2-turn-network.md`; `spec/reference/persistence.md` | No Cloudflare DO class migration; no SQL migration. |
+| 2 | none; explicitly approved unflagged 2026-05-26 | `spec/semantics/distribution.md`; `spec/protocol/v2-turn-network.md` | No Cloudflare DO class migration; no SQL migration. |
+| 3 | none; explicitly approved unflagged 2026-05-26 | `spec/reference/persistence.md`; `spec/protocol/v2-turn-network.md`; `spec/reference/cloudflare.md` | No Cloudflare DO class migration; idempotent meta/high-water SQL if needed. |
 | 4 | `WOO_V2_REPLY_REPLAY_METRICS`; `WOO_V2_REPLY_KV` | `spec/protocol/v2-turn-network.md`; `spec/operations/observability.md` | No Cloudflare DO class migration; no SQL migration unless reply metadata columns are added. |
 | 5 | `WOO_GATEWAY_PROJECTION_CACHE` | `spec/protocol/mcp.md`; `spec/protocol/v2-turn-network.md`; `spec/reference/persistence.md`; `spec/semantics/projection-cache.md` | No new Cloudflare DO class unless a later ProjectionCacheDO is introduced; initial tables are existing-DO SQL. |
 | 6 | `WOO_V2_SAME_HOST_STALE_FALLBACK` | `spec/semantics/projection-cache.md`; `spec/protocol/mcp.md`; `spec/protocol/routing.md` | No Cloudflare DO class migration; uses Step 5 cache tables. |

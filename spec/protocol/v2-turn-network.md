@@ -790,6 +790,23 @@ post-state. Current committed state is owned by the commit scope, and browser
 state reaches clients through state-plane projection/delta transfers. Wire
 replies carry commit position, transcript hash, receipt, and observations.
 
+When the authority applies a transcript, it SHOULD also attach a
+`ProjectionDeltaSummary` and row-body-complete `projection_writes` to the
+accepted frame. Every upsert named by the summary carries the row body in the
+same frame; every delete carries an explicit delete op. Receivers that
+understand projection writes apply those rows directly and do not run a
+compatibility transcript apply or fetch each row by key. Receivers that do not
+see `projection_writes` may fall back to the legacy transcript path.
+`ProjectionDeltaSummary.tool_surface_sources` contains invalidation markers, not
+row bodies. Those markers have `bytes: 0`, are derived from accepted source-row
+changes, and do not require matching `projection_writes` entries.
+
+`ApplyResult` is the authority applier's hot-path contract: accepted frame,
+projection delta, projection writes, fanout observations, reply rows, and
+idempotency rows. It is derived from indexed state plus explicit side-channel
+rows. Producing it by exporting or scanning a full `SerializedWorld` is
+non-conforming for normal accepted commits.
+
 `atoms` are the state/code/metadata closure that a candidate must probably
 cover before execution. `write_atoms` identify write-authority-sensitive cells
 so routing can avoid projection-only nodes before commit. `accept_atoms` are
@@ -909,6 +926,34 @@ cross-scope move accepted in one scope can leave another scope planning against
 stale presence. `session_objects` is a compatibility request field for older
 callers that do not send `authority`; authority-bearing requests MUST leave it
 empty, including when the authority itself is a legacy object-row slice.
+
+MCP and REST gateways may avoid a normal executable `/v2/open` when they
+already hold a local execution view for the commit scope by attaching a
+one-turn execution capsule to `/v2/envelope`:
+
+```ts
+type ExecutionCapsule = {
+  kind: "woo.execution_capsule.v1";
+  scope: ScopeRef;
+  head: ScopeHead;
+  actor: ObjRef;
+  session: string;
+  target: ObjRef;
+  verb: string;
+  authority: AuthorityCellSlice;
+  expires_at_ms: number;
+};
+```
+
+The capsule is execution sufficiency only. It is not a projection checkpoint,
+not a descriptor cache, and not a durable replacement for the scope's accepted
+frame log. A CommitScopeDO that already has a durable snapshot validates the
+capsule scope, actor/session binding, epoch, and expiry before merging the
+request's authority slice and executing the envelope. A CommitScopeDO with no
+durable snapshot MUST reject capsule-only execution with `E_SNAPSHOT_REQUIRED`;
+rollout callers may then perform the legacy seed bootstrap and retry the
+envelope without the capsule. If the capsule's head is behind the scope head,
+the ordinary stale-head repair path applies.
 
 `covers` means "this node probably has the state, code, metadata, and log tail."
 `accepts` means "this node is willing to run this target/verb/scope shape."
@@ -1232,6 +1277,7 @@ rights:
 | `meta` | node id, session, current scope, scope heads, cache epoch | No | No | relay/session claims |
 | `pending` | outbound envelopes retained for idempotent reconnect/retry | No | No | browser-local |
 | `projections` | `woo.scope_projection.v1` rows and patches | No | Yes, for the named scope/head | state authority proof |
+| `projection_rows` | receiver-profiled checkpoint/tail projection rows keyed by opened scope, table, and row key | No | Only after deriving a scope projection for the named head | checkpoint/tail open authority |
 | `applied_frames` | accepted commit frames by `(scope, seq)` | No | Yes, via reducer | commit receipt |
 | `transcript_tail` | recent accepted transcripts | Only after page verification | Indirectly | commit receipt |
 | `tentative_turns` | pending local committed transcripts with base head, actor/session, and transcript hash | Yes, as an overlay for later local plans | Only through optimistic layer | browser-local until accepted |
@@ -1545,7 +1591,9 @@ browser diagnostic tails are bounded; if a browser reconnects from a head older
 than the retained tail, it receives a projection fallback rather than an
 unbounded replay. The browser-side M4 worker opens the v2 WebSocket, persists
 hello/reply/pending-frame state in IndexedDB, applies received projection/delta
-state transfers into projection, applied-frame, and transcript-tail stores,
+state transfers into projection, applied-frame, and transcript-tail stores, can
+apply a browser-profiled `woo.open.checkpoint_tail.v1` into projection-row and
+projection stores once that receiver profile is enabled,
 persists executable object/state pages from closure transfers, replays pending
 envelopes after reconnect, and marks reset/catch-up-needed state when the relay
 reports reset. The browser worker bundles into the SPA on every deployment and
@@ -2153,6 +2201,57 @@ stale, the relay sends the normal executable seed. This optimization is cache
 negotiation only; it does not weaken proof verification or authorize execution
 from unverified client state.
 
+`/v2/open` also supports explicit checkpoint/tail negotiation for projection
+catch-up. A caller that sends `open_protocol: "checkpoint_tail.v1"` with a
+`known_head` asks the relay to return either:
+
+- `frames`: accepted frame transfers after `known_head`, each carrying
+  projection row bodies; or
+- `checkpoint`: byte-bounded projection pages at one head, plus a retained
+  frame tail that seeds future catch-up and is not replayed during checkpoint
+  install.
+
+The server returns `frames` only when the retained tail is contiguous, within
+the advertised frame budget, and row-body complete. The returned frame batch is
+byte-budgeted; when the contiguous batch does not fit, the server returns the
+prefix that fits plus an `OpenContinuation` pinned to the same export id and
+final head. Checkpoint responses are likewise page-budgeted. A checkpoint
+continuation pins the checkpoint hash, head, and export id; if that retained
+export is no longer available, `/v2/open` returns
+`E_CHECKPOINT_CONTINUATION_STALE` and the caller retries without the
+continuation. Otherwise the server returns a checkpoint response or a
+checkpoint-pending error during rollout.
+Legacy `/v2/open` remains the default when `open_protocol` is absent.
+
+For a browser WebSocket open, a gateway MUST negotiate `checkpoint_tail.v1` only
+when the returned pages are safe for the browser receiver profile. The current
+authority-shaped checkpoint rows are server-side only; a browser holder stays on
+legacy display transfer unless a browser-safe projection profile is active and a
+separate browser rollout gate is enabled. When browser-safe checkpoint/tail is
+negotiated, the gateway sends `TransportHello` first and then wraps the returned
+open transfer in:
+
+```ts
+type CheckpointTailOpenEnvelope = {
+  kind: "woo.open.checkpoint_tail.v1";
+  scope: ObjRef;
+  head: ScopeHead;
+  transfer: OpenTransfer;
+  viewer?: { actor: ObjRef; session?: string | null };
+};
+```
+
+The gateway streams continuation chunks as additional checkpoint/tail envelopes
+on the same WebSocket before considering open complete. The browser installs
+partial checkpoint pages into its `projection_rows` cache but does not publish
+the derived projection or mark the open ready until a checkpoint transfer
+arrives without a continuation. For retained `frames`, the browser applies each
+frame's row-body-complete `projection_writes` to the same row cache before
+deriving the projection at `transfer.to`; a frame continuation means the open is
+not complete until the final chunk arrives. A browser that does not implement
+this envelope must not receive a checkpoint/tail WebSocket open; the server
+rollout flag controls that negotiation.
+
 The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
 reject the upgrade with HTTP 400. A server that accepts the WebSocket without
 selecting that subprotocol is not a conforming M4 v2 relay.
@@ -2180,11 +2279,11 @@ MUST close the WebSocket with a policy/auth failure reason. The relay MAY accept
 idempotent `ping` control frames before hello only to keep intermediaries from
 closing a slow-auth connection.
 
-After `TransportHello`, an M4 relay SHOULD immediately send the projection or
-delta `woo.state.transfer.v1` for the opened `scope` before
-processing authority-bearing browser envelopes. This preserves hello-first
-transport semantics while ensuring browser caches install verified state before
-pending turns are replayed.
+After `TransportHello`, an M4 relay SHOULD immediately send either the
+projection/delta `woo.state.transfer.v1` or the checkpoint/tail open envelope
+for the opened `scope` before processing authority-bearing browser envelopes.
+This preserves hello-first transport semantics while ensuring browser caches
+install verified state before pending turns are replayed.
 
 For browser-local execution, the relay SHOULD then send either the open-time
 executable seed transfer or the compact executable-seed cache-hit marker

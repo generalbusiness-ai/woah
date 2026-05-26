@@ -46,6 +46,18 @@ export type ExecutorAuthorityPayload = {
   authority: SerializedAuthoritySlice;
 };
 
+export type ExecutionCapsule = {
+  kind: "woo.execution_capsule.v1";
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  actor: ObjRef;
+  session: string;
+  target: ObjRef;
+  verb: string;
+  authority: SerializedAuthoritySlice;
+  expires_at_ms: number;
+};
+
 export type ExecutorCallInput = {
   id?: string;
   route: ShadowTurnCall["route"];
@@ -71,6 +83,7 @@ export type ExecutorEnvelopeBody = {
   session_objects: SerializedObject[];
   authority: SerializedAuthoritySlice;
   envelope: string;
+  execution_capsule?: ExecutionCapsule;
 };
 
 export type ExecutorEnvelopeResult = {
@@ -132,6 +145,30 @@ export function executorAuthorityPayload(
     sessions: authority.sessions,
     session_objects: [],
     authority
+  };
+}
+
+export function buildExecutionCapsule(input: {
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  actor: ObjRef;
+  session: string;
+  target: ObjRef;
+  verb: string;
+  authority: SerializedAuthoritySlice;
+  now?: number;
+  ttlMs?: number;
+}): ExecutionCapsule {
+  return {
+    kind: "woo.execution_capsule.v1",
+    scope: input.scope,
+    head: structuredClone(input.head) as ShadowScopeHead,
+    actor: input.actor,
+    session: input.session,
+    target: input.target,
+    verb: input.verb,
+    authority: input.authority,
+    expires_at_ms: (input.now ?? Date.now()) + Math.max(1, input.ttlMs ?? 30_000)
   };
 }
 

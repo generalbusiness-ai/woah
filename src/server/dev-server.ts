@@ -51,7 +51,7 @@ import {
   resolveTurnEnvelopeRouting
 } from "./dev-v2-helpers";
 import { stableShadowJson } from "../core/shadow-cell-version";
-import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import { serializedFor, type ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import {
   encodeExecutorIntentEnvelope,
@@ -474,7 +474,7 @@ function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds
     const claims = relay.session_auth.get(shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor }));
     if (claims) relay.session_auth.set(browser.session_token, claims);
   }
-  if (mergeSerializedAuthoritySlice(relay.commit_scope.serialized, authority, { clone: true })) {
+  if (mergeSerializedAuthoritySlice(serializedFor(relay.commit_scope, { reason: "dev_authority_merge" }), authority, { clone: true })) {
     markShadowBrowserRelaySerializedChanged(relay);
   }
 }
@@ -498,17 +498,18 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
     activeScope: session.activeScope,
     apikeyId: session.apikeyId
   };
-  const index = relay.commit_scope.serialized.sessions.findIndex((item) => item.id === session.id);
+  const snapshot = serializedFor(relay.commit_scope, { reason: "dev_session_merge" });
+  const index = snapshot.sessions.findIndex((item) => item.id === session.id);
   if (index < 0) {
-    relay.commit_scope.serialized.sessions.push(serialized);
+    snapshot.sessions.push(serialized);
     refreshDevV2SerializedSessionActor(relay, session.actor);
     markShadowBrowserRelaySerializedChanged(relay);
     return;
   }
-  const existing = relay.commit_scope.serialized.sessions[index];
+  const existing = snapshot.sessions[index];
   const next = serialized;
   if (stableShadowJson(next as unknown as WooValue) !== stableShadowJson(existing as unknown as WooValue)) {
-    relay.commit_scope.serialized.sessions[index] = next;
+    snapshot.sessions[index] = next;
     markShadowBrowserRelaySerializedChanged(relay);
   }
   refreshDevV2SerializedSessionActor(relay, session.actor);
@@ -522,17 +523,18 @@ function refreshDevV2SerializedSessionActor(relay: ShadowBrowserRelayShim, actor
 
 function refreshDevV2SerializedObjects(relay: ShadowBrowserRelayShim, objects: ReturnType<typeof world.exportObjects>): void {
   if (objects.length === 0) return;
-  const byId = new Map(relay.commit_scope.serialized.objects.map((obj, index) => [obj.id, index] as const));
+  const snapshot = serializedFor(relay.commit_scope, { reason: "dev_object_merge" });
+  const byId = new Map(snapshot.objects.map((obj, index) => [obj.id, index] as const));
   let changed = false;
   for (const record of objects) {
     const index = byId.get(record.id);
     if (index === undefined) {
-      byId.set(record.id, relay.commit_scope.serialized.objects.length);
-      relay.commit_scope.serialized.objects.push(record);
+      byId.set(record.id, snapshot.objects.length);
+      snapshot.objects.push(record);
       changed = true;
       continue;
     }
-    relay.commit_scope.serialized.objects[index] = record;
+    snapshot.objects[index] = record;
     changed = true;
   }
   if (changed) markShadowBrowserRelaySerializedChanged(relay);

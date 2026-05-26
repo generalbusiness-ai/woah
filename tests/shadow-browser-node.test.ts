@@ -41,7 +41,7 @@ import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import { submitShadowCommit, type ShadowCommitAccepted, type ShadowScopeHead } from "../src/core/shadow-commit-scope";
+import { serializedFor, submitShadowCommit, type ShadowCommitAccepted, type ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 
 describe("shadow browser node shim", () => {
@@ -401,7 +401,7 @@ describe("shadow browser node shim", () => {
         args: []
       });
       expect(enter.result).toMatchObject({ ok: true });
-      expect(relay.commit_scope.serialized.sessions.find((item) => item.id === session.id)?.lastDetachAt).toBeNull();
+      expect(serializedFor(relay.commit_scope).sessions.find((item) => item.id === session.id)?.lastDetachAt).toBeNull();
 
       vi.setSystemTime(1_000_000 + 61_000);
       const add = await executeShadowBrowserTurn(browser, {
@@ -521,11 +521,12 @@ describe("shadow browser node shim", () => {
     });
     relay.session_auth = auth.session_auth;
     relay.session_revs = auth.session_revs;
-    relay.commit_scope.serialized.sessions = mergeShadowBrowserSessionState(relay.commit_scope.serialized.sessions, anchor.exportSessions());
+    const snapshot = serializedFor(relay.commit_scope);
+    snapshot.sessions = mergeShadowBrowserSessionState(snapshot.sessions, anchor.exportSessions());
     const secondActor = anchor.exportWorld().objects.find((obj) => obj.id === secondSession.actor);
     if (!secondActor) throw new Error("expected second actor object");
-    relay.commit_scope.serialized.objects.push(secondActor);
-    relay.commit_scope.serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
+    snapshot.objects.push(secondActor);
+    snapshot.objects.sort((a, b) => a.id.localeCompare(b.id));
     markShadowBrowserRelaySerializedChanged(relay);
     const second = createShadowBrowserNode({
       node: "browser-reused-executor-b",
@@ -839,7 +840,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.73]
     };
-    const planned = await runShadowTurnCallTranscript(relay.commit_scope.serialized, call);
+    const planned = await runShadowTurnCallTranscript(serializedFor(relay.commit_scope), call);
     const accepted = submitShadowCommit(relay.commit_scope, {
       kind: "woo.commit.submit.shadow.v1",
       id: call.id,
@@ -1029,7 +1030,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.61]
     };
-    const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+    const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
     const request = {
       kind: "woo.turn.exec.request.shadow.v1" as const,
       id: "wire-state-wet",
@@ -1643,12 +1644,12 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.37]
     };
-    const planned = await runShadowTurnCall(browser.relay.commit_scope.serialized, call);
+    const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     browser.relay.executors.push(createShadowExecutionNode({
       node: "near-executor",
       scope: key.scope,
-      serialized: browser.relay.commit_scope.serialized,
+      serialized: serializedFor(browser.relay.commit_scope),
       atom_hashes: key.atom_hashes
     }));
     const request = {
@@ -1719,11 +1720,11 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.39]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(browser.relay.commit_scope.serialized, planningCall)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedFor(browser.relay.commit_scope), planningCall)).transcript);
     browser.relay.executors.push(createShadowExecutionNode({
       node: "near-intent-executor",
       scope: key.scope,
-      serialized: browser.relay.commit_scope.serialized,
+      serialized: serializedFor(browser.relay.commit_scope),
       atom_hashes: key.atom_hashes
     }));
     const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
@@ -1763,7 +1764,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.41]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(browser.relay.commit_scope.serialized, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call)).transcript);
     const envelope = shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
       kind: "woo.state.transfer.request.shadow.v1" as const,
       id: "browser-state-repair-request",
@@ -1858,7 +1859,7 @@ async function browserForScope<T = undefined>(
 }
 
 function worldFor(browser: ShadowBrowserNode): ReturnType<typeof createWorldFromSerialized> {
-  return createWorldFromSerialized(browser.relay.commit_scope.serialized, { persist: false });
+  return createWorldFromSerialized(serializedFor(browser.relay.commit_scope), { persist: false });
 }
 
 async function submitIntentForTest(

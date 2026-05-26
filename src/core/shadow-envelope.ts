@@ -78,6 +78,7 @@ const KNOWN_SHADOW_TYPES = new Set([
   "woo.live.event.v1",
   "woo.live.event.shadow.v1",
   "woo.state.transfer.request.shadow.v1",
+  "woo.open.checkpoint_tail.v1",
   "woo.state.transfer.v1",
   "woo.state.transfer.shadow.v1",
   "woo.turn.exec.request.shadow.v1",

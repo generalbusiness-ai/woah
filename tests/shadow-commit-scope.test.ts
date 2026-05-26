@@ -3,9 +3,10 @@ import { describe, expect, it } from "vitest";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import {
-  applyShadowTranscriptToCommittedState,
   applyShadowTranscriptToCommitScopeCache,
+  applyShadowTranscriptToIndexedState,
   createShadowCommitScope,
+  serializedFor,
   transcriptTouchedObjectIds
 } from "../src/core/shadow-commit-scope";
 import type { MetricEvent } from "../src/core/types";
@@ -15,12 +16,9 @@ describe("shadow commit scope", () => {
     const before = serializedWorld();
     const transcript = addChildTranscript();
 
-    const committed = applyShadowTranscriptToCommittedState(before, transcript);
-    expect(committed.objects.find((obj) => obj.id === "room")?.contents).toEqual(["created_b", "existing_a", "third_party"]);
-
     const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: before });
     applyShadowTranscriptToCommitScopeCache(scope, transcript);
-    expect(scope.serialized.objects.find((obj) => obj.id === "room")?.contents).toEqual(["created_b", "existing_a", "third_party"]);
+    expect(serializedFor(scope).objects.find((obj) => obj.id === "room")?.contents).toEqual(["created_b", "existing_a", "third_party"]);
   });
 
   it("does not replace contents for malformed remove writes without move records", () => {
@@ -38,9 +36,10 @@ describe("shadow commit scope", () => {
       }]
     };
 
-    const committed = applyShadowTranscriptToCommittedState(before, transcript, { metric: (event) => metrics.push(event) });
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: before });
+    applyShadowTranscriptToCommitScopeCache(scope, transcript, { metric: (event) => metrics.push(event) });
 
-    expect(committed.objects.find((obj) => obj.id === "room")?.contents).toEqual(["existing_a", "third_party"]);
+    expect(serializedFor(scope).objects.find((obj) => obj.id === "room")?.contents).toEqual(["existing_a", "third_party"]);
     expect(metrics).toContainEqual({
       kind: "shadow_transcript_anomaly",
       scope: "room",
@@ -73,6 +72,23 @@ describe("shadow commit scope", () => {
       "prop_source",
       "verb_source"
     ]);
+  });
+
+  it("includes source-row invalidation markers in indexed projection deltas", () => {
+    const before = serializedWorld();
+    const transcript = addChildTranscript();
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: before });
+
+    const applied = applyShadowTranscriptToIndexedState(scope.state, transcript);
+
+    const objectKeys = applied.projection_delta.objects?.map((op) => op.key).sort();
+    expect(objectKeys).toEqual(["$thing", "created_b", "room"]);
+    expect(applied.projection_delta.tool_surface_sources).toEqual(objectKeys?.map((key) => ({
+      key: { table: "objects", authority_scope: "room", key },
+      op: "upsert",
+      bytes: 0
+    })));
+    expect(applied.projection_delta.projection_bytes).toBeGreaterThan(0);
   });
 });
 

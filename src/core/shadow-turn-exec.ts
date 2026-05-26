@@ -20,6 +20,7 @@ import {
 } from "./shadow-turn-call";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import {
+  serializedFor,
   shadowCommitScopeObject,
   submitShadowCommit,
   transcriptTouchedObjectIds,
@@ -596,7 +597,7 @@ export async function executeAuthoritativeShadowTurnCall(
     throw new Error("accepted authoritative shadow commit returned a conflict result");
   }
 
-  node.serialized = input.commitScope.serialized;
+  node.serialized = serializedFor(input.commitScope, { reason: "authoritative_turn_result" });
   for (const hash of key.atom_hashes) node.atom_hashes.add(hash);
   cacheShadowTranscriptObjects(node, run.transcript, input.commitScope);
   return {
@@ -606,7 +607,7 @@ export async function executeAuthoritativeShadowTurnCall(
     transcript: run.transcript,
     receipt,
     commit,
-    serializedAfter: input.commitScope.serialized,
+    serializedAfter: node.serialized,
     reply: successReply(request, run.transcript, commit)
   };
 }
@@ -754,7 +755,7 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
-    ? options.commitScope?.serialized ?? requireSerializedAfter(run)
+    ? options.commitScope ? serializedFor(options.commitScope, { reason: "turn_exec_result" }) : requireSerializedAfter(run)
     : livePersistence
       ? serializedBefore
       : requireSerializedAfter(run);

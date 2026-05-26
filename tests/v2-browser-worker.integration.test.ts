@@ -130,6 +130,226 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
   });
 
+  it("opens from a checkpoint/tail transfer without requiring the legacy display transfer", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-checkpoint-tail");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-checkpoint-tail",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-checkpoint-tail",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-checkpoint-tail"
+    });
+    const serialized = world.exportWorld();
+    const checkpointObjects = serialized.objects.filter((obj) => obj.id === "the_dubspace" || obj.id === session.actor);
+    const head = relay.commit_scope.head;
+    const snapshotRow = { space_id: "the_dubspace", seq: 1, ts: 1, state: { view: "checkpoint" }, hash: "snapshot-hash" };
+    const parkedTaskRow = {
+      id: "checkpoint-task",
+      parked_on: "the_dubspace",
+      state: "suspended",
+      resume_at: null,
+      awaiting_player: null,
+      correlation_id: null,
+      serialized: {},
+      created: 1,
+      origin: "the_dubspace"
+    };
+    const toolSurfaceRow = {
+      kind: "woo.tool_surface_projection.v1",
+      scope: "the_dubspace",
+      object: "the_dubspace",
+      head,
+      verbs: [],
+      source_rows: []
+    };
+    const checkpointTail = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: {
+        kind: "checkpoint",
+        checkpoint: {
+          kind: "woo.scope_checkpoint.v1",
+          scope: "the_dubspace",
+          head,
+          checkpoint_hash: "checkpoint-tail-test",
+          pages: [
+            { kind: "woo.projection_page.v1", table: "objects", page: "objects", hash: "objects", rows: checkpointObjects },
+            { kind: "woo.projection_page.v1", table: "sessions", page: "sessions", hash: "sessions", rows: serialized.sessions },
+            {
+              kind: "woo.projection_page.v1",
+              table: "logs",
+              page: "logs",
+              hash: "logs",
+              rows: serialized.logs.flatMap(([space, entries]) => entries.map((entry) => ({ space, entry })))
+            },
+            { kind: "woo.projection_page.v1", table: "snapshots", page: "snapshots", hash: "snapshots", rows: [snapshotRow] },
+            { kind: "woo.projection_page.v1", table: "parked_tasks", page: "parked_tasks", hash: "parked_tasks", rows: [parkedTaskRow] },
+            { kind: "woo.projection_page.v1", table: "tombstones", page: "tombstones", hash: "tombstones", rows: (serialized.tombstones ?? []).map((id) => ({ id })) },
+            { kind: "woo.projection_page.v1", table: "tool_surfaces", page: "tool_surfaces", hash: "tool_surfaces", rows: [toolSurfaceRow] }
+          ],
+          frame_tail: []
+        }
+      },
+      viewer: { actor: session.actor, session: session.id }
+    };
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-checkpoint-tail",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-checkpoint-tail", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "checkpoint-tail-open", "woo.open.checkpoint_tail.v1", checkpointTail)));
+
+    const projection = await waitForMessage(posted, (message) => isKind(message, "projection"));
+    expect(projection).toMatchObject({
+      kind: "projection",
+      scope: "the_dubspace",
+      head,
+      projection: {
+        kind: "woo.scope_projection.shadow.v1",
+        scope: "the_dubspace",
+        subject: { id: "the_dubspace" }
+      }
+    });
+    expect(await waitForMessage(posted, (message) => isCheckpointTailOpenStatus(message))).toMatchObject({
+      status: {
+        connected: true,
+        projections: 1,
+        projection_rows: checkpointObjects.length + serialized.sessions.length + 3,
+        execution_transfers: 0,
+        local_execution_ready: false
+      }
+    });
+  });
+
+  it("accumulates checkpoint continuation pages before marking checkpoint/tail open ready", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-checkpoint-continuation");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-checkpoint-continuation",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-checkpoint-continuation",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-checkpoint-continuation"
+    });
+    const serialized = world.exportWorld();
+    const checkpointObjects = serialized.objects.filter((obj) => obj.id === "the_dubspace" || obj.id === session.actor);
+    const head = relay.commit_scope.head;
+    const continuation = {
+      token: "checkpoint-continuation-token",
+      export_id: "checkpoint-continuation-export",
+      head,
+      checkpoint_hash: "checkpoint-continuation-hash",
+      expires_at_ms: Date.now() + 60_000
+    };
+    const firstChunk = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: {
+        kind: "checkpoint",
+        checkpoint: {
+          kind: "woo.scope_checkpoint.v1",
+          scope: "the_dubspace",
+          head,
+          checkpoint_hash: "checkpoint-continuation-hash",
+          pages: [{ kind: "woo.projection_page.v1", table: "objects", page: "000001", hash: "objects", rows: checkpointObjects }],
+          frame_tail: []
+        },
+        continuation
+      },
+      viewer: { actor: session.actor, session: session.id }
+    };
+    const finalChunk = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: {
+        kind: "checkpoint",
+        checkpoint: {
+          kind: "woo.scope_checkpoint.v1",
+          scope: "the_dubspace",
+          head,
+          checkpoint_hash: "checkpoint-continuation-hash",
+          pages: [
+            { kind: "woo.projection_page.v1", table: "sessions", page: "000002", hash: "sessions", rows: serialized.sessions },
+            { kind: "woo.projection_page.v1", table: "tombstones", page: "000003", hash: "tombstones", rows: (serialized.tombstones ?? []).map((id) => ({ id })) }
+          ],
+          frame_tail: []
+        }
+      },
+      viewer: { actor: session.actor, session: session.id }
+    };
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-checkpoint-continuation",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-checkpoint-continuation", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    const frameProcessBefore = posted.filter((message) => isBrowserMetricPhase(message, "frame_process")).length;
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "checkpoint-continuation-first", "woo.open.checkpoint_tail.v1", firstChunk)));
+    await waitFor(() => posted.filter((message) => isBrowserMetricPhase(message, "frame_process")).length >= frameProcessBefore + 1 ? true : undefined);
+    expect(posted.some((message) => isKind(message, "projection"))).toBe(false);
+
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "checkpoint-continuation-final", "woo.open.checkpoint_tail.v1", finalChunk)));
+    expect(await waitForMessage(posted, (message) => isKind(message, "projection"))).toMatchObject({
+      kind: "projection",
+      scope: "the_dubspace",
+      head,
+      projection: {
+        kind: "woo.scope_projection.shadow.v1",
+        scope: "the_dubspace",
+        subject: { id: "the_dubspace" }
+      }
+    });
+  });
+
   it("posts duplicate accepted frames to the page once per scope sequence", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -918,6 +1138,16 @@ function isReadyStatus(message: unknown): boolean {
 function isStatusWithExecutionTransfers(message: unknown, count: number): boolean {
   return isKind(message, "status") &&
     (message as { status?: { execution_transfers?: unknown } }).status?.execution_transfers === count;
+}
+
+function isCheckpointTailOpenStatus(message: unknown): boolean {
+  if (!isKind(message, "status")) return false;
+  const status = (message as { status?: { connected?: unknown; projections?: unknown; projection_rows?: unknown; execution_transfers?: unknown } }).status;
+  return status?.connected === true &&
+    status.projections === 1 &&
+    typeof status.projection_rows === "number" &&
+    status.projection_rows > 0 &&
+    status.execution_transfers === 0;
 }
 
 async function waitForMessage(messages: unknown[], predicate: (message: unknown) => boolean): Promise<unknown> {

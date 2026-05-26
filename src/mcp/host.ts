@@ -10,6 +10,7 @@ import type { WooWorld } from "../core/world";
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, ObjRef, Observation, RemoteToolDescriptor, RemoteToolProjection, RemoteToolRequest, WooValue } from "../core/types";
 import type { ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import type { ProjectionFreshness, SessionToolManifest } from "../core/projection-delta";
 import { directedRecipients, wooError } from "../core/types";
 
 // Broadcast hooks the runtime wires into the MCP host so that MCP-initiated
@@ -52,6 +53,7 @@ export type McpTool = {
   direct: boolean;
   persistence: "durable" | "live";
   enclosingSpace: ObjRef | null;
+  descriptor?: RemoteToolDescriptor;
 };
 
 export type McpToolScope = "active" | "here" | "focus" | "object" | "space" | "all";
@@ -62,6 +64,7 @@ export type McpToolListOptions = {
   query?: string;
   limit?: number;
   cursor?: string;
+  sessionId?: string;
 };
 
 export type McpToolListPage = {
@@ -86,12 +89,28 @@ export type McpDispatchHooks = {
   call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) => McpAppliedDispatchFrame | ErrorFrame | Promise<McpAppliedDispatchFrame | ErrorFrame>;
 };
 
+export type McpToolManifestHooks = {
+  staleFallback?: boolean;
+  loadSessionManifest?: (sessionId: string) => Promise<SessionToolManifest | null> | SessionToolManifest | null;
+  saveSessionManifest?: (manifest: SessionToolManifest) => Promise<void> | void;
+};
+
 type McpTranscriptBearing = { transcript?: EffectTranscript };
 type McpDirectDispatchFrame = DirectResultFrame & McpTranscriptBearing;
 type McpAppliedDispatchFrame = AppliedFrame & McpTranscriptBearing;
 type McpToolRefreshDecision = { refresh: boolean; reason: string; transcript: boolean };
 type McpToolRefreshBaseline = { digest: string; location: ObjRef | null; activeScopes: string };
 type McpToolRefreshSource = "invoke" | "accepted_frame";
+type McpVerbInfo = {
+  name: string;
+  aliases: string[];
+  arg_spec: Record<string, WooValue>;
+  direct_callable?: boolean;
+  perms: string;
+  tool_exposed?: boolean;
+  source?: string;
+  owner?: ObjRef;
+};
 
 // `actor_wait` runs through the standard verb-dispatch path, which doesn't
 // thread the MCP session id through CallContext. McpHost.invokeTool sets this
@@ -103,10 +122,11 @@ export class McpHost {
   private queues = new Map<string, SessionQueue>();
   private listChangedListeners = new Set<(actor: ObjRef) => void>();
   private toolListSnapshot = new Map<string, string>();
+  private sessionToolManifests = new Map<string, SessionToolManifest>();
 
   private broadcasts: McpBroadcastHooks = {};
 
-  constructor(private world: WooWorld, private dispatchHooks: McpDispatchHooks = {}) {
+  constructor(private world: WooWorld, private dispatchHooks: McpDispatchHooks = {}, private manifestHooks: McpToolManifestHooks = {}) {
     // The actor_focus/unfocus/focus_list/wait native handlers are registered
     // by WooWorld's constructor (see registerNativeHandlers in world.ts) so
     // they remain installed when the actor's home DO wakes from hibernation
@@ -399,7 +419,7 @@ export class McpHost {
     const scope = options.scope ?? "active";
     const limit = clampInt(options.limit, 1, MAX_TOOL_PAGE_LIMIT, DEFAULT_TOOL_PAGE_LIMIT);
     const offset = parseCursor(options.cursor);
-    const filtered = await this.enumerateToolsForScope(actor, scope, options.object, options.query);
+    const filtered = await this.enumerateToolsForScope(actor, scope, options.object, options.query, options.sessionId);
     const tools = filtered.slice(offset, offset + limit);
     const nextOffset = offset + tools.length;
     return {
@@ -416,14 +436,14 @@ export class McpHost {
 
   async enumerateTools(actor: ObjRef, options: McpToolListOptions = {}): Promise<McpTool[]> {
     const scope = options.scope ?? "all";
-    const filtered = await this.enumerateToolsForScope(actor, scope, options.object, options.query);
+    const filtered = await this.enumerateToolsForScope(actor, scope, options.object, options.query, options.sessionId);
     if (options.limit === undefined && options.cursor === undefined) return filtered;
     const limit = clampInt(options.limit, 1, MAX_TOOL_PAGE_LIMIT, filtered.length || DEFAULT_TOOL_PAGE_LIMIT);
     const offset = parseCursor(options.cursor);
     return filtered.slice(offset, offset + limit);
   }
 
-  private async enumerateToolsForScope(actor: ObjRef, scope: McpToolScope, object: ObjRef | undefined, query: string | undefined): Promise<McpTool[]> {
+  private async enumerateToolsForScope(actor: ObjRef, scope: McpToolScope, object: ObjRef | undefined, query: string | undefined, sessionId?: string): Promise<McpTool[]> {
     const plan = await this.toolScopePlan(actor, scope, object);
     const tools: McpTool[] = [];
     const usedNames = new Set<string>();
@@ -458,10 +478,17 @@ export class McpHost {
     };
     if (bridge?.enumerateRemoteTools) {
       let selectedDescriptors: RemoteToolDescriptor[] = [];
+      let remoteFailed = false;
       try {
         if (plan.remoteRequests.length > 0) selectedDescriptors = await bridge.enumerateRemoteTools(actor, plan.remoteRequests);
       } catch {
-        // Best-effort; if a host is unreachable its tools just don't appear.
+        remoteFailed = true;
+      }
+      if ((remoteFailed || selectedDescriptors.length === 0) && sessionId && plan.remoteRequests.length > 0) {
+        selectedDescriptors = this.filterManifestDescriptors(
+          await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss"),
+          plan
+        );
       }
       addRemoteDescriptors(selectedDescriptors, false);
     }
@@ -585,7 +612,8 @@ export class McpHost {
           arg_spec: verb.arg_spec,
           direct: verb.direct_callable === true,
           source: verb.source ?? "",
-          enclosingSpace: this.enclosingSpaceFor(id)
+          enclosingSpace: this.enclosingSpaceFor(id),
+          source_rows: this.toolSurfaceSourceRows(id, verb.owner)
         });
       }
     };
@@ -602,7 +630,7 @@ export class McpHost {
 
   private assembleTool(
     object: ObjRef,
-    spec: { verb: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct: boolean; source: string; enclosingSpace: ObjRef | null },
+    spec: { verb: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct: boolean; source: string; enclosingSpace: ObjRef | null; source_rows?: RemoteToolDescriptor["source_rows"] },
     usedNames: Set<string>
   ): McpTool {
     const baseName = sanitizeId(object) + "__" + spec.verb;
@@ -621,7 +649,17 @@ export class McpHost {
       inputSchema: argSpecToJsonSchema(spec.arg_spec),
       direct: spec.direct,
       persistence: mcpToolPersistence(spec.arg_spec),
-      enclosingSpace: spec.enclosingSpace
+      enclosingSpace: spec.enclosingSpace,
+      descriptor: {
+        object,
+        verb: spec.verb,
+        aliases: spec.aliases,
+        arg_spec: spec.arg_spec,
+        direct: spec.direct,
+        source: spec.source,
+        enclosingSpace: spec.enclosingSpace,
+        ...(spec.source_rows ? { source_rows: spec.source_rows } : {})
+      }
     };
   }
 
@@ -674,21 +712,48 @@ export class McpHost {
    * the right shard but the audience filter rejected." */
   queueCount(): number { return this.queues.size; }
 
-  async markToolListSeen(sessionId: string, actor: ObjRef): Promise<void> {
+  async markToolListSeen(sessionId: string, actor: ObjRef, tools: McpTool[] = []): Promise<void> {
     // The transport just handed this actor a concrete tools/list result.
     // Record that digest as the notification baseline so the next real
     // reachability change emits list_changed even if the fire-and-forget
     // initial seed from createMcpServer is still racing.
     this.toolListSnapshot.set(sessionId, await this.toolListDigest(actor));
+    if (tools.length > 0) {
+      const now = Date.now();
+      const manifest: SessionToolManifest = {
+        kind: "woo.session_tool_manifest.v1",
+        session_id: sessionId,
+        actor,
+        active_scope: this.world.activeScopeForSession(sessionId) ?? actor,
+        tools: tools.map((tool) => tool.descriptor ?? descriptorFromTool(tool)),
+        source_surfaces: [],
+        last_apply_seq: 0,
+        last_apply_hash: "",
+        updated_at_ms: now,
+        expires_at_ms: now + 5 * 60_000
+      };
+      this.sessionToolManifests.set(sessionId, manifest);
+      await this.manifestHooks.saveSessionManifest?.(manifest);
+    }
   }
 
-  async resolveReachableTool(actor: ObjRef, object: ObjRef, verbName: string): Promise<McpTool | null> {
+  async resolveReachableTool(actor: ObjRef, object: ObjRef, verbName: string, sessionId?: string): Promise<McpTool | null> {
     const locallyReachable = this.reachable(actor).some((entry) => entry.id === object);
     const bridge = this.world.getExecutorContext();
     if (locallyReachable && await this.world.isRemoteObject(object)) {
       if (!bridge?.enumerateRemoteTools) return null;
       const projection = this.usesObviousProjection(actor, object) ? "obvious" : "tools";
-      const descriptors = await bridge.enumerateRemoteTools(actor, [{ id: object, projection }]);
+      let descriptors: RemoteToolDescriptor[] = [];
+      let remoteFailed = false;
+      try {
+        descriptors = await bridge.enumerateRemoteTools(actor, [{ id: object, projection }]);
+      } catch {
+        remoteFailed = true;
+        descriptors = [];
+      }
+      if (descriptors.length === 0 && sessionId) {
+        descriptors = await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss");
+      }
       const descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
       return descriptor ? this.assembleTool(descriptor.object, descriptor, new Set()) : null;
     }
@@ -707,19 +772,70 @@ export class McpHost {
     if (!bridge?.enumerateRemoteTools) return null;
     const remoteScopeIds = await this.collectRemoteScopeIds(actor);
     if (remoteScopeIds.length === 0) return null;
-    const descriptors = await bridge.enumerateRemoteTools(actor, remoteScopeIds.map((id) => ({
-      id,
-      projection: "tools" as const,
-      expandContents: true,
-      contentsProjection: "obvious" as const
-    })));
+    let descriptors: RemoteToolDescriptor[] = [];
+    let remoteFailed = false;
+    try {
+      descriptors = await bridge.enumerateRemoteTools(actor, remoteScopeIds.map((id) => ({
+        id,
+        projection: "tools" as const,
+        expandContents: true,
+        contentsProjection: "obvious" as const
+      })));
+    } catch {
+      remoteFailed = true;
+      descriptors = [];
+    }
+    if (descriptors.length === 0 && sessionId) {
+      descriptors = await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss");
+    }
     const descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
     return descriptor ? this.assembleTool(descriptor.object, descriptor, new Set()) : null;
   }
 
-  private tooledVerbsFor(actor: ObjRef, id: ObjRef): Array<{ name: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct_callable?: boolean; perms: string; tool_exposed?: boolean; source?: string }> {
+  private async sessionManifestDescriptors(sessionId: string, staleReason?: ProjectionFreshness["stale_reason"]): Promise<RemoteToolDescriptor[]> {
+    if (this.manifestHooks.staleFallback !== true) return [];
+    const now = Date.now();
+    const cached = this.sessionToolManifests.get(sessionId);
+    if (cached && cached.expires_at_ms > now) return (await this.markSessionManifestStale(cached, staleReason)).tools;
+    const loaded = await this.manifestHooks.loadSessionManifest?.(sessionId) ?? null;
+    if (!loaded || loaded.expires_at_ms <= now) return [];
+    const manifest = await this.markSessionManifestStale(loaded, staleReason);
+    this.sessionToolManifests.set(sessionId, manifest);
+    return manifest.tools;
+  }
+
+  private async markSessionManifestStale(
+    manifest: SessionToolManifest,
+    staleReason?: ProjectionFreshness["stale_reason"]
+  ): Promise<SessionToolManifest> {
+    if (!staleReason) return manifest;
+    const stale: SessionToolManifest = {
+      ...manifest,
+      stale: true,
+      stale_reason: staleReason,
+      updated_at_ms: Date.now()
+    };
+    this.sessionToolManifests.set(manifest.session_id, stale);
+    await this.manifestHooks.saveSessionManifest?.(stale);
+    return stale;
+  }
+
+  private filterManifestDescriptors(
+    descriptors: RemoteToolDescriptor[],
+    plan: { selectedIds: Set<ObjRef>; obviousOnlyIds: Set<ObjRef>; remoteRequests: RemoteToolRequest[] }
+  ): RemoteToolDescriptor[] {
+    if (descriptors.length === 0) return descriptors;
+    const selected = new Set(plan.selectedIds);
+    for (const request of plan.remoteRequests) selected.add(request.id);
+    return descriptors.filter((descriptor) =>
+      selected.has(descriptor.object) ||
+      plan.remoteRequests.some((request) => manifestDescriptorMatchesRequest(descriptor, request))
+    );
+  }
+
+  private tooledVerbsFor(actor: ObjRef, id: ObjRef): McpVerbInfo[] {
     const seen = new Set<string>();
-    const out: Array<{ name: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct_callable?: boolean; perms: string; tool_exposed?: boolean; source?: string }> = [];
+    const out: McpVerbInfo[] = [];
     const collect = (start: ObjRef): void => {
       let cursor: ObjRef | null = start;
       while (cursor && this.world.objects.has(cursor)) {
@@ -730,7 +846,7 @@ export class McpHost {
           if (this.isSuppressedInheritedActorTool(actor, id, cursor)) continue;
           if (verb.tool_exposed !== true) continue;
           if (!this.world.canExecuteVerb(actor, verb)) continue;
-          out.push(verb as unknown as typeof out[number]);
+          out.push({ ...(verb as unknown as Omit<McpVerbInfo, "owner">), owner: cursor });
         }
         cursor = obj.parent;
       }
@@ -741,8 +857,46 @@ export class McpHost {
     return out;
   }
 
-  private obviousVerbsFor(actor: ObjRef, id: ObjRef): Array<{ name: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct_callable?: boolean; perms: string; tool_exposed?: boolean; source?: string }> {
-    return this.world.obviousCommandVerbs(id, { actor, executableOnly: true }) as unknown as Array<{ name: string; aliases: string[]; arg_spec: Record<string, WooValue>; direct_callable?: boolean; perms: string; tool_exposed?: boolean; source?: string }>;
+  private obviousVerbsFor(actor: ObjRef, id: ObjRef): McpVerbInfo[] {
+    return (this.world.obviousCommandVerbs(id, { actor, executableOnly: true }) as unknown as McpVerbInfo[])
+      .map((verb) => ({ ...verb, owner: verb.owner ?? id }));
+  }
+
+  private toolSurfaceSourceRows(object: ObjRef, owner: ObjRef | undefined): RemoteToolDescriptor["source_rows"] {
+    const keys = new Set<ObjRef>();
+    const objectLineage = this.objectLineage(object);
+    const ownerInObjectLineage = owner ? objectLineage.indexOf(owner) : -1;
+    if (ownerInObjectLineage >= 0) {
+      for (const key of objectLineage.slice(0, ownerInObjectLineage + 1)) keys.add(key);
+    } else {
+      // Feature-provided verbs depend on the object/class rows that declare the
+      // feature list, plus the feature object's own resolution path.
+      for (const key of objectLineage) keys.add(key);
+      let foundFeatureOwner = false;
+      if (owner) {
+        for (const feature of this.featureListOf(object)) {
+          const featureLineage = this.objectLineage(feature);
+          const ownerIndex = featureLineage.indexOf(owner);
+          if (ownerIndex < 0) continue;
+          foundFeatureOwner = true;
+          for (const key of featureLineage.slice(0, ownerIndex + 1)) keys.add(key);
+        }
+      }
+      if (owner && !foundFeatureOwner) keys.add(owner);
+    }
+    return Array.from(keys).map((key) => ({ table: "objects" as const, authority_scope: object, key }));
+  }
+
+  private objectLineage(start: ObjRef): ObjRef[] {
+    const out: ObjRef[] = [];
+    const seen = new Set<ObjRef>();
+    let cursor: ObjRef | null = start;
+    while (cursor && this.world.objects.has(cursor) && !seen.has(cursor)) {
+      seen.add(cursor);
+      out.push(cursor);
+      cursor = this.world.object(cursor).parent;
+    }
+    return out;
   }
 
   private usesObviousProjection(actor: ObjRef, target: ObjRef): boolean {
@@ -1100,6 +1254,25 @@ function mcpToolPersistence(spec: Record<string, WooValue>): "durable" | "live" 
     if (persistence === "live" || persistence === "durable") return persistence;
   }
   return "durable";
+}
+
+function manifestDescriptorMatchesRequest(descriptor: RemoteToolDescriptor, request: RemoteToolRequest): boolean {
+  if (descriptor.object === request.id) return true;
+  // expandContents asks the remote owner for child-object tools under the
+  // requested space; stale manifest fallback must use the same match shape.
+  return request.expandContents === true && descriptor.enclosingSpace === request.id;
+}
+
+function descriptorFromTool(tool: McpTool): RemoteToolDescriptor {
+  return {
+    object: tool.object,
+    verb: tool.verb,
+    aliases: tool.aliases,
+    arg_spec: {},
+    direct: tool.direct,
+    source: "",
+    enclosingSpace: tool.enclosingSpace
+  };
 }
 
 function jsonSchemaForHint(hint: string): Record<string, unknown> {

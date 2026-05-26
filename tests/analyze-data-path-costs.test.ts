@@ -44,6 +44,154 @@ describe("analyze-data-path-costs", () => {
     expect(result.stdout).toContain("| commit_reply_replay | 1 | idempotency |");
   });
 
+  it("counts gateway projection cache bytes in projection-byte rollups", () => {
+    const result = runAnalyzer({
+      kind: "gateway_projection_cache_write",
+      scope: "the_chatroom",
+      rows: 2,
+      bytes: 512,
+      projection_bytes: 512,
+      gateway_projection_rows_written: 2,
+      gateway_projection_bytes: 512,
+      source: "fanout"
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("observed projection bytes: 512 B (512 bytes");
+    expect(result.stdout).toContain("| gateway_projection_cache_write | 1 | fanout_apply |");
+  });
+
+  it("reports tool-surface reverse-index sizing by scope", () => {
+    const result = runAnalyzer(
+      {
+        kind: "gateway_tool_surface_source_rows",
+        scope: "room_a",
+        object: "widget_a",
+        rows: 3,
+        scope_rows: 3,
+        shard_rows: 3,
+        cap: 10000,
+        shard_cap: 40000,
+        saturated: false
+      },
+      {
+        kind: "gateway_tool_surface_source_rows",
+        scope: "room_b",
+        object: "widget_b",
+        rows: 2,
+        scope_rows: 0,
+        shard_rows: 3,
+        cap: 1,
+        shard_cap: 40000,
+        saturated: true,
+        saturation_reason: "scope"
+      }
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Tool-surface reverse-index sizing");
+    expect(result.stdout).toContain("gateway_tool_surface_source_rows events: 2");
+    expect(result.stdout).toContain("| room_a | 1 | 1 | 3 | 3 | 10000 | 3 | 40000 | 0 |  |");
+    expect(result.stdout).toContain("| room_b | 1 | 1 | 2 | 0 | 1 | 3 | 40000 | 1 | scope |");
+  });
+
+  it("reports the success-criteria cost fields from observed metrics", () => {
+    const result = runAnalyzer(
+      {
+        kind: "v2_envelope",
+        scope: "the_chatroom",
+        ms: 5,
+        status: "ok",
+        projection_bytes: 20,
+        tail_rows_written: 2,
+        tail_bytes_retained: 128
+      },
+      {
+        kind: "authority_tail",
+        scope: "the_chatroom",
+        ms: 1,
+        tail_rows_written: 3,
+        tail_rows_pruned: 1,
+        tail_bytes_retained: 256,
+        accepted_frames_retained: 2,
+        transcript_tail_retained: 2
+      },
+      {
+        kind: "gateway_projection_apply",
+        scope: "the_chatroom",
+        rows: 4,
+        projection_bytes: 40,
+        source: "fanout"
+      },
+      {
+        kind: "v2_host_apply_fanout",
+        scope: "the_chatroom",
+        hosts: 2,
+        touched: 5,
+        ms: 7,
+        status: "ok"
+      },
+      {
+        kind: "v2_open_step",
+        phase: "gateway_send_checkpoint_tail_transfer",
+        scope: "the_chatroom",
+        ms: 3,
+        status: "ok",
+        bytes: 512,
+        transfer_mode: "checkpoint_tail:frames"
+      },
+      {
+        kind: "v2_open_step",
+        phase: "checkpoint_build",
+        scope: "the_chatroom",
+        ms: 11,
+        status: "ok"
+      },
+      {
+        kind: "v2_open_step",
+        phase: "checkpoint_tail_packaging",
+        scope: "the_chatroom",
+        ms: 13,
+        status: "ok"
+      },
+      {
+        kind: "same_host_fallback",
+        route: "/__internal/enumerate-tools",
+        host: "world",
+        rows: 6,
+        reason: "cache_hit"
+      },
+      {
+        kind: "cross_host_rpc",
+        route: "/__internal/enumerate-tools",
+        host: "room-host",
+        ms: 17,
+        status: "timeout"
+      },
+      {
+        kind: "cross_host_rpc",
+        route: "/__internal/apply-v2-commit",
+        host: "room-host",
+        ms: 19,
+        status: "ok"
+      }
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Success-criteria cost summary");
+    expect(result.stdout).toContain("| projection rows touched | 9 |");
+    expect(result.stdout).toContain("| projection bytes | 60 |");
+    expect(result.stdout).toContain("| fanout rows touched | 9 |");
+    expect(result.stdout).toContain("| checkpoint transfer bytes | 512 |");
+    expect(result.stdout).toContain("| tail rows written | 5 |");
+    expect(result.stdout).toContain("| tail bytes retained | 256 |");
+    expect(result.stdout).toContain("| checkpoint build ms | 11 |");
+    expect(result.stdout).toContain("| checkpoint packaging ms | 13 |");
+    expect(result.stdout).toContain("| same-host fallback count | 1 |");
+    expect(result.stdout).toContain("| remote owner refresh count | 1 |");
+    expect(result.stdout).toContain("| cross-host round trips | 2 |");
+  });
+
   it("classifies every current MetricEvent kind", () => {
     const kinds = metricKindsFromTypes();
     const result = runAnalyzer(...kinds.map((kind) => ({ kind })));

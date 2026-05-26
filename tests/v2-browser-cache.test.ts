@@ -294,6 +294,36 @@ describe("v2 browser cache reducer", () => {
       { kind: "state_pages", scope: "#room", pages: [{ hash: "page-hash", ref: "#room:object_live:", page }] }
     ]);
   });
+
+  it("persists checkpoint/tail open transfers as projection-row catch-up plus new frame markers", () => {
+    const frame = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "turn-2",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "#room", epoch: 1, seq: 2, hash: "h2" },
+      receipt: { kind: "woo.commit_receipt.shadow.v1", id: "turn-2", accepted: true },
+      transcript_hash: "t2",
+      post_state_hash: "p2",
+      observations: [],
+      projection_writes: []
+    };
+    const body = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "#room",
+      head: frame.position,
+      transfer: {
+        kind: "frames",
+        from: { kind: "woo.scope_head.shadow.v1", scope: "#room", epoch: 1, seq: 1, hash: "h1" },
+        to: frame.position,
+        frames: [{ frame, projection_writes: [] }]
+      },
+      viewer: { actor: "guest_1", session: "session_1" }
+    };
+
+    expect(v2BrowserCacheMutationsForEnvelope(envelopeFor("woo.open.checkpoint_tail.v1", body))).toEqual([
+      { kind: "checkpoint_tail", transfer: body },
+      { kind: "applied_frame", frame }
+    ]);
+  });
 });
 
 function envelopeFor<T>(type: string, body: T): ShadowEnvelope<T> {

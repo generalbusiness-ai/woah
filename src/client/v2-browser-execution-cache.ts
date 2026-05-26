@@ -1,5 +1,5 @@
 import type { EffectTranscript } from "../core/effect-transcript";
-import { applyShadowTranscriptToCommitScopeCache, createShadowCommitScope } from "../core/shadow-commit-scope";
+import { applyShadowTranscriptToCommitScopeCache, createShadowCommitScope, serializedFor } from "../core/shadow-commit-scope";
 import { createShadowExecutionNode, installShadowStateTransfer, type ShadowExecutionNode, type ShadowStateTransfer } from "../core/shadow-turn-exec";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { SerializedObject, SerializedWorld } from "../core/repository";
@@ -161,7 +161,7 @@ function materializeTranscriptOverlays(
   return createShadowExecutionNode({
     node: executionNode.node,
     scope: executionNode.scope,
-    serialized: commitScope.serialized,
+    serialized: serializedFor(commitScope, { reason: "browser_execution_overlay" }),
     atom_hashes: Array.from(atomHashes)
   });
 }

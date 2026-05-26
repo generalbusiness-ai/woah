@@ -1,6 +1,6 @@
 import { buildShadowCapabilityAd, rankCapabilityAdsForTurn, type ShadowCapabilityAd } from "./capability-ad";
 import type { SerializedWorld } from "./repository";
-import { createShadowCommitScope, type ShadowCommitScope } from "./shadow-commit-scope";
+import { createShadowCommitScope, serializedFor, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
   buildShadowClosureTransfer,
@@ -161,7 +161,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
       // commit the loser's executor still carries pre-race cell versions — a
       // re-run on stale serialized would just produce another transcript with
       // the same (now-pre-state-mismatched) reads.
-      selected.serialized = commitScope.serialized;
+      selected.serialized = serializedFor(commitScope, { reason: "stale_head_retry" });
       selected.world = undefined;
       activeRequest = { ...activeRequest, expected: commitScope.head };
     } else {

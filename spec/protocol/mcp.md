@@ -168,7 +168,29 @@ After a tool call, the gateway may compute a cheap local reachability signal (ac
 
 Containment cycles and re-entrant rooms (a room as the contents of another room — see the chat catalog's hot tub) are walked once; the algorithm is a BFS bounded by the reachability set's natural boundary (objects not in any of the seven categories above).
 
-Reachability spans hosts. When a selected scope entry resolves to a remote $space (per [hosts.md §3](hosts.md#3-hosts-and-execution-model)) the gateway asks that host for tool descriptors and merges the result with locally-known entries. Scopes that expand space contents (`here`, `space`, `all`) include per-instance verbs on dynamically-created objects (a `$task` minted at runtime on a registry's host, a `$cockatoo` cloned into a chat room). The bounded `active` scope asks the same host but filters the response back to the selected objects, so a registry containing hundreds of tasks does not become hundreds of MCP tools by default. The same rule applies to `woo_call(object, verb, args?)`: targeted resolution must search the remote contribution for the actor's reachable spaces/focus set, not only the gateway's local object ids. The remote host is responsible for applying the actor's read-permission filter before returning its contribution; the gateway trusts that filter (same-deployment trust, [hosts.md §3.3](hosts.md#33-trust-model-across-hosts)). Cross-host reachability lookups are best-effort cached for the duration of one tool-list computation; subsequent `tools/list` requests re-fetch.
+Reachability spans hosts. When a selected scope entry resolves to a remote $space (per [hosts.md §3](hosts.md#3-hosts-and-execution-model)) the gateway first consults same-host projection cache rows and the session's last tool manifest, then refreshes from the owning host when needed. Scopes that expand space contents (`here`, `space`, `all`) include per-instance verbs on dynamically-created objects (a `$task` minted at runtime on a registry's host, a `$cockatoo` cloned into a chat room). The bounded `active` scope asks the same host but filters the response back to the selected objects, so a registry containing hundreds of tasks does not become hundreds of MCP tools by default. The same rule applies to `woo_call(object, verb, args?)`: targeted resolution must search the remote contribution for the actor's reachable spaces/focus set, not only the gateway's local object ids. The remote host is responsible for applying the actor's read-permission filter before returning its contribution; the gateway trusts that filter (same-deployment trust, [hosts.md §3.3](hosts.md#33-trust-model-across-hosts)).
+
+Tool listing is monotonic within a live MCP session up to manifest expiry. Once
+the gateway has returned a descriptor in a session's `SessionToolManifest`, an
+owner timeout or cache miss may mark that descriptor stale but MUST NOT make it
+disappear from `woo_call` resolution in the same session. A descriptor is
+removed only when an accepted projection delta removes the object or verb, the
+session's active scope changes in a way that makes it unreachable, or the
+manifest expires. Persisted manifests record `stale:true` and `stale_reason`
+when they are served because owner refresh failed or returned no descriptors;
+that marker is freshness metadata, not a not-found result. Remote descriptor
+refreshes should also include tool-surface `source_rows` when available so the
+gateway can invalidate inherited and feature-provided verbs from accepted
+projection updates without reopening executable state. Descriptor reads may use
+stale projection rows; auth, permission checks, and VM execution may not.
+During rollout, stale descriptor reads are enabled only when the gateway's
+same-host stale-fallback flag is on; with the flag off, saved manifests are not
+used to recover owner refresh failures.
+When an MCP call executes through v2 and the gateway already holds a local
+execution view for the commit scope, it may send a one-turn
+`ExecutionCapsule` on `/v2/envelope` instead of reopening the scope. The capsule
+does not make descriptor projection data authoritative; permission and VM
+execution still go through the CommitScopeDO authority path.
 
 ### M3.1 Working set: `$actor:focus`
 
@@ -319,7 +341,7 @@ MCP is an agent-oriented deployment surface. The MCP gateway is separate from th
 
 A second-implementation conformance suite for MCP follows the broader conformance plan ([tooling/conformance.md](../tooling/conformance.md)) and is deferred until at least one alternative MCP gateway exists.
 
-The MCP gateway is the first consumer of the v2 turn-network protocol ([v2-turn-network.md](v2-turn-network.md)). On a separate Cloudflare namespace that does not maintain v1 compatibility, the gateway is a pure v2 client for world/object verb invocation: it forwards calls as v2 turn-network envelopes through `CommitScopeDO`, so the authority plans each turn against the live commit head, and routes v2 accepted-frame and live observations to MCP queues rather than consuming v1 applied-frames. MCP is not a browser execution-cache node, so it currently uses the server-assisted intent profile defined by the v2 turn-network spec rather than browser-local optimistic execution. MCP queue/focus controls remain gateway-local protocol controls because they manage session attention and observation drainage, not durable world commits. The MCP wire contract above (tools, notifications, queues) is unchanged; only the gateway's internal observation source and call path are rerouted. The legacy production namespace continues to drive MCP through the v1 path described in §M3–§M6. See [notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md) for the migration plan and implementation status.
+The MCP gateway is the first consumer of the v2 turn-network protocol ([v2-turn-network.md](v2-turn-network.md)). On a separate Cloudflare namespace that does not maintain v1 compatibility, the gateway is a pure v2 client for world/object verb invocation: it forwards calls as v2 turn-network envelopes through `CommitScopeDO`, so the authority plans each turn against the live commit head, and routes v2 accepted-frame and live observations to MCP queues rather than consuming v1 applied-frames. MCP is not a browser execution-cache node, so it currently uses the server-assisted intent profile defined by the v2 turn-network spec rather than browser-local optimistic execution. When the `WOO_V2_EXECUTION_CAPSULE` rollout flag is enabled, a warm MCP v2 scope client can skip executable `/v2/open` and submit a capsule-bearing `/v2/envelope`; cold-cold scopes still retry legacy seed bootstrap on `E_SNAPSHOT_REQUIRED`. MCP queue/focus controls remain gateway-local protocol controls because they manage session attention and observation drainage, not durable world commits. The MCP wire contract above (tools, notifications, queues) is unchanged; only the gateway's internal observation source and call path are rerouted. The legacy production namespace continues to drive MCP through the v1 path described in §M3–§M6. See [notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md) for the migration plan and implementation status.
 
 ---
 

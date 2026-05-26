@@ -205,7 +205,7 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", []);
     await drain(alice);
     await drain(bob);
-    const aliceEnter = unwrap(await alice.callRaw("the_outline", "enter", []));
+    const aliceEnter = await alice.call("the_outline", "enter", []);
     if (!isRecord(aliceEnter) || !Array.isArray(aliceEnter.roster)) {
       throw new Error(`expected roster array on the_outline:enter result; got ${JSON.stringify(aliceEnter).slice(0, 200)}`);
     }
@@ -230,12 +230,11 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
   });
 
-  // Taskboard navigation: chatroom → southeast → the_deck →
-  // south → the_taskboard. (The demoworld manifest names the
-  // deck-south destination as the_garden, but production routes it
-  // directly to the workshop registry.) Two hops, walks both actors
-  // in lock-step, then bob enters last so alice (already in) is the
-  // one waiting on the `entered` observation.
+  // Taskboard navigation: chatroom -> southeast -> the_deck -> south toward
+  // the_taskboard. Local demoworld still routes deck south through
+  // the_garden, while production may route directly to the workshop registry.
+  // The helper follows the extra garden hop only when the first move lands
+  // there, then asserts the actor reached the taskboard.
   await step("tasks: cross-room `entered` reaches peer", async () => {
     // Same guard pattern as outliner:enter — only leave if we're in the
     // outline; only southeast if we're in the chatroom. Without these
@@ -245,17 +244,29 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     await bob.leaveIfIn("the_outline");
     if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", []);
     if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", []);
-    if (alice.currentRoom !== "the_deck") throw new Error(`alice expected on the_deck before south; at=${alice.currentRoom}`);
-    await alice.call("the_deck", "south", []);
+    await walkSouthToTaskboard(alice);
     await drain(alice);
     await drain(bob);
-    await bob.call("the_deck", "south", []);
+    await walkSouthToTaskboard(bob);
     await waitFor(alice, (obs) =>
       obs.type === "entered" &&
       obs.actor === bob.actor &&
       obs.source === "the_taskboard",
     10_000);
   });
+}
+
+async function walkSouthToTaskboard(session: McpSession): Promise<void> {
+  if (session.currentRoom !== "the_deck") {
+    throw new Error(`${session.label} expected on the_deck before south; at=${session.currentRoom}`);
+  }
+  await session.call("the_deck", "south", []);
+  if (session.currentRoom === "the_garden") {
+    await session.call("the_garden", "south", []);
+  }
+  if (session.currentRoom !== "the_taskboard") {
+    throw new Error(`${session.label} expected on the_taskboard after south path; at=${session.currentRoom}`);
+  }
 }
 
 // Step-level watchdog. Even if every per-RPC fetch has a deadline, a step

@@ -1,11 +1,15 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import {
   createShadowCommitScope,
+  isShadowCommitScopeSerializedDirty,
   markShadowCommitScopeSerializedChanged,
+  shadowCommitScopeSerializedRef,
+  serializedFor,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
   type ShadowCommitConflict,
-  type ShadowCommitScope
+  type ShadowCommitScope,
+  type ShadowScopeHead
 } from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
@@ -317,7 +321,7 @@ export type ShadowBrowserOpenScopeOptions = {
   metric?: (event: MetricEvent) => void;
 };
 
-type ShadowProjectionViewer = {
+export type ShadowProjectionViewer = {
   actor: ObjRef;
   session?: string | null;
 };
@@ -532,17 +536,19 @@ export function mergeShadowBrowserAuthoritySessionState(current: readonly Serial
 }
 
 export function markShadowBrowserRelaySerializedChanged(relay: ShadowBrowserRelayShim): void {
-  markShadowCommitScopeSerializedChanged(relay.commit_scope);
+  if (!isShadowCommitScopeSerializedDirty(relay.commit_scope)) {
+    markShadowCommitScopeSerializedChanged(relay.commit_scope);
+  }
   relay.serialized_generation++;
   relay.open_executable_seed_cache.clear();
-  SHADOW_SERIALIZED_INDEX_CACHE.delete(relay.commit_scope.serialized);
+  SHADOW_SERIALIZED_INDEX_CACHE.delete(shadowCommitScopeSerializedRef(relay.commit_scope));
 }
 
 function noteShadowBrowserRelayCommitAccepted(relay: ShadowBrowserRelayShim): void {
-  // Accepted commits replace commit_scope.serialized through the indexed commit
-  // scope, so the state index is already current. The browser-facing generation
-  // still must advance so open-time executable seed digests cannot validate
-  // against pre-commit pages.
+  // Accepted commits advance the indexed commit scope without refreshing the
+  // legacy serialized export immediately. The browser-facing generation still
+  // must advance so open-time executable seed digests cannot validate against
+  // pre-commit pages.
   relay.serialized_generation++;
   relay.open_executable_seed_cache.clear();
 }
@@ -638,7 +644,7 @@ export async function openShadowBrowserScope(
 ): Promise<ShadowBrowserOpenScopeResult> {
   const totalStartedAt = metricNow();
   validateShadowBrowserNodeAuth(browser);
-  const serialized = browser.relay.commit_scope.serialized;
+  const serialized = serializedFor(browser.relay.commit_scope, { reason: "browser_scope_open" });
   const openSeedCacheKey = shadowBrowserOpenExecutableSeedCacheKey(browser.scope, browser.actor);
   const cachedOpenSeed = browser.relay.open_executable_seed_cache.get(openSeedCacheKey);
   const cachedDigestMatches = Boolean(
@@ -848,7 +854,8 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
   // coverage for the scope/actor/content scaffold; after planning derives the
   // exact TurnKey, ordinary missing-state repair installs the specific verb and
   // property cells before the browser submits a TurnExecRequest.
-  const preimages = shadowBrowserOpenExecutableSeedPreimages(relay.commit_scope.serialized, scope, actor);
+  const serialized = serializedFor(relay.commit_scope, { reason: "open_executable_seed" });
+  const preimages = shadowBrowserOpenExecutableSeedPreimages(serialized, scope, actor);
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",
     scope,
@@ -865,7 +872,7 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
     accept_atom_hashes: preimages.map(shadowAtomHash)
   };
   return buildShadowCellPageTransfer({
-    serialized: shadowBrowserOpenExecutableSeedSerialized(relay.commit_scope.serialized, scope, actor),
+    serialized: shadowBrowserOpenExecutableSeedSerialized(serialized, scope, actor),
     key,
     purpose: "open_executable_seed",
     recipient
@@ -878,6 +885,7 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
   recipient: string,
   actor?: ObjRef
 ): ShadowStateTransfer {
+  const serialized = serializedFor(relay.commit_scope, { reason: "open_executable_seed_cache_hit" });
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",
     scope,
@@ -894,7 +902,7 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
     accept_atom_hashes: []
   };
   return buildShadowCellPageTransfer({
-    serialized: relay.commit_scope.serialized,
+    serialized,
     key,
     purpose: "open_executable_seed_cache_hit",
     recipient
@@ -1298,7 +1306,7 @@ export async function executeShadowBrowserTurn(
     args: input.args ?? [],
     body: input.body
   };
-  const planned = await runShadowTurnCallTranscript(browser.relay.commit_scope.serialized, call);
+  const planned = await runShadowTurnCallTranscript(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const pending: ShadowBrowserPendingTurn = {
     id,
@@ -1331,7 +1339,7 @@ export async function executeShadowBrowserTurn(
     ads: [buildShadowTurnExecAd({ node: browser.execution_node.node, scope: key.scope, key, factor: 0.1 })],
     anchor: {
       node: browser.relay.node,
-      serialized: browser.relay.commit_scope.serialized
+      serialized: serializedFor(browser.relay.commit_scope, { reason: "browser_network_anchor" })
     },
     commitScope: browser.relay.commit_scope
   });
@@ -1375,7 +1383,7 @@ export function buildShadowBrowserProjectionTransfer(
     mode: "projection",
     scope,
     to: structuredClone(relay.commit_scope.head) as ShadowCommitAccepted["position"],
-    projection: shadowScopeProjection(relay.commit_scope.serialized, scope, relay.commit_scope.head.seq, viewer)
+    projection: shadowScopeProjection(serializedFor(relay.commit_scope, { reason: "projection_transfer" }), scope, relay.commit_scope.head.seq, viewer)
   } satisfies Omit<ShadowProjectionTransfer, "proof">;
   return { ...transfer, proof: signShadowBrowserStateTransfer(transfer, relay.state_signing, recipient) };
 }
@@ -1445,7 +1453,7 @@ export function buildShadowBrowserDeltaTransferFromFrames(
   } satisfies Omit<ShadowDeltaTransfer, "proof" | "projection" | "projection_patch">;
   if (ordered.length === 1 && baseProjection && baseHead && baseProjection.scope === scope && baseHead.scope === scope) {
     const projectionPatch = shadowScopeProjectionPatchFromTranscript(
-      relay.commit_scope.serialized,
+      serializedFor(relay.commit_scope, { reason: "projection_patch" }),
       ordered[0],
       orderedTranscripts[0],
       baseProjection,
@@ -1460,7 +1468,7 @@ export function buildShadowBrowserDeltaTransferFromFrames(
       return { ...patchTransfer, proof: signShadowBrowserStateTransfer(patchTransfer, relay.state_signing, recipient) };
     }
   }
-  const projection = shadowScopeProjection(relay.commit_scope.serialized, scope, to.seq, viewer);
+  const projection = shadowScopeProjection(serializedFor(relay.commit_scope, { reason: "projection_transfer" }), scope, to.seq, viewer);
   const fullTransfer = {
     ...common,
     projection
@@ -1756,7 +1764,7 @@ export function handleShadowBrowserStateTransferEnvelope(
   // the planned key; when both are present the transfer builder serves the
   // union.
   const transfer = buildShadowCellPageTransfer({
-    serialized: browser.relay.commit_scope.serialized,
+    serialized: serializedFor(browser.relay.commit_scope, { reason: "state_transfer" }),
     key: request.key,
     atom_hashes: request.atom_hashes,
     missing_atoms: request.missing_atoms,
@@ -1819,7 +1827,7 @@ async function executeShadowBrowserLivePersistenceCall(
   // without making the next authority-bearing commit validate against live-only
   // state.
   const sessionKey = call.session ?? call.actor;
-  const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? browser.relay.commit_scope.serialized;
+  const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? serializedFor(browser.relay.commit_scope, { reason: "live_persistence_base" });
   const headHashBefore = browser.relay.commit_scope.head.hash;
   const run = await runShadowTurnCall(serializedBefore, call, { onMetric });
   // A live/direct read may be started by UI hydration immediately after a
@@ -1856,8 +1864,8 @@ async function shadowTurnExecRequestFromIntent(
   // turns it into the same ShadowTurnKey that a local browser planner will
   // submit later.
   const serialized = intent.persistence === "live"
-    ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? browser.relay.commit_scope.serialized
-    : browser.relay.commit_scope.serialized;
+    ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? serializedFor(browser.relay.commit_scope, { reason: "intent_live_plan" })
+    : serializedFor(browser.relay.commit_scope, { reason: "intent_plan" });
   const planned = await runShadowTurnCallTranscript(serialized, call, { onMetric });
   return {
     kind: "woo.turn.exec.request.shadow.v1",
@@ -1901,7 +1909,7 @@ async function executeShadowBrowserTurnExecRequest(
     ads: [buildShadowTurnExecAd({ node: executor.node, scope: request.key.scope, key: request.key, factor: 0.1 })],
     anchor: {
       node: browser.relay.node,
-      serialized: browser.relay.commit_scope.serialized
+      serialized: serializedFor(browser.relay.commit_scope, { reason: "turn_exec_anchor" })
     },
     commitScope: browser.relay.commit_scope,
     profile: options.profile,
@@ -1916,7 +1924,7 @@ async function executeShadowBrowserTurnExecRequest(
       // Projection deltas update display state, but only execution transfers
       // let the browser plan the next related turn locally.
       const stateTransfer = buildShadowCellPageTransfer({
-        serialized: browser.relay.commit_scope.serialized,
+        serialized: serializedFor(browser.relay.commit_scope, { reason: "delegated_state_transfer" }),
         key: request.key,
         atom_hashes: request.key.atom_hashes,
         known_page_hashes: browser.execution_node.page_hashes,
@@ -2003,7 +2011,7 @@ function shadowRelayAuthoritativeExecutorForScope(relay: ShadowBrowserRelayShim,
     const fresh = createShadowExecutionNode({
       node: nodeId,
       scope,
-      serialized: relay.commit_scope.serialized,
+      serialized: serializedFor(relay.commit_scope, { reason: "authoritative_executor" }),
       // The relay-default executor owns the full authoritative serialized
       // state for its commit scope. Marking it authoritative disables the
       // atom-guard that exists to detect partial-cache misses on delegate
@@ -2038,7 +2046,7 @@ export function applyShadowBrowserAcceptedFrame(browser: ShadowBrowserNode, acce
   trimArrayHead(browser.cache.applied_frames, MAX_SHADOW_BROWSER_CACHE_TAIL);
   const existing = browser.cache.projections.get(browser.scope);
   if (isShadowScopeProjection(existing) && existing.seq >= accepted.position.seq) return;
-  browser.cache.projections.set(browser.scope, shadowScopeProjection(browser.relay.commit_scope.serialized, browser.scope, accepted.position.seq, shadowProjectionViewer(browser)));
+  browser.cache.projections.set(browser.scope, shadowScopeProjection(serializedFor(browser.relay.commit_scope, { reason: "accepted_frame_projection" }), browser.scope, accepted.position.seq, shadowProjectionViewer(browser)));
 }
 
 export function applyShadowBrowserConflict(browser: ShadowBrowserNode, conflict: ShadowCommitConflict): void {
@@ -2104,6 +2112,15 @@ function cacheStatePages(cache: ShadowBrowserNodeCache, pages: ShadowStatePage[]
 
 function shadowProjectionViewer(browser: ShadowBrowserNode): ShadowProjectionViewer {
   return { actor: browser.actor, session: browser.session };
+}
+
+export function shadowScopeProjectionFromSerialized(
+  serialized: SerializedWorld,
+  scope: ObjRef,
+  head: ShadowScopeHead,
+  viewer?: ShadowProjectionViewer
+): ShadowScopeProjection {
+  return shadowScopeProjection(serialized, scope, head.seq, viewer);
 }
 
 function shadowScopeProjection(

@@ -11,9 +11,10 @@ import {
   openShadowBrowserScope,
   shadowStateTransferCacheDigest
 } from "../src/core/shadow-browser-node";
-import { applyShadowTranscriptToCommittedState } from "../src/core/shadow-commit-scope";
+import { applyShadowTranscriptToCommitScopeCache, createShadowCommitScope, serializedFor, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
 import type { MetricEvent, Observation, ObjRef, RemoteToolDescriptor, RemoteToolRequest, VerbDef, WooValue } from "../src/core/types";
 import type { CallContext, ExecutorContext, MoveObjectResult, RoomSnapshot, ScopedObjectSummary, WooWorld } from "../src/core/world";
+import type { ProjectionWrite, SessionToolManifest } from "../src/core/projection-delta";
 
 function bootstrapWorld() {
   return createWorld();
@@ -1083,10 +1084,7 @@ describe("McpHost", () => {
       incompleteReasons: [],
       hash: "mcp-v2-cache-apply"
     };
-    const beforeApply = world.exportWorld();
     const timestamp = Date.now() + 1_000;
-    let expected = applyShadowTranscriptToCommittedState(beforeApply, transcript, { objectTimestamp: timestamp });
-    expected = applyShadowTranscriptToCommittedState(expected, transcript, { objectTimestamp: timestamp });
 
     vi.useFakeTimers();
     try {
@@ -1098,13 +1096,19 @@ describe("McpHost", () => {
     }
 
     const after = world.exportWorld();
-    expect(after.objects).toEqual(expected.objects);
-    expect(after.sessions).toEqual(expected.sessions);
-    expect(after.logs).toEqual(expected.logs);
-    expect(after.objectCounter).toBe(expected.objectCounter);
     const chatLog = after.logs.find(([space]) => space === "the_chatroom")?.[1] ?? [];
     expect(chatLog.filter((entry) => entry.seq === 3)).toHaveLength(1);
     expect(after.objectCounter).toBeGreaterThanOrEqual(before + 11);
+    expect(world.getProp(session.actor, "cache_probe")).toBe("updated");
+    expect(world.object(created)).toMatchObject({
+      id: created,
+      name: "cache probe",
+      parent: "$thing",
+      owner: session.actor,
+      location: "the_chatroom"
+    });
+    expect(world.object("$thing").children).toContain(created);
+    expect(world.object("the_chatroom").contents).toContain(created);
     expect(world.sessions.get(session.id)?.attachedSockets.has("socket:mcp-v2-cache-apply")).toBe(true);
     expect(world.sessions.get(session.id)?.attachedSockets.has("socket:mcp-v2-cache-apply-other")).toBe(false);
     expect(world.sessions.get(otherSession.id)?.attachedSockets.has("socket:mcp-v2-cache-apply-other")).toBe(true);
@@ -1132,6 +1136,201 @@ describe("McpHost", () => {
       creates: 1,
       writes: 1
     });
+  });
+
+  it("does not update the gateway WooWorld mirror for projection-cache fanout", () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-v2-external-projection-fanout");
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const gateway = new McpGateway(world, { externalProjectionFanout: true });
+    const row = structuredClone(world.exportObjects([session.actor])[0]!);
+    row.properties = [...row.properties, ["fanout_probe", "remote"]];
+    const write: ProjectionWrite = {
+      table: "objects",
+      key: session.actor,
+      op: "upsert",
+      row,
+      bytes: 100
+    };
+    const transcript = mcpTestTranscript({
+      id: "mcp-v2-external-projection-fanout",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 1,
+      session: session.id,
+      call: { actor: session.actor, target: "the_chatroom", verb: "fanout_probe", args: [] },
+      writes: [{ cell: { kind: "prop", object: session.actor, name: "fanout_probe" }, value: "remote", op: "set" }],
+      observations: [],
+      hash: "mcp-v2-external-projection-fanout"
+    });
+    const commit: ShadowCommitAccepted = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-external-projection-fanout",
+      position: {
+        kind: "woo.scope_head.shadow.v1",
+        scope: "the_chatroom",
+        epoch: 1,
+        seq: 1,
+        hash: "h1"
+      },
+      transcript_hash: transcript.hash,
+      post_state_hash: "post",
+      observations: [],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: transcript.id,
+        route: transcript.route,
+        scope: transcript.scope,
+        seq: transcript.seq,
+        transcript_hash: transcript.hash,
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      },
+      projection_delta: {
+        objects: [{ key: session.actor, op: "upsert", bytes: write.bytes }],
+        projection_bytes: write.bytes
+      },
+      projection_writes: [write]
+    };
+
+    gateway.acceptRemoteV2Commit("the_chatroom", commit, transcript);
+
+    expect(world.propOrNull(session.actor, "fanout_probe")).toBeNull();
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "gateway_projection_apply",
+      source: "fanout",
+      rows: 1,
+      projection_bytes: 100
+    }));
+    expect(metrics.some((event) => event.kind === "shadow_gateway_apply_step")).toBe(false);
+  });
+
+  it("does not compatibility-apply marker-only projection deltas", () => {
+    const world = bootstrapWorld();
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const gateway = new McpGateway(world);
+    const transcript = mcpTestTranscript({
+      id: "mcp-v2-marker-only-projection",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 2,
+      session: null,
+      call: { actor: "$wiz", target: "the_chatroom", verb: "marker_only", args: [] },
+      observations: [],
+      hash: "mcp-v2-marker-only-projection"
+    });
+    const commit: ShadowCommitAccepted = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-marker-only-projection",
+      position: {
+        kind: "woo.scope_head.shadow.v1",
+        scope: "the_chatroom",
+        epoch: 1,
+        seq: 2,
+        hash: "h2"
+      },
+      transcript_hash: transcript.hash,
+      post_state_hash: "post",
+      observations: [],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: transcript.id,
+        route: transcript.route,
+        scope: transcript.scope,
+        seq: transcript.seq,
+        transcript_hash: transcript.hash,
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      },
+      projection_delta: {
+        projection_bytes: 0,
+        tool_surface_sources: [{
+          key: { table: "objects", authority_scope: "the_chatroom", key: "the_chatroom" },
+          op: "upsert",
+          bytes: 0
+        }]
+      },
+      projection_writes: []
+    };
+
+    gateway.acceptRemoteV2Commit("the_chatroom", commit, transcript);
+
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "gateway_projection_apply",
+      source: "fanout",
+      rows: 0,
+      projection_bytes: 0
+    }));
+    expect(metrics.some((event) => event.kind === "shadow_gateway_apply_step")).toBe(false);
+  });
+
+  it("rejects projection deltas that are missing required row bodies", () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-v2-incomplete-projection");
+    const gateway = new McpGateway(world);
+    const relay = createShadowBrowserRelayShim({
+      node: "mcp-v2-incomplete-projection-relay",
+      scope: "the_chatroom",
+      serialized: world.exportWorld()
+    });
+    relay.commit_scope.head = { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 2, hash: "h2" };
+    (gateway as unknown as { v2Scopes: Map<string, unknown> }).v2Scopes.set("the_chatroom", {
+      scope: "the_chatroom",
+      relay,
+      openedSessions: new Set()
+    });
+    const transcript = mcpTestTranscript({
+      id: "mcp-v2-incomplete-projection",
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq: 3,
+      session: session.id,
+      call: { actor: session.actor, target: "the_chatroom", verb: "incomplete_projection", args: [] },
+      writes: [{ cell: { kind: "prop", object: session.actor, name: "incomplete_probe" }, value: "should-not-apply", op: "set" }],
+      observations: [],
+      hash: "mcp-v2-incomplete-projection"
+    });
+    const commit: ShadowCommitAccepted = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-incomplete-projection",
+      position: {
+        kind: "woo.scope_head.shadow.v1",
+        scope: "the_chatroom",
+        epoch: 1,
+        seq: 3,
+        hash: "h3"
+      },
+      transcript_hash: transcript.hash,
+      post_state_hash: "post",
+      observations: [],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: transcript.id,
+        route: transcript.route,
+        scope: transcript.scope,
+        seq: transcript.seq,
+        transcript_hash: transcript.hash,
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      },
+      projection_delta: {
+        objects: [{ key: session.actor, op: "upsert", bytes: 100 }],
+        projection_bytes: 100
+      },
+      projection_writes: []
+    };
+
+    expect(() => gateway.acceptRemoteV2Commit("the_chatroom", commit, transcript)).toThrow(/projection_delta/);
+    expect(relay.commit_scope.head.seq).toBe(2);
+    expect(world.propOrNull(session.actor, "incomplete_probe")).toBeNull();
   });
 
   it("does not replay gateway-host writes after local v2 host write-through", () => {
@@ -1276,8 +1475,8 @@ describe("McpHost", () => {
     // Sanity: both snapshots see the actor in room A.
     const findActor = (objects: ReturnType<WooWorld["exportWorld"]>["objects"], id: ObjRef) =>
       objects.find((object) => object.id === id);
-    expect(findActor(v2Scopes.get("scope_room_a")!.relay.commit_scope.serialized.objects, session.actor)?.location).toBe("scope_room_a");
-    expect(findActor(v2Scopes.get("scope_room_b")!.relay.commit_scope.serialized.objects, session.actor)?.location).toBe("scope_room_a");
+    expect(findActor(serializedFor(v2Scopes.get("scope_room_a")!.relay.commit_scope).objects, session.actor)?.location).toBe("scope_room_a");
+    expect(findActor(serializedFor(v2Scopes.get("scope_room_b")!.relay.commit_scope).objects, session.actor)?.location).toBe("scope_room_a");
     const roomARelay = v2Scopes.get("scope_room_a")!.relay;
     const roomBRelay = v2Scopes.get("scope_room_b")!.relay;
     const roomBBrowser = createShadowBrowserNode({
@@ -1348,7 +1547,7 @@ describe("McpHost", () => {
 
     // The originating scope (room A) advanced head + applied writes — actor is
     // gone from its snapshot's room A contents and now at room B.
-    const roomASnapshot = roomARelay.commit_scope.serialized;
+    const roomASnapshot = serializedFor(roomARelay.commit_scope);
     expect(findActor(roomASnapshot.objects, session.actor)?.location).toBe("scope_room_b");
     expect(roomARelay.commit_scope.head.seq).toBe(1);
     expect(roomARelay.serialized_generation).toBe(roomAGenerationBefore + 1);
@@ -1356,7 +1555,7 @@ describe("McpHost", () => {
     // The OTHER cached scope (room B) also reflects the actor's new location
     // — without this propagation, the next call dispatched to scope B would
     // read actor.location=room A and reject the verb as "not present here".
-    const roomBSnapshot = roomBRelay.commit_scope.serialized;
+    const roomBSnapshot = serializedFor(roomBRelay.commit_scope);
     expect(findActor(roomBSnapshot.objects, session.actor)?.location).toBe("scope_room_b");
     // Room B's head is NOT advanced by another scope's commit — only writes
     // mirror across.
@@ -1374,11 +1573,11 @@ describe("McpHost", () => {
     expect(world.object(session.actor).location).toBe("scope_room_b");
   });
 
-  it("matches the serialized applier for write-only v2 accepted transcripts", () => {
+  it("applies write-only v2 accepted transcript cells through the gateway cache", () => {
     const world = bootstrapWorld();
     world.setProp("$system", "guest_initial_room", null);
     const session = world.auth("guest:mcp-v2-cache-write-only");
-    const beforeApply = world.exportWorld();
+    const objectCounterBefore = world.exportWorld().objectCounter;
     const transcript: EffectTranscript = {
       kind: "woo.effect_transcript.shadow.v1",
       id: "mcp-v2-cache-write-only",
@@ -1404,7 +1603,6 @@ describe("McpHost", () => {
       hash: "mcp-v2-cache-write-only"
     };
     const timestamp = Date.now() + 1_000;
-    const expected = applyShadowTranscriptToCommittedState(beforeApply, transcript, { objectTimestamp: timestamp });
 
     vi.useFakeTimers();
     try {
@@ -1415,10 +1613,11 @@ describe("McpHost", () => {
     }
 
     const after = world.exportWorld();
-    expect(after.objects).toEqual(expected.objects);
-    expect(after.sessions).toEqual(expected.sessions);
-    expect(after.logs).toEqual(expected.logs);
-    expect(after.objectCounter).toBe(expected.objectCounter);
+    expect(world.getProp(session.actor, "cache_probe")).toBe("write-only");
+    expect(world.object(session.actor).location).toBe("the_lobby");
+    expect([...world.object("the_chatroom").contents].sort()).toEqual(["$wiz", session.actor].sort());
+    expect(after.logs.find(([space]) => space === "the_chatroom")?.[1].filter((entry) => entry.seq === 4)).toHaveLength(1);
+    expect(after.objectCounter).toBe(objectCounterBefore);
   });
 
   it("applies v2 accepted transcripts without mutating the input serialized snapshot", () => {
@@ -1453,7 +1652,9 @@ describe("McpHost", () => {
       hash: "mcp-v2-copy-on-write"
     };
 
-    const afterApply = applyShadowTranscriptToCommittedState(beforeApply, transcript, { objectTimestamp: Date.now() + 1_000 });
+    const scope = createShadowCommitScope({ node: "scope:mcp-copy-on-write", scope: "the_chatroom", serialized: beforeApply });
+    applyShadowTranscriptToCommitScopeCache(scope, transcript, { objectTimestamp: Date.now() + 1_000 });
+    const afterApply = serializedFor(scope);
 
     expect(beforeApply).toEqual(beforeSnapshot);
     expect(afterApply).not.toEqual(beforeApply);
@@ -1488,6 +1689,196 @@ describe("McpHost", () => {
 
     expect(listChanged).toBe(1);
     expect(remoteEnumerations).toBe(0);
+  });
+
+  it("preserves a session-visible remote tool from the saved manifest when owner refresh fails", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-tool-manifest");
+    world.createObject({ id: "remote_widget", name: "Remote Widget", parent: "$thing", owner: "$wiz" });
+    world.setProp(session.actor, "focus_list", ["remote_widget"]);
+    const descriptor: RemoteToolDescriptor = {
+      object: "remote_widget",
+      verb: "ping",
+      aliases: [],
+      arg_spec: { args: [] },
+      direct: true,
+      source: "/* remote ping */",
+      enclosingSpace: "remote_widget"
+    };
+    const saved: SessionToolManifest[] = [];
+    world.setExecutorContext({
+      localHost: "home",
+      hostForObject: (id: ObjRef) => id === "remote_widget" ? "remote" : "home",
+      enumerateRemoteTools: async () => [descriptor]
+    } as unknown as ExecutorContext);
+    const host = new McpHost(world, {}, {
+      staleFallback: true,
+      saveSessionManifest: (manifest) => { saved[0] = manifest; },
+      loadSessionManifest: () => saved[0] ?? null
+    });
+    host.bindSession(session.id, session.actor);
+
+    const listed = await host.listTools(session.actor, { scope: "focus", sessionId: session.id });
+    expect(listed.tools.some((tool) => tool.object === "remote_widget" && tool.verb === "ping")).toBe(true);
+    await host.markToolListSeen(session.id, session.actor, listed.tools);
+    expect(saved[0]?.tools.some((tool) => tool.object === "remote_widget" && tool.verb === "ping")).toBe(true);
+
+    world.setExecutorContext({
+      localHost: "home",
+      hostForObject: (id: ObjRef) => id === "remote_widget" ? "remote" : "home",
+      enumerateRemoteTools: async () => { throw new Error("owner timeout"); }
+    } as unknown as ExecutorContext);
+    const rehydrated = new McpHost(world, {}, {
+      staleFallback: true,
+      loadSessionManifest: () => saved[0] ?? null,
+      saveSessionManifest: (manifest) => { saved[0] = manifest; }
+    });
+    rehydrated.bindSession(session.id, session.actor);
+
+    const fallbackList = await rehydrated.listTools(session.actor, { scope: "focus", sessionId: session.id });
+    expect(fallbackList.tools.some((tool) => tool.object === "remote_widget" && tool.verb === "ping")).toBe(true);
+    expect(saved[0]).toMatchObject({ stale: true, stale_reason: "owner_timeout" });
+    await expect(rehydrated.resolveReachableTool(session.actor, "remote_widget", "ping", session.id)).resolves.toMatchObject({
+      object: "remote_widget",
+      verb: "ping"
+    });
+  });
+
+  it("preserves expanded remote-content tools from the saved manifest when owner refresh fails", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-tool-manifest-expanded");
+    world.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
+    world.setProp(session.actor, "focus_list", ["remote_room"]);
+    const descriptor: RemoteToolDescriptor = {
+      object: "remote_child",
+      verb: "ping",
+      aliases: [],
+      arg_spec: { args: [] },
+      direct: true,
+      source: "/* remote child ping */",
+      enclosingSpace: "remote_room"
+    };
+    let saved: SessionToolManifest | null = null;
+    world.setExecutorContext({
+      localHost: "home",
+      hostForObject: (id: ObjRef) => id === "remote_room" || id === "remote_child" ? "remote" : "home",
+      enumerateRemoteTools: async (_actor: ObjRef, requests: Array<{ id: ObjRef; expandContents?: boolean }>) => (
+        requests.some((request) => request.id === "remote_room" && request.expandContents === true) ? [descriptor] : []
+      )
+    } as unknown as ExecutorContext);
+    const host = new McpHost(world, {}, {
+      staleFallback: true,
+      saveSessionManifest: (manifest) => { saved = manifest; },
+      loadSessionManifest: () => saved
+    });
+    host.bindSession(session.id, session.actor);
+
+    const listed = await host.listTools(session.actor, { scope: "space", object: "remote_room", sessionId: session.id });
+    expect(listed.tools.some((tool) => tool.object === "remote_child" && tool.verb === "ping")).toBe(true);
+    await host.markToolListSeen(session.id, session.actor, listed.tools);
+
+    world.setExecutorContext({
+      localHost: "home",
+      hostForObject: (id: ObjRef) => id === "remote_room" || id === "remote_child" ? "remote" : "home",
+      enumerateRemoteTools: async () => { throw new Error("owner timeout"); }
+    } as unknown as ExecutorContext);
+    const rehydrated = new McpHost(world, {}, {
+      staleFallback: true,
+      loadSessionManifest: () => saved,
+      saveSessionManifest: (manifest) => { saved = manifest; }
+    });
+    rehydrated.bindSession(session.id, session.actor);
+
+    const fallbackList = await rehydrated.listTools(session.actor, { scope: "space", object: "remote_room", sessionId: session.id });
+    expect(fallbackList.tools.some((tool) => tool.object === "remote_child" && tool.verb === "ping")).toBe(true);
+    expect(saved).toMatchObject({ stale: true, stale_reason: "owner_timeout" });
+  });
+
+  it("records method-resolution source rows for remote tool-surface invalidation", () => {
+    const world = bootstrapWorld();
+    world.createObject({ id: "source_parent", name: "Source Parent", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "source_mid", name: "Source Mid", parent: "source_parent", owner: "$wiz" });
+    world.createObject({ id: "source_child", name: "Source Child", parent: "source_mid", owner: "$wiz" });
+    expect(installVerb(world, "source_parent", "ping", `verb :ping() rxd { return "parent"; }`, null).ok).toBe(true);
+    const parentPing = world.ownVerb("source_parent", "ping");
+    if (!parentPing) throw new Error("expected parent ping");
+    parentPing.tool_exposed = true;
+    parentPing.direct_callable = true;
+    const host = new McpHost(world);
+
+    const inherited = host.enumerateLocalToolDescriptors("$wiz", [{ id: "source_child", projection: "tools" }])
+      .find((descriptor) => descriptor.object === "source_child" && descriptor.verb === "ping");
+    expect(inherited?.source_rows?.map((row) => row.key)).toEqual(["source_child", "source_mid", "source_parent"]);
+
+    expect(installVerb(world, "source_child", "ping", `verb :ping() rxd { return "child"; }`, null).ok).toBe(true);
+    const childPing = world.ownVerb("source_child", "ping");
+    if (!childPing) throw new Error("expected child ping");
+    childPing.tool_exposed = true;
+    childPing.direct_callable = true;
+    const overridden = host.enumerateLocalToolDescriptors("$wiz", [{ id: "source_child", projection: "tools" }])
+      .find((descriptor) => descriptor.object === "source_child" && descriptor.verb === "ping");
+    expect(overridden?.source_rows?.map((row) => row.key)).toEqual(["source_child"]);
+  });
+
+  it("records feature source rows for remote tool-surface invalidation", () => {
+    const world = bootstrapWorld();
+    world.createObject({ id: "source_feature", name: "Source Feature", parent: "$thing", owner: "$wiz" });
+    world.createObject({ id: "source_feature_user", name: "Source Feature User", parent: "$thing", owner: "$wiz" });
+    world.setProp("source_feature_user", "features", ["source_feature"]);
+    expect(installVerb(world, "source_feature", "spark", `verb :spark() rxd { return "spark"; }`, null).ok).toBe(true);
+    const featureSpark = world.ownVerb("source_feature", "spark");
+    if (!featureSpark) throw new Error("expected feature spark");
+    featureSpark.tool_exposed = true;
+    featureSpark.direct_callable = true;
+    const host = new McpHost(world);
+
+    const descriptor = host.enumerateLocalToolDescriptors("$wiz", [{ id: "source_feature_user", projection: "tools" }])
+      .find((candidate) => candidate.object === "source_feature_user" && candidate.verb === "spark");
+
+    expect(descriptor?.source_rows?.map((row) => row.key)).toEqual(["source_feature_user", "$thing", "$root", "$system", "source_feature"]);
+  });
+
+  it("does not serve saved session manifests when stale fallback is disabled", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-tool-manifest-disabled");
+    world.createObject({ id: "remote_widget_disabled", name: "Remote Widget Disabled", parent: "$thing", owner: "$wiz" });
+    world.setProp(session.actor, "focus_list", ["remote_widget_disabled"]);
+    const descriptor: RemoteToolDescriptor = {
+      object: "remote_widget_disabled",
+      verb: "ping",
+      aliases: [],
+      arg_spec: { args: [] },
+      direct: true,
+      source: "/* remote ping */",
+      enclosingSpace: "remote_widget_disabled"
+    };
+    let saved: SessionToolManifest | null = null;
+    world.setExecutorContext({
+      localHost: "home",
+      hostForObject: (id: ObjRef) => id === "remote_widget_disabled" ? "remote" : "home",
+      enumerateRemoteTools: async () => [descriptor]
+    } as unknown as ExecutorContext);
+    const host = new McpHost(world, {}, {
+      saveSessionManifest: (manifest) => { saved = manifest; },
+      loadSessionManifest: () => saved
+    });
+    host.bindSession(session.id, session.actor);
+    const listed = await host.listTools(session.actor, { scope: "focus", sessionId: session.id });
+    await host.markToolListSeen(session.id, session.actor, listed.tools);
+
+    world.setExecutorContext({
+      localHost: "home",
+      hostForObject: (id: ObjRef) => id === "remote_widget_disabled" ? "remote" : "home",
+      enumerateRemoteTools: async () => { throw new Error("owner timeout"); }
+    } as unknown as ExecutorContext);
+    const rehydrated = new McpHost(world, {}, {
+      loadSessionManifest: () => saved,
+      saveSessionManifest: (manifest) => { saved = manifest; }
+    });
+    rehydrated.bindSession(session.id, session.actor);
+
+    const fallbackList = await rehydrated.listTools(session.actor, { scope: "focus", sessionId: session.id });
+    expect(fallbackList.tools.some((tool) => tool.object === "remote_widget_disabled" && tool.verb === "ping")).toBe(false);
   });
 
   it("waits with timeout and returns more=true when queue overflows the limit", async () => {
