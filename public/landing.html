@@ -1212,15 +1212,15 @@
 
         window.carouselNav = function(dir) { goTo(current + dir, dir); };
 
-        carousel.addEventListener('keydown', function(e) {
-          if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            window.carouselNav(-1);
-          }
-          if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            window.carouselNav(1);
-          }
+        // Listen on document so arrow keys drive the carousel as soon as the
+        // page opens — no need to click an arrow first to focus the carousel.
+        // Skip when the user is typing in a field.
+        document.addEventListener('keydown', function(e) {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+          var t = e.target;
+          if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+          e.preventDefault();
+          window.carouselNav(e.key === 'ArrowRight' ? 1 : -1);
         });
 
         updateDots();
