@@ -804,11 +804,16 @@ their local tool-surface reverse index to evict stale descriptor cache rows.
 They must also apply those row-body-complete projection writes to their
 in-memory routing cache without persistence before queue fanout, because MCP
 delivery predicates read session active scopes, subscriber rows, and local
-reachability from that volatile `WooWorld`. If projection writes are absent,
-shards fall back to the legacy transcript/snapshot apply path for materialized
-rows, but may still consume marker-only tool-surface invalidations. This keeps
-co-present MCP sessions observable across shard boundaries without making any
-shard authoritative for durable world state.
+reachability from that volatile `WooWorld`. The exception is `sessions` rows:
+an MCP shard must persist accepted session projection writes in its local
+session table as the hibernation-resilient routing hint for `active_scope`.
+Object/log/tool projection ownership remains in the gateway projection cache;
+persisting the session row does not make the shard authoritative for object
+state. If projection writes are absent, shards fall back to the legacy
+transcript/snapshot apply path for materialized rows, but may still consume
+marker-only tool-surface invalidations. This keeps co-present MCP sessions
+observable across shard boundaries without making any shard authoritative for
+durable world state.
 
 `/v2/open` supports an opt-in checkpoint/tail protocol by request body
 negotiation: `open_protocol: "checkpoint_tail.v1"`, `known_head`, and bounded

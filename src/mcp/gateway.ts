@@ -17,7 +17,7 @@ import { serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice } from "../core/repository";
-import { projectionDeltaMissingWrites } from "../core/projection-delta";
+import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
 import {
@@ -231,6 +231,10 @@ export class McpGateway {
     }
 
     try {
+      // MCP sessions are long-lived HTTP sessions, not WebSockets. Keep the
+      // in-memory activity clock fresh on every protocol request so a warm
+      // gateway instance does not reap an active queue between durable turns.
+      this.world.touchSessionInput(entry.woo.id);
       const response = await entry.transport.handleRequest(withRequiredMcpAccept(request));
       const transportId = entry.transport.sessionId;
       if (transportId && !this.sessions.has(transportId)) {
@@ -356,7 +360,7 @@ export class McpGateway {
       // Apply the row-body-complete projection writes without persistence so
       // routing sees the accepted state while durable projection ownership
       // stays in the SQL cache and no transcript replay is reintroduced.
-      this.world.applyProjectionWrites(projectionWrites, { persist: false, transcript: entry.transcript });
+      this.applyGatewayProjectionWrites(projectionWrites, entry.transcript);
       this.world.recordMetric({
         kind: "gateway_projection_apply",
         scope: entry.commit.position.scope,
@@ -757,7 +761,7 @@ export class McpGateway {
     const projectionWrites = reply.commit.projection_writes ?? [];
     if (reply.commit.projection_delta) {
       assertProjectionWritesComplete(reply.commit.projection_delta, projectionWrites, reply.commit.position.scope, "mcp");
-      this.world.applyProjectionWrites(projectionWrites, { persist: false, transcript: reply.transcript });
+      this.applyGatewayProjectionWrites(projectionWrites, reply.transcript);
       this.world.recordMetric({
         kind: "gateway_projection_apply",
         scope: reply.commit.position.scope,
@@ -807,6 +811,20 @@ export class McpGateway {
 
   private v2NodeFor(entry: SessionEntry): string {
     return `mcp:${entry.woo.id}`;
+  }
+
+  private applyGatewayProjectionWrites(projectionWrites: readonly ProjectionWrite[], transcript: EffectTranscript): void {
+    const sessionWrites = projectionWrites.filter((write) => write.table === "sessions");
+    const volatileWrites = projectionWrites.filter((write) => write.table !== "sessions");
+    if (volatileWrites.length > 0) {
+      this.world.applyProjectionWrites(volatileWrites, { persist: false, transcript });
+    }
+    if (sessionWrites.length > 0) {
+      // Session activeScope is the durable routing hint for MCP queues after
+      // gateway hibernation. Persist only session rows; object/log projection
+      // rows remain SQL-cache-owned and volatile in WooWorld.
+      this.world.applyProjectionWrites(sessionWrites, { transcript });
+    }
   }
 
 }

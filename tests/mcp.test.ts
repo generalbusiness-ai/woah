@@ -4,6 +4,7 @@ import { createWorld } from "../src/core/bootstrap";
 import { McpHost, type McpTool } from "../src/mcp/host";
 import { McpGateway } from "../src/mcp/gateway";
 import { buildServerInstructions, createMcpServer } from "../src/mcp/server";
+import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import {
   createShadowBrowserNode,
@@ -1287,6 +1288,73 @@ describe("McpHost", () => {
       deliveries: 1
     }));
     expect(metrics.some((event) => event.kind === "shadow_gateway_apply_step")).toBe(false);
+  });
+
+  it("persists MCP session projection rows for gateway rehydrate routing", () => {
+    const repo = new LocalSQLiteRepository(":memory:");
+    try {
+      let world = createWorld({ repository: repo });
+      const session = world.auth("guest:mcp-v2-fanout-session-persist");
+      const gateway = new McpGateway(world, { externalProjectionFanout: true });
+      const sessionRow = structuredClone(world.exportSessions().find((row) => row.id === session.id)!);
+      sessionRow.activeScope = "the_deck";
+      const write: ProjectionWrite = {
+        table: "sessions",
+        key: session.id,
+        op: "upsert",
+        row: sessionRow,
+        bytes: 100
+      };
+      const transcript = mcpTestTranscript({
+        id: "mcp-v2-fanout-session-persist",
+        route: "sequenced",
+        scope: "the_chatroom",
+        seq: 3,
+        session: session.id,
+        call: { actor: session.actor, target: "the_chatroom", verb: "enter", args: [] },
+        observations: [],
+        hash: "mcp-v2-fanout-session-persist"
+      });
+      const commit: ShadowCommitAccepted = {
+        kind: "woo.commit.accepted.shadow.v1",
+        id: "mcp-v2-fanout-session-persist",
+        position: {
+          kind: "woo.scope_head.shadow.v1",
+          scope: "the_chatroom",
+          epoch: 1,
+          seq: 3,
+          hash: "h3"
+        },
+        transcript_hash: transcript.hash,
+        post_state_hash: "post",
+        observations: [],
+        receipt: {
+          kind: "woo.commit_receipt.shadow.v1",
+          id: transcript.id,
+          route: transcript.route,
+          scope: transcript.scope,
+          seq: transcript.seq,
+          transcript_hash: transcript.hash,
+          pre_state_hash: "pre",
+          post_state_hash: "post",
+          accepted: true,
+          errors: []
+        },
+        projection_delta: {
+          sessions: [{ key: session.id, op: "upsert", bytes: write.bytes }],
+          projection_bytes: write.bytes
+        },
+        projection_writes: [write]
+      };
+
+      gateway.acceptRemoteV2Commit("the_chatroom", commit, transcript, null);
+      expect(world.activeScopeForSession(session.id)).toBe("the_deck");
+
+      world = createWorld({ repository: repo });
+      expect(world.activeScopeForSession(session.id)).toBe("the_deck");
+    } finally {
+      repo.close();
+    }
   });
 
   it("does not compatibility-apply marker-only projection deltas", () => {
