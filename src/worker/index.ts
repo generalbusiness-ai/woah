@@ -46,7 +46,8 @@ export default {
     request = sanitizePublicHeaders(request);
 
     if (url.hostname.toLowerCase() === LANDING_HOST) {
-      return handleLandingHost(request, env, url);
+      const landingResponse = handleLandingHost(request, env, url);
+      if (landingResponse) return landingResponse;
     }
 
     if (url.pathname.startsWith("/__internal/")) {
@@ -124,7 +125,7 @@ export default {
   }
 };
 
-function handleLandingHost(request: Request, env: Env, url: URL): Response | Promise<Response> {
+function handleLandingHost(request: Request, env: Env, url: URL): Response | Promise<Response> | null {
   if (isLandingPageRequest(request, url)) {
     if (!env.ASSETS) return missingAssetsResponse();
     const assetUrl = new URL(request.url);
@@ -137,6 +138,11 @@ function handleLandingHost(request: Request, env: Env, url: URL): Response | Pro
     if (!env.ASSETS) return missingAssetsResponse();
     return env.ASSETS.fetch(request);
   }
+
+  // Protocol clients, especially WebSocket upgrades, cannot safely follow the
+  // landing-host redirect. Let API and internal-control paths use normal Worker
+  // routing on this same hostname.
+  if (isLandingHostPassthroughPath(url.pathname)) return null;
 
   const target = new URL(request.url);
   target.hostname = WORLD_PUBLIC_HOST;
@@ -152,6 +158,10 @@ function isLandingPageRequest(request: Request, url: URL): boolean {
 
 function isLandingAssetPath(pathname: string): boolean {
   return pathname === "/woah-og.png" || pathname === "/woah-og.svg" || pathname.startsWith("/icons/");
+}
+
+function isLandingHostPassthroughPath(pathname: string): boolean {
+  return isApiPath(pathname) || pathname.startsWith("/__internal/");
 }
 
 function missingAssetsResponse(): Response {

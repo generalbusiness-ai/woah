@@ -789,17 +789,30 @@ describe("v2 Worker fan-out helpers", () => {
     await expect(response.text()).resolves.toBe("asset:/ws");
   });
 
-  it("serves the marketing homepage on woah and redirects world routes to woah1", async () => {
+  it("serves the marketing homepage on woah while protocol routes bypass the redirect", async () => {
+    const forwarded: Array<{ host: string; method: string; path: string; upgrade: string | null }> = [];
     const env = {
       ASSETS: {
         fetch: async (request: Request) => new Response(`asset:${new URL(request.url).pathname}`)
       },
       WOO: new FakeDurableObjectNamespace((name) => {
-        throw new Error(`landing host should not route to Woo DO ${name}`);
+        return {
+          fetch: async (request: Request) => {
+            const url = new URL(request.url);
+            forwarded.push({
+              host: name,
+              method: request.method,
+              path: url.pathname,
+              upgrade: request.headers.get("upgrade")
+            });
+            return new Response(`woo:${name}:${url.pathname}`, { status: 418 });
+          }
+        };
       }),
       DIRECTORY: new FakeDurableObjectNamespace((name) => {
         throw new Error(`landing host should not route to Directory DO ${name}`);
-      })
+      }),
+      WOO_INTERNAL_SECRET: "cf-test-secret"
     } as unknown as Env;
 
     const landing = await worker.fetch(new Request("https://woah.generalbusiness.ai/"), env, {});
@@ -814,9 +827,26 @@ describe("v2 Worker fan-out helpers", () => {
     expect(icon.status).toBe(200);
     await expect(icon.text()).resolves.toBe("asset:/icons/favicon.svg");
 
-    const redirected = await worker.fetch(new Request("https://woah.generalbusiness.ai/mcp", { method: "POST" }), env, {});
+    const mcp = await worker.fetch(new Request("https://woah.generalbusiness.ai/mcp", { method: "POST" }), env, {});
+    expect(mcp.status).toBe(418);
+    expect(await mcp.text()).toBe("woo:world:/mcp");
+
+    const ws = await worker.fetch(new Request("https://woah.generalbusiness.ai/v2/turn-network/ws", {
+      headers: { upgrade: "websocket" }
+    }), env, {});
+    expect(ws.status).toBe(418);
+    expect(await ws.text()).toBe("woo:world:/v2/turn-network/ws");
+
+    const blockedInternal = await worker.fetch(new Request("https://woah.generalbusiness.ai/__internal/probe"), env, {});
+    expect(blockedInternal.status).toBe(401);
+
+    const redirected = await worker.fetch(new Request("https://woah.generalbusiness.ai/some-world-route"), env, {});
     expect(redirected.status).toBe(308);
-    expect(redirected.headers.get("location")).toBe("https://woah1.generalbusiness.ai/mcp");
+    expect(redirected.headers.get("location")).toBe("https://woah1.generalbusiness.ai/some-world-route");
+    expect(forwarded).toEqual([
+      { host: "world", method: "POST", path: "/mcp", upgrade: null },
+      { host: "world", method: "GET", path: "/v2/turn-network/ws", upgrade: "websocket" }
+    ]);
 
     const appShell = await worker.fetch(new Request("https://woah1.generalbusiness.ai/"), env, {});
     expect(appShell.status).toBe(200);
