@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 RUNS="${RUNS:-1}"
-BASE_URL="${WOO_SMOKE_BASE_URL:-https://woah.generalbusiness.ai}"
+BASE_URL="${WOO_SMOKE_BASE_URL:-https://woah1.generalbusiness.ai}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM}"
 OUT_DIR="${OUT_DIR:-.woo/smoke-measurements/$RUN_ID}"
 TAIL_LOG="${TAIL_LOG:-$OUT_DIR/tail.log}"

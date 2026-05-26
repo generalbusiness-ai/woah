@@ -23,6 +23,8 @@ const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
 const MCP_SESSION_HEADER = "mcp-session-id";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
+const LANDING_HOST = "woah.generalbusiness.ai";
+const WORLD_PUBLIC_HOST = "woah1.generalbusiness.ai";
 
 function isApiPath(pathname: string): boolean {
   return (
@@ -42,6 +44,10 @@ export default {
     // Strip any x-woo-internal-* / x-woo-host-key the public client tried to
     // inject; those headers are reserved for trusted gateway → DO forwarding.
     request = sanitizePublicHeaders(request);
+
+    if (url.hostname.toLowerCase() === LANDING_HOST) {
+      return handleLandingHost(request, env, url);
+    }
 
     if (url.pathname.startsWith("/__internal/")) {
       return jsonResponse({ error: wooError("E_NOSESSION", "internal routes require a signed internal request") }, 401);
@@ -117,6 +123,40 @@ export default {
     );
   }
 };
+
+function handleLandingHost(request: Request, env: Env, url: URL): Response | Promise<Response> {
+  if (isLandingPageRequest(request, url)) {
+    if (!env.ASSETS) return missingAssetsResponse();
+    const assetUrl = new URL(request.url);
+    assetUrl.pathname = "/landing.html";
+    assetUrl.search = "";
+    return env.ASSETS.fetch(new Request(assetUrl, request));
+  }
+
+  if (isLandingAssetPath(url.pathname)) {
+    if (!env.ASSETS) return missingAssetsResponse();
+    return env.ASSETS.fetch(request);
+  }
+
+  const target = new URL(request.url);
+  target.hostname = WORLD_PUBLIC_HOST;
+  return Response.redirect(target.toString(), 308);
+}
+
+function isLandingPageRequest(request: Request, url: URL): boolean {
+  return (request.method === "GET" || request.method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html");
+}
+
+function isLandingAssetPath(pathname: string): boolean {
+  return pathname === "/woah-og.png" || pathname === "/woah-og.svg" || pathname.startsWith("/icons/");
+}
+
+function missingAssetsResponse(): Response {
+  return new Response(
+    JSON.stringify({ error: { code: "E_NO_ASSETS", message: "no SPA bundle deployed; run `npm run build` before `wrangler deploy`" } }),
+    { status: 503, headers: { "content-type": "application/json; charset=utf-8" } }
+  );
+}
 
 async function resolveHostForObjectRoute(
   env: Env,
@@ -467,4 +507,3 @@ function errorResponseFor(err: unknown): Response {
   })();
   return jsonResponse({ error }, status);
 }
-

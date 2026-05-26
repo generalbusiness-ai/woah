@@ -29,12 +29,14 @@ Connect external data with interactive "blocks" and "plugs".
 Early availability and testing. Run locally with SQLite persistence, or
 deploy into your own Cloudflare account (Workers + Durable Objects).
 
-Online: https://woah.generalbusiness.ai/
+Homepage: https://woah.generalbusiness.ai/
+
+Production world: https://woah1.generalbusiness.ai/
 
 ## Connect an Agent (MCP)
 
 The world exposes an MCP server at `/mcp` (streamable HTTP). Point any MCP
-client at `https://woah.generalbusiness.ai/mcp` with header
+client at `https://woah1.generalbusiness.ai/mcp` with header
 `mcp-token: guest:<name>` (or a wizard token). Reachable tools follow the
 actor's location and focus list; `woo_list_reachable_tools` returns the
 current set, and `woo_call(object, verb, args)` is the stable fallback

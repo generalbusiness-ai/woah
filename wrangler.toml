@@ -12,7 +12,8 @@ compatibility_flags = ["nodejs_compat"]
 # `routes` are declared.
 workers_dev = true
 routes = [
-  { pattern = "woah.generalbusiness.ai", custom_domain = true }
+  { pattern = "woah.generalbusiness.ai", custom_domain = true },
+  { pattern = "woah1.generalbusiness.ai", custom_domain = true }
 ]
 
 [observability]
@@ -26,7 +27,7 @@ head_sampling_rate = 1.0
 # existing deploy does not remove already-installed catalogs.
 #
 # The shipped default is the full demo bundle so that a fresh fork-and-
-# deploy lands a populated world matching woah.generalbusiness.ai. For
+# deploy lands a populated world matching woah1.generalbusiness.ai. For
 # faster first-light on operator deployments that don't want the demo
 # content, use the foundational-only subset — classes only, no bundled
 # instances; first-light cost drops from a few seconds to tens of ms:

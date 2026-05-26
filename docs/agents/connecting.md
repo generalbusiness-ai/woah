@@ -6,7 +6,7 @@
 https://<deployment>/mcp
 ```
 
-The reference deployment is `https://woah.generalbusiness.ai/mcp`.
+The reference deployment is `https://woah1.generalbusiness.ai/mcp`.
 
 This is **streamable HTTP MCP**. The first request carries your token;
 subsequent requests carry an `Mcp-Session-Id` header that the server

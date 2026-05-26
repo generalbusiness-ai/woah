@@ -788,6 +788,36 @@ describe("v2 Worker fan-out helpers", () => {
     expect(response.status).toBe(404);
     await expect(response.text()).resolves.toBe("asset:/ws");
   });
+
+  it("serves the marketing homepage on woah and redirects world routes to woah1", async () => {
+    const env = {
+      ASSETS: {
+        fetch: async (request: Request) => new Response(`asset:${new URL(request.url).pathname}`)
+      },
+      WOO: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`landing host should not route to Woo DO ${name}`);
+      }),
+      DIRECTORY: new FakeDurableObjectNamespace((name) => {
+        throw new Error(`landing host should not route to Directory DO ${name}`);
+      })
+    } as unknown as Env;
+
+    const landing = await worker.fetch(new Request("https://woah.generalbusiness.ai/"), env, {});
+    expect(landing.status).toBe(200);
+    await expect(landing.text()).resolves.toBe("asset:/landing.html");
+
+    const icon = await worker.fetch(new Request("https://woah.generalbusiness.ai/icons/favicon.svg"), env, {});
+    expect(icon.status).toBe(200);
+    await expect(icon.text()).resolves.toBe("asset:/icons/favicon.svg");
+
+    const redirected = await worker.fetch(new Request("https://woah.generalbusiness.ai/mcp", { method: "POST" }), env, {});
+    expect(redirected.status).toBe(308);
+    expect(redirected.headers.get("location")).toBe("https://woah1.generalbusiness.ai/mcp");
+
+    const appShell = await worker.fetch(new Request("https://woah1.generalbusiness.ai/"), env, {});
+    expect(appShell.status).toBe(200);
+    await expect(appShell.text()).resolves.toBe("asset:/");
+  });
 });
 
 function v2SocketAttachment(sessionId: string, actor: ObjRef, node: string, scope: ObjRef): Record<string, unknown> {

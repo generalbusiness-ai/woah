@@ -30,7 +30,7 @@ SKIP_POSTFLIGHT=0
 SKIP_SMOKE=0
 DRY_RUN=0
 EXPECTED_BRANCH="main"
-WORKER_URL="${WOO_WORKER_URL:-https://woah.generalbusiness.ai}"
+WORKER_URL="${WOO_WORKER_URL:-https://woah1.generalbusiness.ai}"
 POSTFLIGHT_TIMEOUT="${WOO_POSTFLIGHT_TIMEOUT:-45}"
 # --no-install forces resolution to the project-local wrangler pinned in
 # package.json/package-lock.json. Without it, npx silently downloads whatever

@@ -10,7 +10,7 @@
 //   npm run smoke:walkthrough -- [--base=<url>] [--run-id=<id>] [--verbose]
 //
 // Defaults:
-//   --base    https://woah.generalbusiness.ai
+//   --base    https://woah1.generalbusiness.ai
 //   --run-id  <timestamp>-<rand>
 //
 // Exit status: 0 if every step passes, 1 if any step fails. The script keeps
@@ -583,7 +583,7 @@ function isRecord(value: unknown): value is Record<string, any> {
 }
 
 function parseArgs(argv: string[]): { base: string; runId: string; verbose: boolean } {
-  let base = process.env.WOO_SMOKE_BASE_URL ?? "https://woah.generalbusiness.ai";
+  let base = process.env.WOO_SMOKE_BASE_URL ?? "https://woah1.generalbusiness.ai";
   let runId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
   let verbose = false;
   for (const arg of argv) {
