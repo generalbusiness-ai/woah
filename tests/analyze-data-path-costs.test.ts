@@ -44,6 +44,18 @@ describe("analyze-data-path-costs", () => {
     expect(result.stdout).toContain("| commit_reply_replay | 1 | idempotency |");
   });
 
+  it("classifies sampled browser metric logs as instrumentation volume", () => {
+    const result = runAnalyzer({
+      kind: "browser_metrics_log_sampled",
+      suppressed: 12,
+      ms_window: 1000,
+      host_key: "mcp-gateway-1"
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("| browser_metrics_log_sampled | 1 | browser_projection |");
+  });
+
   it("counts gateway projection cache bytes in projection-byte rollups", () => {
     const result = runAnalyzer({
       kind: "gateway_projection_cache_write",
