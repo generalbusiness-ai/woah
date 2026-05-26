@@ -114,8 +114,11 @@ function createHostSeedKvHarness() {
   const wooNamespace = new FakeDurableObjectNamespace((name) => {
     let object = wooObjects.get(name);
     if (!object) {
-      const state = new WaitUntilDurableObjectState(name);
-      wooStates.set(name, state);
+      let state = wooStates.get(name);
+      if (!state) {
+        state = new WaitUntilDurableObjectState(name);
+        wooStates.set(name, state);
+      }
       object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
       wooObjects.set(name, object);
     }
@@ -194,7 +197,15 @@ function createHostSeedKvHarness() {
     for (const state of wooStates.values()) state.close();
   };
 
-  return { env, kv, wooNamespace, wooObjects, hostSeedFetches, mcpGatewayWorldFetches, drain, publishHostSeed, publishMcpGatewayWorld, close };
+  const reloadHost = (name: string): PersistentObjectDO => {
+    const state = wooStates.get(name);
+    if (!state) throw new Error(`host ${name} has no durable state to reload`);
+    const object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+    wooObjects.set(name, object);
+    return object;
+  };
+
+  return { env, kv, wooNamespace, wooObjects, hostSeedFetches, mcpGatewayWorldFetches, drain, publishHostSeed, publishMcpGatewayWorld, reloadHost, close };
 }
 
 describe("v2 Worker fan-out helpers", () => {
@@ -3790,6 +3801,32 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(metricEvents(logSpy, "kv_catalog_reservoir_build")).toEqual([
         expect.objectContaining({ status: "ok", verbs: expect.any(Number) })
       ]);
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("does not full-save a KV-seeded satellite on a quiescent second cold-load", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const loadHost = async (): Promise<void> => {
+      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+      expect(healthz.ok).toBe(true);
+    };
+    try {
+      await harness.publishHostSeed("the_chatroom");
+      await loadHost();
+
+      logSpy.mockClear();
+      harness.reloadHost("the_chatroom");
+      await loadHost();
+
+      expect(metricEvents(logSpy, "storage_full_save")).toEqual([]);
+      expect(metricEvents(logSpy, "host_schema_sync")).toEqual([]);
+      expect(metricEvents(logSpy, "storage_direct_write")).toEqual([]);
     } finally {
       logSpy.mockRestore();
       harness.close();

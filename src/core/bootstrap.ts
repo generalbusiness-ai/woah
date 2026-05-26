@@ -787,6 +787,20 @@ function arraysShallowEqualStrings(a: readonly string[], b: readonly string[]): 
   return true;
 }
 
+function eventSchemasEqualIgnoringOrder(
+  a: readonly [string, Record<string, WooValue>][],
+  b: readonly [string, Record<string, WooValue>][]
+): boolean {
+  if (a.length !== b.length) return false;
+  const byName = new Map(a);
+  if (byName.size !== a.length) return false;
+  for (const [name, schema] of b) {
+    const current = byName.get(name);
+    if (!current || !valuesEqual(current as unknown as WooValue, schema as unknown as WooValue)) return false;
+  }
+  return true;
+}
+
 /** Compare two propertyDef rows on the authoritative fields only.
  * Excludes `version`, which is a per-host bump counter that accumulates on
  * every defineProperty() call (idempotent or not) and drifts independently
@@ -856,7 +870,11 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
     changed = true;
     note(`verbs[${verbsReason}]`);
   }
-  if (!valuesEqual(current.eventSchemas as unknown as WooValue, seed.eventSchemas as unknown as WooValue)) {
+  // CFObjectRepository reloads event_schema rows ordered by type, while bundled
+  // catalog seeds preserve manifest order. The schema set is authoritative, not
+  // the row order; comparing arrays positionally caused a full satellite
+  // snapshot on every otherwise-clean cold load.
+  if (!eventSchemasEqualIgnoringOrder(current.eventSchemas, seed.eventSchemas)) {
     current.eventSchemas = cloneSerialized(seed.eventSchemas);
     changed = true;
     note("eventSchemas");

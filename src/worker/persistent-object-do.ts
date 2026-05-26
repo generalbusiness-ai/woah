@@ -1705,7 +1705,12 @@ export class PersistentObjectDO {
     if (!scoped) scoped = freshSeed;
     if (!scoped) throw wooError("E_OBJNF", `no host-scoped seed for ${hostKey}`, hostKey);
     const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook, persist: stored === null });
-    runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: stored === null });
+    // A successful seed fetch is the gateway-authoritative schema repair for
+    // foreign-hosted catalog support rows. Running host schema repair on those
+    // rows after the merge re-adds local-only catalog fields that the
+    // post-lifecycle seed merge then deletes, causing a full snapshot on every
+    // satellite wake. Host-owned data migrations still run below.
+    runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: freshSeed !== null });
     if (freshSeed) {
       const exported = world.exportWorld();
       const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed, hostKey);

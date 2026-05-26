@@ -216,7 +216,13 @@ Cold-load runs the merge, then `runHostScopedLocalCatalogLifecycle`
 (which may further mutate receiver-hosted instance data), then
 re-merges with the same seed. HS2.1's skip preserves the lifecycle's
 receiver-hosted writes; HS2.2 keeps gateway-authoritative state
-current.
+current. When the cold-load did fetch a fresh gateway seed, host-scoped
+catalog schema repair MUST treat that seed as the authoritative repair
+for foreign-hosted catalog support rows and avoid rewriting those rows
+locally. Host-owned data migrations still run. Otherwise a schema
+repair can add local-only foreign-row fields that the post-lifecycle
+re-merge immediately deletes, forcing a full snapshot on every
+quiescent wake.
 
 Live refresh (wizard-triggered, see
 [../reference/cloudflare.md §R9.1](../reference/cloudflare.md#r91-first-request-path))
