@@ -147,6 +147,46 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("returns browser-profile frame transfers without authority object bodies", async () => {
+    const state = new FakeDurableObjectState("scope-a");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+    const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;
+    const write: ProjectionWrite = {
+      table: "objects",
+      key: "the_chatroom",
+      op: "upsert",
+      row: objectRow,
+      bytes: 101
+    };
+    const frame = accepted("scope-a", 1, [write]);
+    seedScopeRows(state, "scope-a", head("scope-a", 1), { objects: [objectRow], frames: [frame] });
+
+    try {
+      const response = await target.fetch(await checkpointOpenRequest("scope-a", {
+        known_head: head("scope-a", 0),
+        receiver_profile: "browser"
+      }));
+      expect(response.ok).toBe(true);
+      const body = await response.json() as Record<string, any>;
+      const browserWrite = body.transfer.frames[0].projection_writes[0];
+      expect(browserWrite).toMatchObject({
+        table: "objects",
+        key: "the_chatroom",
+        op: "upsert",
+        row: {
+          kind: "woo.browser_object_row.v1",
+          id: "the_chatroom",
+          display: { id: "the_chatroom", name: expect.any(String) }
+        }
+      });
+      expect(browserWrite.row.properties).toBeUndefined();
+      expect(browserWrite.row.verbs).toBeUndefined();
+      expect(browserWrite.row.propertyDefs).toBeUndefined();
+    } finally {
+      state.close();
+    }
+  });
+
   it("persists side-channel projection writes without waiting for the next full save", () => {
     const state = new FakeDurableObjectState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET }) as unknown as {
@@ -223,6 +263,32 @@ describe("CommitScopeDO checkpoint/tail open", () => {
         }
       });
       expect(body.transfer.checkpoint.frame_tail.map((item: ShadowCommitAccepted) => item.position.seq)).toEqual([1]);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("returns browser-profile checkpoint pages without authority object bodies", async () => {
+    const state = new WaitUntilState("scope-a");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+    const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;
+    seedScopeRows(state, "scope-a", head("scope-a", 1), { objects: [objectRow], frames: [accepted("scope-a", 1)] });
+
+    try {
+      const pending = await target.fetch(await checkpointOpenRequest("scope-a", { receiver_profile: "browser" }));
+      expect(pending.status).toBe(425);
+      await state.drainWaitUntil();
+
+      const response = await target.fetch(await checkpointOpenRequest("scope-a", { receiver_profile: "browser" }));
+      expect(response.ok).toBe(true);
+      const body = await response.json() as Record<string, any>;
+      const objectPage = body.transfer.checkpoint.pages.find((page: any) => page.table === "objects");
+      expect(objectPage.rows[0]).toMatchObject({
+        kind: "woo.browser_object_row.v1",
+        id: "the_chatroom"
+      });
+      expect(objectPage.rows[0].properties).toBeUndefined();
+      expect(body.transfer.checkpoint.pages.some((page: any) => page.table === "snapshots" || page.table === "parked_tasks")).toBe(false);
     } finally {
       state.close();
     }

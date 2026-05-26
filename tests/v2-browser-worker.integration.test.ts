@@ -13,6 +13,7 @@ import {
 } from "../src/core/shadow-browser-node";
 import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
+import type { BrowserObjectRow, BrowserProfile, ProjectionWrite } from "../src/core/projection-delta";
 import { createShadowCommitScope, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
 
 describe("v2 browser worker integration", () => {
@@ -246,6 +247,128 @@ describe("v2 browser worker integration", () => {
     });
   });
 
+  it("does not satisfy local TurnKey reads from browser-profile projection rows", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-projection-boundary");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-projection-boundary",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-projection-boundary",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-projection-boundary"
+    });
+    const head = relay.commit_scope.head;
+    const browserRow: BrowserObjectRow = {
+      kind: "woo.browser_object_row.v1",
+      id: "the_dubspace",
+      scope: "the_dubspace",
+      head,
+      name: "Display Only Dubspace",
+      display: {
+        id: "the_dubspace",
+        name: "Display Only Dubspace",
+        props: { description: "browser-safe display row" }
+      },
+      contents: []
+    };
+    const checkpointTail = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: {
+        kind: "checkpoint",
+        checkpoint: {
+          kind: "woo.scope_checkpoint.v1",
+          scope: "the_dubspace",
+          head,
+          checkpoint_hash: "projection-boundary-checkpoint",
+          pages: [{
+            kind: "woo.projection_page.v1",
+            table: "objects",
+            page: "objects",
+            hash: "projection-boundary-objects",
+            rows: [browserRow]
+          }],
+          frame_tail: []
+        }
+      },
+      viewer: { actor: session.actor, session: session.id }
+    };
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-projection-boundary",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-projection-boundary", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "projection-boundary-open", "woo.open.checkpoint_tail.v1", checkpointTail)));
+
+    expect(await waitForMessage(posted, (message) => isCheckpointTailOpenStatus(message))).toMatchObject({
+      status: {
+        connected: true,
+        projections: 1,
+        projection_rows: 1,
+        execution_transfers: 0,
+        local_execution_ready: false
+      }
+    });
+
+    const sentCursor = socket.sent.length;
+    scope.dispatch({
+      kind: "call",
+      id: "projection-row-boundary",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.44],
+      persistence: "durable"
+    });
+
+    expect(await waitForMessage(posted, (message) => browserMetric(message)?.phase === "local_turn_execution_cache" && browserMetric(message)?.path === "set_control")).toMatchObject({
+      metric: {
+        phase: "local_turn_execution_cache",
+        records: 0,
+        count: 0
+      }
+    });
+    expect(await waitForMessage(posted, (message) => browserMetric(message)?.phase === "local_turn_plan" && browserMetric(message)?.path === "set_control")).toMatchObject({
+      metric: {
+        phase: "local_turn_plan",
+        reason: "no_executable_state"
+      }
+    });
+    expect(await waitForMessage(posted, (message) => isLocalTurnFallback(message, "projection-row-boundary"))).toMatchObject({
+      kind: "local_turn_fallback",
+      id: "projection-row-boundary"
+    });
+    await sleep(20);
+    const sentTypes = socket.sent.slice(sentCursor).map((encoded) => decodeEnvelope(encoded).type);
+    expect(sentTypes).not.toContain("woo.turn.exec.request.shadow.v1");
+  });
+
   it("accumulates checkpoint continuation pages before marking checkpoint/tail open ready", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -414,6 +537,94 @@ describe("v2 browser worker integration", () => {
     await waitFor(() => statusCount() > 0);
     expect(posted.filter((message) => isKind(message, "applied_frame"))).toHaveLength(0);
     await sleep(100);
+  });
+
+  it("installs browser-profile accepted projection writes from direct replies", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-browser-profile");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-browser-profile",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-browser-profile",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-browser-profile"
+    });
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-browser-profile",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-browser-profile", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+
+    const accepted = syntheticAccepted("the_dubspace", 1);
+    const row: BrowserObjectRow = {
+      kind: "woo.browser_object_row.v1",
+      id: "the_dubspace",
+      scope: "the_dubspace",
+      head: accepted.position,
+      name: "Browser Dubspace",
+      display: {
+        id: "the_dubspace",
+        name: "Browser Dubspace",
+        props: { description: "browser-safe projection" }
+      },
+      contents: []
+    };
+    const writes: ProjectionWrite<BrowserProfile>[] = [{
+      table: "objects",
+      key: "the_dubspace",
+      op: "upsert",
+      row,
+      bytes: 10
+    }];
+    const transcript = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, 1);
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "accepted-browser-profile", "woo.turn.exec.reply.shadow.v1", {
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true,
+      id: transcript.id,
+      outcome: { result: null },
+      transcript,
+      commit: {
+        ...accepted,
+        projection_delta: { objects: [{ key: "the_dubspace", op: "upsert", bytes: 10 }], projection_bytes: 10 },
+        projection_writes: writes
+      } as unknown as ShadowCommitAccepted
+    })));
+
+    expect(await waitForMessage(posted, (message) => isKind(message, "projection"))).toMatchObject({
+      kind: "projection",
+      scope: "the_dubspace",
+      projection: {
+        kind: "woo.scope_projection.shadow.v1",
+        title: "Browser Dubspace",
+        subject: {
+          id: "the_dubspace",
+          props: { description: "browser-safe projection" }
+        }
+      }
+    });
   });
 
   it("reads cached state pages for execution cache in one IndexedDB transaction", async () => {
@@ -1104,6 +1315,10 @@ function isKind(message: unknown, kind: string): boolean {
 
 function isLocalTurnDelegated(message: unknown, id: string): boolean {
   return isKind(message, "local_turn_delegated") && (message as { id?: unknown }).id === id;
+}
+
+function isLocalTurnFallback(message: unknown, id: string): boolean {
+  return isKind(message, "local_turn_fallback") && (message as { id?: unknown }).id === id;
 }
 
 function isLocalTurnPlanned(message: unknown, id: string): boolean {

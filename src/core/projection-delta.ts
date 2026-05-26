@@ -1,13 +1,17 @@
 import type { EffectTranscript } from "./effect-transcript";
-import type { ParkedTaskRecord, SerializedObject, SerializedSession, SpaceSnapshotRecord } from "./repository";
+import type { ParkedTaskRecord, SerializedObject, SerializedSession, SerializedWorld, SpaceSnapshotRecord } from "./repository";
+import { stableShadowJson } from "./shadow-cell-version";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "./shadow-commit-scope";
-import type { ObjRef, RemoteToolDescriptor, SpaceLogEntry, WooValue } from "./types";
+import { hashSource } from "./source-hash";
+import { cloneValue, type ObjRef, type Observation, type PropertyDef, type RemoteToolDescriptor, type SpaceLogEntry, type WooValue } from "./types";
 
 export type CounterKey = "objectCounter" | "sessionCounter" | "parkedTaskCounter";
 
 export type RowOp<Key> = {
   key: Key;
   op: "upsert" | "delete";
+  // Kept during the data-path measurement rollout. Receiver-specific transfer
+  // byte totals live on profiled rows, while the summary remains key/op common.
   bytes: number;
 };
 
@@ -68,39 +72,124 @@ export type ProjectionDeltaSummary = {
   projection_bytes: number;
 };
 
-export type ProjectionWrite =
-  | { table: "objects"; key: ObjRef; op: "upsert"; row: SerializedObject; bytes: number }
-  | { table: "objects"; key: ObjRef; op: "delete"; bytes: 0 }
-  | { table: "sessions"; key: string; op: "upsert"; row: SerializedSession; bytes: number }
-  | { table: "sessions"; key: string; op: "delete"; bytes: 0 }
-  | { table: "logs"; key: { space: ObjRef; seq: number }; op: "upsert"; row: SpaceLogEntry; bytes: number }
-  | { table: "logs"; key: { space: ObjRef; seq: number }; op: "delete"; bytes: 0 }
-  | { table: "snapshots"; key: { space: ObjRef; seq: number }; op: "upsert"; row: SpaceSnapshotRecord; bytes: number }
-  | { table: "snapshots"; key: { space: ObjRef; seq: number }; op: "delete"; bytes: 0 }
-  | { table: "parked_tasks"; key: string; op: "upsert"; row: ParkedTaskRecord; bytes: number }
-  | { table: "parked_tasks"; key: string; op: "delete"; bytes: 0 }
-  | { table: "counters"; key: CounterKey; op: "upsert"; value: number; bytes: number }
-  | { table: "tombstones"; key: ObjRef; op: "upsert"; row: { id: ObjRef }; bytes: number }
-  | { table: "tombstones"; key: ObjRef; op: "delete"; bytes: 0 }
-  | { table: "tool_surfaces"; key: { scope: ObjRef; object: ObjRef }; op: "upsert"; row: ToolSurfaceProjectionRow; bytes: number }
-  | { table: "tool_surfaces"; key: { scope: ObjRef; object: ObjRef }; op: "delete"; bytes: 0 };
-
-export type AcceptedFrameTransfer = {
-  frame: ShadowCommitAccepted;
-  projection_writes: ProjectionWrite[];
+export type ProjectionProfile = {
+  objects: unknown;
+  sessions: unknown;
+  logs: unknown;
+  snapshots: unknown;
+  parked_tasks: unknown;
+  counters: unknown;
+  tombstones: unknown;
+  tool_surfaces: unknown;
 };
 
-export type OpenTransfer =
+export type AuthorityProfile = {
+  objects: SerializedObject;
+  sessions: SerializedSession;
+  logs: SpaceLogEntry;
+  snapshots: SpaceSnapshotRecord;
+  parked_tasks: ParkedTaskRecord;
+  counters: { value: number };
+  tombstones: { id: ObjRef };
+  tool_surfaces: ToolSurfaceProjectionRow;
+};
+
+export type BrowserObjectDisplay = {
+  id: ObjRef;
+  name: string;
+  parent?: ObjRef | null;
+  ancestors?: ObjRef[];
+  owner?: ObjRef;
+  location?: ObjRef | null;
+  aliases?: string[];
+  description?: WooValue | null;
+  props?: Record<string, WooValue>;
+};
+
+export type BrowserObjectRow = {
+  kind: "woo.browser_object_row.v1";
+  id: ObjRef;
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  name?: string;
+  display: BrowserObjectDisplay;
+  location?: ObjRef | null;
+  contents?: ObjRef[];
+};
+
+export type BrowserSessionRow = {
+  kind: "woo.browser_session_row.v1";
+  session_id: string;
+  actor: ObjRef;
+  active_scope: ObjRef | null;
+  head: ShadowScopeHead;
+};
+
+export type BrowserLogRow = {
+  kind: "woo.browser_log_row.v1";
+  scope: ObjRef;
+  seq: number;
+  observations: Observation[];
+  head: ShadowScopeHead;
+};
+
+export type BrowserToolRow = {
+  kind: "woo.browser_tool_row.v1";
+  scope: ObjRef;
+  object: ObjRef;
+  verbs: RemoteToolDescriptor[];
+  head: ShadowScopeHead;
+};
+
+export type BrowserProfile = {
+  objects: BrowserObjectRow;
+  sessions: BrowserSessionRow;
+  logs: BrowserLogRow;
+  snapshots: never;
+  parked_tasks: never;
+  counters: never;
+  tombstones: { id: ObjRef };
+  tool_surfaces: BrowserToolRow;
+};
+
+export type ProjectionKey<T extends keyof ProjectionProfile> =
+  T extends "objects" ? ObjRef :
+  T extends "sessions" ? string :
+  T extends "logs" ? { space: ObjRef; seq: number } :
+  T extends "snapshots" ? { space: ObjRef; seq: number } :
+  T extends "parked_tasks" ? string :
+  T extends "counters" ? CounterKey :
+  T extends "tombstones" ? ObjRef :
+  T extends "tool_surfaces" ? { scope: ObjRef; object: ObjRef } :
+  never;
+
+type ProjectionWriteForTable<P extends ProjectionProfile, T extends keyof ProjectionProfile> =
+  P[T] extends never ? never :
+  T extends "counters"
+    ? { table: T; key: ProjectionKey<T>; op: "upsert"; value: number; bytes: number }
+    : | { table: T; key: ProjectionKey<T>; op: "upsert"; row: P[T]; bytes: number }
+      | { table: T; key: ProjectionKey<T>; op: "delete"; bytes: 0 };
+
+export type ProjectionWrite<P extends ProjectionProfile = AuthorityProfile> = {
+  [T in keyof ProjectionProfile]: ProjectionWriteForTable<P, T>
+}[keyof ProjectionProfile];
+
+export type AcceptedFrameTransfer<P extends ProjectionProfile = AuthorityProfile> = {
+  frame: ShadowCommitAccepted;
+  projection_writes: ProjectionWrite<P>[];
+};
+
+export type OpenTransfer<P extends ProjectionProfile = AuthorityProfile> =
   | {
       kind: "frames";
       from: ShadowScopeHead;
       to: ShadowScopeHead;
-      frames: AcceptedFrameTransfer[];
+      frames: AcceptedFrameTransfer<P>[];
       continuation?: OpenContinuation;
     }
   | {
       kind: "checkpoint";
-      checkpoint: ScopeCheckpoint;
+      checkpoint: ScopeCheckpoint<P>;
       continuation?: OpenContinuation;
     };
 
@@ -112,71 +201,34 @@ export type OpenContinuation = {
   expires_at_ms: number;
 };
 
-export type CheckpointTailOpenTransfer = {
+export type CheckpointTailOpenTransfer<P extends ProjectionProfile = AuthorityProfile> = {
   kind: "woo.open.checkpoint_tail.v1";
   scope: ObjRef;
   head: ShadowScopeHead;
-  transfer: OpenTransfer;
+  transfer: OpenTransfer<P>;
   viewer: { actor: ObjRef; session?: string | null };
 };
 
-export type ProjectionPage =
-  | {
-      kind: "woo.projection_page.v1";
-      table: "objects";
-      page: string;
-      hash: string;
-      rows: SerializedObject[];
-    }
-  | {
-      kind: "woo.projection_page.v1";
-      table: "sessions";
-      page: string;
-      hash: string;
-      rows: SerializedSession[];
-    }
-  | {
-      kind: "woo.projection_page.v1";
-      table: "logs";
-      page: string;
-      hash: string;
-      rows: Array<{ space: ObjRef; entry: SpaceLogEntry }>;
-    }
-  | {
-      kind: "woo.projection_page.v1";
-      table: "snapshots";
-      page: string;
-      hash: string;
-      rows: SpaceSnapshotRecord[];
-    }
-  | {
-      kind: "woo.projection_page.v1";
-      table: "parked_tasks";
-      page: string;
-      hash: string;
-      rows: ParkedTaskRecord[];
-    }
-  | {
-      kind: "woo.projection_page.v1";
-      table: "tombstones";
-      page: string;
-      hash: string;
-      rows: Array<{ id: ObjRef }>;
-    }
-  | {
-      kind: "woo.projection_page.v1";
-      table: "tool_surfaces";
-      page: string;
-      hash: string;
-      rows: ToolSurfaceProjectionRow[];
-    };
+type ProjectionPageForTable<P extends ProjectionProfile, T extends keyof ProjectionProfile> =
+  T extends "counters" ? never :
+  P[T] extends never ? never : {
+    kind: "woo.projection_page.v1";
+    table: T;
+    page: string;
+    hash: string;
+    rows: P[T][];
+  };
 
-export type ScopeCheckpoint = {
+export type ProjectionPage<P extends ProjectionProfile = AuthorityProfile> = {
+  [T in keyof ProjectionProfile]: ProjectionPageForTable<P, T>
+}[keyof ProjectionProfile];
+
+export type ScopeCheckpoint<P extends ProjectionProfile = AuthorityProfile> = {
   kind: "woo.scope_checkpoint.v1";
   scope: ObjRef;
   head: ShadowScopeHead;
   checkpoint_hash: string;
-  pages: ProjectionPage[];
+  pages: ProjectionPage<P>[];
   frame_tail: ShadowCommitAccepted[];
 };
 
@@ -202,12 +254,12 @@ export function projectionRowBytes(value: unknown): number {
   return ROW_BYTES_ENCODER.encode(JSON.stringify(value)).byteLength;
 }
 
-export function projectionWriteIdentity(write: ProjectionWrite): string {
+export function projectionWriteIdentity(write: ProjectionWrite<ProjectionProfile>): string {
   return `${write.table}:${JSON.stringify(write.key)}`;
 }
 
-export function coalesceProjectionWrites(writes: readonly ProjectionWrite[]): ProjectionWrite[] {
-  const byKey = new Map<string, ProjectionWrite>();
+export function coalesceProjectionWrites<P extends ProjectionProfile = AuthorityProfile>(writes: readonly ProjectionWrite<P>[]): ProjectionWrite<P>[] {
+  const byKey = new Map<string, ProjectionWrite<P>>();
   for (const write of writes) byKey.set(projectionWriteIdentity(write), write);
   return Array.from(byKey.values()).sort(compareProjectionWrites);
 }
@@ -329,8 +381,322 @@ function compareToolSurfaceSourceMarkers(
   return a.key.key.localeCompare(b.key.key);
 }
 
-function compareProjectionWrites(a: ProjectionWrite, b: ProjectionWrite): number {
+function compareProjectionWrites(a: ProjectionWrite<ProjectionProfile>, b: ProjectionWrite<ProjectionProfile>): number {
   const table = a.table.localeCompare(b.table);
   if (table !== 0) return table;
   return JSON.stringify(a.key).localeCompare(JSON.stringify(b.key));
+}
+
+export type BrowserProjectionViewer = { actor: ObjRef; session?: string | null };
+
+export function browserProfileOpenTransferFromAuthority(input: {
+  transfer: OpenTransfer;
+  serialized: SerializedWorld;
+  viewer: BrowserProjectionViewer;
+}): OpenTransfer<BrowserProfile> {
+  if (input.transfer.kind === "frames") {
+    return {
+      ...input.transfer,
+      frames: input.transfer.frames.map((frame) => ({
+        frame: frame.frame,
+        projection_writes: frame.projection_writes
+          .map((write) => browserProfileProjectionWriteFromAuthority({
+            write,
+            serialized: input.serialized,
+            scope: frame.frame.position.scope,
+            head: frame.frame.position,
+            viewer: input.viewer
+          }))
+          .filter((write): write is ProjectionWrite<BrowserProfile> => write !== null)
+      }))
+    };
+  }
+  return {
+    ...input.transfer,
+    checkpoint: browserProfileScopeCheckpointFromAuthority({
+      checkpoint: input.transfer.checkpoint,
+      serialized: input.serialized,
+      viewer: input.viewer
+    })
+  };
+}
+
+export function browserProfileScopeCheckpointFromAuthority(input: {
+  checkpoint: ScopeCheckpoint;
+  serialized: SerializedWorld;
+  viewer: BrowserProjectionViewer;
+}): ScopeCheckpoint<BrowserProfile> {
+  const pages = input.checkpoint.pages
+    .map((page) => browserProfileProjectionPageFromAuthority({
+      page,
+      scope: input.checkpoint.scope,
+      head: input.checkpoint.head,
+      serialized: input.serialized,
+      viewer: input.viewer
+    }))
+    .filter((page): page is ProjectionPage<BrowserProfile> => page !== null);
+  const material = {
+    kind: "woo.scope_checkpoint_browser_material.v1",
+    scope: input.checkpoint.scope,
+    head: input.checkpoint.head,
+    pages: pages.map((page) => ({ table: page.table, page: page.page, hash: page.hash })),
+    frame_tail: input.checkpoint.frame_tail.map((frame) => frame.position)
+  };
+  return {
+    kind: "woo.scope_checkpoint.v1",
+    scope: input.checkpoint.scope,
+    head: input.checkpoint.head,
+    checkpoint_hash: hashSource(stableShadowJson(material as unknown as WooValue)),
+    pages,
+    frame_tail: input.checkpoint.frame_tail
+  };
+}
+
+export function browserProfileProjectionWriteFromAuthority(input: {
+  write: ProjectionWrite;
+  serialized: SerializedWorld;
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  viewer: BrowserProjectionViewer;
+}): ProjectionWrite<BrowserProfile> | null {
+  const { write, serialized, scope, head, viewer } = input;
+  switch (write.table) {
+    case "objects":
+      return write.op === "delete"
+        ? { table: "objects", key: write.key, op: "delete", bytes: 0 }
+        : browserProjectionWrite("objects", write.key, browserObjectRow(serializedWithObject(serialized, write.row), scope, head, write.row, viewer));
+    case "sessions":
+      return write.op === "delete"
+        ? { table: "sessions", key: write.key, op: "delete", bytes: 0 }
+        : browserProjectionWrite("sessions", write.key, browserSessionRow(write.row, head));
+    case "logs":
+      return write.op === "delete"
+        ? { table: "logs", key: write.key, op: "delete", bytes: 0 }
+        : browserProjectionWrite("logs", write.key, browserLogRow(write.row, head));
+    case "tombstones":
+      return write.op === "delete"
+        ? { table: "tombstones", key: write.key, op: "delete", bytes: 0 }
+        : browserProjectionWrite("tombstones", write.key, { id: write.row.id });
+    case "tool_surfaces":
+      return write.op === "delete"
+        ? { table: "tool_surfaces", key: write.key, op: "delete", bytes: 0 }
+        : browserProjectionWrite("tool_surfaces", write.key, browserToolRow(write.row, head));
+    case "snapshots":
+    case "parked_tasks":
+    case "counters":
+      return null;
+  }
+}
+
+function browserProfileProjectionPageFromAuthority(input: {
+  page: ProjectionPage;
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  serialized: SerializedWorld;
+  viewer: BrowserProjectionViewer;
+}): ProjectionPage<BrowserProfile> | null {
+  const { page, scope, head, serialized, viewer } = input;
+  switch (page.table) {
+    case "objects":
+      return browserProjectionPage("objects", page.page, page.rows.map((row) => browserObjectRow(serializedWithObject(serialized, row), scope, head, row, viewer)));
+    case "sessions":
+      return browserProjectionPage("sessions", page.page, page.rows.map((row) => browserSessionRow(row, head)));
+    case "logs":
+      return browserProjectionPage("logs", page.page, page.rows.map((row) => browserLogRow(authorityLogEntryFromPageRow(row), head)));
+    case "tombstones":
+      return browserProjectionPage("tombstones", page.page, page.rows.map((row) => ({ id: row.id })));
+    case "tool_surfaces":
+      return browserProjectionPage("tool_surfaces", page.page, page.rows.map((row) => browserToolRow(row, head)));
+    case "snapshots":
+    case "parked_tasks":
+      return null;
+  }
+}
+
+function authorityLogEntryFromPageRow(row: unknown): SpaceLogEntry {
+  if (row && typeof row === "object" && !Array.isArray(row) && "entry" in row) {
+    return (row as { entry: SpaceLogEntry }).entry;
+  }
+  return row as SpaceLogEntry;
+}
+
+function browserProjectionWrite<T extends keyof BrowserProfile>(
+  table: T,
+  key: ProjectionKey<T>,
+  row: BrowserProfile[T]
+): ProjectionWrite<BrowserProfile> {
+  return { table, key, op: "upsert", row, bytes: projectionRowBytes(row) } as ProjectionWrite<BrowserProfile>;
+}
+
+function browserProjectionPage<T extends keyof BrowserProfile>(
+  table: T,
+  page: string,
+  rows: BrowserProfile[T][]
+): ProjectionPage<BrowserProfile> {
+  const material = { kind: "woo.projection_page_material.v1", table, page, rows };
+  return {
+    kind: "woo.projection_page.v1",
+    table,
+    page,
+    hash: hashSource(stableShadowJson(material as unknown as WooValue)),
+    rows
+  } as ProjectionPage<BrowserProfile>;
+}
+
+function browserSessionRow(session: SerializedSession, head: ShadowScopeHead): BrowserSessionRow {
+  return {
+    kind: "woo.browser_session_row.v1",
+    session_id: session.id,
+    actor: session.actor,
+    active_scope: session.activeScope ?? session.currentLocation ?? null,
+    head
+  };
+}
+
+function browserLogRow(entry: SpaceLogEntry, head: ShadowScopeHead): BrowserLogRow {
+  return {
+    kind: "woo.browser_log_row.v1",
+    scope: entry.space,
+    seq: entry.seq,
+    observations: structuredClone(entry.observations) as Observation[],
+    head
+  };
+}
+
+function browserToolRow(row: ToolSurfaceProjectionRow, head: ShadowScopeHead): BrowserToolRow {
+  return {
+    kind: "woo.browser_tool_row.v1",
+    scope: row.scope,
+    object: row.object,
+    verbs: row.verbs.map((verb) => ({
+      object: row.object,
+      verb: verb.name,
+      aliases: verb.aliases ?? [],
+      arg_spec: verb.arg_spec ?? {},
+      direct: verb.direct === true,
+      source: verb.source ?? "projection",
+      enclosingSpace: verb.enclosingSpace ?? null,
+      source_rows: row.source_rows
+    })),
+    head
+  };
+}
+
+function browserObjectRow(
+  serialized: SerializedWorld,
+  scope: ObjRef,
+  head: ShadowScopeHead,
+  obj: SerializedObject,
+  viewer: BrowserProjectionViewer
+): BrowserObjectRow {
+  const index = projectionSerializedIndex(serialized);
+  const props = readableProps(index, obj, viewer.actor);
+  const aliases = props.aliases;
+  const display: BrowserObjectDisplay = {
+    id: obj.id,
+    name: obj.name,
+    parent: obj.parent,
+    ancestors: ancestors(index, obj.id),
+    owner: obj.owner,
+    location: obj.location,
+    ...(Array.isArray(aliases) && aliases.every((item) => typeof item === "string") ? { aliases } : {}),
+    description: props.description ?? null,
+    props
+  };
+  return {
+    kind: "woo.browser_object_row.v1",
+    id: obj.id,
+    scope,
+    head,
+    name: obj.name,
+    display,
+    location: obj.location,
+    contents: [...obj.contents]
+  };
+}
+
+function serializedWithObject(serialized: SerializedWorld, obj: SerializedObject): SerializedWorld {
+  const objects = serialized.objects.some((item) => item.id === obj.id)
+    ? serialized.objects.map((item) => item.id === obj.id ? obj : item)
+    : [...serialized.objects, obj];
+  return { ...serialized, objects };
+}
+
+type ProjectionSerializedIndex = {
+  objects: Map<ObjRef, SerializedObject>;
+  indexedObjects: Map<ObjRef, { properties: Map<string, WooValue>; propertyDefs: Map<string, PropertyDef> }>;
+};
+
+function projectionSerializedIndex(serialized: SerializedWorld): ProjectionSerializedIndex {
+  return {
+    objects: new Map(serialized.objects.map((obj) => [obj.id, obj])),
+    indexedObjects: new Map(serialized.objects.map((obj) => [obj.id, {
+      properties: new Map(obj.properties),
+      propertyDefs: new Map(obj.propertyDefs.map((def) => [def.name, def] as const))
+    }] as const))
+  };
+}
+
+function readableProps(index: ProjectionSerializedIndex, obj: SerializedObject, actor?: ObjRef): Record<string, WooValue> {
+  const props: Record<string, WooValue> = {};
+  for (const name of propertyNames(index, obj.id)) {
+    const resolved = propertyValue(index, obj.id, name);
+    if (!resolved || resolved.value === undefined) continue;
+    if (!canReadProperty(index, actor, resolved.owner, resolved.perms)) continue;
+    props[name] = cloneValue(resolved.value);
+  }
+  return props;
+}
+
+function propertyNames(index: ProjectionSerializedIndex, objRef: ObjRef): string[] {
+  const names = new Set<string>();
+  let current = index.objects.get(objRef) ?? null;
+  const seen = new Set<ObjRef>();
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    const indexed = index.indexedObjects.get(current.id);
+    for (const name of indexed?.propertyDefs.keys() ?? []) names.add(name);
+    for (const name of indexed?.properties.keys() ?? []) names.add(name);
+    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+  }
+  return Array.from(names).sort();
+}
+
+function propertyValue(
+  index: ProjectionSerializedIndex,
+  objRef: ObjRef,
+  name: string
+): { value: WooValue | undefined; owner: ObjRef; perms: string } | null {
+  let current = index.objects.get(objRef) ?? null;
+  const seen = new Set<ObjRef>();
+  let value: WooValue | undefined;
+  let hasValue = false;
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    const indexed = index.indexedObjects.get(current.id);
+    if (!hasValue && indexed?.properties.has(name)) {
+      value = indexed.properties.get(name);
+      hasValue = true;
+    }
+    const def = indexed?.propertyDefs.get(name);
+    if (def) return { value: hasValue ? value : def.defaultValue, owner: def.owner, perms: def.perms };
+    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+  }
+  return null;
+}
+
+function ancestors(index: ProjectionSerializedIndex, objRef: ObjRef): ObjRef[] {
+  const out: ObjRef[] = [];
+  let current = index.objects.get(objRef)?.parent ?? null;
+  const seen = new Set<ObjRef>();
+  while (current && !seen.has(current)) {
+    out.push(current);
+    seen.add(current);
+    current = index.objects.get(current)?.parent ?? null;
+  }
+  return out.reverse();
+}
+
+function canReadProperty(index: ProjectionSerializedIndex, actor: ObjRef | undefined, owner: ObjRef, perms: string): boolean {
+  return Boolean(actor && (index.objects.get(actor)?.flags?.wizard === true || owner === actor)) || String(perms).includes("r");
 }

@@ -6,7 +6,16 @@ import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commi
 import { applyShadowScopeProjectionPatch, shadowScopeProjectionFromSerialized, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import type { ObjRef, SpaceLogEntry, WooValue } from "../core/types";
-import type { CheckpointTailOpenTransfer, ProjectionWrite, ToolSurfaceProjectionRow } from "../core/projection-delta";
+import type {
+  BrowserLogRow,
+  BrowserObjectRow,
+  BrowserProfile,
+  BrowserSessionRow,
+  BrowserToolRow,
+  CheckpointTailOpenTransfer,
+  ProjectionWrite,
+  ToolSurfaceProjectionRow
+} from "../core/projection-delta";
 import { isShadowScopeHead } from "../core/shadow-scope-head";
 import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from "./v2-browser-cache";
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
@@ -95,6 +104,8 @@ type BrowserActivityMetric = {
   error?: string;
   error_detail?: string;
 };
+
+type BrowserCheckpointTailOpenTransfer = CheckpointTailOpenTransfer | CheckpointTailOpenTransfer<BrowserProfile>;
 
 const DB_NAME = "woo-v2-browser";
 const DB_VERSION = 8;
@@ -831,20 +842,25 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     });
     return false;
   }
-  if (persistence === "durable") {
-    await putTentativeTurn(v2BrowserTentativeTurnRecord({
+  const tentativeRecord = persistence === "durable"
+    ? v2BrowserTentativeTurnRecord({
       id: command.id,
       scope,
       actor: current.actor,
       session: current.session ?? null,
       base_head: cachedHead,
       transcript: local.transcript
-    }));
-  }
+    })
+    : null;
+  const socketOpen = socket?.readyState === WebSocket.OPEN;
   if (local.result_known) {
     postMessage({ kind: "turn_result", frame: local.optimistic_frame, optimistic: true });
   }
-  await sendTurnExecEnvelope(command.id, local.request);
+  if (tentativeRecord) {
+    if (socketOpen) void journalTentativeTurn(tentativeRecord, "fire_and_forget");
+    else await journalTentativeTurn(tentativeRecord, "before_enqueue");
+  }
+  await sendTurnExecEnvelope(command.id, local.request, { persistBeforeSend: !socketOpen });
   postMessage({
     kind: "local_turn_planned",
     ...turnDiagnostic(command, persistence),
@@ -1021,7 +1037,7 @@ function rejectPendingStateTransfers(err: Error): void {
   }
 }
 
-async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest): Promise<void> {
+async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest, options: { persistBeforeSend?: boolean } = {}): Promise<void> {
   if (!current || !current.actor) return;
   const envelope: ShadowEnvelope<ShadowTurnExecRequest> = {
     v: 2,
@@ -1034,13 +1050,30 @@ async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest):
     body: request
   };
   const encoded = encodeEnvelope(envelope);
-  await putPending({
+  const pending = {
     id: envelope.id,
     encoded,
     created_at: Date.now(),
     auth_token: current.token,
     from: current.node
-  });
+  };
+  if (options.persistBeforeSend === false && socket?.readyState === WebSocket.OPEN) {
+    sendEncoded(encoded);
+    void putPending(pending).catch((err: unknown) => {
+      postBrowserActivity({
+        phase: "pending_journal",
+        path: request.call.verb,
+        route: request.call.route,
+        scope: request.call.scope,
+        ms: 0,
+        status: "error",
+        error: "E_BROWSER_PENDING_JOURNAL",
+        error_detail: errorMessage(err)
+      });
+    });
+    return;
+  }
+  await putPending(pending);
   sendEncoded(encoded);
 }
 
@@ -1175,6 +1208,11 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
         await putProjection(mutation.scope, mutation.head, projection);
         return { kind: "projection", scope: mutation.scope, head: mutation.head, projection };
       }
+      case "accepted_projection": {
+        const installed = await installProjectionWrites(mutation.scope, mutation.head, mutation.writes);
+        await putProjection(installed.scope, installed.head, installed.projection);
+        return { kind: "projection", scope: installed.scope, head: installed.head, projection: installed.projection };
+      }
       case "applied_frame": {
         await putAppliedFrame(mutation.frame);
         if (mutation.transcript) {
@@ -1245,12 +1283,14 @@ function mutationApproxBytes(mutation: V2BrowserCacheMutation): number | undefin
   if (mutation.kind === "projection") return jsonBytes(mutation.projection);
   if (mutation.kind === "projection_patch") return jsonBytes(mutation.patch);
   if (mutation.kind === "checkpoint_tail") return jsonBytes(mutation.transfer.transfer);
+  if (mutation.kind === "accepted_projection") return jsonBytes(mutation.writes);
   if (mutation.kind === "execution_transfer") return jsonBytes(mutation.record.transfer);
   return undefined;
 }
 
 function mutationCount(mutation: V2BrowserCacheMutation): number {
   if (mutation.kind === "state_pages") return mutation.pages.length;
+  if (mutation.kind === "accepted_projection") return mutation.writes.length;
   if (mutation.kind === "checkpoint_tail") {
     return mutation.transfer.transfer.kind === "frames" ? mutation.transfer.transfer.frames.length : mutation.transfer.transfer.checkpoint.pages.length;
   }
@@ -1271,22 +1311,22 @@ function isProjectionRow(value: unknown): value is { scope: string; head: unknow
 }
 
 type ProjectionRowRecord =
-  | { id: string; scope: string; table: "objects"; key: ObjRef; row: SerializedObject }
-  | { id: string; scope: string; table: "sessions"; key: string; row: SerializedSession }
-  | { id: string; scope: string; table: "logs"; key: string; space: ObjRef; row: SpaceLogEntry }
+  | { id: string; scope: string; table: "objects"; key: ObjRef; row: SerializedObject | BrowserObjectRow }
+  | { id: string; scope: string; table: "sessions"; key: string; row: SerializedSession | BrowserSessionRow }
+  | { id: string; scope: string; table: "logs"; key: string; space: ObjRef; row: SpaceLogEntry | BrowserLogRow }
   | { id: string; scope: string; table: "snapshots"; key: string; space: ObjRef; row: SpaceSnapshotRecord }
   | { id: string; scope: string; table: "parked_tasks"; key: string; row: ParkedTaskRecord }
   | { id: string; scope: string; table: "tombstones"; key: ObjRef; row: { id: ObjRef } }
-  | { id: string; scope: string; table: "tool_surfaces"; key: string; row: ToolSurfaceProjectionRow };
+  | { id: string; scope: string; table: "tool_surfaces"; key: string; row: ToolSurfaceProjectionRow | BrowserToolRow };
 
 type ProjectionRowRecordInput =
-  | { scope: string; table: "objects"; key: ObjRef; row: SerializedObject }
-  | { scope: string; table: "sessions"; key: string; row: SerializedSession }
-  | { scope: string; table: "logs"; key: string; space: ObjRef; row: SpaceLogEntry }
+  | { scope: string; table: "objects"; key: ObjRef; row: SerializedObject | BrowserObjectRow }
+  | { scope: string; table: "sessions"; key: string; row: SerializedSession | BrowserSessionRow }
+  | { scope: string; table: "logs"; key: string; space: ObjRef; row: SpaceLogEntry | BrowserLogRow }
   | { scope: string; table: "snapshots"; key: string; space: ObjRef; row: SpaceSnapshotRecord }
   | { scope: string; table: "parked_tasks"; key: string; row: ParkedTaskRecord }
   | { scope: string; table: "tombstones"; key: ObjRef; row: { id: ObjRef } }
-  | { scope: string; table: "tool_surfaces"; key: string; row: ToolSurfaceProjectionRow };
+  | { scope: string; table: "tool_surfaces"; key: string; row: ToolSurfaceProjectionRow | BrowserToolRow };
 
 function projectionRowId(scope: string, table: ProjectionRowRecord["table"], key: string): string {
   return `${scope}\u0000${table}\u0000${key}`;
@@ -1316,7 +1356,7 @@ async function clearProjectionRows(scope: string): Promise<void> {
 }
 
 async function installCheckpointTailProjection(
-  transfer: CheckpointTailOpenTransfer
+  transfer: BrowserCheckpointTailOpenTransfer
 ): Promise<{ scope: string; head: ShadowScopeHead; projection: unknown } | null> {
   const viewer = (transfer as { viewer?: CheckpointTailOpenTransfer["viewer"] }).viewer;
   if (!viewer?.actor) throw new Error("checkpoint/tail transfer missing viewer");
@@ -1335,14 +1375,15 @@ async function installCheckpointTailProjection(
     for (const page of checkpoint.pages) {
       switch (page.table) {
         case "objects":
-          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "objects", key: row.id, row });
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "objects", key: objectProjectionRowKey(row), row });
           break;
         case "sessions":
-          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "sessions", key: row.id, row });
+          for (const row of page.rows) await putProjectionRow({ scope: checkpoint.scope, table: "sessions", key: sessionProjectionRowKey(row), row });
           break;
         case "logs":
           for (const item of page.rows) {
-            await putProjectionRow({ scope: checkpoint.scope, table: "logs", key: `${item.space}:${item.entry.seq}`, space: item.space, row: item.entry });
+            const log = logProjectionRow(item);
+            await putProjectionRow({ scope: checkpoint.scope, table: "logs", key: `${log.space}:${log.seq}`, space: log.space, row: log.row });
           }
           break;
         case "snapshots":
@@ -1391,7 +1432,21 @@ async function installCheckpointTailProjection(
   };
 }
 
-async function applyProjectionWriteToBrowserRows(scope: string, write: ProjectionWrite): Promise<void> {
+async function installProjectionWrites(
+  scope: string,
+  head: ShadowScopeHead,
+  writes: readonly (ProjectionWrite | ProjectionWrite<BrowserProfile>)[]
+): Promise<{ scope: string; head: ShadowScopeHead; projection: unknown }> {
+  for (const write of writes) await applyProjectionWriteToBrowserRows(scope, write);
+  await putMeta(`head:${scope}`, head);
+  return {
+    scope,
+    head,
+    projection: await projectionFromStoredRows(scope, head, currentViewer())
+  };
+}
+
+async function applyProjectionWriteToBrowserRows(scope: string, write: ProjectionWrite | ProjectionWrite<BrowserProfile>): Promise<void> {
   switch (write.table) {
     case "objects":
       if (write.op === "delete") await deleteProjectionRow(scope, "objects", write.key);
@@ -1432,26 +1487,72 @@ async function applyProjectionWriteToBrowserRows(scope: string, write: Projectio
   }
 }
 
+function objectProjectionRowKey(row: SerializedObject | BrowserObjectRow): ObjRef {
+  return isBrowserObjectRow(row) ? row.id : row.id;
+}
+
+function sessionProjectionRowKey(row: SerializedSession | BrowserSessionRow): string {
+  return isBrowserSessionRow(row) ? row.session_id : row.id;
+}
+
+function logProjectionRow(value: unknown): { space: ObjRef; seq: number; row: SpaceLogEntry | BrowserLogRow } {
+  if (isBrowserLogRow(value)) return { space: value.scope, seq: value.seq, row: value };
+  if (value && typeof value === "object" && !Array.isArray(value) && "entry" in value) {
+    const entry = (value as { entry: SpaceLogEntry }).entry;
+    const rawSpace = (value as unknown as { space?: unknown }).space;
+    const space = typeof rawSpace === "string" ? rawSpace as ObjRef : entry.space;
+    return { space, seq: entry.seq, row: entry };
+  }
+  const entry = value as SpaceLogEntry;
+  return { space: entry.space, seq: entry.seq, row: entry };
+}
+
+function isBrowserObjectRow(value: unknown): value is BrowserObjectRow {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "woo.browser_object_row.v1");
+}
+
+function isBrowserSessionRow(value: unknown): value is BrowserSessionRow {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "woo.browser_session_row.v1");
+}
+
+function isBrowserLogRow(value: unknown): value is BrowserLogRow {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "woo.browser_log_row.v1");
+}
+
 async function projectionFromStoredRows(
   scope: string,
   head: ShadowScopeHead,
   viewer: CheckpointTailOpenTransfer["viewer"]
 ): Promise<unknown> {
   const rows = await projectionRowsForScope(scope);
+  if (rows.some((row) => row.table === "objects" && isBrowserObjectRow(row.row)) ||
+      rows.some((row) => row.table === "sessions" && isBrowserSessionRow(row.row)) ||
+      rows.some((row) => row.table === "logs" && isBrowserLogRow(row.row))) {
+    return browserProjectionFromStoredRows(scope, head, rows, viewer);
+  }
   const logsBySpace = new Map<ObjRef, SpaceLogEntry[]>();
   for (const row of rows) {
     if (row.table !== "logs") continue;
+    if (isBrowserLogRow(row.row)) continue;
     const entries = logsBySpace.get(row.space) ?? [];
     entries.push(row.row);
     logsBySpace.set(row.space, entries);
   }
+  const objectRows = rows
+    .filter((row): row is Extract<ProjectionRowRecord, { table: "objects" }> => row.table === "objects")
+    .map((row) => row.row)
+    .filter((row): row is SerializedObject => !isBrowserObjectRow(row));
+  const sessionRows = rows
+    .filter((row): row is Extract<ProjectionRowRecord, { table: "sessions" }> => row.table === "sessions")
+    .map((row) => row.row)
+    .filter((row): row is SerializedSession => !isBrowserSessionRow(row));
   const serialized: SerializedWorld = {
     version: 1,
     objectCounter: 0,
     parkedTaskCounter: 0,
     sessionCounter: 0,
-    objects: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "objects" }> => row.table === "objects").map((row) => row.row),
-    sessions: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "sessions" }> => row.table === "sessions").map((row) => row.row),
+    objects: objectRows,
+    sessions: sessionRows,
     logs: Array.from(logsBySpace, ([space, entries]) => [space, entries.sort((a, b) => a.seq - b.seq)] as [ObjRef, SpaceLogEntry[]]),
     snapshots: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "snapshots" }> => row.table === "snapshots").map((row) => row.row),
     parkedTasks: rows.filter((row): row is Extract<ProjectionRowRecord, { table: "parked_tasks" }> => row.table === "parked_tasks").map((row) => row.row),
@@ -1462,6 +1563,112 @@ async function projectionFromStoredRows(
 
 function transferViewer(viewer: CheckpointTailOpenTransfer["viewer"]): { actor: ObjRef; session?: string | null } {
   return viewer;
+}
+
+function currentViewer(): CheckpointTailOpenTransfer["viewer"] {
+  if (!current?.actor) throw new Error("v2 browser projection requires current actor");
+  return { actor: current.actor, session: current.session ?? null };
+}
+
+function browserProjectionFromStoredRows(
+  scope: string,
+  head: ShadowScopeHead,
+  rows: ProjectionRowRecord[],
+  viewer?: CheckpointTailOpenTransfer["viewer"]
+): unknown {
+  const objectRows = rows
+    .filter((row): row is Extract<ProjectionRowRecord, { table: "objects" }> => row.table === "objects")
+    .map((row) => browserSummaryFromObjectRow(row.row));
+  const byId = new Map(objectRows.map((row) => [String(row.id), row] as const));
+  const subject = byId.get(scope) ?? null;
+  const actor = viewer?.actor ? byId.get(viewer.actor) ?? null : null;
+  const sessionRow = viewer?.session
+    ? rows
+      .filter((row): row is Extract<ProjectionRowRecord, { table: "sessions" }> => row.table === "sessions")
+      .map((row) => row.row)
+      .find((row) => isBrowserSessionRow(row) ? row.session_id === viewer.session : row.id === viewer.session)
+    : undefined;
+  const activeScope = sessionRow
+    ? isBrowserSessionRow(sessionRow)
+      ? sessionRow.active_scope
+      : sessionRow.activeScope ?? sessionRow.currentLocation ?? null
+    : null;
+  const subjectContents = objectRefsFromContents(subject) ?? objectRows
+    .filter((row) => row.location === scope)
+    .map((row) => String(row.id));
+  const inventoryRefs = objectRefsFromContents(actor) ?? (viewer?.actor
+    ? objectRows.filter((row) => row.location === viewer.actor).map((row) => String(row.id))
+    : []);
+  const projectionRefs = new Set<string>([scope, ...subjectContents]);
+  if (viewer?.actor) {
+    projectionRefs.add(viewer.actor);
+    for (const ref of inventoryRefs) projectionRefs.add(ref);
+  }
+  if (activeScope) projectionRefs.add(activeScope);
+  const objects = Array.from(projectionRefs)
+    .map((id) => byId.get(id) ?? null)
+    .filter((item): item is Record<string, unknown> => item !== null);
+  const inventory = inventoryRefs
+    .map((id) => byId.get(id) ?? null)
+    .filter((item): item is Record<string, unknown> => item !== null);
+  return {
+    kind: "woo.scope_projection.shadow.v1",
+    scope,
+    title: typeof subject?.name === "string" ? subject.name : scope,
+    object_count: objectRows.length,
+    contents: subjectContents,
+    seq: head.seq,
+    cursor: { spaces: { [scope]: { next_seq: head.seq + 1 } }, live: { resumable: false } },
+    ...(viewer ? { viewer } : {}),
+    ...(viewer ? {
+      self: actor,
+      session: viewer.session ? {
+        id: viewer.session,
+        actor: viewer.actor,
+        active_scope: activeScope,
+        current_location: activeScope,
+        all_locations: activeScope ? [activeScope] : []
+      } : null,
+      inventory
+    } : {}),
+    subject,
+    objects
+  };
+}
+
+function browserSummaryFromObjectRow(row: SerializedObject | BrowserObjectRow): Record<string, unknown> {
+  if (isBrowserObjectRow(row)) {
+    return {
+      id: row.id,
+      name: row.display.name ?? row.name ?? row.id,
+      parent: row.display.parent,
+      ancestors: row.display.ancestors ?? [],
+      owner: row.display.owner,
+      location: row.location ?? row.display.location ?? null,
+      aliases: row.display.aliases,
+      description: row.display.description ?? null,
+      props: row.display.props ?? {},
+      contents: row.contents ?? []
+    };
+  }
+  const props = Object.fromEntries(row.properties);
+  return {
+    id: row.id,
+    name: row.name,
+    parent: row.parent,
+    ancestors: [],
+    owner: row.owner,
+    location: row.location,
+    description: props.description ?? null,
+    props,
+    contents: row.contents
+  };
+}
+
+function objectRefsFromContents(summary: Record<string, unknown> | null): string[] | null {
+  if (!summary) return null;
+  const contents = summary.contents;
+  return Array.isArray(contents) ? contents.filter((item): item is string => typeof item === "string") : null;
 }
 
 async function postCachedProjection(scope: string): Promise<void> {
@@ -1566,6 +1773,32 @@ async function deleteExecutionCheckpoint(scope: string): Promise<void> {
 
 async function putTentativeTurn(record: V2BrowserTentativeTurnRecord): Promise<void> {
   await tx(TENTATIVE_TURN_STORE, "readwrite", (store) => store.put(record));
+}
+
+async function journalTentativeTurn(record: V2BrowserTentativeTurnRecord, mode: "fire_and_forget" | "before_enqueue"): Promise<void> {
+  const startedAt = metricNow();
+  try {
+    await putTentativeTurn(record);
+    postBrowserActivity({
+      phase: "proposal_journal",
+      path: mode,
+      scope: record.scope,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      count: 1
+    });
+  } catch (err) {
+    postBrowserActivity({
+      phase: "proposal_journal",
+      path: mode,
+      scope: record.scope,
+      ms: metricElapsed(startedAt),
+      status: "error",
+      error: "E_BROWSER_PROPOSAL_JOURNAL",
+      error_detail: errorMessage(err)
+    });
+    if (mode === "before_enqueue") throw err;
+  }
 }
 
 async function deleteTentativeTurn(id: string): Promise<void> {

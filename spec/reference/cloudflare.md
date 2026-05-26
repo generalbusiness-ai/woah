@@ -809,14 +809,15 @@ frame tail as cache seed, also split by continuation when needed. Continuations
 are pinned to the retained export id/head/hash; a stale continuation returns
 `E_CHECKPOINT_CONTINUATION_STALE`. Legacy `/v2/open` responses remain the
 default while checkpoint/tail negotiation is off. `WOO_V2_CHECKPOINT_TAIL_OPEN`
-enables the CommitScopeDO body-field protocol for trusted callers. Browser
-WebSocket opens are narrower: because the first checkpoint pages are
-authority-shaped, the gateway MUST NOT send them to browser holders unless a
-browser-safe projection profile is active and a separate browser rollout gate is
-enabled. That browser gate remains fail-closed until the final checkpoint
-`frame_tail` is either consumed by the browser installer or split under its own
-byte budget. Until then, browser opens use the legacy display transfer even when
-CommitScopeDO can serve checkpoint/tail to server-side callers.
+enables the CommitScopeDO body-field protocol for trusted callers.
+`WOO_BROWSER_PROJECTION_HOLDER` is the independent browser-holder rollback gate:
+when it is off, browser WebSocket open/envelope requests do not ask CommitScopeDO
+for browser-profile rows. Browser checkpoint/tail opens are narrower again:
+because checkpoint pages sent to browser holders must be browser-profiled,
+`WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN` requires both `WOO_BROWSER_PROJECTION_HOLDER`
+and `WOO_V2_CHECKPOINT_TAIL_OPEN`. With either browser gate off, browser opens use
+the legacy display transfer even when CommitScopeDO can serve checkpoint/tail to
+server-side callers.
 
 `WOO_GATEWAY_PROJECTION_CACHE` enables the gateway's durable projection-row SQL
 cache for accepted fanout. `WOO_TOOL_SURFACE_PROJECTION_ROWS` is a narrower

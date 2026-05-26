@@ -1492,7 +1492,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
-  it("does not negotiate authority-shaped checkpoint/tail transfers on the browser WebSocket path", async () => {
+  it("negotiates browser-profile checkpoint/tail transfers on the browser WebSocket path", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
     const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
@@ -1554,6 +1554,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       WOO_INITIAL_WIZARD_TOKEN: "cf-v2-checkpoint-tail-token",
       WOO_INTERNAL_SECRET: "cf-test-secret",
       WOO_AUTO_INSTALL_CATALOGS: "",
+      WOO_BROWSER_PROJECTION_HOLDER: "1",
       WOO_V2_CHECKPOINT_TAIL_OPEN: "1",
       WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN: "1",
       DIRECTORY: new FakeDurableObjectNamespace((name) => {
@@ -1571,9 +1572,11 @@ describe("CFObjectRepository production-shape coverage", () => {
           const actor = String(body.actor);
           const session = String(body.session);
           const head = { kind: "woo.scope_head.shadow.v1", scope, epoch: 1, seq: 0, hash: "checkpoint-tail-head" };
-          if (body.open_protocol === "checkpoint_tail.v1") throw new Error("browser open must not request authority-shaped checkpoint/tail pages");
+          if (body.open_protocol !== "checkpoint_tail.v1") throw new Error("browser open must request checkpoint/tail when enabled");
+          if (body.receiver_profile !== "browser") throw new Error("browser checkpoint/tail must request browser-profile rows");
           return new Response(JSON.stringify({
             ok: true,
+            open_protocol: "checkpoint_tail.v1",
             relay: `node:commit-scope:${scope}`,
             hello: {
               kind: "woo.transport.hello.v1",
@@ -1588,14 +1591,11 @@ describe("CFObjectRepository production-shape coverage", () => {
             },
             head,
             transfer: {
-              kind: "woo.state.transfer.shadow.v1",
-              mode: "projection",
-              scope,
               from: head,
               to: head,
-              projection: { kind: "woo.scope_projection.shadow.v1", scope, subject: { id: scope } }
-            },
-            ads: []
+              kind: "frames",
+              frames: []
+            }
           }), { status: 200, headers: { "content-type": "application/json" } }) as Response;
         }
       }))
@@ -1612,18 +1612,28 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       expect(response.status).toBe(101);
       expect(openBodies).toHaveLength(1);
-      expect(openBodies[0]).not.toHaveProperty("open_protocol");
+      expect(openBodies[0]).toMatchObject({
+        open_protocol: "checkpoint_tail.v1",
+        receiver_profile: "browser"
+      });
       expect(sent).toHaveLength(2);
       expect(decodeEnvelope(sent[0])).toMatchObject({
         type: "woo.transport.hello.v1",
         to: "browser:checkpoint-tail-ws"
       });
       expect(decodeEnvelope(sent[1])).toMatchObject({
-        type: "woo.state.transfer.shadow.v1",
+        type: "woo.open.checkpoint_tail.v1",
         to: "browser:checkpoint-tail-ws",
         body: {
-          kind: "woo.state.transfer.shadow.v1",
-          mode: "projection"
+          kind: "woo.open.checkpoint_tail.v1",
+          scope: "$wiz",
+          transfer: {
+            kind: "frames",
+            frames: []
+          },
+          viewer: {
+            actor: "$wiz"
+          }
         }
       });
     } finally {
@@ -1800,6 +1810,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(replies[0].body.commit.serialized_after).toBeUndefined();
       expect(envelopeBodies[0]?.sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: session.id, actor: session.actor })]));
       expect(envelopeBodies[0]).not.toHaveProperty("serialized");
+      expect(envelopeBodies[0]).not.toHaveProperty("receiver_profile");
       const scopeState = commitStates.get("#-1");
       expect(scopeState).toBeDefined();
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT scope FROM v2_commit_scope_meta"))).toEqual([{ scope: "#-1" }]);

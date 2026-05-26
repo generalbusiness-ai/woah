@@ -7,7 +7,7 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { SerializedObject } from "../core/repository";
 import type { WooValue } from "../core/types";
-import type { CheckpointTailOpenTransfer } from "../core/projection-delta";
+import type { BrowserProfile, CheckpointTailOpenTransfer, ProjectionWrite } from "../core/projection-delta";
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
 import { v2ExecutionAdRecord } from "./v2-browser-delegation";
 import type { V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
@@ -18,12 +18,13 @@ export type V2BrowserCacheMutation =
   | { kind: "pending_delete"; id: string }
   | { kind: "projection"; scope: string; head: ShadowScopeHead; projection: WooValue; reset_execution_overlay?: boolean }
   | { kind: "projection_patch"; scope: string; head: ShadowScopeHead; patch: ShadowScopeProjectionPatch }
+  | { kind: "accepted_projection"; scope: string; head: ShadowScopeHead; writes: Array<ProjectionWrite | ProjectionWrite<BrowserProfile>> }
   | { kind: "applied_frame"; frame: ShadowCommitAccepted; transcript?: EffectTranscript }
   | { kind: "transcript"; transcript: EffectTranscript }
   | { kind: "object_page"; hash: string; object: SerializedObject }
   | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage }
   | { kind: "state_pages"; scope: string; pages: Array<{ hash: string; ref: string; page: ShadowStatePage }> }
-  | { kind: "checkpoint_tail"; transfer: CheckpointTailOpenTransfer }
+  | { kind: "checkpoint_tail"; transfer: CheckpointTailOpenTransfer | CheckpointTailOpenTransfer<BrowserProfile> }
   | { kind: "execution_ad"; record: V2ExecutionAdRecord }
   | { kind: "execution_transfer"; record: V2ExecutableTransferRecord };
 
@@ -62,6 +63,14 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
       ? [{ kind: "pending_delete", id: envelope.reply_to }]
       : [];
     if (reply.ok === true && reply.transcript) {
+      if (reply.commit?.projection_writes?.length) {
+        mutations.push({
+          kind: "accepted_projection" as const,
+          scope: reply.commit.position.scope,
+          head: reply.commit.position,
+          writes: reply.commit.projection_writes as Array<ProjectionWrite | ProjectionWrite<BrowserProfile>>
+        });
+      }
       if (reply.commit) mutations.push({ kind: "applied_frame" as const, frame: reply.commit as ShadowCommitAccepted, transcript: reply.transcript });
       mutations.push({ kind: "transcript" as const, transcript: reply.transcript });
       if (reply.commit) mutations.push({ kind: "meta" as const, key: `head:${reply.commit.position.scope}`, value: reply.commit.position });

@@ -277,13 +277,25 @@ export function applyAcceptedShadowFrame(
   // Consumers that receive an accepted frame from the commit authority already
   // have the validation result. Update their local cache from the transcript
   // and authority head without running the expensive authority checks again.
-  if (accepted.projection_writes?.length) {
-    applyProjectionWritesToCommitScopeCache(scope, accepted.projection_writes);
+  const projectionWrites = accepted.projection_writes ?? [];
+  const authorityProjectionWrites = projectionWrites.length > 0 && projectionWritesAreAuthorityRows(projectionWrites);
+  if (authorityProjectionWrites) {
+    applyProjectionWritesToCommitScopeCache(scope, projectionWrites);
   } else {
+    // Browser-profiled projection rows are display material only. They must
+    // never become VM-readable SerializedWorld rows, so authority caches replay
+    // the transcript when a receiver-profiled frame crosses this boundary.
     applyShadowTranscriptToCommitScopeCache(scope, transcript);
   }
   scope.head = structuredClone(accepted.position) as ShadowScopeHead;
-  if (accepted.id) scope.submissions.set(`${accepted.id}:${accepted.transcript_hash}`, structuredClone(accepted) as ShadowCommitAccepted);
+  if (accepted.id) {
+    const cached = structuredClone(accepted) as ShadowCommitAccepted;
+    if (!authorityProjectionWrites && (cached.projection_writes?.length || cached.projection_delta)) {
+      delete cached.projection_writes;
+      delete cached.projection_delta;
+    }
+    scope.submissions.set(`${accepted.id}:${accepted.transcript_hash}`, cached);
+  }
 }
 
 function shadowSubmissionId(submit: ShadowCommitSubmit): string | undefined {
@@ -665,6 +677,106 @@ function projectionWritesForIndexedApply(
   // accepted commit would put O(scope) work back on the hot path this module is
   // removing.
   return coalesceProjectionWrites(writes);
+}
+
+function projectionWritesAreAuthorityRows(writes: readonly ProjectionWrite[]): boolean {
+  for (const write of writes) {
+    if (write.op === "delete") continue;
+    if (write.table === "counters") {
+      if (typeof write.value !== "number") return false;
+      continue;
+    }
+    if (!("row" in write)) return false;
+    switch (write.table) {
+      case "objects":
+        if (!isSerializedObjectRow(write.row)) return false;
+        break;
+      case "sessions":
+        if (!isSerializedSessionRow(write.row)) return false;
+        break;
+      case "logs":
+        if (!isSerializedLogRow(write.row)) return false;
+        break;
+      case "snapshots":
+        if (!isSerializedSnapshotRow(write.row)) return false;
+        break;
+      case "parked_tasks":
+        if (!isSerializedParkedTaskRow(write.row)) return false;
+        break;
+      case "tombstones":
+        if (!isSerializedTombstoneRow(write.row)) return false;
+        break;
+      case "tool_surfaces":
+        if (!isAuthorityToolSurfaceRow(write.row)) return false;
+        break;
+    }
+  }
+  return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isSerializedObjectRow(value: unknown): value is SerializedObject {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    ("parent" in value) &&
+    typeof value.owner === "string" &&
+    ("location" in value) &&
+    isRecord(value.flags) &&
+    typeof value.created === "number" &&
+    typeof value.modified === "number" &&
+    Array.isArray(value.propertyDefs) &&
+    Array.isArray(value.properties) &&
+    Array.isArray(value.propertyVersions) &&
+    Array.isArray(value.verbs) &&
+    Array.isArray(value.children) &&
+    Array.isArray(value.contents) &&
+    Array.isArray(value.eventSchemas);
+}
+
+function isSerializedSessionRow(value: unknown): value is SerializedWorld["sessions"][number] {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string" &&
+    typeof value.actor === "string" &&
+    typeof value.started === "number";
+}
+
+function isSerializedLogRow(value: unknown): value is SerializedWorld["logs"][number][1][number] {
+  if (!isRecord(value)) return false;
+  return typeof value.space === "string" &&
+    typeof value.seq === "number" &&
+    typeof value.ts === "number" &&
+    typeof value.actor === "string" &&
+    Array.isArray(value.observations) &&
+    typeof value.applied_ok === "boolean";
+}
+
+function isSerializedSnapshotRow(value: unknown): value is SerializedWorld["snapshots"][number] {
+  if (!isRecord(value)) return false;
+  return typeof value.space_id === "string" &&
+    typeof value.seq === "number" &&
+    typeof value.ts === "number" &&
+    typeof value.hash === "string";
+}
+
+function isSerializedParkedTaskRow(value: unknown): value is SerializedWorld["parkedTasks"][number] {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string" &&
+    typeof value.parked_on === "string" &&
+    typeof value.state === "string" &&
+    typeof value.created === "number" &&
+    typeof value.origin === "string";
+}
+
+function isSerializedTombstoneRow(value: unknown): value is { id: ObjRef } {
+  return isRecord(value) && typeof value.id === "string";
+}
+
+function isAuthorityToolSurfaceRow(value: unknown): boolean {
+  return isRecord(value) && value.kind === "woo.tool_surface_projection.v1";
 }
 
 function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, writes: ProjectionWrite[]): void {

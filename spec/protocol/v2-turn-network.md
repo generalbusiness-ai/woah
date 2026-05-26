@@ -801,6 +801,51 @@ see `projection_writes` may fall back to the legacy transcript path.
 row bodies. Those markers have `bytes: 0`, are derived from accepted source-row
 changes, and do not require matching `projection_writes` entries.
 
+Projection transfer rows are receiver-profiled. The authority/gateway profile
+uses full materialized rows (`SerializedObject`, `SerializedSession`, log rows,
+snapshots, parked tasks, tombstones, and tool-surface rows). A browser profile
+uses display-only rows:
+
+```ts
+type BrowserObjectRow = {
+  kind: "woo.browser_object_row.v1";
+  id: ObjRef;
+  scope: ObjRef;
+  head: ScopeHead;
+  name?: string;
+  display: Record<string, Json>; // thin UCM21 summary, permission-filtered
+  location?: ObjRef | null;
+  contents?: ObjRef[];
+};
+type BrowserSessionRow = {
+  kind: "woo.browser_session_row.v1";
+  session_id: string;
+  actor: ObjRef;
+  active_scope: ObjRef | null;
+  head: ScopeHead;
+};
+type BrowserLogRow = {
+  kind: "woo.browser_log_row.v1";
+  scope: ObjRef;
+  seq: number;
+  observations: Observation[];
+  head: ScopeHead;
+};
+type BrowserToolRow = {
+  kind: "woo.browser_tool_row.v1";
+  scope: ObjRef;
+  object: ObjRef;
+  verbs: RemoteToolDescriptor[];
+  head: ScopeHead;
+};
+```
+
+`ProjectionWrite`, `ProjectionPage`, and `ScopeCheckpoint` are parameterized by
+this profile. Browsers receive browser-profile rows in accepted-frame writes and
+checkpoint/tail pages; they MUST NOT receive authority-profile
+`SerializedObject` or `SerializedSession` bodies. Browser-profile rows are never
+VM-readable state and cannot satisfy `TurnKey` atoms.
+
 `ApplyResult` is the authority applier's hot-path contract: accepted frame,
 projection delta, projection writes, fanout observations, reply rows, and
 idempotency rows. It is derived from indexed state plus explicit side-channel
@@ -1295,6 +1340,13 @@ executable pages and session/scope metadata whose proof chain is valid for the
 authenticated actor. UI code may render projection rows immediately, but those
 rows do not satisfy `TurnKey` atoms.
 
+Browser checkpoint/tail open is display catch-up into `projection_rows`. A
+browser-profile checkpoint page installs row bodies and advances continuity
+metadata only after the final continuation chunk. A checkpoint's retained
+`frame_tail` is already reflected in the page rows; the browser records it as
+continuity metadata and MUST NOT re-route historical observations or re-apply
+projection writes from that tail.
+
 Accepted frame delivery is keyed by `(scope, seq)`. A browser may receive the
 same accepted frame from the direct reply and from catch-up/state transfers, but
 the UI reducer must see it once. Duplicate receipts may refresh cache metadata
@@ -1505,6 +1557,16 @@ accepted frame confirms, invalidates, or is independent of each optimistic turn:
 turn id, base head, predicted atoms, read cells, write cells, transcript hash,
 and UI patch id.
 
+A browser-local pending turn is conceptually a `TurnProposal`: a locally
+produced `TurnExecRequest` plus transcript hash, read/write cells, and a partial
+projection overlay. The overlay is not a `ProjectionWrite`; it is rendered only
+through UCM21's pending optimistic layer. Phase 1 stores this material in the
+`tentative_turns` journal rather than exposing final `TurnProposal` or
+`ProposalProjectionOverlay` record names. On an open WebSocket, the browser may
+render the proposal before awaiting IndexedDB persistence and then journal it
+best-effort. On queued/offline/reconnect paths, the proposal MUST be persisted
+before it is enqueued for replay.
+
 #### VTN14.5.1 Phase 1 tentative journal
 
 The current browser worker implements the dependency-chain model locally before
@@ -1528,7 +1590,19 @@ not a commit authority.
 When the authoritative reply accepts a turn, the browser removes the matching
 tentative row by turn id or transcript hash, stores the accepted frame and
 accepted transcript, and lets future plans compose from the committed tail or a
-new checkpoint. A `stale_head` conflict is a convergence signal and MUST NOT
+new checkpoint. In Phase 1 those operations are separate idempotent cache
+updates driven by the same inbound reply: projection rows are installed before
+the scope head advances, applied frames are de-duplicated by `(scope, seq)`, and
+tentative cleanup matches by turn id or transcript hash. A worker may therefore
+observe a transient split between optimistic and canonical display layers during
+frame processing, but the split MUST NOT authorize VM reads from `projection_rows`
+or advance executable state without verified pages/transcripts. The head-last,
+non-atomic projection-row install order is the intended Phase 1 durability
+contract: a crash before head advance leaves the previous head and forces a
+cold-open re-fetch, while replay after head advance is duplicate-safe. A later
+dependency-wire milestone may coalesce row install, head advance, accepted-frame
+install, transcript install, and tentative cleanup into one IndexedDB accept
+transaction. A `stale_head` conflict is a convergence signal and MUST NOT
 invalidate the tentative row by itself; an authoritative executor may re-run the
 turn against the newer head, while a non-authoritative delegated executor may
 surface the conflict for a later browser re-plan.
@@ -2259,8 +2333,9 @@ arrives without a continuation. For retained `frames`, the browser applies each
 frame's row-body-complete `projection_writes` to the same row cache before
 deriving the projection at `transfer.to`; a frame continuation means the open is
 not complete until the final chunk arrives. A browser that does not implement
-this envelope must not receive a checkpoint/tail WebSocket open; the server
-rollout flag controls that negotiation.
+this envelope must not receive a checkpoint/tail WebSocket open;
+`WOO_BROWSER_PROJECTION_HOLDER` enables browser-profile holder payloads and the
+narrower browser checkpoint/tail rollout flag controls this negotiation.
 
 The relay MUST select `Sec-WebSocket-Protocol: woo-v2.turn-network.json` or
 reject the upgrade with HTTP 400. A server that accepts the WebSocket without

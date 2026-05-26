@@ -52,7 +52,19 @@ import { hashSource } from "../core/source-hash";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
-import type { AcceptedFrameTransfer, OpenContinuation, OpenTransfer, ProjectionPage, ProjectionWrite, ScopeCheckpoint } from "../core/projection-delta";
+import {
+  browserProfileOpenTransferFromAuthority,
+  browserProfileProjectionWriteFromAuthority,
+  summarizeProjectionWrites,
+  type AcceptedFrameTransfer,
+  type BrowserProfile,
+  type OpenContinuation,
+  type OpenTransfer,
+  type ProjectionDeltaSummary,
+  type ProjectionPage,
+  type ProjectionWrite,
+  type ScopeCheckpoint
+} from "../core/projection-delta";
 import { V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, type ExecutionCapsule } from "../core/executor";
 import {
   isShadowTurnExecReply,
@@ -384,6 +396,7 @@ export class CommitScopeDO {
             startedAt: replayStartedAt
           });
           const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
+          const responseReply = reply ? this.replyForReceiverProfile(reply, input) : null;
           this.emitMetric({
             kind: "v2_envelope",
             scope,
@@ -404,6 +417,9 @@ export class CommitScopeDO {
           return jsonResponse({
             ok: true,
             reply: reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null,
+            ...(responseReply && responseReply !== reply ? {
+              receiver_reply: encodeEnvelope<ShadowEnvelopeReplyBody>(responseReply as ShadowEnvelope<ShadowEnvelopeReplyBody>)
+            } : {}),
             head: relay.commit_scope.head,
             fanout
           } satisfies CommitScopeEnvelopeResponse);
@@ -662,16 +678,23 @@ export class CommitScopeDO {
   ): CommitScopeOpenCheckpointTailResponse | null {
     const budget = boundedPositiveInteger(input.transfer_budget_bytes, CHECKPOINT_TRANSFER_DEFAULT_BYTES, CHECKPOINT_TRANSFER_MAX_BYTES);
     const maxTailFrames = boundedPositiveInteger(input.max_tail_frames, 200, 200);
-    const transfer = input.continuation !== undefined
+    const authorityTransfer = input.continuation !== undefined
       ? this.openContinuationTransfer(relay.commit_scope.scope, input.continuation, budget)
       : this.openInitialCheckpointTailTransfer(relay, input, maxTailFrames, budget);
-    if (!transfer) {
+    if (!authorityTransfer) {
       if (input.continuation !== undefined) return null;
       this.scheduleCheckpointBuild(relay, "checkpoint_tail_pending");
       return null;
     }
     const browser = this.browserFor(relay, input);
     subscribeShadowBrowserNode(browser, input.scope);
+    const transfer = input.receiver_profile === "browser"
+      ? browserProfileOpenTransferFromAuthority({
+        transfer: authorityTransfer,
+        serialized: this.serializedProjectionWorld(),
+        viewer: { actor: input.actor, session: input.session }
+      })
+      : authorityTransfer;
     return {
       ok: true,
       open_protocol: "checkpoint_tail.v1",
@@ -1079,45 +1102,131 @@ export class CommitScopeDO {
   }
 
   private objectProjectionPages(): ProjectionPage[] {
-    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
-      "SELECT body FROM v2_commit_scope_object ORDER BY id"
-    )).map((row) => JSON.parse(row.body) as SerializedObject);
-    return projectionPages("objects", rows);
+    return projectionPages("objects", this.loadObjectRows());
   }
 
   private sessionProjectionPages(): ProjectionPage[] {
-    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
-      "SELECT body FROM v2_commit_scope_session ORDER BY id"
-    )).map((row) => JSON.parse(row.body) as SerializedSession);
-    return projectionPages("sessions", rows);
+    return projectionPages("sessions", this.loadSessionRows());
   }
 
   private logProjectionPages(): ProjectionPage[] {
-    const rows = sqlRows<{ space: string; body: string }>(this.state.storage.sql.exec(
-      "SELECT space, body FROM v2_commit_scope_log ORDER BY space, seq"
-    )).map((row) => ({ space: row.space as ObjRef, entry: JSON.parse(row.body) as SerializedWorld["logs"][number][1][number] }));
-    return projectionPages("logs", rows);
+    return projectionPages("logs", this.loadLogRows().flatMap(([, entries]) => entries));
   }
 
   private snapshotProjectionPages(): ProjectionPage[] {
-    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
-      "SELECT body FROM v2_commit_scope_snapshot ORDER BY space, seq"
-    )).map((row) => JSON.parse(row.body) as SerializedWorld["snapshots"][number]);
-    return projectionPages("snapshots", rows);
+    return projectionPages("snapshots", this.loadSnapshotRows());
   }
 
   private parkedTaskProjectionPages(): ProjectionPage[] {
-    const rows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
-      "SELECT body FROM v2_commit_scope_task ORDER BY id"
-    )).map((row) => JSON.parse(row.body) as SerializedWorld["parkedTasks"][number]);
-    return projectionPages("parked_tasks", rows);
+    return projectionPages("parked_tasks", this.loadParkedTaskRows());
   }
 
   private tombstoneProjectionPages(): ProjectionPage[] {
-    const rows = sqlRows<{ id: string }>(this.state.storage.sql.exec(
+    return projectionPages("tombstones", this.loadTombstoneRows());
+  }
+
+  private serializedProjectionWorld(): SerializedWorld {
+    const counters = this.loadPersistedCounters();
+    return {
+      version: 1,
+      objectCounter: counters.objectCounter,
+      parkedTaskCounter: counters.parkedTaskCounter,
+      sessionCounter: counters.sessionCounter,
+      objects: this.loadObjectRows(),
+      sessions: this.loadSessionRows(),
+      logs: this.loadLogRows(),
+      snapshots: this.loadSnapshotRows(),
+      parkedTasks: this.loadParkedTaskRows(),
+      tombstones: this.loadTombstoneRows().map((row) => row.id)
+    };
+  }
+
+  private loadPersistedCounters(): Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter"> {
+    const row = sqlRows<{ object_counter: number; parked_task_counter: number; session_counter: number }>(this.state.storage.sql.exec(
+      "SELECT object_counter, parked_task_counter, session_counter FROM v2_commit_scope_meta WHERE id = 'current' LIMIT 1"
+    ))[0] ?? null;
+    return {
+      objectCounter: Number(row?.object_counter ?? 1),
+      parkedTaskCounter: Number(row?.parked_task_counter ?? 1),
+      sessionCounter: Number(row?.session_counter ?? 1)
+    };
+  }
+
+  private loadObjectRows(): SerializedObject[] {
+    return sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_object ORDER BY id"
+    )).map((row) => JSON.parse(row.body) as SerializedObject);
+  }
+
+  private loadSessionRows(): SerializedSession[] {
+    return sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_session ORDER BY id"
+    )).map((row) => JSON.parse(row.body) as SerializedSession);
+  }
+
+  private loadLogRows(): SerializedWorld["logs"] {
+    const rows = sqlRows<{ space: string; body: string }>(this.state.storage.sql.exec(
+      "SELECT space, body FROM v2_commit_scope_log ORDER BY space, seq"
+    ));
+    const bySpace = new Map<ObjRef, SerializedWorld["logs"][number][1]>();
+    for (const row of rows) {
+      const space = row.space as ObjRef;
+      const entries = bySpace.get(space) ?? [];
+      entries.push(JSON.parse(row.body) as SerializedWorld["logs"][number][1][number]);
+      bySpace.set(space, entries);
+    }
+    return Array.from(bySpace, ([space, entries]) => [space, entries] as [ObjRef, SerializedWorld["logs"][number][1]]);
+  }
+
+  private loadSnapshotRows(): SerializedWorld["snapshots"] {
+    return sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_snapshot ORDER BY space, seq"
+    )).map((row) => JSON.parse(row.body) as SerializedWorld["snapshots"][number]);
+  }
+
+  private loadParkedTaskRows(): SerializedWorld["parkedTasks"] {
+    return sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_task ORDER BY id"
+    )).map((row) => JSON.parse(row.body) as SerializedWorld["parkedTasks"][number]);
+  }
+
+  private loadTombstoneRows(): Array<{ id: ObjRef }> {
+    return sqlRows<{ id: string }>(this.state.storage.sql.exec(
       "SELECT id FROM v2_commit_scope_tombstone ORDER BY id"
     )).map((row) => ({ id: row.id as ObjRef }));
-    return projectionPages("tombstones", rows);
+  }
+
+  private replyForReceiverProfile(
+    reply: ShadowEnvelope<ShadowEnvelopeReplyBody>,
+    input: CommitScopeEnvelopeRequest
+  ): ShadowEnvelope<ShadowEnvelopeReplyBody> {
+    if (input.receiver_profile !== "browser") return reply;
+    const body = reply.body;
+    if (!isShadowTurnExecReply(body) || body.ok !== true || !body.commit) return reply;
+    const authorityWrites = body.commit.projection_writes ?? [];
+    if (authorityWrites.length === 0 && !body.commit.projection_delta) return reply;
+    const serialized = this.serializedProjectionWorld();
+    const browserWrites = authorityWrites
+      .map((write) => browserProfileProjectionWriteFromAuthority({
+        write,
+        serialized,
+        scope: body.commit!.position.scope,
+        head: body.commit!.position,
+        viewer: { actor: input.actor, session: input.session }
+      }))
+      .filter((write): write is ProjectionWrite<BrowserProfile> => write !== null);
+    const projectionDelta = browserProjectionDeltaFromWrites(browserWrites, body.commit.projection_delta);
+    return {
+      ...reply,
+      body: {
+        ...body,
+        commit: {
+          ...body.commit,
+          projection_delta: projectionDelta,
+          projection_writes: browserWrites
+        }
+      }
+    } as ShadowEnvelope<ShadowEnvelopeReplyBody>;
   }
 
   private fanoutEnvelopes(
@@ -1846,6 +1955,7 @@ type CommitScopeBaseRequest = {
   token: string;
   session: string;
   actor: ObjRef;
+  receiver_profile?: "authority" | "browser";
   sessions: SerializedSession[];
   session_objects?: SerializedObject[];
   authority?: SerializedAuthoritySlice;
@@ -1880,7 +1990,7 @@ type CommitScopeOpenCheckpointTailResponse = {
   relay: string;
   hello: ShadowTransportHello;
   head: ShadowScopeHead;
-  transfer: OpenTransfer;
+  transfer: OpenTransfer | OpenTransfer<BrowserProfile>;
 };
 
 type CommitScopeEnvelopeRequest = CommitScopeBaseRequest & {
@@ -1895,6 +2005,7 @@ type CommitScopeStateTransferRequest = CommitScopeBaseRequest & {
 type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
+  receiver_reply?: string | null;
   head: ShadowScopeHead;
   fanout: Array<{ node: string; envelope: string }>;
 };
@@ -2247,7 +2358,7 @@ function acceptedFrameForTransfer(frame: ShadowCommitAccepted): ShadowCommitAcce
 
 function projectionPages(table: "objects", rows: SerializedObject[]): Extract<ProjectionPage, { table: "objects" }>[];
 function projectionPages(table: "sessions", rows: SerializedSession[]): Extract<ProjectionPage, { table: "sessions" }>[];
-function projectionPages(table: "logs", rows: Array<{ space: ObjRef; entry: SerializedWorld["logs"][number][1][number] }>): Extract<ProjectionPage, { table: "logs" }>[];
+function projectionPages(table: "logs", rows: SerializedWorld["logs"][number][1]): Extract<ProjectionPage, { table: "logs" }>[];
 function projectionPages(table: "snapshots", rows: SerializedWorld["snapshots"]): Extract<ProjectionPage, { table: "snapshots" }>[];
 function projectionPages(table: "parked_tasks", rows: SerializedWorld["parkedTasks"]): Extract<ProjectionPage, { table: "parked_tasks" }>[];
 function projectionPages(table: "tombstones", rows: Array<{ id: ObjRef }>): Extract<ProjectionPage, { table: "tombstones" }>[];
@@ -2278,6 +2389,17 @@ function projectionPages(table: ProjectionPage["table"], rows: unknown[]): Proje
   }
   flush();
   return pages;
+}
+
+function browserProjectionDeltaFromWrites(
+  writes: ProjectionWrite<BrowserProfile>[],
+  authorityDelta: ProjectionDeltaSummary | undefined
+): ProjectionDeltaSummary {
+  const delta = summarizeProjectionWrites(writes as ProjectionWrite[]);
+  if (authorityDelta?.tool_surface_sources?.length) {
+    delta.tool_surface_sources = structuredClone(authorityDelta.tool_surface_sources);
+  }
+  return delta;
 }
 
 function requestContentLength(request: Request): number | undefined {

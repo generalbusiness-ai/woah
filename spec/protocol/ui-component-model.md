@@ -1304,7 +1304,8 @@ object models for objects the framework has in scope.
 The projection has ordered layers:
 
 1. **Canonical snapshot layer** — the latest permission-filtered object
-   snapshots fetched from REST, replay, or an equivalent host snapshot source.
+   snapshots fetched from REST, replay, browser-profile projection rows, or an
+   equivalent host snapshot source.
 2. **Sequenced observation layer** — deterministic reductions from
    `op:"applied"` observations, applied in `(space, seq, index)` order.
 3. **Live preview layer** — lossy direct-call observations and gesture previews
@@ -1317,6 +1318,13 @@ layers take precedence for fields they patch. Unpatched fields continue to
 come from lower layers. A component that moves a pinboard note or drags a
 dubspace control therefore sees the new position/value immediately through
 the same `observe()` path it uses after the server reply arrives.
+
+Browser-profile projection rows are canonical display input only. They may
+carry thin object/session/log/tool summaries and MUST NOT be treated as
+executable VM state. A pending local turn record (`tentative_turns` in Phase 1,
+the `TurnProposal` model in the final dependency-wire design) contributes only
+to layer 4 until the authority accepts the matching transcript hash and the
+accepted projection writes are installed in the canonical layer.
 
 Refreshing the canonical snapshot layer MUST NOT by itself overwrite a higher
 layer. A stale scoped snapshot response can update the canonical base, but

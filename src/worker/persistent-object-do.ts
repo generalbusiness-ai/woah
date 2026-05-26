@@ -90,6 +90,7 @@ import { stableShadowJson } from "../core/shadow-cell-version";
 import {
   projectionDeltaMissingWrites,
   summarizeProjectionWrites,
+  type BrowserProfile,
   type CheckpointTailOpenTransfer,
   type OpenTransfer,
   type ProjectionDeltaSummary,
@@ -124,6 +125,7 @@ export interface Env {
   WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS?: string;
   WOO_V2_CHECKPOINT_TAIL_OPEN?: string;
   WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN?: string;
+  WOO_BROWSER_PROJECTION_HOLDER?: string;
   WOO_V2_EXECUTION_CAPSULE?: string;
   // Workers Analytics Engine binding. The metrics-sink module writes every
   // `MetricEvent` here (modulo sampling) so /admin/stats can query historical
@@ -176,7 +178,7 @@ type CommitScopeCheckpointTailOpenResponse = {
   relay: string;
   head: ShadowScopeHead;
   hello: CommitScopeLegacyOpenResponse["hello"];
-  transfer: OpenTransfer;
+  transfer: OpenTransfer | OpenTransfer<BrowserProfile>;
 };
 
 type CommitScopeOpenResponse = CommitScopeLegacyOpenResponse | CommitScopeCheckpointTailOpenResponse;
@@ -184,6 +186,7 @@ type CommitScopeOpenResponse = CommitScopeLegacyOpenResponse | CommitScopeCheckp
 type CommitScopeEnvelopeResponse = {
   ok: true;
   reply: string | null;
+  receiver_reply?: string | null;
   fanout?: Array<{ node: string; envelope: string }>;
   head?: ShadowScopeHead;
 };
@@ -548,15 +551,12 @@ export class PersistentObjectDO {
     return envFlag(this.env.WOO_V2_CHECKPOINT_TAIL_OPEN);
   }
 
+  private browserProjectionHolderEnabled(): boolean {
+    return envFlag(this.env.WOO_BROWSER_PROJECTION_HOLDER);
+  }
+
   private browserCheckpointTailOpenEnabled(): boolean {
-    if (!this.checkpointTailOpenEnabled() || !envFlag(this.env.WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN)) return false;
-    // Browser checkpoint/tail stays fail-closed until BrowserProfile pages land
-    // and the final checkpoint frame_tail is either consumed by the browser row
-    // installer or split behind its own transfer budget.
-    console.warn("woo.v2_browser_checkpoint_tail.disabled", {
-      reason: "browser_profile_and_frame_tail_budget_required"
-    });
-    return false;
+    return this.browserProjectionHolderEnabled() && this.checkpointTailOpenEnabled() && envFlag(this.env.WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN);
   }
 
   private withCheckpointTailOpen(body: Record<string, unknown>): Record<string, unknown> {
@@ -3722,6 +3722,7 @@ export class PersistentObjectDO {
         token,
         session: session.id,
         actor: session.actor,
+        ...(this.browserProjectionHolderEnabled() ? { receiver_profile: "browser" as const } : {}),
         ...authority,
         ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
         ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {})
@@ -3875,11 +3876,13 @@ export class PersistentObjectDO {
         token: att.token,
         session: att.sessionId,
         actor: att.actor,
+        ...(this.browserProjectionHolderEnabled() ? { receiver_profile: "browser" as const } : {}),
         envelope: encoded
       });
       const delivery = await this.deliverV2Fanout(world, att.scope, result, att.sessionId, att.node);
       await this.applyV2CommittedTranscript(world, result.reply, att.sessionId, delivery.localHostMaterialized);
-      if (result.reply) ws.send(result.reply);
+      const receiverReply = result.receiver_reply ?? result.reply;
+      if (receiverReply) ws.send(receiverReply);
     } catch (err) {
       ws.send(encodeEnvelope(buildTransportErrorEnvelope({
         id: `${this.durableHostKey()}:error:${Date.now()}`,
@@ -3925,7 +3928,7 @@ export class PersistentObjectDO {
         kind: "woo.open.checkpoint_tail.v1",
         scope: input.scope,
         head: current.head,
-        transfer: current.transfer,
+        transfer: current.transfer as CheckpointTailOpenTransfer["transfer"],
         viewer: { actor: input.actor, session: input.sessionId }
       };
       const envelope = encodeEnvelope({
