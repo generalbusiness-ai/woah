@@ -43,6 +43,11 @@ const CLASSIFICATION = {
     signal: "phase, path, bytes, count, status",
     endState: "Client cache/projection work should consume checkpoints, tails, and projection deltas."
   },
+  browser_metrics_log_sampled: {
+    bucket: "browser_projection",
+    signal: "suppressed browser metric log count",
+    endState: "Instrumentation only; high suppression indicates browser_activity volume, not a separate data path."
+  },
   compose_look: {
     bucket: "projection_read",
     signal: "present_count, contents_count, remote_titles, remote_describe_batches",
