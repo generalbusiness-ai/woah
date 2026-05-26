@@ -804,8 +804,12 @@ changes, and do not require matching `projection_writes` entries.
 `ApplyResult` is the authority applier's hot-path contract: accepted frame,
 projection delta, projection writes, fanout observations, reply rows, and
 idempotency rows. It is derived from indexed state plus explicit side-channel
-rows. Producing it by exporting or scanning a full `SerializedWorld` is
-non-conforming for normal accepted commits.
+rows. Current indexed transcript apply emits object, session, log, and counter
+rows and folds explicit `projectionWrites` recorded by snapshot, parked-task,
+and tombstone mutation sites, including required counter updates; side-channel
+rows must not come from a post-apply table diff. Producing it by exporting or
+scanning a full
+`SerializedWorld` is non-conforming for normal accepted commits.
 
 `atoms` are the state/code/metadata closure that a candidate must probably
 cover before execution. `write_atoms` identify write-authority-sensitive cells
@@ -2227,9 +2231,12 @@ For a browser WebSocket open, a gateway MUST negotiate `checkpoint_tail.v1` only
 when the returned pages are safe for the browser receiver profile. The current
 authority-shaped checkpoint rows are server-side only; a browser holder stays on
 legacy display transfer unless a browser-safe projection profile is active and a
-separate browser rollout gate is enabled. When browser-safe checkpoint/tail is
-negotiated, the gateway sends `TransportHello` first and then wraps the returned
-open transfer in:
+separate browser rollout gate is enabled. That gate also requires final
+checkpoint `frame_tail` handling: the browser must either consume the retained
+tail into its row/applied-frame cache or the gateway must split it under a
+separate byte budget. When browser-safe checkpoint/tail is negotiated, the
+gateway sends `TransportHello` first and then wraps the returned open transfer
+in:
 
 ```ts
 type CheckpointTailOpenEnvelope = {

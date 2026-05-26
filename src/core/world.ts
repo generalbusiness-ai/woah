@@ -45,7 +45,7 @@ import {
   transcriptLogEntry,
   transcriptSessionActiveScope
 } from "./shadow-commit-scope";
-import type { ProjectionWrite } from "./projection-delta";
+import { projectionRowBytes, type ProjectionWrite } from "./projection-delta";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -646,6 +646,48 @@ export class WooWorld {
       name,
       ...(detail ? { detail } : {})
     });
+  }
+
+  private recordProjectionWrite(write: Extract<ProjectionWrite, { table: "snapshots" | "parked_tasks" | "tombstones" | "counters" }>): void {
+    this.recordTurnEvent({ kind: "projection_write", write });
+  }
+
+  private recordSnapshotProjectionUpsert(snapshot: SpaceSnapshotRecord): void {
+    this.recordProjectionWrite({
+      table: "snapshots",
+      key: { space: snapshot.space_id, seq: snapshot.seq },
+      op: "upsert",
+      row: snapshot,
+      bytes: projectionRowBytes(snapshot)
+    });
+  }
+
+  private recordParkedTaskProjectionUpsert(task: ParkedTaskRecord): void {
+    this.recordProjectionWrite({
+      table: "parked_tasks",
+      key: task.id,
+      op: "upsert",
+      row: task,
+      bytes: projectionRowBytes(task)
+    });
+  }
+
+  private recordParkedTaskCounterProjectionUpsert(): void {
+    this.recordProjectionWrite({
+      table: "counters",
+      key: "parkedTaskCounter",
+      op: "upsert",
+      value: this.parkedTaskCounter,
+      bytes: projectionRowBytes({ key: "parkedTaskCounter", value: this.parkedTaskCounter })
+    });
+  }
+
+  private recordParkedTaskProjectionDelete(id: string): void {
+    this.recordProjectionWrite({ table: "parked_tasks", key: id, op: "delete", bytes: 0 });
+  }
+
+  private recordTombstoneProjectionUpsert(id: ObjRef): void {
+    this.recordProjectionWrite({ table: "tombstones", key: id, op: "upsert", row: { id }, bytes: projectionRowBytes({ id }) });
   }
 
   setLogicalInputsForReplay(inputs: Array<{ name: string; value: WooValue }>): void {
@@ -5865,6 +5907,7 @@ export class WooWorld {
     }
     for (const id of killedTasks) {
       this.parkedTasks.delete(id);
+      this.recordParkedTaskProjectionDelete(id);
       this.deletePersistedTask(id);
     }
 
@@ -5918,6 +5961,7 @@ export class WooWorld {
     // Steps 8/9: storage delete and tombstone insert.
     this.objects.delete(objRef);
     this.tombstones.add(objRef);
+    this.recordTombstoneProjectionUpsert(objRef);
     this.deletePersistedObject(objRef);
     this.persistTombstone(objRef);
     if (this.presenceIndexBuilt) this.invalidatePresenceIndex();
@@ -5939,6 +5983,7 @@ export class WooWorld {
     if (!Number.isFinite(seconds)) throw wooError("E_TYPE", "fork delay must be numeric", seconds);
     const id = `ptask_${this.parkedTaskCounter++}`;
     this.persistCounters();
+    this.recordParkedTaskCounterProjectionUpsert();
     const now = Date.now();
     const task: ParkedTaskRecord = {
       id,
@@ -5962,6 +6007,7 @@ export class WooWorld {
       }
     };
     this.parkedTasks.set(id, task);
+    this.recordParkedTaskProjectionUpsert(task);
     this.persistTask(task);
     this.persist();
     return id;
@@ -5971,6 +6017,7 @@ export class WooWorld {
     if (!Number.isFinite(seconds)) throw wooError("E_TYPE", "suspend delay must be numeric", seconds);
     const id = `ptask_${this.parkedTaskCounter++}`;
     this.persistCounters();
+    this.recordParkedTaskCounterProjectionUpsert();
     const now = Date.now();
     const parked: ParkedTaskRecord = {
       id,
@@ -5993,6 +6040,7 @@ export class WooWorld {
       }
     };
     this.parkedTasks.set(id, parked);
+    this.recordParkedTaskProjectionUpsert(parked);
     this.persistTask(parked);
     this.persist();
     return id;
@@ -6001,6 +6049,7 @@ export class WooWorld {
   parkReadContinuation(ctx: CallContext, player: ObjRef, task: SerializedVmTask): string {
     const id = `ptask_${this.parkedTaskCounter++}`;
     this.persistCounters();
+    this.recordParkedTaskCounterProjectionUpsert();
     const now = Date.now();
     const parked: ParkedTaskRecord = {
       id,
@@ -6023,6 +6072,7 @@ export class WooWorld {
       }
     };
     this.parkedTasks.set(id, parked);
+    this.recordParkedTaskProjectionUpsert(parked);
     this.persistTask(parked);
     this.persist();
     return id;
@@ -6038,6 +6088,7 @@ export class WooWorld {
       .sort((left, right) => left.created - right.created || left.id.localeCompare(right.id))[0];
     if (!task) return null;
     this.parkedTasks.delete(task.id);
+    this.recordParkedTaskProjectionDelete(task.id);
     this.deletePersistedTask(task.id);
     const result = await this.runParkedTask(task, input);
     this.persist(true);
@@ -6067,6 +6118,7 @@ export class WooWorld {
     const results: ParkedTaskRun[] = [];
     for (const task of due) {
       this.parkedTasks.delete(task.id);
+      this.recordParkedTaskProjectionDelete(task.id);
       this.deletePersistedTask(task.id);
       results.push(await this.runParkedTask(task));
     }
@@ -7142,6 +7194,7 @@ export class WooWorld {
     };
     this.snapshots = this.snapshots.filter((item) => !(item.space_id === space && item.seq === seq));
     this.snapshots.push(snapshot);
+    this.recordSnapshotProjectionUpsert(snapshot);
     this.setProp(space, "last_snapshot_seq", seq);
     this.repository?.saveSpaceSnapshot?.(snapshot);
     this.persist();
@@ -7837,6 +7890,7 @@ export class WooWorld {
     for (const [id, task] of Array.from(this.parkedTasks.entries())) {
       if (task.state === "awaiting_read" && task.awaiting_player === actor) {
         this.parkedTasks.delete(id);
+        this.recordParkedTaskProjectionDelete(id);
         this.deletePersistedTask(id);
       }
     }

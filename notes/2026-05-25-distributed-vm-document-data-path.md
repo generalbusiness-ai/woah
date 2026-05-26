@@ -1094,7 +1094,9 @@ Negotiation and cutover:
   gated separately and remains off in this landing because these checkpoint
   pages are authority-shaped; browser holders need the BrowserProfile
   projection rows from `notes/2026-05-25-browser-holder-node.md` before they can
-  safely receive checkpoint/tail pages.
+  safely receive checkpoint/tail pages. The browser gate also stays fail-closed
+  until final checkpoint `frame_tail` is consumed by the browser installer or
+  split under a separate byte budget.
 - A frames response is returned only if `known_head` is within retained tail,
   the missing tail is at most 200 frames, every returned frame includes its
   `projection_writes`, and encoded response size is within
@@ -1213,11 +1215,12 @@ outside the first milestone.
 
 2. Collapse to one applier contract.
    Make the commit path report `ApplyResult`. The applier returns only
-   object/session/log/counter row ops. The caller folds in snapshot,
-   parked-task, tombstone, tool-surface, reply, and idempotency side-channel
-   ops. `projection_writes` include row bodies for every touched upsert so
-   fanout and tail transfer do not fetch rows after receiving keys. Neither side
-   may scan a post-apply world. The array-based
+   object/session/log/counter row ops plus explicit `projectionWrites` recorded
+   at snapshot, parked-task, and tombstone mutation sites, including required
+   counter updates. The caller folds in tool-surface, reply, and idempotency
+   side-channel ops. `projection_writes` include row bodies for every touched
+   upsert so fanout and tail transfer do not fetch rows after receiving keys.
+   Neither side may scan a post-apply world. The array-based
    `applyShadowTranscriptToCommittedState` is deleted or retained only as a
    temporary equivalence test oracle; it must not grow a second `ApplyResult`
    path.

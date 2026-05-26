@@ -206,7 +206,7 @@ export function projectionWriteIdentity(write: ProjectionWrite): string {
   return `${write.table}:${JSON.stringify(write.key)}`;
 }
 
-export function coalesceProjectionWrites(writes: ProjectionWrite[]): ProjectionWrite[] {
+export function coalesceProjectionWrites(writes: readonly ProjectionWrite[]): ProjectionWrite[] {
   const byKey = new Map<string, ProjectionWrite>();
   for (const write of writes) byKey.set(projectionWriteIdentity(write), write);
   return Array.from(byKey.values()).sort(compareProjectionWrites);
@@ -253,7 +253,7 @@ function projectionWriteHasBody(write: ProjectionWrite): boolean {
   return "row" in write || "value" in write;
 }
 
-export function summarizeProjectionWrites(writes: ProjectionWrite[]): ProjectionDeltaSummary {
+export function summarizeProjectionWrites(writes: readonly ProjectionWrite[]): ProjectionDeltaSummary {
   const delta: ProjectionDeltaSummary = { projection_bytes: 0 };
   const add = <Key>(field: keyof Omit<ProjectionDeltaSummary, "projection_bytes">, op: RowOp<Key>): void => {
     const current = (delta[field] ?? []) as RowOp<Key>[];

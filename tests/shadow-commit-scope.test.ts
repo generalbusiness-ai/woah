@@ -90,6 +90,87 @@ describe("shadow commit scope", () => {
     })));
     expect(applied.projection_delta.projection_bytes).toBeGreaterThan(0);
   });
+
+  it("does not scan side-channel tables to synthesize projection writes", () => {
+    const before = {
+      ...serializedWorld(),
+      snapshots: [
+        { space_id: "room", seq: 1, ts: 1, state: { before: true }, hash: "snapshot-before" }
+      ],
+      parkedTasks: [{
+        id: "ptask_existing",
+        parked_on: "room",
+        state: "suspended" as const,
+        resume_at: null,
+        awaiting_player: null,
+        correlation_id: null,
+        serialized: {},
+        created: 1,
+        origin: "room"
+      }],
+      tombstones: ["recycled_existing"]
+    };
+    const transcript: EffectTranscript = {
+      ...addChildTranscript(),
+      id: "side-channel-no-scan",
+      hash: "transcript:side-channel-no-scan",
+      creates: [],
+      writes: [{
+        cell: { kind: "prop", object: "room", name: "summary" },
+        value: "updated",
+        op: "set"
+      }]
+    };
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: before });
+
+    const applied = applyShadowTranscriptToIndexedState(scope.state, transcript);
+
+    expect(applied.projection_delta).not.toHaveProperty("snapshots");
+    expect(applied.projection_delta).not.toHaveProperty("parked_tasks");
+    expect(applied.projection_delta).not.toHaveProperty("tombstones");
+    const tables = applied.projection_writes.map((write) => write.table);
+    expect(tables).toContain("objects");
+    expect(tables).not.toContain("snapshots");
+    expect(tables).not.toContain("parked_tasks");
+    expect(tables).not.toContain("tombstones");
+  });
+
+  it("folds explicit side-channel projection writes without scanning side-channel tables", () => {
+    const snapshot = { space_id: "room", seq: 2, ts: 2, state: { after: true }, hash: "snapshot-after" };
+    const parkedTask = {
+      id: "ptask_new",
+      parked_on: "room",
+      state: "suspended" as const,
+      resume_at: 10,
+      awaiting_player: null,
+      correlation_id: null,
+      serialized: {},
+      created: 2,
+      origin: "room"
+    };
+    const transcript: EffectTranscript = {
+      ...addChildTranscript(),
+      id: "side-channel-explicit",
+      hash: "transcript:side-channel-explicit",
+      creates: [],
+      writes: [],
+      projectionWrites: [
+        { table: "snapshots", key: { space: "room", seq: 2 }, op: "upsert", row: snapshot, bytes: 10 },
+        { table: "parked_tasks", key: "ptask_new", op: "upsert", row: parkedTask, bytes: 11 },
+        { table: "tombstones", key: "recycled_new", op: "upsert", row: { id: "recycled_new" }, bytes: 12 }
+      ]
+    };
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+
+    const applied = applyShadowTranscriptToIndexedState(scope.state, transcript);
+
+    expect(applied.projection_delta.snapshots).toEqual([{ key: { space: "room", seq: 2 }, op: "upsert", bytes: 10 }]);
+    expect(applied.projection_delta.parked_tasks).toEqual([{ key: "ptask_new", op: "upsert", bytes: 11 }]);
+    expect(applied.projection_delta.tombstones).toEqual([{ key: "recycled_new", op: "upsert", bytes: 12 }]);
+    expect(applied.state.snapshots).toContainEqual(snapshot);
+    expect(applied.state.parkedTasks).toContainEqual(parkedTask);
+    expect(applied.state.tombstones).toContain("recycled_new");
+  });
 });
 
 function addChildTranscript(): EffectTranscript {

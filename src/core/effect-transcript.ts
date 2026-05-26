@@ -2,7 +2,7 @@ import type { SerializedWorld } from "./repository";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
 import type { ErrorValue, ObjRef, Observation, WooValue } from "./types";
-import type { RecordedCell, RecordedCellWriteOp, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
+import type { RecordedCell, RecordedCellWriteOp, RecordedProjectionWrite, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
 import { nativePrimitiveContractValue, nativePrimitiveIsTranscriptTracked } from "./native-primitive-contract";
 import { readObjectPropertyValue, type PropertyReadableObject } from "./property-read";
 
@@ -67,6 +67,7 @@ export type EffectTranscript = {
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];
   moves: TranscriptMove[];
+  projectionWrites?: RecordedProjectionWrite[];
   observations: Observation[];
   logicalInputs: Array<{ name: string; value: WooValue }>;
   untrackedEffects: TranscriptUntrackedEffect[];
@@ -99,9 +100,11 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const stateProbes: TranscriptCell[] = [];
   const creates: TranscriptCreate[] = [];
   const moves: TranscriptMove[] = [];
+  const projectionWrites: RecordedProjectionWrite[] = [];
   const observations: Observation[] = [];
   const logicalInputs: Array<{ name: string; value: WooValue }> = [];
   const untrackedEffects: TranscriptUntrackedEffect[] = [];
+  let turnFinishedOk = false;
   const incompleteReasons = new Set<string>();
   let result: WooValue | undefined;
   let error: ErrorValue | undefined;
@@ -169,6 +172,9 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           writer: event.writer
         });
         break;
+      case "projection_write":
+        projectionWrites.push(structuredClone(event.write) as RecordedProjectionWrite);
+        break;
       case "observe":
         observations.push(event.observation);
         break;
@@ -204,6 +210,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         incompleteReasons.add(event.name);
         break;
       case "turn_finish":
+        turnFinishedOk = event.ok;
         if (event.ok) result = event.result;
         else error = event.error;
         break;
@@ -231,6 +238,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     writes,
     creates,
     moves,
+    ...(turnFinishedOk && projectionWrites.length > 0 ? { projectionWrites } : {}),
     observations,
     logicalInputs,
     untrackedEffects,
@@ -285,7 +293,38 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     }
   }
 
+  for (const write of transcript.projectionWrites ?? []) {
+    const error = projectionWriteShapeError(write);
+    if (error) errors.push(error);
+  }
+
   return { ok: errors.length === 0, errors };
+}
+
+function projectionWriteShapeError(write: RecordedProjectionWrite): string | null {
+  switch (write.table) {
+    case "snapshots":
+      if (write.op === "delete") return write.bytes === 0 ? null : "projection_write snapshots delete must have zero bytes";
+      return write.row.space_id === write.key.space && write.row.seq === write.key.seq
+        ? null
+        : `projection_write snapshots key mismatch ${write.key.space}@${write.key.seq}`;
+    case "parked_tasks":
+      if (write.op === "delete") return write.bytes === 0 ? null : "projection_write parked_tasks delete must have zero bytes";
+      return write.row.id === write.key
+        ? null
+        : `projection_write parked_tasks key mismatch ${write.key}`;
+    case "tombstones":
+      if (write.op === "delete") return write.bytes === 0 ? null : "projection_write tombstones delete must have zero bytes";
+      return write.row.id === write.key
+        ? null
+        : `projection_write tombstones key mismatch ${write.key}`;
+    case "counters":
+      return write.op === "upsert"
+        ? null
+        : `projection_write counters unsupported op ${(write as { op?: string }).op ?? "unknown"}`;
+    default:
+      return `projection_write unsupported table ${(write as { table?: string }).table ?? "unknown"}`;
+  }
 }
 
 function sameTurnRead(transcript: EffectTranscript, read: TranscriptRead): { ok: true } | { ok: false; reason?: "own_write_mismatch" } {

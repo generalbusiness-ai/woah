@@ -90,6 +90,50 @@ describe("turn recorder", () => {
     expect(rankCapabilityAdsForTurn([ad, cheaper], turnKey).map((item) => item.node)).toEqual(["node-b", "node-a"]);
   });
 
+  it("records parked-task projection writes at the mutation site", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-projection");
+    const actor = session.actor;
+    world.createObject({ id: "scheduler", name: "Scheduler", parent: "$thing", owner: actor });
+    expect(installVerb(
+      world,
+      "scheduler",
+      "noop",
+      "verb :noop() rxd { return 0; }",
+      null
+    ).ok).toBe(true);
+    expect(installVerb(
+      world,
+      "scheduler",
+      "queue",
+      "verb :queue() rxd { return fork(60, this, \"noop\", []); }",
+      null
+    ).ok).toBe(true);
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("queue-task", actor, "scheduler", "queue", []);
+
+    expect(result.op).toBe("result");
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.projectionWrites).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        table: "counters",
+        key: "parkedTaskCounter",
+        op: "upsert"
+      }),
+      expect.objectContaining({
+        table: "parked_tasks",
+        op: "upsert",
+        row: expect.objectContaining({
+          parked_on: "scheduler",
+          state: "suspended",
+          origin: "scheduler"
+        })
+      })
+    ]));
+  });
+
   it("records sequenced turns at the applied-call boundary", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-seq");

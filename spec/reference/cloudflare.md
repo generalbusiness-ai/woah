@@ -813,7 +813,9 @@ enables the CommitScopeDO body-field protocol for trusted callers. Browser
 WebSocket opens are narrower: because the first checkpoint pages are
 authority-shaped, the gateway MUST NOT send them to browser holders unless a
 browser-safe projection profile is active and a separate browser rollout gate is
-enabled. Until then, browser opens use the legacy display transfer even when
+enabled. That browser gate remains fail-closed until the final checkpoint
+`frame_tail` is either consumed by the browser installer or split under its own
+byte budget. Until then, browser opens use the legacy display transfer even when
 CommitScopeDO can serve checkpoint/tail to server-side callers.
 
 `WOO_GATEWAY_PROJECTION_CACHE` enables the gateway's durable projection-row SQL

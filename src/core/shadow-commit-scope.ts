@@ -603,8 +603,9 @@ export function applyShadowTranscriptToIndexedState(
   stepStartedAt = Date.now();
   next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
   profile("counters", stepStartedAt);
+  applyProjectionWritesToCommitScopeState(next, transcript.projectionWrites ?? []);
   profile("total", totalStartedAt);
-  const projectionWrites = projectionWritesForIndexedApply(current, next, transcript, touchedObjectIds);
+  const projectionWrites = projectionWritesForIndexedApply(current, next, transcript, touchedObjectIds, transcript.projectionWrites ?? []);
   return {
     state: next,
     projection_delta: projectionDeltaWithToolSurfaceSourceMarkers(summarizeProjectionWrites(projectionWrites), transcript.scope),
@@ -616,9 +617,10 @@ function projectionWritesForIndexedApply(
   current: ShadowCommitScopeState,
   next: ShadowCommitScopeState,
   transcript: EffectTranscript,
-  touchedObjectIds: Set<ObjRef>
+  touchedObjectIds: Set<ObjRef>,
+  explicitProjectionWrites: readonly ProjectionWrite[] = []
 ): ProjectionWrite[] {
-  const writes: ProjectionWrite[] = [];
+  const writes: ProjectionWrite[] = [...explicitProjectionWrites];
   for (const id of Array.from(touchedObjectIds).sort()) {
     const row = next.objectsById.get(id);
     if (row) {
@@ -656,83 +658,22 @@ function projectionWritesForIndexedApply(
     writes.push({ table: "counters", key: "parkedTaskCounter", op: "upsert", value: next.parkedTaskCounter, bytes: projectionRowBytes({ key: "parkedTaskCounter", value: next.parkedTaskCounter }) });
   }
 
-  appendSnapshotProjectionWrites(writes, current.snapshots, next.snapshots);
-  appendParkedTaskProjectionWrites(writes, current.parkedTasks, next.parkedTasks);
-  appendTombstoneProjectionWrites(writes, current.tombstones ?? [], next.tombstones ?? []);
-
+  // Side-channel tables are intentionally not diffed here. Snapshot, parked
+  // task, and tombstone mutations, plus their required counter updates, enter
+  // projection_writes as explicit transcript-side projectionWrites from their
+  // mutation sites; scanning the post-apply side-channel arrays on every
+  // accepted commit would put O(scope) work back on the hot path this module is
+  // removing.
   return coalesceProjectionWrites(writes);
-}
-
-function appendSnapshotProjectionWrites(
-  writes: ProjectionWrite[],
-  currentRows: SerializedWorld["snapshots"],
-  nextRows: SerializedWorld["snapshots"]
-): void {
-  const current = new Map(currentRows.map((row) => [snapshotProjectionKey(row), row]));
-  const next = new Map(nextRows.map((row) => [snapshotProjectionKey(row), row]));
-  for (const key of Array.from(new Set([...current.keys(), ...next.keys()])).sort()) {
-    const before = current.get(key);
-    const after = next.get(key);
-    if (!after) {
-      const parsed = parseSnapshotProjectionKey(key);
-      writes.push({ table: "snapshots", key: parsed, op: "delete", bytes: 0 });
-      continue;
-    }
-    if (!before || stableShadowJson(before as unknown as WooValue) !== stableShadowJson(after as unknown as WooValue)) {
-      const clone = structuredClone(after) as SerializedWorld["snapshots"][number];
-      writes.push({ table: "snapshots", key: { space: clone.space_id, seq: clone.seq }, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
-    }
-  }
-}
-
-function appendParkedTaskProjectionWrites(
-  writes: ProjectionWrite[],
-  currentRows: SerializedWorld["parkedTasks"],
-  nextRows: SerializedWorld["parkedTasks"]
-): void {
-  const current = new Map(currentRows.map((row) => [row.id, row]));
-  const next = new Map(nextRows.map((row) => [row.id, row]));
-  for (const key of Array.from(new Set([...current.keys(), ...next.keys()])).sort()) {
-    const before = current.get(key);
-    const after = next.get(key);
-    if (!after) {
-      writes.push({ table: "parked_tasks", key, op: "delete", bytes: 0 });
-      continue;
-    }
-    if (!before || stableShadowJson(before as unknown as WooValue) !== stableShadowJson(after as unknown as WooValue)) {
-      const clone = structuredClone(after) as SerializedWorld["parkedTasks"][number];
-      writes.push({ table: "parked_tasks", key, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
-    }
-  }
-}
-
-function appendTombstoneProjectionWrites(
-  writes: ProjectionWrite[],
-  currentRows: readonly ObjRef[],
-  nextRows: readonly ObjRef[]
-): void {
-  const current = new Set(currentRows);
-  const next = new Set(nextRows);
-  for (const id of Array.from(new Set([...current, ...next])).sort()) {
-    if (next.has(id) && !current.has(id)) {
-      writes.push({ table: "tombstones", key: id, op: "upsert", row: { id }, bytes: projectionRowBytes({ id }) });
-    } else if (current.has(id) && !next.has(id)) {
-      writes.push({ table: "tombstones", key: id, op: "delete", bytes: 0 });
-    }
-  }
-}
-
-function snapshotProjectionKey(row: SerializedWorld["snapshots"][number]): string {
-  return `${row.space_id}\u0000${row.seq}`;
-}
-
-function parseSnapshotProjectionKey(key: string): { space: ObjRef; seq: number } {
-  const [space, rawSeq] = key.split("\u0000");
-  return { space: space as ObjRef, seq: Number(rawSeq) };
 }
 
 function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, writes: ProjectionWrite[]): void {
   const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
+  applyProjectionWritesToCommitScopeState(next, writes);
+  commitShadowCommitScopeState(scope, next);
+}
+
+function applyProjectionWritesToCommitScopeState(next: ShadowCommitScopeState, writes: readonly ProjectionWrite[]): void {
   for (const write of coalesceProjectionWrites(writes)) {
     switch (write.table) {
       case "objects":
@@ -776,10 +717,11 @@ function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, write
         break;
       }
       case "tool_surfaces":
+        // Tool-surface rows are a receiver/gateway cache table. They do not
+        // live in authority commit-scope state.
         break;
     }
   }
-  commitShadowCommitScopeState(scope, next);
 }
 
 function upsertBy<T>(rows: T[], predicate: (row: T) => boolean, value: T): T[] {

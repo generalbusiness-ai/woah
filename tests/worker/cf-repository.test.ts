@@ -1555,6 +1555,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       WOO_INTERNAL_SECRET: "cf-test-secret",
       WOO_AUTO_INSTALL_CATALOGS: "",
       WOO_V2_CHECKPOINT_TAIL_OPEN: "1",
+      WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN: "1",
       DIRECTORY: new FakeDurableObjectNamespace((name) => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;

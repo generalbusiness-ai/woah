@@ -1,4 +1,5 @@
 import type { ErrorValue, ObjRef, Observation, WooObject, WooValue } from "./types";
+import type { ProjectionWrite } from "./projection-delta";
 
 export type TurnRoute = "direct" | "sequenced";
 
@@ -10,6 +11,7 @@ export type RecordedCell =
   | { kind: "lifecycle"; object: ObjRef };
 
 export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace";
+export type RecordedProjectionWrite = Extract<ProjectionWrite, { table: "snapshots" | "parked_tasks" | "tombstones" | "counters" }>;
 
 // Authority is captured at the VM-frame boundary so commit validation can
 // authorize each mutation against the exact `progr` that performed it.
@@ -45,6 +47,7 @@ export type TurnRecorderEvent =
   | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string; writer?: RecordedWriteAuthority }
   | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"]; writer?: RecordedWriteAuthority }
   | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef; writer?: RecordedWriteAuthority }
+  | { kind: "projection_write"; write: RecordedProjectionWrite }
   | { kind: "observe"; observation: Observation }
   | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }
   | { kind: "state_probe"; cell: RecordedCell }

@@ -549,10 +549,14 @@ export class PersistentObjectDO {
   }
 
   private browserCheckpointTailOpenEnabled(): boolean {
-    // The current checkpoint/tail pages are authority-shaped. Browser holders
-    // must not negotiate them until the BrowserProfile projection described in
-    // notes/2026-05-25-browser-holder-node.md lands.
-    return this.checkpointTailOpenEnabled() && envFlag(this.env.WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN);
+    if (!this.checkpointTailOpenEnabled() || !envFlag(this.env.WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN)) return false;
+    // Browser checkpoint/tail stays fail-closed until BrowserProfile pages land
+    // and the final checkpoint frame_tail is either consumed by the browser row
+    // installer or split behind its own transfer budget.
+    console.warn("woo.v2_browser_checkpoint_tail.disabled", {
+      reason: "browser_profile_and_frame_tail_budget_required"
+    });
+    return false;
   }
 
   private withCheckpointTailOpen(body: Record<string, unknown>): Record<string, unknown> {
