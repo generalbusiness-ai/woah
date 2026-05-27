@@ -1507,10 +1507,12 @@ export class PersistentObjectDO {
       // Worker deploy. Pull the gateway seed once per catalog bundle so
       // foreign-hosted support rows keep gateway-authoritative repairs while
       // bundled verb-source changes reach resident worlds before stale
-      // bytecode handles the next request.
+      // bytecode handles the next request. This intentionally bypasses KV:
+      // a stale resident gateway could have written a bytecode-free seed under
+      // the same catalog fingerprint before this repair code was deployed.
       const current = world.exportWorld();
       try {
-        const fetched = await this.fetchHostSeed(hostKey as ObjRef, current);
+        const fetched = await this.fetchHostSeed(hostKey as ObjRef, current, { preferKv: false });
         if (fetched.seed.objects.length > 0) {
           let changed = false;
           const merged = mergeHostScopedSeedWithStatus(current, fetched.seed, hostKey as ObjRef);
@@ -1979,7 +1981,7 @@ export class PersistentObjectDO {
     }));
   }
 
-  private async fetchHostSeed(hostKey: ObjRef, localSeedSource: SerializedWorld | null): Promise<{ seed: SeedWorld; digest: string | null; source: "kv" | "do" }> {
+  private async fetchHostSeed(hostKey: ObjRef, localSeedSource: SerializedWorld | null, options: { preferKv?: boolean } = {}): Promise<{ seed: SeedWorld; digest: string | null; source: "kv" | "do" }> {
     // KV READ PATH (Lever B, content-addressed).
     // Sequence:
     //   1. Read seed-current:${catalogs}:${host} → digest (cheap, ~10ms)
@@ -1990,7 +1992,7 @@ export class PersistentObjectDO {
     // satellite that reads an older pointer gets older bytes, but the
     // bytes are self-consistent (digest matches), and the receiver's
     // mergeHostScopedSeedWithStatus is robust to slight version skew.
-    if (this.env.HOST_SEED_KV) {
+    if (this.env.HOST_SEED_KV && options.preferKv !== false) {
       const kvStartedAt = Date.now();
       try {
         let missReason: HostSeedKvRestoreMissReason | null = null;

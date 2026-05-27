@@ -497,9 +497,11 @@ Resident DO instances also persist the last bundled local catalog fingerprint
 they reconciled. If a live in-memory world observes a new fingerprint after a
 Worker deploy, it repairs before serving the request: the gateway host reruns
 local catalog install/repair, and satellite hosts fetch and merge the gateway's
-current host seed before marking the fingerprint current. This closes the
-resident-world case where a deploy changes bundled verb source but the DO keeps
-serving an already-loaded host slice.
+current signed host seed before marking the fingerprint current. The satellite
+repair bypasses the KV accelerator because a stale resident gateway can have
+written a bytecode-free KV seed under the same catalog fingerprint before the
+repairing deploy. This closes the resident-world case where a deploy changes
+bundled verb source but the DO keeps serving an already-loaded host slice.
 
 A wizard may ask the gateway to refresh live object hosts with
 `POST /api/admin/refresh-host-seeds`. The gateway exports each requested

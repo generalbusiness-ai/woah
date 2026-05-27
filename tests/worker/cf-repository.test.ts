@@ -3841,14 +3841,14 @@ describe("CFObjectRepository production-shape coverage", () => {
     const harness = createHostSeedKvHarness();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      await harness.publishHostSeed("the_chatroom");
-      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
-        headers: { "x-woo-host-key": "the_chatroom" }
+      await harness.publishHostSeed("the_deck");
+      const healthz = await harness.wooNamespace.get({ name: "the_deck" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
       })));
       expect(healthz.ok).toBe(true);
 
-      const host = harness.wooObjects.get("the_chatroom") as any;
-      const world = await host.getWorld("the_chatroom") as WooWorld;
+      const host = harness.wooObjects.get("the_deck") as any;
+      const world = await host.getWorld("the_deck") as WooWorld;
       const current = world.ownVerbExact("$conversational", "room_roster");
       expect(current).toBeTruthy();
       const installed = installVerb(world, "$conversational", "room_roster", `verb :room_roster() rxd {
@@ -3856,12 +3856,14 @@ describe("CFObjectRepository production-shape coverage", () => {
 }`, current!.version);
       expect(installed.ok).toBe(true);
       host.repo.saveMeta("local_catalog_bundle_fingerprint", "old-fingerprint");
+      harness.hostSeedFetches.length = 0;
 
-      const repairedHealthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
-        headers: { "x-woo-host-key": "the_chatroom" }
+      const repairedHealthz = await harness.wooNamespace.get({ name: "the_deck" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
       })));
 
       expect(repairedHealthz.ok).toBe(true);
+      expect(harness.hostSeedFetches).toContain("the_deck");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("valid(item)");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
     } finally {
