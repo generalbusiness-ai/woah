@@ -158,6 +158,13 @@ export type McpGatewayOptions = {
   // otherwise advance the cache head to 2 and let the later seq 1 be dropped by
   // the cache's head-idempotency guard.
   persistAcceptedProjection?: (commit: ShadowCommitAccepted, transcript: EffectTranscript) => void;
+  // Durable head_seq of the projection cache for a scope, or null if the cache
+  // has never seen it. Used as the fanout-sequencing fallback when no in-memory
+  // relay exists (a hibernated/cold peer shard that received fanout before its
+  // v2 relay re-opened): without it, remoteExpectedSeq is null and frames apply
+  // in arrival order, letting persistAcceptedProjection write seq N+1 before
+  // seq N and drop seq N at the cache's head-idempotency guard.
+  durableProjectionHeadSeq?: (scope: ObjRef) => number | null;
   v2?: McpV2ClientHooks;
 };
 
@@ -406,8 +413,16 @@ export class McpGateway {
   }
 
   private remoteExpectedSeq(scope: ObjRef): number | null {
-    const head = this.v2Scopes.get(scope)?.relay.commit_scope.head;
-    return head ? head.seq + 1 : null;
+    // The in-memory relay head is authoritative when a relay is open. With no
+    // relay (cold/hibernated shard), fall back to the durable projection-cache
+    // head so fanout still sequences and drains in order rather than applying
+    // in arrival order. Only when neither exists (a scope never seen by this
+    // shard) is there no expected seq; a single mid-stream delta cannot build a
+    // complete projection anyway, and the descriptor read path refreshes it.
+    const relayHead = this.v2Scopes.get(scope)?.relay.commit_scope.head;
+    if (relayHead) return relayHead.seq + 1;
+    const durableHead = this.options.durableProjectionHeadSeq?.(scope);
+    return durableHead != null ? durableHead + 1 : null;
   }
 
   private queueRemoteAccepted(scope: ObjRef, entry: RemoteAcceptedCommit): void {

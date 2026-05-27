@@ -615,10 +615,10 @@ export class PersistentObjectDO {
     // reflected in the cache; re-applying it would burn durable writes for no
     // state change (and could regress a newer head that arrived first). A cold
     // shard that has never seen this scope has no head row and falls through.
-    const existingHead = firstSqlRow<{ head_seq: number }>(
-      sql.exec("SELECT head_seq FROM gateway_projection_scope WHERE scope = ?", authorityScope)
-    );
-    if (existingHead && position.seq <= existingHead.head_seq) return { rows: 0, bytes: 0 };
+    // Out-of-order fanout is prevented upstream by sequencing against this same
+    // head (see durableProjectionHeadSeq); the guard here is the backstop.
+    const existingHead = this.gatewayProjectionHeadSeq(authorityScope);
+    if (existingHead != null && position.seq <= existingHead) return { rows: 0, bytes: 0 };
     this.state.storage.transactionSync(() => {
       sql.exec(
         "INSERT OR REPLACE INTO gateway_projection_scope(scope, head_seq, head_hash, updated_at_ms, stale, stale_reason) VALUES (?, ?, ?, ?, 0, NULL)",
@@ -821,6 +821,17 @@ export class PersistentObjectDO {
       saturated: false
     }, this.durableHostKey());
     this.refreshGatewayToolSurfaceScopeSaturation(row.scope, now);
+  }
+
+  // Durable head_seq of the projection cache for a scope, or null if never seen.
+  // Drives both the head-idempotency guard and (via the gateway's
+  // durableProjectionHeadSeq hook) fanout sequencing on a relay-less cold shard.
+  private gatewayProjectionHeadSeq(scope: ObjRef): number | null {
+    const row = firstSqlRow<{ head_seq: number }>(this.state.storage.sql.exec(
+      "SELECT head_seq FROM gateway_projection_scope WHERE scope = ?",
+      scope
+    ));
+    return row ? row.head_seq : null;
   }
 
   // True only when the gateway already holds a non-stale tool-surface row for
@@ -1443,6 +1454,10 @@ export class PersistentObjectDO {
         // contiguous sequence order, as the gateway accepts/drains each frame.
         persistAcceptedProjection: (commit) =>
           this.applyGatewayProjectionWrites(commit.position, commit.projection_writes ?? [], "fanout", commit.projection_delta),
+        // Fanout-sequencing fallback for a cold shard with no in-memory relay:
+        // sequence against the durable projection-cache head so frames drain in
+        // order instead of applying (and persisting) in arrival order.
+        durableProjectionHeadSeq: (scope) => this.gatewayProjectionHeadSeq(scope),
         broadcasts: {}
       });
       // On cold-load (DO rehydrate after hibernation), McpHost.queues is empty.
