@@ -269,6 +269,7 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
       errors.push(actual.error);
       continue;
     }
+    if (readMatchesSequencedAllocation(transcript, read, actual)) continue;
     const readMatchesOwnWrite = sameTurn.reason === "own_write_mismatch" ? false : sameTurnReadMatchesOwnWrite(transcript, read);
     if (!readMatchesOwnWrite && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
@@ -325,6 +326,17 @@ function projectionWriteShapeError(write: RecordedProjectionWrite): string | nul
     default:
       return `projection_write unsupported table ${(write as { table?: string }).table ?? "unknown"}`;
   }
+}
+
+function readMatchesSequencedAllocation(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
+  if (!actual.ok) return false;
+  if (transcript.route !== "sequenced") return false;
+  if (read.cell.kind !== "prop" || read.cell.object !== transcript.scope || read.cell.name !== "next_seq") return false;
+  if (typeof actual.value !== "number" || typeof read.value !== "number") return false;
+  if (actual.value !== transcript.seq || read.value !== transcript.seq + 1) return false;
+  const actualVersion = numericVersion(actual.version);
+  const readVersion = numericVersion(read.version);
+  return actualVersion === null || readVersion === null || readVersion === actualVersion + 1;
 }
 
 function sameTurnRead(transcript: EffectTranscript, read: TranscriptRead): { ok: true } | { ok: false; reason?: "own_write_mismatch" } {
@@ -586,6 +598,12 @@ function sameCell(a: TranscriptCell, b: TranscriptCell): boolean {
 
 function versionString(version: number | string | undefined): string | undefined {
   return version === undefined ? undefined : String(version);
+}
+
+function numericVersion(version: string | undefined): number | null {
+  if (version === undefined) return null;
+  const parsed = Number(version);
+  return Number.isInteger(parsed) ? parsed : null;
 }
 
 function cellLabel(cell: TranscriptCell): string {

@@ -133,6 +133,89 @@ describe("shadow turn execution", () => {
     expect(warmed.replay("the_dubspace", 1, 10)).toHaveLength(1);
   });
 
+  it("accepts browser-planned hot tub entry after the sequencer was allocated before recording", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-hot-tub-enter");
+    const actor = session.actor;
+
+    const enterChatroom = await anchor.call("setup-enter-chatroom", session.id, "the_chatroom", {
+      actor,
+      target: "the_chatroom",
+      verb: "enter",
+      args: []
+    });
+    expect(enterChatroom.op).toBe("applied");
+    const moveToDeck = await anchor.call("setup-move-deck", session.id, "the_chatroom", {
+      actor,
+      target: "the_chatroom",
+      verb: "southeast",
+      args: []
+    });
+    expect(moveToDeck.op).toBe("applied");
+    expect(anchor.getProp("the_hot_tub", "next_seq")).toBe(1);
+
+    const serializedBefore = anchor.exportWorld();
+    const enterTub = await runShadowTurnCall(serializedBefore, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-hot-tub-enter",
+      route: "sequenced",
+      scope: "the_hot_tub",
+      session: session.id,
+      actor,
+      target: "the_hot_tub",
+      verb: "enter",
+      args: []
+    });
+    expect(enterTub.frame).toMatchObject({ op: "applied", space: "the_hot_tub", seq: 1 });
+    // enrichScopedMoveResult builds a post-move room snapshot after applyCall
+    // has allocated seq 1. The transcript therefore legitimately observes
+    // scope.next_seq as 2 even though pre-commit authority state still has 1.
+    expect(enterTub.transcript.reads).toContainEqual(expect.objectContaining({
+      cell: { kind: "prop", object: "the_hot_tub", name: "next_seq" },
+      value: 2
+    }));
+    expect(enterTub.transcript.writes).not.toContainEqual(expect.objectContaining({
+      cell: { kind: "prop", object: "the_hot_tub", name: "next_seq" }
+    }));
+
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_hot_tub", serialized: serializedBefore });
+    const accepted = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "shadow-hot-tub-enter",
+      scope: "the_hot_tub",
+      expected: structuredClone(commitScope.head),
+      transcript: enterTub.transcript
+    });
+    expect(accepted).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
+
+    const serializedAfterEnter = serializedFor(commitScope);
+    const afterEnter = createWorldFromSerialized(serializedAfterEnter, { persist: false });
+    expect(afterEnter.getProp("the_hot_tub", "next_seq")).toBe(2);
+    expect(afterEnter.allLocationsForActor(actor)).toEqual(["the_hot_tub"]);
+
+    const exitTub = await runShadowTurnCall(serializedAfterEnter, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-hot-tub-out",
+      route: "sequenced",
+      scope: "the_hot_tub",
+      session: session.id,
+      actor,
+      target: "the_hot_tub",
+      verb: "out",
+      args: []
+    });
+    expect(exitTub.frame).toMatchObject({ op: "applied", space: "the_hot_tub", seq: 2 });
+    const acceptedExit = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "shadow-hot-tub-out",
+      scope: "the_hot_tub",
+      expected: structuredClone(commitScope.head),
+      transcript: exitTub.transcript
+    });
+    expect(acceptedExit).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
+    expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("the_hot_tub", "next_seq")).toBe(3);
+  });
+
   it("uses granular transfer to fill a real inventory gap for a dubspace action", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-granular-turn");

@@ -623,6 +623,14 @@ snapshot. Accepted frames also carry the authority's acceptance timestamp so
 transport-specific frame projections can be reply-idempotent without minting a
 fresh wall-clock value on retry.
 
+For sequenced transcripts, `transcript.scope.next_seq` is commit-owned
+sequencer state. An executor may reserve `seq = next_seq` before transcript
+recording starts and then read `scope.next_seq == seq + 1` while constructing
+the turn result. The commit scope validates that special read against
+pre-commit state `scope.next_seq == seq`, not as an ordinary stale property
+read, and applying the accepted transcript must materialize `scope.next_seq` to
+`seq + 1` alongside the sequenced log entry.
+
 The current transcript applier materializes object creation, property writes,
 location writes, contents writes, session-location side effects, and sequenced
 log entries. Lifecycle deletes and verb edits remain recorded/validated

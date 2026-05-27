@@ -611,6 +611,7 @@ export function applyShadowTranscriptToIndexedState(
   profile("apply_session", stepStartedAt);
   stepStartedAt = Date.now();
   applyTranscriptLogToState(next, transcript);
+  applyTranscriptSequencerToState(transcript, mutableObject, options);
   profile("apply_log", stepStartedAt);
   stepStartedAt = Date.now();
   next.objectCounter = nextObjectCounterForCreates(next.objectCounter, transcript.creates);
@@ -862,6 +863,29 @@ function applyTranscriptLogToState(state: ShadowCommitScopeState, transcript: Ef
   const entries = (state.logsByScope.get(transcript.scope) ?? []).slice();
   mergeTranscriptLogEntry(entries, entry);
   state.logsByScope.set(transcript.scope, entries);
+}
+
+function applyTranscriptSequencerToState(
+  transcript: EffectTranscript,
+  mutableObject: (id: ObjRef) => SerializedObject | null,
+  options: ShadowTranscriptApplyOptions
+): void {
+  if (transcript.route !== "sequenced") return;
+  const scopeObject = mutableObject(transcript.scope);
+  if (!scopeObject) return;
+  const nextSeq = transcript.seq + 1;
+  setSerializedProperty(scopeObject, "next_seq", nextSeq);
+  setSerializedPropertyVersion(scopeObject, "next_seq", sequencerReadVersion(transcript));
+  touchSerializedObject(scopeObject, options.objectTimestamp);
+}
+
+function sequencerReadVersion(transcript: EffectTranscript): string | undefined {
+  return transcript.reads.find((read) =>
+    read.cell.kind === "prop" &&
+    read.cell.object === transcript.scope &&
+    read.cell.name === "next_seq" &&
+    read.value === transcript.seq + 1
+  )?.version;
 }
 
 function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState): void {
