@@ -1,7 +1,9 @@
 import { BUNDLED_CATALOGS } from "../generated/bundled-catalogs";
+import { hashSource } from "./source-hash";
 import {
   applyCatalogSchemaPlan,
   catalogManifestStatus,
+  catalogSchemaPlanIdentity,
   installCatalogManifest,
   planCatalogSchemaMigration,
   updateCatalogManifest,
@@ -141,6 +143,17 @@ const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION = "2026-05-1
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
+
+export function localCatalogBundleFingerprint(names: readonly string[] = DEFAULT_LOCAL_CATALOGS): string {
+  const material = sortCatalogNames(names).map((name) => {
+    const manifest = LOCAL_CATALOGS.get(name);
+    return {
+      name,
+      manifest_hash: manifest ? catalogSchemaPlanIdentity(manifest).manifest_hash : ""
+    };
+  });
+  return hashSource(JSON.stringify(material));
+}
 
 const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_SOURCE_MIGRATION },

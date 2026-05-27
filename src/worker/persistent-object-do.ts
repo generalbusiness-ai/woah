@@ -35,7 +35,7 @@ import {
   serializedWorldFromAuthoritySlice
 } from "../core/authority-slice";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
+import { localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
   restFrameFromTurnReply,
@@ -1561,9 +1561,9 @@ export class PersistentObjectDO {
   }
 
   private async createMcpGatewayShardWorld(hostKey: string, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
-    // KV fast path: WORLD publishes a bytecode-free exportWorld to
-    // mcp-gateway-world-current → digest, mcp-gateway-world:${digest}
-    // on every snapshot request. The reader restores exact bytecode
+    // KV fast path: WORLD publishes a bytecode-free exportWorld to a
+    // bundled-catalog-namespaced current pointer and content key on every
+    // snapshot request. The reader restores exact bytecode
     // from local/catalog reservoirs by hash; if any verb cannot be
     // restored it falls through to WORLD's authoritative full snapshot.
     // The bytes are otherwise identical across all gateway shards
@@ -1574,9 +1574,9 @@ export class PersistentObjectDO {
       const kvStartedAt = Date.now();
       try {
         let missReason: HostSeedKvRestoreMissReason | null = null;
-        const pointer = await this.env.HOST_SEED_KV.get("mcp-gateway-world-current", "text");
+        const pointer = await this.env.HOST_SEED_KV.get(mcpGatewayWorldPointerKey(this.env), "text");
         if (pointer && pointer.length > 0) {
-          const raw = await this.env.HOST_SEED_KV.get(`mcp-gateway-world:${pointer}`, "text");
+          const raw = await this.env.HOST_SEED_KV.get(mcpGatewayWorldBytesKey(this.env, pointer), "text");
           if (raw) {
             try {
               const parsed = JSON.parse(raw) as unknown;
@@ -1932,8 +1932,8 @@ export class PersistentObjectDO {
   private async fetchHostSeed(hostKey: ObjRef, localSeedSource: SerializedWorld | null): Promise<{ seed: SeedWorld; digest: string | null; source: "kv" | "do" }> {
     // KV READ PATH (Lever B, content-addressed).
     // Sequence:
-    //   1. Read seed-current:${host} → digest (cheap, ~10ms)
-    //   2. Read seed:${host}:${digest} → bytes (cheap, ~10-50ms)
+    //   1. Read seed-current:${catalogs}:${host} → digest (cheap, ~10ms)
+    //   2. Read seed:${catalogs}:${host}:${digest} → bytes (cheap, ~10-50ms)
     //   3. Return seed + digest; caller's merge logic handles staleness
     // On any miss/error, fall through to the DO RPC path below. The
     // content-addressed key prevents the v1 stale-data poisoning: a
@@ -1944,9 +1944,9 @@ export class PersistentObjectDO {
       const kvStartedAt = Date.now();
       try {
         let missReason: HostSeedKvRestoreMissReason | null = null;
-        const pointer = await this.env.HOST_SEED_KV.get(`seed-current:${hostKey}`, "text");
+        const pointer = await this.env.HOST_SEED_KV.get(hostSeedPointerKey(this.env, hostKey), "text");
         if (pointer && pointer.length > 0) {
-          const raw = await this.env.HOST_SEED_KV.get(`seed:${hostKey}:${pointer}`, "text");
+          const raw = await this.env.HOST_SEED_KV.get(hostSeedBytesKey(this.env, hostKey, pointer), "text");
           if (raw) {
             try {
               const parsed = JSON.parse(raw) as unknown;
@@ -2827,8 +2827,9 @@ export class PersistentObjectDO {
         // from local/catalog reservoirs or falls through to this full
         // DO response. Content-addressed by hash of the full serialized
         // world so a new commit or bytecode change produces a new key
-        // automatically. Pointer moves last. Read path is in
-        // createMcpGatewayShardWorld.
+        // automatically. Keys are salted by the bundled catalog fingerprint
+        // so deploys that change catalog verb source miss stale pointers.
+        // Pointer moves last. Read path is in createMcpGatewayShardWorld.
         //
         // Measurement before this commit (Lever B host-seed only):
         //   mcp_gateway_snapshot_fetch avg 1183ms, max 6647ms
@@ -2838,8 +2839,8 @@ export class PersistentObjectDO {
         if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
           const fullBody = JSON.stringify(exported);
           const digest = hashSource(fullBody);
-          const bytesKey = `mcp-gateway-world:${digest}`;
-          const pointerKey = "mcp-gateway-world-current";
+          const bytesKey = mcpGatewayWorldBytesKey(this.env, digest);
+          const pointerKey = mcpGatewayWorldPointerKey(this.env);
           const payload = JSON.stringify(bytecodeFreeMcpGatewayWorldKvPayload(exported, digest));
           this.state.waitUntil((async () => {
             try {
@@ -2912,9 +2913,10 @@ export class PersistentObjectDO {
         if (!host) throw wooError("E_INVARG", "host-seed requires host");
         const built = world.buildHostSeedForDeliveryWithDigest(host);
         // KV publish (Lever B): content-addressed bytecode-free write.
-        //   seed:${host}:${digest} -> { digest, seed, bytecode_hashes }
-        //   seed-current:${host}   -> digest             (the pointer)
-        // The bytes key is immutable per content; new content = new key.
+        //   seed:${catalogs}:${host}:${digest} -> { digest, seed, bytecode_hashes }
+        //   seed-current:${catalogs}:${host}   -> digest             (the pointer)
+        // The bytes key is immutable per content and bundled-catalog
+        // fingerprint; new content or new catalog source = new key.
         // The seed omits verb.bytecode (the dominant KV storage cost);
         // satellites restore exact bytecode by hash from local SQL or
         // bundled catalogs. If a verb is new, edited, or compiled by a
@@ -2923,14 +2925,13 @@ export class PersistentObjectDO {
         // DO RPC. The pointer moves atomically (last write wins). Stale
         // bytes stay in KV until TTL but are unreferenced.
         //
-        // The version-discriminator design (deploy-version in key,
-        // tried in commit 71e41a5) caused the stale-poisoning incident
-        // when the receiver also persisted the merged seed to local
-        // SQL. Content-addressing fixes that because a stale value's
-        // key isn't reachable from the (newer) pointer.
+        // The catalog-fingerprint namespace is deliberately narrower than a
+        // deploy-version key: ordinary code-only deploys keep cache locality,
+        // but bundled catalog source changes cannot restore old bytecode from
+        // the receiver's local SQL.
         if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function" && built.digest) {
-          const bytesKey = `seed:${host}:${built.digest}`;
-          const pointerKey = `seed-current:${host}`;
+          const bytesKey = hostSeedBytesKey(this.env, host, built.digest);
+          const pointerKey = hostSeedPointerKey(this.env, host);
           const payload = JSON.stringify(bytecodeFreeHostSeedKvPayload(built.seed, built.digest));
           this.state.waitUntil((async () => {
             try {
@@ -5451,6 +5452,32 @@ type ReservoirLookupResult = { ok: true; bytecode: TinyBytecode } | { ok: false;
 // config, which keeps repeated bytecode-free KV restores from reinstalling
 // bundled catalogs while making the one-time build cost observable.
 const localCatalogReservoirs = new Map<string, BytecodeReservoir>();
+const hostSeedKvNamespaces = new Map<string, string>();
+
+function hostSeedKvNamespace(env: Env): string {
+  const key = env.WOO_AUTO_INSTALL_CATALOGS ?? "<default>";
+  const cached = hostSeedKvNamespaces.get(key);
+  if (cached) return cached;
+  const namespace = localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
+  hostSeedKvNamespaces.set(key, namespace);
+  return namespace;
+}
+
+function hostSeedPointerKey(env: Env, host: ObjRef): string {
+  return `seed-current:${hostSeedKvNamespace(env)}:${host}`;
+}
+
+function hostSeedBytesKey(env: Env, host: ObjRef, digest: string): string {
+  return `seed:${hostSeedKvNamespace(env)}:${host}:${digest}`;
+}
+
+function mcpGatewayWorldPointerKey(env: Env): string {
+  return `mcp-gateway-world-current:${hostSeedKvNamespace(env)}`;
+}
+
+function mcpGatewayWorldBytesKey(env: Env, digest: string): string {
+  return `mcp-gateway-world:${hostSeedKvNamespace(env)}:${digest}`;
+}
 
 function bytecodeFreeHostSeedKvPayload(seed: SeedWorld, digest: string): Record<string, unknown> {
   const stripped = stripBytecodeForKv(seed);

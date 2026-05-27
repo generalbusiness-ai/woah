@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
+import { localCatalogBundleFingerprint, parseAutoInstallCatalogs } from "../../src/core/local-catalogs";
 import { decodeEnvelope, encodeEnvelope } from "../../src/core/shadow-envelope";
 import {
   createShadowBrowserNode,
@@ -148,6 +149,12 @@ function createHostSeedKvHarness() {
     HOST_SEED_KV: kv as unknown as KVNamespace
   } as unknown as Env;
 
+  const kvNamespace = (): string => localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
+  const hostSeedPointerKey = (host: string): string => `seed-current:${kvNamespace()}:${host}`;
+  const hostSeedBytesKey = (host: string, digest: string): string => `seed:${kvNamespace()}:${host}:${digest}`;
+  const mcpGatewayPointerKey = (): string => `mcp-gateway-world-current:${kvNamespace()}`;
+  const mcpGatewayBytesKey = (digest: string): string => `mcp-gateway-world:${kvNamespace()}:${digest}`;
+
   const drain = async (name: string): Promise<void> => {
     await wooStates.get(name)?.drainWaitUntil();
   };
@@ -164,9 +171,9 @@ function createHostSeedKvHarness() {
     const response = await wooNamespace.get({ name: "world" }).fetch(request);
     if (!response.ok) throw new Error(`host seed publish failed: ${response.status} ${await response.text()}`);
     await drain("world");
-    const pointer = await kv.get(`seed-current:${host}`, "text");
+    const pointer = await kv.get(hostSeedPointerKey(host), "text");
     expect(pointer).toBeTruthy();
-    const bytesKey = `seed:${host}:${pointer}`;
+    const bytesKey = hostSeedBytesKey(host, pointer!);
     const raw = await kv.get(bytesKey, "text");
     expect(raw).toBeTruthy();
     return { pointer: pointer!, bytesKey, payload: JSON.parse(raw!) as Record<string, unknown> };
@@ -184,9 +191,9 @@ function createHostSeedKvHarness() {
     const response = await wooNamespace.get({ name: "world" }).fetch(request);
     if (!response.ok) throw new Error(`mcp gateway snapshot publish failed: ${response.status} ${await response.text()}`);
     await drain("world");
-    const pointer = await kv.get("mcp-gateway-world-current", "text");
+    const pointer = await kv.get(mcpGatewayPointerKey(), "text");
     expect(pointer).toBeTruthy();
-    const bytesKey = `mcp-gateway-world:${pointer}`;
+    const bytesKey = mcpGatewayBytesKey(pointer!);
     const raw = await kv.get(bytesKey, "text");
     expect(raw).toBeTruthy();
     return { pointer: pointer!, bytesKey, payload: JSON.parse(raw!) as Record<string, unknown> };
@@ -3801,6 +3808,29 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(metricEvents(logSpy, "kv_catalog_reservoir_build")).toEqual([
         expect.objectContaining({ status: "ok", verbs: expect.any(Number) })
       ]);
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("misses host-seed KV entries when the bundled catalog namespace changes", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await harness.publishHostSeed("the_chatroom");
+      harness.hostSeedFetches.length = 0;
+      harness.env.WOO_AUTO_INSTALL_CATALOGS = "chat,note";
+
+      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+
+      expect(healthz.ok).toBe(true);
+      expect(harness.hostSeedFetches).toContain("the_chatroom");
+      expect(metricEvents(logSpy, "host_seed_kv_restore_miss")).toContainEqual(
+        expect.objectContaining({ cache: "host_seed", host: "the_chatroom", reason: "no_pointer" })
+      );
     } finally {
       logSpy.mockRestore();
       harness.close();

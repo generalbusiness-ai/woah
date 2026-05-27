@@ -486,6 +486,13 @@ has to build the per-isolate bundled-catalog reservoir and
 `host_seed_kv_restore_miss` when a KV entry is absent or cannot be
 restored.
 
+Host-seed KV pointer and bytes keys are also namespaced by the bundled local
+catalog fingerprint. The content digest alone is not sufficient across deploys:
+a bytecode-free stale KV payload can otherwise restore old bundled verb bytecode
+from the satellite's own local SQL. A catalog-fingerprint miss forces the
+satellite to fetch the gateway's current `/__internal/host-seed` response, while
+ordinary code-only deploys keep the same namespace and retain cache locality.
+
 A wizard may ask the gateway to refresh live object hosts with
 `POST /api/admin/refresh-host-seeds`. The gateway exports each requested
 host-scoped seed and sends it to the owning DO. The receiving host merges that
