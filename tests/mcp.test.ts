@@ -1213,7 +1213,7 @@ describe("McpHost", () => {
     const session = world.auth("guest:mcp-v2-external-projection-fanout");
     const metrics: MetricEvent[] = [];
     world.setMetricsHook((event) => metrics.push(event));
-    const gateway = new McpGateway(world, { externalProjectionFanout: true });
+    const gateway = new McpGateway(world);
     const row = structuredClone(world.exportObjects([session.actor])[0]!);
     row.properties = [...row.properties, ["fanout_probe", "remote"]];
     const write: ProjectionWrite = {
@@ -1285,7 +1285,7 @@ describe("McpHost", () => {
     const bob = world.auth("guest:mcp-v2-fanout-routing-bob");
     const metrics: MetricEvent[] = [];
     world.setMetricsHook((event) => metrics.push(event));
-    const gateway = new McpGateway(world, { externalProjectionFanout: true });
+    const gateway = new McpGateway(world);
     gateway.bindActorSession(bob.id, bob.actor);
     expect(world.activeScopeForSession(bob.id)).toBe("$nowhere");
 
@@ -1364,7 +1364,7 @@ describe("McpHost", () => {
     try {
       let world = createWorld({ repository: repo });
       const session = world.auth("guest:mcp-v2-fanout-session-persist");
-      const gateway = new McpGateway(world, { externalProjectionFanout: true });
+      const gateway = new McpGateway(world);
       const sessionRow = structuredClone(world.exportSessions().find((row) => row.id === session.id)!);
       sessionRow.activeScope = "the_deck";
       const write: ProjectionWrite = {

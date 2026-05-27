@@ -1388,7 +1388,6 @@ export class PersistentObjectDO {
       const initStart = Date.now();
       this.mcpGateway = new McpGateway(world, {
         serverName: "woo",
-        externalProjectionFanout: true,
         v2: {
           open: async (scope, body): Promise<McpV2OpenResult> => {
             world.touchSessionInput(body.session);

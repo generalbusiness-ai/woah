@@ -150,7 +150,6 @@ export type McpGatewayOptions = {
   broadcasts?: McpBroadcastHooks;
   dispatch?: McpDispatchHooks;
   toolManifests?: McpToolManifestHooks;
-  externalProjectionFanout?: boolean;
   v2?: McpV2ClientHooks;
 };
 
