@@ -4227,10 +4227,19 @@ export class PersistentObjectDO {
       slices.push(filterSerializedAuthoritySliceObjects(response.authority, (id) => accepted.has(id)));
     }
     const authority = combineSerializedAuthoritySlices(local.authority.sessions, slices);
+    // Session rows are live authority too: if we ship a session whose actor row
+    // is absent from the same merged slice, CommitScopeDO replaces its session
+    // set with a presence entry that catalog roster verbs cannot dereference.
+    // That turns stale projected presence into E_OBJNF during room_roster().
+    const authorityObjectIds = authoritySliceObjectIds(authority);
+    const authoritySessions = authority.sessions.filter((session) => authorityObjectIds.has(session.actor));
+    const filteredAuthority: SerializedAuthoritySlice = authority.sessions.length === authoritySessions.length
+      ? authority
+      : { ...authority, sessions: authoritySessions };
     return {
-      sessions: authority.sessions,
+      sessions: filteredAuthority.sessions,
       session_objects: [],
-      authority
+      authority: filteredAuthority
     };
   }
 

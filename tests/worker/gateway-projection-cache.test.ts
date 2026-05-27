@@ -737,4 +737,30 @@ describe("gateway projection cache", () => {
       reason: "snapshot_fallback"
     }));
   });
+
+  it("omits session rows whose actor row is absent from the authority slice", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const world = createWorld();
+    const live = world.auth("guest:authority-session-live");
+    const stale = world.auth("guest:authority-session-stale");
+    world.objects.delete(stale.actor);
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", live.actor], {
+      tolerateRemoteFailures: true,
+      useCommitScopeSnapshotForRemoteAuthority: true
+    });
+    const ids = authoritySliceObjectIds(payload.authority);
+
+    expect(ids.has(live.actor)).toBe(true);
+    expect(ids.has(stale.actor)).toBe(false);
+    expect(payload.authority.sessions.map((session) => session.id)).toContain(live.id);
+    expect(payload.authority.sessions.map((session) => session.id)).not.toContain(stale.id);
+  });
 });
