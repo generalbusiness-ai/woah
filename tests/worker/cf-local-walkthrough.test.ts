@@ -1,0 +1,454 @@
+import { randomUUID } from "node:crypto";
+import { describe, expect, it, vi } from "vitest";
+import worker from "../../src/worker/index";
+import { CommitScopeDO } from "../../src/worker/commit-scope-do";
+import { DirectoryDO } from "../../src/worker/directory-do";
+import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
+
+vi.setConfig({ testTimeout: 180_000 });
+
+const SHARDS = 4;
+const RPC_TIMEOUT_MS = 20_000;
+const STEP_TIMEOUT_MS = 60_000;
+const DRAIN_TOTAL_BUDGET_MS = 3000;
+const DRAIN_POLL_MS = 500;
+
+class FakeKVNamespace {
+  readonly values = new Map<string, string>();
+
+  async get(key: string, _type?: "text"): Promise<string | null> {
+    return this.values.get(key) ?? null;
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    this.values.set(key, value);
+  }
+}
+
+class WaitUntilDurableObjectState extends FakeDurableObjectState {
+  readonly waitUntilPromises: Promise<unknown>[] = [];
+
+  waitUntil(promise: Promise<unknown>): void {
+    this.waitUntilPromises.push(Promise.resolve(promise));
+  }
+
+  async drainWaitUntil(): Promise<void> {
+    await Promise.all(this.waitUntilPromises.splice(0));
+  }
+}
+
+type CfSmokeHarness = {
+  env: Env;
+  request(path: string, init: RequestInit): Promise<Response>;
+  close(): void;
+};
+
+describe("CF-local smoke walkthrough", () => {
+  it("covers cross-shard MCP movement and tool-space fanout through Worker Durable Object shape", async () => {
+    const harness = createCfSmokeHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const runId = `cf-local-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let alice: LocalMcpSession | null = null;
+    let bob: LocalMcpSession | null = null;
+    try {
+      alice = await LocalMcpSession.open(harness, `guest:cf-local-alice-${runId}`, "alice", runId);
+      bob = await openOnDifferentShard(harness, alice, runId);
+      await runWalkthrough(alice, bob);
+    } finally {
+      await Promise.allSettled([alice?.close(), bob?.close()]);
+      warnSpy.mockRestore();
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+});
+
+function createCfSmokeHarness(): CfSmokeHarness {
+  const directoryState = new FakeDurableObjectState("directory");
+  const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-local-smoke-secret" });
+  const wooStates = new Map<string, WaitUntilDurableObjectState>();
+  const wooObjects = new Map<string, PersistentObjectDO>();
+  const commitStates = new Map<string, FakeDurableObjectState>();
+  const commitObjects = new Map<string, CommitScopeDO>();
+  let env: Env;
+
+  const wooNamespace = new FakeDurableObjectNamespace((name) => {
+    let object = wooObjects.get(name);
+    if (!object) {
+      let state = wooStates.get(name);
+      if (!state) {
+        state = new WaitUntilDurableObjectState(name);
+        wooStates.set(name, state);
+      }
+      object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+      wooObjects.set(name, object);
+    }
+    return object;
+  });
+
+  const commitNamespace = new FakeDurableObjectNamespace((name) => {
+    let object = commitObjects.get(name);
+    if (!object) {
+      let state = commitStates.get(name);
+      if (!state) {
+        state = new FakeDurableObjectState(name);
+        commitStates.set(name, state);
+      }
+      object = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-local-smoke-secret" });
+      commitObjects.set(name, object);
+    }
+    return object;
+  });
+
+  env = {
+    WOO_INITIAL_WIZARD_TOKEN: "cf-local-smoke-token",
+    WOO_INTERNAL_SECRET: "cf-local-smoke-secret",
+    WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,note,blocks-demo",
+    WOO_MCP_GATEWAY_SHARDS: String(SHARDS),
+    DIRECTORY: new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    }),
+    WOO: wooNamespace,
+    COMMIT_SCOPE: commitNamespace,
+    HOST_SEED_KV: new FakeKVNamespace() as unknown as KVNamespace
+  } as unknown as Env;
+
+  return {
+    env,
+    request: async (path, init) => await worker.fetch(new Request(`https://woo.test${path}`, init), env, {}),
+    close: () => {
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+      for (const state of commitStates.values()) state.close();
+    }
+  };
+}
+
+async function openOnDifferentShard(harness: CfSmokeHarness, alice: LocalMcpSession, runId: string): Promise<LocalMcpSession> {
+  const aliceShard = mcpShardHost(alice.sessionId);
+  for (let i = 0; i < 16; i += 1) {
+    const candidate = await LocalMcpSession.open(harness, `guest:cf-local-bob-${runId}-${i}`, "bob", runId);
+    if (mcpShardHost(candidate.sessionId) !== aliceShard) return candidate;
+    await candidate.close();
+  }
+  throw new Error(`could not find bob session on a different MCP shard than ${aliceShard}`);
+}
+
+async function runWalkthrough(alice: LocalMcpSession, bob: LocalMcpSession): Promise<void> {
+  await step("enter:chatroom (alice)", async () => {
+    await alice.call("the_chatroom", "enter", []);
+  });
+  await step("enter:chatroom (bob)", async () => {
+    await bob.call("the_chatroom", "enter", []);
+  });
+  await drain(alice);
+  await drain(bob);
+
+  await step("chat:say reaches peer", async () => {
+    const text = `walkthrough-say-${alice.runId}`;
+    await alice.call("the_chatroom", "say", [text]);
+    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text));
+  });
+
+  await step("move:southeast emits `left` to bob (origin room)", async () => {
+    await alice.call("the_chatroom", "southeast", []);
+    await waitFor(bob, (obs) =>
+      obs.type === "left" &&
+      obs.actor === alice.actor &&
+      obs.source === "the_chatroom" &&
+      obs.destination === "the_deck" &&
+      obs.exit === "southeast",
+    10_000);
+  });
+
+  await step("move:west emits `entered` to bob (destination room)", async () => {
+    await alice.call("the_deck", "west", []);
+    await waitFor(bob, (obs) =>
+      obs.type === "entered" &&
+      obs.actor === alice.actor &&
+      obs.source === "the_chatroom" &&
+      obs.origin === "the_deck" &&
+      obs.exit === "west",
+    10_000);
+  });
+
+  await step("pinboard:add_note reaches peer", async () => {
+    await alice.call("the_chatroom", "southeast", []);
+    await bob.call("the_chatroom", "southeast", []);
+    await drain(alice);
+    await drain(bob);
+    try {
+      await alice.call("the_deck", "enter", ["the_pinboard"]);
+    } catch {
+      // The canonical entry below is the real assertion; the deck command is
+      // retained as an opportunistic route/manifest warm-up because prod smoke
+      // has failed here when the deck scope held stale executable state.
+    }
+    await alice.call("the_pinboard", "enter", []);
+    await bob.call("the_pinboard", "enter", []);
+    await drain(alice);
+    await drain(bob);
+    const text = `pinboard-${alice.runId}`;
+    await alice.call("the_pinboard", "add_note", [text, "yellow", 32, 32, 200, 120]);
+    await waitFor(bob, (obs) =>
+      obs.type === "note_added" &&
+      isRecord(obs.note) &&
+      typeof obs.note.text === "string" &&
+      obs.note.text.includes(text),
+    10_000);
+  });
+
+  await step("outliner:enter result includes a roster row for alice", async () => {
+    await alice.leaveIfIn("the_pinboard");
+    await bob.leaveIfIn("the_pinboard");
+    if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", []);
+    if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", []);
+    await drain(alice);
+    await drain(bob);
+    const aliceEnter = await alice.call("the_outline", "enter", []);
+    if (!isRecord(aliceEnter) || !Array.isArray(aliceEnter.roster)) {
+      throw new Error(`expected roster array on the_outline:enter result; got ${JSON.stringify(aliceEnter).slice(0, 200)}`);
+    }
+    const ids = new Set(aliceEnter.roster.filter(isRecord).map((row) => String(row.id ?? "")));
+    if (!ids.has(alice.actor)) {
+      throw new Error(`alice not in her own enter roster; ids=${[...ids].join(",")} expected alice=${alice.actor}`);
+    }
+  });
+
+  await step("outliner:add_item reaches peer", async () => {
+    await bob.call("the_outline", "enter", []);
+    await drain(alice);
+    await drain(bob);
+    const text = `outline-${alice.runId}`;
+    await alice.call("the_outline", "add_item", [text]);
+    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
+  });
+
+  await step("tasks: cross-room `entered` reaches peer", async () => {
+    await alice.leaveIfIn("the_outline");
+    await bob.leaveIfIn("the_outline");
+    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", []);
+    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", []);
+    await walkSouthToTaskboard(alice);
+    await drain(alice);
+    await drain(bob);
+    await walkSouthToTaskboard(bob);
+    await waitFor(alice, (obs) =>
+      obs.type === "entered" &&
+      obs.actor === bob.actor &&
+      obs.source === "the_taskboard",
+    10_000);
+  });
+}
+
+async function walkSouthToTaskboard(session: LocalMcpSession): Promise<void> {
+  if (session.currentRoom !== "the_deck") {
+    throw new Error(`${session.label} expected on the_deck before south; at=${session.currentRoom}`);
+  }
+  await session.call("the_deck", "south", []);
+  const afterFirstMove = session.currentRoom as string | null;
+  if (afterFirstMove === "the_garden") await session.call("the_garden", "south", []);
+  const afterSouthPath = session.currentRoom as string | null;
+  if (afterSouthPath !== "the_taskboard") {
+    throw new Error(`${session.label} expected on the_taskboard after south path; at=${session.currentRoom}`);
+  }
+}
+
+async function step(name: string, body: () => Promise<void>): Promise<void> {
+  try {
+    await raceWithTimeout(body(), STEP_TIMEOUT_MS, `step "${name}" exceeded ${STEP_TIMEOUT_MS}ms watchdog`);
+  } catch (err) {
+    throw new Error(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function drain(session: LocalMcpSession): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < DRAIN_TOTAL_BUDGET_MS) {
+    try {
+      const result = await session.callTool("woo_wait", { timeout_ms: DRAIN_POLL_MS, limit: 100 });
+      if (waitObservationsOf(result).length === 0) return;
+    } catch {
+      return;
+    }
+  }
+}
+
+async function waitFor(
+  session: LocalMcpSession,
+  match: (obs: Record<string, any>) => boolean,
+  totalTimeoutMs = 5000
+): Promise<Record<string, any>> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < totalTimeoutMs) {
+    const remaining = totalTimeoutMs - (Date.now() - startedAt);
+    const result = await session.callTool("woo_wait", { timeout_ms: Math.min(remaining, 1000), limit: 100 });
+    for (const obs of waitObservationsOf(result)) {
+      if (isRecord(obs) && match(obs)) return obs;
+    }
+  }
+  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation`);
+}
+
+class LocalMcpSession {
+  private nextId = 2;
+  currentRoom: string | null = null;
+
+  private constructor(
+    private readonly harness: CfSmokeHarness,
+    readonly sessionId: string,
+    readonly actor: string,
+    readonly label: string,
+    readonly runId: string
+  ) {}
+
+  static async open(harness: CfSmokeHarness, token: string, label: string, runId: string): Promise<LocalMcpSession> {
+    const response = await mcpFetch(harness, {
+      method: "POST",
+      headers: { "mcp-token": token },
+      body: rpc(1, "initialize", initializeParams(`cf-local-smoke/${runId}/${label}`))
+    });
+    expect(response.ok, await response.clone().text()).toBe(true);
+    const sessionId = response.headers.get("mcp-session-id");
+    expect(sessionId).toBeTruthy();
+    await parseMcpResponse(response);
+
+    const probing = new LocalMcpSession(harness, sessionId!, "", label, runId);
+    const notified = await mcpFetch(harness, {
+      method: "POST",
+      headers: { "mcp-session-id": sessionId! },
+      body: notification("notifications/initialized")
+    });
+    expect(notified.status).toBe(202);
+    const tools = await probing.callTool("woo_list_reachable_tools", { scope: "all", limit: 200 });
+    const list = tools?.result?.structuredContent?.result?.tools ?? [];
+    const selfTool = list.find((tool: any) =>
+      typeof tool?.object === "string" &&
+      /^guest_/.test(tool.object) &&
+      (tool.verb === "focus_list" || tool.verb === "focus" || tool.verb === "wait")
+    );
+    if (!selfTool || typeof selfTool.object !== "string") {
+      throw new Error(`could not resolve actor for ${label} from tool list (saw ${list.length} tools)`);
+    }
+    return new LocalMcpSession(harness, sessionId!, selfTool.object, label, runId);
+  }
+
+  async call(object: string, verb: string, args: unknown[]): Promise<unknown> {
+    const result = unwrap(await this.callTool("woo_call", { object, verb, args }));
+    if (isRecord(result) && typeof result.room === "string") this.currentRoom = result.room;
+    return result;
+  }
+
+  async leaveIfIn(space: string): Promise<boolean> {
+    if (this.currentRoom !== space) return false;
+    await this.call(space, "leave", []);
+    return true;
+  }
+
+  async callTool(name: string, params: Record<string, unknown>): Promise<any> {
+    const response = await mcpFetch(this.harness, {
+      method: "POST",
+      headers: { "mcp-session-id": this.sessionId },
+      body: rpc(this.nextId++, "tools/call", { name, arguments: params })
+    });
+    expect(response.ok, await response.clone().text()).toBe(true);
+    const body = await parseMcpResponse(response);
+    if (body && typeof body === "object" && "error" in body && body.error) {
+      throw new Error(`tools/call ${name} JSON-RPC error: ${JSON.stringify(body.error)}`);
+    }
+    return body;
+  }
+
+  async close(): Promise<void> {
+    await mcpFetch(this.harness, {
+      method: "DELETE",
+      headers: { "mcp-session-id": this.sessionId }
+    }).catch(() => undefined);
+  }
+}
+
+async function mcpFetch(
+  harness: CfSmokeHarness,
+  input: { method: string; headers?: Record<string, string>; body?: unknown; timeoutMs?: number }
+): Promise<Response> {
+  const headers = new Headers({ accept: "application/json, text/event-stream", ...input.headers });
+  let body: BodyInit | undefined;
+  if (input.body !== undefined) {
+    headers.set("content-type", "application/json");
+    body = JSON.stringify(input.body);
+  }
+  return await raceWithTimeout(
+    harness.request("/mcp", { method: input.method, headers, body }),
+    input.timeoutMs ?? RPC_TIMEOUT_MS,
+    `MCP ${input.method} /mcp timed out after ${input.timeoutMs ?? RPC_TIMEOUT_MS}ms`
+  );
+}
+
+function raceWithTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    handle = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => {
+    if (handle) clearTimeout(handle);
+  });
+}
+
+async function parseMcpResponse(response: Response): Promise<any> {
+  if (response.status === 202 || response.status === 204) return null;
+  const text = await response.text();
+  if (!text) return null;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("text/event-stream")) {
+    const data = text.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice("data:".length).trim();
+    return data ? JSON.parse(data) : null;
+  }
+  return JSON.parse(text);
+}
+
+function unwrap(body: any): unknown {
+  if (body?.result?.isError) {
+    throw new Error(`MCP tool error: ${JSON.stringify(body.result.structuredContent ?? body.result, null, 2)}`);
+  }
+  return body?.result?.structuredContent?.result;
+}
+
+function waitObservationsOf(body: any): unknown[] {
+  return body?.result?.structuredContent?.result?.observations ?? [];
+}
+
+function initializeParams(name: string): Record<string, unknown> {
+  return {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name, version: "0.0.0" }
+  };
+}
+
+function rpc(id: number, method: string, params?: unknown): Record<string, unknown> {
+  return { jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) };
+}
+
+function notification(method: string, params?: unknown): Record<string, unknown> {
+  return { jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) };
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mcpShardHost(sessionId: string): string {
+  return `mcp-gateway-${stableHash(sessionId) % SHARDS}`;
+}
+
+function stableHash(input: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}

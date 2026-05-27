@@ -31,6 +31,11 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
 
 - **In-memory mode** (tests). Run with `LocalSQLiteRepository(":memory:")` from [`src/server/sqlite-repository.ts`](../../src/server/sqlite-repository.ts); no disk persistence and reset on process exit.
 - **Local SQLite mode** (single-node local system). Use `npm run dev` (default `WOO_DB=.woo/dev.sqlite`) or set `WOO_DB` for custom path/in-memory behavior.
+- **Local Cloudflare-shape smoke**. Run `npm run smoke:cf-local` before a real
+  Cloudflare smoke/deploy when validating cross-actor behavior. It drives the
+  Worker entrypoint through fake Durable Object namespaces, MCP gateway shards,
+  CommitScopeDOs, host seeds, and HOST_SEED_KV, so it covers distributed runtime
+  boundaries that `npm run dev` cannot exercise.
 
 ---
 
