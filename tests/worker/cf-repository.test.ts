@@ -20,7 +20,7 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
+import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
@@ -149,7 +149,7 @@ function createHostSeedKvHarness() {
     HOST_SEED_KV: kv as unknown as KVNamespace
   } as unknown as Env;
 
-  const kvNamespace = (): string => localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
+  const kvNamespace = (): string => `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   const hostSeedPointerKey = (host: string): string => `seed-current:${kvNamespace()}:${host}`;
   const hostSeedBytesKey = (host: string, digest: string): string => `seed:${kvNamespace()}:${host}:${digest}`;
   const mcpGatewayPointerKey = (): string => `mcp-gateway-world-current:${kvNamespace()}`;

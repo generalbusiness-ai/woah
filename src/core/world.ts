@@ -859,6 +859,19 @@ export class WooWorld {
     this.hostSeedCache.delete(host as ObjRef);
   }
 
+  private invalidateHostSeedsForObject(id: ObjRef): void {
+    const host = this.hostKeyForObject(id);
+    if (host === DEFAULT_OBJECT_HOST) {
+      // Default-hosted catalog support rows (classes, features, and shared
+      // seed metadata) can be included in many satellite host seeds. A write
+      // to one of those rows must therefore invalidate every cached per-host
+      // seed, not only the gateway's own "world" entry.
+      this.hostSeedCache.clear();
+      return;
+    }
+    this.invalidateHostSeed(host);
+  }
+
   // Read access for the MCP host (cross-host tool enumeration). Other callers
   // should use the typed APIs that wrap the bridge.
   getExecutorContext(): ExecutorContext | null {
@@ -6655,7 +6668,7 @@ export class WooWorld {
 
   private invalidateProjectionObjectCache(id: ObjRef): void {
     this.mutationCounter += 1;
-    this.invalidateHostSeed(this.hostKeyForObject(id));
+    this.invalidateHostSeedsForObject(id);
   }
 
   applyCommittedShadowTranscript(transcript: EffectTranscript, options: ShadowGatewayApplyOptions = {}): void {
@@ -7409,11 +7422,11 @@ export class WooWorld {
   private persistObject(objRef: ObjRef): void {
     this.mutationCounter += 1;
     // Per-host cache invalidation: only the host whose slice contains
-    // objRef needs its cached host-seed dropped. Other hosts' caches
-    // stay valid. hostKeyForObject walks the anchor chain to find which
-    // host owns the slice; for $-classes and other DEFAULT_OBJECT_HOST
-    // objects this returns "world", so only WORLD's cache is dropped.
-    this.invalidateHostSeed(this.hostKeyForObject(objRef));
+    // objRef needs its cached host-seed dropped unless the object is a
+    // shared default-hosted support row. hostKeyForObject walks the anchor
+    // chain to find which host owns ordinary instance data; support rows
+    // clear the whole host-seed cache via invalidateHostSeedsForObject().
+    this.invalidateHostSeedsForObject(objRef);
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7430,7 +7443,7 @@ export class WooWorld {
 
   private deletePersistedObject(objRef: ObjRef): void {
     this.mutationCounter += 1;
-    this.invalidateHostSeed(this.hostKeyForObject(objRef));
+    this.invalidateHostSeedsForObject(objRef);
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7467,8 +7480,9 @@ export class WooWorld {
   private persistProperty(objRef: ObjRef, name: string): void {
     this.mutationCounter += 1;
     // Properties travel with their owning object's slice. Invalidate
-    // only that host's cache.
-    this.invalidateHostSeed(this.hostKeyForObject(objRef));
+    // only that host's cache, except shared support rows that can appear
+    // in every host seed.
+    this.invalidateHostSeedsForObject(objRef);
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {
@@ -7482,7 +7496,7 @@ export class WooWorld {
 
   private deletePersistedProperty(objRef: ObjRef, name: string): void {
     this.mutationCounter += 1;
-    this.invalidateHostSeed(this.hostKeyForObject(objRef));
+    this.invalidateHostSeedsForObject(objRef);
     const repo = this.activeObjectRepository();
     if (!repo) return;
     if (this.persistencePaused > 0 || this.persistenceDeferred > 0) {

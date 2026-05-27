@@ -1329,6 +1329,34 @@ describe("woo core", () => {
     expect(first.digest).toMatch(/^[0-9a-f]{64}$/); // SHA-256 hex
   });
 
+  it("HS1: shared catalog support edits invalidate every cached host seed", () => {
+    const gateway = createWorld();
+    const before = gateway.buildHostSeedForDeliveryWithDigest("the_deck");
+    const beforeRoster = before.seed.objects
+      .find((obj) => obj.id === "$conversational")
+      ?.verbs.find((verb) => verb.name === "room_roster");
+    expect(beforeRoster?.source).toContain("contents(this)");
+
+    const current = gateway.ownVerbExact("$conversational", "room_roster");
+    expect(current).toBeTruthy();
+    const installed = installVerb(
+      gateway,
+      "$conversational",
+      "room_roster",
+      "verb :room_roster() rxd { return [\"fresh-host-seed\"]; }",
+      current!.version
+    );
+    expect(installed.ok).toBe(true);
+
+    const after = gateway.buildHostSeedForDeliveryWithDigest("the_deck");
+    const afterRoster = after.seed.objects
+      .find((obj) => obj.id === "$conversational")
+      ?.verbs.find((verb) => verb.name === "room_roster");
+    expect(after.seed).not.toBe(before.seed);
+    expect(after.digest).not.toBe(before.digest);
+    expect(afterRoster?.source).toContain("fresh-host-seed");
+  });
+
   it("HS1: seed digest changes when world content changes", () => {
     const gateway = createWorld();
     const before = gateway.buildHostSeedForDeliveryWithDigest("the_chatroom").digest;
