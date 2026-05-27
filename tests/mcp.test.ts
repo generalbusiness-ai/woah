@@ -1658,6 +1658,83 @@ describe("McpHost", () => {
     expect(world.getProp("the_chatroom", "next_seq")).toBe(7);
   });
 
+  it("persists accepted fanout into the projection cache in sequence order, not arrival order", () => {
+    // Regression: the worker gateway wrote its durable SQL projection cache
+    // before McpGateway sequenced the frame. A seq-2-before-seq-1 arrival
+    // advanced the cache head to 2, so the later seq 1 was dropped by the
+    // cache's head-idempotency guard (position.seq <= head_seq) — losing seq 1's
+    // projection rows/invalidations from the durable cache. The
+    // persistAcceptedProjection hook must therefore fire only when the gateway
+    // actually applies a frame, in contiguous scope-sequence order.
+    const world = bootstrapWorld();
+    world.setProp("the_chatroom", "next_seq", 5);
+    const persisted: number[] = [];
+    const gateway = new McpGateway(world, {
+      persistAcceptedProjection: (commit) => persisted.push(commit.position.seq)
+    });
+    const relay = createShadowBrowserRelayShim({
+      node: "mcp-order-persist",
+      scope: "the_chatroom",
+      serialized: world.exportWorld()
+    });
+    relay.commit_scope.head = { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 4, hash: "head-4" };
+    (gateway as unknown as { v2Scopes: Map<string, unknown> }).v2Scopes.set("the_chatroom", {
+      scope: "the_chatroom",
+      relay,
+      openedSessions: new Set()
+    });
+    const transcript = (seq: number, value: string): EffectTranscript => ({
+      kind: "woo.effect_transcript.shadow.v1",
+      id: `persist-order-${seq}`,
+      route: "sequenced",
+      scope: "the_chatroom",
+      seq,
+      session: null,
+      call: { actor: "$wiz", target: "the_chatroom", verb: "persist_order_probe", args: [value] },
+      reads: [],
+      writes: [{ cell: { kind: "prop", object: "the_chatroom", name: "next_seq" }, value: seq + 1, op: "set" }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      result: true,
+      complete: true,
+      incompleteReasons: [],
+      hash: `persist-order-${seq}`
+    });
+    const commit = (seq: number) => ({
+      kind: "woo.commit.accepted.shadow.v1" as const,
+      id: `persist-order-${seq}`,
+      position: { kind: "woo.scope_head.shadow.v1" as const, scope: "the_chatroom", epoch: 1, seq, hash: `head-${seq}` },
+      transcript_hash: `persist-order-${seq}`,
+      post_state_hash: `post-${seq}`,
+      observations: [],
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1" as const,
+        id: `persist-order-${seq}`,
+        route: "sequenced" as const,
+        scope: "the_chatroom",
+        seq,
+        transcript_hash: `persist-order-${seq}`,
+        pre_state_hash: `pre-${seq}`,
+        post_state_hash: `post-${seq}`,
+        accepted: true,
+        errors: []
+      }
+    });
+
+    // seq 6 arrives first: queued, not yet applied, so the cache is NOT touched.
+    gateway.acceptRemoteV2Commit("the_chatroom", commit(6), transcript(6, "six"));
+    expect(persisted).toEqual([]);
+    // seq 5 fills the gap and drains seq 6: the cache is persisted 5 then 6.
+    gateway.acceptRemoteV2Commit("the_chatroom", commit(5), transcript(5, "five"));
+    expect(persisted).toEqual([5, 6]);
+    // A duplicate seq 6 is deduped before application: no re-persist.
+    gateway.acceptRemoteV2Commit("the_chatroom", commit(6), transcript(6, "six-duplicate"));
+    expect(persisted).toEqual([5, 6]);
+  });
+
   it("propagates accepted-frame writes to other cached scope snapshots", async () => {
     // Production bug: after `chatroom → southeast → deck`, then `deck → west →
     // chatroom`, the next actor verb routed to the chatroom scope reads stale

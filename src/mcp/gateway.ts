@@ -150,6 +150,14 @@ export type McpGatewayOptions = {
   broadcasts?: McpBroadcastHooks;
   dispatch?: McpDispatchHooks;
   toolManifests?: McpToolManifestHooks;
+  // Persist an accepted fanout commit into a durable projection cache (the
+  // worker gateway's SQL rows). Invoked from applyRemoteAccepted, i.e. in
+  // contiguous scope-sequence order including drained out-of-order frames, so
+  // the durable cache advances in the same order as in-memory routing. It must
+  // NOT be called before sequencing: a seq-2-before-seq-1 arrival would
+  // otherwise advance the cache head to 2 and let the later seq 1 be dropped by
+  // the cache's head-idempotency guard.
+  persistAcceptedProjection?: (commit: ShadowCommitAccepted, transcript: EffectTranscript) => void;
   v2?: McpV2ClientHooks;
 };
 
@@ -349,6 +357,11 @@ export class McpGateway {
     if (entry.commit.projection_delta) {
       assertProjectionWritesComplete(entry.commit.projection_delta, projectionWrites, entry.commit.position.scope, "fanout");
     }
+    // Persist into the durable projection cache before in-memory routing, and
+    // only here — this runs in contiguous sequence order (including drained
+    // out-of-order frames), so the cache head advances seq by seq and no frame
+    // is dropped by the cache's head-idempotency guard.
+    this.options.persistAcceptedProjection?.(entry.commit, entry.transcript);
     this.rememberRemoteAccepted(remoteAcceptedKey(entry.commit));
     const client = this.v2Scopes.get(scope);
     if (client) {

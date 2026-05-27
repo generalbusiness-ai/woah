@@ -823,6 +823,27 @@ export class PersistentObjectDO {
     this.refreshGatewayToolSurfaceScopeSaturation(row.scope, now);
   }
 
+  // True only when the gateway already holds a non-stale tool-surface row for
+  // this request. Used to decide whether a cache read is a COMPLETE answer for
+  // a request before short-circuiting the owner refresh. A saturated scope
+  // (reverse-index cap hit) is uncovered so reads refresh from the owner; an
+  // empty-but-cached scope also reads as uncovered (it leaves no row) and so
+  // re-verifies with the owner rather than being mistaken for "fully cached".
+  private gatewayToolSurfaceRequestCovered(request: RemoteToolRequest): boolean {
+    if (this.gatewayToolSurfaceScopeSaturated(request.id)) return false;
+    const row = request.expandContents
+      ? firstSqlRow<{ present: number }>(this.state.storage.sql.exec(
+          "SELECT 1 AS present FROM gateway_tool_surface WHERE scope = ? AND stale = 0 LIMIT 1",
+          request.id
+        ))
+      : firstSqlRow<{ present: number }>(this.state.storage.sql.exec(
+          "SELECT 1 AS present FROM gateway_tool_surface WHERE scope = ? AND object = ? AND stale = 0 LIMIT 1",
+          request.id,
+          request.id
+        ));
+    return row != null;
+  }
+
   private readGatewayToolSurfaceDescriptors(requests: readonly RemoteToolRequest[]): RemoteToolDescriptor[] {
     const out: RemoteToolDescriptor[] = [];
     const seen = new Set<string>();
@@ -1418,6 +1439,10 @@ export class PersistentObjectDO {
           loadSessionManifest: (sessionId) => this.loadGatewaySessionToolManifest(sessionId),
           saveSessionManifest: (manifest) => this.saveGatewaySessionToolManifest(manifest)
         },
+        // Persist accepted fanout into the durable SQL projection cache in
+        // contiguous sequence order, as the gateway accepts/drains each frame.
+        persistAcceptedProjection: (commit) =>
+          this.applyGatewayProjectionWrites(commit.position, commit.projection_writes ?? [], "fanout", commit.projection_delta),
         broadcasts: {}
       });
       // On cold-load (DO rehydrate after hibernation), McpHost.queues is empty.
@@ -2695,7 +2720,12 @@ export class PersistentObjectDO {
         const responses = await Promise.all(
           Array.from(byHost, async ([host, hostRequests]) => {
             const cached = this.readGatewayToolSurfaceDescriptors(hostRequests);
-            if (cached.length > 0) {
+            // Only serve from cache without an owner refresh when EVERY request
+            // in this host batch is covered. A partial hit (one cached scope,
+            // another uncached) must still refresh, otherwise the uncached
+            // scopes' tools silently vanish from a mixed/expanded listing.
+            const fullyCovered = hostRequests.every((request) => this.gatewayToolSurfaceRequestCovered(request));
+            if (fullyCovered) {
               this.emitMetric({
                 kind: "same_host_fallback",
                 route: "/__internal/enumerate-tools",
@@ -2902,7 +2932,12 @@ export class PersistentObjectDO {
           throw wooError("E_INVARG", "mcp-commit-fanout requires transcript");
         }
         const originSession = typeof body.origin_session === "string" ? body.origin_session : null;
-        this.applyGatewayProjectionWrites(body.commit.position, body.commit.projection_writes ?? [], "fanout", body.commit.projection_delta);
+        // The durable projection-cache write is NOT done here: a fanout frame
+        // may arrive out of scope-sequence order, and writing it before
+        // sequencing would advance the cache head past a not-yet-seen earlier
+        // frame, dropping that frame at the head-idempotency guard. The gateway
+        // applies the SQL write via the persistAcceptedProjection hook, in
+        // contiguous order, as it accepts/drains each frame.
         this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession);
         return jsonResponse({ ok: true });
       }
