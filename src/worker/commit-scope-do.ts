@@ -9,6 +9,8 @@
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import { mergeSerializedAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { createWorldFromSerialized } from "../core/bootstrap";
+import { localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   applyShadowBrowserTransfer,
@@ -83,6 +85,11 @@ const CHECKPOINT_TRANSFER_MAX_BYTES = 1024 * 1024;
 const CHECKPOINT_PAGE_TARGET_BYTES = 512 * 1024;
 const CHECKPOINT_CONTINUATION_TTL_MS = 5 * 60 * 1000;
 const JSON_BYTES = new TextEncoder();
+const COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH = "commit-scope-catalog-repair-v1";
+
+type CommitScopeEnv = InternalAuthEnv & {
+  WOO_AUTO_INSTALL_CATALOGS?: string;
+};
 
 type PersistedCheckpointPageRef = {
   kind: "woo.projection_page_ref.v1";
@@ -136,7 +143,7 @@ export class CommitScopeDO {
 
   constructor(
     private readonly state: CommitScopeDurableState,
-    private readonly env: InternalAuthEnv
+    private readonly env: CommitScopeEnv
   ) {
     const constructorStartedAt = Date.now();
     this.state.storage.sql.exec(
@@ -181,6 +188,9 @@ export class CommitScopeDO {
     this.state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS v2_commit_scope_checkpoint_frame (scope TEXT NOT NULL, checkpoint_hash TEXT NOT NULL, seq INTEGER NOT NULL, position_hash TEXT NOT NULL, body TEXT NOT NULL, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(scope, checkpoint_hash, seq))"
     );
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS v2_commit_scope_snapshot_repair (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "CommitScopeDO", ms: constructorMs, ts: Date.now(), host_key: this.durableScopeKey() }));
     writeConstructorMetricToAnalytics("CommitScopeDO", constructorMs, this.durableScopeKey(), this.env.METRICS);
@@ -224,6 +234,10 @@ export class CommitScopeDO {
           const relay = await this.relayFor(input, { mergeSerializedAuth: input.open_protocol !== "checkpoint_tail.v1" });
           this.emitV2OpenStep("relay_for", phaseStartedAt, { scope, node });
           if (input.open_protocol === "checkpoint_tail.v1") {
+            phaseStartedAt = metricNow();
+            fullSave = await this.saveFullIfNeeded(relay);
+            this.emitV2OpenStep("full_save", phaseStartedAt, { scope, node, full_save: fullSave, count: fullSave ? 1 : 0 });
+            if (fullSave) this.scheduleCheckpointBuild(relay, "checkpoint_tail_full_save");
             phaseStartedAt = metricNow();
             const responseBody = this.checkpointTailOpenResponse(relay, input);
             if (!responseBody) {
@@ -1477,7 +1491,7 @@ export class CommitScopeDO {
       )).map((row) => row.id)
     };
     if (pruneSerializedSessionsWithoutActorRows(serialized)) this.needsFullSave = true;
-    return serialized;
+    return this.repairLoadedSerializedWorld(serialized, meta.scope as ObjRef);
   }
 
   private async saveFull(relay: ShadowBrowserRelayShim): Promise<void> {
@@ -1487,6 +1501,7 @@ export class CommitScopeDO {
     const now = Date.now();
     this.state.storage.transactionSync(() => {
       this.saveMeta(relay, now);
+      this.clearScopeCheckpoints(relay.commit_scope.scope);
       this.saveWorldRows(serializedFor(relay.commit_scope, { reason: "save_full", metric: (event) => this.emitMetric(event) }), now);
       this.appendAcceptedFrames(relay, now);
       this.appendTranscriptTail(relay, now);
@@ -1494,7 +1509,60 @@ export class CommitScopeDO {
       this.pruneTranscriptTailByHorizon(relay, now);
       this.saveSeenKeys(relay);
       this.saveRecentReplies(relay, now);
+      this.saveSnapshotRepairFingerprint(now);
     });
+  }
+
+  private repairLoadedSerializedWorld(serialized: SerializedWorld, scope: ObjRef): SerializedWorld {
+    // Synthetic/minimal snapshots used by checkpoint tests and capsule probes
+    // may contain only the scope object. Without $system there is no bundled
+    // catalog ledger/support graph to reconcile, so keep the historical row
+    // shape untouched.
+    if (!serialized.objects.some((object) => object.id === "$system")) return serialized;
+    const fingerprint = this.currentSnapshotRepairFingerprint();
+    if (this.loadSnapshotRepairFingerprint() === fingerprint) return serialized;
+    const startedAt = metricNow();
+    const world = createWorldFromSerialized(serialized, {
+      persist: false,
+      metricsHook: (event) => this.emitMetric(event)
+    });
+    // CommitScopeDO snapshots are long-lived row materializations. They do not
+    // re-fetch gateway host seeds on deploy, so bundled catalog support rows
+    // must receive the same idempotent host-scoped schema/data repair that
+    // resident PersistentObjectDO hosts run on cold load.
+    runHostScopedLocalCatalogLifecycle(world, scope);
+    this.needsFullSave = true;
+    console.log("woo.commit_scope_snapshot_repair", JSON.stringify({
+      scope,
+      fingerprint,
+      ms: metricElapsed(startedAt)
+    }));
+    return world.exportWorld();
+  }
+
+  private currentSnapshotRepairFingerprint(): string {
+    return `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS))}:${COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH}`;
+  }
+
+  private loadSnapshotRepairFingerprint(): string | null {
+    const rows = sqlRows<{ fingerprint: string }>(this.state.storage.sql.exec(
+      "SELECT fingerprint FROM v2_commit_scope_snapshot_repair WHERE id = 'current' LIMIT 1"
+    ));
+    return rows[0]?.fingerprint ?? null;
+  }
+
+  private saveSnapshotRepairFingerprint(now: number): void {
+    this.state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_snapshot_repair(id, fingerprint, updated_at) VALUES ('current', ?, ?)",
+      this.currentSnapshotRepairFingerprint(),
+      now
+    );
+  }
+
+  private clearScopeCheckpoints(scope: ObjRef): void {
+    this.state.storage.sql.exec("DELETE FROM v2_commit_scope_checkpoint WHERE scope = ?", scope);
+    this.state.storage.sql.exec("DELETE FROM v2_commit_scope_checkpoint_page WHERE scope = ?", scope);
+    this.state.storage.sql.exec("DELETE FROM v2_commit_scope_checkpoint_frame WHERE scope = ?", scope);
   }
 
   private async saveEnvelopeDelta(
