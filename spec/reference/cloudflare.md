@@ -493,6 +493,14 @@ from the satellite's own local SQL. A catalog-fingerprint miss forces the
 satellite to fetch the gateway's current `/__internal/host-seed` response, while
 ordinary code-only deploys keep the same namespace and retain cache locality.
 
+Resident DO instances also persist the last bundled local catalog fingerprint
+they reconciled. If a live in-memory world observes a new fingerprint after a
+Worker deploy, it repairs before serving the request: the gateway host reruns
+local catalog install/repair, and satellite hosts fetch and merge the gateway's
+current host seed before marking the fingerprint current. This closes the
+resident-world case where a deploy changes bundled verb source but the DO keeps
+serving an already-loaded host slice.
+
 A wizard may ask the gateway to refresh live object hosts with
 `POST /api/admin/refresh-host-seeds`. The gateway exports each requested
 host-scoped seed and sends it to the owning DO. The receiving host merges that

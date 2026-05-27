@@ -35,7 +35,7 @@ import {
   serializedWorldFromAuthoritySlice
 } from "../core/authority-slice";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
+import { installLocalCatalogs, localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
   restFrameFromTurnReply,
@@ -368,6 +368,7 @@ const HOST_STATE_TEARING_DOWN = "tearing_down";
 // current digest and skips the full seed transfer when it matches — see
 // createHostScopedWorld below.
 const HOST_SEED_DIGEST_META_KEY = "host_seed_digest";
+const LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY = "local_catalog_bundle_fingerprint";
 // SHA-256 of the (id|host|anchor) triples this DO last successfully
 // published to the Directory, sorted by id. On gateway cold-restart we
 // recompute the digest from the current route set and skip the
@@ -1492,8 +1493,58 @@ export class PersistentObjectDO {
     return !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { success?: unknown }).success === true);
   }
 
+  private currentLocalCatalogBundleFingerprint(): string {
+    return localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
+  }
+
+  private async ensureLoadedWorldCatalogBundle(world: WooWorld, hostKey: string): Promise<void> {
+    const fingerprint = this.currentLocalCatalogBundleFingerprint();
+    if (this.repo.loadMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY) === fingerprint) return;
+    if (hostKey === WORLD_HOST) {
+      installLocalCatalogs(world, parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
+    } else if (!isMcpGatewayShardHost(hostKey)) {
+      // Hot DO instances can retain an already-loaded host slice across a
+      // Worker deploy. Pull the gateway seed once per catalog bundle so
+      // foreign-hosted support rows keep gateway-authoritative repairs while
+      // bundled verb-source changes reach resident worlds before stale
+      // bytecode handles the next request.
+      const current = world.exportWorld();
+      try {
+        const fetched = await this.fetchHostSeed(hostKey as ObjRef, current);
+        if (fetched.seed.objects.length > 0) {
+          let changed = false;
+          const merged = mergeHostScopedSeedWithStatus(current, fetched.seed, hostKey as ObjRef);
+          if (merged.changed) {
+            this.logHostSeedMergeDiff(hostKey as ObjRef, "catalog_bundle_repair", current, fetched.seed, merged.reasons);
+            world.importWorld(merged.world);
+            this.crossHostPropCache.clear();
+            changed = true;
+          }
+          runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: true });
+          const exported = world.exportWorld();
+          const seeded = mergeHostScopedSeedWithStatus(exported, fetched.seed, hostKey as ObjRef);
+          if (seeded.changed) {
+            this.logHostSeedMergeDiff(hostKey as ObjRef, "catalog_bundle_repair_post_lifecycle", exported, fetched.seed, seeded.reasons);
+            world.importWorld(seeded.world);
+            this.crossHostPropCache.clear();
+            changed = true;
+          }
+          if (changed) world.persistFullSnapshot();
+          if (fetched.digest) this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, fetched.digest);
+        } else {
+          runHostScopedLocalCatalogLifecycle(world, hostKey);
+        }
+      } catch (err) {
+        console.warn("woo.local_catalog_bundle_repair_failed", { host: hostKey, error: normalizeError(err) });
+        runHostScopedLocalCatalogLifecycle(world, hostKey);
+      }
+    }
+    this.repo.saveMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY, fingerprint);
+  }
+
   private async getWorld(hostKey = this.durableHostKey()): Promise<WooWorld> {
     if (this.world) {
+      await this.ensureLoadedWorldCatalogBundle(this.world, hostKey);
       if (hostKey === WORLD_HOST) await this.registerObjectRoutes(this.world);
       return this.world;
     }
@@ -1762,14 +1813,13 @@ export class PersistentObjectDO {
     }
   }
 
-  // Diagnostic for the cold-load write-treadmill: when the cold-load seed
-  // merge declares `changed: true` we re-do a manual diff and log the first
-  // few (object, field) pairs so we can identify which class/instance is
-  // drifting between gateway state and on-disk slice. Cheap, single-shot per
-  // cold-load. Remove once the source is identified.
+  // Diagnostic for host seed write-treadmills: when a seed merge declares
+  // `changed: true` we re-do a manual diff and log the first few (object,
+  // field) pairs so we can identify which class/instance is drifting between
+  // gateway state and the satellite's slice.
   private logHostSeedMergeDiff(
     hostKey: ObjRef,
-    phase: "load" | "post_lifecycle",
+    phase: "load" | "post_lifecycle" | "catalog_bundle_repair" | "catalog_bundle_repair_post_lifecycle",
     storedWorld: SerializedWorld,
     seedWorld: SerializedWorld,
     reasons: Array<{ id: ObjRef; reasons: string[] }> | undefined

@@ -3837,6 +3837,39 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("repairs resident host catalog verbs after a bundle fingerprint change", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await harness.publishHostSeed("the_chatroom");
+      const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+      expect(healthz.ok).toBe(true);
+
+      const host = harness.wooObjects.get("the_chatroom") as any;
+      const world = await host.getWorld("the_chatroom") as WooWorld;
+      const current = world.ownVerbExact("$conversational", "room_roster");
+      expect(current).toBeTruthy();
+      const installed = installVerb(world, "$conversational", "room_roster", `verb :room_roster() rxd {
+  return ["stale"];
+}`, current!.version);
+      expect(installed.ok).toBe(true);
+      host.repo.saveMeta("local_catalog_bundle_fingerprint", "old-fingerprint");
+
+      const repairedHealthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_chatroom" }
+      })));
+
+      expect(repairedHealthz.ok).toBe(true);
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("valid(item)");
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
   it("does not full-save a KV-seeded satellite on a quiescent second cold-load", async () => {
     const harness = createHostSeedKvHarness();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
