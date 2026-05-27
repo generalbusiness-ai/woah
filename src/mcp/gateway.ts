@@ -81,7 +81,10 @@ type SessionEntry = {
 export type McpV2ClientHooks = {
   open: (scope: ObjRef, body: McpV2OpenBody) => Promise<McpV2OpenResult>;
   envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
-  authorityPayload?: (extraObjectIds: ObjRef[]) => Promise<ReturnType<typeof executorAuthorityPayload>>;
+  authorityPayload?: (
+    extraObjectIds: ObjRef[],
+    options?: { useCommitScopeSnapshotForRemoteAuthority?: boolean }
+  ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
 };
 
@@ -547,6 +550,7 @@ export class McpGateway {
     if (!entry) throw new Error(`MCP session is not bound: ${sessionId}`);
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    let authorityRefreshAttempts = 0;
     const submitted = await submitTurnIntent<V2ScopeClient, McpV2EnvelopeResult>({
       input: {
         id,
@@ -561,11 +565,14 @@ export class McpGateway {
         token: entry.v2Token
       },
       strategy: "intent",
+      maxAttempts: 2,
       ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
       clientNode: () => this.v2NodeFor(entry),
       nextTurnId: () => id,
       authorityPayload: async (_submitScope, extraObjectIds) => {
-        const payload = await this.v2AuthorityPayload(extraObjectIds);
+        const useCommitScopeSnapshotForRemoteAuthority = authorityRefreshAttempts === 0;
+        authorityRefreshAttempts += 1;
+        const payload = await this.v2AuthorityPayload(extraObjectIds, { useCommitScopeSnapshotForRemoteAuthority });
         const client = this.v2Scopes.get(scope);
         if (client) this.mergeV2AuthorityIntoScopeClient(client, payload.authority);
         return payload;
@@ -730,8 +737,14 @@ export class McpGateway {
     };
   }
 
-  private async v2AuthorityPayload(extraObjectIds: ObjRef[]): Promise<ReturnType<typeof executorAuthorityPayload>> {
-    return await (this.options.v2?.authorityPayload?.(extraObjectIds) ?? Promise.resolve(executorAuthorityPayload(this.world, extraObjectIds)));
+  private async v2AuthorityPayload(
+    extraObjectIds: ObjRef[],
+    options: { useCommitScopeSnapshotForRemoteAuthority?: boolean } = {}
+  ): Promise<ReturnType<typeof executorAuthorityPayload>> {
+    return await (
+      this.options.v2?.authorityPayload?.(extraObjectIds, options)
+      ?? Promise.resolve(executorAuthorityPayload(this.world, extraObjectIds))
+    );
   }
 
   private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {

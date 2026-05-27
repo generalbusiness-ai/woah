@@ -975,6 +975,13 @@ cross-scope move accepted in one scope can leave another scope planning against
 stale presence. `session_objects` is a compatibility request field for older
 callers that do not send `authority`; authority-bearing requests MUST leave it
 empty, including when the authority itself is a legacy object-row slice.
+After a client has opened a scope and the CommitScopeDO has a durable planning
+snapshot, an MCP per-envelope refresh MAY omit remote object-owner rows and
+fall back to that snapshot for execution state. The request MUST still carry
+live session rows plus the explicit actor row and actor ancestry when the actor
+is a request root; newly minted session actors may not exist in the durable
+scope snapshot yet. First-open bootstrap and serialized seed construction MUST
+NOT use this omission rule.
 
 MCP and REST gateways may avoid a normal executable `/v2/open` when they
 already hold a local execution view for the commit scope by attaching a

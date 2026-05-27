@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
+import { executorAuthorityPayload } from "../src/core/executor";
+import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
+import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
 import { McpGateway, type McpV2EnvelopeBody, type McpV2OpenBody } from "../src/mcp/gateway";
 import { CommitScopeDO } from "../src/worker/commit-scope-do";
@@ -82,6 +85,45 @@ describe("v2 MCP e2e", () => {
       });
       const afterWait = sqlRows<{ n: number }>(scopeState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
       expect(afterWait).toBe(beforeWait);
+    } finally {
+      scopeState.close();
+    }
+  });
+
+  it("uses snapshot authority only for the first MCP envelope attempt", async () => {
+    const world = createWorld();
+    const scopeState = new FakeDurableObjectState("the_chatroom");
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    const authoritySnapshotFlags: boolean[] = [];
+    let envelopeCalls = 0;
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/open", body),
+        authorityPayload: async (extraObjectIds, options) => {
+          authoritySnapshotFlags.push(options?.useCommitScopeSnapshotForRemoteAuthority === true);
+          return executorAuthorityPayload(world, extraObjectIds);
+        },
+        envelope: async (commitScope, body) => {
+          envelopeCalls += 1;
+          if (envelopeCalls === 1) {
+            return { ok: true, reply: encodeEnvelope(replyEnvelope(missingStateReply("mcp-snapshot-retry"))) };
+          }
+          return await postCommitScope(scope, env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const session = await initializeMcp(gateway, "guest:v2-mcp-authority-snapshot", 1);
+      const result = await mcp(gateway, session, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+
+      expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
+      expect(envelopeCalls).toBe(2);
+      expect(authoritySnapshotFlags).toEqual([false, true, false]);
     } finally {
       scopeState.close();
     }
@@ -378,4 +420,27 @@ function sqlRows<T>(cursor: unknown): T[] {
     return cursor.toArray() as T[];
   }
   return Array.from(cursor as Iterable<T>);
+}
+
+function missingStateReply(id: string): ShadowTurnExecReply {
+  return {
+    kind: "woo.turn.exec.reply.shadow.v1",
+    ok: false,
+    id,
+    reason: "missing_state"
+  };
+}
+
+function replyEnvelope(body: ShadowTurnExecReply): ShadowEnvelope<ShadowTurnExecReply> {
+  return {
+    v: 2,
+    type: body.kind,
+    id: `reply:${body.id ?? "unknown"}`,
+    from: "commit-scope",
+    to: "mcp-gateway",
+    actor: "$actor",
+    session: "session",
+    auth: { mode: "session", token: "token" },
+    body
+  };
 }

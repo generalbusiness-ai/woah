@@ -758,6 +758,11 @@ authority row and actor-class ancestry when those rows are explicit request
 roots; a new session actor might not be present in the target CommitScopeDO
 snapshot yet, and omitting it turns a read timeout into a false
 `permission_denied: actor not found` rejection.
+For MCP sessions whose scope has already completed `/v2/open`, the gateway may
+take the same stale-snapshot fallback proactively: it sends live session/actor
+authority and omits remote object-owner rows instead of waking those owners on
+every envelope. This optimization is not valid for first-open seeding or any
+path that is still constructing the CommitScopeDO's durable planning snapshot.
 
 Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to indexed commit-scope state, marks any legacy `SerializedWorld`

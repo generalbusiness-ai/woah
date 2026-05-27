@@ -336,7 +336,7 @@ export type MetricEvent =
   // for the underlying RPC; this distinct event captures the higher-level
   // decision so cross_host_rpc latency stats stay clean and policy
   // changes are easy to grep for.
-  | { kind: "authority_slice_omitted"; host: string; object_count: number }
+  | { kind: "authority_slice_omitted"; host: string; object_count: number; reason?: "timeout" | "snapshot_fallback" }
   // Fires once per reapExpiredSessions sweep only when at least one session is
   // actually reaped. This keeps background sweep noise out of data-path tails
   // while preserving enough volume information for retention debugging.

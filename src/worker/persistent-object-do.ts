@@ -1418,8 +1418,11 @@ export class PersistentObjectDO {
           // snapshot, so omitting a cold satellite's slice falls through to
           // existing cells. The first-open seeding path does NOT pass this
           // flag — see comment on v2GatewayAuthorityPayload.
-          authorityPayload: async (extraObjectIds) =>
-            await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true }),
+          authorityPayload: async (extraObjectIds, authorityOptions) =>
+            await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
+              tolerateRemoteFailures: true,
+              useCommitScopeSnapshotForRemoteAuthority: authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true
+            }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
         },
         toolManifests: {
@@ -4076,7 +4079,7 @@ export class PersistentObjectDO {
   private async v2GatewayAuthorityPayload(
     world: WooWorld,
     extraObjectIds: Iterable<ObjRef>,
-    options: { tolerateRemoteFailures?: boolean } = {}
+    options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
     // omit slices for cold/unreachable remote hosts and rely on the
@@ -4092,12 +4095,17 @@ export class PersistentObjectDO {
     const routesById = new Map(world.objectRoutes().map((route) => [route.id, route] as const));
     const resolveHost = async (id: ObjRef, fallbackHost: string): Promise<string> => {
       const localRoute = routesById.get(id) ?? null;
-      const cached = this.routeCache.get(id);
-      if (cached) {
-        if (localRoute && localRoute.host !== cached) return await this.adoptLocalObjectRoute(localRoute);
-        return cached;
+      if (localRoute) {
+        // This is classification for an authority payload, not route
+        // publication. Publishing every transitive local route here turns a
+        // cheap authority refresh into directory fanout, especially on cold
+        // MCP gateway shards; the normal route registration paths keep the
+        // directory current.
+        this.routeCache.set(id, localRoute.host);
+        return localRoute.host;
       }
-      if (localRoute) return await this.adoptLocalObjectRoute(localRoute);
+      const cached = this.routeCache.get(id);
+      if (cached) return cached;
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
@@ -4119,8 +4127,9 @@ export class PersistentObjectDO {
     // exit_living_room_southeast, the_deck (via exit.dest), etc.
     // We classify every object in `local.authority` by host, then drop only
     // those whose host appears in `omittedHosts` (populated below from
-    // tolerated remote-fetch timeouts). Transitively-reachable cells for
-    // hosts we never asked stay in the slice — preserving the existing
+    // tolerated remote-fetch timeouts or commit-scope snapshot fallback).
+    // Transitively-reachable cells for hosts we never asked stay in the slice,
+    // preserving the existing
     // behavior of using the gateway's local view for second-degree cells.
     const localAuthorityObjectIds = Array.from(authoritySliceObjectIds(local.authority));
     const localAuthorityHosts = await Promise.all(localAuthorityObjectIds.map(
@@ -4143,33 +4152,54 @@ export class PersistentObjectDO {
     // caller retries against what is now a warm satellite.
     const omittedHosts = new Set<string>();
     const localActorAuthorityIds = localActorAuthorityPreserveIds(world, ids);
-    const remoteSlices = await Promise.all(Array.from(byHost, async ([host, objects]) => {
-      try {
-        const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+    const remoteSlices: Array<{ host: string; response: { authority: SerializedAuthoritySlice } | null; error: { code: string } | null }> = [];
+    if (options.useCommitScopeSnapshotForRemoteAuthority) {
+      // MCP per-envelope refresh happens only after ensureV2ScopeSessionOpen has
+      // established the CommitScopeDO's durable planning snapshot. Re-waking
+      // every remote owner here reintroduces the cold-open fanout that the
+      // snapshot is meant to avoid; omit those rows and let the scope snapshot
+      // provide execution state. The actor row is preserved below because a new
+      // session actor may not exist in the snapshot yet.
+      for (const [host, objects] of byHost) {
+        world.recordMetric({
+          kind: "authority_slice_omitted",
           host,
-          "/__internal/authority-slice",
-          { objects: Array.from(objects) }
-        );
-        return { host, response, error: null as { code: string } | null };
-      } catch (err) {
-        const error = normalizeError(err);
-        // Only swallow read-deadline timeouts (E_TIMEOUT) and only when the
-        // caller declared this is a refresh path (durable snapshot exists).
-        // Other errors (auth, signature, unreachable) always propagate;
-        // first-open seeding paths likewise propagate so cold-cold misses
-        // fail loudly instead of persisting a partial seed.
-        if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures) {
-          this.world?.recordMetric({
-            kind: "authority_slice_omitted",
-            host,
-            object_count: objects.size
-          });
-          omittedHosts.add(host);
-          return { host, response: null, error };
-        }
-        throw err;
+          object_count: objects.size,
+          reason: "snapshot_fallback"
+        });
+        omittedHosts.add(host);
+        remoteSlices.push({ host, response: null, error: null });
       }
-    }));
+    } else {
+      remoteSlices.push(...await Promise.all(Array.from(byHost, async ([host, objects]) => {
+        try {
+          const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+            host,
+            "/__internal/authority-slice",
+            { objects: Array.from(objects) }
+          );
+          return { host, response, error: null as { code: string } | null };
+        } catch (err) {
+          const error = normalizeError(err);
+          // Only swallow read-deadline timeouts (E_TIMEOUT) and only when the
+          // caller declared this is a refresh path (durable snapshot exists).
+          // Other errors (auth, signature, unreachable) always propagate;
+          // first-open seeding paths likewise propagate so cold-cold misses
+          // fail loudly instead of persisting a partial seed.
+          if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures) {
+            world.recordMetric({
+              kind: "authority_slice_omitted",
+              host,
+              object_count: objects.size,
+              reason: "timeout"
+            });
+            omittedHosts.add(host);
+            return { host, response: null, error };
+          }
+          throw err;
+        }
+      })));
+    }
     // Strip the gateway's local cells for hosts we attempted-and-omitted.
     // The one deliberate exception is the explicit actor authority root: a
     // new MCP/REST actor may not exist in the CommitScopeDO snapshot yet, so

@@ -5,7 +5,7 @@ import type { EffectTranscript } from "../../src/core/effect-transcript";
 import type { ProjectionDeltaSummary, ProjectionWrite, SessionToolManifest } from "../../src/core/projection-delta";
 import type { SerializedAuthoritySlice } from "../../src/core/repository";
 import { encodeEnvelope } from "../../src/core/shadow-envelope";
-import { wooError, type ObjRef, type RemoteToolDescriptor, type RemoteToolRequest } from "../../src/core/types";
+import { wooError, type MetricEvent, type ObjRef, type RemoteToolDescriptor, type RemoteToolRequest } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
@@ -699,5 +699,42 @@ describe("gateway projection cache", () => {
     expect(ids.has(session.actor)).toBe(true);
     if (actorParent) expect(ids.has(actorParent)).toBe(true);
     expect(ids.has("the_chatroom")).toBe(false);
+  });
+
+  it("uses the commit-scope snapshot for MCP per-envelope remote authority refresh", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const metrics: MetricEvent[] = [];
+    const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+    const session = world.auth("guest:authority-snapshot-fallback");
+    const actorParent = world.object(session.actor).parent;
+    let ownerReads = 0;
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      forwardInternalReadChecked: () => Promise<never>;
+    };
+    po.forwardInternalReadChecked = async () => {
+      ownerReads += 1;
+      throw new Error("owner should not be read for snapshot fallback");
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", session.actor], {
+      tolerateRemoteFailures: true,
+      useCommitScopeSnapshotForRemoteAuthority: true
+    });
+    const ids = authoritySliceObjectIds(payload.authority);
+
+    expect(ownerReads).toBe(0);
+    expect(ids.has(session.actor)).toBe(true);
+    if (actorParent) expect(ids.has(actorParent)).toBe(true);
+    expect(ids.has("the_chatroom")).toBe(false);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "authority_slice_omitted",
+      host: "the_chatroom",
+      reason: "snapshot_fallback"
+    }));
   });
 });
