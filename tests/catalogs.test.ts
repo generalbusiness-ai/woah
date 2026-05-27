@@ -724,6 +724,57 @@ describe("local catalogs", () => {
     }
   });
 
+  it("room rosters skip stale actor refs before reading row fields", async () => {
+    const world = createWorld({ catalogs: false });
+    installDemoworldDependencyClosure(world);
+    const session = world.auth("guest:roster-stale-projected");
+    const stale = "guest_roster_stale_projected";
+
+    const enteredChat = await world.directCall("stale-roster-chat-enter", session.actor, "the_chatroom", "enter", []);
+    expect(enteredChat.op).toBe("result");
+    world.object("the_chatroom").contents.add(stale);
+    const originalIsa = world.isDescendantOfChecked.bind(world);
+    world.isDescendantOfChecked = ((...args: Parameters<typeof world.isDescendantOfChecked>) => {
+      const [obj, ancestor, memo] = args;
+      if (obj === stale && ancestor === "$player") return true;
+      return originalIsa(obj, ancestor, memo);
+    }) as typeof world.isDescendantOfChecked;
+
+    const chatRoster = await world.directCall("stale-roster-chat", session.actor, "the_chatroom", "room_roster", []);
+    expect(chatRoster.op).toBe("result");
+    if (chatRoster.op === "result") {
+      const ids = (chatRoster.result as Array<{ id: string }>).map((row) => row.id);
+      expect(ids).toContain(session.actor);
+      expect(ids).not.toContain(stale);
+    }
+
+    const originalPresentActorsIn = world.presentActorsIn.bind(world);
+    world.presentActorsIn = (async (...args: Parameters<typeof world.presentActorsIn>) => {
+      const [ctx, space] = args;
+      const base = await originalPresentActorsIn(ctx, space);
+      if (space === "the_pinboard" || space === "the_dubspace") return [...base, stale];
+      return base;
+    }) as typeof world.presentActorsIn;
+
+    const enteredPinboard = await world.directCall("stale-roster-pinboard-enter", session.actor, "the_pinboard", "enter", []);
+    expect(enteredPinboard.op).toBe("result");
+    const pinboardRoster = await world.directCall("stale-roster-pinboard", session.actor, "the_pinboard", "room_roster", []);
+    expect(pinboardRoster.op).toBe("result");
+    if (pinboardRoster.op === "result") {
+      const ids = (pinboardRoster.result as Array<{ id: string }>).map((row) => row.id);
+      expect(ids).not.toContain(stale);
+    }
+
+    const enteredDubspace = await world.directCall("stale-roster-dubspace-enter", session.actor, "the_dubspace", "enter", []);
+    expect(enteredDubspace.op).toBe("result");
+    const dubspaceRoster = await world.directCall("stale-roster-dubspace", session.actor, "the_dubspace", "room_roster", []);
+    expect(dubspaceRoster.op).toBe("result");
+    if (dubspaceRoster.op === "result") {
+      const ids = (dubspaceRoster.result as Array<{ id: string }>).map((row) => row.id);
+      expect(ids).not.toContain(stale);
+    }
+  });
+
   it("treats rxd catalog source perms as direct-callable shorthand", async () => {
     const world = createWorld({ catalogs: false });
     const manifest: RuntimeCatalogManifest = {

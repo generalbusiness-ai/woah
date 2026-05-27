@@ -192,7 +192,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :room_roster() rxd { let rows = []; for item in present_actors(this) { if (isa(item, $actor)) { let idle = idle_seconds(item); let row = { id: item, name: item.name, presence: presence_status(item) }; if (idle != null) { row[\"idle_seconds\"] = idle; } rows = rows + [row]; } } return rows; }"
+          "source": "verb :room_roster() rxd {\n  let rows = [];\n  for item in present_actors(this) {\n    // Presence rows are runtime-maintained, but projected snapshots can lag a\n    // recycled/disconnected actor. Treat stale refs like absent occupants.\n    let is_actor = false;\n    try { is_actor = valid(item) && isa(item, $actor); } except err { is_actor = false; }\n    if (is_actor) {\n      let idle = idle_seconds(item);\n      let row = { id: item, name: item.name, presence: presence_status(item) };\n      if (idle != null) { row[\"idle_seconds\"] = idle; }\n      rows = rows + [row];\n    }\n  }\n  return rows;\n}"
         },
         {
           "name": "live_audience",
