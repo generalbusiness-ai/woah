@@ -20,7 +20,7 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
+import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
@@ -149,7 +149,7 @@ function createHostSeedKvHarness() {
     HOST_SEED_KV: kv as unknown as KVNamespace
   } as unknown as Env;
 
-  const kvNamespace = (): string => localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
+  const kvNamespace = (): string => `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   const hostSeedPointerKey = (host: string): string => `seed-current:${kvNamespace()}:${host}`;
   const hostSeedBytesKey = (host: string, digest: string): string => `seed:${kvNamespace()}:${host}:${digest}`;
   const mcpGatewayPointerKey = (): string => `mcp-gateway-world-current:${kvNamespace()}`;
@@ -3865,6 +3865,43 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(repairedHealthz.ok).toBe(true);
       expect(harness.hostSeedFetches).toContain("the_deck");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("valid(item)");
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("repairs resident host catalog verbs when legacy metadata says the bundle is current", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await harness.publishHostSeed("the_deck");
+      const healthz = await harness.wooNamespace.get({ name: "the_deck" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
+      expect(healthz.ok).toBe(true);
+
+      const host = harness.wooObjects.get("the_deck") as any;
+      const world = await host.getWorld("the_deck") as WooWorld;
+      const current = world.ownVerbExact("$conversational", "room_roster");
+      expect(current).toBeTruthy();
+      expect(installVerb(world, "$conversational", "room_roster", `verb :room_roster() rxd {
+  return ["stale"];
+}`, current!.version).ok).toBe(true);
+      host.repo.saveMeta(
+        "local_catalog_bundle_fingerprint",
+        localCatalogBundleFingerprint(parseAutoInstallCatalogs(harness.env.WOO_AUTO_INSTALL_CATALOGS))
+      );
+      harness.hostSeedFetches.length = 0;
+
+      const repairedHealthz = await harness.wooNamespace.get({ name: "the_deck" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
+
+      expect(repairedHealthz.ok).toBe(true);
+      expect(harness.hostSeedFetches).toContain("the_deck");
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("contents(this)");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
     } finally {
       logSpy.mockRestore();

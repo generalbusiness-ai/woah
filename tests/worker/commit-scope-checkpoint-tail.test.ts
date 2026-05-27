@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../../src/core/bootstrap";
+import { installVerb } from "../../src/core/authoring";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
+import { executorAuthorityPayload } from "../../src/core/executor";
 import type { ProjectionWrite } from "../../src/core/projection-delta";
 import type { SerializedObject, SerializedSession, SerializedWorld } from "../../src/core/repository";
 import type { ObjRef } from "../../src/core/types";
@@ -327,6 +329,53 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("repairs bundled catalog verbs when loading a durable snapshot", async () => {
+    const state = new WaitUntilState("the_deck");
+    const currentWorld = createWorld();
+    const staleWorld = createWorld();
+    const session = currentWorld.auth("guest:commit-scope-snapshot-repair");
+    const currentRoster = currentWorld.ownVerbExact("$conversational", "room_roster")!;
+    const staleRoster = staleWorld.ownVerbExact("$conversational", "room_roster")!;
+    installVerb(
+      staleWorld,
+      "$conversational",
+      "room_roster",
+      "verb :room_roster() rxd { return [\"stale\"]; }",
+      staleRoster.version
+    );
+    const staleSeed = staleWorld.exportHostScopedWorld("the_deck");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+    const authority = executorAuthorityPayload(currentWorld, ["the_deck", session.actor]);
+
+    seedScopeRows(state, "the_deck", head("the_deck", 0), {
+      objects: staleSeed.objects,
+      sessions: authority.sessions
+    });
+
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_deck",
+          node: "browser:commit-scope-snapshot-repair",
+          token: "guest:commit-scope-snapshot-repair",
+          session: session.id,
+          actor: session.actor,
+          ...authority
+        })
+      }));
+      const response = await target.fetch(request);
+      await state.drainWaitUntil();
+
+      expect(response.ok).toBe(true);
+      const repaired = objectRow(state, "$conversational");
+      expect(repaired?.verbs.find((verb) => verb.name === "room_roster")?.source).toBe(currentRoster.source);
+    } finally {
+      state.close();
+    }
+  });
+
   it("pages checkpoints by byte budget and resumes the pinned export with a continuation", async () => {
     const state = new WaitUntilState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
@@ -562,6 +611,11 @@ function tailSeqs(
   table: "v2_commit_scope_accepted_frame" | "v2_commit_scope_transcript_tail"
 ): number[] {
   return state.storage.sql.exec(`SELECT seq FROM ${table} ORDER BY seq`).toArray().map((row) => Number((row as { seq: number }).seq));
+}
+
+function objectRow(state: FakeDurableObjectState, id: ObjRef): SerializedObject | null {
+  const row = state.storage.sql.exec("SELECT body FROM v2_commit_scope_object WHERE id = ? LIMIT 1", id).toArray()[0] as { body?: string } | undefined;
+  return row?.body ? JSON.parse(row.body) as SerializedObject : null;
 }
 
 function seedScopeRows(

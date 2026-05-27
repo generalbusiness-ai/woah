@@ -623,6 +623,14 @@ snapshot. Accepted frames also carry the authority's acceptance timestamp so
 transport-specific frame projections can be reply-idempotent without minting a
 fresh wall-clock value on retry.
 
+For sequenced transcripts, `transcript.scope.next_seq` is commit-owned
+sequencer state. An executor may reserve `seq = next_seq` before transcript
+recording starts and then read `scope.next_seq == seq + 1` while constructing
+the turn result. The commit scope validates that special read against
+pre-commit state `scope.next_seq == seq`, not as an ordinary stale property
+read, and applying the accepted transcript must materialize `scope.next_seq` to
+`seq + 1` alongside the sequenced log entry.
+
 The current transcript applier materializes object creation, property writes,
 location writes, contents writes, session-location side effects, and sequenced
 log entries. Lifecycle deletes and verb edits remain recorded/validated
@@ -969,6 +977,15 @@ that surface catalog helpers in the slice should do so by precise reachability
 roots; class-chain walk) rather than by name prefix or by enumerating the
 whole `objects` map — a catalog-wide sweep inflates the cross-host RPC body
 into multi-megabyte territory and trips read-timeout deadlines on cold opens.
+Because CommitScopeDO persists that first-open planning snapshot across deploys,
+the stored snapshot MUST be catalog-repair-epoch aware. On cold load, if the
+bundled-catalog fingerprint or runtime repair epoch differs from the marker
+stored with the snapshot, the CommitScopeDO MUST run the idempotent
+host-scoped bundled-catalog repair over the loaded serialized world before
+planning or serving checkpoint/tail rows, then persist the repaired rows and the
+new marker. Any projection/checkpoint material derived from the pre-repair rows
+MUST be discarded; it can be rebuilt from the repaired row store and retained
+accepted frame tail.
 When an authority slice is present, its `sessions[*].activeScope`
 replaces any older per-scope value in the CommitScopeDO snapshot; otherwise a
 cross-scope move accepted in one scope can leave another scope planning against

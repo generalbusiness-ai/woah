@@ -94,6 +94,13 @@ entry is a miss and the receiver MUST fetch the authoritative seed.
 Receivers MUST NOT recompile arbitrary seed source synchronously on the
 cold-load path as the fallback for a missing bytecode body.
 
+Cache keys MUST be scoped by the bundled-catalog fingerprint and by any
+runtime-declared catalog repair epoch that changes how existing bundled
+catalog rows are repaired without changing the catalog sources
+themselves. Otherwise a newly repaired runtime can cold-load a stale
+bytecode-free seed built before the repair and then treat it as
+authoritative.
+
 ---
 
 ## HS2. Per-subject merge
@@ -231,3 +238,9 @@ runs the merge without lifecycle.
 Implementations SHOULD log, when `changed` is true, the first ~12
 `(subject, field)` pairs that drove the result. The current impl emits
 `woo.host_seed_merge_diff`.
+
+Gateway host-seed caches MUST invalidate every cached host seed when a
+shared/default-hosted support row changes. Such rows (for example
+catalog classes and features) can be present in many satellite seeds, so
+invalidating only the gateway's own `world` seed can strand stale class
+verbs in cached per-host deliveries.

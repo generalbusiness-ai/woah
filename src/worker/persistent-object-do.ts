@@ -366,6 +366,7 @@ const HOST_STATE_TEARING_DOWN = "tearing_down";
 // createHostScopedWorld below.
 const HOST_SEED_DIGEST_META_KEY = "host_seed_digest";
 const LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY = "local_catalog_bundle_fingerprint";
+export const LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH = "resident-catalog-repair-v3";
 // SHA-256 of the (id|host|anchor) triples this DO last successfully
 // published to the Directory, sorted by id. On gateway cold-restart we
 // recompute the digest from the current route set and skip the
@@ -1480,7 +1481,7 @@ export class PersistentObjectDO {
   }
 
   private currentLocalCatalogBundleFingerprint(): string {
-    return localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
+    return `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   }
 
   private async ensureLoadedWorldCatalogBundle(world: WooWorld, hostKey: string): Promise<void> {
@@ -5491,10 +5492,10 @@ const localCatalogReservoirs = new Map<string, BytecodeReservoir>();
 const hostSeedKvNamespaces = new Map<string, string>();
 
 function hostSeedKvNamespace(env: Env): string {
-  const key = env.WOO_AUTO_INSTALL_CATALOGS ?? "<default>";
+  const key = `${env.WOO_AUTO_INSTALL_CATALOGS ?? "<default>"}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   const cached = hostSeedKvNamespaces.get(key);
   if (cached) return cached;
-  const namespace = localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
+  const namespace = `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   hostSeedKvNamespaces.set(key, namespace);
   return namespace;
 }
