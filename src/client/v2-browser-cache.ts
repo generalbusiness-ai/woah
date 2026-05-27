@@ -17,8 +17,10 @@ export type V2BrowserCacheMutation =
   | { kind: "meta"; key: string; value: unknown }
   | { kind: "pending_delete"; id: string }
   | { kind: "projection"; scope: string; head: ShadowScopeHead; projection: WooValue; reset_execution_overlay?: boolean }
+  // Legacy state-transfer display catch-up only. Accepted-frame projection
+  // installs use `accepted_frame_projection` and the holder row installer.
   | { kind: "projection_patch"; scope: string; head: ShadowScopeHead; patch: ShadowScopeProjectionPatch }
-  | { kind: "accepted_projection"; scope: string; head: ShadowScopeHead; writes: Array<ProjectionWrite | ProjectionWrite<BrowserProfile>> }
+  | { kind: "accepted_frame_projection"; frame: ShadowCommitAccepted; writes: Array<ProjectionWrite | ProjectionWrite<BrowserProfile>> }
   | { kind: "applied_frame"; frame: ShadowCommitAccepted; transcript?: EffectTranscript }
   | { kind: "transcript"; transcript: EffectTranscript }
   | { kind: "object_page"; hash: string; object: SerializedObject }
@@ -65,9 +67,8 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
     if (reply.ok === true && reply.transcript) {
       if (reply.commit?.projection_writes?.length) {
         mutations.push({
-          kind: "accepted_projection" as const,
-          scope: reply.commit.position.scope,
-          head: reply.commit.position,
+          kind: "accepted_frame_projection" as const,
+          frame: reply.commit as ShadowCommitAccepted,
           writes: reply.commit.projection_writes as Array<ProjectionWrite | ProjectionWrite<BrowserProfile>>
         });
       }

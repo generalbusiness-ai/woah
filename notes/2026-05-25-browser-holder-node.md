@@ -1,6 +1,6 @@
 # Browser as a holder node
 
-Updated 2026-05-25 (rev 6: one receiver profile across the transfer family). Companion to
+Updated 2026-05-27 (rev 7: reconciled with current code and holder install boundary). Companion to
 [2026-05-25-distributed-vm-document-data-path.md](2026-05-25-distributed-vm-document-data-path.md)
 (the "data-path note"), which designs the server tiers and omits the browser.
 
@@ -41,33 +41,39 @@ holder (gateway included). VM reads come only from the authority DO's indexed
 state or from execution cells installed with proof. A2 is about payload fullness,
 not VM-read rights.
 
-## Draft spec types (relocate to VTN14 when implementation starts)
+## Current implementation status
 
-The shared-spec changes the repositioning needs. They live **here only until
-implementation begins**, then move verbatim into
-`spec/protocol/v2-turn-network.md` §VTN14, reconciling with the data-path note's
-`ProjectionWrite`/`ProjectionPage`/`ScopeCheckpoint`/`ProjectionDeltaSummary`
-(data-path:328/353/523), and this note references them — normative-in-waiting,
-not a second definition. All referenced types are real today: `TranscriptCell`
-(= `RecordedCell`, `turn-recorder.ts:5`), `ShadowTurnKey` (`turn-key.ts:5`),
-`ShadowTurnCall`, `EffectTranscript`, `ShadowScopeHead`, `Observation`,
-`SerializedObject`/`SerializedSession`, `RemoteToolDescriptor`.
+The shared transfer types are no longer drafts in this note. The source of
+truth is `spec/protocol/v2-turn-network.md` §VTN14 and
+`src/core/projection-delta.ts`, which now define `ProjectionProfile`,
+`AuthorityProfile`, `BrowserProfile`, `ProjectionWrite<P>`,
+`ProjectionPage<P>`, `ScopeCheckpoint<P>`, `OpenTransfer<P>`, and
+`CheckpointTailOpenTransfer<P>`. Existing server call sites keep the default
+authority profile (`ProjectionWrite` = `ProjectionWrite<AuthorityProfile>`),
+while the browser path consumes `ProjectionWrite<BrowserProfile>` and
+`ScopeCheckpoint<BrowserProfile>`.
 
-Implementation handoff delta, 2026-05-26: the distributed data-path branch
-landed the first server-side refactor with concrete authority-shaped
-`ProjectionWrite`, `ProjectionPage`, and `ScopeCheckpoint` types in
-`src/core/projection-delta.ts`. Before browser-holder work starts, make those
-types generic in the data-path layer itself, with defaults equivalent to the
-current authority/gateway profile. That lets existing server call sites keep
-using `ProjectionWrite` while browser code can later request
-`ProjectionWrite<BrowserProfile>` and checkpoint/tail can share the same
-receiver-profiled transfer family. Also reconcile the byte-accounting split
-deliberately: the browser profile wants `ProjectionDeltaSummary`/`RowOp` to stay
-common key/op metadata while `bytes`/`projection_bytes` become profile-specific
-transfer metrics. If the server branch keeps bytes on the common delta for the
-first landing, document that as a temporary measurement compatibility choice and
-do not let browser security or payload-shaping depend on those common byte
-fields.
+The byte-accounting split is intentionally only partly complete:
+`ProjectionWrite<P>` rows carry receiver-specific `bytes`, while
+`ProjectionDeltaSummary`/`RowOp` still retain byte fields during measurement
+rollout. Security and payload-shaping must depend on the receiver-profile row
+types, not on those compatibility byte fields.
+
+Implementation checklist, current as of 2026-05-27:
+
+1. Done: reconcile spec/code around generic receiver-profiled projection types.
+2. Done: introduce the browser holder row-install boundary in
+   `src/client/v2-browser-holder-install.ts`.
+3. Done: direct accepted-frame replies with row-body-complete
+   `projection_writes` install through that holder boundary.
+4. Done for display state: legacy `ShadowScopeProjectionPatch` remains only for
+   signed state-transfer compatibility, not for row-body-complete accepted-frame
+   installs. Execution-cache transcript overlay remains temporary until the
+   capsule/write-cell promotion work lands.
+5. Remaining: finish `TurnProposal`/proposal-buffer naming and dependency
+   lifecycle.
+6. Remaining: finish execution capsule proof metadata and hash-matched
+   write-cell promotion into store 2.
 
 ### One receiver profile, applied across the whole transfer family
 
@@ -218,9 +224,14 @@ These are the same for gateway and browser; the browser inherits them.
   recipient-filtering at the authority/fanout boundary (no browser-side
   transform). `ProjectionDeltaSummary` stays common (key/op only); byte
   accounting is profile-specific.
-- **One installer.** Accepted frames install via the single `ApplyResult`
-  applier. Delete the browser's `applyShadowTranscriptToCommitScopeCache`; no
-  transcript replay, no `ShadowScopeProjectionPatch`.
+- **One holder row installer.** Accepted-frame display state installs through
+  `src/client/v2-browser-holder-install.ts`, which consumes row-body-complete
+  `ProjectionWrite<BrowserProfile>`s, writes `projection_rows`, and advances the
+  scope head last. `ShadowScopeProjectionPatch` is now legacy state-transfer
+  compatibility only; it is not the accepted-frame install path. The remaining
+  `applyShadowTranscriptToCommitScopeCache` use is the temporary execution-cache
+  overlay for accepted/tentative transcripts until store-2 write-cell promotion
+  and executable capsules replace it.
 - **Execution view advances from accepted frames** (projection rows cannot feed
   the VM). Promote a proposal's `write_cells` into store-2 under the accepted
   receipt **only when the accepted frame's transcript hash equals the proposal's
@@ -265,11 +276,15 @@ These are the same for gateway and browser; the browser inherits them.
   catch-up and proposal retry is best-effort. On the **queued/offline/reconnect**
   path, the proposal MUST be persisted before it is enqueued — otherwise a socket
   loss or tab death drops a durable turn that was never submitted.
-- **Two-phase accept** (IDB cannot run VM inside a transaction): phase 1 is one
-  ordered, `(scope,seq)`+hash-idempotent transaction (VTN14.1 spec:1248) doing
-  pure installs — accepted `ProjectionWrite<BrowserProfile>`s, head advance,
-  hash-matched store-2 write-cell promotion, drop the matched proposal, mark
-  survivors `needs_replan`.
+- **Two-phase accept** (IDB cannot run VM inside a transaction): phase 1 is the
+  pure install boundary. Today it is implemented as head-last, idempotent row
+  installs plus separate applied-frame/transcript/proposal cleanup updates, as
+  described in VTN14.5.1. The dependency-wire milestone may coalesce those into
+  one IndexedDB transaction once proposal dependencies and write-cell promotion
+  are explicit. The boundary must still remain pure: accepted
+  `ProjectionWrite<BrowserProfile>`s, head advance, hash-matched store-2
+  write-cell promotion, drop the matched proposal, mark survivors
+  `needs_replan`.
   Phase 2, after the transaction, replans `needs_replan` survivors (may fetch a
   capsule, re-plan only if an accepted frame changed a cell it read, spec:1441)
   and installs each new overlay in a later atomic write.
@@ -285,7 +300,7 @@ These are the same for gateway and browser; the browser inherits them.
 
 | Data-path step | Browser arm |
 |---|---|
-| Step 2 — one `ApplyResult` applier | Parameterize the transfer family by `ProjectionProfile`; browser consumes `ProjectionWrite<BrowserProfile>` through the same installer; remove `applyShadowTranscriptToCommitScopeCache`. |
+| Step 2 — one `ApplyResult` applier | Transfer family is parameterized by `ProjectionProfile`; browser display state consumes `ProjectionWrite<BrowserProfile>` through `v2-browser-holder-install`. Store-2 write promotion still needs the capsule milestone before `applyShadowTranscriptToCommitScopeCache` can disappear from execution composition. |
 | Step 5 — projection-row cache | Store 1 = the holder cache, browser-safe payload (A2). |
 | Step 6 — same-host stale fallback | Store 1 is the browser's same-host fallback; render at 0 ms, reconcile after. |
 | Step 7 — checkpoint/tail open | Browser open = display catch-up into store 1. |
@@ -297,13 +312,11 @@ These are the same for gateway and browser; the browser inherits them.
 - Flag `WOO_BROWSER_PROJECTION_HOLDER`, default off; off = legacy
   `ShadowStateTransfer`/full-world-checkpoint/transcript-replay path. Disables
   only this path.
-- Spec edits (at implementation start, relocate §Draft spec types into VTN14
-  verbatim): VTN14 — `TurnProposal`, `ProposalProjectionOverlay`, the
-  holder/proposal split, and the `ProjectionProfile`-parameterized family
-  (`ProjectionWrite`/`ProjectionPage`/`ScopeCheckpoint`); data-path:328 — drop
-  byte fields from the common `ProjectionDeltaSummary`/`RowOp` (profile-specific);
-  VTN14.1 store-rights table; VTN14.3/14.5 (flow + proposal lifecycle); UCM21
-  (layer-4 optimistic view); data-path Step 2/5/7 call-site tables.
+- Spec edits: receiver-profiled projection types and browser cache ownership are
+  already in VTN14. Remaining spec work is narrower: final `TurnProposal` and
+  `ProposalProjectionOverlay` record shapes, proposal dependency lifecycle,
+  write-cell promotion, and the eventual removal of compatibility byte fields
+  from common `ProjectionDeltaSummary`/`RowOp`.
 - Migration: none (Cloudflare DO). IndexedDB schema versioned, idempotent.
 - Metrics: accepted-frame install cost (`projection_rows_written`,
   `browser_checkpoint_bytes`, `browser_capsule_bytes`) vs proposal lifecycle
@@ -323,9 +336,10 @@ These are the same for gateway and browser; the browser inherits them.
 
 ## Success criteria
 
-- The browser uses one shared installer with the gateway for accepted
-  `ProjectionWrite[]`; no transcript replay or `ShadowScopeProjectionPatch` on the
-  accepted path.
+- The browser uses the holder row installer for accepted display
+  `ProjectionWrite[]`; no `ShadowScopeProjectionPatch` on the row-body-complete
+  accepted-frame path. Transcript replay remains only as the temporary
+  execution-cache overlay until executable capsules/write-cell promotion lands.
 - The only browser-specific state is the `proposal_buffer`; "optimistic" is a
   view over it.
 - No projection row (any profile) satisfies a `TurnKey` atom on any holder; VM
@@ -341,3 +355,38 @@ These are the same for gateway and browser; the browser inherits them.
   `object_records` are gone from the browser hot path.
 - `TurnProposal` is defined once in the shared spec and consumed by the browser
   buffer; there is no parallel browser reconcile model.
+
+## Known divergent-apply hazards (track during convergence)
+
+Concrete instances of "the browser materialized state differently than the
+authority" caught in the pre-convergence implementation. Each is a symptom of
+the parallel apply this note exists to retire; list them so the shared-installer
+work closes them rather than re-deriving the same divergence.
+
+- **`contents` ordering has multiple producers and no single canonical form**
+  (observed 2026-05-27 as `drop`/`take` after `enter` → spurious
+  `commit_rejected: read_version_mismatch`; see
+  `tests/v2-browser-contents-order.test.ts`). The structural-cell *version* hash
+  sorts membership (`shadow-cell-version.ts:20`, `Array.from(contents).sort()`),
+  so it is order-blind. But two materializers disagree on array order: the
+  snapshot/export path sorts (`world.ts` ~4284 / ~4878), while the
+  transcript-replay applier the browser uses to rebuild its execution node
+  appends (`applyTranscriptContentsWriteRefs` → `addUniqueObjectRef`, via
+  `materializeTranscriptOverlays` → `applyShadowTranscriptToCommitScopeCache`,
+  `v2-browser-execution-cache.ts:152`). A locally-planned follow-up read records
+  the appended order; the authority holds the sorted order; same members, same
+  version, different array → the value comparison rejected it.
+
+  Interim fix (landed): the shared transcript validator compares `contents`
+  read values as a set, consistent with the version hash
+  (`effect-transcript.ts` `transcriptReadValuesMatch`), and the spec now states
+  `contents` is order-independent for versioning *and* read-value validation
+  (`spec/protocol/v2-turn-network.md` §VTN, cell-version section).
+
+  Convergence requirement: when the browser stops re-running transcript replay
+  and consumes accepted frames through the one shared installer, that installer
+  must define a single canonical `contents` order (or formalize the set
+  semantics end to end) so no producer can emit a divergent array. Until then,
+  any new order-sensitive comparison of a structural set cell is a latent
+  repeat of this bug — keep set-cell value comparisons aligned with the
+  set-based version hash.

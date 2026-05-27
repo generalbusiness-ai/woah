@@ -181,6 +181,55 @@ describe("v2 browser cache reducer", () => {
     ]);
   });
 
+  it("routes reply-bundled projection writes through the accepted-frame holder install mutation", () => {
+    const accepted = {
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "turn-projection",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "the_dubspace", epoch: 1, seq: 3, hash: "h3" },
+      receipt: { kind: "woo.commit_receipt.shadow.v1", id: "turn-projection", accepted: true },
+      transcript_hash: "tp",
+      post_state_hash: "p3",
+      observations: [],
+      projection_writes: [{
+        table: "objects",
+        key: "the_dubspace",
+        op: "upsert",
+        row: {
+          kind: "woo.browser_object_row.v1",
+          id: "the_dubspace",
+          scope: "the_dubspace",
+          head: { kind: "woo.scope_head.shadow.v1", scope: "the_dubspace", epoch: 1, seq: 3, hash: "h3" },
+          display: { id: "the_dubspace", name: "Dubspace" },
+          contents: []
+        },
+        bytes: 12
+      }]
+    };
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "turn-projection",
+      scope: "the_dubspace",
+      seq: 3,
+      hash: "tp",
+      complete: true
+    };
+    expect(v2BrowserCacheMutationsForEnvelope({
+      ...envelopeFor("woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: true,
+        transcript,
+        commit: accepted
+      }),
+      reply_to: "pending-projection"
+    })).toEqual([
+      { kind: "pending_delete", id: "pending-projection" },
+      { kind: "accepted_frame_projection", frame: accepted, writes: accepted.projection_writes },
+      { kind: "applied_frame", frame: accepted, transcript },
+      { kind: "transcript", transcript },
+      { kind: "meta", key: "head:the_dubspace", value: accepted.position }
+    ]);
+  });
+
   it("persists reply-bundled executable transfers and capability ads", () => {
     const transfer = {
       kind: "woo.state.transfer.shadow.v1",

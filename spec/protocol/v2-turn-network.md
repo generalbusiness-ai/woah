@@ -1640,6 +1640,12 @@ invalidate the tentative row by itself; an authoritative executor may re-run the
 turn against the newer head, while a non-authoritative delegated executor may
 surface the conflict for a later browser re-plan.
 
+Row-body-complete accepted-frame projection writes install through the browser
+holder row installer, not through the legacy projection-patch state-transfer
+path. Projection patches remain a signed display-transfer compatibility form
+only; they are not executable state and are not the accepted-frame row-install
+path.
+
 Permanent conflicts are narrower in Phase 1 than in the final dependency-wire
 model. Because `depends_on` is not yet carried on the wire, the server treats
 later locally planned turns as independent submissions. The browser therefore
