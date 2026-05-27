@@ -274,7 +274,7 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     if (!readMatchesOwnWrite && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
     }
-    if (!readMatchesOwnWrite && stableJson(actual.value) !== stableJson(read.value)) {
+    if (!readMatchesOwnWrite && !transcriptReadValuesMatch(read.cell, actual.value, read.value)) {
       errors.push(`read value mismatch ${cellLabel(read.cell)}`);
     }
   }
@@ -375,7 +375,9 @@ function sameTurnReadMatchesOwnWrite(transcript: EffectTranscript, read: Transcr
   return transcript.writes.some((write) =>
     sameCell(write.cell, read.cell) &&
     (write.next === undefined || write.next === read.version) &&
-    stableJson(write.value) === stableJson(read.value)
+    // Use the same set-aware comparison as cross-turn reads so a contents read
+    // that echoes a same-turn contents write is not rejected on ordering alone.
+    transcriptReadValuesMatch(read.cell, write.value, read.value)
   );
 }
 
@@ -627,4 +629,27 @@ function cellKey(cell: TranscriptCell): string {
 
 function stableJson(value: WooValue): string {
   return stableShadowJson(value);
+}
+
+// Compare a recorded read value against the authoritative cell value. The
+// `contents` cell is canonically an unordered set: shadowStructuralCellVersion
+// ("contents") hashes `Array.from(contents).sort()`, so two contents arrays with
+// the same members are the SAME version. The runtime, however, captures contents
+// reads in live insertion order (`Array.from(obj.contents)`), while the serialized
+// authority stores them sorted — so right after a contents mutation (e.g. `enter`
+// appends the actor to a room's contents) a locally-planned follow-up read records
+// `[...,actor]` while the committed authority holds the sorted array. Comparing
+// those order-sensitively spuriously rejects the turn as a value mismatch even
+// though the membership (and version) are identical. Compare contents as a set so
+// the value check stays consistent with the version hash; genuine membership
+// changes still differ once sorted, and the version check already guards them.
+function transcriptReadValuesMatch(cell: TranscriptCell, actual: WooValue, recorded: WooValue): boolean {
+  if (cell.kind === "contents") {
+    return stableJson(canonicalContentsValue(actual)) === stableJson(canonicalContentsValue(recorded));
+  }
+  return stableJson(actual) === stableJson(recorded);
+}
+
+function canonicalContentsValue(value: WooValue): WooValue {
+  return Array.isArray(value) ? [...value].sort() : value;
 }

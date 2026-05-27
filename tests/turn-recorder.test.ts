@@ -203,6 +203,56 @@ describe("turn recorder", () => {
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
   });
 
+  it("accepts a contents read whose order differs from the serialized authority (contents is a versioned set)", async () => {
+    // Regression: the contents cell VERSION hashes Array.from(contents).sort()
+    // (shadow-cell-version.ts), so it is order-independent — but the recorder
+    // captures contents reads in live order while the committed authority can
+    // hold the same members in a different order (the browser overlay appends,
+    // the server serialization sorts). A follow-up read therefore differs in
+    // order from the authority even though membership AND version match.
+    // Validation must compare contents as a set, otherwise enter -> take/drop
+    // rejects with a spurious read_version_mismatch and only succeeds on retry.
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-contents-order");
+    const actor = session.actor;
+
+    world.createObject({ id: "order_room", name: "Order Room", parent: "$thing", owner: actor, location: "$nowhere" });
+    world.createObject({ id: "zeta_item", name: "Zeta", parent: "$thing", owner: actor, location: "order_room" });
+    world.createObject({ id: "alpha_item", name: "Alpha", parent: "$thing", owner: actor, location: "order_room" });
+    const installed = installVerb(
+      world,
+      "order_room",
+      "inspect_cells",
+      `verb :inspect_cells() rxd {
+        return { items: contents(this) };
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+
+    const before = world.exportWorld();
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("order-inspect", actor, "order_room", "inspect_cells", []);
+    expect(result.op).toBe("result");
+
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    const contentsRead = transcript.reads.find((read) => read.cell.kind === "contents" && read.cell.object === "order_room");
+    expect(new Set(contentsRead?.value as string[])).toEqual(new Set(["zeta_item", "alpha_item"]));
+
+    // Reorder the serialized authority's contents (same members) to model the
+    // committed-vs-recorded ordering divergence the live system produces. The
+    // version is unchanged (the version hash sorts contents), so this is purely
+    // an ordering difference that must NOT count as a value mismatch.
+    const serializedRoom = before.objects.find((obj) => obj.id === "order_room");
+    if (!serializedRoom) throw new Error("expected order_room in serialized world");
+    serializedRoom.contents = [...serializedRoom.contents].reverse();
+    expect(serializedRoom.contents).not.toEqual(contentsRead?.value);
+
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+  });
+
   it("keeps Tier 1 look and describe verbs in bytecode transcripts", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-tier1");

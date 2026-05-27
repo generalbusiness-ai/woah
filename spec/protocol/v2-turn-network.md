@@ -282,6 +282,15 @@ depend on wall-clock object metadata such as `modified`, because replaying the
 same turn against the same pre-state must produce the same transcript and
 post-state hash.
 
+The `contents` cell is an unordered set: its version hash is derived from the
+sorted membership, so array order is not version-significant. Read-set
+validation MUST therefore compare a recorded `contents` value against the
+authority as a set, not an ordered array. A node that records a `contents` read
+in one order (e.g. a browser overlay that appends a new member) while the
+authority holds the same members in another order (e.g. sorted serialization)
+MUST NOT be rejected for that ordering difference alone; a genuine membership
+change is caught by the version hash and the post-state membership checks.
+
 Routing atoms are compact hashes of typed preimages. The preimage MUST include
 the atom kind. For private scopes, the preimage MUST also include a
 scope/epoch-specific salt known only to authorized participants.
