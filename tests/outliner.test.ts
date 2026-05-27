@@ -567,6 +567,20 @@ describe("outliner catalog: room_roster (presence aside)", () => {
     }
   });
 
+  it("skips stale projected presence refs instead of failing the roster", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:roster-stale");
+    const originalPresentActorsIn = world.presentActorsIn.bind(world);
+    world.presentActorsIn = (async (ctx, space) => {
+      if (space !== "the_outline") return await originalPresentActorsIn(ctx, space);
+      return [session.actor, "guest_roster_stale_actor"];
+    }) as typeof world.presentActorsIn;
+
+    const r = await expectResult(call(world, session.actor, "the_outline", "room_roster", []));
+
+    expect(r.result).toMatchObject([{ id: session.actor, name: expect.any(String) }]);
+  });
+
   it("emits outliner_entered / outliner_left observations the UI uses to trigger re-hydrate", async () => {
     const world = setupWorld();
     const a = world.auth("guest:roster-enter");
