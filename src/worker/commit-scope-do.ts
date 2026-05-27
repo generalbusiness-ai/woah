@@ -8,7 +8,7 @@
 
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
-import { mergeSerializedAuthoritySlice, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { mergeSerializedAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   applyShadowBrowserTransfer,
@@ -1106,7 +1106,8 @@ export class CommitScopeDO {
   }
 
   private sessionProjectionPages(): ProjectionPage[] {
-    return projectionPages("sessions", this.loadSessionRows());
+    const objects = this.loadObjectRows();
+    return projectionPages("sessions", this.loadActorBackedSessionRows(objects));
   }
 
   private logProjectionPages(): ProjectionPage[] {
@@ -1127,13 +1128,14 @@ export class CommitScopeDO {
 
   private serializedProjectionWorld(): SerializedWorld {
     const counters = this.loadPersistedCounters();
+    const objects = this.loadObjectRows();
     return {
       version: 1,
       objectCounter: counters.objectCounter,
       parkedTaskCounter: counters.parkedTaskCounter,
       sessionCounter: counters.sessionCounter,
-      objects: this.loadObjectRows(),
-      sessions: this.loadSessionRows(),
+      objects,
+      sessions: this.loadActorBackedSessionRows(objects),
       logs: this.loadLogRows(),
       snapshots: this.loadSnapshotRows(),
       parkedTasks: this.loadParkedTaskRows(),
@@ -1162,6 +1164,12 @@ export class CommitScopeDO {
     return sqlRows<{ body: string }>(this.state.storage.sql.exec(
       "SELECT body FROM v2_commit_scope_session ORDER BY id"
     )).map((row) => JSON.parse(row.body) as SerializedSession);
+  }
+
+  private loadActorBackedSessionRows(objects: readonly SerializedObject[]): SerializedSession[] {
+    const serialized = { objects: objects.map((obj) => obj), sessions: this.loadSessionRows() };
+    pruneSerializedSessionsWithoutActorRows(serialized);
+    return serialized.sessions;
   }
 
   private loadLogRows(): SerializedWorld["logs"] {
@@ -1447,15 +1455,14 @@ export class CommitScopeDO {
     const objectRows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
       "SELECT body FROM v2_commit_scope_object ORDER BY id"
     ));
-    return {
+    const objects = objectRows.map((row) => JSON.parse(row.body) as SerializedObject);
+    const serialized: SerializedWorld = {
       version: Number(meta.version ?? 1) as 1,
       objectCounter: Number(meta.object_counter ?? 1),
       parkedTaskCounter: Number(meta.parked_task_counter ?? 1),
       sessionCounter: Number(meta.session_counter ?? 1),
-      objects: objectRows.map((row) => JSON.parse(row.body) as SerializedObject),
-      sessions: sqlRows<{ body: string }>(this.state.storage.sql.exec(
-        "SELECT body FROM v2_commit_scope_session ORDER BY id"
-      )).map((row) => JSON.parse(row.body) as SerializedSession),
+      objects,
+      sessions: this.loadSessionRows(),
       logs: logsFromRows(sqlRows<{ space: string; body: string }>(this.state.storage.sql.exec(
         "SELECT space, body FROM v2_commit_scope_log ORDER BY space, seq"
       ))),
@@ -1469,6 +1476,8 @@ export class CommitScopeDO {
         "SELECT id FROM v2_commit_scope_tombstone ORDER BY id"
       )).map((row) => row.id)
     };
+    if (pruneSerializedSessionsWithoutActorRows(serialized)) this.needsFullSave = true;
+    return serialized;
   }
 
   private async saveFull(relay: ShadowBrowserRelayShim): Promise<void> {
@@ -1563,6 +1572,10 @@ export class CommitScopeDO {
   }
 
   private saveWorldRows(serialized: SerializedWorld, now: number): void {
+    // Session rows are presence authority. Persist only rows whose actor row is
+    // in the same scope snapshot so catalog roster verbs never receive a
+    // present actor they cannot dereference.
+    pruneSerializedSessionsWithoutActorRows(serialized);
     for (const table of [
       "v2_commit_scope_tombstone",
       "v2_commit_scope_task",

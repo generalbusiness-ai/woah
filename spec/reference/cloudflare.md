@@ -751,6 +751,11 @@ turn scope/target rows, and their required owner/class/feature/catalog support
 cells. The DO refreshes those cells before planning or serving recipient-bound
 transfer state so cross-scope movement accepted by one CommitScopeDO is visible
 to the next scope without a full-world transfer.
+Session rows are valid authority only with their actor object row present in the
+same merged planning snapshot. Gateways and CommitScopeDOs MUST omit or prune
+dangling session rows before exposing presence to catalog code; projected
+presence must never make `present_actors()` return an object ref that cannot be
+dereferenced.
 
 Per-envelope authority refresh may omit a timed-out remote host only as a
 stale-snapshot fallback. It must still include the submitting actor's local

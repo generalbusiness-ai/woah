@@ -47,9 +47,11 @@ export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuth
   if (isAuthorityCellSlice(authority)) {
     const referenced = new Set(authority.page_refs.map((ref) => ref.hash));
     const pages = authority.inline_pages.filter((page) => referenced.has(shadowStatePageHash(page)));
-    return mergeShadowStatePagesIntoSerialized(emptySerializedWorldFromAuthority(authority), pages, () => emptySerializedWorldFromAuthority(authority));
+    const serialized = mergeShadowStatePagesIntoSerialized(emptySerializedWorldFromAuthority(authority), pages, () => emptySerializedWorldFromAuthority(authority));
+    pruneSerializedSessionsWithoutActorRows(serialized);
+    return serialized;
   }
-  return {
+  const serialized: SerializedWorld = {
     version: 1,
     objectCounter: inferObjectCounter(authority.objects),
     parkedTaskCounter: 1,
@@ -61,6 +63,8 @@ export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuth
     parkedTasks: [],
     tombstones: []
   };
+  pruneSerializedSessionsWithoutActorRows(serialized);
+  return serialized;
 }
 
 export function mergeSerializedAuthoritySlice(
@@ -75,6 +79,7 @@ export function mergeSerializedAuthoritySlice(
   } else {
     changed = mergeAuthorityObjectRows(serialized, authority.objects, options) || changed;
   }
+  changed = pruneSerializedSessionsWithoutActorRows(serialized) || changed;
   return changed;
 }
 
@@ -174,6 +179,14 @@ export function filterSerializedAuthoritySliceObjects(
 export function authoritySliceObjectIds(authority: MergeSerializedAuthorityInput): Set<ObjRef> {
   if (!isAuthorityCellSlice(authority)) return new Set(authority.objects.map((obj) => obj.id));
   return new Set(authority.page_refs.map((ref) => ref.object));
+}
+
+export function pruneSerializedSessionsWithoutActorRows(serialized: { sessions: SerializedSession[]; objects: SerializedObject[] }): boolean {
+  const objectIds = new Set(serialized.objects.map((obj) => obj.id));
+  const sessions = serialized.sessions.filter((session) => objectIds.has(session.actor));
+  if (sessions.length === serialized.sessions.length) return false;
+  serialized.sessions = sessions;
+  return true;
 }
 
 export function isAuthorityCellSlice(authority: MergeSerializedAuthorityInput): authority is SerializedAuthorityCellSlice {

@@ -9745,6 +9745,10 @@ export class WooWorld {
     for (const [sessionId, actor] of sessions) {
       const session = this.sessions.get(sessionId);
       if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
+      // A projected presence row is only useful when the actor object is in
+      // the same planning snapshot. Older CommitScopeDO snapshots can contain
+      // dangling session rows; do not surface those refs to catalog code.
+      if (!this.objects.has(actor)) continue;
       actors.add(actor);
     }
     return Array.from(actors).sort();

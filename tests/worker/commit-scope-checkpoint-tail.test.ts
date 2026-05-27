@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createWorld } from "../../src/core/bootstrap";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
 import type { ProjectionWrite } from "../../src/core/projection-delta";
-import type { SerializedObject } from "../../src/core/repository";
+import type { SerializedObject, SerializedSession, SerializedWorld } from "../../src/core/repository";
 import type { ObjRef } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
@@ -294,6 +294,39 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("omits persisted session rows whose actor object row is absent", () => {
+    const state = new WaitUntilState("scope-a");
+    const world = createWorld();
+    const live = world.auth("guest:commit-scope-live-session");
+    const liveSession = world.exportSessions().find((session) => session.id === live.id)!;
+    const liveActor = world.exportObjects([live.actor])[0]!;
+    const scopeRow = world.exportObjects(["the_deck"])[0]!;
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET }) as unknown as {
+      serializedProjectionWorld: () => SerializedWorld;
+    };
+    seedScopeRows(state, "scope-a", head("scope-a", 1), {
+      objects: [scopeRow, liveActor],
+      sessions: [
+        liveSession,
+        {
+          id: "session-stale-actor",
+          actor: "guest_missing_from_snapshot" as ObjRef,
+          started: 1,
+          expiresAt: Date.now() + 60_000,
+          activeScope: "the_deck" as ObjRef
+        }
+      ]
+    });
+
+    try {
+      const serialized = target.serializedProjectionWorld();
+
+      expect(serialized.sessions.map((session) => session.id)).toEqual([live.id]);
+    } finally {
+      state.close();
+    }
+  });
+
   it("pages checkpoints by byte budget and resumes the pinned export with a continuation", async () => {
     const state = new WaitUntilState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
@@ -535,7 +568,7 @@ function seedScopeRows(
   state: FakeDurableObjectState,
   scope: ObjRef,
   current: ShadowScopeHead,
-  input: { objects?: unknown[]; frames?: ShadowCommitAccepted[] }
+  input: { objects?: unknown[]; sessions?: SerializedSession[]; frames?: ShadowCommitAccepted[] }
 ): void {
   const now = Date.now();
   state.storage.sql.exec(
@@ -556,6 +589,14 @@ function seedScopeRows(
       "INSERT OR REPLACE INTO v2_commit_scope_object(id, body, updated_at) VALUES (?, ?, ?)",
       id,
       JSON.stringify(object),
+      now
+    );
+  }
+  for (const session of input.sessions ?? []) {
+    state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_session(id, body, updated_at) VALUES (?, ?, ?)",
+      session.id,
+      JSON.stringify(session),
       now
     );
   }

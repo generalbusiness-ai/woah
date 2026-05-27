@@ -109,6 +109,7 @@ describe("v2 turn gateway", () => {
       sessions: [{ id: "new", actor: "$actor" as ObjRef, started: 2, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$room" as ObjRef }],
       objects: [
         { ...serialized.objects[1], name: "two updated", properties: [["value", 2]], propertyVersions: [["value", 2]] },
+        serializedObject("$actor", "actor", 3),
         serializedObject("$three", "three", 3)
       ],
       counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 },
@@ -118,11 +119,34 @@ describe("v2 turn gateway", () => {
 
     expect(serialized.sessions.map((session) => session.id)).toEqual(["new"]);
     expect(new Map(serialized.objects.map((object) => [object.id, object.name]))).toEqual(new Map([
+      ["$actor", "actor"],
       ["$one", "one"],
       ["$two", "two updated"],
       ["$three", "three"]
     ]));
     expect(serialized.objects.find((object) => object.id === "$two")?.properties).toEqual([["value", 2]]);
+  });
+
+  it("drops authority session rows whose actor object is absent after merge", () => {
+    const serialized = {
+      sessions: [{ id: "stale", actor: "$stale_actor" as ObjRef, started: 1, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$room" as ObjRef }],
+      objects: [
+        serializedObject("$room", "room", 1),
+        serializedObject("$kept_actor", "kept", 1)
+      ]
+    };
+    const authority = buildSerializedAuthorityCellSlice({
+      sessions: [
+        { id: "stale", actor: "$stale_actor" as ObjRef, started: 1, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$room" as ObjRef },
+        { id: "kept", actor: "$kept_actor" as ObjRef, started: 2, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$room" as ObjRef }
+      ],
+      objects: [serializedObject("$room", "room", 2)],
+      counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 }
+    });
+
+    mergeExecutorAuthority(serialized, authority);
+
+    expect(serialized.sessions.map((session) => session.id)).toEqual(["kept"]);
   });
 
   it("does not duplicate legacy object-row authority through session_objects", () => {
