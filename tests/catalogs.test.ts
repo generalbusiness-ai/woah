@@ -397,6 +397,24 @@ describe("local catalogs", () => {
     expect(() => installCatalogManifest(world, manifest, { tap: "@local", alias: "needs-chat" })).toThrow(/@local:chat.*\(none\)/);
   });
 
+  it("ignores unknown manifest object flags and keeps known ones", async () => {
+    const world = createWorld({ catalogs: false });
+    // `recyclable` was a catalog flag before its runtime gate was removed
+    // (spec/semantics/recycle.md). A stale or typo'd flag must be ignored, not
+    // set on the runtime object only to silently vanish on the next SQL
+    // round-trip — so `fertile` survives and `recyclable` never lands.
+    const manifest = {
+      name: "stale-flag",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [{ local_name: "$stale_flag_probe", parent: "$thing", flags: { fertile: true, recyclable: true } }]
+    } as unknown as RuntimeCatalogManifest;
+    installCatalogManifest(world, manifest, { tap: "@local", alias: "stale-flag" });
+    const flags = world.object("$stale_flag_probe").flags as Record<string, boolean | undefined>;
+    expect(flags.fertile).toBe(true);
+    expect(flags.recyclable).toBeUndefined();
+  });
+
   it("rejects duplicate catalog aliases and duplicate source identities", async () => {
     const world = createWorld({ catalogs: false });
     const first: RuntimeCatalogManifest = {

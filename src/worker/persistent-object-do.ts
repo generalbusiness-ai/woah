@@ -118,9 +118,6 @@ export interface Env {
   WOO_HOST_WRITE_TIMEOUT_MS?: string;
   WOO_HOST_OUT_FETCH_CONCURRENCY?: string;
   WOO_MCP_GATEWAY_SHARDS?: string;
-  WOO_GATEWAY_PROJECTION_CACHE?: string;
-  WOO_V2_SAME_HOST_STALE_FALLBACK?: string;
-  WOO_TOOL_SURFACE_PROJECTION_ROWS?: string;
   WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS?: string;
   WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS?: string;
   WOO_V2_CHECKPOINT_TAIL_OPEN?: string;
@@ -440,7 +437,7 @@ export class PersistentObjectDO {
     // Projection-cache tables are idempotent existing-DO SQL migrations. They
     // are created on every host because PersistentObjectDO uses one class for
     // world, gateway shards, and object hosts; only gateway shards write them
-    // when WOO_GATEWAY_PROJECTION_CACHE is enabled.
+    // (a world/object host never routes accepted fanout through the cache).
     const sql = this.state.storage.sql;
     sql.exec(`CREATE TABLE IF NOT EXISTS gateway_projection_scope (
       scope TEXT PRIMARY KEY,
@@ -523,18 +520,6 @@ export class PersistentObjectDO {
     )`);
   }
 
-  private gatewayProjectionCacheEnabled(): boolean {
-    return envFlag(this.env.WOO_GATEWAY_PROJECTION_CACHE);
-  }
-
-  private sameHostStaleFallbackEnabled(): boolean {
-    return this.gatewayProjectionCacheEnabled() && envFlag(this.env.WOO_V2_SAME_HOST_STALE_FALLBACK);
-  }
-
-  private toolSurfaceProjectionRowsEnabled(): boolean {
-    return this.gatewayProjectionCacheEnabled() && envFlag(this.env.WOO_TOOL_SURFACE_PROJECTION_ROWS);
-  }
-
   private toolSurfaceSourceIndexMaxScopeRows(): number {
     return nonNegativeIntegerEnv(
       this.env.WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS,
@@ -580,7 +565,6 @@ export class PersistentObjectDO {
   }
 
   private loadGatewaySessionToolManifest(sessionId: string): SessionToolManifest | null {
-    if (!this.sameHostStaleFallbackEnabled()) return null;
     const row = firstSqlRow<{ body: string }>(this.state.storage.sql.exec(
       "SELECT body FROM gateway_session_tool_manifest WHERE session_id = ? AND expires_at_ms > ?",
       sessionId,
@@ -592,7 +576,6 @@ export class PersistentObjectDO {
   }
 
   private saveGatewaySessionToolManifest(manifest: SessionToolManifest): void {
-    if (!this.gatewayProjectionCacheEnabled()) return;
     const body = stableShadowJson(manifest as unknown as WooValue);
     this.state.storage.sql.exec(
       `INSERT OR REPLACE INTO gateway_session_tool_manifest(
@@ -618,7 +601,6 @@ export class PersistentObjectDO {
     delta?: ProjectionDeltaSummary
   ): { rows: number; bytes: number } {
     this.requireProjectionWritesComplete(position.scope, delta, writes, `gateway_projection:${source}`);
-    if (!this.gatewayProjectionCacheEnabled()) return { rows: 0, bytes: 0 };
     // The gateway cache stores accepted projection rows durably so a hibernated
     // MCP shard can answer descriptor reads without reconstructing an
     // executable WooWorld mirror first. Auth and execution still use the
@@ -628,6 +610,15 @@ export class PersistentObjectDO {
     let rows = 0;
     let bytes = 0;
     const authorityScope = position.scope;
+    // Accepted-fanout application is idempotent by scope head. A duplicate
+    // envelope replay or a redelivered fanout frame carries a position already
+    // reflected in the cache; re-applying it would burn durable writes for no
+    // state change (and could regress a newer head that arrived first). A cold
+    // shard that has never seen this scope has no head row and falls through.
+    // Out-of-order fanout is prevented upstream by sequencing against this same
+    // head (see durableProjectionHeadSeq); the guard here is the backstop.
+    const existingHead = this.gatewayProjectionHeadSeq(authorityScope);
+    if (existingHead != null && position.seq <= existingHead) return { rows: 0, bytes: 0 };
     this.state.storage.transactionSync(() => {
       sql.exec(
         "INSERT OR REPLACE INTO gateway_projection_scope(scope, head_seq, head_hash, updated_at_ms, stale, stale_reason) VALUES (?, ?, ?, ?, 0, NULL)",
@@ -637,18 +628,16 @@ export class PersistentObjectDO {
         now
       );
       rows += 1;
-      if (this.toolSurfaceProjectionRowsEnabled()) {
-        for (const marker of delta?.tool_surface_sources ?? []) {
-          if (marker.key.table === "objects") {
-            this.invalidateGatewayToolSurfacesForObject(marker.key.authority_scope, marker.key.key);
-          }
+      for (const marker of delta?.tool_surface_sources ?? []) {
+        if (marker.key.table === "objects") {
+          this.invalidateGatewayToolSurfacesForObject(marker.key.authority_scope, marker.key.key);
         }
       }
       for (const write of writes) {
         bytes += write.bytes;
         switch (write.table) {
           case "objects":
-            if (this.toolSurfaceProjectionRowsEnabled()) this.invalidateGatewayToolSurfacesForObject(authorityScope, write.key);
+            this.invalidateGatewayToolSurfacesForObject(authorityScope, write.key);
             if (write.op === "delete") {
               sql.exec("DELETE FROM gateway_projection_object WHERE authority_scope = ? AND id = ?", authorityScope, write.key);
               sql.exec("DELETE FROM gateway_scope_member WHERE authority_scope = ? AND id = ?", authorityScope, write.key);
@@ -696,7 +685,6 @@ export class PersistentObjectDO {
             rows += 1;
             break;
           case "tool_surfaces":
-            if (!this.toolSurfaceProjectionRowsEnabled()) break;
             if (write.op === "delete") {
               this.deleteGatewayToolSurface(write.key.scope, write.key.object);
             } else {
@@ -835,8 +823,39 @@ export class PersistentObjectDO {
     this.refreshGatewayToolSurfaceScopeSaturation(row.scope, now);
   }
 
+  // Durable head_seq of the projection cache for a scope, or null if never seen.
+  // Drives both the head-idempotency guard and (via the gateway's
+  // durableProjectionHeadSeq hook) fanout sequencing on a relay-less cold shard.
+  private gatewayProjectionHeadSeq(scope: ObjRef): number | null {
+    const row = firstSqlRow<{ head_seq: number }>(this.state.storage.sql.exec(
+      "SELECT head_seq FROM gateway_projection_scope WHERE scope = ?",
+      scope
+    ));
+    return row ? row.head_seq : null;
+  }
+
+  // True only when the gateway already holds a non-stale tool-surface row for
+  // this request. Used to decide whether a cache read is a COMPLETE answer for
+  // a request before short-circuiting the owner refresh. A saturated scope
+  // (reverse-index cap hit) is uncovered so reads refresh from the owner; an
+  // empty-but-cached scope also reads as uncovered (it leaves no row) and so
+  // re-verifies with the owner rather than being mistaken for "fully cached".
+  private gatewayToolSurfaceRequestCovered(request: RemoteToolRequest): boolean {
+    if (this.gatewayToolSurfaceScopeSaturated(request.id)) return false;
+    const row = request.expandContents
+      ? firstSqlRow<{ present: number }>(this.state.storage.sql.exec(
+          "SELECT 1 AS present FROM gateway_tool_surface WHERE scope = ? AND stale = 0 LIMIT 1",
+          request.id
+        ))
+      : firstSqlRow<{ present: number }>(this.state.storage.sql.exec(
+          "SELECT 1 AS present FROM gateway_tool_surface WHERE scope = ? AND object = ? AND stale = 0 LIMIT 1",
+          request.id,
+          request.id
+        ));
+    return row != null;
+  }
+
   private readGatewayToolSurfaceDescriptors(requests: readonly RemoteToolRequest[]): RemoteToolDescriptor[] {
-    if (!this.toolSurfaceProjectionRowsEnabled()) return [];
     const out: RemoteToolDescriptor[] = [];
     const seen = new Set<string>();
     const append = (row: ToolSurfaceProjectionRow): void => {
@@ -923,7 +942,7 @@ export class PersistentObjectDO {
   }
 
   private storeGatewayToolSurfacesFromDescriptors(scope: ObjRef, authorityScope: ObjRef, descriptors: readonly RemoteToolDescriptor[]): void {
-    if (!this.toolSurfaceProjectionRowsEnabled() || descriptors.length === 0) return;
+    if (descriptors.length === 0) return;
     const byObject = new Map<ObjRef, RemoteToolDescriptor[]>();
     for (const descriptor of descriptors) {
       const list = byObject.get(descriptor.object) ?? [];
@@ -1402,7 +1421,6 @@ export class PersistentObjectDO {
       const initStart = Date.now();
       this.mcpGateway = new McpGateway(world, {
         serverName: "woo",
-        externalProjectionFanout: this.gatewayProjectionCacheEnabled(),
         v2: {
           open: async (scope, body): Promise<McpV2OpenResult> => {
             world.touchSessionInput(body.session);
@@ -1428,10 +1446,18 @@ export class PersistentObjectDO {
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
         },
         toolManifests: {
-          staleFallback: this.sameHostStaleFallbackEnabled(),
+          staleFallback: true,
           loadSessionManifest: (sessionId) => this.loadGatewaySessionToolManifest(sessionId),
           saveSessionManifest: (manifest) => this.saveGatewaySessionToolManifest(manifest)
         },
+        // Persist accepted fanout into the durable SQL projection cache in
+        // contiguous sequence order, as the gateway accepts/drains each frame.
+        persistAcceptedProjection: (commit) =>
+          this.applyGatewayProjectionWrites(commit.position, commit.projection_writes ?? [], "fanout", commit.projection_delta),
+        // Fanout-sequencing fallback for a cold shard with no in-memory relay:
+        // sequence against the durable projection-cache head so frames drain in
+        // order instead of applying (and persisting) in arrival order.
+        durableProjectionHeadSeq: (scope) => this.gatewayProjectionHeadSeq(scope),
         broadcasts: {}
       });
       // On cold-load (DO rehydrate after hibernation), McpHost.queues is empty.
@@ -2696,7 +2722,6 @@ export class PersistentObjectDO {
       },
       enumerateRemoteTools: async (actor, requests) => {
         // Group ids by owning host, RPC each, merge.
-        const staleFallback = this.sameHostStaleFallbackEnabled();
         const byHost = new Map<string, RemoteToolRequest[]>();
         for (const request of requests) {
           const id = request.id;
@@ -2709,8 +2734,13 @@ export class PersistentObjectDO {
         if (byHost.size === 0) return [];
         const responses = await Promise.all(
           Array.from(byHost, async ([host, hostRequests]) => {
-            const cached = staleFallback ? this.readGatewayToolSurfaceDescriptors(hostRequests) : [];
-            if (cached.length > 0) {
+            const cached = this.readGatewayToolSurfaceDescriptors(hostRequests);
+            // Only serve from cache without an owner refresh when EVERY request
+            // in this host batch is covered. A partial hit (one cached scope,
+            // another uncached) must still refresh, otherwise the uncached
+            // scopes' tools silently vanish from a mixed/expanded listing.
+            const fullyCovered = hostRequests.every((request) => this.gatewayToolSurfaceRequestCovered(request));
+            if (fullyCovered) {
               this.emitMetric({
                 kind: "same_host_fallback",
                 route: "/__internal/enumerate-tools",
@@ -2743,8 +2773,10 @@ export class PersistentObjectDO {
                 }, localHost);
                 return cached;
               }
-              if (staleFallback) throw new Error(`remote tool descriptor refresh failed: ${host}`);
-              return [] as RemoteToolDescriptor[];
+              // Same-host stale fallback is unconditional: a previously listed
+              // descriptor must not silently vanish on owner timeout. With no
+              // cached row to serve, surface the refresh failure to the caller.
+              throw new Error(`remote tool descriptor refresh failed: ${host}`);
             }
           })
         );
@@ -2915,7 +2947,12 @@ export class PersistentObjectDO {
           throw wooError("E_INVARG", "mcp-commit-fanout requires transcript");
         }
         const originSession = typeof body.origin_session === "string" ? body.origin_session : null;
-        this.applyGatewayProjectionWrites(body.commit.position, body.commit.projection_writes ?? [], "fanout", body.commit.projection_delta);
+        // The durable projection-cache write is NOT done here: a fanout frame
+        // may arrive out of scope-sequence order, and writing it before
+        // sequencing would advance the cache head past a not-yet-seen earlier
+        // frame, dropping that frame at the head-idempotency guard. The gateway
+        // applies the SQL write via the persistAcceptedProjection hook, in
+        // contiguous order, as it accepts/drains each frame.
         this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession);
         return jsonResponse({ ok: true });
       }
@@ -3577,16 +3614,14 @@ export class PersistentObjectDO {
   }
 
   // Adapter for gateway-side apply (full housekeeping: api-key revocation
-  // diff + per-session route mirroring). Used by REST/MCP/WS reply paths.
-  private buildGatewayApplyTarget(
-    world: WooWorld,
-    options: { skipObjectHost?: V2LocalHostMaterialization } = {}
-  ): ShadowApplyTarget {
+  // diff + per-session route mirroring). Used only by the in-process REST turn
+  // fallback (`restV2TurnInProcess`, when there is no CommitScopeDO binding);
+  // the normal REST/MCP/WS reply paths maintain the gateway projection cache
+  // from the accepted commit's projection delta instead of a mirror WooWorld.
+  private buildGatewayApplyTarget(world: WooWorld): ShadowApplyTarget {
     return {
       applyTranscript: (transcript) => {
-        world.applyCommittedShadowTranscript(transcript, options.skipObjectHost
-          ? { skipObjectHost: options.skipObjectHost }
-          : {});
+        world.applyCommittedShadowTranscript(transcript, {});
       },
       revokedApiKeyIdsBefore: () => this.revokedApiKeyIds(world),
       cleanupRevokedApiKeys: (revokedBefore) => this.cleanupNewlyRevokedApiKeys(world, revokedBefore),
@@ -3941,8 +3976,8 @@ export class PersistentObjectDO {
         ...(this.browserProjectionHolderEnabled() ? { receiver_profile: "browser" as const } : {}),
         envelope: encoded
       });
-      const delivery = await this.deliverV2Fanout(world, att.scope, result, att.sessionId, att.node);
-      await this.applyV2CommittedTranscript(world, result.reply, att.sessionId, delivery.localHostMaterialized);
+      await this.deliverV2Fanout(world, att.scope, result, att.sessionId, att.node);
+      await this.applyV2CommittedTranscript(world, result.reply, att.sessionId);
       const receiverReply = result.receiver_reply ?? result.reply;
       if (receiverReply) ws.send(receiverReply);
     } catch (err) {
@@ -4392,9 +4427,9 @@ export class PersistentObjectDO {
       onMetric: (event) => world.recordMetric(event)
     });
     if (submitted.kind === "local_frame") return submitted.frame;
-    const delivery = await this.deliverV2Fanout(world, submitted.commitScope, submitted.result, input.session.id, submitted.client.node);
+    await this.deliverV2Fanout(world, submitted.commitScope, submitted.result, input.session.id, submitted.client.node);
     if (!submitted.result.reply || !submitted.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-    await this.applyV2CommittedTranscript(world, submitted.result.reply, input.session.id, delivery.localHostMaterialized);
+    await this.applyV2CommittedTranscript(world, submitted.result.reply, input.session.id);
     return restFrameFromTurnReply(input.scope, submitted.reply);
   }
 
@@ -4464,8 +4499,7 @@ export class PersistentObjectDO {
   private async applyV2CommittedTranscript(
     world: WooWorld,
     replyText: string | null,
-    sessionId: string,
-    localHostMaterialized: V2LocalHostMaterialization = null
+    sessionId: string
   ): Promise<void> {
     if (!replyText) return;
     const reply = decodeEnvelope<ShadowTurnExecReply | ShadowStateTransfer>(replyText);
@@ -4482,32 +4516,32 @@ export class PersistentObjectDO {
     if (callScope && callScope !== reply.body.commit.position.scope) this.restV2Relays.delete(callScope);
     const projectionWrites = reply.body.commit.projection_writes ?? [];
     const projectionDelta = reply.body.commit.projection_delta;
-    if (projectionDelta) {
-      const revokedBefore = projectionWrites.length ? this.revokedApiKeyIds(world) : null;
-      this.applyGatewayProjectionWrites(reply.body.commit.position, projectionWrites, "rest", projectionDelta);
-      if (projectionWrites.length) {
-        world.applyProjectionWrites(projectionWrites, { persist: false, transcript: reply.body.transcript });
-      }
-      if (revokedBefore) await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
-      const session = world.sessions.get(sessionId);
-      if (session) {
-        this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
-        await this.registerSessionRoute(session);
-      }
-      world.recordMetric({
-        kind: "gateway_projection_apply",
-        scope: reply.body.commit.position.scope,
-        rows: projectionWrites.length,
-        projection_bytes: projectionDelta?.projection_bytes ?? 0,
-        source: "rest"
-      });
-      return;
+    // The gateway maintains its projection-row cache from the accepted commit's
+    // projection delta; it does not keep a mirror WooWorld via runShadowApply.
+    // The core applier emits projection_delta for every accepted commit
+    // (shadow-commit-scope.ts), so a delta-less accepted reply is a contract
+    // violation, not a cue to fall back to the retired mirror-apply path.
+    if (!projectionDelta) {
+      throw wooError("E_INTERNAL", `accepted commit for ${reply.body.commit.position.scope} carried no projection_delta`);
     }
-    await runShadowApply(
-      reply.body.transcript,
-      this.buildGatewayApplyTarget(world, { skipObjectHost: localHostMaterialized }),
-      { sessionId, result: reply.body.outcome.result ?? reply.body.transcript.result }
-    );
+    const revokedBefore = projectionWrites.length ? this.revokedApiKeyIds(world) : null;
+    this.applyGatewayProjectionWrites(reply.body.commit.position, projectionWrites, "rest", projectionDelta);
+    if (projectionWrites.length) {
+      world.applyProjectionWrites(projectionWrites, { persist: false, transcript: reply.body.transcript });
+    }
+    if (revokedBefore) await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
+    const session = world.sessions.get(sessionId);
+    if (session) {
+      this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
+      await this.registerSessionRoute(session);
+    }
+    world.recordMetric({
+      kind: "gateway_projection_apply",
+      scope: reply.body.commit.position.scope,
+      rows: projectionWrites.length,
+      projection_bytes: projectionDelta.projection_bytes,
+      source: "rest"
+    });
   }
 
   private applyGatewayProjectionCacheFromReply(replyText: string | null, source: "rest" | "mcp" | "fanout"): void {

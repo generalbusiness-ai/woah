@@ -23,11 +23,30 @@ type CatalogObjectDef = {
   description?: string;
   flags?: {
     fertile?: boolean;
-    recyclable?: boolean;
   };
   properties?: CatalogPropertyDef[];
   verbs?: CatalogVerbDef[];
 };
+
+// Catalog manifests may set only the engine's object flags. Any other key — a
+// stale `recyclable` from before that gate was removed (spec/semantics/
+// recycle.md §RC), or a typo — is ignored here rather than passed through to be
+// silently set on the runtime object and then dropped on the next SQL
+// round-trip (flagsToSqlInt persists only these three). Manifests in practice
+// set only `fertile`; wizard/programmer are honored if present but should be
+// minted by bootstrap, not catalogs.
+const CATALOG_OBJECT_FLAG_KEYS = ["wizard", "programmer", "fertile"] as const;
+
+function catalogObjectFlags(
+  flags: Record<string, unknown> | undefined
+): { wizard?: boolean; programmer?: boolean; fertile?: boolean } {
+  const out: { wizard?: boolean; programmer?: boolean; fertile?: boolean } = {};
+  for (const key of CATALOG_OBJECT_FLAG_KEYS) {
+    const value = flags?.[key];
+    if (typeof value === "boolean") out[key] = value;
+  }
+  return out;
+}
 
 type CatalogPropertyDef = {
   name: string;
@@ -293,7 +312,7 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
           actual: actualParent
         });
       }
-      for (const [flag, expected] of Object.entries(def.flags ?? {})) {
+      for (const [flag, expected] of Object.entries(catalogObjectFlags(def.flags))) {
         if (typeof expected !== "boolean") continue;
         const actual = (world.object(def.local_name).flags as Record<string, boolean | undefined>)[flag] === true;
         if (actual !== expected) {
@@ -509,7 +528,7 @@ export function installCatalogManifest(world: WooWorld, manifest: CatalogManifes
   for (const def of objectDefs) {
     const id = def.local_name;
     const parent = resolveObjectRef(world, def.parent, localObjects, localSeeds, existing);
-    world.createObject({ id, name: id, parent, owner: actor, flags: def.flags });
+    world.createObject({ id, name: id, parent, owner: actor, flags: catalogObjectFlags(def.flags) });
     setDescriptionIfEmpty(world, id, catalogDescription(def.description, id, manifest.name));
     for (const property of def.properties ?? []) installProperty(world, id, property, actor);
     for (const verb of def.verbs ?? []) installVerbDef(world, id, verb, actor, allowImplementationHints, false);
@@ -907,14 +926,14 @@ function applyCatalogSchemaPlanStep(
   switch (step.kind) {
     case "ensure_object": {
       const parent = resolveObjectRef(world, step.def.parent, context.localObjects, context.localSeeds, context.existing);
-      if (!world.objects.has(step.object)) world.createObject({ id: step.object, name: step.object, parent, owner: context.actor, flags: step.def.flags });
+      if (!world.objects.has(step.object)) world.createObject({ id: step.object, name: step.object, parent, owner: context.actor, flags: catalogObjectFlags(step.def.flags) });
       else if (world.object(step.object).parent !== parent && !world.isDescendantOf(parent, step.object)) {
         world.chparentAuthoredObject(context.actor, step.object, parent);
       }
       if (world.objects.has(step.object)) {
         let flagsChanged = false;
         const target = world.object(step.object);
-        for (const [flag, expected] of Object.entries(step.def.flags ?? {})) {
+        for (const [flag, expected] of Object.entries(catalogObjectFlags(step.def.flags))) {
           if (typeof expected !== "boolean") continue;
           const actual = (target.flags as Record<string, boolean | undefined>)[flag] === true;
           if (actual === expected) continue;

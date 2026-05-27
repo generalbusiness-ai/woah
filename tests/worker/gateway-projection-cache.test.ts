@@ -14,9 +14,6 @@ function env(overrides: Partial<Env> = {}): Env {
   return {
     WOO_INITIAL_WIZARD_TOKEN: "test-wizard",
     WOO_INTERNAL_SECRET: "test-secret",
-    WOO_GATEWAY_PROJECTION_CACHE: "1",
-    WOO_TOOL_SURFACE_PROJECTION_ROWS: "1",
-    WOO_V2_SAME_HOST_STALE_FALLBACK: "1",
     WOO: new FakeDurableObjectNamespace(() => ({ fetch: () => new Response(null, { status: 404 }) })) as unknown as DurableObjectNamespace,
     DIRECTORY: new FakeDurableObjectNamespace(() => ({ fetch: () => new Response(null, { status: 404 }) })) as unknown as DurableObjectNamespace,
     ...overrides
@@ -176,11 +173,12 @@ describe("gateway projection cache", () => {
     }]);
   });
 
-  it("does not expose tool-surface rows while their rollback flag is off", () => {
+  it("treats a partial cache hit as incomplete so uncached scopes still refresh", () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
-    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({ WOO_TOOL_SURFACE_PROJECTION_ROWS: "0" })) as unknown as {
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
       storeGatewayToolSurfacesFromDescriptors: (scope: ObjRef, authorityScope: ObjRef, descriptors: RemoteToolDescriptor[]) => void;
       readGatewayToolSurfaceDescriptors: (requests: RemoteToolRequest[]) => RemoteToolDescriptor[];
+      gatewayToolSurfaceRequestCovered: (request: RemoteToolRequest) => boolean;
     };
     const descriptor: RemoteToolDescriptor = {
       object: "remote_widget",
@@ -188,14 +186,23 @@ describe("gateway projection cache", () => {
       aliases: [],
       arg_spec: { args: [] },
       direct: true,
-      source: "/* remote ping */",
-      enclosingSpace: "remote_room"
+      source: "/* cached */",
+      enclosingSpace: "room_a"
     };
+    // room_a is cached; room_b (same owning host) has never been refreshed.
+    po.storeGatewayToolSurfacesFromDescriptors("room_a", "room_a", [descriptor]);
+    const requestA: RemoteToolRequest = { id: "room_a", projection: "tools", expandContents: true };
+    const requestB: RemoteToolRequest = { id: "room_b", projection: "tools", expandContents: true };
 
-    po.storeGatewayToolSurfacesFromDescriptors("remote_room", "remote_room", [descriptor]);
-
-    expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toEqual([]);
-    expect(rows(state, "SELECT scope, object FROM gateway_tool_surface")).toEqual([]);
+    // The mixed-batch cache read is non-empty (room_a's descriptor). The old
+    // `cached.length > 0` short-circuit wrongly treated that as a complete
+    // answer and suppressed room_b's owner refresh, so room_b's tools vanished.
+    expect(po.readGatewayToolSurfaceDescriptors([requestA, requestB]).length).toBe(1);
+    // Coverage is request-level: room_a is covered, room_b is not, so the batch
+    // is NOT fully covered and enumerateRemoteTools must refresh from the owner.
+    expect(po.gatewayToolSurfaceRequestCovered(requestA)).toBe(true);
+    expect(po.gatewayToolSurfaceRequestCovered(requestB)).toBe(false);
+    expect([requestA, requestB].every((request) => po.gatewayToolSurfaceRequestCovered(request))).toBe(false);
   });
 
   it("keeps batched remote descriptor cache writes scoped to their request", () => {

@@ -862,14 +862,17 @@ and `WOO_V2_CHECKPOINT_TAIL_OPEN`. With either browser gate off, browser opens u
 the legacy display transfer even when CommitScopeDO can serve checkpoint/tail to
 server-side callers.
 
-`WOO_GATEWAY_PROJECTION_CACHE` enables the gateway's durable projection-row SQL
-cache for accepted fanout. `WOO_TOOL_SURFACE_PROJECTION_ROWS` is a narrower
-rollback flag for persisting and serving `ToolSurfaceProjectionRow` descriptor
-rows from that cache. `WOO_V2_SAME_HOST_STALE_FALLBACK` is a narrower rollback
-flag for serving cached tool surfaces or a session's last
-`SessionToolManifest` when owner descriptor refresh times out. Both narrower
-flags require `WOO_GATEWAY_PROJECTION_CACHE`; disabling either leaves ordinary
-authority and execution paths unchanged. `WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS`
+The gateway's durable projection-row SQL cache for accepted fanout is always on.
+It persists each accepted commit's projection delta (scope head, touched object
+rows, and scope-membership rows), persists and serves `ToolSurfaceProjectionRow`
+descriptor rows, and serves cached tool surfaces or a session's last
+`SessionToolManifest` when an owner descriptor refresh times out. The
+`WOO_GATEWAY_PROJECTION_CACHE`, `WOO_TOOL_SURFACE_PROJECTION_ROWS`, and
+`WOO_V2_SAME_HOST_STALE_FALLBACK` rollback flags that gated this during rollout
+were removed once the path became unconditional. Applying a projection delta is
+idempotent by scope head: a duplicate envelope replay or a redelivered fanout
+frame whose position is already reflected in the cache is a no-op, so replays
+cost zero durable writes. `WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_ROWS`
 caps reverse-index rows per gateway scope, defaulting to 10,000 rows.
 `WOO_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS` caps reverse-index rows per
 gateway shard, defaulting to 40,000 rows. When either cap is hit, the gateway

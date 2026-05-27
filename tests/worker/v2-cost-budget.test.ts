@@ -106,12 +106,18 @@ describe("v2 CommitScopeDO cost budget", () => {
       // CommitScopeDO remains the scope-head authority, but accepted v2
       // commits now write through to the routed object host before reporting
       // success. A gateway-hosted object therefore gets only its touched
-      // property rows persisted here, not a full gateway-world rewrite.
+      // property rows persisted here, not a full gateway-world rewrite. On top
+      // of the object-host write-through, the gateway persists the accepted
+      // commit's bounded projection delta into its cache (scope head + the
+      // touched object row + its scope-membership row).
       expect(writeRowsByTable(gatewayState)).toMatchObject({
         property_value: 1,
-        property_version: 1
+        property_version: 1,
+        gateway_projection_scope: 1,
+        gateway_projection_object: 1,
+        gateway_scope_member: 1
       });
-      expect(rowWrites(gatewayState)).toBe(2);
+      expect(rowWrites(gatewayState)).toBe(5);
       expect(commitScopeNamespace.fetchCallCount).toBe(1);
       expect(writeRowsByTable(directScopeState!)).toMatchObject({
         v2_commit_scope_meta: 1,
@@ -217,10 +223,17 @@ describe("v2 CommitScopeDO cost budget", () => {
         v2_commit_scope_seen: 1,
         v2_commit_scope_reply: 1
       });
-      // v2 envelope handling may read gateway sessions for auth projection,
-      // but it must not persist session activity, metrics, or cache state on
-      // the gateway hot path.
-      expect(rowWrites(harness.gatewayState)).toBe(0);
+      // v2 envelope handling reads gateway sessions for auth projection and
+      // persists the accepted commit's bounded projection delta into the
+      // gateway cache (the runShadowApply mirror-world replacement): the scope
+      // head, the one touched object row, and its scope-membership row. It must
+      // not rewrite the whole gateway world or churn session-activity rows.
+      expect(writeRowsByTable(harness.gatewayState)).toEqual({
+        gateway_projection_scope: 1,
+        gateway_projection_object: 1,
+        gateway_scope_member: 1
+      });
+      expect(rowWrites(harness.gatewayState)).toBe(3);
       // One browser envelope should cross exactly one extra Durable Object
       // boundary: gateway -> CommitScopeDO. Extra hops are billing-visible.
       expect(harness.commitScopeNamespace.fetchCallCount).toBe(1);
