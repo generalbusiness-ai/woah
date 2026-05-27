@@ -14,9 +14,6 @@ function env(overrides: Partial<Env> = {}): Env {
   return {
     WOO_INITIAL_WIZARD_TOKEN: "test-wizard",
     WOO_INTERNAL_SECRET: "test-secret",
-    WOO_GATEWAY_PROJECTION_CACHE: "1",
-    WOO_TOOL_SURFACE_PROJECTION_ROWS: "1",
-    WOO_V2_SAME_HOST_STALE_FALLBACK: "1",
     WOO: new FakeDurableObjectNamespace(() => ({ fetch: () => new Response(null, { status: 404 }) })) as unknown as DurableObjectNamespace,
     DIRECTORY: new FakeDurableObjectNamespace(() => ({ fetch: () => new Response(null, { status: 404 }) })) as unknown as DurableObjectNamespace,
     ...overrides
@@ -174,28 +171,6 @@ describe("gateway projection cache", () => {
       ...descriptor,
       source_rows: [{ table: "objects", authority_scope: "remote_room", key: "remote_widget" }]
     }]);
-  });
-
-  it("does not expose tool-surface rows while their rollback flag is off", () => {
-    const state = new FakeDurableObjectState("mcp-gateway-0");
-    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({ WOO_TOOL_SURFACE_PROJECTION_ROWS: "0" })) as unknown as {
-      storeGatewayToolSurfacesFromDescriptors: (scope: ObjRef, authorityScope: ObjRef, descriptors: RemoteToolDescriptor[]) => void;
-      readGatewayToolSurfaceDescriptors: (requests: RemoteToolRequest[]) => RemoteToolDescriptor[];
-    };
-    const descriptor: RemoteToolDescriptor = {
-      object: "remote_widget",
-      verb: "ping",
-      aliases: [],
-      arg_spec: { args: [] },
-      direct: true,
-      source: "/* remote ping */",
-      enclosingSpace: "remote_room"
-    };
-
-    po.storeGatewayToolSurfacesFromDescriptors("remote_room", "remote_room", [descriptor]);
-
-    expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toEqual([]);
-    expect(rows(state, "SELECT scope, object FROM gateway_tool_surface")).toEqual([]);
   });
 
   it("keeps batched remote descriptor cache writes scoped to their request", () => {

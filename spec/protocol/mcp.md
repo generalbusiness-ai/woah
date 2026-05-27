@@ -188,9 +188,11 @@ also include tool-surface `source_rows` when available so the
 gateway can invalidate inherited and feature-provided verbs from accepted
 projection updates without reopening executable state. Descriptor reads may use
 stale projection rows; auth, permission checks, and VM execution may not.
-During rollout, stale descriptor reads are enabled only when the gateway's
-same-host stale-fallback flag is on; with the flag off, saved manifests are not
-used to recover owner refresh failures.
+Same-host stale fallback is unconditional: when an owner descriptor refresh
+times out or returns nothing, the gateway serves cached tool surfaces or the
+session's last `SessionToolManifest` rather than dropping a previously listed
+descriptor. (The rollout flag that gated this was removed once it became the
+only path.)
 When an MCP call executes through v2 and the gateway already holds a local
 execution view for the commit scope, it may send a one-turn
 `ExecutionCapsule` on `/v2/envelope` instead of reopening the scope. The capsule

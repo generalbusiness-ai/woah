@@ -839,6 +839,43 @@ single `ApplyResult` applier, and append-only tail persistence. Their rollback
 surface is therefore the branch/deploy rollback rather than per-step env flags.
 Steps 4+ keep the narrower rollback flags named below.
 
+Landing note, 2026-05-27: Steps 5, 6, and 8 were promoted to unflagged on this
+branch by request, validated by the existing flag-on test coverage rather than a
+fresh prod smoke (smoke is the reviewer's pre-merge gate). The
+`WOO_GATEWAY_PROJECTION_CACHE`, `WOO_V2_SAME_HOST_STALE_FALLBACK`, and
+`WOO_TOOL_SURFACE_PROJECTION_ROWS` env flags and their gating helpers were
+removed; the gateway projection cache, same-host stale fallback, and
+tool-surface descriptor rows are now the only path. The retired gateway
+mirror-world apply (`runShadowApply` via `buildGatewayApplyTarget`) was deleted
+from `applyV2CommittedTranscript`, which now requires the accepted commit's
+`projection_delta` (a delta-less accepted reply throws `E_INTERNAL`).
+`buildGatewayApplyTarget` itself stays — it still serves the in-process REST
+turn path. Applying a projection delta was made idempotent by scope head so
+duplicate replays and redelivered fanout frames cost zero durable writes.
+
+Step 4a (the `commit_reply_replay` metric) was already implemented and is
+unchanged; only the 4b reply-persistence *decision* remains deferred for prod
+data. Step 1's promised guard against direct `scope.serialized` access landed as
+`scripts/guard-serialized-access.mjs` (wired into `pretest`/`pretypecheck`).
+
+Two items from the original cleanup list were investigated and intentionally
+NOT done because they are load-bearing, not legacy:
+
+- Step 7 (delete the legacy executable-seed `/v2/open` and cold-open
+  `saveFull`): blocked. `checkpoint_tail.v1` open is wired only for the browser
+  WS path, gated by `WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN`, which is deferred
+  until browser-profile projection rows land (see
+  `2026-05-25-browser-holder-node.md`). The non-browser MCP/REST `/v2/open` does
+  not negotiate checkpoint/tail at all yet. Deleting the legacy open would break
+  browser holders and every non-browser open. `WOO_V2_CHECKPOINT_TAIL_OPEN`
+  therefore stays as the browser prerequisite gate.
+- Retiring the REST in-process fallback (`restV2TurnInProcess`): kept. It is
+  reached when `!env.COMMIT_SCOPE` (deployments/runtime modes without a
+  CommitScopeDO binding) and for `persistence: "live"` verbs, where it is a
+  deliberate optimization avoiding a 9-26s WORLD-blocking cross-DO round-trip
+  (see `2026-05-22-horoscope-blocking-world.md`). It is not the gateway
+  mirror-apply path and is not legacy.
+
 Freshness is also explicit. Every projection cache row carries:
 
 ```ts

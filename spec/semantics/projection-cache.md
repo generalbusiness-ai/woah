@@ -73,10 +73,13 @@ hint: inherited verb edits must invalidate surfaces whose descriptors used that
 inherited row, while overridden parent verbs should not invalidate a descendant
 surface unless another visible descriptor still depends on the parent row.
 
-The initial rollout gates tool-surface persistence separately from the broader
-gateway projection cache. If the tool-surface flag is disabled, accepted
-object/session projection rows may still be cached, but descriptor rows are not
-persisted or served from `gateway_tool_surface`.
+The gateway projection cache and tool-surface descriptor persistence are both
+unconditional: accepted object/session projection rows are cached and descriptor
+rows are persisted to and served from `gateway_tool_surface`. The separate
+rollout flags that gated these during cutover were removed once they became the
+only path. Applying an accepted projection delta is idempotent by scope head, so
+a duplicate envelope replay or a redelivered fanout frame whose position is
+already reflected in the cache is a no-op and costs zero durable writes.
 
 The authority scope does not know which gateway shards have cached which tool
 surfaces. Tool-surface invalidation is therefore receiver-side: each gateway
@@ -91,8 +94,8 @@ initial caps are 10,000 source rows per active scope and 40,000 source rows per
 gateway shard. When adding a tool surface would exceed either cap, the gateway
 stores that surface as stale, marks the scope saturated, and does not add
 `gateway_tool_surface_source` rows for it. A saturated scope is not used for
-descriptor reads; the read path falls back to a session manifest when the
-same-host stale-fallback flag allows it, or refreshes from the owner. The scope
+descriptor reads; the read path falls back to a session manifest, or refreshes
+from the owner. The scope
 may resume serving cached tool surfaces only after disabled surfaces have been
 replaced or deleted and the source-index row counts fit under both caps. This
 keeps ancestor or feature-heavy catalogs from turning one active room or shard
@@ -108,10 +111,9 @@ Manifest expiry is the explicit time bound on this monotonicity: after
 `expires_at_ms`, stale fallback returns no saved descriptors until a fresh
 owner refresh or tool listing records a new manifest.
 
-Serving a manifest because owner refresh failed is controlled by the same-host
-stale-fallback rollout flag. With that flag disabled, a saved manifest may be
-recorded for later rollout, but it is not used to answer a failed descriptor
-refresh.
+Serving a saved manifest when an owner refresh fails is unconditional: the
+gateway answers from the session's last manifest rather than dropping a
+descriptor it has already shown the session.
 
 This monotonicity applies only to descriptor availability. A later call still
 executes through the ordinary authority path and may fail permission or stale
