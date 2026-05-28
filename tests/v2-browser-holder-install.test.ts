@@ -124,6 +124,8 @@ describe("v2 browser holder projection install", () => {
     expect((browserProjection.projection as { title: string }).title).toBe("Browser Room");
     expect((browserProjection.projection as { object_count: number }).object_count).toBe(2);
     expect((browserProjection.projection as { self: { name: string } | null }).self?.name).toBe("Browser Actor");
+    expect(browserStore.ops).toContain("countRows:objects");
+    expect(browserStore.ops).not.toContain("rows:room");
   });
 
   it("rejects authority-shaped checkpoint rows", async () => {
@@ -206,6 +208,16 @@ class FakeHolderStore implements V2BrowserHolderInstallStore {
     return Array.from(this.rows.values())
       .filter((row) => row.scope === scope)
       .map((row) => clone(row));
+  }
+
+  async getProjectionRow(scope: string, table: V2BrowserProjectionRowRecord["table"], key: string): Promise<V2BrowserProjectionRowRecord | undefined> {
+    this.ops.push(`getRow:${table}:${key}`);
+    return clone(this.rows.get(v2BrowserProjectionRowId(scope, table, key)));
+  }
+
+  async projectionRowCountForScopeTable(scope: string, table: V2BrowserProjectionRowRecord["table"]): Promise<number> {
+    this.ops.push(`countRows:${table}`);
+    return Array.from(this.rows.values()).filter((row) => row.scope === scope && row.table === table).length;
   }
 
   async putProjectionRow(row: V2BrowserProjectionRowRecordInput): Promise<void> {

@@ -5,12 +5,11 @@ import {
   createShadowExecutionNode,
   installShadowStateTransfer,
   type ShadowCellPageTransfer,
-  type ShadowExecutionNode,
-  type ShadowStateTransfer
+  type ShadowExecutionNode
 } from "../core/shadow-turn-exec";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { SerializedObject, SerializedWorld } from "../core/repository";
-import { shadowStatePageHash, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
+import type { ShadowStatePage, ShadowStatePageRef } from "../core/shadow-state-pages";
 import { hashSource } from "../core/source-hash";
 import { shadowAtomHash, shadowReadCellPreimage, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../core/turn-key";
 import type { ObjRef, WooValue } from "../core/types";
@@ -18,8 +17,8 @@ import type { ObjRef, WooValue } from "../core/types";
 export type V2ExecutableTransferRecord = {
   id: string;
   scope: ObjRef;
-  mode: ShadowStateTransfer["mode"];
-  transfer: ShadowStateTransfer;
+  mode: ShadowCellPageTransfer["mode"];
+  transfer: ShadowCellPageTransfer;
   received_at: number;
 };
 
@@ -49,19 +48,19 @@ export type V2PromotedAcceptedTranscriptTransfer = {
 };
 
 export function v2ExecutableTransferRecord(
-  transfer: ShadowStateTransfer,
+  transfer: ShadowCellPageTransfer,
   receivedAt: number = Date.now()
 ): V2ExecutableTransferRecord {
   return {
     id: v2ExecutableTransferId(transfer),
     scope: transfer.scope,
     mode: transfer.mode,
-    transfer: structuredClone(transfer) as ShadowStateTransfer,
+    transfer: structuredClone(transfer) as ShadowCellPageTransfer,
     received_at: receivedAt
   };
 }
 
-export function v2ExecutableTransferId(transfer: ShadowStateTransfer): string {
+export function v2ExecutableTransferId(transfer: ShadowCellPageTransfer): string {
   const proofRoot = transfer.proof?.root;
   const contentHash = typeof proofRoot === "string" && proofRoot.length > 0
     ? proofRoot
@@ -218,16 +217,15 @@ function acceptedWriteCellPromotionKey(anchor: EffectTranscript, transcripts: re
 }
 
 function executableStatePageRows(transfer: ShadowCellPageTransfer): Array<{ hash: string; ref: string; page: ShadowStatePage }> {
-  const refs = new Map(transfer.page_refs.map((ref) => [ref.hash, ref] as const));
+  const refs = new Map(transfer.page_refs.map((ref) => [statePageRefKey(ref), ref] as const));
   return transfer.inline_pages.flatMap((page) => {
-    const hash = shadowStatePageHash(page);
-    const ref = refs.get(hash);
+    const ref = refs.get(statePageRefKey(page));
     if (!ref) return [];
-    return [{ hash, ref: statePageRefKey(shadowStatePageRef(page, true)), page }];
+    return [{ hash: ref.hash, ref: statePageRefKey(ref), page }];
   });
 }
 
-function statePageRefKey(page: Pick<ShadowStatePage, "object" | "page"> & { name?: string }): string {
+function statePageRefKey(page: Pick<ShadowStatePage | ShadowStatePageRef, "object" | "page"> & { name?: string }): string {
   return `${page.object}:${page.page}:${page.name ?? ""}`;
 }
 

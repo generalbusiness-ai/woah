@@ -183,7 +183,6 @@ type TurnProposal = {
   transcript: EffectTranscript;
   transcript_hash: string;                 // accept-match condition for write-cell promotion
   read_cells: TranscriptCell[];            // rebase decision (VTN14.5 spec:1453, spec:1441)
-  write_cells: TranscriptCell[];           // promoted to store-2 only on a hash-matched accept
   predicted_overlay: ProposalProjectionOverlay[];
   ui_patch_ids: string[];                  // UCM21 layer-4 patches to retract on rollback
   created_at_ms: number; expires_at_ms: number;
@@ -243,11 +242,12 @@ These are the same for gateway and browser; the browser inherits them.
   for pending proposals and for accepted transcripts whose sequence gap has not
   closed yet.
 - **Execution view advances from accepted frames** (projection rows cannot feed
-  the VM). Promote a proposal's `write_cells` into store-2 under the accepted
-  receipt **only when the accepted frame's transcript hash equals the proposal's
-  `transcript_hash`**; if the authority re-executed differently under the same
-  turn id, discard the local writes and fetch capsule/checkpoint instead. For a
-  non-local accepted frame, promote the accepted transcript's write cells once
+  the VM). Promote a proposal's transcript writes into store-2 under the
+  accepted receipt **only when the accepted frame's transcript hash equals the
+  proposal's `transcript_hash`**; if the authority re-executed differently under
+  the same turn id, discard the local writes and fetch capsule/checkpoint
+  instead. For a non-local accepted frame, promote the accepted transcript's
+  write cells once
   the browser has contiguous accepted sequence coverage from its execution
   checkpoint or accepted-write-cell high-watermark.
 - **`ExecutionCapsuleTransfer` = `ShadowCellPageTransfer` + signed capsule

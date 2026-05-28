@@ -86,18 +86,6 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
 
 function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2BrowserCacheMutation[] {
   if (transfer.kind !== "woo.state.transfer.shadow.v1") return [];
-  if (transfer.mode === "object_records") {
-    const hashByObject = new Map(transfer.object_pages.map((page) => [page.id, page.hash]));
-    return [
-      { kind: "execution_transfer" as const, record: v2ExecutableTransferRecord(transfer) },
-      ...transfer.objects
-      .map((object) => {
-        const hash = hashByObject.get(object.id);
-        return hash ? { kind: "object_page" as const, hash, object } : null;
-      })
-      .filter((item): item is Extract<V2BrowserCacheMutation, { kind: "object_page" }> => item !== null)
-    ];
-  }
   if (transfer.mode === "cell_pages") {
     const hashByRef = new Map(transfer.page_refs.map((ref) => [statePageRefKey(ref), ref.hash]));
     const pages = transfer.inline_pages
@@ -112,7 +100,10 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
       ...(pages.length > 0 ? [{ kind: "state_pages" as const, scope: transfer.scope, pages }] : [])
     ];
   }
-  if (transfer.mode === "closure") return [{ kind: "execution_transfer", record: v2ExecutableTransferRecord(transfer) }];
+  // Browser executable cache is store-2 cell pages only. The worker rejects
+  // legacy `closure`/`object_records` before mutation; returning no mutation
+  // here keeps direct cache tests and future callers on the same boundary.
+  if (transfer.mode === "closure" || transfer.mode === "object_records") return [];
   if (transfer.mode !== "projection" && transfer.mode !== "delta") return [];
   const projectionMutation: V2BrowserCacheMutation | null = transfer.mode === "delta" && transfer.projection_patch
     ? { kind: "projection_patch", scope: transfer.scope, head: transfer.to, patch: transfer.projection_patch }

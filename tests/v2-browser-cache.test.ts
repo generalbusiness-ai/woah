@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import type { ShadowEnvelope } from "../src/core/shadow-envelope";
 import type { ShadowStatePage } from "../src/core/shadow-state-pages";
+import type { WooValue } from "../src/core/types";
 
 describe("v2 browser cache reducer", () => {
   it("persists projection transfers as projection head and clears catch-up-required", () => {
@@ -230,23 +231,30 @@ describe("v2 browser cache reducer", () => {
     ]);
   });
 
-  it("persists reply-bundled executable transfers and capability ads", () => {
+  it("persists reply-bundled cell-page executable transfers and capability ads", () => {
+    const page: ShadowStatePage = {
+      kind: "woo.state_page.object_live.shadow.v1",
+      page: "object_live",
+      object: "#room",
+      location: null,
+      children: [],
+      contents: []
+    };
     const transfer = {
       kind: "woo.state.transfer.shadow.v1",
-      mode: "closure",
+      mode: "cell_pages",
       scope: "the_dubspace",
       atom_hashes: ["atom-1"],
-      serialized: {
-        objects: [],
-        sessions: [],
-        logs: [],
-        snapshots: [],
-        parkedTasks: [],
-        tombstones: [],
-        objectCounter: 0,
-        sessionCounter: 0,
-        parkedTaskCounter: 0
-      },
+      page_refs: [{ object: "#room", page: "object_live", hash: "page-hash", bytes: 10, inline: true }],
+      inline_pages: [page],
+      sessions: [],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: [],
+      counters: { objectCounter: 0, sessionCounter: 0, parkedTaskCounter: 0 },
+      source_object_count: 0,
+      source_page_count: 1,
       proof: { root: "transfer-root" }
     };
     const ad = {
@@ -281,9 +289,52 @@ describe("v2 browser cache reducer", () => {
     expect(mutations).toEqual([
       { kind: "pending_delete", id: "pending-transfer" },
       { kind: "transcript", transcript: expect.objectContaining({ hash: "t-transfer" }) },
-      { kind: "execution_transfer", record: expect.objectContaining({ scope: "the_dubspace", mode: "closure", transfer }) },
+      { kind: "execution_transfer", record: expect.objectContaining({ scope: "the_dubspace", mode: "cell_pages", transfer }) },
+      { kind: "state_pages", scope: "the_dubspace", pages: [{ hash: "page-hash", ref: "#room:object_live:", page }] },
       { kind: "execution_ad", record: expect.objectContaining({ node: "near-executor", scope: "the_dubspace", ad }) }
     ]);
+  });
+
+  it("ignores legacy executable transfer modes at the browser cache boundary", () => {
+    const legacyTransfers: unknown[] = [
+      {
+        kind: "woo.state.transfer.shadow.v1",
+        mode: "closure",
+        scope: "the_dubspace",
+        atom_hashes: [],
+        serialized: {
+          objects: [],
+          sessions: [],
+          logs: [],
+          snapshots: [],
+          parkedTasks: [],
+          tombstones: [],
+          objectCounter: 0,
+          sessionCounter: 0,
+          parkedTaskCounter: 0
+        },
+        proof: { root: "legacy-closure" }
+      },
+      {
+        kind: "woo.state.transfer.shadow.v1",
+        mode: "object_records",
+        scope: "the_dubspace",
+        atom_hashes: [],
+        object_pages: [],
+        objects: [],
+        sessions: [],
+        logs: [],
+        snapshots: [],
+        parkedTasks: [],
+        tombstones: [],
+        counters: { objectCounter: 0, sessionCounter: 0, parkedTaskCounter: 0 },
+        source_object_count: 0,
+        proof: { root: "legacy-object-records" }
+      }
+    ];
+    for (const transfer of legacyTransfers) {
+      expect(v2BrowserCacheMutationsForEnvelope(envelopeFor("woo.state.transfer.shadow.v1", transfer as WooValue))).toEqual([]);
+    }
   });
 
   it("persists standalone capability-ad frames from gossip", () => {

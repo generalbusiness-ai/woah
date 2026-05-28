@@ -4,7 +4,7 @@ import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
-import { buildShadowCellPageTransfer, buildShadowClosureTransfer, createShadowExecutionNode, installShadowStateTransfer } from "../src/core/shadow-turn-exec";
+import { buildShadowCellPageTransfer, createShadowExecutionNode, installShadowStateTransfer } from "../src/core/shadow-turn-exec";
 import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
 import {
   createV2BrowserAcceptedWriteCellTransfer,
@@ -16,7 +16,7 @@ import {
 describe("v2 browser executable cache", () => {
   it("reconstructs an execution node from persisted executable transfers", () => {
     const key = turnKey("#room");
-    const transfer = buildShadowClosureTransfer({ serialized: serializedWorld(), key });
+    const transfer = buildShadowCellPageTransfer({ serialized: serializedWorld(), key });
     const record = v2ExecutableTransferRecord(transfer, 100);
 
     const node = createV2BrowserExecutionNodeFromTransfers({
@@ -32,7 +32,7 @@ describe("v2 browser executable cache", () => {
 
   it("ignores executable transfers for other scopes", () => {
     const key = turnKey("#other");
-    const transfer = buildShadowClosureTransfer({ serialized: serializedWorld("#other"), key });
+    const transfer = buildShadowCellPageTransfer({ serialized: serializedWorld("#other"), key });
     const record = v2ExecutableTransferRecord(transfer, 100);
 
     const node = createV2BrowserExecutionNodeFromTransfers({
@@ -86,7 +86,7 @@ describe("v2 browser executable cache", () => {
 
   it("uses a checkpoint as the replay base and skips older executable transfers", () => {
     const key = turnKey("#room");
-    const base = buildShadowClosureTransfer({ serialized: serializedWorld(), key });
+    const base = buildShadowCellPageTransfer({ serialized: serializedWorld(), key });
     const oldRecord = v2ExecutableTransferRecord(base, 100);
     const first = propTranscript("turn-1", 1, "checkpointed");
     const checkpoint = createV2BrowserExecutionCheckpoint({
@@ -103,7 +103,7 @@ describe("v2 browser executable cache", () => {
     const composed = createV2BrowserExecutionNodeFromTransfers({
       node: "browser:test",
       scope: "#room",
-      // Reinstalling this old closure over the checkpoint would erase the
+      // Reinstalling this old cell-page transfer over the checkpoint would erase the
       // checkpointed property. The checkpoint high-watermark makes it history.
       records: [oldRecord],
       checkpoint,
@@ -116,7 +116,7 @@ describe("v2 browser executable cache", () => {
 
   it("promotes accepted transcript write cells into executable page transfers", () => {
     const key = turnKey("#room");
-    const base = buildShadowClosureTransfer({ serialized: serializedWorld(), key, recipient: "browser:test" });
+    const base = buildShadowCellPageTransfer({ serialized: serializedWorld(), key, recipient: "browser:test" });
     const oldRecord = v2ExecutableTransferRecord(base, 100);
     const transcript = propTranscript("turn-1", 1, "promoted");
 
@@ -152,7 +152,7 @@ describe("v2 browser executable cache", () => {
 });
 
 function turnKey(scope: string): ShadowTurnKey {
-  const preimages = [`scope:${scope}`];
+  const preimages = [`actor:#actor`, `scope:${scope}`, `target:${scope}`];
   return {
     kind: "woo.turn_key.shadow.v1",
     scope,

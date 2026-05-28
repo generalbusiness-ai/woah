@@ -1,4 +1,4 @@
-import type { EffectTranscript, TranscriptCell, TranscriptWrite } from "../core/effect-transcript";
+import type { EffectTranscript, TranscriptCell } from "../core/effect-transcript";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ObjRef } from "../core/types";
 
@@ -7,13 +7,6 @@ export const V2_BROWSER_TENTATIVE_JOURNAL_LIMIT = 16;
 export type V2ProposalDependency = {
   cell: TranscriptCell;
   version?: string;
-};
-
-export type V2ProposalWriteCell = {
-  cell: TranscriptCell;
-  prior?: string;
-  next?: string;
-  op: TranscriptWrite["op"];
 };
 
 export type V2ProposalProjectionOverlay = {
@@ -34,8 +27,6 @@ export type V2BrowserTurnProposalRecord = {
   transcript_hash: string;
   transcript: EffectTranscript;
   depends_on: V2ProposalDependency[];
-  write_cells: V2ProposalWriteCell[];
-  state_probe_cells: TranscriptCell[];
   predicted_overlay: V2ProposalProjectionOverlay | null;
   status: "pending" | "needs_replan";
   created_at: number;
@@ -67,8 +58,6 @@ export function v2BrowserTurnProposalRecord(input: {
     transcript_hash: input.transcript.hash,
     transcript: structuredClone(input.transcript) as EffectTranscript,
     depends_on: proposalDependencies(input.transcript),
-    write_cells: proposalWriteCells(input.transcript),
-    state_probe_cells: structuredClone(input.transcript.stateProbes ?? []) as TranscriptCell[],
     predicted_overlay: input.predicted_overlay
       ? structuredClone(input.predicted_overlay) as V2ProposalProjectionOverlay
       : null,
@@ -203,23 +192,10 @@ function proposalDependencies(transcript: EffectTranscript): V2ProposalDependenc
   return Array.from(byCell.values()).sort(compareProposalCells);
 }
 
-function proposalWriteCells(transcript: EffectTranscript): V2ProposalWriteCell[] {
-  return transcript.writes
-    .map((write) => ({
-      cell: structuredClone(write.cell) as TranscriptCell,
-      ...(write.prior !== undefined ? { prior: write.prior } : {}),
-      ...(write.next !== undefined ? { next: write.next } : {}),
-      op: write.op
-    }))
-    .sort(compareProposalCells);
-}
-
 function normalizeTurnProposalRecord(record: V2BrowserTurnProposalRecord): V2BrowserTurnProposalRecord {
   if (
     record.kind === "woo.turn_proposal.v1" &&
-    Array.isArray(record.depends_on) &&
-    Array.isArray(record.write_cells) &&
-    Array.isArray(record.state_probe_cells)
+    Array.isArray(record.depends_on)
   ) {
     return record;
   }
@@ -227,8 +203,6 @@ function normalizeTurnProposalRecord(record: V2BrowserTurnProposalRecord): V2Bro
     ...record,
     kind: "woo.turn_proposal.v1",
     depends_on: proposalDependencies(record.transcript),
-    write_cells: proposalWriteCells(record.transcript),
-    state_probe_cells: structuredClone(record.transcript.stateProbes ?? []) as TranscriptCell[],
     predicted_overlay: record.predicted_overlay ?? null,
     status: record.status ?? "pending"
   };

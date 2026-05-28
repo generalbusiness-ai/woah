@@ -1650,8 +1650,6 @@ type TurnProposal = {
   transcript_hash: Hash;
   transcript: EffectTranscript;
   depends_on: Array<{ cell: CellRef; version?: Hash | string }>;
-  write_cells: Array<{ cell: CellRef; prior?: Hash | string; next?: Hash | string; op: string }>;
-  state_probe_cells: CellRef[];
   predicted_overlay?: ProposalProjectionOverlay | null;
   status: "pending" | "needs_replan";
   created_at: number;
@@ -1668,8 +1666,9 @@ type ProposalProjectionOverlay = {
 
 `depends_on` is the union of transcript reads and state probes. It is the
 browser's replan predicate for later accepted frames; it is not commit
-authority. `write_cells` is eligible for executable-store promotion only when a
-later accepted frame for the same turn has the same `transcript_hash`.
+authority. The canonical transcript remains the source for write-cell
+promotion; implementations MUST NOT persist a parallel write-cell copy in the
+proposal row unless that copy has an active consumer.
 
 #### VTN14.5.1 Phase 1 tentative journal
 
@@ -1806,13 +1805,14 @@ hello/reply/pending-frame state in IndexedDB, applies received projection/delta
 state transfers into projection, applied-frame, and transcript-tail stores, can
 apply a browser-profiled `woo.open.checkpoint_tail.v1` into projection-row and
 projection stores once that receiver profile is enabled,
-persists executable object/state pages from closure transfers, replays pending
-envelopes after reconnect, and marks reset/catch-up-needed state when the relay
-reports reset. The browser worker bundles into the SPA on every deployment and
-the UI consumes applied frames that arrive from the v2 worker. Catalogs can move
-their own controls to v2 by submitting `woo.turn.intent.request.v1` through the
-shared browser helper. The SPA sends generic sequenced UI calls through the same
-v2 helper whenever a browser-session token is available; the legacy `/ws`
+persists executable state pages from verified `cell_pages` execution capsule
+transfers, replays pending envelopes after reconnect, and marks
+reset/catch-up-needed state when the relay reports reset. The browser worker
+bundles into the SPA on every deployment and the UI consumes applied frames that
+arrive from the v2 worker. Catalogs can move their own controls to v2 by
+submitting `woo.turn.intent.request.v1` through the shared browser helper. The
+SPA sends generic sequenced UI calls through the same v2 helper whenever a
+browser-session token is available; the legacy `/ws`
 fallback has been removed. The bounded browser-local test gate asserts
 transcript parity with server recording for representative chat carrying,
 pinboard edit, taskboard kanban create, and dubspace committed control turns.

@@ -18,6 +18,7 @@ import {
   installShadowCachedObjectRecords,
   installShadowStateTransfer,
   shadowObjectRecordHash,
+  type ShadowCellPageTransfer,
   type ShadowExecutionNode,
   type ShadowMissingAtom,
   type ShadowStateTransfer,
@@ -303,7 +304,7 @@ export type ShadowBrowserEnvelopeReceipt<T = WooValue> = {
 export type ShadowBrowserOpenScopeResult = {
   projection: WooValue;
   transfer: ShadowProjectionTransfer | ShadowDeltaTransfer;
-  executable_transfer: ShadowStateTransfer;
+  executable_transfer: ShadowCellPageTransfer;
   executable_transfer_cache: "hit" | "miss";
   executable_transfer_digest?: string;
   executable_transfer_bytes: number;
@@ -678,7 +679,7 @@ export async function openShadowBrowserScope(
   const catchupApplyStartedAt = metricNow();
   applyShadowBrowserTransfer(browser, transfer);
   emitV2OpenStep(options, browser, "catchup_transfer_apply", catchupApplyStartedAt, { transfer_mode: transfer.mode });
-  let executableTransfer: ShadowStateTransfer;
+  let executableTransfer: ShadowCellPageTransfer;
   let executableSeedDigest: string | null = cachedOpenSeed?.generation === browser.relay.serialized_generation ? cachedOpenSeed.digest : null;
   if (cachedDigestMatches) {
     const cacheHitStartedAt = metricNow();
@@ -849,7 +850,7 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
   recipient: string,
   actor?: ObjRef,
   session?: string | null
-): ShadowStateTransfer {
+): ShadowCellPageTransfer {
   // Scope open needs enough executable material for the browser to plan the
   // first durable turn locally. This seed grants only coarse structural atom
   // coverage for the scope/actor/content scaffold; after planning derives the
@@ -895,7 +896,7 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
   recipient: string,
   actor?: ObjRef,
   session?: string | null
-): ShadowStateTransfer {
+): ShadowCellPageTransfer {
   const serialized = serializedFor(relay.commit_scope, { reason: "open_executable_seed_cache_hit" });
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",

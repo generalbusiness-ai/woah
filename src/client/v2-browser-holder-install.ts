@@ -30,6 +30,8 @@ export type V2BrowserHolderInstallStore = {
   getMeta<T>(key: string): Promise<T | undefined>;
   putMeta(key: string, value: unknown): Promise<void>;
   projectionRowsForScope(scope: string): Promise<V2BrowserProjectionRowRecord[]>;
+  getProjectionRow(scope: string, table: V2BrowserProjectionRowRecord["table"], key: string): Promise<V2BrowserProjectionRowRecord | undefined>;
+  projectionRowCountForScopeTable(scope: string, table: V2BrowserProjectionRowRecord["table"]): Promise<number>;
   putProjectionRow(row: V2BrowserProjectionRowRecordInput): Promise<void>;
   deleteProjectionRow(scope: string, table: V2BrowserProjectionRowRecord["table"], key: string): Promise<void>;
   clearProjectionRows(scope: string): Promise<void>;
@@ -241,8 +243,64 @@ async function projectionFromStoredRows(
   head: ShadowScopeHead,
   viewer: ProjectionViewer
 ): Promise<unknown> {
+  const subject = await storedBrowserObjectSummary(store, scope, scope);
+  if (!subject) return projectionFromAllStoredRows(store, scope, head, viewer);
+  const actor = viewer?.actor ? await storedBrowserObjectSummary(store, scope, viewer.actor) : null;
+  const sessionRow = viewer?.session ? await storedBrowserSessionRow(store, scope, viewer.session) : undefined;
+  const activeScope = sessionRow?.active_scope ?? null;
+  const subjectContents = objectRefsFromContents(subject) ?? [];
+  const inventoryRefs = objectRefsFromContents(actor) ?? [];
+  const projectionRefs = new Set<string>([scope, ...subjectContents]);
+  if (viewer?.actor) {
+    projectionRefs.add(viewer.actor);
+    for (const ref of inventoryRefs) projectionRefs.add(ref);
+  }
+  if (activeScope) projectionRefs.add(activeScope);
+
+  const byId = new Map<string, Record<string, unknown>>();
+  byId.set(scope, subject);
+  if (actor) byId.set(viewer!.actor, actor);
+  for (const id of projectionRefs) {
+    if (byId.has(id)) continue;
+    const summary = await storedBrowserObjectSummary(store, scope, id);
+    if (summary) byId.set(id, summary);
+  }
+  return browserProjectionFromObjectSummaries(scope, head, {
+    object_count: await store.projectionRowCountForScopeTable(scope, "objects"),
+    byId,
+    viewer,
+    sessionRow,
+    subjectContents,
+    inventoryRefs
+  });
+}
+
+async function projectionFromAllStoredRows(
+  store: V2BrowserHolderInstallStore,
+  scope: string,
+  head: ShadowScopeHead,
+  viewer: ProjectionViewer
+): Promise<unknown> {
   const rows = await store.projectionRowsForScope(scope);
   return browserProjectionFromStoredRows(scope, head, rows, viewer);
+}
+
+async function storedBrowserObjectSummary(
+  store: V2BrowserHolderInstallStore,
+  scope: string,
+  id: string
+): Promise<Record<string, unknown> | null> {
+  const row = await store.getProjectionRow(scope, "objects", id);
+  return row?.table === "objects" ? browserSummaryFromObjectRow(row.row) : null;
+}
+
+async function storedBrowserSessionRow(
+  store: V2BrowserHolderInstallStore,
+  scope: string,
+  id: string
+): Promise<BrowserSessionRow | undefined> {
+  const row = await store.getProjectionRow(scope, "sessions", id);
+  return row?.table === "sessions" ? row.row : undefined;
 }
 
 function objectProjectionRowKey(row: BrowserObjectRow): ObjRef {
@@ -349,6 +407,58 @@ function browserProjectionFromStoredRows(
       session: viewer.session ? {
         id: viewer.session,
         actor: viewer.actor,
+        active_scope: activeScope,
+        current_location: activeScope,
+        all_locations: activeScope ? [activeScope] : []
+      } : null,
+      inventory
+    } : {}),
+    subject,
+    objects
+  };
+}
+
+function browserProjectionFromObjectSummaries(
+  scope: string,
+  head: ShadowScopeHead,
+  input: {
+    object_count: number;
+    byId: Map<string, Record<string, unknown>>;
+    viewer?: ProjectionViewer;
+    sessionRow?: BrowserSessionRow;
+    subjectContents: string[];
+    inventoryRefs: string[];
+  }
+): unknown {
+  const subject = input.byId.get(scope) ?? null;
+  const actor = input.viewer?.actor ? input.byId.get(input.viewer.actor) ?? null : null;
+  const activeScope = input.sessionRow?.active_scope ?? null;
+  const projectionRefs = new Set<string>([scope, ...input.subjectContents]);
+  if (input.viewer?.actor) {
+    projectionRefs.add(input.viewer.actor);
+    for (const ref of input.inventoryRefs) projectionRefs.add(ref);
+  }
+  if (activeScope) projectionRefs.add(activeScope);
+  const objects = Array.from(projectionRefs)
+    .map((id) => input.byId.get(id) ?? null)
+    .filter((item): item is Record<string, unknown> => item !== null);
+  const inventory = input.inventoryRefs
+    .map((id) => input.byId.get(id) ?? null)
+    .filter((item): item is Record<string, unknown> => item !== null);
+  return {
+    kind: "woo.scope_projection.shadow.v1",
+    scope,
+    title: typeof subject?.name === "string" ? subject.name : scope,
+    object_count: input.object_count,
+    contents: input.subjectContents,
+    seq: head.seq,
+    cursor: { spaces: { [scope]: { next_seq: head.seq + 1 } }, live: { resumable: false } },
+    ...(input.viewer ? { viewer: input.viewer } : {}),
+    ...(input.viewer ? {
+      self: actor,
+      session: input.viewer.session ? {
+        id: input.viewer.session,
+        actor: input.viewer.actor,
         active_scope: activeScope,
         current_location: activeScope,
         all_locations: activeScope ? [activeScope] : []

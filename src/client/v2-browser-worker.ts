@@ -128,6 +128,8 @@ const OBJECT_PAGE_STORE = "object_pages";
 const STATE_PAGE_STORE = "state_pages";
 const EXECUTION_TRANSFER_STORE = "execution_transfers";
 const EXECUTION_AD_STORE = "execution_ads";
+// Physical store name is fixed for IndexedDB compatibility. The logical record
+// name is TurnProposal; do not rename this string without an explicit migration.
 const PROPOSAL_STORE = "tentative_turns";
 const EXECUTION_CHECKPOINT_STORE = "execution_checkpoints";
 const V2_BROWSER_COMMITTED_TRANSCRIPT_CHECKPOINT_INTERVAL = 8;
@@ -1010,11 +1012,11 @@ async function repairLocalExecutableState(
   // structural writes). The relay caches state-transfer replies by envelope id
   // for idempotency, so reusing `${id}:state-repair` across rounds replays the
   // first round's transfer and the new atoms are never granted. Mint a fresh
-  // envelope id per attempt so each round gets its own cell-page closure.
+  // envelope id per attempt so each round gets its own cell-page transfer.
   const requestId = `${id}:state-repair:${crypto.randomUUID()}`;
   // Missing atoms reported via `E_NEED_STATE` carry their preimage; the planned
   // key does NOT (the recorder threw before recording the access). When we
-  // have those preimages, ask only for that missing closure. Otherwise fall
+  // have those preimages, ask only for the missing cell pages. Otherwise fall
   // back to the planned key's hash set, which the relay can resolve through
   // key.preimages.
   const missingAtomsWithPreimage = missingAtoms.filter(
@@ -1815,6 +1817,8 @@ function browserHolderInstallStore(): V2BrowserHolderInstallStore {
     getMeta,
     putMeta,
     projectionRowsForScope,
+    getProjectionRow,
+    projectionRowCountForScopeTable,
     putProjectionRow,
     deleteProjectionRow,
     clearProjectionRows
@@ -1822,12 +1826,36 @@ function browserHolderInstallStore(): V2BrowserHolderInstallStore {
 }
 
 async function projectionRowsForScope(scope: string): Promise<V2BrowserProjectionRowRecord[]> {
-  const rows = await tx<V2BrowserProjectionRowRecord[]>(PROJECTION_ROW_STORE, "readonly", (store) => store.getAll());
-  return rows.filter((row) => row.scope === scope);
+  const lower = `${scope}\u0000`;
+  const upper = `${scope}\u0001`;
+  const idbKeyRange = globalThis.IDBKeyRange;
+  if (!idbKeyRange) {
+    const rows = await tx<V2BrowserProjectionRowRecord[]>(PROJECTION_ROW_STORE, "readonly", (store) => store.getAll());
+    return rows.filter((row) => typeof row.id === "string" && row.id >= lower && row.id < upper);
+  }
+  const range = idbKeyRange.bound(lower, upper, false, true);
+  return await tx<V2BrowserProjectionRowRecord[]>(PROJECTION_ROW_STORE, "readonly", (store) => store.getAll(range));
 }
 
 async function projectionRowCountForScope(scope: string): Promise<number> {
   return (await projectionRowsForScope(scope)).length;
+}
+
+async function getProjectionRow(scope: string, table: V2BrowserProjectionRowRecord["table"], key: string): Promise<V2BrowserProjectionRowRecord | undefined> {
+  return await tx<V2BrowserProjectionRowRecord | undefined>(PROJECTION_ROW_STORE, "readonly", (store) =>
+    store.get(v2BrowserProjectionRowId(scope, table, key))
+  );
+}
+
+async function projectionRowCountForScopeTable(scope: string, table: V2BrowserProjectionRowRecord["table"]): Promise<number> {
+  const lower = v2BrowserProjectionRowId(scope, table, "");
+  const upper = `${scope}\u0000${table}\u0001`;
+  const idbKeyRange = globalThis.IDBKeyRange;
+  if (!idbKeyRange) {
+    return (await projectionRowsForScope(scope)).filter((row) => row.table === table).length;
+  }
+  const range = idbKeyRange.bound(lower, upper, false, true);
+  return await tx<number>(PROJECTION_ROW_STORE, "readonly", (store) => store.count(range));
 }
 
 async function putProjectionRow(row: V2BrowserProjectionRowRecordInput): Promise<void> {
@@ -1839,9 +1867,7 @@ async function deleteProjectionRow(scope: string, table: V2BrowserProjectionRowR
 }
 
 async function clearProjectionRows(scope: string): Promise<void> {
-  for (const row of await projectionRowsForScope(scope)) {
-    await tx(PROJECTION_ROW_STORE, "readwrite", (store) => store.delete(row.id));
-  }
+  await deleteStoreKeys(PROJECTION_ROW_STORE, (await projectionRowsForScope(scope)).map((row) => row.id));
 }
 
 async function postCachedProjection(scope: string): Promise<void> {
@@ -2088,11 +2114,7 @@ async function executionCacheForScope(
     const pageHashes = new Set<string>();
     for (const record of recordsToInstall) {
       const transfer = record.transfer;
-      if (transfer.mode === "object_records") {
-        for (const page of transfer.object_pages) objectHashes.add(page.hash);
-      } else if (transfer.mode === "cell_pages") {
-        for (const page of transfer.page_refs) pageHashes.add(page.hash);
-      }
+      for (const page of transfer.page_refs) pageHashes.add(page.hash);
     }
     objectHashCount = objectHashes.size;
     pageHashCount = pageHashes.size;
@@ -2367,7 +2389,7 @@ async function deleteStoreKeys(storeName: string, keys: readonly IDBValidKey[]):
     let request: IDBRequest<undefined> | null = null;
     for (const key of keys) request = store.delete(key);
     return request ?? store.delete(keys[0]!);
-  });
+  }, { count: keys.length });
 }
 
 function postStatus(): void {

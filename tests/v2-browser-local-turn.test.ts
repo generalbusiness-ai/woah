@@ -5,7 +5,7 @@ import { v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-c
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowBrowserOpenExecutableSeedTransfer, createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
 import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
-import { buildShadowCellPageTransfer, buildShadowClosureTransfer, createShadowExecutionNode } from "../src/core/shadow-turn-exec";
+import { buildShadowCellPageTransfer, createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { WooValue } from "../src/core/types";
@@ -77,7 +77,7 @@ describe("v2 browser local turn planning", () => {
       anchor: { node: "stable-anchor", serialized }
     });
     const transfer = routed.transfers[0];
-    if (!transfer) throw new Error("expected cache-warming transfer");
+    if (!transfer || transfer.mode !== "cell_pages") throw new Error("expected cell-page cache-warming transfer");
 
     const local = await planV2BrowserLocalTurn({
       node: "browser:test",
@@ -105,7 +105,7 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
-  it("reports no executable state before the browser has learned a closure", async () => {
+  it("reports no executable state before the browser has learned cell pages", async () => {
     const local = await planV2BrowserLocalTurn({
       node: "browser:test",
       actor: "guest_missing",
@@ -354,7 +354,7 @@ describe("v2 browser local turn planning", () => {
       verb: "add_note",
       args: ["accepted tail note", "yellow", 48, 48, 180, 110]
     });
-    const addTransfer = buildShadowClosureTransfer({
+    const addTransfer = buildShadowCellPageTransfer({
       serialized,
       key: shadowTurnKeyFromTranscript(added.transcript)
     });
@@ -381,7 +381,7 @@ describe("v2 browser local turn planning", () => {
     });
     if (firstLocal.ok || !firstLocal.key) throw new Error("expected repairable local list plan");
 
-    const repairTransfer = buildShadowClosureTransfer({
+    const repairTransfer = buildShadowCellPageTransfer({
       serialized: added.serializedAfter,
       key: firstLocal.key
     });
@@ -443,7 +443,7 @@ describe("v2 browser local turn planning", () => {
       verb: "add",
       args: ["accepted outline item"]
     });
-    const addTransfer = buildShadowClosureTransfer({
+    const addTransfer = buildShadowCellPageTransfer({
       serialized,
       key: shadowTurnKeyFromTranscript(added.transcript)
     });
@@ -469,7 +469,7 @@ describe("v2 browser local turn planning", () => {
     });
     if (firstLocal.ok || !firstLocal.key) throw new Error("expected repairable local list plan");
 
-    const repairTransfer = buildShadowClosureTransfer({
+    const repairTransfer = buildShadowCellPageTransfer({
       serialized: added.serializedAfter,
       key: firstLocal.key
     });
@@ -535,7 +535,7 @@ describe("v2 browser local turn planning", () => {
       verb: "add",
       args: ["tentative outline item"]
     });
-    const addTransfer = buildShadowClosureTransfer({
+    const addTransfer = buildShadowCellPageTransfer({
       serialized,
       key: shadowTurnKeyFromTranscript(added.transcript)
     });
@@ -601,7 +601,7 @@ describe("v2 browser local turn planning", () => {
     });
     if (firstList.ok || !firstList.key) throw new Error("expected repairable local list_items plan");
 
-    const repairTransfer = buildShadowClosureTransfer({
+    const repairTransfer = buildShadowCellPageTransfer({
       serialized: added.serializedAfter,
       key: firstList.key
     });
@@ -661,12 +661,27 @@ describe("v2 browser local turn planning", () => {
     const added = await runShadowTurnCall(entered.serializedAfter, addCall);
     const enterKey = shadowTurnKeyFromTranscript(entered.transcript);
     const addKey = shadowTurnKeyFromTranscript(added.transcript);
-    const enterTransfer = buildShadowClosureTransfer({
+    const enterTransfer = buildShadowCellPageTransfer({
       serialized,
       key: enterKey,
     });
-    const addTransfer = buildShadowClosureTransfer({ serialized, key: addKey });
-    const transfers = [v2ExecutableTransferRecord(enterTransfer, 1), v2ExecutableTransferRecord(addTransfer, 2)];
+    const addTransfer = buildShadowCellPageTransfer({ serialized, key: addKey });
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:pinboard-journal",
+      scope: "the_pinboard",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_pinboard",
+      "browser:test",
+      session.actor
+    );
+    const transfers = [
+      v2ExecutableTransferRecord(openTransfer, 1),
+      v2ExecutableTransferRecord(enterTransfer, 2),
+      v2ExecutableTransferRecord(addTransfer, 3)
+    ];
 
     const localEnter = await planV2BrowserLocalTurn({
       node: "browser:test",
@@ -808,10 +823,23 @@ describe("v2 browser local turn planning", () => {
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.57);
     const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serialized, call)).transcript);
-    const partialTransfer = buildShadowClosureTransfer({
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:dubspace-missing-state",
+      scope: "the_dubspace",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_dubspace",
+      "browser:test",
+      session.actor
+    );
+    const omittedHash = key.atom_hashes.find((hash) => !openTransfer.atom_hashes.includes(hash));
+    if (!omittedHash) throw new Error("expected a turn-specific atom outside the open executable seed");
+    const partialTransfer = buildShadowCellPageTransfer({
       serialized,
       key,
-      atom_hashes: key.atom_hashes.slice(1)
+      atom_hashes: key.atom_hashes.filter((hash) => hash !== omittedHash)
     });
 
     const local = await planV2BrowserLocalTurn({
@@ -826,7 +854,10 @@ describe("v2 browser local turn planning", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.57],
       persistence: "durable",
-      transfers: [v2ExecutableTransferRecord(partialTransfer, 1)]
+      transfers: [
+        v2ExecutableTransferRecord(openTransfer, 1),
+        v2ExecutableTransferRecord(partialTransfer, 2)
+      ]
     });
 
     expect(local).toMatchObject({
@@ -838,7 +869,7 @@ describe("v2 browser local turn planning", () => {
       }
     });
     if (local.ok) throw new Error("expected missing_state");
-    expect(local.missing_atoms?.map((atom) => atom.hash)).toContain(key.atom_hashes[0]);
+    expect(local.missing_atoms?.map((atom) => atom.hash)).toContain(omittedHash);
   });
 });
 

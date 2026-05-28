@@ -14,7 +14,7 @@ import {
 } from "../src/client/v2-browser-journal";
 
 describe("v2 browser tentative journal", () => {
-  it("records explicit proposal dependencies and write cells from the transcript", () => {
+  it("records explicit proposal dependencies from the transcript", () => {
     const proposal = v2BrowserTurnProposalRecord({
       id: "turn-proposal",
       scope: "the_pinboard",
@@ -46,10 +46,6 @@ describe("v2 browser tentative journal", () => {
       { cell: { kind: "prop", object: "the_pinboard", name: "title" }, version: "v-title" },
       { cell: { kind: "verb", object: "the_pinboard", name: "add_note" } }
     ]);
-    expect(proposal.write_cells).toEqual([
-      { cell: { kind: "contents", object: "the_pinboard" }, op: "add", prior: "v-contents", next: "v-contents-next" }
-    ]);
-    expect(proposal.state_probe_cells).toEqual([{ kind: "verb", object: "the_pinboard", name: "add_note" }]);
   });
 
   it("normalizes legacy tentative rows into proposal records on read", () => {
@@ -83,10 +79,6 @@ describe("v2 browser tentative journal", () => {
       { cell: { kind: "prop", object: "the_pinboard", name: "title" }, version: "v-title" },
       { cell: { kind: "verb", object: "the_pinboard", name: "add_note" } }
     ]);
-    expect(selected[0]!.write_cells).toEqual([
-      { cell: { kind: "contents", object: "the_pinboard" }, op: "add", prior: "v-contents", next: "v-contents-next" }
-    ]);
-    expect(selected[0]!.state_probe_cells).toEqual([{ kind: "verb", object: "the_pinboard", name: "add_note" }]);
   });
 
   it("invalidates only the directly rejected Phase 1 tentative", () => {
