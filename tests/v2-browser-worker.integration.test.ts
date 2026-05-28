@@ -156,10 +156,9 @@ describe("v2 browser worker integration", () => {
     });
 
     const warmRequest = await waitForBrowserBuiltExecRequest(browser, socket);
-    expect(await waitForMessage(posted, (message) => isComposeViewFor(message, "warm-dubspace-control"))).toMatchObject({
-      kind: "shadow_browser_compose_view",
-      committed_transcript_count: 0
-    });
+    const warmCompose = await waitForMessage(posted, (message) => isComposeViewFor(message, "warm-dubspace-control"));
+    expect(warmCompose).toMatchObject({ kind: "shadow_browser_compose_view" });
+    expect(warmCompose).not.toHaveProperty("committed_transcript_count");
     expect(warmRequest).toMatchObject({
       type: "woo.turn.exec.request.shadow.v1",
       body: {
@@ -1042,10 +1041,9 @@ describe("v2 browser worker integration", () => {
 
     const replanRequest = await waitForBrowserBuiltExecRequest(browser, socket, "save_scene", undefined, replanCursor);
     expect(replanRequest.id).toBe(replannedEnvelopeId);
-    expect(await waitForMessageFrom(posted, replanMessageCursor, (message) => isComposeViewFor(message, "needs-replan-scene"))).toMatchObject({
-      kind: "shadow_browser_compose_view",
-      committed_transcript_count: 0
-    });
+    const replanCompose = await waitForMessageFrom(posted, replanMessageCursor, (message) => isComposeViewFor(message, "needs-replan-scene"));
+    expect(replanCompose).toMatchObject({ kind: "shadow_browser_compose_view" });
+    expect(replanCompose).not.toHaveProperty("committed_transcript_count");
     expect(replanRequest.body).toMatchObject({
       kind: "woo.turn.exec.request.shadow.v1",
       id: "needs-replan-scene",
@@ -2421,10 +2419,9 @@ describe("v2 browser worker integration", () => {
       persistence: "durable"
     });
     await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
-    expect(await waitForMessage(posted, (message) => isComposeViewFor(message, "checkpoint-control-after"))).toMatchObject({
-      kind: "shadow_browser_compose_view",
-      committed_transcript_count: 0
-    });
+    const afterGapCompose = await waitForMessage(posted, (message) => isComposeViewFor(message, "checkpoint-control-after"));
+    expect(afterGapCompose).toMatchObject({ kind: "shadow_browser_compose_view" });
+    expect(afterGapCompose).not.toHaveProperty("committed_transcript_count");
   });
 });
 

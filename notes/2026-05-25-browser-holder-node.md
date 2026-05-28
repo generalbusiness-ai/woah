@@ -71,8 +71,9 @@ Implementation checklist, current as of 2026-05-27:
    signed state-transfer compatibility, not for row-body-complete accepted-frame
    installs. Accepted transcript-tail rows are now a write-cell promotion buffer
    only; they no longer advance executable coverage or feed local VM reads.
-   Execution-cache transcript overlay remains for tentative proposals and for
-   materializing accepted write-cell transfers.
+   The ordinary execution-compose API no longer accepts committed transcript
+   overlays; transcript replay remains for tentative proposals and the private
+   accepted write-cell promotion materializer.
 5. Done: `TurnProposal`/proposal-buffer naming, explicit dependency records,
    accepted-frame hash-match promotion, and
    dependency-driven `needs_replan` marking are in the browser journal/worker.

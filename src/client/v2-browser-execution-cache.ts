@@ -36,7 +36,6 @@ export type V2BrowserExecutionComposeStats = {
   ms: number;
   transfer_count: number;
   installed_transfer_count: number;
-  committed_transcript_count: number;
   tentative_transcript_count: number;
   checkpoint_seq?: number;
   object_count: number;
@@ -75,7 +74,6 @@ export function createV2BrowserExecutionNodeFromTransfers(input: {
   cached_objects?: readonly SerializedObject[];
   cached_pages?: readonly ShadowStatePage[];
   checkpoint?: V2BrowserExecutionCheckpoint | null;
-  committed_transcripts?: readonly EffectTranscript[];
   tentative_transcripts?: readonly EffectTranscript[];
   onCompose?: (stats: V2BrowserExecutionComposeStats) => void;
 }): ShadowExecutionNode {
@@ -94,18 +92,13 @@ export function createV2BrowserExecutionNodeFromTransfers(input: {
     .slice()
     .sort((a, b) => a.received_at - b.received_at || a.id.localeCompare(b.id));
   for (const record of records) installShadowStateTransfer(executionNode, record.transfer);
-  const committed = input.committed_transcripts ?? [];
   const tentative = input.tentative_transcripts ?? [];
-  const materialized = materializeTranscriptOverlays(executionNode, [
-    ...committed,
-    ...tentative
-  ]);
+  const materialized = materializeTranscriptOverlays(executionNode, tentative);
   input.onCompose?.({
     scope: input.scope,
     ms: Date.now() - startedAt,
     transfer_count: input.records.filter((record) => record.scope === input.scope).length,
     installed_transfer_count: records.length,
-    committed_transcript_count: committed.length,
     tentative_transcript_count: tentative.length,
     ...(input.checkpoint ? { checkpoint_seq: input.checkpoint.through_seq } : {}),
     object_count: materialized.serialized?.objects.length ?? 0
@@ -127,15 +120,15 @@ export function createV2BrowserAcceptedWriteCellTransfer(input: {
   const scoped = input.transcripts.filter((transcript) => transcript.scope === input.scope);
   const anchor = scoped[scoped.length - 1];
   if (!anchor) return null;
-  const materialized = createV2BrowserExecutionNodeFromTransfers({
+  const base = createV2BrowserExecutionNodeFromTransfers({
     node: input.node,
     scope: input.scope,
     records: input.records,
     cached_objects: input.cached_objects,
     cached_pages: input.cached_pages,
-    checkpoint: input.checkpoint,
-    committed_transcripts: scoped
+    checkpoint: input.checkpoint
   });
+  const materialized = materializeTranscriptOverlays(base, scoped);
   if (!materialized.serialized) return null;
   const key = acceptedWriteCellPromotionKey(anchor, scoped);
   const transfer = buildShadowCellPageTransfer({

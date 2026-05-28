@@ -68,7 +68,13 @@ Each persistent host emits standard metrics:
 - `shadow_transcript_anomaly` records malformed transcript shapes that are rejected or no-op materialized instead of being silently applied, such as a `contents:remove` write with no corresponding move record.
 - `gateway_projection_apply` and `gateway_projection_cache_write` record accepted projection writes consumed by the gateway, including source (`rest`, `mcp`, or `fanout`). `gateway_projection_cache_write` carries `gateway_projection_rows_written` and `gateway_projection_bytes` so smoke-tail reports can distinguish SQL cache writes from generic row counts. `gateway_tool_surface_source_rows` records per-scope and per-shard tool-surface reverse-index growth and cap hits so active-room source-row sizing is visible in smoke tails. `shadow_gateway_apply_step` remains only a legacy/fallback probe for the temporary export → serialized apply → import path; a fresh v2 tail with `projection_delta` present should show gateway projection rows, not gateway whole-world apply scans. `same_host_fallback` records descriptor reads served from the gateway-local projection cache when an owner refresh is unavailable or unnecessary.
 - `session_reap` is emitted once per sweep only when at least one session is reaped. It includes `inspected`, `reaped`, `guest_reaped`, `credential_reaped`, and sweep latency so background retention work does not dominate data-path metric counts.
-- Browser workers emit `woo.v2.shadow_browser_compose_view` and `woo.v2.shadow_browser_execution_checkpoint` diagnostics to the page for local execution-cache composition. These are client-side probes rather than Analytics Engine events; they report compose milliseconds, installed transfer count, committed/tentative replay counts, checkpoint sequence, and checkpoint pruning.
+- Browser workers emit `woo.v2.shadow_browser_compose_view` and
+  `woo.v2.shadow_browser_execution_promotion` diagnostics to the page for local
+  execution-cache composition and accepted write-cell promotion. These are
+  client-side probes rather than Analytics Engine events; they report compose
+  milliseconds, installed transfer count, tentative overlay count, accepted
+  promotion sequence, promoted transcript count, and accepted write-cell page
+  count.
 - `parked_tasks` (gauge)
 - `inbound_rate_drops` (counter)
 - `outbound_overflow_drops` (counter)
