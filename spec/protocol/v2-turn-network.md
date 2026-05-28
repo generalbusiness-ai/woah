@@ -1350,8 +1350,8 @@ It is not just a renderer.
 Required browser-node components:
 
 - worker-hosted VM/runtime subset;
-- IndexedDB cache for state pages, projections, transcript tails, and pending
-  turns;
+- IndexedDB cache for state pages, projections, transcript tails awaiting
+  write-cell promotion, and pending turns;
 - WebSocket connection to a session relay;
 - subscription client for applied frames and projections;
 - live-plane sender/receiver for chat, cursors, and gesture previews;
@@ -1395,7 +1395,7 @@ rights:
 | `projections` | `woo.scope_projection.v1` rows and patches | No | Yes, for the named scope/head | state authority proof |
 | `projection_rows` | receiver-profiled checkpoint/tail projection rows keyed by opened scope, table, and row key | No | Only after deriving a scope projection for the named head | checkpoint/tail open authority |
 | `applied_frames` | accepted commit frames by `(scope, seq)` | No | Yes, via reducer | commit receipt |
-| `transcript_tail` | recent accepted transcripts | Only after page verification | Indirectly | commit receipt |
+| `transcript_tail` | recent accepted transcripts awaiting contiguous write-cell promotion | No; promotion buffer only | Indirectly | commit receipt |
 | `tentative_turns` | pending local committed transcripts with base head, actor/session, and transcript hash | Yes, as an overlay for later local plans | Only through optimistic layer | browser-local until accepted |
 | `execution_checkpoints` | per-scope materialized executable snapshots through an accepted seq | Yes, as a replay base | No | derived from state proofs and commit receipts |
 | `object_pages` | verified object-record pages | Yes | No | state proof |
@@ -1458,23 +1458,18 @@ persist VM-mutated post-state as authoritative executable pages until the turn
 is accepted or a verified state transfer supplies the matching pages. Tentative
 post-state lives only in the pending-turn/optimistic layer.
 
-Accepted transcripts may be replayed over the executable seed, but this replay
-tail MUST be bounded. A browser worker SHOULD periodically materialize a
-per-scope execution checkpoint through an accepted sequence number, then prune
-older transcript-tail rows covered by that checkpoint. A later local execution
-view starts from the checkpoint, installs only executable transfers received
-after the checkpoint's transfer high-watermark, and replays only accepted
-transcripts newer than the checkpoint plus current tentative turns. A full
-projection/open fallback is a new authoritative snapshot boundary and MUST
-discard the prior checkpoint and committed transcript tail for that scope.
-Implementations SHOULD expose compose-view timing and replay counts so local
-execution cost regressions are visible before they become user-visible.
-
-The current browser worker checkpoints a scope after a bounded batch of accepted
-transcripts, stores the checkpointed serialized execution view and transfer
-high-watermark, then prunes transcript-tail rows whose accepted sequence is
-covered by the checkpoint. This keeps each later local plan from replaying an
-unbounded commit history.
+Accepted transcripts MUST NOT be replayed over the executable seed to authorize
+ordinary local VM reads. The browser may retain transcript-tail rows only as a
+promotion buffer: once the rows cover a contiguous accepted sequence from the
+last execution checkpoint or accepted-write-cell high-watermark, it materializes
+that sequence into a proof-bearing `accepted_write_cells` transfer and prunes the
+covered tail rows. While a sequence gap remains, executable coverage stays at the
+last verified page/checkpoint high-watermark and later local turns must repair,
+delegate, or fall back rather than replaying the tail. A full projection/open
+fallback is a new authoritative snapshot boundary and MUST discard the prior
+checkpoint and committed transcript tail for that scope. Implementations SHOULD
+expose compose-view timing and replay counts so local execution cost regressions
+are visible before they become user-visible.
 
 The browser execution node has narrow authority:
 
@@ -1626,11 +1621,12 @@ The authoritative reconciliation rules are:
 
 The browser MUST retain enough pending-turn metadata to decide whether an
 accepted frame confirms, invalidates, or is independent of each optimistic turn:
-turn id, base head, predicted atoms, read cells, write cells, transcript hash,
-and UI patch id.
+turn id, base head, predicted atoms, dependency cells, canonical transcript,
+transcript hash, and UI patch id.
 
 A browser-local pending turn is a `TurnProposal`: a locally produced
-`TurnExecRequest` plus transcript hash, dependency cells, write cells, and a
+`TurnExecRequest` plus transcript hash, dependency cells, canonical transcript,
+and a
 partial projection overlay. The overlay is not a `ProjectionWrite`; it is
 rendered only through UCM21's pending optimistic layer. Phase 1 stores this
 material in the existing `tentative_turns` IndexedDB object store for
@@ -1680,7 +1676,6 @@ later local plan materializes:
 ```text
 verified executable seed or checkpoint
 + executable transfers newer than the checkpoint
-+ accepted transcripts newer than the checkpoint
 + pending tentative transcripts for the same actor/session/scope
 ```
 
@@ -1691,24 +1686,24 @@ network still sequences both turns; the journal is a local composed read view,
 not a commit authority.
 
 When the authoritative path accepts a turn, the browser removes the matching
-tentative row by turn id or transcript hash, stores the accepted frame, records
-or materializes the accepted transcript, and lets future plans compose from the
-committed tail or a new checkpoint. If catch-up supplies only an accepted frame,
-a transcript-hash match against a local proposal promotes that proposal's
-transcript into the accepted transcript tail; an id-only match with a different
-transcript hash discards the local proposal and waits for a verified
-transcript/capsule repair.
-An implementation MAY immediately materialize the hash-matched transcript into
-an `accepted_write_cells` executable page transfer instead of writing it to the
-transcript tail when the accepted frame is the immediate successor of the
-proposal's `base_head`. It MAY also materialize a non-local accepted transcript
-into `accepted_write_cells` when the browser has a contiguous accepted
-transcript sequence from the last execution checkpoint through that frame; if
-the sequence has a gap, the browser MUST retain the transcript-tail fallback or
-fetch a verified executable transfer before using the state for VM reads. When
-a later accepted frame closes such a gap, the browser SHOULD drain any now-
-contiguous transcript-tail rows into executable pages before composing later
-local turns.
+tentative row by turn id or transcript hash, stores the accepted frame, and
+materializes the accepted transcript into executable pages when it can prove a
+contiguous accepted sequence. If catch-up supplies only an accepted frame, a
+transcript-hash match against a local proposal may use that proposal's
+transcript for write-cell promotion; an id-only match with a different transcript
+hash discards the local proposal and waits for a verified transcript/capsule
+repair.
+An implementation MAY materialize the hash-matched transcript into an
+`accepted_write_cells` executable page transfer when the accepted frame is the
+immediate successor of the proposal's `base_head`. It MAY also materialize a
+non-local accepted transcript into `accepted_write_cells` when the browser has a
+contiguous accepted transcript sequence from the last execution checkpoint or
+accepted-write-cell high-watermark through that frame. If the sequence has a
+gap, the browser MAY retain transcript-tail rows as a promotion buffer, but MUST
+NOT count those rows as executable coverage or replay them for ordinary VM
+reads. When a later accepted frame closes such a gap, the browser SHOULD drain
+any now-contiguous transcript-tail rows into executable pages before composing
+later local turns.
 Accepted frames for other turns compare their accepted transcript writes against
 each pending proposal's `depends_on`; touched proposals are marked
 `needs_replan` and no longer participate in local execution composition. In
@@ -2006,8 +2001,9 @@ spreading.
    executable pages with proof metadata, installs an open-time executable seed
    for the current scope, reconstructs an execution node from IndexedDB, and
    refuses to use projection rows for VM reads. Contiguous accepted transcripts
-   are materialized into accepted write-cell pages; transcript replay remains a
-   bounded fallback for gaps and tentative overlays.
+   are materialized into accepted write-cell pages; accepted transcript-tail
+   replay is not a VM-read fallback. Transcript replay remains only for
+   tentative overlays and write-cell promotion materialization.
 4. **Missing-state repair.** Browser local execution requests closure
    transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
    same turn id locally before delegation.

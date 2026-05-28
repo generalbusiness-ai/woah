@@ -68,8 +68,10 @@ Implementation checklist, current as of 2026-05-27:
    `projection_writes` install through that holder boundary.
 4. Done for display state: legacy `ShadowScopeProjectionPatch` remains only for
    signed state-transfer compatibility, not for row-body-complete accepted-frame
-   installs. Execution-cache transcript overlay remains only for tentative
-   proposals and non-contiguous accepted-transcript gap fallback.
+   installs. Accepted transcript-tail rows are now a write-cell promotion buffer
+   only; they no longer advance executable coverage or feed local VM reads.
+   Execution-cache transcript overlay remains for tentative proposals and for
+   materializing accepted write-cell transfers.
 5. Done: `TurnProposal`/proposal-buffer naming, explicit dependency records,
    accepted-frame hash-match promotion, and
    dependency-driven `needs_replan` marking are in the browser journal/worker.
@@ -85,7 +87,9 @@ Implementation checklist, current as of 2026-05-27:
    accepted-write-cell high-watermark, now promote accepted write cells into a
    signed `accepted_write_cells` execution transfer instead of entering the
    replay tail. When an out-of-order gap closes, the worker drains any now-
-   contiguous transcript-tail rows into store 2 before later local composition.
+   contiguous transcript-tail rows into store 2 before later local composition;
+   while the gap remains, local execution falls back instead of replaying the
+   accepted transcript tail.
 7. Done: reconnect/cold-open authority reconciliation validates the
    `TransportHello` actor/session, treats that actor/session as authoritative
    for the worker, filters executable transfers by capsule recipient and active
@@ -247,8 +251,8 @@ These are the same for gateway and browser; the browser inherits them.
   scope head last. `ShadowScopeProjectionPatch` is now legacy state-transfer
   compatibility only; it is not the accepted-frame install path. The remaining
   `applyShadowTranscriptToCommitScopeCache` use is the execution-cache overlay
-  for pending proposals and for accepted transcripts whose sequence gap has not
-  closed yet.
+  for pending proposals and the store-2 write-cell promotion materializer; an
+  accepted transcript-tail gap no longer feeds local VM composition.
 - **Execution view advances from accepted frames** (projection rows cannot feed
   the VM). Promote a proposal's transcript writes into store-2 under the
   accepted receipt **only when the accepted frame's transcript hash equals the
@@ -328,7 +332,7 @@ These are the same for gateway and browser; the browser inherits them.
 
 | Data-path step | Browser arm |
 |---|---|
-| Step 2 — one `ApplyResult` applier | Transfer family is parameterized by `ProjectionProfile`; browser display state consumes `ProjectionWrite<BrowserProfile>` through `v2-browser-holder-install`. Store-2 write promotion now covers contiguous accepted transcripts; `applyShadowTranscriptToCommitScopeCache` remains only for tentative overlays and non-contiguous accepted-transcript gap fallback. |
+| Step 2 — one `ApplyResult` applier | Transfer family is parameterized by `ProjectionProfile`; browser display state consumes `ProjectionWrite<BrowserProfile>` through `v2-browser-holder-install`. Store-2 write promotion now covers contiguous accepted transcripts; `applyShadowTranscriptToCommitScopeCache` remains only for tentative overlays and write-cell promotion materialization, not accepted-tail VM composition. |
 | Step 5 — projection-row cache | Store 1 = the holder cache, browser-safe payload (A2). |
 | Step 6 — same-host stale fallback | Store 1 is the browser's same-host fallback; render at 0 ms, reconcile after. |
 | Step 7 — checkpoint/tail open | Browser open = display catch-up into store 1. The browser-profile checkpoint hash is stable across continuation chunks and keyed from the authority checkpoint export plus viewer, not from the current chunk's page subset. |
@@ -344,8 +348,9 @@ These are the same for gateway and browser; the browser inherits them.
   `TurnProposal`/`ProposalProjectionOverlay`, proposal dependency lifecycle, and
   capsule proof metadata are in VTN14. Remaining spec work is the eventual
   removal of compatibility byte fields from common `ProjectionDeltaSummary`/
-  `RowOp`; transcript replay is now a bounded fallback rather than the normal
-  accepted-transcript path.
+  `RowOp`; accepted-transcript replay is retired from the VM-read path, with
+  transcript-tail rows retained only as a promotion buffer until contiguous
+  `accepted_write_cells` can be built.
 - Migration: none (Cloudflare DO). IndexedDB schema versioned, idempotent.
 - Metrics: accepted-frame install cost (`projection_rows_written`,
   `browser_checkpoint_bytes`, `browser_capsule_bytes`) vs proposal lifecycle
@@ -417,8 +422,9 @@ work closes them rather than re-deriving the same divergence.
   `contents` is order-independent for versioning *and* read-value validation
   (`spec/protocol/v2-turn-network.md` §VTN, cell-version section).
 
-  Convergence requirement: accepted frames now normally materialize contiguous
-  write cells into store 2, but tentative overlays and accepted-transcript gap
-  fallback can still run transcript replay. Any new order-sensitive comparison
-  of a structural set cell is a latent repeat of this bug — keep set-cell value
-  comparisons aligned with the set-based version hash.
+  Convergence status: accepted frames now materialize contiguous write cells
+  into store 2, and accepted-transcript gap fallback no longer drives local VM
+  composition. Tentative overlays and the write-cell promotion materializer can
+  still apply transcripts; any new order-sensitive comparison of a structural
+  set cell is a latent repeat of this bug — keep set-cell value comparisons
+  aligned with the set-based version hash.

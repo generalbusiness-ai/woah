@@ -31,7 +31,6 @@ export type V2BrowserLocalTurnInput = {
   cached_objects?: readonly SerializedObject[];
   cached_pages?: readonly ShadowStatePage[];
   execution_checkpoint?: V2BrowserExecutionCheckpoint | null;
-  committed_transcripts?: readonly EffectTranscript[];
   tentative_transcripts?: readonly EffectTranscript[];
   onCompose?: (stats: V2BrowserExecutionComposeStats) => void;
 };
@@ -62,7 +61,6 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     cached_objects: input.cached_objects,
     cached_pages: input.cached_pages,
     checkpoint: input.execution_checkpoint,
-    committed_transcripts: input.committed_transcripts,
     tentative_transcripts: input.tentative_transcripts,
     onCompose: input.onCompose
   });

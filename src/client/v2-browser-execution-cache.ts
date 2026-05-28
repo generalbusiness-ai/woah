@@ -113,40 +113,6 @@ export function createV2BrowserExecutionNodeFromTransfers(input: {
   return materialized;
 }
 
-export function createV2BrowserExecutionCheckpoint(input: {
-  node: string;
-  scope: ObjRef;
-  records: readonly V2ExecutableTransferRecord[];
-  cached_objects?: readonly SerializedObject[];
-  cached_pages?: readonly ShadowStatePage[];
-  checkpoint?: V2BrowserExecutionCheckpoint | null;
-  committed_transcripts: readonly EffectTranscript[];
-  through_seq: number;
-  updated_at?: number;
-}): V2BrowserExecutionCheckpoint | null {
-  const node = createV2BrowserExecutionNodeFromTransfers({
-    node: input.node,
-    scope: input.scope,
-    records: input.records,
-    cached_objects: input.cached_objects,
-    cached_pages: input.cached_pages,
-    checkpoint: input.checkpoint,
-    committed_transcripts: input.committed_transcripts
-  });
-  if (!node.serialized) return null;
-  const transferHighWatermark = input.records
-    .filter((record) => record.scope === input.scope)
-    .reduce((max, record) => Math.max(max, record.received_at), input.checkpoint?.transfer_high_watermark ?? 0);
-  return {
-    scope: input.scope,
-    through_seq: input.through_seq,
-    transfer_high_watermark: transferHighWatermark,
-    serialized: structuredClone(node.serialized) as SerializedWorld,
-    atom_hashes: Array.from(node.atom_hashes).sort(),
-    updated_at: input.updated_at ?? Date.now()
-  };
-}
-
 export function createV2BrowserAcceptedWriteCellTransfer(input: {
   node: string;
   scope: ObjRef;

@@ -8,7 +8,6 @@ import { buildShadowCellPageTransfer, createShadowExecutionNode, installShadowSt
 import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
 import {
   createV2BrowserAcceptedWriteCellTransfer,
-  createV2BrowserExecutionCheckpoint,
   createV2BrowserExecutionNodeFromTransfers,
   v2ExecutableTransferRecord
 } from "../src/client/v2-browser-execution-cache";
@@ -82,36 +81,6 @@ describe("v2 browser executable cache", () => {
       cached_pages: fullTransfer.inline_pages
     });
     expect(rebuilt.serialized?.objects.find((object) => object.id === "the_dubspace")).toBeTruthy();
-  });
-
-  it("uses a checkpoint as the replay base and skips older executable transfers", () => {
-    const key = turnKey("#room");
-    const base = buildShadowCellPageTransfer({ serialized: serializedWorld(), key });
-    const oldRecord = v2ExecutableTransferRecord(base, 100);
-    const first = propTranscript("turn-1", 1, "checkpointed");
-    const checkpoint = createV2BrowserExecutionCheckpoint({
-      node: "browser:test",
-      scope: "#room",
-      records: [oldRecord],
-      committed_transcripts: [first],
-      through_seq: 1,
-      updated_at: 200
-    });
-    expect(checkpoint?.transfer_high_watermark).toBe(100);
-
-    const second = propTranscript("turn-2", 2, "tail");
-    const composed = createV2BrowserExecutionNodeFromTransfers({
-      node: "browser:test",
-      scope: "#room",
-      // Reinstalling this old cell-page transfer over the checkpoint would erase the
-      // checkpointed property. The checkpoint high-watermark makes it history.
-      records: [oldRecord],
-      checkpoint,
-      committed_transcripts: [second]
-    });
-
-    const room = composed.serialized?.objects.find((object) => object.id === "#room");
-    expect(room?.properties).toContainEqual(["marker", "tail"]);
   });
 
   it("promotes accepted transcript write cells into executable page transfers", () => {

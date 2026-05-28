@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { planV2BrowserLocalTurn } from "../src/client/v2-browser-local-turn";
-import { v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
+import { createV2BrowserAcceptedWriteCellTransfer, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowBrowserOpenExecutableSeedTransfer, createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
 import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
@@ -296,6 +296,14 @@ describe("v2 browser local turn planning", () => {
       "browser:pinboard-peer-enter",
       second.actor
     );
+    const promoted = createV2BrowserAcceptedWriteCellTransfer({
+      node: "browser:pinboard-peer-enter",
+      scope: "the_pinboard",
+      records: [v2ExecutableTransferRecord(openTransfer, 1)],
+      transcripts: [firstEntered.transcript],
+      accepted_head: { kind: "woo.scope_head.shadow.v1", scope: "the_pinboard", epoch: 1, seq: 1, hash: "peer" }
+    });
+    if (!promoted) throw new Error("expected peer enter write-cell promotion");
     const planned = await planV2BrowserLocalTurn({
       node: "browser:pinboard-peer-enter",
       actor: second.actor,
@@ -308,8 +316,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: [],
       persistence: "durable",
-      transfers: [v2ExecutableTransferRecord(openTransfer, 1)],
-      committed_transcripts: [firstEntered.transcript]
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1), promoted.record]
     });
 
     expect(planned).toMatchObject({
@@ -322,7 +329,7 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
-  it("plans read-side hydrations against accepted transcript tails", async () => {
+  it("plans read-side hydrations against accepted write-cell transfers", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-read-tail");
     const serialized = anchor.exportWorld();
@@ -354,10 +361,14 @@ describe("v2 browser local turn planning", () => {
       verb: "add_note",
       args: ["accepted tail note", "yellow", 48, 48, 180, 110]
     });
-    const addTransfer = buildShadowCellPageTransfer({
-      serialized,
-      key: shadowTurnKeyFromTranscript(added.transcript)
+    const promoted = createV2BrowserAcceptedWriteCellTransfer({
+      node: "browser:pinboard-tail",
+      scope: "the_pinboard",
+      records: [v2ExecutableTransferRecord(transfer, 1)],
+      transcripts: [entered.transcript, added.transcript],
+      accepted_head: { kind: "woo.scope_head.shadow.v1", scope: "the_pinboard", epoch: 1, seq: 2, hash: "tail" }
     });
+    if (!promoted) throw new Error("expected pinboard write-cell promotion");
 
     const firstLocal = await planV2BrowserLocalTurn({
       node: "browser:pinboard-tail",
@@ -371,8 +382,7 @@ describe("v2 browser local turn planning", () => {
       verb: "list_notes",
       args: [],
       persistence: "live",
-      transfers: [v2ExecutableTransferRecord(transfer, 1), v2ExecutableTransferRecord(addTransfer, 2)],
-      committed_transcripts: [entered.transcript, added.transcript]
+      transfers: [v2ExecutableTransferRecord(transfer, 1), promoted.record]
     });
     expect(firstLocal).toMatchObject({
       ok: false,
@@ -397,8 +407,7 @@ describe("v2 browser local turn planning", () => {
       verb: "list_notes",
       args: [],
       persistence: "live",
-      transfers: [v2ExecutableTransferRecord(transfer, 1), v2ExecutableTransferRecord(addTransfer, 2), v2ExecutableTransferRecord(repairTransfer, 3)],
-      committed_transcripts: [entered.transcript, added.transcript]
+      transfers: [v2ExecutableTransferRecord(transfer, 1), promoted.record, v2ExecutableTransferRecord(repairTransfer, 3)]
     });
 
     expect(local).toMatchObject({
@@ -411,7 +420,7 @@ describe("v2 browser local turn planning", () => {
     expect(JSON.stringify(local.optimistic_frame.result)).toContain("accepted tail note");
   });
 
-  it("keeps later accepted outliner items visible when older transcripts are replayed", async () => {
+  it("keeps later accepted outliner items visible from accepted write-cell transfers", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-outline-tail");
     const serialized = anchor.exportWorld();
@@ -443,10 +452,14 @@ describe("v2 browser local turn planning", () => {
       verb: "add",
       args: ["accepted outline item"]
     });
-    const addTransfer = buildShadowCellPageTransfer({
-      serialized,
-      key: shadowTurnKeyFromTranscript(added.transcript)
+    const promoted = createV2BrowserAcceptedWriteCellTransfer({
+      node: "browser:outline-tail",
+      scope: "the_outline",
+      records: [v2ExecutableTransferRecord(transfer, 1)],
+      transcripts: [entered.transcript, added.transcript],
+      accepted_head: { kind: "woo.scope_head.shadow.v1", scope: "the_outline", epoch: 1, seq: 2, hash: "tail" }
     });
+    if (!promoted) throw new Error("expected outliner write-cell promotion");
     const firstLocal = await planV2BrowserLocalTurn({
       node: "browser:outline-tail",
       actor: session.actor,
@@ -459,8 +472,7 @@ describe("v2 browser local turn planning", () => {
       verb: "list_items",
       args: [],
       persistence: "live",
-      transfers: [v2ExecutableTransferRecord(transfer, 1), v2ExecutableTransferRecord(addTransfer, 2)],
-      committed_transcripts: [entered.transcript, added.transcript]
+      transfers: [v2ExecutableTransferRecord(transfer, 1), promoted.record]
     });
     expect(firstLocal).toMatchObject({
       ok: false,
@@ -487,10 +499,9 @@ describe("v2 browser local turn planning", () => {
       persistence: "live",
       transfers: [
         v2ExecutableTransferRecord(transfer, 1),
-        v2ExecutableTransferRecord(addTransfer, 2),
+        promoted.record,
         v2ExecutableTransferRecord(repairTransfer, 3)
-      ],
-      committed_transcripts: [entered.transcript, added.transcript]
+      ]
     });
 
     expect(local).toMatchObject({

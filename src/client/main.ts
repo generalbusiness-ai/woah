@@ -646,7 +646,7 @@ function ensureV2BrowserWorker() {
       }
       console.debug("woo.v2.local_turn_invalidated", event.data);
     }
-    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed" || event.data?.kind === "shadow_browser_compose_view" || event.data?.kind === "shadow_browser_execution_checkpoint") {
+    if (event.data?.kind === "local_turn_planned" || event.data?.kind === "local_turn_fallback" || event.data?.kind === "local_turn_delegated" || event.data?.kind === "local_turn_repairing" || event.data?.kind === "local_turn_repair_failed" || event.data?.kind === "shadow_browser_compose_view") {
       window.dispatchEvent(new CustomEvent(`woo.v2.${event.data.kind}`, { detail: event.data }));
       console.debug(`woo.v2.${event.data.kind}`, event.data);
     }

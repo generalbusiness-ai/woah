@@ -2362,6 +2362,23 @@ describe("v2 browser worker integration", () => {
         transcript_tail: 1
       }
     });
+    const gapFallbackCursor = posted.length;
+    scope.dispatch({
+      kind: "call",
+      id: "checkpoint-control-before-gap-close",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.77],
+      persistence: "durable"
+    });
+    expect(await waitForMessageFrom(posted, gapFallbackCursor, (message) => isLocalTurnFallback(message, "checkpoint-control-before-gap-close"))).toMatchObject({
+      kind: "local_turn_fallback",
+      id: "checkpoint-control-before-gap-close",
+      reason: "executable_state_stale",
+      coverage_seq: 1
+    });
 
     const accepted2 = syntheticAccepted("the_dubspace", 2);
     const transcript2 = syntheticCheckpointTranscript("the_dubspace", remoteSession.actor, remoteSession.id, 2);

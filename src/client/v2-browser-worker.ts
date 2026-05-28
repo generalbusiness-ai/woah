@@ -21,7 +21,7 @@ import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from 
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
 import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-browser-delegation";
 import type { V2BrowserExecutionCheckpoint, V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
-import { createV2BrowserAcceptedWriteCellTransfer, createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
+import { createV2BrowserAcceptedWriteCellTransfer, createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
 import { shouldInvalidateTentativeTurnForCommitReason } from "./v2-browser-optimistic-lifecycle";
 import {
@@ -133,7 +133,6 @@ const EXECUTION_AD_STORE = "execution_ads";
 // name is TurnProposal; do not rename this string without an explicit migration.
 const PROPOSAL_STORE = "tentative_turns";
 const EXECUTION_CHECKPOINT_STORE = "execution_checkpoints";
-const V2_BROWSER_COMMITTED_TRANSCRIPT_CHECKPOINT_INTERVAL = 8;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
@@ -878,7 +877,7 @@ async function sendLocalTurnExec(
       ms: metricElapsed(cacheStartedAt),
       status: "ok",
       records: executionCache.records.length,
-      count: executionCache.cached_objects.length + executionCache.cached_pages.length + executionCache.committed_transcripts.length
+      count: executionCache.cached_objects.length + executionCache.cached_pages.length
     });
     if (!executionCacheCoversHead(scope, cachedHead, executionCache)) {
       postMessage({
@@ -918,7 +917,6 @@ async function sendLocalTurnExec(
       cached_objects: executionCache.cached_objects,
       cached_pages: executionCache.cached_pages,
       execution_checkpoint: executionCache.checkpoint,
-      committed_transcripts: executionCache.committed_transcripts,
       tentative_transcripts: v2ProposalTranscriptChain(proposals, selector),
       onCompose: (stats) => postMessage({
         kind: "shadow_browser_compose_view",
@@ -1368,7 +1366,6 @@ async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, 
       const promoted = await materializeAcceptedProposalWriteTransfer(frame, record.transcript, record);
       if (!promoted) {
         await putTranscript(record.transcript, frame.position.seq);
-        await maybeCheckpointCommittedTranscripts(record.scope);
       }
     }
     await deleteTurnProposal(record.id);
@@ -1416,8 +1413,8 @@ async function materializeAcceptedTranscriptWriteTransfer(
   // Store-2 write-cell promotion for a local proposal is safe only when the
   // accepted frame is the immediate successor of the state that proposal
   // executed against. Other accepted transcripts are safe when the local
-  // committed transcript rows cover every accepted sequence since the last
-  // execution checkpoint.
+  // transcript tail covers every accepted sequence since the last verified
+  // execution checkpoint or accepted-write-cell high-watermark.
   if (proposal && frame.position.seq !== proposal.base_head.seq + 1) return false;
   const checkpoint = await getExecutionCheckpoint(frame.position.scope);
   if (checkpoint && frame.position.seq <= checkpoint.through_seq) return true;
@@ -1739,7 +1736,6 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
             await materializeAcceptedTranscriptWriteTransfer(mutation.frame, mutation.transcript);
           if (!promoted) {
             await putTranscript(mutation.transcript, mutation.frame.position.seq);
-            await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
           }
         }
         if (rememberAppliedFramePost(mutation.frame)) return { kind: "applied_frame", frame: mutation.frame, transcript: mutation.transcript };
@@ -1996,10 +1992,6 @@ async function putExecutionAd(record: V2ExecutionAdRecord): Promise<void> {
   await tx(EXECUTION_AD_STORE, "readwrite", (store) => store.put(record));
 }
 
-async function putExecutionCheckpoint(record: V2BrowserExecutionCheckpoint): Promise<void> {
-  await tx(EXECUTION_CHECKPOINT_STORE, "readwrite", (store) => store.put(record));
-}
-
 async function getExecutionCheckpoint(scope: string): Promise<V2BrowserExecutionCheckpoint | undefined> {
   if (!scope) return undefined;
   return await tx<V2BrowserExecutionCheckpoint | undefined>(EXECUTION_CHECKPOINT_STORE, "readonly", (store) => store.get(scope));
@@ -2116,41 +2108,13 @@ async function deleteCommittedTranscriptsThrough(scope: string, throughSeq: numb
 
 async function resetCommittedExecutionOverlay(scope: string): Promise<void> {
   // A full projection/open seed is an authoritative snapshot boundary. The
-  // committed transcript tail and checkpoint describe how to advance an older
-  // executable seed; keeping them would replay already-included commits over
-  // the new seed on the next local plan. Verified executable transfers remain
-  // usable until the replacement executable seed arrives.
+  // committed transcript tail is only a write-cell promotion buffer for an
+  // older executable seed; keeping it would later promote already-included
+  // commits over the new seed. Verified executable transfers remain usable
+  // until the replacement executable seed arrives.
   const rows = await transcriptRowsForScope(scope);
   await deleteStoreKeys(TRANSCRIPT_STORE, rows.map((row) => row.hash));
   await deleteExecutionCheckpoint(scope);
-}
-
-async function maybeCheckpointCommittedTranscripts(scope: string): Promise<void> {
-  const checkpoint = await getExecutionCheckpoint(scope);
-  const rows = await committedTranscriptRowsForScope(scope, checkpoint?.through_seq ?? -1);
-  if (rows.length < V2_BROWSER_COMMITTED_TRANSCRIPT_CHECKPOINT_INTERVAL) return;
-  const cache = await executionCacheForScope(scope, undefined, { skip_checkpoint_build: true });
-  const throughSeq = rows[rows.length - 1]!.accepted_seq ?? rows[rows.length - 1]!.seq;
-  const next = createV2BrowserExecutionCheckpoint({
-    node: current?.node ?? "browser:checkpoint",
-    scope,
-    records: cache.records,
-    cached_objects: cache.cached_objects,
-    cached_pages: cache.cached_pages,
-    checkpoint,
-    committed_transcripts: rows.map((row) => structuredClone(row.transcript) as EffectTranscript),
-    through_seq: throughSeq
-  });
-  if (!next) return;
-  await putExecutionCheckpoint(next);
-  const pruned = await deleteCommittedTranscriptsThrough(scope, throughSeq);
-  postMessage({
-    kind: "shadow_browser_execution_checkpoint",
-    scope,
-    through_seq: throughSeq,
-    transcript_count: rows.length,
-    pruned
-  });
 }
 
 async function allTurnProposals(): Promise<V2BrowserTurnProposalRecord[]> {
@@ -2168,7 +2132,6 @@ async function executionCacheForScope(
   cached_pages: ShadowStatePage[];
   checkpoint?: V2BrowserExecutionCheckpoint;
   committed_transcript_rows: TranscriptTailRow[];
-  committed_transcripts: EffectTranscript[];
 }> {
   const startedAt = metricNow();
   let scopedRecordCount = 0;
@@ -2195,8 +2158,6 @@ async function executionCacheForScope(
     const cached_objects = await cachedObjectsByHash(objectHashes);
     const cached_pages = await cachedStatePagesByHash(pageHashes);
     const committed_transcript_rows = await committedTranscriptRowsForScope(scope, checkpoint?.through_seq ?? -1);
-    const committed_transcripts = committed_transcript_rows
-      .map((row) => structuredClone(row.transcript) as EffectTranscript);
     postBrowserActivity({
       phase: "execution_cache_build",
       path: options.skip_checkpoint_build ? "skip_checkpoint" : "with_checkpoint",
@@ -2204,15 +2165,14 @@ async function executionCacheForScope(
       ms: metricElapsed(startedAt),
       status: "ok",
       records: scopedRecords.length,
-      count: cached_objects.length + cached_pages.length + committed_transcripts.length
+      count: cached_objects.length + cached_pages.length
     });
     return {
       records: scopedRecords,
       cached_objects,
       cached_pages,
       ...(checkpoint ? { checkpoint } : {}),
-      committed_transcript_rows,
-      committed_transcripts
+      committed_transcript_rows
     };
   } catch (err) {
     postBrowserActivity({
@@ -2405,7 +2365,6 @@ function executionCacheCoversHead(
   cache: {
     records: readonly V2ExecutableTransferRecord[];
     checkpoint?: V2BrowserExecutionCheckpoint;
-    committed_transcript_rows: readonly TranscriptTailRow[];
   }
 ): boolean {
   if (head.scope !== scope) return false;
@@ -2417,7 +2376,6 @@ function executionCacheCoverageSeq(
   cache: {
     records: readonly V2ExecutableTransferRecord[];
     checkpoint?: V2BrowserExecutionCheckpoint;
-    committed_transcript_rows?: readonly TranscriptTailRow[];
   }
 ): number {
   // A reconstructable execution node is not necessarily current. Accepted
@@ -2434,13 +2392,6 @@ function executionCacheCoverageSeq(
     ) {
       high = Math.max(high, transfer.capsule.head.seq);
     }
-  }
-  const rows = [...(cache.committed_transcript_rows ?? [])]
-    .filter((row) => row.scope === scope)
-    .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash));
-  for (const row of rows) {
-    const seq = row.accepted_seq ?? row.seq;
-    if (seq === high + 1) high = seq;
   }
   return high;
 }
