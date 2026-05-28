@@ -352,7 +352,10 @@ These are the same for gateway and browser; the browser inherits them.
   `needs_replan`; durability — offline/reconnect path persists a durable proposal
   before enqueue; fake-IndexedDB duplicate-`(scope,seq)`/partial-failure
   idempotency; reload→cold-open→rebuild overlay from surviving proposals;
-  predicate denies an out-of-scope proposal an authoritative-looking overlay.
+  predicate denies an out-of-scope proposal an authoritative-looking overlay;
+  completion gate — browser-local transcripts match server transcripts for
+  representative chat carrying, pinboard edit, taskboard kanban create, and
+  dubspace committed controls.
 
 ## Success criteria
 

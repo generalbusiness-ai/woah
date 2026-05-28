@@ -1813,7 +1813,9 @@ the UI consumes applied frames that arrive from the v2 worker. Catalogs can move
 their own controls to v2 by submitting `woo.turn.intent.request.v1` through the
 shared browser helper. The SPA sends generic sequenced UI calls through the same
 v2 helper whenever a browser-session token is available; the legacy `/ws`
-fallback has been removed.
+fallback has been removed. The bounded browser-local test gate asserts
+transcript parity with server recording for representative chat carrying,
+pinboard edit, taskboard kanban create, and dubspace committed control turns.
 The default browser chat surface uses the same helper:
 it asks the catalog `command_plan` verb to parse text, executes speech/tells as
 direct `live` turns, and executes room movement/carrying commands as

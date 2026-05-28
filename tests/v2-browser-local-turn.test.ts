@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { planV2BrowserLocalTurn } from "../src/client/v2-browser-local-turn";
 import { v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
@@ -8,8 +8,59 @@ import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork } fr
 import { buildShadowCellPageTransfer, buildShadowClosureTransfer, createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
+import type { WooValue } from "../src/core/types";
 
 describe("v2 browser local turn planning", () => {
+  it("matches server transcripts for representative committed browser surfaces", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_779_000_000_000);
+    try {
+      await expectLocalTranscriptToMatchServer({
+        name: "chat carrying",
+        scope: "the_chatroom",
+        target: "the_chatroom",
+        verb: "take",
+        args: ["mug"],
+        setup: async (world, session) => {
+          await world.directCall("setup-chat-parity-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+        }
+      });
+      await expectLocalTranscriptToMatchServer({
+        name: "pinboard edit",
+        scope: "the_pinboard",
+        target: "the_pinboard",
+        verb: "add_note",
+        args: ["parity pin", "yellow", 48, 48, 180, 110],
+        setup: async (world, session) => {
+          await world.directCall("setup-pinboard-parity-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
+        }
+      });
+      await expectLocalTranscriptToMatchServer({
+        name: "taskboard kanban create",
+        scope: "the_taskboard",
+        target: "the_taskboard",
+        verb: "create_task",
+        args: ["task", "Parity task", "Verify browser transcript parity.", ["browser"], null],
+        setup: async (world, session) => {
+          world.setProp("the_taskboard", "roles", { doer: { description: "Does the work", owners: [session.actor] } });
+          world.setProp("the_taskboard", "obligations", { "do:it": { role: "doer", criterion: "Done." } });
+          world.setProp("the_taskboard", "policies", { task: ["do:it"] });
+        }
+      });
+      await expectLocalTranscriptToMatchServer({
+        name: "dubspace committed control",
+        scope: "the_dubspace",
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.42],
+        setup: async (world, session) => {
+          world.setProp("the_dubspace", "operators", [session.actor]);
+        }
+      });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("builds a TurnExecRequest from a warmed browser execution cache", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-turn");
@@ -790,6 +841,70 @@ describe("v2 browser local turn planning", () => {
     expect(local.missing_atoms?.map((atom) => atom.hash)).toContain(key.atom_hashes[0]);
   });
 });
+
+type LocalTranscriptParityScenario = {
+  name: string;
+  scope: string;
+  target: string;
+  verb: string;
+  args: WooValue[];
+  setup?: (world: ReturnType<typeof createWorld>, session: { id: string; actor: string }) => Promise<void> | void;
+};
+
+async function expectLocalTranscriptToMatchServer(scenario: LocalTranscriptParityScenario): Promise<void> {
+  const anchor = createWorld();
+  const session = anchor.auth(`guest:v2-browser-local-parity-${scenario.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`);
+  await scenario.setup?.(anchor, session);
+  const serialized = anchor.exportWorld();
+  const turnId = `browser-local-parity-${scenario.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
+  const call: ShadowTurnCall = {
+    kind: "woo.turn_call.shadow.v1",
+    id: turnId,
+    route: "sequenced",
+    scope: scenario.scope,
+    session: session.id,
+    actor: session.actor,
+    target: scenario.target,
+    verb: scenario.verb,
+    args: scenario.args
+  };
+  const server = await runShadowTurnCall(serialized, call);
+  const key = shadowTurnKeyFromTranscript(server.transcript);
+  // The open executable seed carries shared runtime objects such as $wiz; the
+  // turn-specific transfer carries the exact cells selected for this call.
+  const relay = createShadowBrowserRelayShim({
+    node: `relay:parity:${scenario.scope}`,
+    scope: scenario.scope,
+    serialized
+  });
+  const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+    relay,
+    scenario.scope,
+    `browser:parity:${scenario.scope}`,
+    session.actor
+  );
+  const transfer = buildShadowCellPageTransfer({ serialized, key });
+  const local = await planV2BrowserLocalTurn({
+    node: `browser:parity:${scenario.scope}`,
+    actor: session.actor,
+    session: session.id,
+    head: { kind: "woo.scope_head.shadow.v1", scope: scenario.scope, epoch: 1, seq: 0, hash: "root" },
+    id: turnId,
+    route: "sequenced",
+    scope: scenario.scope,
+    target: scenario.target,
+    verb: scenario.verb,
+    args: scenario.args,
+    persistence: "durable",
+    transfers: [v2ExecutableTransferRecord(openTransfer, 1), v2ExecutableTransferRecord(transfer, 2)]
+  });
+
+  expect(local, scenario.name).toMatchObject({ ok: true });
+  if (!local.ok) throw new Error(`expected local transcript for ${scenario.name}`);
+  expect(local.transcript.error, scenario.name).toBeUndefined();
+  expect(local.transcript_hash, scenario.name).toBe(server.transcript.hash);
+  expect(local.transcript, scenario.name).toEqual(server.transcript);
+}
 
 function dubspaceCall(session: string, actor: string, value: number): ShadowTurnCall {
   return {
