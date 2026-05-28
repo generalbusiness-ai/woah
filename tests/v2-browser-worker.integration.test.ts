@@ -871,6 +871,118 @@ describe("v2 browser worker integration", () => {
     expect(posted.filter((message) => isLocalTurnCommitted(message, "needs-replan-scene"))).toHaveLength(0);
   });
 
+  it("does not locally execute past an id-only accepted frame without executable repair", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-id-only-accept");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-id-only-accept",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-id-only-accept",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-id-only-accept"
+    });
+    const opened = await openShadowBrowserScope(browser);
+    const baseHead = structuredClone(browser.relay.commit_scope.head) as ShadowCommitAccepted["position"];
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-id-only-accept",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-id-only", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-id-only", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-id-only", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-id-only", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "id-only-local",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.61],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "id-only-local"));
+
+    const acceptedTemplate = syntheticAccepted("the_dubspace", 1);
+    const accepted = {
+      ...acceptedTemplate,
+      id: "id-only-local",
+      transcript_hash: "authority-rerun-hash",
+      receipt: {
+        ...acceptedTemplate.receipt,
+        id: "id-only-local",
+        transcript_hash: "authority-rerun-hash"
+      }
+    };
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "id-only-frame", "woo.open.checkpoint_tail.v1", {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head: accepted.position,
+      transfer: {
+        kind: "frames",
+        from: baseHead,
+        to: accepted.position,
+        frames: [{ frame: accepted, projection_writes: [] }]
+      },
+      viewer: { actor: session.actor, session: session.id }
+    })));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "id-only-local"));
+
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        local_execution_ready: false,
+        local_execution_coverage_seq: 0
+      }
+    });
+
+    const fallbackCursor = posted.length;
+    scope.dispatch({
+      kind: "call",
+      id: "after-id-only-local",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.62],
+      persistence: "durable"
+    });
+    expect(await waitForMessageFrom(posted, fallbackCursor, (message) => isLocalTurnFallback(message, "after-id-only-local"))).toMatchObject({
+      kind: "local_turn_fallback",
+      id: "after-id-only-local",
+      reason: "executable_state_stale",
+      coverage_seq: 0
+    });
+  });
+
   it("opens from a checkpoint/tail transfer without requiring the legacy display transfer", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();

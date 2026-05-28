@@ -346,7 +346,8 @@ These are the same for gateway and browser; the browser inherits them.
   — browser receives `BrowserProfile` rows in both fanout *and* checkpoint/tail,
   never a `SerializedObject`/`SerializedSession` body, and authority-shaped rows
   are rejected at the holder boundary; write-cell promotion —
-  hash-matched accept promotes to store 2, hash-mismatch discards and fetches;
+  hash-matched accept promotes to store 2, hash-mismatch discards and blocks
+  local VM execution until verified transcript/capsule repair catches up;
   two-phase accept — phase-1 transaction runs no VM/capsule fetch, survivors land
   `needs_replan`; durability — offline/reconnect path persists a durable proposal
   before enqueue; fake-IndexedDB duplicate-`(scope,seq)`/partial-failure

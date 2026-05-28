@@ -88,6 +88,7 @@ type V2CacheStatus = {
   proposals: number;
   executable_scopes: string[];
   local_execution_ready?: boolean;
+  local_execution_coverage_seq?: number;
   last_hello?: unknown;
   catchup_required?: boolean;
 };
@@ -799,6 +800,24 @@ async function sendLocalTurnExec(
       records: executionCache.records.length,
       count: executionCache.cached_objects.length + executionCache.cached_pages.length + executionCache.committed_transcripts.length
     });
+    if (!executionCacheCoversHead(scope, cachedHead, executionCache)) {
+      postMessage({
+        kind: "local_turn_fallback",
+        ...turnDiagnostic(command, persistence),
+        reason: "executable_state_stale",
+        coverage_seq: executionCacheCoverageSeq(scope, executionCache)
+      });
+      postBrowserActivity({
+        phase: "local_turn_plan",
+        path: command.verb,
+        route: command.route,
+        scope,
+        ms: 0,
+        status: "ok",
+        reason: "executable_state_stale"
+      });
+      return false;
+    }
     activePhase = "local_turn_plan";
     activeStartedAt = metricNow();
     const planStartedAt = metricNow();
@@ -2001,6 +2020,7 @@ async function executionCacheForScope(
   cached_objects: SerializedObject[];
   cached_pages: ShadowStatePage[];
   checkpoint?: V2BrowserExecutionCheckpoint;
+  committed_transcript_rows: TranscriptTailRow[];
   committed_transcripts: EffectTranscript[];
 }> {
   const startedAt = metricNow();
@@ -2029,7 +2049,9 @@ async function executionCacheForScope(
     pageHashCount = pageHashes.size;
     const cached_objects = await cachedObjectsByHash(objectHashes);
     const cached_pages = await cachedStatePagesByHash(pageHashes);
-    const committed_transcripts = await committedTranscriptsForScope(scope, checkpoint?.through_seq ?? -1);
+    const committed_transcript_rows = await committedTranscriptRowsForScope(scope, checkpoint?.through_seq ?? -1);
+    const committed_transcripts = committed_transcript_rows
+      .map((row) => structuredClone(row.transcript) as EffectTranscript);
     postBrowserActivity({
       phase: "execution_cache_build",
       path: options.skip_checkpoint_build ? "skip_checkpoint" : "with_checkpoint",
@@ -2044,6 +2066,7 @@ async function executionCacheForScope(
       cached_objects,
       cached_pages,
       ...(checkpoint ? { checkpoint } : {}),
+      committed_transcript_rows,
       committed_transcripts
     };
   } catch (err) {
@@ -2164,15 +2187,21 @@ async function allExecutionAds(): Promise<V2ExecutionAdRecord[]> {
 async function status(): Promise<V2CacheStatus> {
   const executionTransfers = await allExecutionTransfers();
   const executionCache = current?.scope ? await executionCacheForScope(current.scope, executionTransfers) : undefined;
-  const localExecutionReady = current?.scope
-    ? canReconstructExecutionNode(
+  const cachedHead = current?.scope ? await getMeta<unknown>(`head:${current.scope}`) : undefined;
+  const coverageSeq = current?.scope && executionCache
+    ? executionCacheCoverageSeq(current.scope, executionCache)
+    : undefined;
+  const localExecutionReady = current?.scope && executionCache
+    ? isShadowScopeHead(cachedHead) &&
+      canReconstructExecutionNode(
       current.node,
       current.scope,
-      executionCache?.records ?? executionTransfers,
-      executionCache?.cached_objects ?? [],
-      executionCache?.cached_pages ?? [],
-      executionCache?.checkpoint
-    )
+      executionCache.records,
+      executionCache.cached_objects,
+      executionCache.cached_pages,
+      executionCache.checkpoint
+    ) &&
+      executionCacheCoversHead(current.scope, cachedHead, executionCache)
     : undefined;
   return {
     connected: socket?.readyState === WebSocket.OPEN,
@@ -2189,6 +2218,7 @@ async function status(): Promise<V2CacheStatus> {
     proposals: await countStore(PROPOSAL_STORE),
     executable_scopes: executableScopes(executionTransfers),
     ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
+    ...(coverageSeq !== undefined ? { local_execution_coverage_seq: coverageSeq } : {}),
     last_hello: await getMeta("hello"),
     catchup_required: await getMeta("catchup_required")
   };
@@ -2222,6 +2252,52 @@ function canReconstructExecutionNode(
   } catch {
     return false;
   }
+}
+
+function executionCacheCoversHead(
+  scope: string,
+  head: ShadowScopeHead,
+  cache: {
+    records: readonly V2ExecutableTransferRecord[];
+    checkpoint?: V2BrowserExecutionCheckpoint;
+    committed_transcript_rows: readonly TranscriptTailRow[];
+  }
+): boolean {
+  if (head.scope !== scope) return false;
+  return executionCacheCoverageSeq(scope, cache) >= head.seq;
+}
+
+function executionCacheCoverageSeq(
+  scope: string,
+  cache: {
+    records: readonly V2ExecutableTransferRecord[];
+    checkpoint?: V2BrowserExecutionCheckpoint;
+    committed_transcript_rows?: readonly TranscriptTailRow[];
+  }
+): number {
+  // A reconstructable execution node is not necessarily current. Accepted
+  // frame-only catch-up can advance the display head without giving the browser
+  // a transcript or accepted-write-cell transfer, so local VM execution must
+  // also prove contiguous executable coverage through the cached head.
+  let high = cache.checkpoint?.through_seq ?? 0;
+  for (const record of cache.records) {
+    const transfer = record.transfer;
+    if (
+      record.scope === scope &&
+      transfer.mode === "cell_pages" &&
+      transfer.capsule?.head.scope === scope
+    ) {
+      high = Math.max(high, transfer.capsule.head.seq);
+    }
+  }
+  const rows = [...(cache.committed_transcript_rows ?? [])]
+    .filter((row) => row.scope === scope)
+    .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash));
+  for (const row of rows) {
+    const seq = row.accepted_seq ?? row.seq;
+    if (seq === high + 1) high = seq;
+  }
+  return high;
 }
 
 function isSerializedObject(value: unknown): value is SerializedObject {
