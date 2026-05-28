@@ -564,9 +564,13 @@ function markConnectReady(receivedDisplayState: boolean, receivedExecutableState
 }
 
 function isExecutableStateTransfer(body: unknown): boolean {
+  return isCellPageTransfer(body);
+}
+
+function isLegacyExecutableStateTransfer(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   const mode = (body as { mode?: unknown }).mode;
-  return mode === "closure" || mode === "object_records" || mode === "cell_pages";
+  return mode === "closure" || mode === "object_records";
 }
 
 function isCellPageTransfer(body: unknown): body is ShadowCellPageTransfer {
@@ -1067,6 +1071,9 @@ function validateStateTransferEnvelope(envelope: ShadowEnvelope<ShadowStateTrans
   if (envelope.reply_to) {
     validatePendingStateTransferReply(envelope.reply_to, envelope.body);
     return;
+  }
+  if (isLegacyExecutableStateTransfer(envelope.body)) {
+    throw new Error(`browser executable state transfer must use cell_pages: ${(envelope.body as { mode: unknown }).mode}`);
   }
   if (!isCellPageTransfer(envelope.body)) return;
   if (isOpenExecutableSeedPurpose(envelope.body.purpose)) {

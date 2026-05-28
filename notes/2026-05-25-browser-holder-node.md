@@ -256,7 +256,9 @@ These are the same for gateway and browser; the browser inherits them.
   `target`, `verb`, `turn_key_hash`, `recipient`, `expires_at_ms`, page refs) MUST be
   covered by the signed proof — extend `ShadowStateProof` (today binds only
   scope/mode/root/recipient, `shadow-turn-exec.ts:119`); a sidecar is
-  insufficient. `closure`/`object_records` are dropped from the hot path.
+  insufficient. The browser worker hot path rejects executable
+  `closure`/`object_records` transfers; durable local execution warms only from
+  `cell_pages` with capsule metadata.
 - **Checkpoint/tail.** `/v2/open` is display catch-up: a `checkpoint_tail.v1`
   projection batch into store 1. The browser receives `BrowserProfile`
   checkpoint pages, never authority rows. A checkpoint's `frame_tail` is already

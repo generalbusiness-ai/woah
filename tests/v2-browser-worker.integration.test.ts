@@ -223,6 +223,87 @@ describe("v2 browser worker integration", () => {
     await waitFor(() => posted.filter((message) => browserMetric(message)?.phase === "idb_tx").length > idbMetricCursor ? true : undefined);
   });
 
+  it("rejects legacy executable transfers on the browser worker hot path", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-legacy-transfer");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-legacy-transfer",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-legacy-transfer",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-legacy-transfer"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-legacy-transfer",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-legacy-transfer", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "display-legacy-transfer", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "legacy-executable-transfer", "woo.state.transfer.shadow.v1", {
+      kind: "woo.state.transfer.shadow.v1",
+      mode: "closure",
+      scope: "the_dubspace",
+      atom_hashes: [],
+      serialized: {
+        objects: [],
+        sessions: [],
+        logs: [],
+        snapshots: [],
+        parkedTasks: [],
+        tombstones: [],
+        objectCounter: 0,
+        sessionCounter: 0,
+        parkedTaskCounter: 0
+      },
+      proof: {
+        kind: "woo.state_proof.shadow.v1",
+        scheme: "shadow.anchor_mac.v1",
+        authority: "shadow-anchor",
+        key_id: "shadow-dev",
+        recipient: browser.node,
+        scope: "the_dubspace",
+        mode: "closure",
+        root: "legacy-root",
+        signature: "legacy-signature"
+      }
+    })));
+
+    const error = await waitForMessage(posted, (message) => isKind(message, "error"));
+    expect((error as { error?: unknown }).error).toMatch(/must use cell_pages/);
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        execution_transfers: 0,
+        local_execution_ready: false
+      }
+    });
+  });
+
   it("rejects an open executable seed whose capsule is bound to another session", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
