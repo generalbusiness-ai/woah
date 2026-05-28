@@ -1692,12 +1692,16 @@ network still sequences both turns; the journal is a local composed read view,
 not a commit authority.
 
 When the authoritative path accepts a turn, the browser removes the matching
-tentative row by turn id or transcript hash, stores the accepted frame and
-accepted transcript, and lets future plans compose from the committed tail or a
-new checkpoint. If catch-up supplies only an accepted frame, a transcript-hash
-match against a local proposal promotes that proposal's transcript into the
-accepted transcript tail; an id-only match with a different transcript hash
-discards the local proposal and waits for a verified transcript/capsule repair.
+tentative row by turn id or transcript hash, stores the accepted frame, records
+or materializes the accepted transcript, and lets future plans compose from the
+committed tail or a new checkpoint. If catch-up supplies only an accepted frame,
+a transcript-hash match against a local proposal promotes that proposal's
+transcript into the accepted transcript tail; an id-only match with a different
+transcript hash discards the local proposal and waits for a verified
+transcript/capsule repair.
+An implementation MAY immediately materialize the hash-matched transcript into
+an executable checkpoint instead of writing it to the transcript tail when the
+accepted frame is the immediate successor of the proposal's `base_head`.
 Accepted frames for other turns compare their accepted transcript writes against
 each pending proposal's `depends_on`; touched proposals are marked
 `needs_replan` and no longer participate in local execution composition. In

@@ -105,7 +105,24 @@ describe("v2 browser worker integration", () => {
     socket.receive(encodeEnvelope(coldReply));
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "cold-dubspace-control"));
     await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "cold-dubspace-control"));
+    expect(await waitForMessage(posted, (message) => isExecutionCheckpointFor(message, "the_dubspace", "proposal_accept"))).toMatchObject({
+      kind: "shadow_browser_execution_checkpoint",
+      through_seq: 1,
+      transcript_count: 1,
+      proposal_id: "cold-dubspace-control"
+    });
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        transcript_tail: 0,
+        execution_checkpoints: 1,
+        local_execution_ready: true
+      }
+    });
 
+    posted.length = 0;
     scope.dispatch({
       kind: "call",
       id: "warm-dubspace-control",
@@ -118,6 +135,11 @@ describe("v2 browser worker integration", () => {
     });
 
     const warmRequest = await waitForBrowserBuiltExecRequest(browser, socket);
+    expect(await waitForMessage(posted, (message) => isComposeViewFor(message, "warm-dubspace-control"))).toMatchObject({
+      kind: "shadow_browser_compose_view",
+      checkpoint_seq: 1,
+      committed_transcript_count: 0
+    });
     expect(warmRequest).toMatchObject({
       type: "woo.turn.exec.request.shadow.v1",
       body: {
@@ -1556,6 +1578,12 @@ function isLocalTurnCommitted(message: unknown, id: string): boolean {
 
 function isComposeViewFor(message: unknown, id: string): boolean {
   return isKind(message, "shadow_browser_compose_view") && (message as { id?: unknown }).id === id;
+}
+
+function isExecutionCheckpointFor(message: unknown, scope: string, reason?: string): boolean {
+  return isKind(message, "shadow_browser_execution_checkpoint") &&
+    (message as { scope?: unknown }).scope === scope &&
+    (reason === undefined || (message as { reason?: unknown }).reason === reason);
 }
 
 function isBrowserMetricPhase(message: unknown, phase: string): boolean {

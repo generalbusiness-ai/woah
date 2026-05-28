@@ -77,9 +77,12 @@ Implementation checklist, current as of 2026-05-27:
    carried on browser executable transfers, included in the signed state proof
    root, checked against pending missing-state repair requests, and checked on
    no-reply open executable seed/cache-hit installs against the active browser
-   node, actor, and session. Remaining convergence work is retiring the
-   compatibility transcript-replay overlay once store-2 write-cell
-   materialization fully replaces it.
+   node, actor, and session. Hash-matched accepted proposals that are the
+   immediate successor of their `base_head` now materialize an execution
+   checkpoint instead of entering the replay tail. Remaining convergence work is
+   retiring the compatibility transcript-replay overlay for interleaved or
+   non-local accepted transcripts once store-2 write-cell materialization fully
+   replaces it.
 
 ### One receiver profile, applied across the whole transfer family
 

@@ -1193,10 +1193,13 @@ async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, 
   for (const record of matched) {
     // If catch-up supplies only the accepted frame, a hash match proves the
     // local transcript is the accepted one. Promote it into the executable
-    // transcript tail so later local turns do not keep using it as tentative.
+    // store when safe, or fall back to the bounded transcript tail.
     if (promote.includes(record)) {
-      await putTranscript(record.transcript, frame.position.seq);
-      await maybeCheckpointCommittedTranscripts(record.scope);
+      const promoted = await materializeAcceptedProposalTranscriptCheckpoint(frame, record.transcript, record);
+      if (!promoted) {
+        await putTranscript(record.transcript, frame.position.seq);
+        await maybeCheckpointCommittedTranscripts(record.scope);
+      }
     }
     await deleteTurnProposal(record.id);
   }
@@ -1213,6 +1216,68 @@ async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, 
     });
   }
   return matched.map((record) => record.id);
+}
+
+async function maybePromoteAcceptedProposalTranscript(frame: ShadowCommitAccepted, transcript: EffectTranscript): Promise<boolean> {
+  if (!current?.actor || transcript.hash !== frame.transcript_hash) return false;
+  const selector = { scope: frame.position.scope, actor: current.actor, session: current.session ?? null };
+  const match = selectV2PendingTurnProposals(await allTurnProposals(), selector)
+    .find((record) => record.transcript_hash === frame.transcript_hash);
+  if (!match) return false;
+  return await materializeAcceptedProposalTranscriptCheckpoint(frame, transcript, match);
+}
+
+async function materializeAcceptedProposalTranscriptCheckpoint(
+  frame: ShadowCommitAccepted,
+  transcript: EffectTranscript,
+  proposal: V2BrowserTurnProposalRecord
+): Promise<boolean> {
+  if (transcript.scope !== frame.position.scope || proposal.scope !== frame.position.scope) return false;
+  // Store-2 promotion is safe only when the accepted frame is the immediate
+  // successor of the state this proposal executed against. Interleaved frames
+  // continue down the bounded transcript-tail path until dependency-wire
+  // replan can prove the whole local suffix.
+  if (frame.position.seq !== proposal.base_head.seq + 1) return false;
+  const checkpoint = await getExecutionCheckpoint(frame.position.scope);
+  if (checkpoint && frame.position.seq <= checkpoint.through_seq) return true;
+  const afterSeq = checkpoint?.through_seq ?? -1;
+  const rows = (await committedTranscriptRowsForScope(frame.position.scope, afterSeq))
+    .filter((row) => (row.accepted_seq ?? row.seq) <= frame.position.seq);
+  const rowByHash = new Map(rows.map((row) => [row.hash, row] as const));
+  rowByHash.set(transcript.hash, {
+    hash: transcript.hash,
+    scope: transcript.scope,
+    seq: frame.position.seq,
+    accepted_seq: frame.position.seq,
+    transcript,
+    received_at: Date.now()
+  });
+  const committedRows = Array.from(rowByHash.values())
+    .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash));
+  const cache = await executionCacheForScope(frame.position.scope, undefined, { skip_checkpoint_build: true });
+  const next = createV2BrowserExecutionCheckpoint({
+    node: current?.node ?? "browser:proposal-promotion",
+    scope: frame.position.scope,
+    records: cache.records,
+    cached_objects: cache.cached_objects,
+    cached_pages: cache.cached_pages,
+    checkpoint,
+    committed_transcripts: committedRows.map((row) => structuredClone(row.transcript) as EffectTranscript),
+    through_seq: frame.position.seq
+  });
+  if (!next) return false;
+  await putExecutionCheckpoint(next);
+  const pruned = await deleteCommittedTranscriptsThrough(frame.position.scope, frame.position.seq);
+  postMessage({
+    kind: "shadow_browser_execution_checkpoint",
+    scope: frame.position.scope,
+    through_seq: frame.position.seq,
+    transcript_count: committedRows.length,
+    pruned,
+    reason: "proposal_accept",
+    proposal_id: proposal.id
+  });
+  return true;
 }
 
 async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHash?: string): Promise<V2BrowserTurnProposalRecord[]> {
@@ -1435,8 +1500,11 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
       case "applied_frame": {
         await putAppliedFrame(mutation.frame);
         if (mutation.transcript) {
-          await putTranscript(mutation.transcript, mutation.frame.position.seq);
-          await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
+          const promoted = await maybePromoteAcceptedProposalTranscript(mutation.frame, mutation.transcript);
+          if (!promoted) {
+            await putTranscript(mutation.transcript, mutation.frame.position.seq);
+            await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);
+          }
         }
         if (rememberAppliedFramePost(mutation.frame)) return { kind: "applied_frame", frame: mutation.frame, transcript: mutation.transcript };
         return;
