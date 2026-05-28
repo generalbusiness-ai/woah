@@ -52,7 +52,7 @@ type V2WorkerCommand =
   | { kind: "connect"; token: string; node?: string; scope?: string; actor?: string; session?: string }
   | { kind: "disconnect" }
   | { kind: "send"; envelope: ShadowEnvelope }
-  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; persistence?: "durable" | "live" }
+  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; body?: Record<string, WooValue>; persistence?: "durable" | "live" }
   | { kind: "get_projection"; scope?: string }
   | { kind: "cache_status" };
 
@@ -649,6 +649,7 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
       target: command.target,
       verb: command.verb,
       args: Array.isArray(command.args) ? command.args as WooValue[] : [],
+      body: command.body,
       persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
     };
     const delegationStartedAt = metricNow();
@@ -758,7 +759,11 @@ function turnDiagnostic(command: Extract<V2WorkerCommand, { kind: "call" }>, per
 // enough that a normal first tool click does not fall back after one repair.
 const maxLocalRepairAttempts = 8;
 
-async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call" }>, repairAttempts = 0): Promise<boolean> {
+async function sendLocalTurnExec(
+  command: Extract<V2WorkerCommand, { kind: "call" }>,
+  repairAttempts = 0,
+  options: { envelopeId?: string; replanOf?: string } = {}
+): Promise<boolean> {
   if (!current || !current.actor) return false;
   const scope = command.scope || current.scope;
   const persistence = command.persistence ?? (command.route === "direct" ? "live" : "durable");
@@ -804,6 +809,7 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
       target: command.target,
       verb: command.verb,
       args: Array.isArray(command.args) ? command.args as WooValue[] : [],
+      body: command.body,
       persistence,
       transfers: executionCache.records,
       cached_objects: executionCache.cached_objects,
@@ -852,7 +858,7 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
   if (!local.ok) {
     if (local.reason === "missing_state" && local.request && local.key) {
       if (repairAttempts < maxLocalRepairAttempts && await repairLocalExecutableState(local, command)) {
-        return await sendLocalTurnExec(command, repairAttempts + 1);
+        return await sendLocalTurnExec(command, repairAttempts + 1, options);
       }
       const delegation = selectV2DelegatedExecutor({
         records: await allExecutionAds(),
@@ -906,13 +912,15 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     if (socketOpen) void journalTurnProposal(proposal, "fire_and_forget");
     else await journalTurnProposal(proposal, "before_enqueue");
   }
-  await sendTurnExecEnvelope(command.id, local.request, { persistBeforeSend: !socketOpen });
+  const envelopeId = options.envelopeId ?? command.id;
+  await sendTurnExecEnvelope(envelopeId, local.request, { persistBeforeSend: !socketOpen });
   postMessage({
     kind: "local_turn_planned",
     ...turnDiagnostic(command, persistence),
     transcript_hash: local.transcript_hash,
     observation_count: local.observation_count,
-    result_known: local.result_known
+    result_known: local.result_known,
+    ...(options.replanOf ? { replan_of: options.replanOf, envelope_id: envelopeId } : {})
   });
   return true;
 }
@@ -1173,9 +1181,61 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
   }
   if (reply.reason === "commit_rejected") {
     const reason = reply.commit?.reason ?? "commit_rejected";
+    if (reason === "stale_head" && await replanNeedsReplanTurns(ids, reason)) return;
     if (!shouldInvalidateTentativeTurnForCommitReason(reason)) return;
     await invalidateTentativeTurn(ids[0], reason, ids, reply.transcript?.hash);
   }
+}
+
+async function replanNeedsReplanTurns(ids: readonly string[], reason: string): Promise<boolean> {
+  if (!current?.actor) return false;
+  const actor = current.actor;
+  const session = current.session ?? null;
+  const candidates = (await allTurnProposals())
+    .filter((record) =>
+      record.status === "needs_replan" &&
+      ids.includes(record.id) &&
+      record.actor === actor &&
+      record.session === session
+    );
+  if (candidates.length === 0) return false;
+  for (const record of candidates) {
+    const envelopeId = `${record.id}:replan:${crypto.randomUUID()}`;
+    const command = turnProposalReplanCommand(record);
+    postBrowserActivity({
+      phase: "proposal_replan",
+      path: command.verb,
+      route: command.route,
+      scope: command.scope,
+      ms: 0,
+      status: "ok",
+      reason
+    });
+    const planned = await sendLocalTurnExec(command, 0, { envelopeId, replanOf: record.id });
+    if (planned) {
+      postMessage({
+        kind: "local_turn_replanned",
+        id: record.id,
+        envelope_id: envelopeId,
+        reason
+      });
+    }
+  }
+  return true;
+}
+
+function turnProposalReplanCommand(record: V2BrowserTurnProposalRecord): Extract<V2WorkerCommand, { kind: "call" }> {
+  return {
+    kind: "call",
+    id: record.id,
+    route: record.transcript.route,
+    scope: record.scope,
+    target: record.transcript.call.target,
+    verb: record.transcript.call.verb,
+    args: record.transcript.call.args,
+    ...(record.transcript.call.body ? { body: record.transcript.call.body } : {}),
+    persistence: record.transcript.route === "direct" ? "live" : "durable"
+  };
 }
 
 function frameAlreadyReconciledReplyProposal(ids: readonly string[], reply: ShadowTurnExecReply, replyTo?: string): boolean {

@@ -261,7 +261,10 @@ These are the same for gateway and browser; the browser inherits them.
   applied (data-path:682): it updates continuity metadata but MUST NOT re-route
   historical observations or re-apply row writes.
 - **Conflict handling** (VTN14.5): `stale_head` is a convergence signal — do not
-  invalidate by itself; permanent → reject the proposal.
+  invalidate by itself. When a matching proposal is already `needs_replan`, the
+  browser re-plans it after the stale-head reply clears the original pending
+  envelope, keeping the proposal id but using a fresh transport envelope id;
+  permanent conflicts reject the proposal.
 
 ## Browser-local mechanics
 

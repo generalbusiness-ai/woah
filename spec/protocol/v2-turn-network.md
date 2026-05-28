@@ -1721,7 +1721,12 @@ install, transcript install, and tentative cleanup into one IndexedDB accept
 transaction. A `stale_head` conflict is a convergence signal and MUST NOT
 invalidate the tentative row by itself; an authoritative executor may re-run the
 turn against the newer head, while a non-authoritative delegated executor may
-surface the conflict for a later browser re-plan.
+surface the conflict for a later browser re-plan. If an accepted frame has
+already marked the matching proposal `needs_replan`, the browser SHOULD consume
+the stale-head reply by planning the turn again against the current executable
+view. The re-plan keeps the user-visible turn/proposal id stable but MUST use a
+fresh transport envelope id so relay idempotency for the stale submission cannot
+replay the old reply.
 
 Row-body-complete accepted-frame projection writes install through the browser
 holder row installer, not through the legacy projection-patch state-transfer

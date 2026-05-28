@@ -389,6 +389,125 @@ describe("v2 browser worker integration", () => {
     expect(posted.filter((message) => isLocalTurnCommitted(message, "bad-bundled-capsule-turn"))).toHaveLength(1);
   });
 
+  it("replans a needs-replan proposal after a stale-head reply with a fresh envelope id", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-replan");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-replan",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-replan",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-replan"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-replan",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-replan", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-replan", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-replan", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-replan", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "needs-replan-scene",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "save_scene",
+      args: ["Replan scene"],
+      persistence: "durable"
+    });
+    const originalRequest = await waitForBrowserBuiltExecRequest(browser, socket, "save_scene");
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "needs-replan-scene"));
+
+    const accepted = syntheticAccepted("the_dubspace", 1);
+    const acceptedTranscript = syntheticPropTranscript(
+      "the_dubspace",
+      session.actor,
+      session.id,
+      1,
+      "delay_1",
+      "wet",
+      0.48
+    );
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "accepted-replan-interrupt", "woo.turn.exec.reply.shadow.v1", {
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true,
+      id: acceptedTranscript.id,
+      outcome: { result: null },
+      transcript: acceptedTranscript,
+      commit: accepted
+    })));
+    expect(await waitForMessage(posted, (message) => isLocalTurnNeedsReplan(message, "needs-replan-scene"))).toMatchObject({
+      kind: "local_turn_needs_replan",
+      ids: ["needs-replan-scene"],
+      accepted_seq: 1
+    });
+
+    const replanCursor = socket.sent.length;
+    socket.receive(encodeEnvelope({
+      ...relayEnvelope(browser, "stale-replan-original", "woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: false,
+        id: "needs-replan-scene",
+        reason: "commit_rejected",
+        commit: syntheticStaleHeadConflict("needs-replan-scene", "the_dubspace", accepted.position)
+      }),
+      reply_to: originalRequest.id
+    }));
+
+    const replanned = await waitForMessage(posted, (message) => isKind(message, "local_turn_replanned"));
+    expect(replanned).toMatchObject({
+      kind: "local_turn_replanned",
+      id: "needs-replan-scene",
+      reason: "stale_head"
+    });
+    const replannedEnvelopeId = (replanned as { envelope_id?: unknown }).envelope_id;
+    expect(typeof replannedEnvelopeId).toBe("string");
+    expect(replannedEnvelopeId).not.toBe(originalRequest.id);
+    expect(replannedEnvelopeId as string).toMatch(/^needs-replan-scene:replan:/);
+
+    const replanRequest = await waitForBrowserBuiltExecRequest(browser, socket, "save_scene", undefined, replanCursor);
+    expect(replanRequest.id).toBe(replannedEnvelopeId);
+    expect(replanRequest.body).toMatchObject({
+      kind: "woo.turn.exec.request.shadow.v1",
+      id: "needs-replan-scene",
+      call: {
+        id: "needs-replan-scene",
+        target: "the_dubspace",
+        verb: "save_scene"
+      }
+    });
+    expect(posted.filter((message) => isLocalTurnCommitted(message, "needs-replan-scene"))).toHaveLength(0);
+  });
+
   it("opens from a checkpoint/tail transfer without requiring the legacy display transfer", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -1459,9 +1578,10 @@ async function waitForBrowserBuiltExecRequest(
   browser: ReturnType<typeof createShadowBrowserClient>,
   socket: FakeWebSocket,
   verb?: string,
-  stats?: { stateTransferRequests: number }
+  stats?: { stateTransferRequests: number },
+  startCursor = socket.sent.length
 ): Promise<ShadowEnvelope> {
-  let cursor = socket.sent.length;
+  let cursor = startCursor;
   for (;;) {
     await waitFor(() => socket.sent[cursor] ? true : undefined);
     const encoded = socket.sent[cursor++];
@@ -1567,6 +1687,57 @@ function syntheticCheckpointTranscript(scope: string, actor: string, session: st
   };
 }
 
+function syntheticPropTranscript(
+  scope: string,
+  actor: string,
+  session: string,
+  seq: number,
+  object: string,
+  prop: string,
+  value: unknown
+): EffectTranscript {
+  const base = syntheticCheckpointTranscript(scope, actor, session, seq);
+  return {
+    ...base,
+    call: {
+      actor,
+      target: scope,
+      verb: "synthetic_prop_write",
+      args: [object, prop, value],
+      body: undefined
+    },
+    writes: [{
+      cell: { kind: "prop", object, name: prop },
+      value,
+      op: "set",
+      next: `synthetic:${object}.${prop}:${seq}`
+    }]
+  } as EffectTranscript;
+}
+
+function syntheticStaleHeadConflict(id: string, scope: string, current: ShadowCommitAccepted["position"]) {
+  return {
+    kind: "woo.commit.conflict.shadow.v1",
+    id,
+    scope,
+    current,
+    reason: "stale_head",
+    errors: [`stale_head: current=${current.hash}@${current.seq}`],
+    receipt: {
+      kind: "woo.commit_receipt.shadow.v1",
+      id,
+      route: "sequenced",
+      scope,
+      seq: current.seq + 1,
+      transcript_hash: `stale:${id}`,
+      pre_state_hash: current.hash,
+      post_state_hash: current.hash,
+      accepted: false,
+      errors: [`stale_head: current=${current.hash}@${current.seq}`]
+    }
+  };
+}
+
 function isKind(message: unknown, kind: string): boolean {
   return Boolean(message && typeof message === "object" && (message as { kind?: unknown }).kind === kind);
 }
@@ -1585,6 +1756,12 @@ function isLocalTurnPlanned(message: unknown, id: string): boolean {
 
 function isLocalTurnCommitted(message: unknown, id: string): boolean {
   return isKind(message, "local_turn_committed") &&
+    Array.isArray((message as { ids?: unknown }).ids) &&
+    ((message as { ids: unknown[] }).ids).includes(id);
+}
+
+function isLocalTurnNeedsReplan(message: unknown, id: string): boolean {
+  return isKind(message, "local_turn_needs_replan") &&
     Array.isArray((message as { ids?: unknown }).ids) &&
     ((message as { ids: unknown[] }).ids).includes(id);
 }
