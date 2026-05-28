@@ -15,8 +15,14 @@ import {
 } from "../src/core/shadow-browser-node";
 import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
-import type { BrowserObjectRow, BrowserProfile, ProjectionWrite } from "../src/core/projection-delta";
-import { createShadowCommitScope, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
+import {
+  browserProfileOpenTransferFromAuthority,
+  browserProfileProjectionWriteFromAuthority,
+  type BrowserObjectRow,
+  type BrowserProfile,
+  type ProjectionWrite
+} from "../src/core/projection-delta";
+import { createShadowCommitScope, serializedFor, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 
 describe("v2 browser worker integration", () => {
@@ -898,7 +904,7 @@ describe("v2 browser worker integration", () => {
     const parkedTaskRow = {
       id: "checkpoint-task",
       parked_on: "the_dubspace",
-      state: "suspended",
+      state: "suspended" as const,
       resume_at: null,
       awaiting_player: null,
       correlation_id: null,
@@ -907,17 +913,15 @@ describe("v2 browser worker integration", () => {
       origin: "the_dubspace"
     };
     const toolSurfaceRow = {
-      kind: "woo.tool_surface_projection.v1",
+      kind: "woo.tool_surface_projection.v1" as const,
       scope: "the_dubspace",
       object: "the_dubspace",
       head,
       verbs: [],
       source_rows: []
     };
-    const checkpointTail = {
-      kind: "woo.open.checkpoint_tail.v1",
-      scope: "the_dubspace",
-      head,
+    const viewer = { actor: session.actor, session: session.id };
+    const checkpointTailTransfer = browserProfileOpenTransferFromAuthority({
       transfer: {
         kind: "checkpoint",
         checkpoint: {
@@ -933,7 +937,7 @@ describe("v2 browser worker integration", () => {
               table: "logs",
               page: "logs",
               hash: "logs",
-              rows: serialized.logs.flatMap(([space, entries]) => entries.map((entry) => ({ space, entry })))
+              rows: serialized.logs.flatMap(([, entries]) => entries)
             },
             { kind: "woo.projection_page.v1", table: "snapshots", page: "snapshots", hash: "snapshots", rows: [snapshotRow] },
             { kind: "woo.projection_page.v1", table: "parked_tasks", page: "parked_tasks", hash: "parked_tasks", rows: [parkedTaskRow] },
@@ -943,8 +947,19 @@ describe("v2 browser worker integration", () => {
           frame_tail: []
         }
       },
-      viewer: { actor: session.actor, session: session.id }
+      serialized,
+      viewer
+    });
+    const checkpointTail = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: checkpointTailTransfer,
+      viewer
     };
+    const checkpointRowCount = checkpointTailTransfer.kind === "checkpoint"
+      ? checkpointTailTransfer.checkpoint.pages.reduce((sum, page) => sum + page.rows.length, 0)
+      : 0;
 
     scope.dispatch({
       kind: "connect",
@@ -974,7 +989,7 @@ describe("v2 browser worker integration", () => {
       status: {
         connected: true,
         projections: 1,
-        projection_rows: checkpointObjects.length + serialized.sessions.length + 3,
+        projection_rows: checkpointRowCount,
         execution_transfers: 0,
         local_execution_ready: false
       }
@@ -1139,10 +1154,8 @@ describe("v2 browser worker integration", () => {
       checkpoint_hash: "checkpoint-continuation-hash",
       expires_at_ms: Date.now() + 60_000
     };
-    const firstChunk = {
-      kind: "woo.open.checkpoint_tail.v1",
-      scope: "the_dubspace",
-      head,
+    const viewer = { actor: session.actor, session: session.id };
+    const firstTransfer = browserProfileOpenTransferFromAuthority({
       transfer: {
         kind: "checkpoint",
         checkpoint: {
@@ -1155,12 +1168,10 @@ describe("v2 browser worker integration", () => {
         },
         continuation
       },
-      viewer: { actor: session.actor, session: session.id }
-    };
-    const finalChunk = {
-      kind: "woo.open.checkpoint_tail.v1",
-      scope: "the_dubspace",
-      head,
+      serialized,
+      viewer
+    });
+    const finalTransfer = browserProfileOpenTransferFromAuthority({
       transfer: {
         kind: "checkpoint",
         checkpoint: {
@@ -1175,7 +1186,24 @@ describe("v2 browser worker integration", () => {
           frame_tail: []
         }
       },
-      viewer: { actor: session.actor, session: session.id }
+      serialized,
+      viewer
+    });
+    if (firstTransfer.kind !== "checkpoint" || finalTransfer.kind !== "checkpoint") throw new Error("test expected checkpoint transfers");
+    expect(firstTransfer.checkpoint.checkpoint_hash).toBe(finalTransfer.checkpoint.checkpoint_hash);
+    const firstChunk = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: firstTransfer,
+      viewer
+    };
+    const finalChunk = {
+      kind: "woo.open.checkpoint_tail.v1",
+      scope: "the_dubspace",
+      head,
+      transfer: finalTransfer,
+      viewer
     };
 
     scope.dispatch({
@@ -1989,7 +2017,36 @@ async function relayReply(browser: ReturnType<typeof createShadowBrowserClient>,
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
   const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt);
   if (!reply) throw new Error("expected relay turn reply");
-  return reply;
+  return browserProfiledReply(browser, reply);
+}
+
+function browserProfiledReply(browser: ReturnType<typeof createShadowBrowserClient>, reply: ShadowEnvelope): ShadowEnvelope {
+  // The worker receives CommitScopeDO replies after the gateway rewrites
+  // authority projection rows for the browser receiver profile.
+  const body = reply.body as ShadowTurnExecReply;
+  if (body.kind !== "woo.turn.exec.reply.shadow.v1" || body.ok !== true || !body.commit) return reply;
+  const authorityWrites = body.commit.projection_writes ?? [];
+  if (authorityWrites.length === 0) return reply;
+  const serialized = serializedFor(browser.relay.commit_scope, { reason: "test_browser_profile_reply" });
+  const projectionWrites = authorityWrites
+    .map((write) => browserProfileProjectionWriteFromAuthority({
+      write,
+      serialized,
+      scope: body.commit!.position.scope,
+      head: body.commit!.position,
+      viewer: { actor: browser.actor, session: browser.session }
+    }))
+    .filter((write): write is ProjectionWrite<BrowserProfile> => write !== null);
+  return {
+    ...reply,
+    body: {
+      ...body,
+      commit: {
+        ...body.commit,
+        projection_writes: projectionWrites
+      }
+    }
+  } as ShadowEnvelope;
 }
 
 function relayEnvelope<T>(

@@ -20,13 +20,13 @@ export type V2BrowserCacheMutation =
   // Legacy state-transfer display catch-up only. Accepted-frame projection
   // installs use `accepted_frame_projection` and the holder row installer.
   | { kind: "projection_patch"; scope: string; head: ShadowScopeHead; patch: ShadowScopeProjectionPatch }
-  | { kind: "accepted_frame_projection"; frame: ShadowCommitAccepted; writes: Array<ProjectionWrite | ProjectionWrite<BrowserProfile>> }
+  | { kind: "accepted_frame_projection"; frame: ShadowCommitAccepted; writes: Array<ProjectionWrite<BrowserProfile>> }
   | { kind: "applied_frame"; frame: ShadowCommitAccepted; transcript?: EffectTranscript }
   | { kind: "transcript"; transcript: EffectTranscript }
   | { kind: "object_page"; hash: string; object: SerializedObject }
   | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage }
   | { kind: "state_pages"; scope: string; pages: Array<{ hash: string; ref: string; page: ShadowStatePage }> }
-  | { kind: "checkpoint_tail"; transfer: CheckpointTailOpenTransfer | CheckpointTailOpenTransfer<BrowserProfile> }
+  | { kind: "checkpoint_tail"; transfer: CheckpointTailOpenTransfer<BrowserProfile> }
   | { kind: "execution_ad"; record: V2ExecutionAdRecord }
   | { kind: "execution_transfer"; record: V2ExecutableTransferRecord };
 
@@ -45,7 +45,7 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
     return stateTransferMutations(envelope.body as ShadowBrowserStateTransfer);
   }
   if (envelope.type === "woo.open.checkpoint_tail.v1") {
-    const transfer = envelope.body as CheckpointTailOpenTransfer;
+    const transfer = envelope.body as CheckpointTailOpenTransfer<BrowserProfile>;
     return [
       { kind: "checkpoint_tail", transfer },
       ...(transfer.transfer.kind === "frames"
@@ -69,7 +69,7 @@ export function v2BrowserCacheMutationsForEnvelope(envelope: ShadowEnvelope): V2
         mutations.push({
           kind: "accepted_frame_projection" as const,
           frame: reply.commit as ShadowCommitAccepted,
-          writes: reply.commit.projection_writes as Array<ProjectionWrite | ProjectionWrite<BrowserProfile>>
+          writes: reply.commit.projection_writes as Array<ProjectionWrite<BrowserProfile>>
         });
       }
       if (reply.commit) mutations.push({ kind: "applied_frame" as const, frame: reply.commit as ShadowCommitAccepted, transcript: reply.transcript });

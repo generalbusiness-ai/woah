@@ -9,7 +9,6 @@ import {
   type V2BrowserProjectionRowRecordInput
 } from "../src/client/v2-browser-holder-install";
 import type { BrowserObjectRow, BrowserProfile, ProjectionWrite } from "../src/core/projection-delta";
-import type { SerializedObject } from "../src/core/repository";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import type { ObjRef } from "../src/core/types";
 
@@ -109,7 +108,7 @@ describe("v2 browser holder projection install", () => {
     expect(store.clearCalls).toEqual(["room"]);
   });
 
-  it("derives browser-profile projections from browser rows and authority projections from authority rows", async () => {
+  it("derives browser-profile projections from browser rows", async () => {
     const browserStore = new FakeHolderStore();
     const browserFrame = accepted("room", 4);
     const browserProjection = await installV2BrowserAcceptedFrameProjection({
@@ -125,22 +124,47 @@ describe("v2 browser holder projection install", () => {
     expect((browserProjection.projection as { title: string }).title).toBe("Browser Room");
     expect((browserProjection.projection as { object_count: number }).object_count).toBe(2);
     expect((browserProjection.projection as { self: { name: string } | null }).self?.name).toBe("Browser Actor");
+  });
 
-    const authorityStore = new FakeHolderStore();
-    const authorityFrame = accepted("room", 5);
-    const authorityProjection = await installV2BrowserAcceptedFrameProjection({
-      store: authorityStore,
-      frame: authorityFrame,
-      writes: [
-        authorityObjectWrite(serializedObject("room", "Authority Room", null, ["actor"])),
-        authorityObjectWrite(serializedObject("actor", "Authority Actor", "room", []))
-      ],
-      viewer: { actor: "actor" }
-    });
+  it("rejects authority-shaped checkpoint rows", async () => {
+    const store = new FakeHolderStore();
+    const checkpointHead = head("room", 6);
+    const authorityShaped = {
+      id: "room",
+      name: "Authority Room",
+      parent: null,
+      owner: "actor",
+      location: null,
+      properties: [],
+      contents: []
+    };
 
-    expect((authorityProjection.projection as { title: string }).title).toBe("Authority Room");
-    expect((authorityProjection.projection as { object_count: number }).object_count).toBe(2);
-    expect((authorityProjection.projection as { self: { name: string } | null }).self?.name).toBe("Authority Actor");
+    await expect(installV2BrowserCheckpointTailProjection({
+      store,
+      transfer: {
+        kind: "woo.open.checkpoint_tail.v1",
+        scope: "room",
+        head: checkpointHead,
+        viewer: { actor: "actor" },
+        transfer: {
+          kind: "checkpoint",
+          checkpoint: {
+            kind: "woo.scope_checkpoint.v1",
+            scope: "room",
+            head: checkpointHead,
+            checkpoint_hash: "authority-shaped",
+            pages: [{
+              kind: "woo.projection_page.v1",
+              table: "objects",
+              page: "000001",
+              hash: "authority-shaped-objects",
+              rows: [authorityShaped]
+            }],
+            frame_tail: []
+          }
+        }
+      } as unknown as V2BrowserCheckpointTailOpenTransfer
+    })).rejects.toThrow("BrowserObjectRow");
   });
 });
 
@@ -252,10 +276,6 @@ function browserObjectWrite(row: BrowserObjectRow): ProjectionWrite<BrowserProfi
   return { table: "objects", key: row.id, op: "upsert", row, bytes: 1 };
 }
 
-function authorityObjectWrite(row: SerializedObject): ProjectionWrite {
-  return { table: "objects", key: row.id, op: "upsert", row, bytes: 1 };
-}
-
 function checkpointTransfer(
   scope: ObjRef,
   checkpointHead: ShadowScopeHead,
@@ -284,27 +304,6 @@ function checkpointTransfer(
         frame_tail: []
       }
     }
-  };
-}
-
-function serializedObject(id: ObjRef, name: string, location: ObjRef | null, contents: ObjRef[]): SerializedObject {
-  return {
-    id,
-    name,
-    parent: null,
-    owner: "actor",
-    location,
-    anchor: null,
-    flags: {},
-    created: 1,
-    modified: 1,
-    propertyDefs: [],
-    properties: [],
-    propertyVersions: [],
-    verbs: [],
-    children: [],
-    contents,
-    eventSchemas: []
   };
 }
 

@@ -435,18 +435,21 @@ export function browserProfileScopeCheckpointFromAuthority(input: {
       viewer: input.viewer
     }))
     .filter((page): page is ProjectionPage<BrowserProfile> => page !== null);
-  const material = {
-    kind: "woo.scope_checkpoint_browser_material.v1",
+  // Continuation chunks carry different page subsets, so the browser-facing
+  // checkpoint hash must key the whole transformed export, not the current
+  // chunk's rows.
+  const checkpointHashMaterial = {
+    kind: "woo.scope_checkpoint_browser_hash.v1",
     scope: input.checkpoint.scope,
     head: input.checkpoint.head,
-    pages: pages.map((page) => ({ table: page.table, page: page.page, hash: page.hash })),
-    frame_tail: input.checkpoint.frame_tail.map((frame) => frame.position)
+    authority_checkpoint_hash: input.checkpoint.checkpoint_hash,
+    viewer: { actor: input.viewer.actor, session: input.viewer.session ?? null }
   };
   return {
     kind: "woo.scope_checkpoint.v1",
     scope: input.checkpoint.scope,
     head: input.checkpoint.head,
-    checkpoint_hash: hashSource(stableShadowJson(material as unknown as WooValue)),
+    checkpoint_hash: hashSource(stableShadowJson(checkpointHashMaterial as unknown as WooValue)),
     pages,
     frame_tail: input.checkpoint.frame_tail
   };

@@ -320,7 +320,7 @@ These are the same for gateway and browser; the browser inherits them.
 | Step 2 — one `ApplyResult` applier | Transfer family is parameterized by `ProjectionProfile`; browser display state consumes `ProjectionWrite<BrowserProfile>` through `v2-browser-holder-install`. Store-2 write promotion now covers contiguous accepted transcripts; `applyShadowTranscriptToCommitScopeCache` remains only for tentative overlays and non-contiguous accepted-transcript gap fallback. |
 | Step 5 — projection-row cache | Store 1 = the holder cache, browser-safe payload (A2). |
 | Step 6 — same-host stale fallback | Store 1 is the browser's same-host fallback; render at 0 ms, reconcile after. |
-| Step 7 — checkpoint/tail open | Browser open = display catch-up into store 1. |
+| Step 7 — checkpoint/tail open | Browser open = display catch-up into store 1. The browser-profile checkpoint hash is stable across continuation chunks and keyed from the authority checkpoint export plus viewer, not from the current chunk's page subset. |
 | `cell_pages` standardization | Promote to `ExecutionCapsuleTransfer`; drop `closure`/`object_records`. |
 | `TurnProposal` | Define in shared VTN14, not browser-only; browser is the first/only proposal-buffering holder. |
 
@@ -344,7 +344,8 @@ These are the same for gateway and browser; the browser inherits them.
   **security** — no `BrowserProfile` row satisfies a `TurnKey` atom, and capsule
   metadata tamper (head/verb/turn_key) fails proof verification; receiver profile
   — browser receives `BrowserProfile` rows in both fanout *and* checkpoint/tail,
-  never a `SerializedObject`/`SerializedSession` body; write-cell promotion —
+  never a `SerializedObject`/`SerializedSession` body, and authority-shaped rows
+  are rejected at the holder boundary; write-cell promotion —
   hash-matched accept promotes to store 2, hash-mismatch discards and fetches;
   two-phase accept — phase-1 transaction runs no VM/capsule fetch, survivors land
   `needs_replan`; durability — offline/reconnect path persists a durable proposal
