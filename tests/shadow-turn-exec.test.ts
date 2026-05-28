@@ -1249,6 +1249,60 @@ describe("shadow turn execution", () => {
     })).toThrow(/call mismatch|turn key mismatch/);
   });
 
+  it("rejects expired and mismatched execution capsule bindings", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-capsule-binding");
+    const actor = session.actor;
+    await anchor.directCall("shadow-capsule-binding-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+
+    const serializedBefore = anchor.exportWorld();
+    const commitScope = createShadowCommitScope({ node: "anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-capsule-binding-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.58]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const transfer = buildShadowCellPageTransfer({
+      serialized: serializedBefore,
+      key,
+      atom_hashes: key.atom_hashes,
+      session: session.id,
+      recipient: "actor-node",
+      capsule: {
+        head: commitScope.head,
+        actor,
+        session: session.id,
+        target: key.target,
+        verb: key.verb,
+        recipient: "actor-node",
+        now: 10_000,
+        ttlMs: 100
+      }
+    });
+    const valid = {
+      node: "actor-node",
+      transfer,
+      scope: key.scope,
+      key,
+      actor,
+      session: session.id,
+      target: key.target,
+      verb: key.verb
+    };
+
+    expect(() => validateShadowExecutionCapsuleTransfer({ ...valid, now: 15_099 })).not.toThrow();
+    expect(() => validateShadowExecutionCapsuleTransfer({ ...valid, now: 15_100 })).toThrow(/expired/);
+    expect(() => validateShadowExecutionCapsuleTransfer({ ...valid, node: "other-node", now: 10_050 })).toThrow(/recipient mismatch/);
+    expect(() => validateShadowExecutionCapsuleTransfer({ ...valid, session: "wrong-session", now: 10_050 })).toThrow(/session mismatch/);
+  });
+
   it("aborts during execution when a real dubspace turn touches an unpredicted cell", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-need-state");

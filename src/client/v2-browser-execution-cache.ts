@@ -14,6 +14,9 @@ import { hashSource } from "../core/source-hash";
 import { shadowAtomHash, shadowReadCellPreimage, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../core/turn-key";
 import type { ObjRef, WooValue } from "../core/types";
 
+const ACCEPTED_WRITE_CELL_CAPSULE_NOW_MS = 0;
+const ACCEPTED_WRITE_CELL_CAPSULE_TTL_MS = Number.MAX_SAFE_INTEGER - 5_000;
+
 export type V2ExecutableTransferRecord = {
   id: string;
   scope: ObjRef;
@@ -144,7 +147,12 @@ export function createV2BrowserAcceptedWriteCellTransfer(input: {
       session: anchor.session ?? null,
       target: key.target,
       verb: key.verb,
-      recipient: input.node
+      recipient: input.node,
+      // Accepted write cells are durable, already sequenced scope state. Use a
+      // deterministic capsule timestamp so promoting the same accepted range
+      // remains content-addressed even if the worker retries the promotion.
+      now: ACCEPTED_WRITE_CELL_CAPSULE_NOW_MS,
+      ttlMs: ACCEPTED_WRITE_CELL_CAPSULE_TTL_MS
     }
   });
   return {

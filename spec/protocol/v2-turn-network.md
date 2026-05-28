@@ -1063,6 +1063,12 @@ installing executable pages: scope/head, actor/session, target/verb, full
 and the signed proof material. A sidecar binding that is not included in the
 proof root is not sufficient.
 
+The current implementation still provisions the state-proof MAC authority with
+the local development secret unless a deployment supplies explicit trusted
+transfer authorities. The capsule binding is therefore a routing/replay
+constraint today; it must not be treated as a malicious-relay authority boundary
+until production authority-secret provisioning is complete.
+
 Open-time executable seed and executable-seed cache-hit transfers arrive during
 scope open without a `reply_to`. A browser MUST still verify their capsule
 binding before installing them: the recipient must match the browser node, the
@@ -1755,8 +1761,9 @@ authority-bearing envelopes. It then:
 
 1. treats `TransportHello.actor` and `TransportHello.session` as the
    authoritative browser identity for the opened transport;
-2. discards auth-bound executable transfers, pages, and checkpoints whose
-   capsule recipient/actor/session no longer match that identity;
+2. discards auth-bound executable transfers, pages, checkpoints, and in-flight
+   execution requests whose capsule or envelope recipient/actor/session no
+   longer match that identity;
 3. installs the initial projection/delta transfer for the opened scope;
 4. replays pending envelopes only when auth token, sender node, actor, and
    session still match the opened transport;

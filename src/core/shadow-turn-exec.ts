@@ -51,6 +51,7 @@ import {
 const DEFAULT_SHADOW_TRANSFER_AUTHORITY = "shadow-anchor";
 const DEFAULT_SHADOW_TRANSFER_KEY_ID = "shadow-dev";
 const DEFAULT_SHADOW_TRANSFER_SECRET = "shadow-dev-secret";
+const SHADOW_EXECUTION_CAPSULE_CLOCK_SKEW_MS = 5_000;
 
 export type ShadowMissingAtom = {
   hash: string;
@@ -551,6 +552,9 @@ function shadowExecutionCapsuleMetadata(input: {
   };
 }
 
+// Validates the request/recipient/expiry binding carried inside a cell-page
+// execution capsule. The transfer proof and signature are verified separately
+// by installShadowStateTransfer when the pages are installed.
 export function validateShadowExecutionCapsuleTransfer(input: {
   node: string;
   transfer: ShadowStateTransfer;
@@ -581,7 +585,9 @@ export function validateShadowExecutionCapsuleTransfer(input: {
   if ((capsule.session ?? null) !== (input.session ?? null)) throw new Error("execution capsule session mismatch");
   if (capsule.target !== target || capsule.verb !== verb) throw new Error("execution capsule call mismatch");
   if (!constantTimeEqual(capsule.turn_key_hash, shadowTurnKeyHash(input.key))) throw new Error("execution capsule turn key mismatch");
-  if (capsule.expires_at_ms <= (input.now ?? Date.now())) throw new Error("execution capsule expired");
+  if (capsule.expires_at_ms + SHADOW_EXECUTION_CAPSULE_CLOCK_SKEW_MS <= (input.now ?? Date.now())) {
+    throw new Error("execution capsule expired");
+  }
 }
 
 function shadowTurnKeyHash(key: ShadowTurnKey): string {

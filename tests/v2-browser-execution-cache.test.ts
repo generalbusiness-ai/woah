@@ -118,6 +118,35 @@ describe("v2 browser executable cache", () => {
     expect(room?.properties).toContainEqual(["marker", "promoted"]);
     expect(composed.atom_hashes.has(shadowAtomHash("read:cell:prop:#room.marker"))).toBe(true);
   });
+
+  it("keeps accepted write-cell promotion transfer ids deterministic across retries", () => {
+    const key = turnKey("#room");
+    const base = buildShadowCellPageTransfer({ serialized: serializedWorld(), key, recipient: "browser:test" });
+    const oldRecord = v2ExecutableTransferRecord(base, 100);
+    const transcript = propTranscript("turn-1", 1, "promoted");
+    const input = {
+      node: "browser:test",
+      scope: "#room",
+      records: [oldRecord],
+      transcripts: [transcript],
+      accepted_head: {
+        kind: "woo.scope_head.shadow.v1" as const,
+        scope: "#room",
+        epoch: 1,
+        seq: 1,
+        hash: "head:1"
+      },
+      received_at: 200
+    };
+
+    const first = createV2BrowserAcceptedWriteCellTransfer(input);
+    const second = createV2BrowserAcceptedWriteCellTransfer(input);
+
+    expect(first?.record.id).toBe(second?.record.id);
+    expect(first?.record.transfer.proof.root).toBe(second?.record.transfer.proof.root);
+    expect(first?.record.transfer.mode === "cell_pages" ? first.record.transfer.capsule?.expires_at_ms : undefined)
+      .toBe(Number.MAX_SAFE_INTEGER - 5_000);
+  });
 });
 
 function turnKey(scope: string): ShadowTurnKey {

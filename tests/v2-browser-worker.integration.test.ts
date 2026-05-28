@@ -2204,6 +2204,114 @@ describe("v2 browser worker integration", () => {
     );
   });
 
+  it("purges in-flight execution requests and rejects stale replies after a transport identity change", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const firstSession = browserWorkerSession(world, "guest:v2-browser-worker-stale-reply-a");
+    const secondSession = browserWorkerSession(world, "guest:v2-browser-worker-stale-reply-b");
+    world.setProp("the_dubspace", "operators", [firstSession.actor, secondSession.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-stale-reply",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const firstBrowser = createShadowBrowserClient({
+      node: "browser:v2-worker-stale-reply",
+      scope: "the_dubspace",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay,
+      token: "token:v2-worker-stale-reply"
+    });
+    const opened = await openShadowBrowserScope(firstBrowser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-stale-reply",
+      node: firstBrowser.node,
+      scope: firstBrowser.scope,
+      actor: firstBrowser.actor,
+      session: firstSession.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "hello-stale-reply-a", "woo.transport.hello.v1", shadowBrowserTransportHello(firstBrowser))));
+    socket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "transfer-stale-reply-a", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "exec-stale-reply-a", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "ad-stale-reply-a", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "stale-reply-turn",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.66],
+      persistence: "durable"
+    });
+    const staleRequest = await waitForBrowserBuiltExecRequest(firstBrowser, socket, "set_control");
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "stale-reply-turn"));
+    await sleep(20);
+
+    const pendingStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(pendingStatusCursor)[0])).toMatchObject({
+      status: {
+        pending: 1
+      }
+    });
+
+    const secondBrowser = createShadowBrowserClient({
+      node: firstBrowser.node,
+      scope: "the_dubspace",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay,
+      token: "token:v2-worker-stale-reply-b"
+    });
+    socket.receive(encodeEnvelope(relayEnvelope(secondBrowser, "hello-stale-reply-b", "woo.transport.hello.v1", shadowBrowserTransportHello(secondBrowser))));
+    const purgeMetric = await waitForMessage(posted, (message) =>
+      browserMetric(message)?.phase === "execution_cache_purge" &&
+      browserMetric(message)?.path === "transport_hello_authority_changed"
+    );
+    expect(Number(browserMetric(purgeMetric)?.records)).toBeGreaterThan(0);
+    expect(purgeMetric).toMatchObject({
+      metric: {
+        pending: 1
+      }
+    });
+    const purgedStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(purgedStatusCursor)[0])).toMatchObject({
+      status: {
+        pending: 0,
+        execution_transfers: 0,
+        local_execution_ready: false
+      }
+    });
+
+    const staleReply = await relayReply(firstBrowser, encodeEnvelope(staleRequest));
+    posted.length = 0;
+    socket.receive(encodeEnvelope(staleReply));
+    expect(await waitForMessage(posted, (message) => isKind(message, "error"))).toMatchObject({
+      kind: "error",
+      error: expect.stringMatching(/turn execution reply actor mismatch|turn execution reply session mismatch/)
+    });
+    expect(posted.some((message) => isKind(message, "applied_frame"))).toBe(false);
+    expect(posted.some((message) => isLocalTurnCommitted(message, "stale-reply-turn"))).toBe(false);
+  });
+
   it("replays only pending envelopes for the active token actor session and sender", async () => {
     const indexedDB = new FakeIndexedDBFactory();
     const world = createWorld();
@@ -2404,7 +2512,10 @@ describe("v2 browser worker integration", () => {
     scope.dispatch({ kind: "cache_status" });
     expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
       status: {
-        transcript_tail: 0
+        transcript_tail: 0,
+        execution_transfers: expect.any(Number),
+        local_execution_ready: true,
+        local_execution_coverage_seq: 3
       }
     });
 

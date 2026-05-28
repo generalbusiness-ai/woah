@@ -50,6 +50,7 @@ type BrowserActivityMetricPayload = {
   what?: string;
   reason?: string;
   count?: number;
+  pending?: number;
   bytes?: number;
   records?: number;
   transfer_mode?: string;

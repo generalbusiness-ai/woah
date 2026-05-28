@@ -109,6 +109,7 @@ type BrowserActivityMetric = {
   what?: string;
   reason?: string;
   count?: number;
+  pending?: number;
   bytes?: number;
   records?: number;
   transfer_mode?: string;
@@ -550,6 +551,7 @@ async function receiveFrame(encoded: string): Promise<void> {
     if (envelope.type === "woo.transport.hello.v1") await reconcileTransportHello(envelope.body);
     if (receivedStateTransfer) validateStateTransferEnvelope(envelope as ShadowEnvelope<ShadowStateTransfer>);
     if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
+      validateTurnExecReplyCurrentAuthority(envelope as ShadowEnvelope<ShadowTurnExecReply>);
       envelope = await envelopeWithValidatedTurnExecStateTransfer(envelope as ShadowEnvelope<ShadowTurnExecReply>) as ShadowEnvelope;
     }
     const mutations = v2BrowserCacheMutationsForEnvelope(envelope);
@@ -688,6 +690,22 @@ function pendingMatchesCurrentSession(pending: PendingEnvelope): boolean {
     if (envelope.from !== current.node) return false;
     if (envelope.actor !== current.actor) return false;
     return (envelope.session ?? null) === (current.session ?? null);
+  } catch {
+    return false;
+  }
+}
+
+function turnExecRequestMatchesCurrentSession(request: ShadowTurnExecRequest): boolean {
+  if (!current?.actor) return false;
+  if (request.call.actor !== current.actor) return false;
+  return (request.call.session ?? null) === (current.session ?? null);
+}
+
+function pendingTurnExecMatchesCurrentSession(pending: PendingEnvelope): boolean | null {
+  try {
+    const envelope = decodeEnvelope(pending.encoded);
+    if (envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+    return pendingMatchesCurrentSession(pending);
   } catch {
     return false;
   }
@@ -1207,6 +1225,19 @@ function validateOpenExecutableSeedTransfer(transfer: ShadowCellPageTransfer): v
     target: transfer.scope,
     verb
   });
+}
+
+function validateTurnExecReplyCurrentAuthority(envelope: ShadowEnvelope<ShadowTurnExecReply>): void {
+  if (!envelope.reply_to) return;
+  if (!current?.actor) throw new Error("turn execution reply has no active browser authority");
+  if (envelope.to && envelope.to !== current.node) {
+    throw new Error(`turn execution reply recipient mismatch: envelope=${envelope.to} current=${current.node}`);
+  }
+  if (envelope.actor !== current.actor) throw new Error("turn execution reply actor mismatch");
+  if ((envelope.session ?? null) !== (current.session ?? null)) throw new Error("turn execution reply session mismatch");
+  if (envelope.auth.mode === "session" && envelope.auth.token !== current.token) {
+    throw new Error("turn execution reply token mismatch");
+  }
 }
 
 async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<ShadowTurnExecReply>): Promise<void> {
@@ -2041,17 +2072,18 @@ async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
 
 async function purgeStaleExecutableStateForCurrentAuthority(reason: string): Promise<void> {
   if (!current?.actor) return;
+  const purgedPending = await purgeStalePendingTurnExecRequestsForCurrentAuthority();
   const records = await allExecutionTransfers();
   const stale = records.filter((record) => !executionTransferMatchesCurrentAuthority(record));
-  if (stale.length === 0) return;
+  if (stale.length === 0 && purgedPending === 0) return;
   const staleIds = new Set(stale.map((record) => record.id));
   const remaining = records.filter((record) => !staleIds.has(record.id));
   const referencedPageHashes = new Set<string>();
   for (const record of remaining) {
     for (const ref of record.transfer.page_refs) referencedPageHashes.add(ref.hash);
   }
-  const statePageKeys = await cachedStatePageHashes();
-  const staleStatePageKeys = statePageKeys.filter((key) => !referencedPageHashes.has(key));
+  const statePageKeys = stale.length === 0 ? [] : await cachedStatePageHashes();
+  const staleStatePageKeys = stale.length === 0 ? [] : statePageKeys.filter((key) => !referencedPageHashes.has(key));
   const staleScopes = Array.from(new Set(stale.map((record) => record.scope)));
   await deleteStoreKeys(EXECUTION_TRANSFER_STORE, Array.from(staleIds));
   await deleteStoreKeys(STATE_PAGE_STORE, staleStatePageKeys);
@@ -2064,8 +2096,24 @@ async function purgeStaleExecutableStateForCurrentAuthority(reason: string): Pro
     ms: 0,
     status: "ok",
     records: stale.length,
+    pending: purgedPending,
     count: staleStatePageKeys.length
   });
+}
+
+async function purgeStalePendingTurnExecRequestsForCurrentAuthority(): Promise<number> {
+  if (!current?.actor) return 0;
+  const staleIds = new Set<string>();
+  for (const [id, request] of pendingTurnExecRequests) {
+    if (!turnExecRequestMatchesCurrentSession(request)) staleIds.add(id);
+  }
+  for (const pending of await allPending()) {
+    const matches = pendingTurnExecMatchesCurrentSession(pending);
+    if (matches === false) staleIds.add(pending.id);
+  }
+  for (const id of staleIds) pendingTurnExecRequests.delete(id);
+  await deleteStoreKeys(PENDING_STORE, Array.from(staleIds));
+  return staleIds.size;
 }
 
 function executionTransferMatchesCurrentAuthority(record: V2ExecutableTransferRecord): boolean {
@@ -2135,7 +2183,6 @@ async function executionCacheForScope(
 }> {
   const startedAt = metricNow();
   let scopedRecordCount = 0;
-  let objectHashCount = 0;
   let pageHashCount = 0;
   try {
     const sourceRecords = records ?? await allExecutionTransfers();
@@ -2147,15 +2194,13 @@ async function executionCacheForScope(
     const recordsToInstall = checkpoint
       ? scopedRecords.filter((record) => record.received_at > checkpoint.transfer_high_watermark)
       : scopedRecords;
-    const objectHashes = new Set<string>();
     const pageHashes = new Set<string>();
     for (const record of recordsToInstall) {
       const transfer = record.transfer;
       for (const page of transfer.page_refs) pageHashes.add(page.hash);
     }
-    objectHashCount = objectHashes.size;
     pageHashCount = pageHashes.size;
-    const cached_objects = await cachedObjectsByHash(objectHashes);
+    const cached_objects: SerializedObject[] = [];
     const cached_pages = await cachedStatePagesByHash(pageHashes);
     const committed_transcript_rows = await committedTranscriptRowsForScope(scope, checkpoint?.through_seq ?? -1);
     postBrowserActivity({
@@ -2182,21 +2227,12 @@ async function executionCacheForScope(
       ms: metricElapsed(startedAt),
       status: "error",
       records: scopedRecordCount,
-      count: objectHashCount + pageHashCount,
+      count: pageHashCount,
       error: "E_BROWSER_EXECUTION_CACHE",
       error_detail: errorMessage(err)
     });
     throw err;
   }
-}
-
-async function cachedObjectsByHash(hashes: Iterable<string>): Promise<SerializedObject[]> {
-  const objects: SerializedObject[] = [];
-  for (const hash of hashes) {
-    const row = await tx<{ record?: unknown } | undefined>(OBJECT_PAGE_STORE, "readonly", (store) => store.get(hash));
-    if (isSerializedObject(row?.record)) objects.push(row.record);
-  }
-  return objects;
 }
 
 async function cachedStatePagesByHash(hashes: Iterable<string>): Promise<ShadowStatePage[]> {
@@ -2394,10 +2430,6 @@ function executionCacheCoverageSeq(
     }
   }
   return high;
-}
-
-function isSerializedObject(value: unknown): value is SerializedObject {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value) && typeof (value as { id?: unknown }).id === "string");
 }
 
 function isShadowStatePage(value: unknown): value is ShadowStatePage {
