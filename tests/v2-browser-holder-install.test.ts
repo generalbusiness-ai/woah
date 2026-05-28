@@ -8,7 +8,7 @@ import {
   type V2BrowserProjectionRowRecord,
   type V2BrowserProjectionRowRecordInput
 } from "../src/client/v2-browser-holder-install";
-import type { BrowserObjectRow, BrowserProfile, ProjectionWrite } from "../src/core/projection-delta";
+import type { AcceptedFrameTransfer, BrowserObjectRow, BrowserProfile, ProjectionWrite } from "../src/core/projection-delta";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import type { ObjRef } from "../src/core/types";
 
@@ -75,6 +75,46 @@ describe("v2 browser holder projection install", () => {
     expect(stale.head).toEqual(frame.position);
     expect((stale.projection as { title: string }).title).toBe("Current Room");
     expect(store.row("room", "objects", "room")?.row).toMatchObject({ display: { name: "Current Room" } });
+  });
+
+  it("treats stale checkpoint/tail transfers as idempotent no-ops", async () => {
+    const store = new FakeHolderStore();
+    const currentFrame = accepted("room", 4);
+    await installV2BrowserAcceptedFrameProjection({
+      store,
+      frame: currentFrame,
+      writes: [browserObjectWrite(browserObject("room", "Current Room", currentFrame.position))],
+      viewer: { actor: "actor" }
+    });
+
+    store.ops.length = 0;
+    const staleFrame = accepted("room", 3);
+    const staleTail = await installV2BrowserCheckpointTailProjection({
+      store,
+      transfer: framesTransfer("room", head("room", 2), staleFrame.position, [{
+        frame: staleFrame,
+        projection_writes: [browserObjectWrite(browserObject("room", "Stale Tail Should Not Regress", staleFrame.position))]
+      }])
+    });
+
+    expect(staleTail?.head).toEqual(currentFrame.position);
+    expect((staleTail?.projection as { title: string }).title).toBe("Current Room");
+    expect(store.row("room", "objects", "room")?.row).toMatchObject({ display: { name: "Current Room" } });
+    expect(store.ops).not.toContain("putRow:objects:room");
+    expect(store.ops).not.toContain("putMeta:head:room");
+
+    store.ops.length = 0;
+    store.clearCalls.length = 0;
+    const staleCheckpoint = await installV2BrowserCheckpointTailProjection({
+      store,
+      transfer: checkpointTransfer("room", head("room", 1), "stale-checkpoint", "000001")
+    });
+
+    expect(staleCheckpoint?.head).toEqual(currentFrame.position);
+    expect((staleCheckpoint?.projection as { title: string }).title).toBe("Current Room");
+    expect(store.clearCalls).toEqual([]);
+    expect(store.ops).not.toContain("clear:room");
+    expect(store.ops).not.toContain("putMeta:head:room");
   });
 
   it("clears checkpoint rows at a new export boundary or checkpoint hash", async () => {
@@ -315,6 +355,26 @@ function checkpointTransfer(
         }],
         frame_tail: []
       }
+    }
+  };
+}
+
+function framesTransfer(
+  scope: ObjRef,
+  from: ShadowScopeHead,
+  to: ShadowScopeHead,
+  frames: Array<AcceptedFrameTransfer<BrowserProfile>>
+): V2BrowserCheckpointTailOpenTransfer {
+  return {
+    kind: "woo.open.checkpoint_tail.v1",
+    scope,
+    head: to,
+    viewer: { actor: "actor" },
+    transfer: {
+      kind: "frames",
+      from,
+      to,
+      frames
     }
   };
 }

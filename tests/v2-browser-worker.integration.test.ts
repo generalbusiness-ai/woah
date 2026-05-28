@@ -44,7 +44,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker",
@@ -187,7 +187,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-queued-journal");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-queued-journal");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-queued-journal",
@@ -292,7 +292,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-cross-scope-overlay");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-cross-scope-overlay");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-cross-scope-overlay",
@@ -383,7 +383,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-reload-overlay");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-reload-overlay");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-reload-overlay",
@@ -478,7 +478,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-orphan-state");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-orphan-state");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-orphan-state",
       scope: "the_dubspace",
@@ -533,7 +533,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-legacy-transfer");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-legacy-transfer");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-legacy-transfer",
       scope: "the_dubspace",
@@ -614,7 +614,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-open-seed-capsule");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-open-seed-capsule");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-open-seed-capsule",
       scope: "the_dubspace",
@@ -679,7 +679,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-open-seed-cache-capsule");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-open-seed-cache-capsule");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-open-seed-cache-capsule",
       scope: "the_dubspace",
@@ -746,7 +746,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-orphan-bundled-state");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-orphan-bundled-state");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-orphan-bundled-state",
       scope: "the_dubspace",
@@ -832,7 +832,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-bad-bundled-capsule");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-bad-bundled-capsule");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-bad-bundled-capsule",
@@ -933,7 +933,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-replan");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-replan");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-replan",
@@ -1070,7 +1070,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-id-only-accept");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-id-only-accept");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-id-only-accept",
@@ -1182,7 +1182,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-checkpoint-tail");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint-tail");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-checkpoint-tail",
       scope: "the_dubspace",
@@ -1307,7 +1307,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-projection-boundary");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-projection-boundary");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-projection-boundary",
@@ -1429,7 +1429,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-checkpoint-continuation");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint-continuation");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-checkpoint-continuation",
       scope: "the_dubspace",
@@ -1546,7 +1546,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-dedupe");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-dedupe");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-dedupe",
       scope: "the_pinboard",
@@ -1612,7 +1612,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-browser-profile");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-browser-profile");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-browser-profile",
       scope: "the_dubspace",
@@ -1700,7 +1700,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-state-page-read");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-state-page-read");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-state-page-read",
       scope: "the_dubspace",
@@ -1760,7 +1760,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-journal");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-journal");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-journal",
       scope: "the_pinboard",
@@ -1846,7 +1846,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-outline-journal");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-outline-journal");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-outline-journal",
       scope: "the_outline",
@@ -1921,7 +1921,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-live-read");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-live-read");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-live-read",
       scope: "the_pinboard",
@@ -2053,7 +2053,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-overlay-reset");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-overlay-reset");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-overlay-reset",
       scope: "the_pinboard",
@@ -2119,7 +2119,7 @@ describe("v2 browser worker integration", () => {
     await import("../src/client/v2-browser-worker");
 
     const world = createWorld();
-    const session = world.auth("guest:v2-browser-worker-checkpoint");
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint");
     world.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-checkpoint",
@@ -2222,6 +2222,12 @@ describe("v2 browser worker integration", () => {
     });
   });
 });
+
+function browserWorkerSession(world: ReturnType<typeof createWorld>, token: string) {
+  const session = world.auth(token);
+  session.expiresAt = Math.max(session.expiresAt, Date.now() + 24 * 60 * 60_000);
+  return session;
+}
 
 class FakeWorkerScope {
   private readonly listeners: Array<(event: MessageEvent) => void> = [];

@@ -78,8 +78,21 @@ export async function installV2BrowserCheckpointTailProjection(input: {
 }): Promise<V2BrowserHolderProjectionInstall | null> {
   const viewer = input.transfer.viewer;
   if (!viewer?.actor) throw new Error("checkpoint/tail transfer missing viewer");
+  const current = await input.store.getMeta<ShadowScopeHead>(`head:${input.transfer.scope}`);
   if (input.transfer.transfer.kind === "checkpoint") {
+    const checkpoint = input.transfer.transfer.checkpoint;
+    if (current && scopeHeadBeyond(current, checkpoint.head)) {
+      return await currentProjectionInstall(input.store, input.transfer.scope, current, viewer);
+    }
+    const prior = await input.store.getMeta<{ checkpoint_hash: string; head: ShadowScopeHead }>(`checkpoint_export:${checkpoint.scope}`);
+    const beginsExport = checkpoint.pages.some((page) => page.page === "000001");
+    if (current && scopeHeadSamePosition(current, checkpoint.head) && !beginsExport && prior?.checkpoint_hash === checkpoint.checkpoint_hash) {
+      return await currentProjectionInstall(input.store, input.transfer.scope, current, viewer);
+    }
     return await installCheckpointProjection(input.store, input.transfer, viewer);
+  }
+  if (current && scopeHeadAtOrBeyond(current, input.transfer.transfer.to)) {
+    return await currentProjectionInstall(input.store, input.transfer.scope, current, viewer);
   }
   for (const frame of input.transfer.transfer.frames) {
     for (const write of frame.projection_writes) {
@@ -101,6 +114,19 @@ export function v2BrowserProjectionRowId(
   key: string
 ): string {
   return `${scope}\u0000${table}\u0000${key}`;
+}
+
+async function currentProjectionInstall(
+  store: V2BrowserHolderInstallStore,
+  scope: string,
+  head: ShadowScopeHead,
+  viewer: ProjectionViewer
+): Promise<V2BrowserHolderProjectionInstall> {
+  return {
+    scope,
+    head,
+    projection: await projectionFromStoredRows(store, scope, head, viewer)
+  };
 }
 
 async function installProjectionWritesAtHead(input: {
@@ -310,6 +336,15 @@ function objectProjectionRowKey(row: BrowserObjectRow): ObjRef {
 function scopeHeadAtOrBeyond(current: ShadowScopeHead, incoming: ShadowScopeHead): boolean {
   if (current.scope !== incoming.scope) return false;
   return current.epoch > incoming.epoch || (current.epoch === incoming.epoch && current.seq >= incoming.seq);
+}
+
+function scopeHeadBeyond(current: ShadowScopeHead, incoming: ShadowScopeHead): boolean {
+  if (current.scope !== incoming.scope) return false;
+  return current.epoch > incoming.epoch || (current.epoch === incoming.epoch && current.seq > incoming.seq);
+}
+
+function scopeHeadSamePosition(current: ShadowScopeHead, incoming: ShadowScopeHead): boolean {
+  return current.scope === incoming.scope && current.epoch === incoming.epoch && current.seq === incoming.seq;
 }
 
 function sessionProjectionRowKey(row: BrowserSessionRow): string {

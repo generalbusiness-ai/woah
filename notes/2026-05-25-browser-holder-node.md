@@ -265,7 +265,10 @@ These are the same for gateway and browser; the browser inherits them.
   projection batch into store 1. The browser receives `BrowserProfile`
   checkpoint pages, never authority rows. A checkpoint's `frame_tail` is already
   applied (data-path:682): it updates continuity metadata but MUST NOT re-route
-  historical observations or re-apply row writes.
+  historical observations or re-apply row writes. Stale checkpoint/tail chunks
+  older than the holder's current scope head are ignored; same-head checkpoint
+  refreshes still apply when they begin a new export or carry a new checkpoint
+  hash.
 - **Conflict handling** (VTN14.5): `stale_head` is a convergence signal — do not
   invalidate by itself. When a matching proposal is already `needs_replan`, the
   browser re-plans it after the stale-head reply clears the original pending
