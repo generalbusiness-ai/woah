@@ -1,6 +1,7 @@
 # Browser as a holder node
 
-Updated 2026-05-27 (rev 7: reconciled with current code and holder install boundary). Companion to
+Updated 2026-05-28 (rev 8: reconciled missing-state repair wording with the `cell_pages`
+execution-capsule path). Companion to
 [2026-05-25-distributed-vm-document-data-path.md](2026-05-25-distributed-vm-document-data-path.md)
 (the "data-path note"), which designs the server tiers and omits the browser.
 

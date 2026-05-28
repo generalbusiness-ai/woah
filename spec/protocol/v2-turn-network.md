@@ -1115,7 +1115,7 @@ authority.
 
 ```ts
 type TransferRequest = {
-  mode: "projection" | "delta" | "closure";
+  mode: "projection" | "delta" | "closure" | "cell_pages";
   base?: ScopeHead;
   max_bytes?: number;
   atoms?: string[];
@@ -1123,7 +1123,7 @@ type TransferRequest = {
 
 type StateTransfer = {
   kind: "woo.state.transfer.v1";
-  mode: "projection" | "delta" | "closure";
+  mode: "projection" | "delta" | "closure" | "cell_pages";
   scope?: ScopeRef;
   base?: ScopeHead;
   to?: ScopeHead;
@@ -1178,12 +1178,14 @@ Transfer modes:
 - `projection`: enough for display and command planning, not authoritative
   execution unless marked as a semantic read by a later committed turn;
 - `delta`: applied frames or transcript tail since a known head;
-- `closure`: executable state bundle for a predicted turn, including cells,
-  parent/feature/verb metadata, bytecode hashes, and permission facts.
+- `closure`: legacy executable state bundle for a predicted turn, including
+  cells, parent/feature/verb metadata, bytecode hashes, and permission facts;
+- `cell_pages`: executable state pages selected by `TurnKey` atom preimages,
+  with capsule metadata bound into the transfer proof.
 
 State transfers use `kind: "woo.state.transfer.v1"`. The default fresh-call
-network path uses `mode: "closure"` with content-addressed cell pages, selected
-from missing TurnKey atom preimages:
+network path uses `mode: "cell_pages"` with content-addressed pages selected
+from missing `TurnKey` atom preimages:
 
 - `object_lineage`: object identity, parent, owner, flags, anchor, and schemas;
 - `object_live`: location, children, and contents cells;
@@ -1544,9 +1546,9 @@ cannot prove it has the required atoms, the browser first tries to learn enough
 state to execute locally:
 
 ```text
-worker -> relay: StateTransferRequest(mode:"closure", atoms:[...], base:head)
+worker -> relay: StateTransferRequest(mode:"cell_pages", atoms:[...], base:head)
 relay/authority: select pages from owner/commit-scope state
-relay -> worker: StateTransfer(mode:"closure", pages, inline_pages, proof)
+relay -> worker: StateTransfer(mode:"cell_pages", pages, inline_pages, proof, capsule)
 worker: verify proof, page hashes, recipient, scope/epoch, authorization
 worker: install executable pages into IndexedDB
 worker: rebuild execution node and retry the same turn id
@@ -2004,9 +2006,9 @@ spreading.
    are materialized into accepted write-cell pages; accepted transcript-tail
    replay is not a VM-read fallback. Transcript replay remains only for
    tentative overlays and write-cell promotion materialization.
-4. **Missing-state repair.** Browser local execution requests closure
-   transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
-   same turn id locally before delegation.
+4. **Missing-state repair.** Browser local execution requests `cell_pages`
+   execution-capsule transfers on `E_NEED_STATE`, verifies and installs pages,
+   then retries the same turn id locally before delegation.
 5. **Browser-planned committed turns.** Chat movement/carrying, pinboard,
    kanban, and dubspace committed controls submit browser-built
    `TurnExecRequest` messages by default. `woo.turn.intent.request.v1` remains
