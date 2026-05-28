@@ -169,6 +169,110 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
   });
 
+  it("persists a queued durable proposal before enqueueing when the socket is not open", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-queued-journal");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-queued-journal",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-queued-journal",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-queued-journal"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-queued-journal",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-queued-journal", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-queued-journal", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-queued-journal", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-queued-journal", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "queued-warmup-enter",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    const warmupRequest = await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(warmupRequest))));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "queued-warmup-enter"));
+
+    socket.close();
+    posted.length = 0;
+    scope.dispatch({
+      kind: "call",
+      id: "queued-dubspace-enter",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    const reconnectSocket = await waitForSocket(1);
+    await sleep(0);
+    reconnectSocket.close();
+
+    const proposalJournalIndex = await waitForMessageIndex(posted, (message) =>
+      browserMetric(message)?.phase === "proposal_journal" &&
+      browserMetric(message)?.path === "before_enqueue"
+    );
+    const sendIndex = await waitForMessageIndex(posted, (message) =>
+      browserMetric(message)?.phase === "websocket_send" &&
+      browserMetric(message)?.reason === "socket_not_open"
+    );
+    expect(proposalJournalIndex).toBeLessThan(sendIndex);
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "queued-dubspace-enter"))).toMatchObject({
+      kind: "local_turn_planned"
+    });
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        pending: 1,
+        proposals: 1
+      }
+    });
+    const disconnectCursor = posted.length;
+    scope.dispatch({ kind: "disconnect" });
+    await waitForMessageFrom(posted, disconnectCursor, (message) =>
+      browserMetric(message)?.phase === "command" &&
+      browserMetric(message)?.path === "disconnect"
+    );
+    await sleep(20);
+  });
+
   it("rejects executable state-transfer replies that are not bound to a pending request", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -1853,8 +1957,8 @@ class FakeWebSocket {
   }
 }
 
-async function waitForSocket(): Promise<FakeWebSocket> {
-  return await waitFor(() => FakeWebSocket.instances[0]);
+async function waitForSocket(index = 0): Promise<FakeWebSocket> {
+  return await waitFor(() => FakeWebSocket.instances[index]);
 }
 
 async function waitForBrowserBuiltExecRequest(
