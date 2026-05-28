@@ -430,6 +430,7 @@ export function buildShadowCellPageTransfer(input: {
     recipient?: string;
     now?: number;
     ttlMs?: number;
+    keyMode?: "request" | "transfer_atoms";
   };
 } & ShadowTransferSigning): ShadowCellPageTransfer {
   const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
@@ -462,7 +463,13 @@ export function buildShadowCellPageTransfer(input: {
     ...(input.capsule ? {
       capsule: shadowExecutionCapsuleMetadata({
         scope: input.key.scope,
-        key: input.key,
+        key: input.capsule.keyMode === "transfer_atoms"
+          ? shadowTransferAtomTurnKey(input.key.scope, granted, {
+              actor: input.capsule.actor ?? input.key.actor,
+              target: input.capsule.target ?? input.key.target,
+              verb: input.capsule.verb ?? input.key.verb
+            })
+          : input.key,
         head: input.capsule.head,
         actor: input.capsule.actor,
         session: input.capsule.session,
@@ -477,6 +484,43 @@ export function buildShadowCellPageTransfer(input: {
   return {
     ...transfer,
     proof: signShadowStateTransfer(transfer, input)
+  };
+}
+
+export function shadowCellPageTransferAtomTurnKey(
+  transfer: ShadowCellPageTransfer,
+  input: { actor: ObjRef; target: ObjRef; verb: string }
+): ShadowTurnKey {
+  const preimages = transfer.preimages ?? [];
+  const atoms = preimages.map((preimage, index) => ({
+    preimage,
+    hash: transfer.atom_hashes[index] ?? shadowAtomHash(preimage)
+  }));
+  return shadowTransferAtomTurnKey(transfer.scope, atoms, input);
+}
+
+function shadowTransferAtomTurnKey(
+  scope: ObjRef,
+  atoms: readonly { hash: string; preimage: string }[],
+  input: { actor: ObjRef; target: ObjRef; verb: string }
+): ShadowTurnKey {
+  const sorted = atoms.slice().sort((a, b) => a.hash.localeCompare(b.hash));
+  const preimages = sorted.map((item) => item.preimage);
+  const atomHashes = sorted.map((item) => item.hash);
+  return {
+    kind: "woo.turn_key.shadow.v1",
+    scope,
+    actor: input.actor,
+    target: input.target,
+    verb: input.verb,
+    preimages,
+    atom_hashes: atomHashes,
+    read_preimages: preimages,
+    read_atom_hashes: atomHashes,
+    write_preimages: [],
+    write_atom_hashes: [],
+    accept_preimages: preimages,
+    accept_atom_hashes: atomHashes
   };
 }
 

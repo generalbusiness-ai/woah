@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeIndexedDBFactory } from "./helpers/fake-indexeddb";
 import { encodeEnvelope, decodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import {
+  buildShadowBrowserOpenExecutableSeedTransfer,
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   handleShadowBrowserStateTransferEnvelope,
@@ -15,6 +16,7 @@ import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { BrowserObjectRow, BrowserProfile, ProjectionWrite } from "../src/core/projection-delta";
 import { createShadowCommitScope, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
+import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 
 describe("v2 browser worker integration", () => {
   afterEach(() => {
@@ -180,6 +182,176 @@ describe("v2 browser worker integration", () => {
     const error = await waitForMessage(posted, (message) => isKind(message, "error"));
     expect((error as { error?: unknown }).error).toMatch(/no pending request/);
     expect(posted.some(isReadyStatus)).toBe(false);
+    const idbMetricCursor = posted.filter((message) => browserMetric(message)?.phase === "idb_tx").length;
+    socket.close();
+    await waitForMessage(posted, (message) => browserMetric(message)?.phase === "connect_ready_wait" && browserMetric(message)?.reason === "close");
+    await waitFor(() => posted.filter((message) => browserMetric(message)?.phase === "idb_tx").length > idbMetricCursor ? true : undefined);
+  });
+
+  it("rejects an open executable seed whose capsule is bound to another session", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-open-seed-capsule");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-open-seed-capsule",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-open-seed-capsule",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-open-seed-capsule"
+    });
+    const opened = await openShadowBrowserScope(browser);
+    const wrongSessionSeed = buildShadowBrowserOpenExecutableSeedTransfer(
+      browser.relay,
+      browser.scope,
+      browser.node,
+      browser.actor,
+      "wrong-session"
+    );
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-open-seed-capsule",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-open-seed-capsule", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-open-seed-capsule", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-open-seed-capsule", wrongSessionSeed.kind, wrongSessionSeed)));
+
+    const error = await waitForMessage(posted, (message) => isKind(message, "error"));
+    expect((error as { error?: unknown }).error).toMatch(/session mismatch/);
+    const idbMetricCursor = posted.filter((message) => browserMetric(message)?.phase === "idb_tx").length;
+    socket.close();
+    await waitForMessage(posted, (message) => browserMetric(message)?.phase === "connect_ready_wait" && browserMetric(message)?.reason === "close");
+    await waitFor(() => posted.filter((message) => browserMetric(message)?.phase === "idb_tx").length > idbMetricCursor ? true : undefined);
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        execution_transfers: 0,
+        local_execution_ready: false
+      }
+    });
+  });
+
+  it("keeps an accepted reply when its bundled executable transfer fails capsule validation", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-bad-bundled-capsule");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-bad-bundled-capsule",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-bad-bundled-capsule",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-bad-bundled-capsule"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-bad-bundled-capsule",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-bad-bundled-capsule", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-bad-bundled-capsule", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-bad-bundled-capsule", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-bad-bundled-capsule", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "bad-bundled-capsule-turn",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.55],
+      persistence: "durable"
+    });
+    const request = await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "bad-bundled-capsule-turn"));
+    const beforeStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    const beforeStatus = await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(beforeStatusCursor)[0]);
+    const transferCountBeforeReply = (beforeStatus as { status?: { execution_transfers?: unknown } }).status?.execution_transfers;
+    expect(typeof transferCountBeforeReply).toBe("number");
+
+    const reply = await relayReply(browser, encodeEnvelope(request));
+    const badTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      browser.relay,
+      browser.scope,
+      browser.node,
+      browser.actor,
+      "wrong-session"
+    );
+    (reply.body as ShadowTurnExecReply).state_transfer = badTransfer;
+
+    posted.length = 0;
+    socket.receive(encodeEnvelope(reply));
+
+    expect(await waitForMessage(posted, (message) => isKind(message, "applied_frame"))).toMatchObject({
+      kind: "applied_frame"
+    });
+    expect(await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "bad-bundled-capsule-turn"))).toMatchObject({
+      kind: "local_turn_committed",
+      ids: ["bad-bundled-capsule-turn"]
+    });
+    expect(await waitForMessage(posted, (message) => browserMetric(message)?.phase === "execution_capsule_validate")).toMatchObject({
+      metric: {
+        status: "error",
+        error: "E_BROWSER_EXECUTION_CAPSULE"
+      }
+    });
+    await waitForMessage(posted, (message) => isBrowserMetricPhase(message, "frame_process"));
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        execution_transfers: transferCountBeforeReply,
+        local_execution_ready: true
+      }
+    });
+    expect(posted.filter((message) => isLocalTurnCommitted(message, "bad-bundled-capsule-turn"))).toHaveLength(1);
   });
 
   it("opens from a checkpoint/tail transfer without requiring the legacy display transfer", async () => {

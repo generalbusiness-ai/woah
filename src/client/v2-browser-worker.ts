@@ -4,7 +4,14 @@ import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { applyShadowScopeProjectionPatch, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
-import { validateShadowExecutionCapsuleTransfer, type ShadowStateTransfer, type ShadowTurnExecReply, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
+import {
+  shadowCellPageTransferAtomTurnKey,
+  validateShadowExecutionCapsuleTransfer,
+  type ShadowCellPageTransfer,
+  type ShadowStateTransfer,
+  type ShadowTurnExecReply,
+  type ShadowTurnExecRequest
+} from "../core/shadow-turn-exec";
 import type { ObjRef, WooValue } from "../core/types";
 import type {
   CheckpointTailOpenTransfer
@@ -467,7 +474,7 @@ async function receiveFrame(encoded: string): Promise<void> {
   // relay and in-process tests.
   try {
     const decodeStartedAt = metricNow();
-    const envelope = decodeEnvelope(encoded);
+    let envelope = decodeEnvelope(encoded);
     envelopeType = envelope.type;
     postBrowserActivity({
       phase: "frame_decode",
@@ -482,23 +489,28 @@ async function receiveFrame(encoded: string): Promise<void> {
     const receivedCompleteCheckpointTail = receivedCheckpointTail && checkpointTailOpenTransferIsComplete(envelope.body);
     const receivedExecutableStateTransfer = receivedStateTransfer && isExecutableStateTransfer(envelope.body);
     const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
-    if (receivedStateTransfer && envelope.reply_to) validatePendingStateTransferReply(envelope.reply_to, envelope.body);
-    if (envelope.type === "woo.turn.exec.reply.shadow.v1") await validateTurnExecReplyStateTransfer(envelope as ShadowEnvelope<ShadowTurnExecReply>);
+    if (receivedStateTransfer) validateStateTransferEnvelope(envelope as ShadowEnvelope<ShadowStateTransfer>);
+    if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
+      envelope = await envelopeWithValidatedTurnExecStateTransfer(envelope as ShadowEnvelope<ShadowTurnExecReply>) as ShadowEnvelope;
+    }
     const mutations = v2BrowserCacheMutationsForEnvelope(envelope);
     mutationCount = mutations.length;
+    const frameReconciledProposalIds: string[] = [];
     for (const mutation of mutations) {
       const applied = await applyCacheMutation(mutation);
       if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
       if (applied?.kind === "projection") postProjection(applied.scope, applied.head, applied.projection);
       if (applied?.kind === "applied_frame") {
-        await reconcileAcceptedFrameWithProposals(applied.frame, applied.transcript);
+        frameReconciledProposalIds.push(...await reconcileAcceptedFrameWithProposals(applied.frame, applied.transcript));
         postAppliedFrame(applied.frame, applied.transcript);
       }
       if (mutation.kind === "object_page" || mutation.kind === "state_page" || mutation.kind === "state_pages") installedExecutableState = true;
     }
     if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
       const reply = envelope.body as ShadowTurnExecReply;
-      if (!(reply.ok === false && reply.reason === "missing_state")) await reconcileTentativeTurnReply(reply, envelope.reply_to);
+      if (!frameAlreadyReconciledReplyProposal(frameReconciledProposalIds, reply, envelope.reply_to) && !(reply.ok === false && reply.reason === "missing_state")) {
+        await reconcileTentativeTurnReply(reply, envelope.reply_to);
+      }
       const message = v2TurnResultMessageFromReply(reply, envelope.reply_to);
       if (message) postMessage(message);
     }
@@ -553,6 +565,16 @@ function isExecutableStateTransfer(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   const mode = (body as { mode?: unknown }).mode;
   return mode === "closure" || mode === "object_records" || mode === "cell_pages";
+}
+
+function isCellPageTransfer(body: unknown): body is ShadowCellPageTransfer {
+  return Boolean(body && typeof body === "object" && !Array.isArray(body) &&
+    (body as { kind?: unknown }).kind === "woo.state.transfer.shadow.v1" &&
+    (body as { mode?: unknown }).mode === "cell_pages");
+}
+
+function isOpenExecutableSeedPurpose(purpose: unknown): purpose is "open_executable_seed" | "open_executable_seed_cache_hit" {
+  return purpose === "open_executable_seed" || purpose === "open_executable_seed_cache_hit";
 }
 
 function checkpointTailOpenTransferIsComplete(body: unknown): boolean {
@@ -1031,6 +1053,46 @@ function validatePendingStateTransferReply(replyTo: string, body: unknown): void
   });
 }
 
+function validateStateTransferEnvelope(envelope: ShadowEnvelope<ShadowStateTransfer>): void {
+  if (envelope.reply_to) {
+    validatePendingStateTransferReply(envelope.reply_to, envelope.body);
+    return;
+  }
+  if (!isCellPageTransfer(envelope.body)) return;
+  if (isOpenExecutableSeedPurpose(envelope.body.purpose)) {
+    validateOpenExecutableSeedTransfer(envelope.body);
+    return;
+  }
+  if (envelope.body.capsule) throw new Error("execution capsule transfer has no pending request");
+}
+
+function validateOpenExecutableSeedTransfer(transfer: ShadowCellPageTransfer): void {
+  if (!current) throw new Error("open executable seed arrived before browser connect");
+  if (transfer.scope !== current.scope) {
+    throw new Error(`open executable seed scope mismatch: transfer=${transfer.scope} current=${current.scope}`);
+  }
+  if (!transfer.capsule) throw new Error("open executable seed capsule metadata is required");
+  const verb = transfer.purpose === "open_executable_seed_cache_hit"
+    ? "__open_executable_seed_cache_hit__"
+    : "__open_executable_seed__";
+  const actor = current.actor ?? "";
+  const key = shadowCellPageTransferAtomTurnKey(transfer, {
+    actor,
+    target: transfer.scope,
+    verb
+  });
+  validateShadowExecutionCapsuleTransfer({
+    node: current.node,
+    transfer,
+    scope: transfer.scope,
+    key,
+    actor,
+    session: current.session ?? null,
+    target: transfer.scope,
+    verb
+  });
+}
+
 async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<ShadowTurnExecReply>): Promise<void> {
   const reply = envelope.body;
   if (!reply.state_transfer) return;
@@ -1047,6 +1109,36 @@ async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<Shado
     target: request.call.target,
     verb: request.call.verb
   });
+}
+
+async function envelopeWithValidatedTurnExecStateTransfer(
+  envelope: ShadowEnvelope<ShadowTurnExecReply>
+): Promise<ShadowEnvelope<ShadowTurnExecReply>> {
+  try {
+    await validateTurnExecReplyStateTransfer(envelope);
+    return envelope;
+  } catch (err) {
+    const reply = envelope.body;
+    if (reply.ok === true && reply.commit) {
+      postBrowserActivity({
+        phase: "execution_capsule_validate",
+        path: "turn_exec_reply",
+        scope: reply.state_transfer?.scope ?? reply.commit.position.scope,
+        node: current?.node,
+        actor: current?.actor,
+        ms: 0,
+        status: "error",
+        error: "E_BROWSER_EXECUTION_CAPSULE",
+        error_detail: errorMessage(err)
+      });
+      const { state_transfer: _stateTransfer, ...withoutStateTransfer } = reply;
+      return {
+        ...envelope,
+        body: withoutStateTransfer as ShadowTurnExecReply
+      };
+    }
+    throw err;
+  }
 }
 
 async function pendingTurnExecRequest(id: string): Promise<ShadowTurnExecRequest | null> {
@@ -1084,9 +1176,15 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
   }
 }
 
-async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, transcript?: EffectTranscript): Promise<void> {
+function frameAlreadyReconciledReplyProposal(ids: readonly string[], reply: ShadowTurnExecReply, replyTo?: string): boolean {
+  if (ids.length === 0) return false;
+  const replyIds = new Set([reply.id, replyTo].filter((id): id is string => typeof id === "string" && id.length > 0));
+  return ids.some((id) => replyIds.has(id));
+}
+
+async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, transcript?: EffectTranscript): Promise<string[]> {
   const records = await allTurnProposals();
-  if (records.length === 0 || !current?.actor) return;
+  if (records.length === 0 || !current?.actor) return [];
   const { matched, promote, replan } = v2ReconcileTurnProposalsWithAcceptedFrame(records, {
     scope: frame.position.scope,
     actor: current.actor,
@@ -1114,6 +1212,7 @@ async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, 
       accepted_transcript_hash: frame.transcript_hash
     });
   }
+  return matched.map((record) => record.id);
 }
 
 async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHash?: string): Promise<V2BrowserTurnProposalRecord[]> {

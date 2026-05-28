@@ -883,7 +883,8 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
       session,
       target: key.target,
       verb: key.verb,
-      recipient
+      recipient,
+      keyMode: "transfer_atoms"
     }
   });
 }
@@ -922,7 +923,8 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
       session,
       target: key.target,
       verb: key.verb,
-      recipient
+      recipient,
+      keyMode: "transfer_atoms"
     }
   });
 }

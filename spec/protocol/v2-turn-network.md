@@ -1063,6 +1063,14 @@ installing executable pages: scope/head, actor/session, target/verb, full
 and the signed proof material. A sidecar binding that is not included in the
 proof root is not sufficient.
 
+Open-time executable seed and executable-seed cache-hit transfers arrive during
+scope open without a `reply_to`. A browser MUST still verify their capsule
+binding before installing them: the recipient must match the browser node, the
+actor/session must match the active connection, and the `turn_key` hash must be
+reconstructed from the signed transfer atoms for the reserved open-seed verb.
+Other executable capsule transfers without request correlation are not eligible
+for executable-page install.
+
 `covers` means "this node probably has the state, code, metadata, and log tail."
 `accepts` means "this node is willing to run this target/verb/scope shape."
 
@@ -1554,6 +1562,11 @@ The browser worker SHOULD request executable state with an authenticated
 relay replies with a recipient-bound `StateTransfer`; this repair request MUST
 NOT commit or execute the turn. If repair succeeds, the worker retries local
 planning before selecting a delegated executor.
+
+If an accepted turn-execution reply bundles executable state transfer whose
+capsule fails validation, the browser MUST NOT install the executable pages.
+The accepted commit/projection/transcript portion remains independently
+applicable when its ordinary commit validation succeeds.
 
 The worker MUST cap retries and transferred bytes. A turn that still cannot be
 executed locally after the negotiated retry/byte budget MUST be delegated to
