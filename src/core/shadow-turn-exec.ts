@@ -107,7 +107,21 @@ export type ShadowCellPageTransfer = {
   counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
   source_object_count: number;
   source_page_count: number;
+  capsule?: ShadowExecutionCapsuleMetadata;
   proof: ShadowStateProof;
+};
+
+export type ShadowExecutionCapsuleMetadata = {
+  kind: "woo.execution_capsule_metadata.shadow.v1";
+  scope: ObjRef;
+  head: ShadowScopeHead;
+  actor: ObjRef;
+  session?: string | null;
+  target: ObjRef;
+  verb: string;
+  turn_key_hash: string;
+  recipient: string;
+  expires_at_ms: number;
 };
 
 export type ShadowObjectPageRef = {
@@ -407,6 +421,16 @@ export function buildShadowCellPageTransfer(input: {
   known_page_hashes?: Iterable<string>;
   session?: string | null;
   purpose?: ShadowCellPageTransferPurpose;
+  capsule?: {
+    head: ShadowScopeHead;
+    actor?: ObjRef;
+    session?: string | null;
+    target?: ObjRef;
+    verb?: string;
+    recipient?: string;
+    now?: number;
+    ttlMs?: number;
+  };
 } & ShadowTransferSigning): ShadowCellPageTransfer {
   const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
   const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage));
@@ -434,12 +458,89 @@ export function buildShadowCellPageTransfer(input: {
     // material, which defeats the open-time cache-hit fast path.
     source_page_count: selected.length === 0
       ? 0
-      : input.serialized.objects.reduce((sum, obj) => sum + shadowStatePagesForObject(obj).length, 0)
+      : input.serialized.objects.reduce((sum, obj) => sum + shadowStatePagesForObject(obj).length, 0),
+    ...(input.capsule ? {
+      capsule: shadowExecutionCapsuleMetadata({
+        scope: input.key.scope,
+        key: input.key,
+        head: input.capsule.head,
+        actor: input.capsule.actor,
+        session: input.capsule.session,
+        target: input.capsule.target,
+        verb: input.capsule.verb,
+        recipient: input.capsule.recipient ?? input.recipient ?? "*",
+        now: input.capsule.now,
+        ttlMs: input.capsule.ttlMs
+      })
+    } : {})
   } satisfies Omit<ShadowCellPageTransfer, "proof">;
   return {
     ...transfer,
     proof: signShadowStateTransfer(transfer, input)
   };
+}
+
+function shadowExecutionCapsuleMetadata(input: {
+  scope: ObjRef;
+  key: ShadowTurnKey;
+  head: ShadowScopeHead;
+  actor?: ObjRef;
+  session?: string | null;
+  target?: ObjRef;
+  verb?: string;
+  recipient: string;
+  now?: number;
+  ttlMs?: number;
+}): ShadowExecutionCapsuleMetadata {
+  return {
+    kind: "woo.execution_capsule_metadata.shadow.v1",
+    scope: input.scope,
+    head: structuredClone(input.head) as ShadowScopeHead,
+    actor: input.actor ?? input.key.actor,
+    ...(input.session !== undefined ? { session: input.session } : {}),
+    target: input.target ?? input.key.target,
+    verb: input.verb ?? input.key.verb,
+    turn_key_hash: shadowTurnKeyHash(input.key),
+    recipient: input.recipient,
+    expires_at_ms: (input.now ?? Date.now()) + Math.max(1, input.ttlMs ?? 30_000)
+  };
+}
+
+export function validateShadowExecutionCapsuleTransfer(input: {
+  node: string;
+  transfer: ShadowStateTransfer;
+  scope: ObjRef;
+  key: ShadowTurnKey;
+  actor?: ObjRef;
+  session?: string | null;
+  target?: ObjRef;
+  verb?: string;
+  now?: number;
+}): void {
+  if (input.transfer.mode !== "cell_pages") {
+    throw new Error(`execution capsule transfer must use cell_pages: ${input.transfer.mode}`);
+  }
+  const capsule = input.transfer.capsule;
+  if (!capsule) throw new Error("execution capsule metadata is required");
+  if (capsule.scope !== input.transfer.scope || capsule.scope !== input.scope) {
+    throw new Error("execution capsule scope mismatch");
+  }
+  if (capsule.head.scope !== input.scope) throw new Error("execution capsule head scope mismatch");
+  if (capsule.recipient !== "*" && capsule.recipient !== input.node) {
+    throw new Error(`execution capsule recipient mismatch: capsule=${capsule.recipient} node=${input.node}`);
+  }
+  const actor = input.actor ?? input.key.actor;
+  const target = input.target ?? input.key.target;
+  const verb = input.verb ?? input.key.verb;
+  if (capsule.actor !== actor) throw new Error("execution capsule actor mismatch");
+  if ((capsule.session ?? null) !== (input.session ?? null)) throw new Error("execution capsule session mismatch");
+  if (capsule.target !== target || capsule.verb !== verb) throw new Error("execution capsule call mismatch");
+  if (!constantTimeEqual(capsule.turn_key_hash, shadowTurnKeyHash(input.key))) throw new Error("execution capsule turn key mismatch");
+  if (capsule.expires_at_ms <= (input.now ?? Date.now())) throw new Error("execution capsule expired");
+}
+
+function shadowTurnKeyHash(key: ShadowTurnKey): string {
+  return hashSource(stableShadowJson(key as unknown as WooValue));
 }
 
 export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: ShadowStateTransfer): void {
@@ -905,6 +1006,7 @@ function shadowStateTransferRoot(
       ? {
           ...base,
           ...(transfer.purpose ? { purpose: transfer.purpose } : {}),
+          ...(transfer.capsule ? { capsule: transfer.capsule } : {}),
           page_refs: transfer.page_refs,
           inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
           sessions: transfer.sessions,

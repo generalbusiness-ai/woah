@@ -11,7 +11,7 @@
 // needing a cross-catalog symbol table. Whole-bundle cross-reference
 // (e.g. "$cls:verb does not exist") is a follow-up.
 //
-// Wired into `pretest` so `npm test` blocks on a clean compile.
+// Wired into the test guard script so `npm test` blocks on a clean compile.
 // Run standalone via `npm run catalog:check`.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";

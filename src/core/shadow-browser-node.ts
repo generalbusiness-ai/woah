@@ -683,11 +683,11 @@ export async function openShadowBrowserScope(
   if (cachedDigestMatches) {
     const cacheHitStartedAt = metricNow();
     rememberShadowBrowserOpenExecutableSeedDigest(browser.relay, openSeedCacheKey, cachedOpenSeed!.digest);
-    executableTransfer = buildShadowBrowserOpenExecutableSeedCacheHitTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+    executableTransfer = buildShadowBrowserOpenExecutableSeedCacheHitTransfer(browser.relay, browser.scope, browser.node, browser.actor, browser.session);
     emitV2OpenStep(options, browser, "open_seed_cache_hit_build", cacheHitStartedAt, { executable_transfer_cache: "hit" });
   } else {
     const seedBuildStartedAt = metricNow();
-    const fullExecutableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor);
+    const fullExecutableTransfer = buildShadowBrowserOpenExecutableSeedTransfer(browser.relay, browser.scope, browser.node, browser.actor, browser.session);
     emitV2OpenStep(options, browser, "open_seed_full_build", seedBuildStartedAt, {
       executable_transfer_cache: "miss",
       count: fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.page_refs.length : 1
@@ -847,7 +847,8 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
   relay: ShadowBrowserRelayShim,
   scope: ObjRef,
   recipient: string,
-  actor?: ObjRef
+  actor?: ObjRef,
+  session?: string | null
 ): ShadowStateTransfer {
   // Scope open needs enough executable material for the browser to plan the
   // first durable turn locally. This seed grants only coarse structural atom
@@ -875,7 +876,15 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
     serialized: shadowBrowserOpenExecutableSeedSerialized(serialized, scope, actor),
     key,
     purpose: "open_executable_seed",
-    recipient
+    recipient,
+    capsule: {
+      head: relay.commit_scope.head,
+      actor: actor ?? "",
+      session,
+      target: key.target,
+      verb: key.verb,
+      recipient
+    }
   });
 }
 
@@ -883,7 +892,8 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
   relay: ShadowBrowserRelayShim,
   scope: ObjRef,
   recipient: string,
-  actor?: ObjRef
+  actor?: ObjRef,
+  session?: string | null
 ): ShadowStateTransfer {
   const serialized = serializedFor(relay.commit_scope, { reason: "open_executable_seed_cache_hit" });
   const key: ShadowTurnKey = {
@@ -905,7 +915,15 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
     serialized,
     key,
     purpose: "open_executable_seed_cache_hit",
-    recipient
+    recipient,
+    capsule: {
+      head: relay.commit_scope.head,
+      actor: actor ?? "",
+      session,
+      target: key.target,
+      verb: key.verb,
+      recipient
+    }
   });
 }
 
@@ -1774,7 +1792,15 @@ export function handleShadowBrowserStateTransferEnvelope(
     // cold repair replies reference pages the browser never stored.
     known_page_hashes: request.known_page_hashes ?? [],
     session: browser.session,
-    recipient: browser.node
+    recipient: browser.node,
+    capsule: {
+      head: browser.relay.commit_scope.head,
+      actor: request.key.actor,
+      session: browser.session,
+      target: request.key.target,
+      verb: request.key.verb,
+      recipient: browser.node
+    }
   });
   const response: ShadowEnvelope<ShadowStateTransfer> = {
     v: 2,
@@ -1929,7 +1955,15 @@ async function executeShadowBrowserTurnExecRequest(
         atom_hashes: request.key.atom_hashes,
         known_page_hashes: browser.execution_node.page_hashes,
         session: request.call.session,
-        recipient: browser.node
+        recipient: browser.node,
+        capsule: {
+          head: browser.relay.commit_scope.head,
+          actor: request.key.actor,
+          session: request.call.session,
+          target: request.key.target,
+          verb: request.key.verb,
+          recipient: browser.node
+        }
       });
       if (network.result.reply) {
         network.result.reply.state_transfer = stateTransfer;

@@ -70,11 +70,15 @@ Implementation checklist, current as of 2026-05-27:
    signed state-transfer compatibility, not for row-body-complete accepted-frame
    installs. Execution-cache transcript overlay remains temporary until the
    capsule/write-cell promotion work lands.
-5. In progress: `TurnProposal`/proposal-buffer naming and explicit
-   read/write-cell dependency records are in the browser journal; remaining
-   work is dependency-driven replan/promote behavior.
-6. Remaining: finish execution capsule proof metadata and hash-matched
-   write-cell promotion into store 2.
+5. Done: `TurnProposal`/proposal-buffer naming, explicit read/write-cell
+   dependency records, accepted-frame hash-match promotion, and
+   dependency-driven `needs_replan` marking are in the browser journal/worker.
+6. Done for repair/open-seed transfers: cell-page execution capsule metadata is
+   carried on browser executable transfers, included in the signed state proof
+   root, and checked against pending missing-state repair requests before
+   install. Remaining convergence work is retiring the compatibility
+   transcript-replay overlay once store-2 write-cell materialization fully
+   replaces it.
 
 ### One receiver profile, applied across the whole transfer family
 
@@ -243,7 +247,7 @@ These are the same for gateway and browser; the browser inherits them.
 - **`ExecutionCapsuleTransfer` = `ShadowCellPageTransfer` + signed capsule
   metadata**, not a new primitive (`installShadowStateTransfer` already handles
   `cell_pages`, `shadow-turn-exec.ts:461`). Metadata (`head`, `actor`, `session`,
-  `target`, `verb`, `turn_key`, `recipient`, `expires_at_ms`, page refs) MUST be
+  `target`, `verb`, `turn_key_hash`, `recipient`, `expires_at_ms`, page refs) MUST be
   covered by the signed proof — extend `ShadowStateProof` (today binds only
   scope/mode/root/recipient, `shadow-turn-exec.ts:119`); a sidecar is
   insufficient. `closure`/`object_records` are dropped from the hot path.
@@ -313,11 +317,12 @@ These are the same for gateway and browser; the browser inherits them.
 - Flag `WOO_BROWSER_PROJECTION_HOLDER`, default off; off = legacy
   `ShadowStateTransfer`/full-world-checkpoint/transcript-replay path. Disables
   only this path.
-- Spec edits: receiver-profiled projection types and browser cache ownership are
-  already in VTN14. Remaining spec work is narrower: final `TurnProposal` and
-  `ProposalProjectionOverlay` record shapes, proposal dependency lifecycle,
-  write-cell promotion, and the eventual removal of compatibility byte fields
-  from common `ProjectionDeltaSummary`/`RowOp`.
+- Spec edits: receiver-profiled projection types, browser cache ownership,
+  `TurnProposal`/`ProposalProjectionOverlay`, proposal dependency lifecycle, and
+  capsule proof metadata are in VTN14. Remaining spec work is the eventual
+  removal of compatibility byte fields from common `ProjectionDeltaSummary`/
+  `RowOp` and the final replacement of transcript replay with materialized
+  store-2 write cells.
 - Migration: none (Cloudflare DO). IndexedDB schema versioned, idempotent.
 - Metrics: accepted-frame install cost (`projection_rows_written`,
   `browser_checkpoint_bytes`, `browser_capsule_bytes`) vs proposal lifecycle

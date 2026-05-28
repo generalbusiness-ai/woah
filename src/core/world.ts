@@ -4007,8 +4007,8 @@ export class WooWorld {
   objectRoutes(): Array<{ id: ObjRef; host: string; anchor: ObjRef | null }> {
     // Use the same lookup as hostKeyForObject so legacy class-level
     // host_placement defaults, explicit instance properties, and anchored
-    // routes classify consistently. New self-hosting classes use
-    // instances_self_host at create time, which stamps host_placement on
+    // routes classify consistently. New self-hosting classes use a
+    // class-level self-placement marker at create time, which stamps host_placement on
     // each instance rather than routing class objects themselves.
     const selfHosted = new Set<ObjRef>();
     for (const id of this.objects.keys()) {
@@ -5284,7 +5284,7 @@ export class WooWorld {
       const progr = options.progr ?? owner;
       this.assertCanCreateObject(progr, parent, owner);
       // Self-hosted instances cannot be anchored. Per
-      // spec/semantics/objects.md §4.1, combining `instances_self_host = true`
+      // spec/semantics/objects.md §4.1, combining the self-placement marker
       // with a non-null anchor would route the instance to its own DO (rule 1)
       // while declaring it a member of another cluster, breaking
       // co-residency. The recycle anchored-descendants check (recycle.md
@@ -5316,7 +5316,7 @@ export class WooWorld {
       if (typeof options.name === "string") this.setProp(id, "name", options.name);
       if (typeof options.description === "string") this.setProp(id, "description", options.description);
       if (Array.isArray(options.aliases) && options.aliases.length > 0) this.setProp(id, "aliases", options.aliases);
-      // When the resolved class declares `instances_self_host: true`,
+      // When the resolved class declares self-placement for instances,
       // the routing layer expects the new instance to carry
       // `host_placement: "self"` so its own DO becomes the host root.
       // Without this, the class-level signal is the only marker — and
@@ -6196,11 +6196,11 @@ export class WooWorld {
     const contentsExpanded = new Set<ObjRef>();
     // Value-ref tracing surfaces runtime instances named directly or one
     // wrapper level deep inside a property value. Examples that must work:
-    //   `exit.dest = "the_deck"`                          (direct string)
-    //   `the_chatroom.exits = { southeast: "exit_x" }`    (one-level map)
-    //   `the_actor.inventory = ["the_mug", "the_lamp"]`   (one-level array)
+    //   `exit.dest = "room_ref"`                          (direct string)
+    //   `room.exits = { southeast: "exit_ref" }`          (one-level map)
+    //   `actor.inventory = ["item_a", "item_b"]`          (one-level array)
     // We deliberately do NOT recurse without limit: deeply nested catalog
-    // tables (e.g. `the_dubspace.scenes_history = [{ drum: "$drum_loop", … }]`)
+    // tables (e.g. `room.scene_history = [{ drum: "$loop_class", ... }]`)
     // would otherwise drag the entire reachable-instance graph into every
     // slice. The wrapper (an array/map directly stored as the property
     // value) is followed; references inside *that* wrapper's string/array/
@@ -6209,8 +6209,8 @@ export class WooWorld {
     //
     // When we surface a runtime ref through this walk, we mark its push with
     // `traceValues: true` so the *target* gets one more hop of value-tracing
-    // (e.g. `the_chatroom.exits.southeast = exit_x` then `exit_x.dest =
-    // the_deck`). The cascade stops at the target's targets — `the_deck`'s
+    // (e.g. `room.exits.southeast = exit_ref` then `exit_ref.dest =
+    // room_ref`). The cascade stops at the target's targets — the room's
     // own exits do not pull in their destinations.
     const VALUE_TRACE_MAX_DEPTH = 2;
     const pushValueRefs = (value: WooValue, depth = 0, propagate = true): void => {

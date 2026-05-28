@@ -1,5 +1,8 @@
 {
-  "src/core/world.ts": {
+  "src/core/catalog-installer.ts": {
     "instances_self_host": 3
+  },
+  "src/core/world.ts": {
+    "instances_self_host": 4
   }
 }

@@ -616,7 +616,7 @@ export class PersistentObjectDO {
     // state change (and could regress a newer head that arrived first). A cold
     // shard that has never seen this scope has no head row and falls through.
     // Out-of-order fanout is prevented upstream by sequencing against this same
-    // head (see durableProjectionHeadSeq); the guard here is the backstop.
+    // head (see durableProjectionHeadSeq); this guard is the final protection.
     const existingHead = this.gatewayProjectionHeadSeq(authorityScope);
     if (existingHead != null && position.seq <= existingHead) return { rows: 0, bytes: 0 };
     this.state.storage.transactionSync(() => {
@@ -4212,8 +4212,8 @@ export class PersistentObjectDO {
     // a host whose remote fetch we attempted-and-omitted. exportAuthoritySlice
     // expands the request through parent chain, contents, value-refs, and verb
     // bytecode literals, so `local.authority` carries far more than the
-    // explicit `ids`: requesting `the_chatroom` also pulls in
-    // exit_living_room_southeast, the_deck (via exit.dest), etc.
+    // explicit `ids`: requesting a room also pulls in its exit objects,
+    // destination rooms surfaced through exit.dest, etc.
     // We classify every object in `local.authority` by host, then drop only
     // those whose host appears in `omittedHosts` (populated below from
     // tolerated remote-fetch timeouts or commit-scope snapshot fallback).

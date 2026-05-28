@@ -172,6 +172,15 @@ Maintain local dirty-state regression tests and run `npm run smoke:cf-local`
 before CF.  If a smoke-test fails: stop, inspect tail/metrics, and only
 re-run when strong new signals will be available.
 
+**Test selection discipline**
+
+Use targeted Vitest files for the code just changed (`npm run test:files --
+tests/path.test.ts`), then run `npm test` as the fast guarded local gate. `npm
+test` is intentionally not the entire Vitest corpus; it keeps the default
+validation loop bounded. Run `npm run test:worker` for Worker/Cloudflare-shape
+changes, and reserve `npm run test:full` for an explicit slow all-files sweep
+before broad merges or when a targeted signal is not enough.
+
 ## Migrations
 
 woo has several distinct migration kinds. Pick by the *kind of state* the
@@ -193,7 +202,11 @@ must include a vitest case before it lands.
 
 - `npm run guard:object-names` enforces a subset of the naming rule.
 - `npm run guard:catalog-migrations` requires a `migration-v(N-1)-to-vN.json` for every bundled catalog at major version N.
-- `npm test` — vitest (runs `catalog:index` + `guard:object-names` + `guard:catalog-migrations` first).
+- `npm test` — fast guarded Vitest gate (runs `catalog:index` and all guards first).
+- `npm run test:guards` — catalog index/check plus all local guard scripts.
+- `npm run test:files -- tests/name.test.ts` — targeted Vitest files for the code just changed.
+- `npm run test:worker` — slow Worker/Cloudflare-shape and MCP smoke Vitest lane.
+- `npm run test:full` — slow all-files Vitest sweep; run deliberately, not as the default inner loop.
 - `npm run typecheck` — both tsconfigs.
 - `npm run dev` — local dev server at `http://localhost:5173`.
 - `npm run cf:migrations:check` — wrangler DO migrations in sync.

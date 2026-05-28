@@ -131,6 +131,57 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
   });
 
+  it("rejects executable state-transfer replies that are not bound to a pending request", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-orphan-state");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-orphan-state",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-orphan-state",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-orphan-state"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-orphan-state",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-orphan-state", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-orphan-state", opened.transfer.kind, opened.transfer)));
+
+    socket.receive(encodeEnvelope({
+      ...relayEnvelope(browser, "exec-state-orphan", opened.executable_transfer.kind, opened.executable_transfer),
+      reply_to: "missing-state-repair"
+    }));
+
+    const error = await waitForMessage(posted, (message) => isKind(message, "error"));
+    expect((error as { error?: unknown }).error).toMatch(/no pending request/);
+    expect(posted.some(isReadyStatus)).toBe(false);
+  });
+
   it("opens from a checkpoint/tail transfer without requiring the legacy display transfer", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();

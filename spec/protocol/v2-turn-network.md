@@ -1037,6 +1037,32 @@ rollout callers may then perform the legacy seed bootstrap and retry the
 envelope without the capsule. If the capsule's head is behind the scope head,
 the ordinary stale-head repair path applies.
 
+Executable cell-page transfers served for browser execution use the same
+`woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule
+metadata covered by the state proof root:
+
+```ts
+type ExecutionCapsuleMetadata = {
+  kind: "woo.execution_capsule_metadata.v1";
+  scope: ScopeRef;
+  head: ScopeHead;
+  actor: ActorRef;
+  session?: SessionRef | null;
+  target: ObjRef;
+  verb: string;
+  turn_key_hash: Hash;
+  recipient: string;
+  expires_at_ms: number;
+};
+```
+
+When a browser receives a state-transfer reply to a missing-state repair
+request, it MUST verify both the transfer proof and the capsule binding before
+installing executable pages: scope/head, actor/session, target/verb, full
+`turn_key` hash, recipient, expiry, and page refs must match the pending request
+and the signed proof material. A sidecar binding that is not included in the
+proof root is not sufficient.
+
 `covers` means "this node probably has the state, code, metadata, and log tail."
 `accepts` means "this node is willing to run this target/verb/scope shape."
 
@@ -1652,16 +1678,23 @@ This means a same-actor chain such as `enter` followed immediately by
 network still sequences both turns; the journal is a local composed read view,
 not a commit authority.
 
-When the authoritative reply accepts a turn, the browser removes the matching
+When the authoritative path accepts a turn, the browser removes the matching
 tentative row by turn id or transcript hash, stores the accepted frame and
 accepted transcript, and lets future plans compose from the committed tail or a
-new checkpoint. In Phase 1 those operations are separate idempotent cache
-updates driven by the same inbound reply: projection rows are installed before
-the scope head advances, applied frames are de-duplicated by `(scope, seq)`, and
-tentative cleanup matches by turn id or transcript hash. A worker may therefore
-observe a transient split between optimistic and canonical display layers during
-frame processing, but the split MUST NOT authorize VM reads from `projection_rows`
-or advance executable state without verified pages/transcripts. The head-last,
+new checkpoint. If catch-up supplies only an accepted frame, a transcript-hash
+match against a local proposal promotes that proposal's transcript into the
+accepted transcript tail; an id-only match with a different transcript hash
+discards the local proposal and waits for a verified transcript/capsule repair.
+Accepted frames for other turns compare their accepted transcript writes against
+each pending proposal's `depends_on`; touched proposals are marked
+`needs_replan` and no longer participate in local execution composition. In
+Phase 1 those operations are separate idempotent cache updates driven by the
+same inbound frame/reply: projection rows are installed before the scope head
+advances, applied frames are de-duplicated by `(scope, seq)`, and tentative
+cleanup matches by turn id or transcript hash. A worker may therefore observe a
+transient split between optimistic and canonical display layers during frame
+processing, but the split MUST NOT authorize VM reads from `projection_rows` or
+advance executable state without verified pages/transcripts. The head-last,
 non-atomic projection-row install order is the intended Phase 1 durability
 contract: a crash before head advance leaves the previous head and forces a
 cold-open re-fetch, while replay after head advance is duplicate-safe. A later

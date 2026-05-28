@@ -57,7 +57,7 @@ The normative specs are documented in [spec/](spec/).
 ```sh
 npm install
 cp .dev.vars.example .dev.vars   # safe defaults for local dev
-npm test
+npm test                          # fast guarded local gate
 npm run dev
 ```
 

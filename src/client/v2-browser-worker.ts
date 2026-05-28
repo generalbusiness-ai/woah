@@ -4,7 +4,7 @@ import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import { applyShadowScopeProjectionPatch, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
-import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../core/shadow-turn-exec";
+import { validateShadowExecutionCapsuleTransfer, type ShadowStateTransfer, type ShadowTurnExecReply, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import type { ObjRef, WooValue } from "../core/types";
 import type {
   CheckpointTailOpenTransfer
@@ -25,6 +25,8 @@ import {
   v2ProposalTranscriptChain,
   v2TurnProposalForInvalidation,
   v2TurnProposalMatches,
+  v2ReconcileTurnProposalsWithAcceptedFrame,
+  v2TurnProposalNeedsReplanRecord,
   type V2BrowserTurnProposalRecord
 } from "./v2-browser-journal";
 import {
@@ -134,7 +136,16 @@ let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
 let inboundFrameQueue: Promise<void> = Promise.resolve();
-const pendingStateTransfers = new Map<string, { resolve: () => void; reject: (err: Error) => void; timer: number }>();
+const pendingStateTransfers = new Map<string, {
+  request: ShadowExecutableStateTransferRequest;
+  node: string;
+  actor?: ObjRef;
+  session?: string | null;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  timer: number;
+}>();
+const pendingTurnExecRequests = new Map<string, ShadowTurnExecRequest>();
 const postedAppliedFrameKeys = new Set<string>();
 
 type V2WorkerScope = {
@@ -471,13 +482,18 @@ async function receiveFrame(encoded: string): Promise<void> {
     const receivedCompleteCheckpointTail = receivedCheckpointTail && checkpointTailOpenTransferIsComplete(envelope.body);
     const receivedExecutableStateTransfer = receivedStateTransfer && isExecutableStateTransfer(envelope.body);
     const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
+    if (receivedStateTransfer && envelope.reply_to) validatePendingStateTransferReply(envelope.reply_to, envelope.body);
+    if (envelope.type === "woo.turn.exec.reply.shadow.v1") await validateTurnExecReplyStateTransfer(envelope as ShadowEnvelope<ShadowTurnExecReply>);
     const mutations = v2BrowserCacheMutationsForEnvelope(envelope);
     mutationCount = mutations.length;
     for (const mutation of mutations) {
       const applied = await applyCacheMutation(mutation);
       if (mutation.kind === "projection") postProjection(mutation.scope, mutation.head, mutation.projection);
       if (applied?.kind === "projection") postProjection(applied.scope, applied.head, applied.projection);
-      if (applied?.kind === "applied_frame") postAppliedFrame(applied.frame, applied.transcript);
+      if (applied?.kind === "applied_frame") {
+        await reconcileAcceptedFrameWithProposals(applied.frame, applied.transcript);
+        postAppliedFrame(applied.frame, applied.transcript);
+      }
       if (mutation.kind === "object_page" || mutation.kind === "state_page" || mutation.kind === "state_pages") installedExecutableState = true;
     }
     if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
@@ -963,7 +979,15 @@ async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableSta
       pendingStateTransfers.delete(id);
       reject(new Error("state transfer request timed out"));
     }, 5000);
-    pendingStateTransfers.set(id, { resolve, reject, timer });
+    pendingStateTransfers.set(id, {
+      request: envelope.body,
+      node: envelope.from,
+      actor: envelope.actor,
+      session: envelope.session ?? null,
+      resolve,
+      reject,
+      timer
+    });
   });
   sendEncoded(encoded);
   try {
@@ -992,6 +1016,51 @@ async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableSta
   }
 }
 
+function validatePendingStateTransferReply(replyTo: string, body: unknown): void {
+  const pending = pendingStateTransfers.get(replyTo);
+  if (!pending) throw new Error("state transfer reply has no pending request");
+  validateShadowExecutionCapsuleTransfer({
+    node: pending.node,
+    transfer: body as ShadowStateTransfer,
+    scope: pending.request.scope,
+    key: pending.request.key,
+    actor: pending.actor ?? pending.request.key.actor,
+    session: pending.session ?? null,
+    target: pending.request.key.target,
+    verb: pending.request.key.verb
+  });
+}
+
+async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<ShadowTurnExecReply>): Promise<void> {
+  const reply = envelope.body;
+  if (!reply.state_transfer) return;
+  if (!envelope.reply_to) throw new Error("turn execution state transfer is missing reply_to");
+  const request = pendingTurnExecRequests.get(envelope.reply_to) ?? await pendingTurnExecRequest(envelope.reply_to);
+  if (!request) throw new Error("turn execution state transfer has no pending request");
+  validateShadowExecutionCapsuleTransfer({
+    node: current?.node ?? "",
+    transfer: reply.state_transfer,
+    scope: request.key.scope,
+    key: request.key,
+    actor: request.call.actor,
+    session: request.call.session ?? null,
+    target: request.call.target,
+    verb: request.call.verb
+  });
+}
+
+async function pendingTurnExecRequest(id: string): Promise<ShadowTurnExecRequest | null> {
+  const pending = await getPending(id);
+  if (!pending) return null;
+  try {
+    const envelope = decodeEnvelope(pending.encoded);
+    if (envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+    return envelope.body as ShadowTurnExecRequest;
+  } catch {
+    return null;
+  }
+}
+
 function resolvePendingStateTransfer(id: string): void {
   const pending = pendingStateTransfers.get(id);
   if (!pending) return;
@@ -1012,6 +1081,38 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
     const reason = reply.commit?.reason ?? "commit_rejected";
     if (!shouldInvalidateTentativeTurnForCommitReason(reason)) return;
     await invalidateTentativeTurn(ids[0], reason, ids, reply.transcript?.hash);
+  }
+}
+
+async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, transcript?: EffectTranscript): Promise<void> {
+  const records = await allTurnProposals();
+  if (records.length === 0 || !current?.actor) return;
+  const { matched, promote, replan } = v2ReconcileTurnProposalsWithAcceptedFrame(records, {
+    scope: frame.position.scope,
+    actor: current.actor,
+    session: current.session ?? null
+  }, frame, transcript);
+  for (const record of matched) {
+    // If catch-up supplies only the accepted frame, a hash match proves the
+    // local transcript is the accepted one. Promote it into the executable
+    // transcript tail so later local turns do not keep using it as tentative.
+    if (promote.includes(record)) {
+      await putTranscript(record.transcript, frame.position.seq);
+      await maybeCheckpointCommittedTranscripts(record.scope);
+    }
+    await deleteTurnProposal(record.id);
+  }
+  for (const record of replan) {
+    await putTurnProposal(v2TurnProposalNeedsReplanRecord(record));
+  }
+  if (matched.length > 0) postMessage({ kind: "local_turn_committed", ids: matched.map((record) => record.id) });
+  if (replan.length > 0) {
+    postMessage({
+      kind: "local_turn_needs_replan",
+      ids: replan.map((record) => record.id),
+      accepted_seq: frame.position.seq,
+      accepted_transcript_hash: frame.transcript_hash
+    });
   }
 }
 
@@ -1063,6 +1164,7 @@ async function sendTurnExecEnvelope(id: string, request: ShadowTurnExecRequest, 
     auth_token: current.token,
     from: current.node
   };
+  pendingTurnExecRequests.set(envelope.id, request);
   if (options.persistBeforeSend === false && socket?.readyState === WebSocket.OPEN) {
     sendEncoded(encoded);
     void putPending(pending).catch((err: unknown) => {
@@ -1180,12 +1282,17 @@ async function putPending(value: PendingEnvelope): Promise<void> {
 }
 
 async function deletePending(id: string): Promise<void> {
+  pendingTurnExecRequests.delete(id);
   await tx(PENDING_STORE, "readwrite", (store) => store.delete(id));
 }
 
 async function allPending(): Promise<PendingEnvelope[]> {
   const pending = await tx<PendingEnvelope[]>(PENDING_STORE, "readonly", (store) => store.getAll());
   return pending.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
+}
+
+async function getPending(id: string): Promise<PendingEnvelope | undefined> {
+  return await tx<PendingEnvelope | undefined>(PENDING_STORE, "readonly", (store) => store.get(id));
 }
 
 async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<

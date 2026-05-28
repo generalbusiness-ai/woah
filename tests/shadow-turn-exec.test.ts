@@ -13,7 +13,8 @@ import {
   executeShadowRecordedTurnOrNeedState,
   executeShadowTurnCallOrNeedState,
   installShadowStateTransfer,
-  missingAtomsForShadowTurn
+  missingAtomsForShadowTurn,
+  validateShadowExecutionCapsuleTransfer
 } from "../src/core/shadow-turn-exec";
 import { shadowObjectLivePage, shadowStatePageHash } from "../src/core/shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
@@ -1164,6 +1165,88 @@ describe("shadow turn execution", () => {
     });
     expect(() => installShadowStateTransfer(createShadowExecutionNode({ node: "actor-node", scope: key.scope }), wrongSecret))
       .toThrow(/signature mismatch/);
+  });
+
+  it("binds cell-page execution capsule metadata into the transfer proof", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-capsule-proof");
+    const actor = session.actor;
+    await anchor.directCall("shadow-capsule-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+
+    const serializedBefore = anchor.exportWorld();
+    const commitScope = createShadowCommitScope({ node: "anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-capsule-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.57]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const transfer = buildShadowCellPageTransfer({
+      serialized: serializedBefore,
+      key,
+      atom_hashes: key.atom_hashes,
+      session: session.id,
+      recipient: "actor-node",
+      capsule: {
+        head: commitScope.head,
+        actor,
+        session: session.id,
+        target: key.target,
+        verb: key.verb,
+        recipient: "actor-node"
+      }
+    });
+
+    validateShadowExecutionCapsuleTransfer({
+      node: "actor-node",
+      transfer,
+      scope: key.scope,
+      key,
+      actor,
+      session: session.id,
+      target: key.target,
+      verb: key.verb
+    });
+    installShadowStateTransfer(createShadowExecutionNode({ node: "actor-node", scope: key.scope }), transfer);
+
+    const tamperedVerb = structuredClone(transfer);
+    if (tamperedVerb.mode !== "cell_pages" || !tamperedVerb.capsule) throw new Error("expected capsule transfer");
+    tamperedVerb.capsule.verb = "look";
+    expect(() => installShadowStateTransfer(createShadowExecutionNode({ node: "actor-node", scope: key.scope }), tamperedVerb))
+      .toThrow(/root mismatch/);
+
+    const wrongKeyTransfer = buildShadowCellPageTransfer({
+      serialized: serializedBefore,
+      key,
+      atom_hashes: key.atom_hashes,
+      session: session.id,
+      recipient: "actor-node",
+      capsule: {
+        head: commitScope.head,
+        actor,
+        session: session.id,
+        target: key.target,
+        verb: key.verb,
+        recipient: "actor-node"
+      }
+    });
+    const wrongKey = { ...key, verb: "look" };
+    expect(() => validateShadowExecutionCapsuleTransfer({
+      node: "actor-node",
+      transfer: wrongKeyTransfer,
+      scope: key.scope,
+      key: wrongKey,
+      actor,
+      session: session.id,
+      target: wrongKey.target,
+      verb: wrongKey.verb
+    })).toThrow(/call mismatch|turn key mismatch/);
   });
 
   it("aborts during execution when a real dubspace turn touches an unpredicted cell", async () => {
