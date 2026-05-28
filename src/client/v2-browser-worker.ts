@@ -1286,7 +1286,7 @@ async function maybePromoteAcceptedProposalTranscript(frame: ShadowCommitAccepte
   const match = selectV2PendingTurnProposals(await allTurnProposals(), selector)
     .find((record) => record.transcript_hash === frame.transcript_hash);
   if (!match) return false;
-  return await materializeAcceptedProposalWriteTransfer(frame, transcript, match);
+  return await materializeAcceptedTranscriptWriteTransfer(frame, transcript, { proposal: match });
 }
 
 async function materializeAcceptedProposalWriteTransfer(
@@ -1294,15 +1294,31 @@ async function materializeAcceptedProposalWriteTransfer(
   transcript: EffectTranscript,
   proposal: V2BrowserTurnProposalRecord
 ): Promise<boolean> {
-  if (transcript.scope !== frame.position.scope || proposal.scope !== frame.position.scope) return false;
-  // Store-2 write-cell promotion is safe only when the accepted frame is the
-  // immediate successor of the state this proposal executed against. Interleaved
-  // frames continue down the bounded transcript-tail path until dependency-wire
-  // replan can prove the whole local suffix.
-  if (frame.position.seq !== proposal.base_head.seq + 1) return false;
+  return await materializeAcceptedTranscriptWriteTransfer(frame, transcript, { proposal });
+}
+
+async function materializeAcceptedTranscriptWriteTransfer(
+  frame: ShadowCommitAccepted,
+  transcript: EffectTranscript,
+  options: { proposal?: V2BrowserTurnProposalRecord } = {}
+): Promise<boolean> {
+  const proposal = options.proposal;
+  if (transcript.scope !== frame.position.scope || transcript.hash !== frame.transcript_hash) return false;
+  if (proposal && proposal.scope !== frame.position.scope) return false;
+  // Store-2 write-cell promotion for a local proposal is safe only when the
+  // accepted frame is the immediate successor of the state that proposal
+  // executed against. Other accepted transcripts are safe when the local
+  // committed transcript rows cover every accepted sequence since the last
+  // execution checkpoint.
+  if (proposal && frame.position.seq !== proposal.base_head.seq + 1) return false;
   const checkpoint = await getExecutionCheckpoint(frame.position.scope);
   if (checkpoint && frame.position.seq <= checkpoint.through_seq) return true;
-  const afterSeq = checkpoint?.through_seq ?? -1;
+  const records = await allExecutionTransfers();
+  const afterSeq = Math.max(
+    checkpoint?.through_seq ?? 0,
+    acceptedWriteTransferHighWatermark(frame.position.scope, records)
+  );
+  if (frame.position.seq <= afterSeq) return true;
   const rows = (await committedTranscriptRowsForScope(frame.position.scope, afterSeq))
     .filter((row) => (row.accepted_seq ?? row.seq) <= frame.position.seq);
   const rowByHash = new Map(rows.map((row) => [row.hash, row] as const));
@@ -1316,9 +1332,10 @@ async function materializeAcceptedProposalWriteTransfer(
   });
   const committedRows = Array.from(rowByHash.values())
     .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash));
-  const cache = await executionCacheForScope(frame.position.scope, undefined, { skip_checkpoint_build: true });
+  if (!committedRowsCoverAcceptedRange(committedRows, afterSeq, frame.position.seq)) return false;
+  const cache = await executionCacheForScope(frame.position.scope, records, { skip_checkpoint_build: true });
   const promoted = createV2BrowserAcceptedWriteCellTransfer({
-    node: current?.node ?? "browser:proposal-promotion",
+    node: current?.node ?? "browser:accepted-promotion",
     scope: frame.position.scope,
     records: cache.records,
     cached_objects: cache.cached_objects,
@@ -1338,11 +1355,37 @@ async function materializeAcceptedProposalWriteTransfer(
     through_seq: frame.position.seq,
     transcript_count: committedRows.length,
     pruned,
-    reason: "proposal_accept",
-    proposal_id: proposal.id,
+    reason: proposal ? "proposal_accept" : "accepted_transcript",
+    ...(proposal ? { proposal_id: proposal.id } : {}),
     page_count: promoted.pages.length
   });
   return true;
+}
+
+function committedRowsCoverAcceptedRange(rows: readonly TranscriptTailRow[], afterSeq: number, throughSeq: number): boolean {
+  let expected = afterSeq + 1;
+  for (const row of rows) {
+    const seq = row.accepted_seq ?? row.seq;
+    if (seq !== expected) return false;
+    expected++;
+  }
+  return expected === throughSeq + 1;
+}
+
+function acceptedWriteTransferHighWatermark(scope: string, records: readonly V2ExecutableTransferRecord[]): number {
+  let high = 0;
+  for (const record of records) {
+    const transfer = record.transfer;
+    if (
+      record.scope === scope &&
+      transfer.mode === "cell_pages" &&
+      transfer.purpose === "accepted_write_cells" &&
+      transfer.capsule?.head.scope === scope
+    ) {
+      high = Math.max(high, transfer.capsule.head.seq);
+    }
+  }
+  return high;
 }
 
 async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHash?: string): Promise<V2BrowserTurnProposalRecord[]> {
@@ -1565,7 +1608,8 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
       case "applied_frame": {
         await putAppliedFrame(mutation.frame);
         if (mutation.transcript) {
-          const promoted = await maybePromoteAcceptedProposalTranscript(mutation.frame, mutation.transcript);
+          const promoted = await maybePromoteAcceptedProposalTranscript(mutation.frame, mutation.transcript) ||
+            await materializeAcceptedTranscriptWriteTransfer(mutation.frame, mutation.transcript);
           if (!promoted) {
             await putTranscript(mutation.transcript, mutation.frame.position.seq);
             await maybeCheckpointCommittedTranscripts(mutation.transcript.scope);

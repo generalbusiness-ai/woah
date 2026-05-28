@@ -68,8 +68,8 @@ Implementation checklist, current as of 2026-05-27:
    `projection_writes` install through that holder boundary.
 4. Done for display state: legacy `ShadowScopeProjectionPatch` remains only for
    signed state-transfer compatibility, not for row-body-complete accepted-frame
-   installs. Execution-cache transcript overlay remains temporary until the
-   capsule/write-cell promotion work lands.
+   installs. Execution-cache transcript overlay remains only for tentative
+   proposals and non-contiguous accepted-transcript gap fallback.
 5. Done: `TurnProposal`/proposal-buffer naming, explicit read/write-cell
    dependency records, accepted-frame hash-match promotion, and
    dependency-driven `needs_replan` marking are in the browser journal/worker.
@@ -78,11 +78,10 @@ Implementation checklist, current as of 2026-05-27:
    root, checked against pending missing-state repair requests, and checked on
    no-reply open executable seed/cache-hit installs against the active browser
    node, actor, and session. Hash-matched accepted proposals that are the
-   immediate successor of their `base_head` now promote accepted write cells into
-   a signed `accepted_write_cells` execution transfer instead of entering the
-   replay tail. Remaining convergence work is retiring the compatibility
-   transcript-replay overlay for interleaved or non-local accepted transcripts
-   once store-2 write-cell materialization fully replaces it.
+   immediate successor of their `base_head`, plus non-local accepted transcripts
+   that form a contiguous sequence since the last execution checkpoint, now
+   promote accepted write cells into a signed `accepted_write_cells` execution
+   transfer instead of entering the replay tail.
 
 ### One receiver profile, applied across the whole transfer family
 
@@ -352,16 +351,16 @@ These are the same for gateway and browser; the browser inherits them.
 
 - The browser uses the holder row installer for accepted display
   `ProjectionWrite[]`; no `ShadowScopeProjectionPatch` on the row-body-complete
-  accepted-frame path. Transcript replay remains only as the temporary
-  execution-cache overlay until executable capsules/write-cell promotion lands.
+  accepted-frame path. Accepted write-cell promotion keeps contiguous committed
+  transcripts out of the execution replay tail.
 - The only browser-specific state is the `proposal_buffer`; "optimistic" is a
   view over it.
 - No projection row (any profile) satisfies a `TurnKey` atom on any holder; VM
   reads come only from `execution_pages` / authority indexed state. Cold open
   delivers `BrowserProfile` checkpoint pages — never authority-shaped rows.
 - The proposal overlay is a partial `ProposalProjectionOverlay`, never a
-  `ProjectionWrite`; write-cell promotion to store 2 happens only on a
-  transcript-hash-matched accept.
+  `ProjectionWrite`; write-cell promotion to store 2 happens only after an
+  accepted frame supplies a verified transcript and contiguous accepted sequence.
 - The optimistic render path emits zero `idb_tx` on the open-socket path;
   offline/reconnect persists proposals before enqueue; accept is two-phase and
   `(scope,seq)`-idempotent with no flicker.

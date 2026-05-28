@@ -1702,7 +1702,11 @@ transcript/capsule repair.
 An implementation MAY immediately materialize the hash-matched transcript into
 an `accepted_write_cells` executable page transfer instead of writing it to the
 transcript tail when the accepted frame is the immediate successor of the
-proposal's `base_head`.
+proposal's `base_head`. It MAY also materialize a non-local accepted transcript
+into `accepted_write_cells` when the browser has a contiguous accepted
+transcript sequence from the last execution checkpoint through that frame; if
+the sequence has a gap, the browser MUST retain the transcript-tail fallback or
+fetch a verified executable transfer before using the state for VM reads.
 Accepted frames for other turns compare their accepted transcript writes against
 each pending proposal's `depends_on`; touched proposals are marked
 `needs_replan` and no longer participate in local execution composition. In

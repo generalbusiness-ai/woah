@@ -470,8 +470,22 @@ describe("v2 browser worker integration", () => {
       ids: ["needs-replan-scene"],
       accepted_seq: 1
     });
+    expect(await waitForMessage(posted, (message) => isExecutionPromotionFor(message, "the_dubspace", "accepted_transcript"))).toMatchObject({
+      kind: "shadow_browser_execution_promotion",
+      through_seq: 1,
+      transcript_count: 1,
+      reason: "accepted_transcript"
+    });
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        transcript_tail: 0
+      }
+    });
 
     const replanCursor = socket.sent.length;
+    const replanMessageCursor = posted.length;
     socket.receive(encodeEnvelope({
       ...relayEnvelope(browser, "stale-replan-original", "woo.turn.exec.reply.shadow.v1", {
         kind: "woo.turn.exec.reply.shadow.v1",
@@ -496,6 +510,10 @@ describe("v2 browser worker integration", () => {
 
     const replanRequest = await waitForBrowserBuiltExecRequest(browser, socket, "save_scene", undefined, replanCursor);
     expect(replanRequest.id).toBe(replannedEnvelopeId);
+    expect(await waitForMessageFrom(posted, replanMessageCursor, (message) => isComposeViewFor(message, "needs-replan-scene"))).toMatchObject({
+      kind: "shadow_browser_compose_view",
+      committed_transcript_count: 0
+    });
     expect(replanRequest.body).toMatchObject({
       kind: "woo.turn.exec.request.shadow.v1",
       id: "needs-replan-scene",
@@ -1423,7 +1441,7 @@ describe("v2 browser worker integration", () => {
     });
   });
 
-  it("checkpoints accepted transcript replay and reports compose-view stats", async () => {
+  it("promotes contiguous accepted transcripts and reports compose-view stats without replay", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
     vi.stubGlobal("self", scope);
@@ -1481,13 +1499,23 @@ describe("v2 browser worker integration", () => {
       })));
     }
 
-    const checkpoint = await waitForMessage(posted, (message) => isKind(message, "shadow_browser_execution_checkpoint") || isKind(message, "error"));
-    expect(checkpoint).not.toMatchObject({ kind: "error" });
-    expect(checkpoint).toMatchObject({
-      kind: "shadow_browser_execution_checkpoint",
+    const promotion = await waitForMessage(posted, (message) =>
+      isExecutionPromotionFor(message, "the_dubspace", "accepted_transcript") &&
+      (message as { through_seq?: unknown }).through_seq === 8
+    );
+    expect(promotion).toMatchObject({
+      kind: "shadow_browser_execution_promotion",
       scope: "the_dubspace",
-      transcript_count: 8,
-      pruned: 8
+      through_seq: 8,
+      transcript_count: 1,
+      reason: "accepted_transcript"
+    });
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        transcript_tail: 0
+      }
     });
 
     scope.dispatch({
@@ -1503,7 +1531,6 @@ describe("v2 browser worker integration", () => {
     await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
     expect(await waitForMessage(posted, (message) => isComposeViewFor(message, "checkpoint-control-after"))).toMatchObject({
       kind: "shadow_browser_compose_view",
-      checkpoint_seq: 8,
       committed_transcript_count: 0
     });
   });
@@ -1814,6 +1841,10 @@ function isCheckpointTailOpenStatus(message: unknown): boolean {
 
 async function waitForMessage(messages: unknown[], predicate: (message: unknown) => boolean): Promise<unknown> {
   return await waitFor(() => messages.find(predicate));
+}
+
+async function waitForMessageFrom(messages: unknown[], cursor: number, predicate: (message: unknown) => boolean): Promise<unknown> {
+  return await waitFor(() => messages.slice(cursor).find(predicate));
 }
 
 async function waitForMessageIndex(messages: unknown[], predicate: (message: unknown) => boolean): Promise<number> {
