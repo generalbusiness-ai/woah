@@ -312,7 +312,7 @@ These are the same for gateway and browser; the browser inherits them.
 
 | Data-path step | Browser arm |
 |---|---|
-| Step 2 — one `ApplyResult` applier | Transfer family is parameterized by `ProjectionProfile`; browser display state consumes `ProjectionWrite<BrowserProfile>` through `v2-browser-holder-install`. Store-2 write promotion still needs the capsule milestone before `applyShadowTranscriptToCommitScopeCache` can disappear from execution composition. |
+| Step 2 — one `ApplyResult` applier | Transfer family is parameterized by `ProjectionProfile`; browser display state consumes `ProjectionWrite<BrowserProfile>` through `v2-browser-holder-install`. Store-2 write promotion now covers contiguous accepted transcripts; `applyShadowTranscriptToCommitScopeCache` remains only for tentative overlays and non-contiguous accepted-transcript gap fallback. |
 | Step 5 — projection-row cache | Store 1 = the holder cache, browser-safe payload (A2). |
 | Step 6 — same-host stale fallback | Store 1 is the browser's same-host fallback; render at 0 ms, reconcile after. |
 | Step 7 — checkpoint/tail open | Browser open = display catch-up into store 1. |
@@ -328,8 +328,8 @@ These are the same for gateway and browser; the browser inherits them.
   `TurnProposal`/`ProposalProjectionOverlay`, proposal dependency lifecycle, and
   capsule proof metadata are in VTN14. Remaining spec work is the eventual
   removal of compatibility byte fields from common `ProjectionDeltaSummary`/
-  `RowOp` and the final replacement of transcript replay with materialized
-  store-2 write cells.
+  `RowOp`; transcript replay is now a bounded fallback rather than the normal
+  accepted-transcript path.
 - Migration: none (Cloudflare DO). IndexedDB schema versioned, idempotent.
 - Metrics: accepted-frame install cost (`projection_rows_written`,
   `browser_checkpoint_bytes`, `browser_capsule_bytes`) vs proposal lifecycle
@@ -382,13 +382,13 @@ work closes them rather than re-deriving the same divergence.
   `tests/v2-browser-contents-order.test.ts`). The structural-cell *version* hash
   sorts membership (`shadow-cell-version.ts:20`, `Array.from(contents).sort()`),
   so it is order-blind. But two materializers disagree on array order: the
-  snapshot/export path sorts (`world.ts` ~4284 / ~4878), while the
-  transcript-replay applier the browser uses to rebuild its execution node
-  appends (`applyTranscriptContentsWriteRefs` → `addUniqueObjectRef`, via
-  `materializeTranscriptOverlays` → `applyShadowTranscriptToCommitScopeCache`,
-  `v2-browser-execution-cache.ts:152`). A locally-planned follow-up read records
-  the appended order; the authority holds the sorted order; same members, same
-  version, different array → the value comparison rejected it.
+  snapshot/export path sorts (`world.ts` ~4284 / ~4878), while the old
+  transcript-replay applier used by browser execution composition appended
+  (`applyTranscriptContentsWriteRefs` → `addUniqueObjectRef`, via
+  `materializeTranscriptOverlays` → `applyShadowTranscriptToCommitScopeCache`).
+  A locally-planned follow-up read recorded the appended order; the authority
+  held the sorted order; same members, same version, different array → the value
+  comparison rejected it.
 
   Interim fix (landed): the shared transcript validator compares `contents`
   read values as a set, consistent with the version hash
@@ -396,10 +396,8 @@ work closes them rather than re-deriving the same divergence.
   `contents` is order-independent for versioning *and* read-value validation
   (`spec/protocol/v2-turn-network.md` §VTN, cell-version section).
 
-  Convergence requirement: when the browser stops re-running transcript replay
-  and consumes accepted frames through the one shared installer, that installer
-  must define a single canonical `contents` order (or formalize the set
-  semantics end to end) so no producer can emit a divergent array. Until then,
-  any new order-sensitive comparison of a structural set cell is a latent
-  repeat of this bug — keep set-cell value comparisons aligned with the
-  set-based version hash.
+  Convergence requirement: accepted frames now normally materialize contiguous
+  write cells into store 2, but tentative overlays and accepted-transcript gap
+  fallback can still run transcript replay. Any new order-sensitive comparison
+  of a structural set cell is a latent repeat of this bug — keep set-cell value
+  comparisons aligned with the set-based version hash.

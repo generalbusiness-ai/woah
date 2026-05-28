@@ -1994,8 +1994,9 @@ spreading.
 3. **IndexedDB execution cache.** The browser worker persists verified
    executable pages with proof metadata, installs an open-time executable seed
    for the current scope, reconstructs an execution node from IndexedDB, and
-   refuses to use projection rows for VM reads. Accepted transcript replay is
-   bounded by per-scope execution checkpoints.
+   refuses to use projection rows for VM reads. Contiguous accepted transcripts
+   are materialized into accepted write-cell pages; transcript replay remains a
+   bounded fallback for gaps and tentative overlays.
 4. **Missing-state repair.** Browser local execution requests closure
    transfers on `E_NEED_STATE`, verifies and installs pages, then retries the
    same turn id locally before delegation.
