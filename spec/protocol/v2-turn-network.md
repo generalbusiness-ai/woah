@@ -1590,15 +1590,47 @@ accepted frame confirms, invalidates, or is independent of each optimistic turn:
 turn id, base head, predicted atoms, read cells, write cells, transcript hash,
 and UI patch id.
 
-A browser-local pending turn is conceptually a `TurnProposal`: a locally
-produced `TurnExecRequest` plus transcript hash, read/write cells, and a partial
-projection overlay. The overlay is not a `ProjectionWrite`; it is rendered only
-through UCM21's pending optimistic layer. Phase 1 stores this material in the
-`tentative_turns` journal rather than exposing final `TurnProposal` or
-`ProposalProjectionOverlay` record names. On an open WebSocket, the browser may
-render the proposal before awaiting IndexedDB persistence and then journal it
-best-effort. On queued/offline/reconnect paths, the proposal MUST be persisted
-before it is enqueued for replay.
+A browser-local pending turn is a `TurnProposal`: a locally produced
+`TurnExecRequest` plus transcript hash, dependency cells, write cells, and a
+partial projection overlay. The overlay is not a `ProjectionWrite`; it is
+rendered only through UCM21's pending optimistic layer. Phase 1 stores this
+material in the existing `tentative_turns` IndexedDB object store for
+compatibility, but new rows use the protocol names below. On an open WebSocket,
+the browser may render the proposal before awaiting IndexedDB persistence and
+then journal it best-effort. On queued/offline/reconnect paths, the proposal
+MUST be persisted before it is enqueued for replay.
+
+```ts
+type TurnProposal = {
+  kind: "woo.turn_proposal.v1";
+  id: TurnId;
+  scope: ScopeRef;
+  actor: ActorRef;
+  session?: SessionRef | null;
+  base_head: ScopeHead;
+  transcript_hash: Hash;
+  transcript: EffectTranscript;
+  depends_on: Array<{ cell: CellRef; version?: Hash | string }>;
+  write_cells: Array<{ cell: CellRef; prior?: Hash | string; next?: Hash | string; op: string }>;
+  state_probe_cells: CellRef[];
+  predicted_overlay?: ProposalProjectionOverlay | null;
+  status: "pending" | "needs_replan";
+  created_at: number;
+};
+
+type ProposalProjectionOverlay = {
+  kind: "woo.proposal_projection_overlay.v1";
+  id: TurnId;
+  scope: ScopeRef;
+  result_known: boolean;
+  authoritative_projection: false;
+};
+```
+
+`depends_on` is the union of transcript reads and state probes. It is the
+browser's replan predicate for later accepted frames; it is not commit
+authority. `write_cells` is eligible for executable-store promotion only when a
+later accepted frame for the same turn has the same `transcript_hash`.
 
 #### VTN14.5.1 Phase 1 tentative journal
 

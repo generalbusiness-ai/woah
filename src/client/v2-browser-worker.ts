@@ -18,14 +18,14 @@ import { createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTra
 import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
 import { shouldInvalidateTentativeTurnForCommitReason } from "./v2-browser-optimistic-lifecycle";
 import {
-  selectV2PendingTentativeTurns,
-  v2BrowserTentativeTurnRecord,
+  selectV2PendingTurnProposals,
+  v2BrowserTurnProposalRecord,
   V2_BROWSER_TENTATIVE_JOURNAL_LIMIT,
-  v2TentativeJournalHasCapacity,
-  v2TentativeTranscriptChain,
-  v2TentativeTurnForInvalidation,
-  v2TentativeTurnMatches,
-  type V2BrowserTentativeTurnRecord
+  v2ProposalBufferHasCapacity,
+  v2ProposalTranscriptChain,
+  v2TurnProposalForInvalidation,
+  v2TurnProposalMatches,
+  type V2BrowserTurnProposalRecord
 } from "./v2-browser-journal";
 import {
   installV2BrowserAcceptedFrameProjection,
@@ -76,7 +76,7 @@ type V2CacheStatus = {
   execution_transfers: number;
   execution_ads: number;
   execution_checkpoints: number;
-  tentative_turns: number;
+  proposals: number;
   executable_scopes: string[];
   local_execution_ready?: boolean;
   last_hello?: unknown;
@@ -118,7 +118,7 @@ const OBJECT_PAGE_STORE = "object_pages";
 const STATE_PAGE_STORE = "state_pages";
 const EXECUTION_TRANSFER_STORE = "execution_transfers";
 const EXECUTION_AD_STORE = "execution_ads";
-const TENTATIVE_TURN_STORE = "tentative_turns";
+const PROPOSAL_STORE = "tentative_turns";
 const EXECUTION_CHECKPOINT_STORE = "execution_checkpoints";
 const V2_BROWSER_COMMITTED_TRANSCRIPT_CHECKPOINT_INTERVAL = 8;
 
@@ -728,9 +728,9 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     return false;
   }
   const selector = { scope, actor: current.actor, session: current.session ?? null };
-  const tentativeRecords = selectV2PendingTentativeTurns(await allTentativeTurns(), selector);
-  if (persistence === "durable" && !v2TentativeJournalHasCapacity(tentativeRecords, selector, V2_BROWSER_TENTATIVE_JOURNAL_LIMIT)) {
-    postTurnUnavailable(command, "tentative_journal_full");
+  const proposals = selectV2PendingTurnProposals(await allTurnProposals(), selector);
+  if (persistence === "durable" && !v2ProposalBufferHasCapacity(proposals, selector, V2_BROWSER_TENTATIVE_JOURNAL_LIMIT)) {
+    postTurnUnavailable(command, "proposal_buffer_full");
     postMessage({ kind: "local_turn_journal_full", ...turnDiagnostic(command, persistence), limit: V2_BROWSER_TENTATIVE_JOURNAL_LIMIT });
     return true;
   }
@@ -770,7 +770,7 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
       cached_pages: executionCache.cached_pages,
       execution_checkpoint: executionCache.checkpoint,
       committed_transcripts: executionCache.committed_transcripts,
-      tentative_transcripts: v2TentativeTranscriptChain(tentativeRecords, selector),
+      tentative_transcripts: v2ProposalTranscriptChain(proposals, selector),
       onCompose: (stats) => postMessage({
         kind: "shadow_browser_compose_view",
         ...turnDiagnostic(command, persistence),
@@ -841,23 +841,30 @@ async function sendLocalTurnExec(command: Extract<V2WorkerCommand, { kind: "call
     });
     return false;
   }
-  const tentativeRecord = persistence === "durable"
-    ? v2BrowserTentativeTurnRecord({
+  const proposal = persistence === "durable"
+    ? v2BrowserTurnProposalRecord({
       id: command.id,
       scope,
       actor: current.actor,
       session: current.session ?? null,
       base_head: cachedHead,
-      transcript: local.transcript
+      transcript: local.transcript,
+      predicted_overlay: {
+        kind: "woo.proposal_projection_overlay.v1",
+        id: command.id,
+        scope,
+        result_known: local.result_known,
+        authoritative_projection: false
+      }
     })
     : null;
   const socketOpen = socket?.readyState === WebSocket.OPEN;
   if (local.result_known) {
     postMessage({ kind: "turn_result", frame: local.optimistic_frame, optimistic: true });
   }
-  if (tentativeRecord) {
-    if (socketOpen) void journalTentativeTurn(tentativeRecord, "fire_and_forget");
-    else await journalTentativeTurn(tentativeRecord, "before_enqueue");
+  if (proposal) {
+    if (socketOpen) void journalTurnProposal(proposal, "fire_and_forget");
+    else await journalTurnProposal(proposal, "before_enqueue");
   }
   await sendTurnExecEnvelope(command.id, local.request, { persistBeforeSend: !socketOpen });
   postMessage({
@@ -1008,18 +1015,18 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
   }
 }
 
-async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHash?: string): Promise<V2BrowserTentativeTurnRecord[]> {
-  const records = await allTentativeTurns();
-  const matched = records.filter((record) => v2TentativeTurnMatches(record, ids, transcriptHash));
-  for (const record of matched) await deleteTentativeTurn(record.id);
+async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHash?: string): Promise<V2BrowserTurnProposalRecord[]> {
+  const records = await allTurnProposals();
+  const matched = records.filter((record) => v2TurnProposalMatches(record, ids, transcriptHash));
+  for (const record of matched) await deleteTurnProposal(record.id);
   return matched;
 }
 
 async function invalidateTentativeTurn(id: string, reason: string, ids: readonly string[] = [id], transcriptHash?: string): Promise<void> {
-  const records = await allTentativeTurns();
-  const anchor = v2TentativeTurnForInvalidation(records, ids, transcriptHash);
+  const records = await allTurnProposals();
+  const anchor = v2TurnProposalForInvalidation(records, ids, transcriptHash);
   if (!anchor) return;
-  await deleteTentativeTurn(anchor.id);
+  await deleteTurnProposal(anchor.id);
   postMessage({
     kind: "local_turn_invalidated",
     id,
@@ -1144,7 +1151,7 @@ async function db(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(STATE_PAGE_STORE)) database.createObjectStore(STATE_PAGE_STORE, { keyPath: "hash" });
       if (!database.objectStoreNames.contains(EXECUTION_TRANSFER_STORE)) database.createObjectStore(EXECUTION_TRANSFER_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(EXECUTION_AD_STORE)) database.createObjectStore(EXECUTION_AD_STORE, { keyPath: "id" });
-      if (!database.objectStoreNames.contains(TENTATIVE_TURN_STORE)) database.createObjectStore(TENTATIVE_TURN_STORE, { keyPath: "id" });
+      if (!database.objectStoreNames.contains(PROPOSAL_STORE)) database.createObjectStore(PROPOSAL_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(EXECUTION_CHECKPOINT_STORE)) database.createObjectStore(EXECUTION_CHECKPOINT_STORE, { keyPath: "scope" });
     };
     request.onsuccess = () => {
@@ -1459,14 +1466,14 @@ async function deleteExecutionCheckpoint(scope: string): Promise<void> {
   await tx(EXECUTION_CHECKPOINT_STORE, "readwrite", (store) => store.delete(scope));
 }
 
-async function putTentativeTurn(record: V2BrowserTentativeTurnRecord): Promise<void> {
-  await tx(TENTATIVE_TURN_STORE, "readwrite", (store) => store.put(record));
+async function putTurnProposal(record: V2BrowserTurnProposalRecord): Promise<void> {
+  await tx(PROPOSAL_STORE, "readwrite", (store) => store.put(record));
 }
 
-async function journalTentativeTurn(record: V2BrowserTentativeTurnRecord, mode: "fire_and_forget" | "before_enqueue"): Promise<void> {
+async function journalTurnProposal(record: V2BrowserTurnProposalRecord, mode: "fire_and_forget" | "before_enqueue"): Promise<void> {
   const startedAt = metricNow();
   try {
-    await putTentativeTurn(record);
+    await putTurnProposal(record);
     postBrowserActivity({
       phase: "proposal_journal",
       path: mode,
@@ -1489,8 +1496,8 @@ async function journalTentativeTurn(record: V2BrowserTentativeTurnRecord, mode: 
   }
 }
 
-async function deleteTentativeTurn(id: string): Promise<void> {
-  await tx(TENTATIVE_TURN_STORE, "readwrite", (store) => store.delete(id));
+async function deleteTurnProposal(id: string): Promise<void> {
+  await tx(PROPOSAL_STORE, "readwrite", (store) => store.delete(id));
 }
 
 async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
@@ -1562,8 +1569,8 @@ async function maybeCheckpointCommittedTranscripts(scope: string): Promise<void>
   });
 }
 
-async function allTentativeTurns(): Promise<V2BrowserTentativeTurnRecord[]> {
-  const records = await tx<V2BrowserTentativeTurnRecord[]>(TENTATIVE_TURN_STORE, "readonly", (store) => store.getAll());
+async function allTurnProposals(): Promise<V2BrowserTurnProposalRecord[]> {
+  const records = await tx<V2BrowserTurnProposalRecord[]>(PROPOSAL_STORE, "readonly", (store) => store.getAll());
   return records.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
 }
 
@@ -1761,7 +1768,7 @@ async function status(): Promise<V2CacheStatus> {
     execution_transfers: executionTransfers.length,
     execution_ads: await countStore(EXECUTION_AD_STORE),
     execution_checkpoints: await countStore(EXECUTION_CHECKPOINT_STORE),
-    tentative_turns: await countStore(TENTATIVE_TURN_STORE),
+    proposals: await countStore(PROPOSAL_STORE),
     executable_scopes: executableScopes(executionTransfers),
     ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
     last_hello: await getMeta("hello"),

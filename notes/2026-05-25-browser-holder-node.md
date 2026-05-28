@@ -70,8 +70,9 @@ Implementation checklist, current as of 2026-05-27:
    signed state-transfer compatibility, not for row-body-complete accepted-frame
    installs. Execution-cache transcript overlay remains temporary until the
    capsule/write-cell promotion work lands.
-5. Remaining: finish `TurnProposal`/proposal-buffer naming and dependency
-   lifecycle.
+5. In progress: `TurnProposal`/proposal-buffer naming and explicit
+   read/write-cell dependency records are in the browser journal; remaining
+   work is dependency-driven replan/promote behavior.
 6. Remaining: finish execution capsule proof metadata and hash-matched
    write-cell promotion into store 2.
 
