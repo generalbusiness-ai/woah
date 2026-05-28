@@ -279,12 +279,13 @@ These are the same for gateway and browser; the browser inherits them.
   active scope, have no untracked effects, and the call is not a cross-scope
   move/enter. Otherwise the proposal shows pending UI only.
 - **Memory-first, durability by connection state** (A3/A4): zero *awaited* IDB
-  transactions before the optimistic render. On the **open-WebSocket** path,
-  render then journal the proposal fire-and-forget (today it awaits the journal
-  first, `v2-browser-worker.ts:813`); tab death pre-flush is repaired by authority
-  catch-up and proposal retry is best-effort. On the **queued/offline/reconnect**
-  path, the proposal MUST be persisted before it is enqueued — otherwise a socket
-  loss or tab death drops a durable turn that was never submitted.
+  transactions between local execution and the optimistic render. On the
+  **open-WebSocket** path, the worker renders first, journals the proposal
+  fire-and-forget, and sends with pending-envelope persistence in the
+  background; tab death pre-flush is repaired by authority catch-up and proposal
+  retry is best-effort. On the **queued/offline/reconnect** path, the proposal
+  MUST be persisted before it is enqueued — otherwise a socket loss or tab death
+  drops a durable turn that was never submitted.
 - **Two-phase accept** (IDB cannot run VM inside a transaction): phase 1 is the
   pure install boundary. Today it is implemented as head-last, idempotent row
   installs plus separate applied-frame/transcript/proposal cleanup updates, as

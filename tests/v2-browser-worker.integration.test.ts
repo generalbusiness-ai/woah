@@ -100,6 +100,12 @@ describe("v2 browser worker integration", () => {
       }
     });
     expect((coldRequest.body as { selected_ad?: unknown }).selected_ad).toBeUndefined();
+    const optimisticIndex = await waitForMessageIndex(posted, (message) => isOptimisticTurnResult(message, "cold-dubspace-control"));
+    const proposalJournalIndex = await waitForMessageIndex(posted, (message) =>
+      browserMetric(message)?.phase === "proposal_journal" &&
+      browserMetric(message)?.path === "fire_and_forget"
+    );
+    expect(optimisticIndex).toBeLessThan(proposalJournalIndex);
 
     const coldReply = await relayReply(browser, encodeEnvelope(coldRequest));
     socket.receive(encodeEnvelope(coldReply));
@@ -1576,6 +1582,12 @@ function isLocalTurnCommitted(message: unknown, id: string): boolean {
     ((message as { ids: unknown[] }).ids).includes(id);
 }
 
+function isOptimisticTurnResult(message: unknown, id: string): boolean {
+  return isKind(message, "turn_result") &&
+    (message as { optimistic?: unknown }).optimistic === true &&
+    (message as { frame?: { id?: unknown } }).frame?.id === id;
+}
+
 function isComposeViewFor(message: unknown, id: string): boolean {
   return isKind(message, "shadow_browser_compose_view") && (message as { id?: unknown }).id === id;
 }
@@ -1618,6 +1630,13 @@ function isCheckpointTailOpenStatus(message: unknown): boolean {
 
 async function waitForMessage(messages: unknown[], predicate: (message: unknown) => boolean): Promise<unknown> {
   return await waitFor(() => messages.find(predicate));
+}
+
+async function waitForMessageIndex(messages: unknown[], predicate: (message: unknown) => boolean): Promise<number> {
+  return await waitFor(() => {
+    const index = messages.findIndex(predicate);
+    return index >= 0 ? index : undefined;
+  });
 }
 
 async function waitFor<T>(read: () => T | undefined, timeoutMs = 5000): Promise<T> {
