@@ -279,6 +279,102 @@ describe("v2 browser worker integration", () => {
     await sleep(20);
   });
 
+  it("replays surviving proposal overlays after a worker reload", async () => {
+    const posted: unknown[] = [];
+    const indexedDB = new FakeIndexedDBFactory();
+    const firstScope = new FakeWorkerScope();
+    vi.stubGlobal("self", firstScope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-reload-overlay");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-reload-overlay",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-reload-overlay",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-reload-overlay"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    firstScope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-reload-overlay",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const firstSocket = await waitForSocket();
+    firstSocket.open();
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "hello-reload-overlay", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-reload-overlay", opened.transfer.kind, opened.transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "exec-reload-overlay", opened.executable_transfer.kind, opened.executable_transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "ad-reload-overlay", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    firstScope.dispatch({
+      kind: "call",
+      id: "reload-overlay-turn",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.52],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, firstSocket, "set_control");
+    await waitForMessage(posted, (message) => isOptimisticTurnResult(message, "reload-overlay-turn"));
+    await waitForMessage(posted, (message) =>
+      browserMetric(message)?.phase === "proposal_journal" &&
+      browserMetric(message)?.path === "fire_and_forget"
+    );
+
+    vi.resetModules();
+    FakeWebSocket.instances.length = 0;
+    const reloadedPosted: unknown[] = [];
+    const reloadedScope = new FakeWorkerScope();
+    vi.stubGlobal("self", reloadedScope);
+    vi.stubGlobal("postMessage", (message: unknown) => reloadedPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    reloadedScope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-reload-overlay",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    expect(await waitForMessage(reloadedPosted, (message) => isOptimisticTurnResult(message, "reload-overlay-turn"))).toMatchObject({
+      kind: "turn_result",
+      optimistic: true,
+      replayed: true,
+      frame: {
+        id: "reload-overlay-turn"
+      }
+    });
+    expect(await waitForMessage(reloadedPosted, (message) => isKind(message, "local_turn_overlay_replayed"))).toMatchObject({
+      kind: "local_turn_overlay_replayed",
+      id: "reload-overlay-turn"
+    });
+  });
+
   it("rejects executable state-transfer replies that are not bound to a pending request", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();

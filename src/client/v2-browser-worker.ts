@@ -274,6 +274,7 @@ async function connectTo(next: { token: string; node: string; scope: string; act
     && (current.token !== next.token || current.node !== next.node || current.scope !== next.scope || current.actor !== next.actor || current.session !== next.session);
   current = next;
   await postCachedProjection(current.scope);
+  await replayOptimisticProposalOverlays(current.scope);
   if (changed) {
     // A new scope needs a new WebSocket open so the relay can send a fresh
     // TransportHello and projection/catch-up transfer for that scope. Clear
@@ -294,6 +295,54 @@ async function connectTo(next: { token: string; node: string; scope: string; act
   // transfers. Calls below await `connect()` for their own scope before
   // planning, preserving the first-turn executable/ad barrier where it matters.
   void connect();
+}
+
+async function replayOptimisticProposalOverlays(scope: string): Promise<void> {
+  // A tab reload loses the in-memory UI optimistic layer, but IndexedDB may
+  // still contain pending proposals. Re-emit those proposals as optimistic
+  // turn results so canonical projection plus layer 4 matches the pre-reload
+  // view while the authority reply is still unresolved.
+  if (!current?.actor) return;
+  const proposals = selectV2PendingTurnProposals(await allTurnProposals(), {
+    scope,
+    actor: current.actor,
+    session: current.session ?? null
+  });
+  for (const proposal of proposals) {
+    if (!proposal.predicted_overlay) continue;
+    const frame = optimisticFrameFromProposal(proposal);
+    if (!frame) continue;
+    postMessage({ kind: "turn_result", frame, optimistic: true, replayed: true });
+    postMessage({
+      kind: "local_turn_overlay_replayed",
+      id: proposal.id,
+      scope: proposal.scope,
+      transcript_hash: proposal.transcript_hash
+    });
+  }
+}
+
+function optimisticFrameFromProposal(proposal: V2BrowserTurnProposalRecord): Record<string, unknown> | null {
+  const transcript = proposal.transcript;
+  const observations = transcript.observations ?? [];
+  if (transcript.error !== undefined) {
+    return {
+      op: "error",
+      id: proposal.id,
+      error: transcript.error,
+      observations,
+      audience: transcript.scope
+    };
+  }
+  if (transcript.result === undefined && observations.length === 0 && !proposal.predicted_overlay?.result_known) return null;
+  return {
+    op: "result",
+    id: proposal.id,
+    command: transcript.call.verb,
+    result: transcript.result ?? null,
+    observations,
+    audience: transcript.scope
+  };
 }
 
 /**
