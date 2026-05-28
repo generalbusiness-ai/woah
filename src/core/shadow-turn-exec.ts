@@ -88,7 +88,8 @@ export type ShadowObjectRecordTransfer = {
 export type ShadowCellPageTransferPurpose =
   | "open_executable_seed"
   | "open_executable_seed_cache_hit"
-  | "state_repair";
+  | "state_repair"
+  | "accepted_write_cells";
 
 export type ShadowCellPageTransfer = {
   kind: "woo.state.transfer.shadow.v1";

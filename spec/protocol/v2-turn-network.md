@@ -1700,8 +1700,9 @@ transcript into the accepted transcript tail; an id-only match with a different
 transcript hash discards the local proposal and waits for a verified
 transcript/capsule repair.
 An implementation MAY immediately materialize the hash-matched transcript into
-an executable checkpoint instead of writing it to the transcript tail when the
-accepted frame is the immediate successor of the proposal's `base_head`.
+an `accepted_write_cells` executable page transfer instead of writing it to the
+transcript tail when the accepted frame is the immediate successor of the
+proposal's `base_head`.
 Accepted frames for other turns compare their accepted transcript writes against
 each pending proposal's `depends_on`; touched proposals are marked
 `needs_replan` and no longer participate in local execution composition. In

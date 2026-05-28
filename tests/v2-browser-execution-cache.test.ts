@@ -6,7 +6,12 @@ import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowCellPageTransfer, buildShadowClosureTransfer, createShadowExecutionNode, installShadowStateTransfer } from "../src/core/shadow-turn-exec";
 import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
-import { createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTransfers, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
+import {
+  createV2BrowserAcceptedWriteCellTransfer,
+  createV2BrowserExecutionCheckpoint,
+  createV2BrowserExecutionNodeFromTransfers,
+  v2ExecutableTransferRecord
+} from "../src/client/v2-browser-execution-cache";
 
 describe("v2 browser executable cache", () => {
   it("reconstructs an execution node from persisted executable transfers", () => {
@@ -107,6 +112,42 @@ describe("v2 browser executable cache", () => {
 
     const room = composed.serialized?.objects.find((object) => object.id === "#room");
     expect(room?.properties).toContainEqual(["marker", "tail"]);
+  });
+
+  it("promotes accepted transcript write cells into executable page transfers", () => {
+    const key = turnKey("#room");
+    const base = buildShadowClosureTransfer({ serialized: serializedWorld(), key, recipient: "browser:test" });
+    const oldRecord = v2ExecutableTransferRecord(base, 100);
+    const transcript = propTranscript("turn-1", 1, "promoted");
+
+    const promoted = createV2BrowserAcceptedWriteCellTransfer({
+      node: "browser:test",
+      scope: "#room",
+      records: [oldRecord],
+      transcripts: [transcript],
+      accepted_head: {
+        kind: "woo.scope_head.shadow.v1",
+        scope: "#room",
+        epoch: 1,
+        seq: 1,
+        hash: "head:1"
+      },
+      received_at: 200
+    });
+    expect(promoted).toBeTruthy();
+    expect(promoted?.record.transfer.mode).toBe("cell_pages");
+    expect(promoted?.record.transfer.mode === "cell_pages" ? promoted.record.transfer.purpose : undefined).toBe("accepted_write_cells");
+    expect(promoted?.pages.length).toBeGreaterThan(0);
+
+    const composed = createV2BrowserExecutionNodeFromTransfers({
+      node: "browser:test",
+      scope: "#room",
+      records: [oldRecord, promoted!.record],
+      cached_pages: promoted!.pages.map((row) => row.page)
+    });
+    const room = composed.serialized?.objects.find((object) => object.id === "#room");
+    expect(room?.properties).toContainEqual(["marker", "promoted"]);
+    expect(composed.atom_hashes.has(shadowAtomHash("read:cell:prop:#room.marker"))).toBe(true);
   });
 });
 

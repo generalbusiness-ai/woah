@@ -21,7 +21,7 @@ import { v2BrowserCacheMutationsForEnvelope, type V2BrowserCacheMutation } from 
 import type { V2ExecutionAdRecord } from "./v2-browser-delegation";
 import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor } from "./v2-browser-delegation";
 import type { V2BrowserExecutionCheckpoint, V2ExecutableTransferRecord } from "./v2-browser-execution-cache";
-import { createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
+import { createV2BrowserAcceptedWriteCellTransfer, createV2BrowserExecutionCheckpoint, createV2BrowserExecutionNodeFromTransfers } from "./v2-browser-execution-cache";
 import { v2ServerAssistedIntentPolicy } from "./v2-browser-intent-policy";
 import { shouldInvalidateTentativeTurnForCommitReason } from "./v2-browser-optimistic-lifecycle";
 import {
@@ -154,6 +154,7 @@ const pendingStateTransfers = new Map<string, {
 }>();
 const pendingTurnExecRequests = new Map<string, ShadowTurnExecRequest>();
 const postedAppliedFrameKeys = new Set<string>();
+const promotedAcceptedTranscriptHashes = new Set<string>();
 
 type V2WorkerScope = {
   addEventListener(type: "message", listener: (event: MessageEvent<V2WorkerCommand>) => void): void;
@@ -282,6 +283,7 @@ async function connectTo(next: { token: string; node: string; scope: string; act
     connecting = false;
     connectReady?.settle("superseded");
     postedAppliedFrameKeys.clear();
+    promotedAcceptedTranscriptHashes.clear();
     previous?.close(1000, "v2 browser scope changed");
     await putMeta("connected", false);
   }
@@ -1192,10 +1194,10 @@ async function reconcileAcceptedFrameWithProposals(frame: ShadowCommitAccepted, 
   }, frame, transcript);
   for (const record of matched) {
     // If catch-up supplies only the accepted frame, a hash match proves the
-    // local transcript is the accepted one. Promote it into the executable
-    // store when safe, or fall back to the bounded transcript tail.
+    // local transcript is the accepted one. Promote its write cells into
+    // executable pages when safe, or fall back to the bounded transcript tail.
     if (promote.includes(record)) {
-      const promoted = await materializeAcceptedProposalTranscriptCheckpoint(frame, record.transcript, record);
+      const promoted = await materializeAcceptedProposalWriteTransfer(frame, record.transcript, record);
       if (!promoted) {
         await putTranscript(record.transcript, frame.position.seq);
         await maybeCheckpointCommittedTranscripts(record.scope);
@@ -1224,18 +1226,18 @@ async function maybePromoteAcceptedProposalTranscript(frame: ShadowCommitAccepte
   const match = selectV2PendingTurnProposals(await allTurnProposals(), selector)
     .find((record) => record.transcript_hash === frame.transcript_hash);
   if (!match) return false;
-  return await materializeAcceptedProposalTranscriptCheckpoint(frame, transcript, match);
+  return await materializeAcceptedProposalWriteTransfer(frame, transcript, match);
 }
 
-async function materializeAcceptedProposalTranscriptCheckpoint(
+async function materializeAcceptedProposalWriteTransfer(
   frame: ShadowCommitAccepted,
   transcript: EffectTranscript,
   proposal: V2BrowserTurnProposalRecord
 ): Promise<boolean> {
   if (transcript.scope !== frame.position.scope || proposal.scope !== frame.position.scope) return false;
-  // Store-2 promotion is safe only when the accepted frame is the immediate
-  // successor of the state this proposal executed against. Interleaved frames
-  // continue down the bounded transcript-tail path until dependency-wire
+  // Store-2 write-cell promotion is safe only when the accepted frame is the
+  // immediate successor of the state this proposal executed against. Interleaved
+  // frames continue down the bounded transcript-tail path until dependency-wire
   // replan can prove the whole local suffix.
   if (frame.position.seq !== proposal.base_head.seq + 1) return false;
   const checkpoint = await getExecutionCheckpoint(frame.position.scope);
@@ -1255,27 +1257,30 @@ async function materializeAcceptedProposalTranscriptCheckpoint(
   const committedRows = Array.from(rowByHash.values())
     .sort((a, b) => (a.accepted_seq ?? a.seq) - (b.accepted_seq ?? b.seq) || a.received_at - b.received_at || a.hash.localeCompare(b.hash));
   const cache = await executionCacheForScope(frame.position.scope, undefined, { skip_checkpoint_build: true });
-  const next = createV2BrowserExecutionCheckpoint({
+  const promoted = createV2BrowserAcceptedWriteCellTransfer({
     node: current?.node ?? "browser:proposal-promotion",
     scope: frame.position.scope,
     records: cache.records,
     cached_objects: cache.cached_objects,
     cached_pages: cache.cached_pages,
     checkpoint,
-    committed_transcripts: committedRows.map((row) => structuredClone(row.transcript) as EffectTranscript),
-    through_seq: frame.position.seq
+    transcripts: committedRows.map((row) => structuredClone(row.transcript) as EffectTranscript),
+    accepted_head: frame.position
   });
-  if (!next) return false;
-  await putExecutionCheckpoint(next);
+  if (!promoted) return false;
+  await putStatePages(promoted.pages);
+  await putExecutionTransfer(promoted.record);
+  promotedAcceptedTranscriptHashes.add(transcript.hash);
   const pruned = await deleteCommittedTranscriptsThrough(frame.position.scope, frame.position.seq);
   postMessage({
-    kind: "shadow_browser_execution_checkpoint",
+    kind: "shadow_browser_execution_promotion",
     scope: frame.position.scope,
     through_seq: frame.position.seq,
     transcript_count: committedRows.length,
     pruned,
     reason: "proposal_accept",
-    proposal_id: proposal.id
+    proposal_id: proposal.id,
+    page_count: promoted.pages.length
   });
   return true;
 }
@@ -1510,6 +1515,7 @@ async function applyCacheMutation(mutation: V2BrowserCacheMutation): Promise<
         return;
       }
       case "transcript":
+        if (promotedAcceptedTranscriptHashes.has(mutation.transcript.hash)) return;
         if (await transcriptCoveredByCheckpoint(mutation.transcript)) return;
         await putTranscript(mutation.transcript);
         return;

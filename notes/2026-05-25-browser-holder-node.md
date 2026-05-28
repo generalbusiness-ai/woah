@@ -78,11 +78,11 @@ Implementation checklist, current as of 2026-05-27:
    root, checked against pending missing-state repair requests, and checked on
    no-reply open executable seed/cache-hit installs against the active browser
    node, actor, and session. Hash-matched accepted proposals that are the
-   immediate successor of their `base_head` now materialize an execution
-   checkpoint instead of entering the replay tail. Remaining convergence work is
-   retiring the compatibility transcript-replay overlay for interleaved or
-   non-local accepted transcripts once store-2 write-cell materialization fully
-   replaces it.
+   immediate successor of their `base_head` now promote accepted write cells into
+   a signed `accepted_write_cells` execution transfer instead of entering the
+   replay tail. Remaining convergence work is retiring the compatibility
+   transcript-replay overlay for interleaved or non-local accepted transcripts
+   once store-2 write-cell materialization fully replaces it.
 
 ### One receiver profile, applied across the whole transfer family
 

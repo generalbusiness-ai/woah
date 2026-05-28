@@ -1,11 +1,18 @@
 import type { EffectTranscript } from "../core/effect-transcript";
-import { applyShadowTranscriptToCommitScopeCache, createShadowCommitScope, serializedFor } from "../core/shadow-commit-scope";
-import { createShadowExecutionNode, installShadowStateTransfer, type ShadowExecutionNode, type ShadowStateTransfer } from "../core/shadow-turn-exec";
+import { applyShadowTranscriptToCommitScopeCache, createShadowCommitScope, serializedFor, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import {
+  buildShadowCellPageTransfer,
+  createShadowExecutionNode,
+  installShadowStateTransfer,
+  type ShadowCellPageTransfer,
+  type ShadowExecutionNode,
+  type ShadowStateTransfer
+} from "../core/shadow-turn-exec";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import type { SerializedObject, SerializedWorld } from "../core/repository";
-import type { ShadowStatePage } from "../core/shadow-state-pages";
+import { shadowStatePageHash, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
 import { hashSource } from "../core/source-hash";
-import { shadowAtomHash, shadowReadCellPreimage, shadowTurnKeyFromTranscript } from "../core/turn-key";
+import { shadowAtomHash, shadowReadCellPreimage, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../core/turn-key";
 import type { ObjRef, WooValue } from "../core/types";
 
 export type V2ExecutableTransferRecord = {
@@ -34,6 +41,11 @@ export type V2BrowserExecutionComposeStats = {
   tentative_transcript_count: number;
   checkpoint_seq?: number;
   object_count: number;
+};
+
+export type V2PromotedAcceptedTranscriptTransfer = {
+  record: V2ExecutableTransferRecord;
+  pages: Array<{ hash: string; ref: string; page: ShadowStatePage }>;
 };
 
 export function v2ExecutableTransferRecord(
@@ -134,6 +146,89 @@ export function createV2BrowserExecutionCheckpoint(input: {
     atom_hashes: Array.from(node.atom_hashes).sort(),
     updated_at: input.updated_at ?? Date.now()
   };
+}
+
+export function createV2BrowserAcceptedWriteCellTransfer(input: {
+  node: string;
+  scope: ObjRef;
+  records: readonly V2ExecutableTransferRecord[];
+  cached_objects?: readonly SerializedObject[];
+  cached_pages?: readonly ShadowStatePage[];
+  checkpoint?: V2BrowserExecutionCheckpoint | null;
+  transcripts: readonly EffectTranscript[];
+  received_at?: number;
+  accepted_head: ShadowScopeHead;
+}): V2PromotedAcceptedTranscriptTransfer | null {
+  const scoped = input.transcripts.filter((transcript) => transcript.scope === input.scope);
+  const anchor = scoped[scoped.length - 1];
+  if (!anchor) return null;
+  const materialized = createV2BrowserExecutionNodeFromTransfers({
+    node: input.node,
+    scope: input.scope,
+    records: input.records,
+    cached_objects: input.cached_objects,
+    cached_pages: input.cached_pages,
+    checkpoint: input.checkpoint,
+    committed_transcripts: scoped
+  });
+  if (!materialized.serialized) return null;
+  const key = acceptedWriteCellPromotionKey(anchor, scoped);
+  const transfer = buildShadowCellPageTransfer({
+    serialized: materialized.serialized,
+    key,
+    atom_hashes: key.atom_hashes,
+    session: anchor.session ?? null,
+    purpose: "accepted_write_cells",
+    recipient: input.node,
+    capsule: {
+      head: input.accepted_head,
+      actor: key.actor,
+      session: anchor.session ?? null,
+      target: key.target,
+      verb: key.verb,
+      recipient: input.node
+    }
+  });
+  return {
+    record: v2ExecutableTransferRecord(transfer, input.received_at ?? Date.now()),
+    pages: executableStatePageRows(transfer)
+  };
+}
+
+function acceptedWriteCellPromotionKey(anchor: EffectTranscript, transcripts: readonly EffectTranscript[]): ShadowTurnKey {
+  const base = shadowTurnKeyFromTranscript(anchor);
+  const preimages = new Set(base.preimages);
+  const readPreimages = new Set(base.read_preimages);
+  for (const transcript of transcripts) {
+    for (const write of transcript.writes) {
+      const preimage = shadowReadCellPreimage(write.cell);
+      preimages.add(preimage);
+      readPreimages.add(preimage);
+    }
+  }
+  const sorted = Array.from(preimages).sort();
+  const sortedReads = Array.from(readPreimages).sort();
+  return {
+    ...base,
+    preimages: sorted,
+    atom_hashes: sorted.map(shadowAtomHash),
+    read_preimages: sortedReads,
+    read_atom_hashes: sortedReads.map(shadowAtomHash)
+  };
+}
+
+function executableStatePageRows(transfer: ShadowCellPageTransfer): Array<{ hash: string; ref: string; page: ShadowStatePage }> {
+  const refs = new Map(transfer.page_refs.map((ref) => [ref.hash, ref] as const));
+  return transfer.inline_pages.flatMap((page) => {
+    const hash = shadowStatePageHash(page);
+    const ref = refs.get(hash);
+    if (!ref) return [];
+    return [{ hash, ref: statePageRefKey(shadowStatePageRef(page, true)), page }];
+  });
+}
+
+function statePageRefKey(page: Pick<ShadowStatePage, "object" | "page"> & { name?: string }): string {
+  return `${page.object}:${page.page}:${page.name ?? ""}`;
 }
 
 function materializeTranscriptOverlays(

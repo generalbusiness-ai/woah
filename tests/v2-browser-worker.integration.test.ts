@@ -106,27 +106,35 @@ describe("v2 browser worker integration", () => {
       browserMetric(message)?.path === "fire_and_forget"
     );
     expect(optimisticIndex).toBeLessThan(proposalJournalIndex);
+    const beforeReplyStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    const beforeReplyStatus = await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(beforeReplyStatusCursor)[0]);
+    const transferCountBeforeReply = (beforeReplyStatus as { status?: { execution_transfers?: unknown } }).status?.execution_transfers;
+    expect(typeof transferCountBeforeReply).toBe("number");
 
     const coldReply = await relayReply(browser, encodeEnvelope(coldRequest));
     socket.receive(encodeEnvelope(coldReply));
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "cold-dubspace-control"));
     await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
     await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "cold-dubspace-control"));
-    expect(await waitForMessage(posted, (message) => isExecutionCheckpointFor(message, "the_dubspace", "proposal_accept"))).toMatchObject({
-      kind: "shadow_browser_execution_checkpoint",
+    expect(await waitForMessage(posted, (message) => isExecutionPromotionFor(message, "the_dubspace", "proposal_accept"))).toMatchObject({
+      kind: "shadow_browser_execution_promotion",
       through_seq: 1,
       transcript_count: 1,
       proposal_id: "cold-dubspace-control"
     });
     const statusCursor = posted.filter((message) => isKind(message, "status")).length;
     scope.dispatch({ kind: "cache_status" });
-    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+    const afterReplyStatus = await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0]);
+    expect(afterReplyStatus).toMatchObject({
       status: {
         transcript_tail: 0,
-        execution_checkpoints: 1,
+        execution_checkpoints: 0,
         local_execution_ready: true
       }
     });
+    expect(Number((afterReplyStatus as { status?: { execution_transfers?: unknown } }).status?.execution_transfers))
+      .toBeGreaterThanOrEqual((transferCountBeforeReply as number) + 1);
 
     posted.length = 0;
     scope.dispatch({
@@ -143,7 +151,6 @@ describe("v2 browser worker integration", () => {
     const warmRequest = await waitForBrowserBuiltExecRequest(browser, socket);
     expect(await waitForMessage(posted, (message) => isComposeViewFor(message, "warm-dubspace-control"))).toMatchObject({
       kind: "shadow_browser_compose_view",
-      checkpoint_seq: 1,
       committed_transcript_count: 0
     });
     expect(warmRequest).toMatchObject({
@@ -375,7 +382,7 @@ describe("v2 browser worker integration", () => {
     scope.dispatch({ kind: "cache_status" });
     expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
       status: {
-        execution_transfers: transferCountBeforeReply,
+        execution_transfers: (transferCountBeforeReply as number) + 1,
         local_execution_ready: true
       }
     });
@@ -1592,8 +1599,8 @@ function isComposeViewFor(message: unknown, id: string): boolean {
   return isKind(message, "shadow_browser_compose_view") && (message as { id?: unknown }).id === id;
 }
 
-function isExecutionCheckpointFor(message: unknown, scope: string, reason?: string): boolean {
-  return isKind(message, "shadow_browser_execution_checkpoint") &&
+function isExecutionPromotionFor(message: unknown, scope: string, reason?: string): boolean {
+  return isKind(message, "shadow_browser_execution_promotion") &&
     (message as { scope?: unknown }).scope === scope &&
     (reason === undefined || (message as { reason?: unknown }).reason === reason);
 }
