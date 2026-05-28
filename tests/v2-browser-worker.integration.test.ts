@@ -279,6 +279,97 @@ describe("v2 browser worker integration", () => {
     await sleep(20);
   });
 
+  it("does not render or replay a projection overlay for a cross-scope durable enter", async () => {
+    const posted: unknown[] = [];
+    const indexedDB = new FakeIndexedDBFactory();
+    const firstScope = new FakeWorkerScope();
+    vi.stubGlobal("self", firstScope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = world.auth("guest:v2-browser-worker-cross-scope-overlay");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-cross-scope-overlay",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-cross-scope-overlay",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-cross-scope-overlay"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    firstScope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-cross-scope-overlay",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const firstSocket = await waitForSocket();
+    firstSocket.open();
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "hello-cross-scope-overlay", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-cross-scope-overlay", opened.transfer.kind, opened.transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "exec-cross-scope-overlay", opened.executable_transfer.kind, opened.executable_transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "ad-cross-scope-overlay", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    firstScope.dispatch({
+      kind: "call",
+      id: "cross-scope-enter",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "enter",
+      args: [],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, firstSocket, "enter");
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "cross-scope-enter"))).toMatchObject({
+      kind: "local_turn_planned",
+      result_known: true
+    });
+    await waitForMessage(posted, (message) =>
+      browserMetric(message)?.phase === "proposal_journal" &&
+      browserMetric(message)?.path === "fire_and_forget"
+    );
+    expect(posted.some((message) => isOptimisticTurnResult(message, "cross-scope-enter"))).toBe(false);
+
+    vi.resetModules();
+    FakeWebSocket.instances.length = 0;
+    const reloadedPosted: unknown[] = [];
+    const reloadedScope = new FakeWorkerScope();
+    vi.stubGlobal("self", reloadedScope);
+    vi.stubGlobal("postMessage", (message: unknown) => reloadedPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    reloadedScope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-cross-scope-overlay",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    await sleep(20);
+    expect(reloadedPosted.some((message) => isOptimisticTurnResult(message, "cross-scope-enter"))).toBe(false);
+    expect(reloadedPosted.some((message) => isKind(message, "local_turn_overlay_replayed"))).toBe(false);
+  });
+
   it("replays surviving proposal overlays after a worker reload", async () => {
     const posted: unknown[] = [];
     const indexedDB = new FakeIndexedDBFactory();

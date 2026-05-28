@@ -32,6 +32,7 @@ import {
   v2ProposalTranscriptChain,
   v2TurnProposalForInvalidation,
   v2TurnProposalMatches,
+  v2ProposalProjectionOverlayForTranscript,
   v2ReconcileTurnProposalsWithAcceptedFrame,
   v2TurnProposalNeedsReplanRecord,
   type V2BrowserTurnProposalRecord
@@ -961,6 +962,14 @@ async function sendLocalTurnExec(
     });
     return false;
   }
+  const predictedOverlay = persistence === "durable"
+    ? v2ProposalProjectionOverlayForTranscript({
+      id: command.id,
+      scope,
+      transcript: local.transcript,
+      result_known: local.result_known
+    })
+    : null;
   const proposal = persistence === "durable"
     ? v2BrowserTurnProposalRecord({
       id: command.id,
@@ -969,17 +978,11 @@ async function sendLocalTurnExec(
       session: current.session ?? null,
       base_head: cachedHead,
       transcript: local.transcript,
-      predicted_overlay: {
-        kind: "woo.proposal_projection_overlay.v1",
-        id: command.id,
-        scope,
-        result_known: local.result_known,
-        authoritative_projection: false
-      }
+      predicted_overlay: predictedOverlay
     })
     : null;
   const socketOpen = socket?.readyState === WebSocket.OPEN;
-  if (local.result_known) {
+  if (local.result_known && (persistence !== "durable" || predictedOverlay)) {
     postMessage({ kind: "turn_result", frame: local.optimistic_frame, optimistic: true });
   }
   if (proposal) {

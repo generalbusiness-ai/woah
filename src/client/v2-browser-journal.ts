@@ -38,6 +38,30 @@ export type V2BrowserProposalSelector = {
   session: string | null;
 };
 
+export function v2ProposalProjectionOverlayForTranscript(input: {
+  id: string;
+  scope: ObjRef;
+  transcript: EffectTranscript;
+  result_known: boolean;
+}): V2ProposalProjectionOverlay | null {
+  if (!v2TranscriptSupportsProposalProjectionOverlay(input.transcript, input.scope)) return null;
+  return {
+    kind: "woo.proposal_projection_overlay.v1",
+    id: input.id,
+    scope: input.scope,
+    result_known: input.result_known,
+    authoritative_projection: false
+  };
+}
+
+export function v2TranscriptSupportsProposalProjectionOverlay(transcript: EffectTranscript, scope: ObjRef): boolean {
+  if (!transcript.complete || transcript.untrackedEffects.length > 0) return false;
+  return transcript.moves.every((move) =>
+    move.to === scope &&
+    (move.from === null || move.from === scope)
+  );
+}
+
 export function v2BrowserTurnProposalRecord(input: {
   id: string;
   scope: ObjRef;

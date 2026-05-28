@@ -6,7 +6,9 @@ import {
   selectV2PendingTurnProposals,
   type V2BrowserTurnProposalRecord,
   v2BrowserTurnProposalRecord,
+  v2ProposalProjectionOverlayForTranscript,
   v2ReconcileTurnProposalsWithAcceptedFrame,
+  v2TranscriptSupportsProposalProjectionOverlay,
   v2TurnProposalAcceptedFrameMatch,
   v2TurnProposalForInvalidation,
   v2TurnProposalNeedsReplanAfterTranscript,
@@ -46,6 +48,48 @@ describe("v2 browser tentative journal", () => {
       { cell: { kind: "prop", object: "the_pinboard", name: "title" }, version: "v-title" },
       { cell: { kind: "verb", object: "the_pinboard", name: "add_note" } }
     ]);
+  });
+
+  it("creates proposal projection overlays only for locally bounded transcripts", () => {
+    const localWrite = transcript("local-write", "hash-local-write");
+    const localCreate = {
+      ...transcript("local-create", "hash-local-create"),
+      moves: [{
+        object: "pin_note_1",
+        from: null,
+        to: "the_pinboard"
+      }]
+    };
+    const crossScopeMove = {
+      ...transcript("cross-scope", "hash-cross-scope"),
+      moves: [{
+        object: "guest_1",
+        from: "the_chatroom",
+        to: "the_pinboard"
+      }]
+    };
+    const untracked = {
+      ...transcript("untracked", "hash-untracked"),
+      untrackedEffects: [{ name: "side_channel", detail: null }]
+    };
+
+    expect(v2ProposalProjectionOverlayForTranscript({
+      id: "local-write",
+      scope: "the_pinboard",
+      transcript: localWrite,
+      result_known: true
+    })).toMatchObject({
+      kind: "woo.proposal_projection_overlay.v1",
+      authoritative_projection: false
+    });
+    expect(v2TranscriptSupportsProposalProjectionOverlay(localCreate, "the_pinboard")).toBe(true);
+    expect(v2TranscriptSupportsProposalProjectionOverlay(crossScopeMove, "the_pinboard")).toBe(false);
+    expect(v2ProposalProjectionOverlayForTranscript({
+      id: "untracked",
+      scope: "the_pinboard",
+      transcript: untracked,
+      result_known: true
+    })).toBeNull();
   });
 
   it("normalizes legacy tentative rows into proposal records on read", () => {

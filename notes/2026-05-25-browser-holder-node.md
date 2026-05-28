@@ -70,9 +70,11 @@ Implementation checklist, current as of 2026-05-27:
    signed state-transfer compatibility, not for row-body-complete accepted-frame
    installs. Execution-cache transcript overlay remains only for tentative
    proposals and non-contiguous accepted-transcript gap fallback.
-5. Done: `TurnProposal`/proposal-buffer naming, explicit read/write-cell
-   dependency records, accepted-frame hash-match promotion, and
+5. Done: `TurnProposal`/proposal-buffer naming, explicit dependency records,
+   accepted-frame hash-match promotion, and
    dependency-driven `needs_replan` marking are in the browser journal/worker.
+   Proposal projection overlays are now limited to locally bounded transcripts;
+   cross-scope moves/enters and untracked-effect transcripts stay pending-only.
 6. Done for repair/open-seed transfers: cell-page execution capsule metadata is
    carried on browser executable transfers, included in the signed state proof
    root, checked against pending missing-state repair requests, and checked on
