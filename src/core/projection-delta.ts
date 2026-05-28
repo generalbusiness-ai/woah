@@ -389,11 +389,28 @@ function compareProjectionWrites(a: ProjectionWrite<ProjectionProfile>, b: Proje
 
 export type BrowserProjectionViewer = { actor: ObjRef; session?: string | null };
 
+export type BrowserProfileProjectionContext = {
+  serialized: SerializedWorld;
+  index: ProjectionSerializedIndex;
+};
+
+export function browserProfileProjectionContext(serialized: SerializedWorld): BrowserProfileProjectionContext {
+  // Browser-profile conversion may project many object rows from one committed
+  // frame or checkpoint page. Build the inherited property index once, then
+  // overlay each row being projected so per-row cost is proportional to lineage
+  // depth instead of all objects in the scope.
+  return {
+    serialized,
+    index: projectionSerializedIndex(serialized)
+  };
+}
+
 export function browserProfileOpenTransferFromAuthority(input: {
   transfer: OpenTransfer;
   serialized: SerializedWorld;
   viewer: BrowserProjectionViewer;
 }): OpenTransfer<BrowserProfile> {
+  const context = browserProfileProjectionContext(input.serialized);
   if (input.transfer.kind === "frames") {
     return {
       ...input.transfer,
@@ -402,7 +419,7 @@ export function browserProfileOpenTransferFromAuthority(input: {
         projection_writes: frame.projection_writes
           .map((write) => browserProfileProjectionWriteFromAuthority({
             write,
-            serialized: input.serialized,
+            context,
             scope: frame.frame.position.scope,
             head: frame.frame.position,
             viewer: input.viewer
@@ -415,7 +432,7 @@ export function browserProfileOpenTransferFromAuthority(input: {
     ...input.transfer,
     checkpoint: browserProfileScopeCheckpointFromAuthority({
       checkpoint: input.transfer.checkpoint,
-      serialized: input.serialized,
+      context,
       viewer: input.viewer
     })
   };
@@ -423,15 +440,17 @@ export function browserProfileOpenTransferFromAuthority(input: {
 
 export function browserProfileScopeCheckpointFromAuthority(input: {
   checkpoint: ScopeCheckpoint;
-  serialized: SerializedWorld;
+  serialized?: SerializedWorld;
+  context?: BrowserProfileProjectionContext;
   viewer: BrowserProjectionViewer;
 }): ScopeCheckpoint<BrowserProfile> {
+  const context = input.context ?? browserProfileProjectionContext(requiredSerialized(input.serialized));
   const pages = input.checkpoint.pages
     .map((page) => browserProfileProjectionPageFromAuthority({
       page,
       scope: input.checkpoint.scope,
       head: input.checkpoint.head,
-      serialized: input.serialized,
+      context,
       viewer: input.viewer
     }))
     .filter((page): page is ProjectionPage<BrowserProfile> => page !== null);
@@ -457,17 +476,19 @@ export function browserProfileScopeCheckpointFromAuthority(input: {
 
 export function browserProfileProjectionWriteFromAuthority(input: {
   write: ProjectionWrite;
-  serialized: SerializedWorld;
+  serialized?: SerializedWorld;
+  context?: BrowserProfileProjectionContext;
   scope: ObjRef;
   head: ShadowScopeHead;
   viewer: BrowserProjectionViewer;
 }): ProjectionWrite<BrowserProfile> | null {
-  const { write, serialized, scope, head, viewer } = input;
+  const { write, scope, head, viewer } = input;
+  const context = input.context ?? browserProfileProjectionContext(requiredSerialized(input.serialized));
   switch (write.table) {
     case "objects":
       return write.op === "delete"
         ? { table: "objects", key: write.key, op: "delete", bytes: 0 }
-        : browserProjectionWrite("objects", write.key, browserObjectRow(serializedWithObject(serialized, write.row), scope, head, write.row, viewer));
+        : browserProjectionWrite("objects", write.key, browserObjectRow(context.index, scope, head, write.row, viewer));
     case "sessions":
       return write.op === "delete"
         ? { table: "sessions", key: write.key, op: "delete", bytes: 0 }
@@ -495,13 +516,13 @@ function browserProfileProjectionPageFromAuthority(input: {
   page: ProjectionPage;
   scope: ObjRef;
   head: ShadowScopeHead;
-  serialized: SerializedWorld;
+  context: BrowserProfileProjectionContext;
   viewer: BrowserProjectionViewer;
 }): ProjectionPage<BrowserProfile> | null {
-  const { page, scope, head, serialized, viewer } = input;
+  const { page, scope, head, context, viewer } = input;
   switch (page.table) {
     case "objects":
-      return browserProjectionPage("objects", page.page, page.rows.map((row) => browserObjectRow(serializedWithObject(serialized, row), scope, head, row, viewer)));
+      return browserProjectionPage("objects", page.page, page.rows.map((row) => browserObjectRow(context.index, scope, head, row, viewer)));
     case "sessions":
       return browserProjectionPage("sessions", page.page, page.rows.map((row) => browserSessionRow(row, head)));
     case "logs":
@@ -586,13 +607,13 @@ function browserToolRow(row: ToolSurfaceProjectionRow, head: ShadowScopeHead): B
 }
 
 function browserObjectRow(
-  serialized: SerializedWorld,
+  baseIndex: ProjectionSerializedIndex,
   scope: ObjRef,
   head: ShadowScopeHead,
   obj: SerializedObject,
   viewer: BrowserProjectionViewer
 ): BrowserObjectRow {
-  const index = projectionSerializedIndex(serialized);
+  const index = projectionSerializedIndexWithObject(baseIndex, obj);
   const props = readableProps(index, obj, viewer.actor);
   const aliases = props.aliases;
   const display: BrowserObjectDisplay = {
@@ -618,26 +639,46 @@ function browserObjectRow(
   };
 }
 
-function serializedWithObject(serialized: SerializedWorld, obj: SerializedObject): SerializedWorld {
-  const objects = serialized.objects.some((item) => item.id === obj.id)
-    ? serialized.objects.map((item) => item.id === obj.id ? obj : item)
-    : [...serialized.objects, obj];
-  return { ...serialized, objects };
+function requiredSerialized(serialized: SerializedWorld | undefined): SerializedWorld {
+  if (!serialized) throw new Error("browser-profile projection conversion requires serialized state or a projection context");
+  return serialized;
 }
 
 type ProjectionSerializedIndex = {
   objects: Map<ObjRef, SerializedObject>;
   indexedObjects: Map<ObjRef, { properties: Map<string, WooValue>; propertyDefs: Map<string, PropertyDef> }>;
+  objectOverrides?: Map<ObjRef, SerializedObject>;
+  indexedObjectOverrides?: Map<ObjRef, { properties: Map<string, WooValue>; propertyDefs: Map<string, PropertyDef> }>;
 };
 
 function projectionSerializedIndex(serialized: SerializedWorld): ProjectionSerializedIndex {
   return {
     objects: new Map(serialized.objects.map((obj) => [obj.id, obj])),
-    indexedObjects: new Map(serialized.objects.map((obj) => [obj.id, {
-      properties: new Map(obj.properties),
-      propertyDefs: new Map(obj.propertyDefs.map((def) => [def.name, def] as const))
-    }] as const))
+    indexedObjects: new Map(serialized.objects.map((obj) => [obj.id, indexedSerializedObject(obj)] as const))
   };
+}
+
+function projectionSerializedIndexWithObject(index: ProjectionSerializedIndex, obj: SerializedObject): ProjectionSerializedIndex {
+  return {
+    ...index,
+    objectOverrides: new Map([[obj.id, obj]]),
+    indexedObjectOverrides: new Map([[obj.id, indexedSerializedObject(obj)]])
+  };
+}
+
+function indexedSerializedObject(obj: SerializedObject): { properties: Map<string, WooValue>; propertyDefs: Map<string, PropertyDef> } {
+  return {
+    properties: new Map(obj.properties),
+    propertyDefs: new Map(obj.propertyDefs.map((def) => [def.name, def] as const))
+  };
+}
+
+function indexedObject(index: ProjectionSerializedIndex, id: ObjRef): { properties: Map<string, WooValue>; propertyDefs: Map<string, PropertyDef> } | undefined {
+  return index.indexedObjectOverrides?.get(id) ?? index.indexedObjects.get(id);
+}
+
+function serializedObject(index: ProjectionSerializedIndex, id: ObjRef): SerializedObject | undefined {
+  return index.objectOverrides?.get(id) ?? index.objects.get(id);
 }
 
 function readableProps(index: ProjectionSerializedIndex, obj: SerializedObject, actor?: ObjRef): Record<string, WooValue> {
@@ -653,14 +694,14 @@ function readableProps(index: ProjectionSerializedIndex, obj: SerializedObject, 
 
 function propertyNames(index: ProjectionSerializedIndex, objRef: ObjRef): string[] {
   const names = new Set<string>();
-  let current = index.objects.get(objRef) ?? null;
+  let current = serializedObject(index, objRef) ?? null;
   const seen = new Set<ObjRef>();
   while (current && !seen.has(current.id)) {
     seen.add(current.id);
-    const indexed = index.indexedObjects.get(current.id);
+    const indexed = indexedObject(index, current.id);
     for (const name of indexed?.propertyDefs.keys() ?? []) names.add(name);
     for (const name of indexed?.properties.keys() ?? []) names.add(name);
-    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+    current = current.parent ? serializedObject(index, current.parent) ?? null : null;
   }
   return Array.from(names).sort();
 }
@@ -670,36 +711,36 @@ function propertyValue(
   objRef: ObjRef,
   name: string
 ): { value: WooValue | undefined; owner: ObjRef; perms: string } | null {
-  let current = index.objects.get(objRef) ?? null;
+  let current = serializedObject(index, objRef) ?? null;
   const seen = new Set<ObjRef>();
   let value: WooValue | undefined;
   let hasValue = false;
   while (current && !seen.has(current.id)) {
     seen.add(current.id);
-    const indexed = index.indexedObjects.get(current.id);
+    const indexed = indexedObject(index, current.id);
     if (!hasValue && indexed?.properties.has(name)) {
       value = indexed.properties.get(name);
       hasValue = true;
     }
     const def = indexed?.propertyDefs.get(name);
     if (def) return { value: hasValue ? value : def.defaultValue, owner: def.owner, perms: def.perms };
-    current = current.parent ? index.objects.get(current.parent) ?? null : null;
+    current = current.parent ? serializedObject(index, current.parent) ?? null : null;
   }
   return null;
 }
 
 function ancestors(index: ProjectionSerializedIndex, objRef: ObjRef): ObjRef[] {
   const out: ObjRef[] = [];
-  let current = index.objects.get(objRef)?.parent ?? null;
+  let current = serializedObject(index, objRef)?.parent ?? null;
   const seen = new Set<ObjRef>();
   while (current && !seen.has(current)) {
     out.push(current);
     seen.add(current);
-    current = index.objects.get(current)?.parent ?? null;
+    current = serializedObject(index, current)?.parent ?? null;
   }
   return out.reverse();
 }
 
 function canReadProperty(index: ProjectionSerializedIndex, actor: ObjRef | undefined, owner: ObjRef, perms: string): boolean {
-  return Boolean(actor && (index.objects.get(actor)?.flags?.wizard === true || owner === actor)) || String(perms).includes("r");
+  return Boolean(actor && (serializedObject(index, actor)?.flags?.wizard === true || owner === actor)) || String(perms).includes("r");
 }

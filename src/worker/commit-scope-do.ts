@@ -56,6 +56,7 @@ import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
 import {
   browserProfileOpenTransferFromAuthority,
+  browserProfileProjectionContext,
   browserProfileProjectionWriteFromAuthority,
   summarizeProjectionWrites,
   type AcceptedFrameTransfer,
@@ -1228,10 +1229,11 @@ export class CommitScopeDO {
     const authorityWrites = body.commit.projection_writes ?? [];
     if (authorityWrites.length === 0 && !body.commit.projection_delta) return reply;
     const serialized = this.serializedProjectionWorld();
+    const context = browserProfileProjectionContext(serialized);
     const browserWrites = authorityWrites
       .map((write) => browserProfileProjectionWriteFromAuthority({
         write,
-        serialized,
+        context,
         scope: body.commit!.position.scope,
         head: body.commit!.position,
         viewer: { actor: input.actor, session: input.session }
