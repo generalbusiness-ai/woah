@@ -79,9 +79,11 @@ Implementation checklist, current as of 2026-05-27:
    no-reply open executable seed/cache-hit installs against the active browser
    node, actor, and session. Hash-matched accepted proposals that are the
    immediate successor of their `base_head`, plus non-local accepted transcripts
-   that form a contiguous sequence since the last execution checkpoint, now
-   promote accepted write cells into a signed `accepted_write_cells` execution
-   transfer instead of entering the replay tail.
+   that form a contiguous sequence since the last execution checkpoint or
+   accepted-write-cell high-watermark, now promote accepted write cells into a
+   signed `accepted_write_cells` execution transfer instead of entering the
+   replay tail. When an out-of-order gap closes, the worker drains any now-
+   contiguous transcript-tail rows into store 2 before later local composition.
 
 ### One receiver profile, applied across the whole transfer family
 
@@ -237,16 +239,17 @@ These are the same for gateway and browser; the browser inherits them.
   `ProjectionWrite<BrowserProfile>`s, writes `projection_rows`, and advances the
   scope head last. `ShadowScopeProjectionPatch` is now legacy state-transfer
   compatibility only; it is not the accepted-frame install path. The remaining
-  `applyShadowTranscriptToCommitScopeCache` use is the temporary execution-cache
-  overlay for accepted/tentative transcripts until store-2 write-cell promotion
-  and executable capsules replace it.
+  `applyShadowTranscriptToCommitScopeCache` use is the execution-cache overlay
+  for pending proposals and for accepted transcripts whose sequence gap has not
+  closed yet.
 - **Execution view advances from accepted frames** (projection rows cannot feed
   the VM). Promote a proposal's `write_cells` into store-2 under the accepted
   receipt **only when the accepted frame's transcript hash equals the proposal's
   `transcript_hash`**; if the authority re-executed differently under the same
-  turn id, discard the local writes and fetch capsule/checkpoint instead. For an
-  unrelated remote frame, invalidate capsule coverage for the touched atoms and
-  fetch a capsule on the next local plan that needs them.
+  turn id, discard the local writes and fetch capsule/checkpoint instead. For a
+  non-local accepted frame, promote the accepted transcript's write cells once
+  the browser has contiguous accepted sequence coverage from its execution
+  checkpoint or accepted-write-cell high-watermark.
 - **`ExecutionCapsuleTransfer` = `ShadowCellPageTransfer` + signed capsule
   metadata**, not a new primitive (`installShadowStateTransfer` already handles
   `cell_pages`, `shadow-turn-exec.ts:461`). Metadata (`head`, `actor`, `session`,

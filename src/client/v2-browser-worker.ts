@@ -1300,7 +1300,7 @@ async function materializeAcceptedProposalWriteTransfer(
 async function materializeAcceptedTranscriptWriteTransfer(
   frame: ShadowCommitAccepted,
   transcript: EffectTranscript,
-  options: { proposal?: V2BrowserTurnProposalRecord } = {}
+  options: { proposal?: V2BrowserTurnProposalRecord; drainTail?: boolean } = {}
 ): Promise<boolean> {
   const proposal = options.proposal;
   if (transcript.scope !== frame.position.scope || transcript.hash !== frame.transcript_hash) return false;
@@ -1359,7 +1359,26 @@ async function materializeAcceptedTranscriptWriteTransfer(
     ...(proposal ? { proposal_id: proposal.id } : {}),
     page_count: promoted.pages.length
   });
+  if (options.drainTail !== false) await promoteContiguousAcceptedTranscriptTail(frame.position.scope);
   return true;
+}
+
+async function promoteContiguousAcceptedTranscriptTail(scope: string): Promise<void> {
+  for (;;) {
+    const records = await allExecutionTransfers();
+    const checkpoint = await getExecutionCheckpoint(scope);
+    const highWatermark = Math.max(
+      checkpoint?.through_seq ?? 0,
+      acceptedWriteTransferHighWatermark(scope, records)
+    );
+    const next = (await committedTranscriptRowsForScope(scope, highWatermark))
+      .find((row) => (row.accepted_seq ?? row.seq) === highWatermark + 1);
+    if (!next) return;
+    const frame = await appliedFrameFor(scope, highWatermark + 1);
+    if (!frame) return;
+    const promoted = await materializeAcceptedTranscriptWriteTransfer(frame, next.transcript, { drainTail: false });
+    if (!promoted) return;
+  }
 }
 
 function committedRowsCoverAcceptedRange(rows: readonly TranscriptTailRow[], afterSeq: number, throughSeq: number): boolean {
@@ -1786,6 +1805,14 @@ async function putAppliedFrame(frame: ShadowCommitAccepted): Promise<void> {
   const existing = await tx<{ id?: string } | undefined>(APPLIED_STORE, "readonly", (store) => store.get(key));
   if (existing) return;
   await tx(APPLIED_STORE, "readwrite", (store) => store.put({ id: key, scope: frame.position.scope, seq: frame.position.seq, frame, received_at: Date.now() }));
+}
+
+async function appliedFrameFor(scope: string, seq: number): Promise<ShadowCommitAccepted | undefined> {
+  const row = await tx<{ frame?: unknown } | undefined>(APPLIED_STORE, "readonly", (store) => store.get(`${scope}:${seq}`));
+  const frame = row?.frame;
+  return frame && typeof frame === "object" && !Array.isArray(frame)
+    ? structuredClone(frame) as ShadowCommitAccepted
+    : undefined;
 }
 
 async function putTranscript(transcript: EffectTranscript, acceptedSeq?: number): Promise<void> {

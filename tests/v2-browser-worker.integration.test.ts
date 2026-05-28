@@ -1441,7 +1441,7 @@ describe("v2 browser worker integration", () => {
     });
   });
 
-  it("promotes contiguous accepted transcripts and reports compose-view stats without replay", async () => {
+  it("drains out-of-order accepted transcripts into write-cell transfers before later local compose", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
     vi.stubGlobal("self", scope);
@@ -1486,7 +1486,7 @@ describe("v2 browser worker integration", () => {
     socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-checkpoint", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
     await waitForMessage(posted, (message) => isReadyStatus(message));
 
-    for (let seq = 1; seq <= 8; seq++) {
+    for (const seq of [1, 3]) {
       const accepted = syntheticAccepted("the_dubspace", seq);
       const transcript = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, seq);
       socket.receive(encodeEnvelope(relayEnvelope(browser, `accepted-checkpoint-${seq}`, "woo.turn.exec.reply.shadow.v1", {
@@ -1498,15 +1498,36 @@ describe("v2 browser worker integration", () => {
         commit: accepted
       })));
     }
+    const gapStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitForMessageFrom(posted, gapStatusCursor, (message) =>
+      isKind(message, "status") &&
+      (message as { status?: { transcript_tail?: unknown } }).status?.transcript_tail === 1
+    )).toMatchObject({
+      status: {
+        transcript_tail: 1
+      }
+    });
+
+    const accepted2 = syntheticAccepted("the_dubspace", 2);
+    const transcript2 = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, 2);
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "accepted-checkpoint-2", "woo.turn.exec.reply.shadow.v1", {
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: true,
+      id: transcript2.id,
+      outcome: { result: null },
+      transcript: transcript2,
+      commit: accepted2
+    })));
 
     const promotion = await waitForMessage(posted, (message) =>
       isExecutionPromotionFor(message, "the_dubspace", "accepted_transcript") &&
-      (message as { through_seq?: unknown }).through_seq === 8
+      (message as { through_seq?: unknown }).through_seq === 3
     );
     expect(promotion).toMatchObject({
       kind: "shadow_browser_execution_promotion",
       scope: "the_dubspace",
-      through_seq: 8,
+      through_seq: 3,
       transcript_count: 1,
       reason: "accepted_transcript"
     });

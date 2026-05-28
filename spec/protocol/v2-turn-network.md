@@ -1706,7 +1706,10 @@ proposal's `base_head`. It MAY also materialize a non-local accepted transcript
 into `accepted_write_cells` when the browser has a contiguous accepted
 transcript sequence from the last execution checkpoint through that frame; if
 the sequence has a gap, the browser MUST retain the transcript-tail fallback or
-fetch a verified executable transfer before using the state for VM reads.
+fetch a verified executable transfer before using the state for VM reads. When
+a later accepted frame closes such a gap, the browser SHOULD drain any now-
+contiguous transcript-tail rows into executable pages before composing later
+local turns.
 Accepted frames for other turns compare their accepted transcript writes against
 each pending proposal's `depends_on`; touched proposals are marked
 `needs_replan` and no longer participate in local execution composition. In
